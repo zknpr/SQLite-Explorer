@@ -70,9 +70,9 @@ export default function Footer() {
         <div className="mt-8 pt-8 border-t border-[var(--border)] flex flex-col sm:flex-row items-center justify-between gap-4 text-sm text-[var(--muted-foreground)]">
           <p>&copy; {currentYear} zknpr. All rights reserved.</p>
           <p>
-            Built with{' '}
+            Built with{" "}
             <a
-              href="https://claude.ai/claude-code"
+              href="https://claude.com/product/claude-code"
               target="_blank"
               rel="noopener noreferrer"
               className="text-[var(--accent)] hover:underline"

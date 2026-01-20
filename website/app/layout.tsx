@@ -7,6 +7,7 @@
 
 import type { Metadata, Viewport } from 'next';
 import { Analytics } from '@vercel/analytics/react';
+import { SpeedInsights } from '@vercel/speed-insights/next';
 import './globals.css';
 
 /**
@@ -75,7 +76,7 @@ export const viewport: Viewport = {
 
 /**
  * RootLayout wraps all pages with common HTML structure.
- * Includes Vercel Analytics for traffic monitoring.
+ * Includes Vercel Analytics for traffic monitoring and Speed Insights for Core Web Vitals.
  */
 export default function RootLayout({
   children,
@@ -88,6 +89,8 @@ export default function RootLayout({
         {children}
         {/* Vercel Analytics - automatically tracks page views and web vitals */}
         <Analytics />
+        {/* Vercel Speed Insights - Core Web Vitals monitoring */}
+        <SpeedInsights />
       </body>
     </html>
   );
