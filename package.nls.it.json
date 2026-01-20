@@ -1,16 +1,10 @@
 {
-  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer",
-  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer (rilevamento automatico)",
-  "sqlite-explorer.customEditor.readonly.displayName": "SQLite Explorer (sola lettura)",
-  "sqlite-explorer.customEditor.wasm.displayName": "SQLite Explorer (sola lettura, in memoria)",
-  "sqlite-explorer.config.maxFileSize.markdownDescription": "Dimensione massima del file in MB che l'estensione tenterà di aprire. Impostare su 0 per disabilitare il limite. Il limite massimo è 4GB, ma il sistema potrebbe avere limiti inferiori.\n\n__Attenzione__: I file di grandi dimensioni potrebbero causare problemi di prestazioni o blocchi.",
-  "sqlite-explorer.commands.exportTable.title": "Esporta tabella",
+  "sqlite-explorer.displayName": "SQLite Explorer",
+  "sqlite-explorer.description": "Un potente visualizzatore ed editor di database SQLite per VS Code",
+  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer",
+  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer (Opzionale)",
   "sqlite-explorer.commands.refresh.title": "Aggiorna database",
-  "sqlite-explorer.config.instantCommit.never": "Mai",
-  "sqlite-explorer.config.instantCommit.remoteOnly": "Solo remoto",
-  "sqlite-explorer.config.instantCommit.always": "Sempre",
-  "sqlite-explorer.config.instantCommit.markdownDescription": "Controlla quando le modifiche vengono salvate immediatamente nel database. Quando abilitato, le modifiche vengono salvate istantaneamente senza richiedere un salvataggio manuale.\n\n__Attenzione__: I commit istantanei utilizzano istruzioni SQL inverse per annulla/ripeti, che potrebbero non funzionare in tutti gli scenari (es. se un altro processo ha modificato la stessa riga).",
-  "sqlite-explorer.config.doubleClickBehavior.modal": "Finestra di dialogo modale",
-  "sqlite-explorer.config.doubleClickBehavior.vscode": "Editor VS Code",
-  "sqlite-explorer.config.doubleClickBehavior.markdownDescription": "Controlla cosa succede quando si fa doppio clic su una cella nella vista tabella.\n\n- **Finestra di dialogo modale**: Apre una finestra di dialogo modale per modificare la cella (predefinito)\n- **Editor VS Code**: Apre il valore della cella in una scheda VS Code separata"
+  "sqlite-explorer.config.maxFileSize.markdownDescription": "Dimensione massima del file in MB che può essere aperto. Impostare su 0 per illimitato.",
+  "sqlite-explorer.config.defaultPageSize.markdownDescription": "Numero predefinito di righe da visualizzare per pagina.",
+  "sqlite-explorer.config.maxRows.markdownDescription": "Numero massimo di righe da caricare da una tabella. Impostare su 0 per illimitato."
 }

@@ -1,16 +1,10 @@
 {
-  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer",
-  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer (detecção automática)",
-  "sqlite-explorer.customEditor.readonly.displayName": "SQLite Explorer (somente leitura)",
-  "sqlite-explorer.customEditor.wasm.displayName": "SQLite Explorer (somente leitura, na memória)",
-  "sqlite-explorer.config.maxFileSize.markdownDescription": "Tamanho máximo do arquivo em MB que a extensão tentará abrir. Defina como 0 para desativar o limite. O limite rígido é de 4 GB, mas seu sistema pode ter limites mais baixos.\n\n__Aviso__: Arquivos grandes podem causar problemas de desempenho ou travamentos.",
-  "sqlite-explorer.commands.exportTable.title": "Exportar tabela",
+  "sqlite-explorer.displayName": "SQLite Explorer",
+  "sqlite-explorer.description": "Um poderoso visualizador e editor de banco de dados SQLite para VS Code",
+  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer",
+  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer (Opcional)",
   "sqlite-explorer.commands.refresh.title": "Atualizar banco de dados",
-  "sqlite-explorer.config.instantCommit.never": "Nunca",
-  "sqlite-explorer.config.instantCommit.remoteOnly": "Apenas remoto",
-  "sqlite-explorer.config.instantCommit.always": "Sempre",
-  "sqlite-explorer.config.instantCommit.markdownDescription": "Controla quando as alterações são salvas imediatamente no banco de dados. Quando ativado, as modificações são salvas instantaneamente sem necessidade de salvamento manual.\n\n__Aviso__: Commits instantâneos usam instruções SQL reversas para desfazer/refazer, o que pode não funcionar em todos os cenários (por exemplo, se outro processo modificou a mesma linha).",
-  "sqlite-explorer.config.doubleClickBehavior.modal": "Caixa de diálogo modal",
-  "sqlite-explorer.config.doubleClickBehavior.vscode": "Editor do VS Code",
-  "sqlite-explorer.config.doubleClickBehavior.markdownDescription": "Controla o que acontece quando você clica duas vezes em uma célula na visualização da tabela.\n\n- **Caixa de diálogo modal**: Abre uma caixa de diálogo modal para editar a célula (padrão)\n- **Editor do VS Code**: Abre o valor da célula em uma aba separada do VS Code"
+  "sqlite-explorer.config.maxFileSize.markdownDescription": "Tamanho máximo do arquivo em MB que pode ser aberto. Defina como 0 para ilimitado.",
+  "sqlite-explorer.config.defaultPageSize.markdownDescription": "Número padrão de linhas a serem exibidas por página.",
+  "sqlite-explorer.config.maxRows.markdownDescription": "Número máximo de linhas a serem carregadas de uma tabela. Defina como 0 para ilimitado."
 }

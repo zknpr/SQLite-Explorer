@@ -1,16 +1,10 @@
 {
-  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer",
-  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer (自動検出)",
-  "sqlite-explorer.customEditor.readonly.displayName": "SQLite Explorer (読み取り専用)",
-  "sqlite-explorer.customEditor.wasm.displayName": "SQLite Explorer (読み取り専用、メモリ内)",
-  "sqlite-explorer.config.maxFileSize.markdownDescription": "拡張機能が開こうとするファイルの最大サイズ（MB）。制限を無効にするには0に設定してください。ハードリミットは4GBですが、システムにはより低い制限がある場合があります。\n\n__警告__: 大きなファイルはパフォーマンスの問題やフリーズを引き起こす可能性があります。",
-  "sqlite-explorer.commands.exportTable.title": "テーブルをエクスポート",
+  "sqlite-explorer.displayName": "SQLite Explorer",
+  "sqlite-explorer.description": "VS Code用の強力なSQLiteデータベースビューアーとエディター",
+  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer",
+  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer (オプション)",
   "sqlite-explorer.commands.refresh.title": "データベースを更新",
-  "sqlite-explorer.config.instantCommit.never": "しない",
-  "sqlite-explorer.config.instantCommit.remoteOnly": "リモートのみ",
-  "sqlite-explorer.config.instantCommit.always": "常に",
-  "sqlite-explorer.config.instantCommit.markdownDescription": "変更がデータベースに即座に保存されるタイミングを制御します。有効にすると、手動で保存することなく変更が即座に保存されます。\n\n__警告__: インスタントコミットは元に戻す/やり直しに逆SQLステートメントを使用しますが、すべてのシナリオで機能するとは限りません（例：別のプロセスが同じ行を変更した場合）。",
-  "sqlite-explorer.config.doubleClickBehavior.modal": "モーダルダイアログ",
-  "sqlite-explorer.config.doubleClickBehavior.vscode": "VS Codeエディター",
-  "sqlite-explorer.config.doubleClickBehavior.markdownDescription": "テーブルビューでセルをダブルクリックしたときの動作を制御します。\n\n- **モーダルダイアログ**: セルを編集するためのモーダルダイアログを開きます（デフォルト）\n- **VS Codeエディター**: 別のVS Codeタブでセル値を開きます"
+  "sqlite-explorer.config.maxFileSize.markdownDescription": "開くことができる最大ファイルサイズ（MB）。無制限にするには0に設定してください。",
+  "sqlite-explorer.config.defaultPageSize.markdownDescription": "ページごとに表示するデフォルトの行数。",
+  "sqlite-explorer.config.maxRows.markdownDescription": "テーブルから読み込む最大行数。無制限にするには0に設定してください。"
 }

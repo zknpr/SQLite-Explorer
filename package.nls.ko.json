@@ -1,16 +1,10 @@
 {
-  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer",
-  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer (자동 감지)",
-  "sqlite-explorer.customEditor.readonly.displayName": "SQLite Explorer (읽기 전용)",
-  "sqlite-explorer.customEditor.wasm.displayName": "SQLite Explorer (읽기 전용, 메모리 내)",
-  "sqlite-explorer.config.maxFileSize.markdownDescription": "확장 프로그램이 열려고 시도하는 최대 파일 크기(MB)입니다. 제한을 비활성화하려면 0으로 설정하세요. 하드 제한은 4GB이지만 시스템에 더 낮은 제한이 있을 수 있습니다.\n\n__경고__: 대용량 파일은 성능 문제나 정지를 일으킬 수 있습니다.",
-  "sqlite-explorer.commands.exportTable.title": "테이블 내보내기",
+  "sqlite-explorer.displayName": "SQLite Explorer",
+  "sqlite-explorer.description": "VS Code용 강력한 SQLite 데이터베이스 뷰어 및 편집기",
+  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer",
+  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer (선택 사항)",
   "sqlite-explorer.commands.refresh.title": "데이터베이스 새로 고침",
-  "sqlite-explorer.config.instantCommit.never": "안 함",
-  "sqlite-explorer.config.instantCommit.remoteOnly": "원격만",
-  "sqlite-explorer.config.instantCommit.always": "항상",
-  "sqlite-explorer.config.instantCommit.markdownDescription": "변경 사항이 즉시 데이터베이스에 저장되는 시점을 제어합니다. 활성화되면 수동 저장 없이 변경 사항이 즉시 저장됩니다.\n\n__경고__: 즉시 커밋은 실행 취소/다시 실행에 역방향 SQL 문을 사용하며, 모든 시나리오에서 작동하지 않을 수 있습니다(예: 다른 프로세스가 같은 행을 수정한 경우).",
-  "sqlite-explorer.config.doubleClickBehavior.modal": "모달 대화 상자",
-  "sqlite-explorer.config.doubleClickBehavior.vscode": "VS Code 편집기",
-  "sqlite-explorer.config.doubleClickBehavior.markdownDescription": "테이블 보기에서 셀을 더블 클릭할 때 발생하는 동작을 제어합니다.\n\n- **모달 대화 상자**: 셀을 편집하기 위한 모달 대화 상자를 엽니다 (기본값)\n- **VS Code 편집기**: 별도의 VS Code 탭에서 셀 값을 엽니다"
+  "sqlite-explorer.config.maxFileSize.markdownDescription": "열 수 있는 최대 파일 크기(MB). 무제한으로 설정하려면 0으로 설정하세요.",
+  "sqlite-explorer.config.defaultPageSize.markdownDescription": "페이지당 표시할 기본 행 수.",
+  "sqlite-explorer.config.maxRows.markdownDescription": "테이블에서 로드할 최대 행 수. 무제한으로 설정하려면 0으로 설정하세요."
 }

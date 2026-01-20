@@ -1,16 +1,10 @@
 {
-  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer",
-  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer (auto-detect)",
-  "sqlite-explorer.customEditor.readonly.displayName": "SQLite Explorer (read-only)",
-  "sqlite-explorer.customEditor.wasm.displayName": "SQLite Explorer (read-only, in-memory)",
-  "sqlite-explorer.config.maxFileSize.markdownDescription": "Maximum file size in MB that the extension will attempt to open. Set to 0 to disable the limit. The hard limit is 4GB, but your system may have lower limits.\n\n__Warning__: Large files may cause performance issues or freezes.",
-  "sqlite-explorer.commands.exportTable.title": "Export Table",
+  "sqlite-explorer.displayName": "SQLite Explorer",
+  "sqlite-explorer.description": "A powerful SQLite database viewer and editor for VS Code",
+  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer",
+  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer (Optional)",
   "sqlite-explorer.commands.refresh.title": "Refresh Database",
-  "sqlite-explorer.config.instantCommit.never": "Never",
-  "sqlite-explorer.config.instantCommit.remoteOnly": "Remote Only",
-  "sqlite-explorer.config.instantCommit.always": "Always",
-  "sqlite-explorer.config.instantCommit.markdownDescription": "Controls when changes are committed immediately to the database. When enabled, modifications are saved instantly without requiring a manual save.\n\n__Warning__: Instant commits use reverse SQL statements for undo/redo, which may not work in all scenarios (e.g., if another process modified the same row).",
-  "sqlite-explorer.config.doubleClickBehavior.modal": "Modal Dialog",
-  "sqlite-explorer.config.doubleClickBehavior.vscode": "VS Code Editor",
-  "sqlite-explorer.config.doubleClickBehavior.markdownDescription": "Controls what happens when you double-click a cell in the table view.\n\n- **Modal Dialog**: Opens a modal dialog to edit the cell (default)\n- **VS Code Editor**: Opens the cell value in a separate VS Code tab"
+  "sqlite-explorer.config.maxFileSize.markdownDescription": "Maximum file size in MB that can be opened. Set to 0 for unlimited.",
+  "sqlite-explorer.config.defaultPageSize.markdownDescription": "Default number of rows to display per page.",
+  "sqlite-explorer.config.maxRows.markdownDescription": "Maximum number of rows to load from a table. Set to 0 for unlimited."
 }
