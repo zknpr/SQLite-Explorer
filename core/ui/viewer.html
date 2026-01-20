@@ -1025,7 +1025,9 @@
         let transitionLockTimeout = null; // Failsafe timeout to release stuck lock
 
         // Cell selection state (for copying individual values)
-        let selectedCell = null; // { rowIdx, colIdx, rowId, value }
+        // Supports multi-cell selection with Cmd+Click
+        let selectedCells = []; // Array of { rowIdx, colIdx, rowId, value }
+        let lastSelectedCell = null; // For Shift+Click range selection
 
         // Column resize state
         let columnWidths = {}; // Map of column name -> width in pixels
@@ -1329,7 +1331,8 @@
             pinnedRowIds.clear(); // Reset pinned rows
             filterQuery = '';
             selectedRowIds.clear();
-            selectedCell = null; // Clear cell selection
+            selectedCells = []; // Clear cell selection
+            lastSelectedCell = null;
             document.getElementById('filterInput').value = '';
 
             document.getElementById('tableNameLabel').textContent = tableName;
@@ -1569,7 +1572,7 @@
                     const displayValue = formatCellValue(value);
                     const isNull = value === null || value === undefined;
                     const colWidth = columnWidths[col.name] || 120;
-                    const isCellSelected = selectedCell && selectedCell.rowIdx === rowIdx && selectedCell.colIdx === originalColIdx;
+                    const isCellSelected = selectedCells.some(sc => sc.rowIdx === rowIdx && sc.colIdx === originalColIdx);
                     const isColPinned = pinnedColumns.has(col.name);
                     const leftOffset = pinnedColumnOffsets.get(col.name);
                     const pinnedStyle = isColPinned ? `position:sticky;left:${leftOffset}px;` : '';
@@ -1627,6 +1630,96 @@
                 // When a cell is being edited, clicks should only trigger blur on the input
                 if (isLoadingData || isSavingCell || isTransitioningEdit || editingCellInfo) return;
 
+                // Get the cell value for selection
+                const value = gridData[rowIdx] ? gridData[rowIdx][colIdx + 1] : null;
+                const cellInfo = { rowIdx, colIdx, rowId, value };
+
+                // Handle Cmd+Shift+Click (Mac) or Ctrl+Shift+Click (Windows/Linux) for range selection
+                // Selects all cells from last selected cell to this one, adding to existing selection
+                if ((event.metaKey || event.ctrlKey) && event.shiftKey && lastSelectedCell) {
+                    // Clear row selection when selecting cells
+                    selectedRowIds.clear();
+
+                    // Calculate range bounds
+                    const minRow = Math.min(lastSelectedCell.rowIdx, rowIdx);
+                    const maxRow = Math.max(lastSelectedCell.rowIdx, rowIdx);
+                    const minCol = Math.min(lastSelectedCell.colIdx, colIdx);
+                    const maxCol = Math.max(lastSelectedCell.colIdx, colIdx);
+
+                    // Add all cells in the range to selection
+                    for (let r = minRow; r <= maxRow; r++) {
+                        for (let c = minCol; c <= maxCol; c++) {
+                            const rId = gridData[r] ? gridData[r][0] : null;
+                            const val = gridData[r] ? gridData[r][c + 1] : null;
+                            // Check if cell is already selected
+                            const existsIdx = selectedCells.findIndex(sc => sc.rowIdx === r && sc.colIdx === c);
+                            if (existsIdx === -1) {
+                                selectedCells.push({ rowIdx: r, colIdx: c, rowId: rId, value: val });
+                            }
+                        }
+                    }
+
+                    updateCellSelectionUI();
+                    updateRowSelectionUI();
+                    updateToolbarButtons();
+                    return;
+                }
+
+                // Handle Shift+Click for range selection (replaces current selection with range)
+                if (event.shiftKey && lastSelectedCell) {
+                    // Clear row selection when selecting cells
+                    selectedRowIds.clear();
+
+                    // Clear current selection and select range
+                    selectedCells = [];
+
+                    // Calculate range bounds
+                    const minRow = Math.min(lastSelectedCell.rowIdx, rowIdx);
+                    const maxRow = Math.max(lastSelectedCell.rowIdx, rowIdx);
+                    const minCol = Math.min(lastSelectedCell.colIdx, colIdx);
+                    const maxCol = Math.max(lastSelectedCell.colIdx, colIdx);
+
+                    // Add all cells in the range to selection
+                    for (let r = minRow; r <= maxRow; r++) {
+                        for (let c = minCol; c <= maxCol; c++) {
+                            const rId = gridData[r] ? gridData[r][0] : null;
+                            const val = gridData[r] ? gridData[r][c + 1] : null;
+                            selectedCells.push({ rowIdx: r, colIdx: c, rowId: rId, value: val });
+                        }
+                    }
+
+                    updateCellSelectionUI();
+                    updateRowSelectionUI();
+                    updateToolbarButtons();
+                    return;
+                }
+
+                // Handle Cmd+Click (Mac) or Ctrl+Click (Windows/Linux) for multi-cell selection
+                // Toggles individual cell in the selection
+                if (event.metaKey || event.ctrlKey) {
+                    // Clear row selection when selecting cells
+                    selectedRowIds.clear();
+
+                    // Check if this cell is already selected
+                    const existingIdx = selectedCells.findIndex(
+                        sc => sc.rowIdx === rowIdx && sc.colIdx === colIdx
+                    );
+
+                    if (existingIdx !== -1) {
+                        // Already selected - remove from selection
+                        selectedCells.splice(existingIdx, 1);
+                    } else {
+                        // Add to selection
+                        selectedCells.push(cellInfo);
+                        lastSelectedCell = cellInfo;
+                    }
+
+                    updateCellSelectionUI();
+                    updateRowSelectionUI();
+                    updateToolbarButtons();
+                    return;
+                }
+
                 // Clear any pending cell click timer
                 if (cellClickTimer) {
                     clearTimeout(cellClickTimer);
@@ -1647,15 +1740,19 @@
                         // Guard against stale data
                         if (!gridData[rowIdx]) return;
 
-                        const value = gridData[rowIdx][colIdx + 1];
+                        const cellValue = gridData[rowIdx][colIdx + 1];
+                        const cell = { rowIdx, colIdx, rowId, value: cellValue };
 
-                        // Toggle cell selection
-                        if (selectedCell && selectedCell.rowIdx === rowIdx && selectedCell.colIdx === colIdx) {
-                            // Already selected - deselect
-                            selectedCell = null;
+                        // Check if clicking on the only selected cell - deselect it
+                        if (selectedCells.length === 1 &&
+                            selectedCells[0].rowIdx === rowIdx &&
+                            selectedCells[0].colIdx === colIdx) {
+                            selectedCells = [];
+                            lastSelectedCell = null;
                         } else {
-                            // Select this cell
-                            selectedCell = { rowIdx, colIdx, rowId, value };
+                            // Single click - select only this cell (clear previous selection)
+                            selectedCells = [cell];
+                            lastSelectedCell = cell;
                             // Clear row selection when selecting a cell
                             selectedRowIds.clear();
                         }
@@ -1675,6 +1772,7 @@
 
         /**
          * Update cell selection UI without full re-render.
+         * Supports multi-cell selection.
          */
         function updateCellSelectionUI() {
             // Remove selection from all cells
@@ -1683,10 +1781,10 @@
                 cell.classList.remove('cell-selected');
             }
 
-            // Add selection to currently selected cell
-            if (selectedCell) {
+            // Add selection to all currently selected cells
+            for (const sc of selectedCells) {
                 const cell = document.querySelector(
-                    `.data-cell[data-rowidx="${selectedCell.rowIdx}"][data-colidx="${selectedCell.colIdx}"]`
+                    `.data-cell[data-rowidx="${sc.rowIdx}"][data-colidx="${sc.colIdx}"]`
                 );
                 if (cell) {
                     cell.classList.add('cell-selected');
@@ -1775,7 +1873,8 @@
 
                 // Clear any existing cell selection when entering edit mode
                 // Must also update UI to remove the visual selection class
-                selectedCell = null;
+                selectedCells = [];
+                lastSelectedCell = null;
                 selectedRowIds.clear();
                 updateCellSelectionUI();
                 updateRowSelectionUI();
@@ -2060,7 +2159,8 @@
             }
 
             // Clear cell selection when selecting rows
-            selectedCell = null;
+            selectedCells = [];
+            lastSelectedCell = null;
             updateCellSelectionUI();
 
             // Handle selection immediately (no debounce)
@@ -2718,17 +2818,17 @@
         // KEYBOARD SHORTCUTS
         // ================================================================
         document.addEventListener('keydown', async (event) => {
-            // Cmd+C / Ctrl+C - Copy selected cell or rows to clipboard
+            // Cmd+C / Ctrl+C - Copy selected cells or rows to clipboard
             if ((event.metaKey || event.ctrlKey) && event.key === 'c') {
                 // Don't intercept if we're editing a cell or in an input
                 if (editingCellInfo || document.activeElement.tagName === 'INPUT') {
                     return;
                 }
 
-                // Priority: selected cell first, then selected rows
-                if (selectedCell) {
+                // Priority: selected cells first, then selected rows
+                if (selectedCells.length > 0) {
                     event.preventDefault();
-                    await copyCellToClipboard();
+                    await copyCellsToClipboard();
                 } else if (selectedRowIds.size > 0 && gridData.length > 0) {
                     event.preventDefault();
                     await copySelectedRowsToClipboard();
@@ -2750,25 +2850,65 @@
         });
 
         /**
-         * Copy selected cell value to clipboard.
+         * Copy selected cells to clipboard.
+         * For single cell: copies the value directly.
+         * For multiple cells: copies as tab-separated grid (maintains row/col structure).
          */
-        async function copyCellToClipboard() {
-            if (!selectedCell) return;
+        async function copyCellsToClipboard() {
+            if (selectedCells.length === 0) return;
 
             try {
-                const value = selectedCell.value;
                 let clipboardText;
 
-                if (value === null) {
-                    clipboardText = '';
-                } else if (value instanceof Uint8Array) {
-                    clipboardText = '[BLOB]';
+                if (selectedCells.length === 1) {
+                    // Single cell - copy value directly
+                    const value = selectedCells[0].value;
+                    if (value === null || value === undefined) {
+                        clipboardText = '';
+                    } else if (value instanceof Uint8Array) {
+                        clipboardText = '[BLOB]';
+                    } else {
+                        clipboardText = String(value);
+                    }
                 } else {
-                    clipboardText = String(value);
+                    // Multiple cells - organize into a grid and copy as TSV
+                    // Find the bounds of the selection
+                    const rows = [...new Set(selectedCells.map(c => c.rowIdx))].sort((a, b) => a - b);
+                    const cols = [...new Set(selectedCells.map(c => c.colIdx))].sort((a, b) => a - b);
+
+                    // Build a map for quick lookup
+                    const cellMap = new Map();
+                    for (const cell of selectedCells) {
+                        cellMap.set(`${cell.rowIdx},${cell.colIdx}`, cell.value);
+                    }
+
+                    // Build the grid output
+                    const lines = [];
+                    for (const rowIdx of rows) {
+                        const rowValues = [];
+                        for (const colIdx of cols) {
+                            const key = `${rowIdx},${colIdx}`;
+                            if (cellMap.has(key)) {
+                                const value = cellMap.get(key);
+                                if (value === null || value === undefined) {
+                                    rowValues.push('');
+                                } else if (value instanceof Uint8Array) {
+                                    rowValues.push('[BLOB]');
+                                } else {
+                                    rowValues.push(String(value));
+                                }
+                            } else {
+                                rowValues.push(''); // Empty for non-selected cells in the range
+                            }
+                        }
+                        lines.push(rowValues.join('\t'));
+                    }
+                    clipboardText = lines.join('\n');
                 }
 
                 await navigator.clipboard.writeText(clipboardText);
-                updateStatus('Copied cell value to clipboard');
+                const count = selectedCells.length;
+                updateStatus(`Copied ${count} cell${count > 1 ? 's' : ''} to clipboard`);
 
             } catch (err) {
                 console.error('Copy failed:', err);
@@ -2829,7 +2969,8 @@
             if (gridData.length === 0) return;
 
             // Clear cell selection when selecting rows
-            selectedCell = null;
+            selectedCells = [];
+            lastSelectedCell = null;
             updateCellSelectionUI();
 
             // Check if all are already selected - if so, deselect all

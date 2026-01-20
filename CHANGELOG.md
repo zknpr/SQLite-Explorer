@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.2
+
+### New Features
+
+- Multi-cell selection with Cmd+Click (Mac) / Ctrl+Click (Windows/Linux)
+- Range selection with Shift+Click
+- Add to selection with Cmd+Shift+Click / Ctrl+Shift+Click
+- Copy multiple cells to clipboard as tab-separated values
+
 ## 1.0.1
 
 ### Bug Fixes
