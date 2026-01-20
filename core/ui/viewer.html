@@ -1,0 +1,2731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQLite Explorer</title>
+    <!--HEAD-->
+    <style>
+        /* ================================================================
+           CSS VARIABLES & RESET
+           ================================================================ */
+        :root {
+            --bg-primary: var(--vscode-editor-background, #1e1e1e);
+            --bg-secondary: var(--vscode-sideBar-background, #252526);
+            --bg-tertiary: var(--vscode-input-background, #3c3c3c);
+            --bg-stripe: rgba(255, 255, 255, 0.02); /* Subtle stripe for alternating rows */
+            --text-primary: var(--vscode-editor-foreground, #cccccc);
+            --text-secondary: var(--vscode-descriptionForeground, #888888);
+            --border-color: var(--vscode-panel-border, #454545);
+            --accent-color: var(--vscode-focusBorder, #007acc);
+            --hover-bg: var(--vscode-list-hoverBackground, #2a2d2e);
+            --active-bg: var(--vscode-list-activeSelectionBackground, #094771);
+            --active-text: var(--vscode-list-activeSelectionForeground, #ffffff);
+            --error-color: var(--vscode-errorForeground, #f48771);
+            --success-color: var(--vscode-terminal-ansiGreen, #89d185);
+
+            --sidebar-width: 220px;
+            --toolbar-height: 36px;
+            --footer-height: 28px;
+            --row-height: 26px;
+            --header-height: 52px; /* Increased to accommodate filter input */
+            --row-num-width: 50px;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+            font-size: var(--vscode-font-size, 13px);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+        }
+
+        /* ================================================================
+           LAYOUT STRUCTURE
+           ================================================================ */
+        .app-container {
+            display: flex;
+            width: 100%;
+            height: 100%;
+        }
+
+        .sidebar-panel {
+            width: var(--sidebar-width);
+            min-width: 150px;
+            max-width: 400px;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
+
+        .main-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* ================================================================
+           SIDEBAR STYLES
+           ================================================================ */
+        .sidebar-header {
+            padding: 8px 12px;
+            font-weight: 600;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .sidebar-actions {
+            display: flex;
+            gap: 4px;
+        }
+
+        .icon-button {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 3px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .icon-button:hover {
+            background: var(--hover-bg);
+            color: var(--text-primary);
+        }
+
+        .section-title {
+            padding: 6px 12px;
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .section-title:hover {
+            background: var(--hover-bg);
+        }
+
+        .section-title .arrow {
+            margin-right: 4px;
+            transition: transform 0.15s;
+        }
+
+        .section-title.collapsed .arrow {
+            transform: rotate(-90deg);
+        }
+
+        .section-title .badge {
+            margin-left: auto;
+            background: var(--bg-tertiary);
+            padding: 1px 6px;
+            border-radius: 10px;
+            font-size: 10px;
+        }
+
+        .item-list {
+            list-style: none;
+            overflow-y: auto;
+        }
+
+        .item-list.hidden {
+            display: none;
+        }
+
+        .list-item {
+            padding: 4px 12px 4px 24px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .list-item:hover {
+            background: var(--hover-bg);
+        }
+
+        .list-item.selected {
+            background: var(--active-bg);
+            color: var(--active-text);
+        }
+
+        .list-item .item-icon {
+            opacity: 0.7;
+            flex-shrink: 0;
+        }
+
+        .list-item .item-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .resize-handle {
+            position: absolute;
+            right: 0;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+            cursor: col-resize;
+        }
+
+        .resize-handle:hover {
+            background: var(--accent-color);
+        }
+
+        /* ================================================================
+           TOOLBAR STYLES
+           ================================================================ */
+        .toolbar-panel {
+            height: var(--toolbar-height);
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            padding: 0 8px;
+            gap: 8px;
+        }
+
+        .toolbar-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .toolbar-right {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .current-table {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-weight: 500;
+        }
+
+        .toolbar-button {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 4px 10px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .toolbar-button:hover {
+            background: var(--hover-bg);
+        }
+
+        .toolbar-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .filter-input {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 4px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+            width: 200px;
+        }
+
+        .filter-input:focus {
+            outline: none;
+            border-color: var(--accent-color);
+        }
+
+        /* ================================================================
+           DATA GRID STYLES
+           ================================================================ */
+        .grid-container {
+            flex: 1;
+            overflow: auto;
+            position: relative;
+        }
+
+        .data-grid {
+            border-collapse: collapse;
+            table-layout: fixed;
+            /* Use auto width to allow table to expand beyond container */
+            /* This enables horizontal scrolling in .grid-container */
+        }
+
+        .grid-header {
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            background: var(--bg-secondary);
+        }
+
+        .grid-header tr {
+            height: var(--header-height);
+            max-height: var(--header-height);
+        }
+
+        .header-cell {
+            padding: 4px 8px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 11px;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border-color);
+            user-select: none;
+            white-space: nowrap;
+            overflow: visible; /* Allow filter to show */
+            position: relative;
+            min-width: 60px;
+            box-sizing: border-box;
+            height: var(--header-height);
+            max-height: var(--header-height);
+            vertical-align: top;
+        }
+
+        /* Header cell content layout - column name + pin button on top, filter below */
+        .header-content {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            gap: 2px;
+        }
+
+        .header-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: 22px;
+            cursor: pointer;
+        }
+
+        .header-bottom {
+            flex: 1;
+            display: flex;
+            align-items: center;
+        }
+
+        .header-cell:hover {
+            background: var(--hover-bg);
+        }
+
+        /* Column resize handle */
+        .resize-handle {
+            position: absolute;
+            right: 0;
+            top: 0;
+            height: 100%;
+            width: 6px;
+            cursor: col-resize;
+            background: transparent;
+        }
+
+        .resize-handle:hover,
+        .resize-handle.resizing {
+            background: var(--accent-color);
+        }
+
+        .header-text {
+            display: block;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* Sort indicator - displayed inline next to column name */
+        .sort-indicator {
+            font-size: 10px;
+            margin-left: 4px;
+            color: var(--text-secondary);
+        }
+
+        /* Row number header (#) - clickable for select all */
+        .header-cell.row-number-header {
+            text-align: center;
+            cursor: pointer;
+        }
+
+        .header-cell.row-number-header:hover {
+            background: var(--hover-bg);
+        }
+
+        /* Column filter input inside header cell */
+        .column-filter {
+            width: 100%;
+            padding: 2px 6px;
+            font-size: 11px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 3px;
+            color: var(--text-primary);
+            box-sizing: border-box;
+            text-transform: none; /* Override header uppercase */
+            font-weight: normal;
+        }
+
+        .column-filter:focus {
+            outline: none;
+            border-color: var(--accent-color);
+        }
+
+        .column-filter::placeholder {
+            color: var(--text-secondary);
+            opacity: 0.7;
+        }
+
+        /* Pinned columns - sticky left positioning to stay visible when scrolling */
+        .header-cell.pinned,
+        .data-cell.pinned {
+            z-index: 5;
+            background-color: var(--bg-secondary) !important;
+        }
+
+        .header-cell.pinned {
+            z-index: 12; /* Above data rows */
+            background-color: var(--bg-secondary) !important;
+        }
+
+        /* Pinned column cells should NOT become transparent on hover/selection */
+        /* They keep their solid background to hide sliding content */
+        .data-row:hover .data-cell.pinned,
+        .data-row.selected .data-cell.pinned {
+            background-color: var(--bg-secondary) !important;
+        }
+
+        /* Pinned rows - sticky top (top offset set via inline style) */
+        /* These rows must ALWAYS have a solid background to hide content sliding under them */
+        /* Use a slightly different background to indicate pinned state */
+        .data-row.pinned {
+            position: sticky;
+            z-index: 6;
+        }
+
+        .data-row.pinned td {
+            background-color: var(--bg-secondary) !important;
+        }
+
+        /* Pinned row cells should NOT become transparent on hover/selection */
+        /* They keep their solid background to hide sliding content */
+        .data-row.pinned:hover td,
+        .data-row.pinned.selected td {
+            background-color: var(--bg-secondary) !important;
+        }
+
+        /* Cell that is both in pinned row AND pinned column */
+        .data-row.pinned td.pinned {
+            background-color: var(--bg-secondary) !important;
+        }
+
+        /* Cells in pinned row AND pinned column keep solid background on hover/selection */
+        .data-row.pinned:hover td.pinned,
+        .data-row.pinned.selected td.pinned {
+            background-color: var(--bg-secondary) !important;
+        }
+
+        /* Pin indicator icon - using codicon */
+        .pin-icon {
+            cursor: pointer;
+            opacity: 0;
+            margin-left: 4px;
+            font-size: 12px;
+            vertical-align: middle;
+        }
+
+        .header-cell:hover .pin-icon,
+        .data-cell.row-number:hover .pin-icon,
+        .pin-icon.pinned {
+            opacity: 0.5;
+        }
+
+        .pin-icon:hover {
+            opacity: 1 !important;
+        }
+
+        .pin-icon.pinned {
+            opacity: 0.8;
+        }
+
+        .data-row {
+            height: var(--row-height);
+            max-height: var(--row-height);
+            background: var(--bg-primary);
+        }
+
+        /* All data cells inherit row background by default */
+        .data-row td {
+            background: transparent;
+        }
+
+        /* Alternating row colors (zebra striping) */
+        .data-row:nth-child(even) {
+            background: var(--bg-stripe);
+        }
+
+        .data-row:hover {
+            background: var(--hover-bg);
+        }
+
+        .data-row.selected {
+            background: var(--active-bg);
+        }
+
+        .data-cell {
+            padding: 4px 8px;
+            border-bottom: 1px solid var(--border-color);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            /* Width is set dynamically via inline styles based on columnWidths state */
+            box-sizing: border-box;
+            height: var(--row-height);
+            max-height: var(--row-height);
+        }
+
+        /* Row number column (#) - subtle background to distinguish from data */
+        .data-cell.row-number {
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            text-align: center;
+            font-size: 0.85em;
+            user-select: none;
+        }
+
+        .data-cell.null-value {
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+
+        .data-cell.cell-selected {
+            outline: 2px solid var(--accent-color);
+            outline-offset: -2px;
+            background: var(--active-bg);
+        }
+
+        .data-cell.editing {
+            padding: 0;
+        }
+
+        .cell-input {
+            width: 100%;
+            height: 100%;
+            padding: 4px 8px;
+            border: 2px solid var(--accent-color);
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: inherit;
+            outline: none;
+        }
+
+        /* ================================================================
+           EMPTY STATE & LOADING
+           ================================================================ */
+        .empty-view {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--text-secondary);
+            gap: 12px;
+        }
+
+        .empty-view .empty-icon {
+            font-size: 48px;
+            opacity: 0.5;
+        }
+
+        .empty-view .empty-title {
+            font-size: 16px;
+            font-weight: 500;
+        }
+
+        .empty-view .empty-desc {
+            font-size: 13px;
+        }
+
+        .loading-view {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            gap: 12px;
+        }
+
+        .loading-spinner {
+            width: 32px;
+            height: 32px;
+            border: 3px solid var(--border-color);
+            border-top-color: var(--accent-color);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* ================================================================
+           FOOTER STYLES
+           ================================================================ */
+        .footer-panel {
+            height: var(--footer-height);
+            background: var(--bg-secondary);
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            padding: 0 12px;
+            font-size: 12px;
+        }
+
+        .footer-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .footer-right {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .page-selector {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .page-selector select {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 11px;
+        }
+
+        .pagination-controls {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .pagination-controls button {
+            background: none;
+            border: none;
+            color: var(--text-primary);
+            cursor: pointer;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+
+        .pagination-controls button:hover:not(:disabled) {
+            background: var(--hover-bg);
+        }
+
+        .pagination-controls button:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        /* ================================================================
+           MODAL STYLES
+           ================================================================ */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .modal-overlay.hidden {
+            display: none;
+        }
+
+        .modal-dialog {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            min-width: 400px;
+            max-width: 600px;
+            max-height: 80vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .modal-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-title {
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 18px;
+            padding: 4px;
+        }
+
+        .modal-close:hover {
+            color: var(--text-primary);
+        }
+
+        .modal-body {
+            padding: 16px;
+            overflow-y: auto;
+        }
+
+        .modal-footer {
+            padding: 12px 16px;
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+        }
+
+        .form-field {
+            margin-bottom: 12px;
+        }
+
+        .form-field label {
+            display: block;
+            margin-bottom: 4px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .form-field input,
+        .form-field select {
+            width: 100%;
+            padding: 6px 10px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 3px;
+            color: var(--text-primary);
+            font-size: 13px;
+        }
+
+        .form-field input:focus,
+        .form-field select:focus {
+            outline: none;
+            border-color: var(--accent-color);
+        }
+
+        .btn-primary {
+            background: var(--accent-color);
+            border: none;
+            color: white;
+            padding: 6px 14px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        .btn-primary:hover {
+            opacity: 0.9;
+        }
+
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 6px 14px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        .btn-secondary:hover {
+            background: var(--hover-bg);
+        }
+
+        .btn-danger {
+            background: var(--error-color);
+            border: none;
+            color: white;
+            padding: 6px 14px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Panel -->
+        <div class="sidebar-panel" id="sidebarPanel">
+            <div class="sidebar-header">
+                <span>Explorer</span>
+                <div class="sidebar-actions">
+                    <button class="icon-button" onclick="reloadFromDisk()" title="Reload">
+                        <span class="codicon codicon-refresh"></span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Tables Section -->
+            <div class="section-title" data-section="tables" onclick="toggleSection('tables')">
+                <span class="arrow">▼</span>
+                <span>Tables</span>
+                <span class="badge" id="tablesBadge">0</span>
+                <button class="icon-button" onclick="event.stopPropagation(); openCreateTableModal()" title="Create Table" style="margin-left: auto;">
+                    <span class="codicon codicon-add"></span>
+                </button>
+            </div>
+            <ul class="item-list" id="tablesList"></ul>
+
+            <!-- Views Section -->
+            <div class="section-title collapsed" data-section="views" onclick="toggleSection('views')">
+                <span class="arrow">▼</span>
+                <span>Views</span>
+                <span class="badge" id="viewsBadge">0</span>
+            </div>
+            <ul class="item-list hidden" id="viewsList"></ul>
+
+            <!-- Indexes Section -->
+            <div class="section-title collapsed" data-section="indexes" onclick="toggleSection('indexes')">
+                <span class="arrow">▼</span>
+                <span>Indexes</span>
+                <span class="badge" id="indexesBadge">0</span>
+            </div>
+            <ul class="item-list hidden" id="indexesList"></ul>
+
+            <div class="resize-handle" id="resizeHandle"></div>
+        </div>
+
+        <!-- Main Panel -->
+        <div class="main-panel">
+            <!-- Toolbar -->
+            <div class="toolbar-panel">
+                <div class="toolbar-left">
+                    <div class="current-table" id="currentTable">
+                        <span class="codicon codicon-table"></span>
+                        <span id="tableNameLabel">No table selected</span>
+                    </div>
+                </div>
+                <div class="toolbar-right">
+                    <button class="toolbar-button" id="btnAddRow" onclick="openAddRowModal()" disabled>
+                        <span class="codicon codicon-add"></span> Add Row
+                    </button>
+                    <button class="toolbar-button" id="btnAddColumn" onclick="openAddColumnModal()" disabled>
+                        <span class="codicon codicon-insert"></span> Add Column
+                    </button>
+                    <button class="toolbar-button" id="btnDeleteRows" onclick="openDeleteModal()" disabled>
+                        <span class="codicon codicon-trash"></span> Delete
+                    </button>
+                    <button class="toolbar-button" id="btnExport" onclick="exportCurrentTable()" disabled>
+                        <span class="codicon codicon-export"></span> Export
+                    </button>
+                    <input type="text" class="filter-input" id="filterInput" placeholder="Filter..." onkeyup="onFilterChange()">
+                </div>
+            </div>
+
+            <!-- Grid Container -->
+            <div class="grid-container" id="gridContainer">
+                <div class="loading-view" id="loadingView">
+                    <div class="loading-spinner"></div>
+                    <span>Connecting to database...</span>
+                </div>
+            </div>
+
+            <!-- Footer -->
+            <div class="footer-panel">
+                <div class="footer-left">
+                    <span id="statusText">Ready</span>
+                </div>
+                <div class="footer-right">
+                    <div class="page-selector">
+                        <span>Rows:</span>
+                        <select id="pageSizeSelect" onchange="onPageSizeChange()">
+                            <option value="100">100</option>
+                            <option value="500">500</option>
+                            <option value="1000" selected>1000</option>
+                            <option value="5000">5000</option>
+                            <option value="10000">10000</option>
+                        </select>
+                    </div>
+                    <div class="pagination-controls">
+                        <button id="btnFirst" onclick="goToPage(0)" disabled>⏮</button>
+                        <button id="btnPrev" onclick="goToPage(currentPageIndex - 1)" disabled>◀</button>
+                        <span id="pageIndicator">0 / 0</span>
+                        <button id="btnNext" onclick="goToPage(currentPageIndex + 1)" disabled>▶</button>
+                        <button id="btnLast" onclick="goToPage(totalPageCount - 1)" disabled>⏭</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Row Modal -->
+    <div class="modal-overlay hidden" id="addRowModal">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <span class="modal-title">Add New Row</span>
+                <button class="modal-close" onclick="closeModal('addRowModal')">&times;</button>
+            </div>
+            <div class="modal-body" id="addRowForm"></div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="closeModal('addRowModal')">Cancel</button>
+                <button class="btn-primary" onclick="submitAddRow()">Add Row</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Delete Confirmation Modal -->
+    <div class="modal-overlay hidden" id="deleteModal">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <span class="modal-title">Confirm Delete</span>
+                <button class="modal-close" onclick="closeModal('deleteModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="deleteConfirmText">Are you sure you want to delete the selected rows?</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="closeModal('deleteModal')">Cancel</button>
+                <button class="btn-danger" onclick="submitDelete()">Delete</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Table Modal -->
+    <div class="modal-overlay hidden" id="createTableModal">
+        <div class="modal-dialog" style="width: 500px;">
+            <div class="modal-header">
+                <span class="modal-title">Create New Table</span>
+                <button class="modal-close" onclick="closeModal('createTableModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-field">
+                    <label>Table Name</label>
+                    <input type="text" id="newTableName" placeholder="my_table">
+                </div>
+                <div class="form-field">
+                    <label>Columns</label>
+                    <div id="columnDefinitions"></div>
+                    <button class="btn-secondary" onclick="addColumnDefinition()" style="margin-top: 8px;">+ Add Column</button>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="closeModal('createTableModal')">Cancel</button>
+                <button class="btn-primary" onclick="submitCreateTable()">Create Table</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Column Modal -->
+    <div class="modal-overlay hidden" id="addColumnModal">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <span class="modal-title">Add Column</span>
+                <button class="modal-close" onclick="closeModal('addColumnModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-field">
+                    <label>Column Name</label>
+                    <input type="text" id="newColumnName" placeholder="column_name">
+                </div>
+                <div class="form-field">
+                    <label>Type</label>
+                    <select id="newColumnType">
+                        <option value="TEXT">TEXT</option>
+                        <option value="INTEGER">INTEGER</option>
+                        <option value="REAL">REAL</option>
+                        <option value="BLOB">BLOB</option>
+                        <option value="NUMERIC">NUMERIC</option>
+                    </select>
+                </div>
+                <div class="form-field">
+                    <label>Default Value (optional)</label>
+                    <input type="text" id="newColumnDefault" placeholder="NULL">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="closeModal('addColumnModal')">Cancel</button>
+                <button class="btn-primary" onclick="submitAddColumn()">Add Column</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ================================================================
+        // APPLICATION STATE
+        // ================================================================
+        let isDbConnected = false;
+        let selectedTable = null;
+        let selectedTableType = 'table';
+        let currentPageIndex = 0;
+        let rowsPerPage = 1000;
+        let totalRecordCount = 0;
+        let totalPageCount = 1;
+        let tableColumns = [];
+        let sortedColumn = null;
+        let sortAscending = true;
+        let filterQuery = '';
+        let filterTimer = null;
+        let selectedRowIds = new Set();
+        let gridData = [];
+
+        // Cell editing state
+        let editingCellInfo = null;
+        let activeCellInput = null;
+
+        // Cell selection state (for copying individual values)
+        let selectedCell = null; // { rowIdx, colIdx, rowId, value }
+
+        // Column resize state
+        let columnWidths = {}; // Map of column name -> width in pixels
+        let resizingColumn = null;
+        let resizeStartX = 0;
+        let resizeStartWidth = 0;
+
+        // Column filters state (per-column filtering)
+        let columnFilters = {}; // Map of column name -> filter value
+
+        // Pinned rows and columns
+        let pinnedColumns = new Set(); // Set of column names
+        let pinnedRowIds = new Set(); // Set of row IDs
+
+        // Schema cache
+        let schemaCache = { tables: [], views: [], indexes: [] };
+
+        // RPC proxy (will be set up during init)
+        let backendApi = null;
+
+        // ================================================================
+        // RPC SETUP
+        // ================================================================
+        const vscodeApi = typeof acquireVsCodeApi !== 'undefined' ? acquireVsCodeApi() : null;
+
+        // Message ID tracking for RPC
+        let rpcMessageId = 0;
+        const pendingRpcCalls = new Map();
+
+        function sendRpcRequest(method, args) {
+            return new Promise((resolve, reject) => {
+                const messageId = `rpc_${++rpcMessageId}_${Date.now()}`;
+
+                const timeoutId = setTimeout(() => {
+                    if (pendingRpcCalls.has(messageId)) {
+                        pendingRpcCalls.delete(messageId);
+                        reject(new Error(`RPC timeout: ${method}`));
+                    }
+                }, 30000);
+
+                pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
+
+                if (vscodeApi) {
+                    vscodeApi.postMessage({
+                        channel: 'rpc',
+                        content: {
+                            kind: 'invoke',
+                            messageId,
+                            targetMethod: method,
+                            payload: args
+                        }
+                    });
+                }
+            });
+        }
+
+        // ================================================================
+        // LOCAL METHODS FOR EXTENSION TO CALL
+        // These methods are called BY the extension via RPC (extension -> webview)
+        // ================================================================
+        const webviewMethods = {
+            // Called when document content changes and we need to reload data
+            async refreshContent(filename) {
+                if (isDbConnected && selectedTable) {
+                    await loadTableData();
+                }
+                return { success: true };
+            },
+
+            // Called when VS Code color scheme changes
+            async updateColorScheme(scheme) {
+                document.documentElement.style.colorScheme = scheme;
+                return { success: true };
+            },
+
+            // Called when auto-commit setting changes
+            async updateAutoCommit(value) {
+                // Store for later use if needed
+                return { success: true };
+            },
+
+            // Called when cell edit behavior setting changes
+            async updateCellEditBehavior(value) {
+                // Store for later use if needed
+                return { success: true };
+            },
+
+            // Called when webview visibility/active state changes
+            async updateViewState(state) {
+                // Handle visibility changes if needed
+                return { success: true };
+            },
+
+            // Called when Copilot becomes active/inactive
+            async updateCopilotActive(active) {
+                // Handle Copilot state if needed
+                return { success: true };
+            }
+        };
+
+        // Handle messages from extension
+        window.addEventListener('message', event => {
+            const envelope = event.data;
+
+            // Handle RPC protocol messages (from core/rpc.ts)
+            if (envelope && envelope.kind === 'invoke') {
+                // This is an incoming invocation from the extension
+                const { correlationId, methodName, parameters } = envelope;
+                const method = webviewMethods[methodName];
+
+                if (typeof method === 'function') {
+                    Promise.resolve(method.apply(webviewMethods, parameters || []))
+                        .then(result => {
+                            if (vscodeApi) {
+                                vscodeApi.postMessage({
+                                    kind: 'result',
+                                    correlationId,
+                                    payload: result
+                                });
+                            }
+                        })
+                        .catch(err => {
+                            if (vscodeApi) {
+                                vscodeApi.postMessage({
+                                    kind: 'result',
+                                    correlationId,
+                                    errorText: err instanceof Error ? err.message : String(err)
+                                });
+                            }
+                        });
+                } else {
+                    // Method not found
+                    if (vscodeApi) {
+                        vscodeApi.postMessage({
+                            kind: 'result',
+                            correlationId,
+                            errorText: `Unknown method: ${methodName}`
+                        });
+                    }
+                }
+                return;
+            }
+
+            // Handle RPC responses (from our requests to the extension)
+            if (!envelope || envelope.channel !== 'rpc') return;
+
+            const message = envelope.content;
+            if (message && message.kind === 'response') {
+                const pending = pendingRpcCalls.get(message.messageId);
+                if (pending) {
+                    clearTimeout(pending.timeoutId);
+                    pendingRpcCalls.delete(message.messageId);
+
+                    if (message.success) {
+                        pending.resolve(message.data);
+                    } else {
+                        pending.reject(new Error(message.errorMessage || 'RPC failed'));
+                    }
+                }
+            }
+        });
+
+        // Create backend API proxy
+        backendApi = {
+            initialize: () => sendRpcRequest('initialize', []),
+            exec: (sql, params) => sendRpcRequest('exec', [sql, params]),
+            exportDb: (filename) => sendRpcRequest('exportDb', [filename]),
+            refreshFile: () => sendRpcRequest('refreshFile', []),
+            fireEditEvent: (edit) => sendRpcRequest('fireEditEvent', [edit]),
+            exportTable: (dbParams, columns) => sendRpcRequest('exportTable', [dbParams, columns])
+        };
+
+        // ================================================================
+        // INITIALIZATION
+        // ================================================================
+        async function initializeApp() {
+            try {
+                updateStatus('Connecting to database...');
+
+                const result = await backendApi.initialize();
+                if (!result || !result.connected) {
+                    throw new Error('Failed to connect to database');
+                }
+
+                isDbConnected = true;
+                console.log('Connected to database:', result.filename);
+
+                // Test connection
+                await backendApi.exec('SELECT 1');
+
+                // Load schema
+                await refreshSchema();
+
+                updateStatus('Ready');
+                showEmptyState();
+
+            } catch (err) {
+                console.error('Init error:', err);
+                showErrorState(err.message);
+            }
+        }
+
+        // ================================================================
+        // SCHEMA LOADING
+        // ================================================================
+        async function refreshSchema() {
+            if (!isDbConnected) return;
+
+            try {
+                const tablesResult = await backendApi.exec(
+                    "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                );
+                const viewsResult = await backendApi.exec(
+                    "SELECT name FROM sqlite_schema WHERE type='view' ORDER BY name"
+                );
+                const indexesResult = await backendApi.exec(
+                    "SELECT name, tbl_name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                );
+
+                schemaCache.tables = (tablesResult[0]?.records || []).map(r => ({ name: r[0] }));
+                schemaCache.views = (viewsResult[0]?.records || []).map(r => ({ name: r[0] }));
+                schemaCache.indexes = (indexesResult[0]?.records || []).map(r => ({ name: r[0], table: r[1] }));
+
+                renderSidebar();
+
+            } catch (err) {
+                console.error('Error loading schema:', err);
+                updateStatus('Error loading schema');
+            }
+        }
+
+        // ================================================================
+        // SIDEBAR RENDERING
+        // ================================================================
+        function renderSidebar() {
+            document.getElementById('tablesBadge').textContent = schemaCache.tables.length;
+            document.getElementById('viewsBadge').textContent = schemaCache.views.length;
+            document.getElementById('indexesBadge').textContent = schemaCache.indexes.length;
+
+            const tablesList = document.getElementById('tablesList');
+            if (schemaCache.tables.length === 0) {
+                tablesList.innerHTML = '<li class="list-item" style="opacity:0.5">No tables</li>';
+            } else {
+                tablesList.innerHTML = schemaCache.tables.map(t => `
+                    <li class="list-item ${selectedTable === t.name && selectedTableType === 'table' ? 'selected' : ''}"
+                        onclick="selectTableItem('${escapeHtml(t.name)}', 'table')"
+                        title="${escapeHtml(t.name)}">
+                        <span class="item-icon codicon codicon-table"></span>
+                        <span class="item-name">${escapeHtml(t.name)}</span>
+                    </li>
+                `).join('');
+            }
+
+            const viewsList = document.getElementById('viewsList');
+            if (schemaCache.views.length === 0) {
+                viewsList.innerHTML = '<li class="list-item" style="opacity:0.5">No views</li>';
+            } else {
+                viewsList.innerHTML = schemaCache.views.map(v => `
+                    <li class="list-item ${selectedTable === v.name && selectedTableType === 'view' ? 'selected' : ''}"
+                        onclick="selectTableItem('${escapeHtml(v.name)}', 'view')"
+                        title="${escapeHtml(v.name)}">
+                        <span class="item-icon codicon codicon-eye"></span>
+                        <span class="item-name">${escapeHtml(v.name)}</span>
+                    </li>
+                `).join('');
+            }
+
+            const indexesList = document.getElementById('indexesList');
+            if (schemaCache.indexes.length === 0) {
+                indexesList.innerHTML = '<li class="list-item" style="opacity:0.5">No indexes</li>';
+            } else {
+                indexesList.innerHTML = schemaCache.indexes.map(i => `
+                    <li class="list-item" title="${escapeHtml(i.name)} on ${escapeHtml(i.table)}">
+                        <span class="item-icon codicon codicon-list-tree"></span>
+                        <span class="item-name">${escapeHtml(i.name)}</span>
+                    </li>
+                `).join('');
+            }
+        }
+
+        function toggleSection(section) {
+            const title = document.querySelector(`[data-section="${section}"]`);
+            const list = document.getElementById(`${section}List`);
+
+            title.classList.toggle('collapsed');
+            list.classList.toggle('hidden');
+        }
+
+        // ================================================================
+        // TABLE SELECTION & DATA LOADING
+        // ================================================================
+        async function selectTableItem(tableName, tableType = 'table') {
+            selectedTable = tableName;
+            selectedTableType = tableType;
+            currentPageIndex = 0;
+            sortedColumn = null;
+            sortAscending = true;
+            columnWidths = {}; // Reset column widths for new table
+            columnFilters = {}; // Reset column filters
+            pinnedColumns.clear(); // Reset pinned columns
+            pinnedRowIds.clear(); // Reset pinned rows
+            filterQuery = '';
+            selectedRowIds.clear();
+            selectedCell = null; // Clear cell selection
+            document.getElementById('filterInput').value = '';
+
+            document.getElementById('tableNameLabel').textContent = tableName;
+            updateToolbarButtons();
+            renderSidebar();
+
+            await loadTableColumns();
+            await loadTableData();
+        }
+
+        async function loadTableColumns() {
+            if (!selectedTable) return;
+
+            try {
+                const result = await backendApi.exec(`PRAGMA table_info("${selectedTable}")`);
+                tableColumns = (result[0]?.records || []).map(r => ({
+                    cid: r[0],
+                    name: r[1],
+                    type: r[2] || 'TEXT',
+                    notnull: r[3],
+                    defaultValue: r[4],
+                    isPrimaryKey: r[5]
+                }));
+            } catch (err) {
+                console.error('Error loading columns:', err);
+                tableColumns = [];
+            }
+        }
+
+        async function loadTableData() {
+            if (!selectedTable || !isDbConnected) return;
+
+            showLoading();
+
+            try {
+                // Build WHERE clause from global filter and column filters
+                const whereConditions = [];
+
+                // Global filter (searches all columns)
+                if (filterQuery) {
+                    const globalConditions = tableColumns.map(c => `"${c.name}" LIKE '%${filterQuery.replace(/'/g, "''")}%'`).join(' OR ');
+                    whereConditions.push(`(${globalConditions})`);
+                }
+
+                // Column-specific filters (AND logic between columns)
+                for (const [colName, filterValue] of Object.entries(columnFilters)) {
+                    if (filterValue && filterValue.trim()) {
+                        const escaped = filterValue.replace(/'/g, "''");
+                        whereConditions.push(`"${colName}" LIKE '%${escaped}%'`);
+                    }
+                }
+
+                const whereClause = whereConditions.length > 0 ? ` WHERE ${whereConditions.join(' AND ')}` : '';
+
+                // Get total count
+                const countSql = `SELECT COUNT(*) FROM "${selectedTable}"${whereClause}`;
+                const countResult = await backendApi.exec(countSql);
+                totalRecordCount = countResult[0]?.records?.[0]?.[0] || 0;
+                totalPageCount = Math.max(1, Math.ceil(totalRecordCount / rowsPerPage));
+
+                if (currentPageIndex >= totalPageCount) {
+                    currentPageIndex = Math.max(0, totalPageCount - 1);
+                }
+
+                // Build data query with explicit column names for consistent ordering
+                // Use alias for rowid to prevent deduplication with INTEGER PRIMARY KEY columns
+                // This ensures native SQLite backend returns columns in the same order as PRAGMA table_info
+                const columnNames = tableColumns.map(c => `"${c.name}"`).join(', ');
+                let dataSql = `SELECT rowid AS _rowid_, ${columnNames} FROM "${selectedTable}"${whereClause}`;
+                if (sortedColumn) {
+                    dataSql += ` ORDER BY "${sortedColumn}" ${sortAscending ? 'ASC' : 'DESC'}`;
+                }
+                dataSql += ` LIMIT ${rowsPerPage} OFFSET ${currentPageIndex * rowsPerPage}`;
+
+                const dataResult = await backendApi.exec(dataSql);
+                gridData = dataResult[0]?.records || [];
+
+                renderDataGrid();
+                updatePagination();
+                updateStatus(`${totalRecordCount} records`);
+
+            } catch (err) {
+                console.error('Error loading data:', err);
+                updateStatus(`Error: ${err.message}`);
+                showErrorState(err.message);
+            }
+        }
+
+        // ================================================================
+        // DATA GRID RENDERING
+        // ================================================================
+        function renderDataGrid() {
+            const container = document.getElementById('gridContainer');
+
+            if (gridData.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-view">
+                        <span class="empty-icon codicon codicon-database"></span>
+                        <span class="empty-title">No data</span>
+                        <span class="empty-desc">This table is empty</span>
+                    </div>
+                `;
+                return;
+            }
+
+            let html = '<table class="data-grid"><thead class="grid-header"><tr>';
+
+            // Calculate initial column widths if not already set
+            if (Object.keys(columnWidths).length === 0 && gridData.length > 0) {
+                for (const col of tableColumns) {
+                    // Estimate width based on column name and sample data
+                    const headerLen = col.name.length;
+                    let maxDataLen = 0;
+
+                    // Sample first 10 rows to estimate content width
+                    const colIdx = tableColumns.indexOf(col);
+                    for (let i = 0; i < Math.min(10, gridData.length); i++) {
+                        const val = gridData[i][colIdx + 1];
+                        const valStr = val === null ? 'NULL' : String(val);
+                        maxDataLen = Math.max(maxDataLen, valStr.length);
+                    }
+
+                    // Calculate width: ~8px per character, min 80px, max 300px
+                    const charWidth = Math.max(headerLen, Math.min(maxDataLen, 40));
+                    columnWidths[col.name] = Math.max(80, Math.min(300, charWidth * 8 + 24));
+                }
+            }
+
+            // Reorder columns: pinned columns first, then non-pinned columns
+            // This ensures pinned columns are always rendered on the left side
+            const orderedColumns = [
+                ...tableColumns.filter(col => pinnedColumns.has(col.name)),
+                ...tableColumns.filter(col => !pinnedColumns.has(col.name))
+            ];
+
+            // Calculate cumulative left offsets for pinned columns based on their DOM order
+            // Row number column is always at left: 0 with width 50px
+            const pinnedColumnOffsets = new Map();
+            let cumulativeLeft = 50; // Start after row number column
+            for (const col of orderedColumns) {
+                if (pinnedColumns.has(col.name)) {
+                    pinnedColumnOffsets.set(col.name, cumulativeLeft);
+                    cumulativeLeft += (columnWidths[col.name] || 120);
+                }
+            }
+
+            // Create a mapping from column name to original index for data access
+            const columnIndexMap = new Map();
+            tableColumns.forEach((col, idx) => columnIndexMap.set(col.name, idx));
+
+            // Header cells - '#' column is clickable for select all
+            // Row number header has same height but no filter
+            html += '<th class="header-cell row-number-header" style="width:50px;position:sticky;left:0;z-index:11;background:var(--bg-secondary)" onclick="onSelectAllClick(event)" title="Click to select all rows"><div class="header-content"><div class="header-top" style="height:100%;justify-content:center">#</div></div></th>';
+            for (const col of orderedColumns) {
+                const isSorted = sortedColumn === col.name;
+                const isPinned = pinnedColumns.has(col.name);
+                const pinnedClass = isPinned ? 'pinned' : '';
+                const leftOffset = pinnedColumnOffsets.get(col.name);
+                const pinnedStyle = isPinned ? `position:sticky;left:${leftOffset}px;` : '';
+                // Use stored width (now always set)
+                const colWidth = columnWidths[col.name] || 120;
+                const filterValue = columnFilters[col.name] || '';
+                // Build sort indicator HTML - shown next to column name
+                const sortIndicator = isSorted ? `<span class="sort-indicator">${sortAscending ? '▲' : '▼'}</span>` : '';
+                html += `<th class="header-cell ${pinnedClass}" style="width:${colWidth}px;min-width:${colWidth}px;max-width:${colWidth}px;${pinnedStyle}" data-column="${escapeHtml(col.name)}">`;
+                html += `<div class="header-content">`;
+                // Top row: column name + sort indicator + pin icon
+                html += `<div class="header-top" onclick="onColumnSort('${escapeHtml(col.name)}')">`;
+                html += `<span class="header-text">${escapeHtml(col.name)}${sortIndicator}</span>`;
+                html += `<span class="pin-icon codicon codicon-pin ${isPinned ? 'pinned' : ''}" onclick="event.stopPropagation(); toggleColumnPin(event, '${escapeHtml(col.name)}')" title="${isPinned ? 'Unpin column' : 'Pin column'}"></span>`;
+                html += `</div>`;
+                // Bottom row: filter input
+                html += `<div class="header-bottom">`;
+                html += `<input type="text" class="column-filter" data-column="${escapeHtml(col.name)}" value="${escapeHtml(filterValue)}" placeholder="Filter..." onclick="event.stopPropagation()" onkeyup="onColumnFilterChange(event, '${escapeHtml(col.name)}')">`;
+                html += `</div>`;
+                html += `</div>`; // End header-content
+                html += `<div class="resize-handle" onmousedown="startColumnResize(event, '${escapeHtml(col.name)}')"></div>`;
+                html += `</th>`;
+            }
+            html += '</tr></thead><tbody>';
+
+            // Calculate cumulative top offsets for pinned rows
+            // Use CSS variable values - header height is 52px (CSS --header-height)
+            // With border-collapse, the 1px bottom border is shared with the first row
+            // So effective offset is 51px to attach pinned rows directly to header
+            // Row: 26px (CSS --row-height), but border-collapse shares the 1px border
+            // So effective row offset is 25px to attach pinned rows to each other
+            const headerHeight = 51;
+            const rowHeight = 25;
+            const rowNumWidth = 50;
+
+            // Count pinned rows to calculate offsets
+            const pinnedRowsList = [];
+            for (let rowIdx = 0; rowIdx < gridData.length; rowIdx++) {
+                const rowId = gridData[rowIdx][0];
+                if (pinnedRowIds.has(rowId)) {
+                    pinnedRowsList.push({ rowIdx, rowId, row: gridData[rowIdx] });
+                }
+            }
+
+            // Calculate top offset for each pinned row
+            // All pinned rows stack starting from header height
+            // Each subsequent pinned row is offset by the row height
+            const pinnedRowOffsets = new Map();
+            for (let i = 0; i < pinnedRowsList.length; i++) {
+                const topOffset = headerHeight + (i * rowHeight);
+                pinnedRowOffsets.set(pinnedRowsList[i].rowId, topOffset);
+            }
+
+            // Helper function to render a single row
+            function renderRow(rowIdx, row, rowId) {
+                const isSelected = selectedRowIds.has(rowId);
+                const isRowPinned = pinnedRowIds.has(rowId);
+                const topOffset = pinnedRowOffsets.get(rowId);
+                const pinnedRowStyle = isRowPinned ? `top:${topOffset}px;` : '';
+
+                let rowHtml = `<tr class="data-row ${isSelected ? 'selected' : ''} ${isRowPinned ? 'pinned' : ''}" style="${pinnedRowStyle}" data-rowid="${rowId}" data-rowidx="${rowIdx}" onclick="onRowClick(event, ${rowId}, ${rowIdx})">`;
+
+                // Row number cell with pin icon - always sticky left
+                const rowNumZIndex = isRowPinned ? 8 : 2;
+                rowHtml += `<td class="data-cell row-number" style="width:50px;position:sticky;left:0;z-index:${rowNumZIndex};" onclick="onRowNumberClick(event, ${rowId})">`;
+                rowHtml += `${currentPageIndex * rowsPerPage + rowIdx + 1}`;
+                rowHtml += `<span class="pin-icon codicon codicon-pin ${isRowPinned ? 'pinned' : ''}" onclick="toggleRowPin(event, ${rowId})" title="${isRowPinned ? 'Unpin row' : 'Pin row'}"></span>`;
+                rowHtml += `</td>`;
+
+                // Iterate over reordered columns (pinned first, then non-pinned)
+                for (let displayColIdx = 0; displayColIdx < orderedColumns.length; displayColIdx++) {
+                    const col = orderedColumns[displayColIdx];
+                    const originalColIdx = columnIndexMap.get(col.name);
+                    const value = row[originalColIdx + 1]; // +1 because row[0] is rowid
+                    const displayValue = formatCellValue(value);
+                    const isNull = value === null;
+                    const colWidth = columnWidths[col.name] || 120;
+                    const isCellSelected = selectedCell && selectedCell.rowIdx === rowIdx && selectedCell.colIdx === originalColIdx;
+                    const isColPinned = pinnedColumns.has(col.name);
+                    const leftOffset = pinnedColumnOffsets.get(col.name);
+                    const pinnedStyle = isColPinned ? `position:sticky;left:${leftOffset}px;` : '';
+
+                    // Use originalColIdx for data operations (edit, select) to maintain correct mapping
+                    rowHtml += `<td class="data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''}" style="width:${colWidth}px;min-width:${colWidth}px;max-width:${colWidth}px;${pinnedStyle}" data-rowidx="${rowIdx}" data-colidx="${originalColIdx}" onclick="onCellClick(event, ${rowIdx}, ${originalColIdx}, ${rowId})" ondblclick="onCellDoubleClick(event, ${rowIdx}, ${originalColIdx}, ${rowId})">${displayValue}</td>`;
+                }
+                rowHtml += '</tr>';
+                return rowHtml;
+            }
+
+            // Reorder rows: pinned rows first, then non-pinned rows
+            // This ensures pinned rows are always rendered at the top
+            const orderedRowIndices = [
+                ...gridData.map((row, idx) => ({ idx, rowId: row[0] })).filter(r => pinnedRowIds.has(r.rowId)),
+                ...gridData.map((row, idx) => ({ idx, rowId: row[0] })).filter(r => !pinnedRowIds.has(r.rowId))
+            ];
+
+            // Render all rows in reordered order (pinned rows first)
+            for (const { idx: rowIdx, rowId } of orderedRowIndices) {
+                const row = gridData[rowIdx];
+                html += renderRow(rowIdx, row, rowId);
+            }
+
+            html += '</tbody></table>';
+            container.innerHTML = html;
+        }
+
+        function formatCellValue(value) {
+            if (value === null) return 'NULL';
+            if (value instanceof Uint8Array) return '[BLOB]';
+            if (typeof value === 'string' && value.length > 100) {
+                return escapeHtml(value.substring(0, 100)) + '...';
+            }
+            return escapeHtml(String(value));
+        }
+
+        // ================================================================
+        // CELL SELECTION & EDITING
+        // ================================================================
+
+        // Debounce timer for cell click to allow double-click to fire first
+        let cellClickTimer = null;
+
+        /**
+         * Handle single click on a data cell - select the cell for copying.
+         * Uses debounce to allow double-click (edit) to take precedence.
+         */
+        function onCellClick(event, rowIdx, colIdx, rowId) {
+            event.stopPropagation(); // Prevent row click from firing
+
+            // Clear any pending cell click timer
+            if (cellClickTimer) {
+                clearTimeout(cellClickTimer);
+                cellClickTimer = null;
+            }
+
+            // Delay selection to allow double-click to fire
+            cellClickTimer = setTimeout(() => {
+                cellClickTimer = null;
+
+                // Don't select if we're now in editing mode (double-click happened)
+                if (editingCellInfo) return;
+
+                const value = gridData[rowIdx][colIdx + 1];
+
+                // Toggle cell selection
+                if (selectedCell && selectedCell.rowIdx === rowIdx && selectedCell.colIdx === colIdx) {
+                    // Already selected - deselect
+                    selectedCell = null;
+                } else {
+                    // Select this cell
+                    selectedCell = { rowIdx, colIdx, rowId, value };
+                    // Clear row selection when selecting a cell
+                    selectedRowIds.clear();
+                }
+
+                // Update UI efficiently
+                updateCellSelectionUI();
+                updateRowSelectionUI();
+                updateToolbarButtons();
+            }, 200);
+        }
+
+        /**
+         * Update cell selection UI without full re-render.
+         */
+        function updateCellSelectionUI() {
+            // Remove selection from all cells
+            const allCells = document.querySelectorAll('.data-cell.cell-selected');
+            for (const cell of allCells) {
+                cell.classList.remove('cell-selected');
+            }
+
+            // Add selection to currently selected cell
+            if (selectedCell) {
+                const cell = document.querySelector(
+                    `.data-cell[data-rowidx="${selectedCell.rowIdx}"][data-colidx="${selectedCell.colIdx}"]`
+                );
+                if (cell) {
+                    cell.classList.add('cell-selected');
+                }
+            }
+        }
+
+        function onCellDoubleClick(event, rowIdx, colIdx, rowId) {
+            event.stopPropagation();
+
+            // Cancel any pending cell click timer since we're handling a double-click
+            if (cellClickTimer) {
+                clearTimeout(cellClickTimer);
+                cellClickTimer = null;
+            }
+
+            // Cancel any pending row click since we're handling a double-click
+            if (rowClickTimer) {
+                clearTimeout(rowClickTimer);
+                rowClickTimer = null;
+            }
+
+            // Only allow editing for tables, not views
+            // Views in SQLite are read-only unless they have INSTEAD OF triggers
+            if (selectedTableType !== 'table') {
+                updateStatus('Views are read-only');
+                return;
+            }
+
+            // If already editing another cell, save it first
+            if (editingCellInfo) {
+                saveCellEdit();
+            }
+
+            // Use closest() to ensure we get the <td> cell, not a child element
+            // This is important because event.target could be an inner element
+            const cell = event.target.closest('td.data-cell');
+            if (!cell) return; // Guard against null cell reference
+
+            const column = tableColumns[colIdx];
+            if (!column) return; // Guard against invalid column index
+
+            const currentValue = gridData[rowIdx][colIdx + 1];
+
+            // Store the editing state: row index, column index, row ID, column name, and original value
+            editingCellInfo = { rowIdx, colIdx, rowId, columnName: column.name, originalValue: currentValue };
+
+            // Add editing class to cell for styling (removes padding, adds border)
+            cell.classList.add('editing');
+
+            // Create inline input element with the current value
+            // Null values are displayed as empty string for editing
+            cell.innerHTML = `<input type="text" class="cell-input" value="${currentValue === null ? '' : escapeHtml(String(currentValue))}">`;
+
+            activeCellInput = cell.querySelector('input');
+            activeCellInput.focus();
+            activeCellInput.select();
+
+            activeCellInput.addEventListener('keydown', onCellInputKeydown);
+            activeCellInput.addEventListener('blur', onCellInputBlur);
+        }
+
+        /**
+         * Handle keyboard events in the cell input.
+         * - Enter: Save the edit
+         * - Escape: Cancel the edit
+         */
+        function onCellInputKeydown(event) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                saveCellEdit();
+            } else if (event.key === 'Escape') {
+                event.preventDefault();
+                cancelCellEdit();
+            }
+        }
+
+        /**
+         * Handle blur event on the cell input.
+         * Auto-saves when clicking outside the cell.
+         * Uses setTimeout to allow for click events on other elements.
+         */
+        function onCellInputBlur() {
+            setTimeout(() => {
+                if (editingCellInfo) {
+                    saveCellEdit();
+                }
+            }, 100);
+        }
+
+        /**
+         * Save the current cell edit to the database.
+         *
+         * Flow:
+         * 1. Validate that editing is in progress
+         * 2. Check if the value actually changed
+         * 3. Convert the value to proper SQL syntax (NULL, number, or quoted string)
+         * 4. Execute UPDATE query via RPC
+         * 5. Fire edit event for undo/redo and dirty state tracking
+         * 6. Refresh the grid to show the updated value
+         */
+        async function saveCellEdit() {
+            if (!editingCellInfo || !activeCellInput) return;
+
+            const { rowIdx, colIdx, rowId, columnName, originalValue } = editingCellInfo;
+            const newValue = activeCellInput.value;
+
+            // Compare values - convert both to strings for comparison
+            // Null is treated as empty string for comparison purposes
+            const origStr = originalValue === null ? '' : String(originalValue);
+            if (newValue === origStr) {
+                // No change, just cancel the edit
+                cancelCellEdit();
+                return;
+            }
+
+            // Determine the SQL value representation:
+            // - Empty string on NOT NULL column becomes empty string (not NULL)
+            // - Empty string on nullable column becomes NULL
+            // - Numeric strings are inserted as numbers (no quotes)
+            // - Everything else is a quoted string with single quotes escaped
+            const column = tableColumns[colIdx];
+            const isNotNull = column && column.notnull === 1;
+
+            let sqlValue;
+            if (newValue === '') {
+                if (isNotNull) {
+                    // NOT NULL column - use empty string
+                    sqlValue = "''";
+                } else {
+                    // Nullable column - use NULL
+                    sqlValue = 'NULL';
+                }
+            } else if (!isNaN(Number(newValue)) && newValue.trim() !== '') {
+                // Numeric value - insert as number without quotes
+                sqlValue = newValue;
+            } else {
+                // String value - escape single quotes by doubling them (SQL standard)
+                sqlValue = `'${newValue.replace(/'/g, "''")}'`;
+            }
+
+            // Build UPDATE query using rowid for precise row identification
+            // Column and table names are quoted to handle special characters/reserved words
+            const updateSql = `UPDATE "${selectedTable}" SET "${columnName}" = ${sqlValue} WHERE rowid = ${rowId}`;
+
+            try {
+                updateStatus('Saving...');
+
+                // Execute the UPDATE query via RPC to the extension host
+                await backendApi.exec(updateSql);
+
+                // Compute the typed new value for storage
+                // Empty string becomes null for nullable columns, empty string for NOT NULL columns
+                const typedNewValue = newValue === '' ? (isNotNull ? '' : null) :
+                    (!isNaN(Number(newValue)) && newValue.trim() !== '' ? Number(newValue) : newValue);
+
+                // Fire edit event to:
+                // 1. Mark the document as dirty (enables Ctrl+S save)
+                // 2. Track the modification for undo/redo
+                await backendApi.fireEditEvent({
+                    label: `Edit ${columnName}`,
+                    description: `Edit ${columnName}`,
+                    modificationType: 'cell_update',
+                    targetTable: selectedTable,
+                    targetRowId: rowId,
+                    targetColumn: columnName,
+                    previousValue: originalValue,
+                    newValue: typedNewValue
+                });
+
+                // Update local grid data optimistically
+                // Convert the value to the appropriate type for local display
+                gridData[rowIdx][colIdx + 1] = typedNewValue;
+
+                // Clean up editing state and refresh the view
+                cleanupCellEdit();
+                await loadTableData();
+
+                // Update status - changes are saved immediately for native engine
+                updateStatus('Saved');
+
+            } catch (err) {
+                // On error, log to console and show status, but keep the cell in edit mode
+                // so the user can correct the value or press Escape to cancel
+                console.error('Save failed:', err);
+
+                // Parse and format error message for better user experience
+                let errorMessage = err.message || String(err);
+
+                // Handle common SQLite constraint errors with friendlier messages
+                if (errorMessage.includes('FOREIGN KEY constraint failed')) {
+                    errorMessage = 'Foreign key constraint: the value must reference an existing record in the related table';
+                } else if (errorMessage.includes('UNIQUE constraint failed')) {
+                    errorMessage = 'Unique constraint: this value already exists in the column';
+                } else if (errorMessage.includes('NOT NULL constraint failed')) {
+                    errorMessage = 'Not null constraint: this column cannot be empty';
+                } else if (errorMessage.includes('CHECK constraint failed')) {
+                    errorMessage = 'Check constraint: the value does not satisfy the column requirements';
+                }
+
+                updateStatus(`Save failed: ${errorMessage}`);
+                // Don't cleanup - let user retry or cancel
+            }
+        }
+
+        /**
+         * Cancel the current cell edit without saving.
+         * Restores the original value by re-rendering the grid.
+         */
+        function cancelCellEdit() {
+            cleanupCellEdit();
+            renderDataGrid(); // Re-render to restore original value
+        }
+
+        /**
+         * Clean up cell editing state.
+         * Removes event listeners and resets editing variables.
+         */
+        function cleanupCellEdit() {
+            if (activeCellInput) {
+                // Remove event listeners to prevent memory leaks
+                activeCellInput.removeEventListener('keydown', onCellInputKeydown);
+                activeCellInput.removeEventListener('blur', onCellInputBlur);
+                activeCellInput = null;
+            }
+            editingCellInfo = null;
+        }
+
+        // ================================================================
+        // ROW SELECTION
+        // ================================================================
+
+        // Debounce timer for row click to allow double-click to fire first
+        let rowClickTimer = null;
+
+        /**
+         * Handle click on row number cell - immediate selection without debounce.
+         * Row numbers are not editable, so no need to wait for double-click.
+         * Clicking on a selected row deselects it (toggle behavior).
+         */
+        function onRowNumberClick(event, rowId) {
+            event.stopPropagation(); // Prevent triggering onRowClick on the parent row
+
+            // Clear any pending row click timer
+            if (rowClickTimer) {
+                clearTimeout(rowClickTimer);
+                rowClickTimer = null;
+            }
+
+            // Clear cell selection when selecting rows
+            selectedCell = null;
+            updateCellSelectionUI();
+
+            // Handle selection immediately (no debounce)
+            if (event.ctrlKey || event.metaKey) {
+                // Toggle selection with Ctrl/Cmd click
+                if (selectedRowIds.has(rowId)) {
+                    selectedRowIds.delete(rowId);
+                } else {
+                    selectedRowIds.add(rowId);
+                }
+            } else {
+                // Single click - toggle behavior
+                if (selectedRowIds.has(rowId)) {
+                    // Already selected - deselect it
+                    selectedRowIds.delete(rowId);
+                } else {
+                    // Not selected - select only this row
+                    selectedRowIds.clear();
+                    selectedRowIds.add(rowId);
+                }
+            }
+
+            // Update UI efficiently without full re-render
+            updateRowSelectionUI();
+            updateToolbarButtons();
+        }
+
+        function onRowClick(event, rowId, rowIdx) {
+            // Clear any pending click timer
+            if (rowClickTimer) {
+                clearTimeout(rowClickTimer);
+                rowClickTimer = null;
+            }
+
+            // Delay the click processing to allow double-click to fire
+            // Double-click events fire after ~300ms of the second click
+            rowClickTimer = setTimeout(() => {
+                rowClickTimer = null;
+
+                // Don't process if we're now in editing mode (double-click happened)
+                if (editingCellInfo) return;
+
+                if (event.ctrlKey || event.metaKey) {
+                    if (selectedRowIds.has(rowId)) {
+                        selectedRowIds.delete(rowId);
+                    } else {
+                        selectedRowIds.add(rowId);
+                    }
+                } else {
+                    selectedRowIds.clear();
+                    selectedRowIds.add(rowId);
+                }
+
+                renderDataGrid();
+                updateToolbarButtons();
+            }, 200); // 200ms delay to allow double-click detection
+        }
+
+        // ================================================================
+        // COLUMN RESIZING
+        // ================================================================
+
+        /**
+         * Start resizing a column when user mousedowns on resize handle.
+         */
+        function startColumnResize(event, columnName) {
+            event.stopPropagation(); // Prevent sorting when clicking resize handle
+            event.preventDefault();
+
+            resizingColumn = columnName;
+            resizeStartX = event.clientX;
+
+            // Get current column width
+            const headerCell = document.querySelector(`th[data-column="${columnName}"]`);
+            resizeStartWidth = headerCell ? headerCell.offsetWidth : 150;
+
+            // Add resizing class to handle
+            const handle = event.target;
+            handle.classList.add('resizing');
+
+            // Add document-level event listeners for drag
+            document.addEventListener('mousemove', onColumnResize);
+            document.addEventListener('mouseup', stopColumnResize);
+
+            // Prevent text selection during resize
+            document.body.style.userSelect = 'none';
+            document.body.style.cursor = 'col-resize';
+        }
+
+        /**
+         * Handle mousemove during column resize.
+         * Updates both header and data cells in the column for proper visual feedback.
+         */
+        function onColumnResize(event) {
+            if (!resizingColumn) return;
+
+            const deltaX = event.clientX - resizeStartX;
+            const newWidth = Math.max(60, resizeStartWidth + deltaX); // Minimum 60px
+
+            // Update the column width in state
+            columnWidths[resizingColumn] = newWidth;
+
+            // Find the column index for this column name
+            const colIdx = tableColumns.findIndex(c => c.name === resizingColumn);
+            if (colIdx === -1) return;
+
+            // Update the header cell width directly for smooth resizing
+            const headerCell = document.querySelector(`th[data-column="${resizingColumn}"]`);
+            if (headerCell) {
+                headerCell.style.width = `${newWidth}px`;
+            }
+
+            // Update all data cells in this column for consistent width
+            // Data cells are at colIdx + 1 (accounting for row number column)
+            const dataCells = document.querySelectorAll(`.data-row td:nth-child(${colIdx + 2})`);
+            for (const cell of dataCells) {
+                cell.style.width = `${newWidth}px`;
+                cell.style.maxWidth = `${newWidth}px`;
+            }
+        }
+
+        /**
+         * Stop column resize on mouseup.
+         */
+        function stopColumnResize() {
+            if (!resizingColumn) return;
+
+            // Remove resizing class from handle
+            const handle = document.querySelector('.resize-handle.resizing');
+            if (handle) {
+                handle.classList.remove('resizing');
+            }
+
+            // Clean up
+            resizingColumn = null;
+            document.removeEventListener('mousemove', onColumnResize);
+            document.removeEventListener('mouseup', stopColumnResize);
+
+            // Restore selection and cursor
+            document.body.style.userSelect = '';
+            document.body.style.cursor = '';
+        }
+
+        // ================================================================
+        // SORTING & FILTERING
+        // ================================================================
+        function onColumnSort(columnName) {
+            if (sortedColumn === columnName) {
+                sortAscending = !sortAscending;
+            } else {
+                sortedColumn = columnName;
+                sortAscending = true;
+            }
+            loadTableData();
+        }
+
+        function onFilterChange() {
+            clearTimeout(filterTimer);
+            filterTimer = setTimeout(() => {
+                filterQuery = document.getElementById('filterInput').value.trim();
+                currentPageIndex = 0;
+                loadTableData();
+            }, 300);
+        }
+
+        // Column filter debounce timer
+        let columnFilterTimer = null;
+
+        /**
+         * Handle change in per-column filter input.
+         * Uses debounce to avoid excessive queries while typing.
+         */
+        function onColumnFilterChange(event, columnName) {
+            clearTimeout(columnFilterTimer);
+            columnFilterTimer = setTimeout(() => {
+                columnFilters[columnName] = event.target.value.trim();
+                currentPageIndex = 0;
+                loadTableData();
+            }, 300);
+        }
+
+        // ================================================================
+        // PIN FUNCTIONALITY
+        // ================================================================
+
+        /**
+         * Toggle pin state for a column.
+         * Pinned columns stick to the left when scrolling horizontally.
+         */
+        function toggleColumnPin(event, columnName) {
+            event.stopPropagation(); // Prevent sorting
+
+            if (pinnedColumns.has(columnName)) {
+                pinnedColumns.delete(columnName);
+            } else {
+                pinnedColumns.add(columnName);
+            }
+
+            renderDataGrid();
+        }
+
+        /**
+         * Toggle pin state for a row.
+         * Pinned rows stick to the top when scrolling vertically.
+         */
+        function toggleRowPin(event, rowId) {
+            event.stopPropagation(); // Prevent row selection
+
+            if (pinnedRowIds.has(rowId)) {
+                pinnedRowIds.delete(rowId);
+            } else {
+                pinnedRowIds.add(rowId);
+            }
+
+            renderDataGrid();
+        }
+
+        // ================================================================
+        // PAGINATION
+        // ================================================================
+        function updatePagination() {
+            document.getElementById('pageIndicator').textContent = `${currentPageIndex + 1} / ${totalPageCount}`;
+
+            document.getElementById('btnFirst').disabled = currentPageIndex === 0;
+            document.getElementById('btnPrev').disabled = currentPageIndex === 0;
+            document.getElementById('btnNext').disabled = currentPageIndex >= totalPageCount - 1;
+            document.getElementById('btnLast').disabled = currentPageIndex >= totalPageCount - 1;
+        }
+
+        function goToPage(page) {
+            if (page < 0 || page >= totalPageCount) return;
+            currentPageIndex = page;
+            loadTableData();
+        }
+
+        function onPageSizeChange() {
+            rowsPerPage = parseInt(document.getElementById('pageSizeSelect').value, 10);
+            currentPageIndex = 0;
+            loadTableData();
+        }
+
+        // ================================================================
+        // CRUD OPERATIONS
+        // ================================================================
+        function openAddRowModal() {
+            if (!selectedTable || selectedTableType !== 'table') return;
+
+            const form = document.getElementById('addRowForm');
+            // Mark NOT NULL columns as required (notnull is index 3 in PRAGMA table_info)
+            form.innerHTML = tableColumns.map(col => {
+                const isRequired = col.notnull === 1 && !col.isPrimaryKey;
+                const requiredLabel = isRequired ? ' <span style="color: var(--error-color)">*</span>' : '';
+                return `
+                <div class="form-field">
+                    <label>${escapeHtml(col.name)}${requiredLabel} <span style="opacity:0.5">(${col.type})</span></label>
+                    <input type="text" data-column="${escapeHtml(col.name)}" data-required="${isRequired}" placeholder="${col.isPrimaryKey ? 'Auto (Primary Key)' : (isRequired ? 'Required' : 'NULL')}" ${col.isPrimaryKey ? 'disabled' : ''}>
+                </div>
+            `}).join('');
+
+            openModal('addRowModal');
+        }
+
+        async function submitAddRow() {
+            const inputs = document.querySelectorAll('#addRowForm input[data-column]:not([disabled])');
+            const colNames = [];
+            const colValues = [];
+            const missingRequired = [];
+
+            // First pass: validate required fields
+            for (const input of inputs) {
+                const colName = input.dataset.column;
+                const value = input.value.trim();
+                const isRequired = input.dataset.required === 'true';
+
+                if (isRequired && (value === '' || value.toLowerCase() === 'null')) {
+                    missingRequired.push(colName);
+                    input.style.borderColor = 'var(--error-color)';
+                } else {
+                    input.style.borderColor = '';
+                }
+            }
+
+            if (missingRequired.length > 0) {
+                updateStatus(`Required fields missing: ${missingRequired.join(', ')}`);
+                return;
+            }
+
+            // Second pass: build SQL
+            for (const input of inputs) {
+                const colName = input.dataset.column;
+                const value = input.value.trim();
+
+                if (value !== '') {
+                    colNames.push(`"${colName}"`);
+                    if (value.toLowerCase() === 'null') {
+                        colValues.push('NULL');
+                    } else if (!isNaN(Number(value)) && value !== '') {
+                        colValues.push(value);
+                    } else {
+                        colValues.push(`'${value.replace(/'/g, "''")}'`);
+                    }
+                }
+            }
+
+            let sql;
+            if (colNames.length === 0) {
+                sql = `INSERT INTO "${selectedTable}" DEFAULT VALUES`;
+            } else {
+                sql = `INSERT INTO "${selectedTable}" (${colNames.join(', ')}) VALUES (${colValues.join(', ')})`;
+            }
+
+            try {
+                updateStatus('Inserting row...');
+                await backendApi.exec(sql);
+                await backendApi.fireEditEvent({
+                    description: `Insert row into ${selectedTable}`,
+                    operation: 'add',
+                    targetTable: selectedTable,
+                    queryText: sql
+                });
+
+                closeModal('addRowModal');
+                await loadTableData();
+                updateStatus('Row inserted - Ctrl+S to save');
+
+            } catch (err) {
+                console.error('Insert failed:', err);
+                updateStatus(`Error: ${err.message}`);
+            }
+        }
+
+        function openDeleteModal() {
+            if (selectedRowIds.size === 0) return;
+
+            document.getElementById('deleteConfirmText').textContent =
+                `Are you sure you want to delete ${selectedRowIds.size} row${selectedRowIds.size > 1 ? 's' : ''}?`;
+
+            openModal('deleteModal');
+        }
+
+        async function submitDelete() {
+            if (selectedRowIds.size === 0) return;
+
+            const rowIds = Array.from(selectedRowIds);
+            const sql = `DELETE FROM "${selectedTable}" WHERE rowid IN (${rowIds.join(', ')})`;
+
+            try {
+                updateStatus('Deleting...');
+                await backendApi.exec(sql);
+                await backendApi.fireEditEvent({
+                    description: `Delete ${rowIds.length} row${rowIds.length > 1 ? 's' : ''} from ${selectedTable}`,
+                    operation: 'remove',
+                    targetTable: selectedTable,
+                    affectedRecords: rowIds,
+                    queryText: sql
+                });
+
+                closeModal('deleteModal');
+                selectedRowIds.clear();
+                await loadTableData();
+                updateToolbarButtons();
+                updateStatus(`Deleted - Ctrl+S to save`);
+
+            } catch (err) {
+                console.error('Delete failed:', err);
+                updateStatus(`Error: ${err.message}`);
+            }
+        }
+
+        async function exportCurrentTable() {
+            if (!selectedTable) return;
+            await backendApi.exportTable({ table: selectedTable }, tableColumns.map(c => c.name));
+        }
+
+        async function reloadFromDisk() {
+            if (!isDbConnected) return;
+
+            try {
+                updateStatus('Reloading...');
+                await backendApi.refreshFile();
+                await refreshSchema();
+                if (selectedTable) {
+                    await loadTableColumns();
+                    await loadTableData();
+                }
+                updateStatus('Reloaded');
+            } catch (err) {
+                console.error('Reload failed:', err);
+                updateStatus(`Reload failed: ${err.message}`);
+            }
+        }
+
+        // ================================================================
+        // UI HELPERS
+        // ================================================================
+        function openModal(modalId) {
+            document.getElementById(modalId).classList.remove('hidden');
+        }
+
+        function closeModal(modalId) {
+            document.getElementById(modalId).classList.add('hidden');
+        }
+
+        function updateStatus(message) {
+            document.getElementById('statusText').textContent = message;
+        }
+
+        function updateToolbarButtons() {
+            const hasTable = selectedTable && selectedTableType === 'table';
+            document.getElementById('btnAddRow').disabled = !hasTable;
+            document.getElementById('btnAddColumn').disabled = !hasTable;
+            document.getElementById('btnDeleteRows').disabled = !hasTable || selectedRowIds.size === 0;
+            document.getElementById('btnExport').disabled = !selectedTable;
+        }
+
+        function showLoading() {
+            document.getElementById('gridContainer').innerHTML = `
+                <div class="loading-view">
+                    <div class="loading-spinner"></div>
+                    <span>Loading...</span>
+                </div>
+            `;
+        }
+
+        function showEmptyState() {
+            document.getElementById('gridContainer').innerHTML = `
+                <div class="empty-view">
+                    <span class="empty-icon codicon codicon-database"></span>
+                    <span class="empty-title">Select a table</span>
+                    <span class="empty-desc">Choose a table from the sidebar to view data</span>
+                </div>
+            `;
+        }
+
+        function showErrorState(message) {
+            document.getElementById('gridContainer').innerHTML = `
+                <div class="empty-view">
+                    <span class="empty-icon codicon codicon-error" style="color: var(--error-color)"></span>
+                    <span class="empty-title">Error</span>
+                    <span class="empty-desc">${escapeHtml(message)}</span>
+                </div>
+            `;
+        }
+
+        function escapeHtml(str) {
+            if (str === null || str === undefined) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        // ================================================================
+        // CREATE TABLE FUNCTIONALITY
+        // ================================================================
+        let columnDefCounter = 0;
+
+        function openCreateTableModal() {
+            // Reset the form
+            document.getElementById('newTableName').value = '';
+            document.getElementById('columnDefinitions').innerHTML = '';
+            columnDefCounter = 0;
+
+            // Add initial column (id as primary key)
+            addColumnDefinition(true);
+
+            openModal('createTableModal');
+        }
+
+        function addColumnDefinition(isFirst = false) {
+            const container = document.getElementById('columnDefinitions');
+            const colId = ++columnDefCounter;
+
+            const html = `
+                <div class="column-def-row" id="colDef_${colId}" style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;">
+                    <input type="text" placeholder="Column name" class="col-name" style="flex: 2;" value="${isFirst ? 'id' : ''}">
+                    <select class="col-type" style="flex: 1;">
+                        <option value="INTEGER" ${isFirst ? 'selected' : ''}>INTEGER</option>
+                        <option value="TEXT" ${!isFirst ? 'selected' : ''}>TEXT</option>
+                        <option value="REAL">REAL</option>
+                        <option value="BLOB">BLOB</option>
+                        <option value="NUMERIC">NUMERIC</option>
+                    </select>
+                    <label style="display: flex; align-items: center; gap: 4px;">
+                        <input type="checkbox" class="col-pk" ${isFirst ? 'checked' : ''}> PK
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 4px;">
+                        <input type="checkbox" class="col-nn"> NN
+                    </label>
+                    <button class="icon-button" onclick="removeColumnDefinition(${colId})" title="Remove" ${isFirst ? 'disabled' : ''}>
+                        <span class="codicon codicon-close"></span>
+                    </button>
+                </div>
+            `;
+            container.insertAdjacentHTML('beforeend', html);
+        }
+
+        function removeColumnDefinition(colId) {
+            const elem = document.getElementById(`colDef_${colId}`);
+            if (elem) elem.remove();
+        }
+
+        async function submitCreateTable() {
+            const tableName = document.getElementById('newTableName').value.trim();
+
+            if (!tableName) {
+                updateStatus('Error: Table name is required');
+                return;
+            }
+
+            // Validate table name (alphanumeric and underscores only)
+            if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(tableName)) {
+                updateStatus('Error: Table name must start with a letter or underscore and contain only letters, numbers, and underscores');
+                return;
+            }
+
+            // Collect column definitions
+            const colDefs = [];
+            const rows = document.querySelectorAll('.column-def-row');
+
+            for (const row of rows) {
+                const name = row.querySelector('.col-name').value.trim();
+                const type = row.querySelector('.col-type').value;
+                const isPK = row.querySelector('.col-pk').checked;
+                const isNN = row.querySelector('.col-nn').checked;
+
+                if (!name) continue;
+
+                let def = `"${name}" ${type}`;
+                if (isPK) def += ' PRIMARY KEY';
+                if (isNN && !isPK) def += ' NOT NULL';
+                colDefs.push(def);
+            }
+
+            if (colDefs.length === 0) {
+                updateStatus('Error: At least one column is required');
+                return;
+            }
+
+            const sql = `CREATE TABLE "${tableName}" (${colDefs.join(', ')})`;
+
+            try {
+                updateStatus('Creating table...');
+                await backendApi.exec(sql);
+                await backendApi.fireEditEvent({
+                    description: `Create table ${tableName}`,
+                    operation: 'add',
+                    targetTable: tableName,
+                    queryText: sql
+                });
+
+                closeModal('createTableModal');
+                await refreshSchema();
+                updateStatus(`Table "${tableName}" created - Ctrl+S to save`);
+
+            } catch (err) {
+                console.error('Create table failed:', err);
+                updateStatus(`Error: ${err.message}`);
+            }
+        }
+
+        // ================================================================
+        // ADD COLUMN FUNCTIONALITY
+        // ================================================================
+        function openAddColumnModal() {
+            if (!selectedTable || selectedTableType !== 'table') return;
+
+            // Reset form
+            document.getElementById('newColumnName').value = '';
+            document.getElementById('newColumnType').value = 'TEXT';
+            document.getElementById('newColumnDefault').value = '';
+
+            openModal('addColumnModal');
+        }
+
+        async function submitAddColumn() {
+            const columnName = document.getElementById('newColumnName').value.trim();
+            const columnType = document.getElementById('newColumnType').value;
+            const defaultValue = document.getElementById('newColumnDefault').value.trim();
+
+            if (!columnName) {
+                updateStatus('Error: Column name is required');
+                return;
+            }
+
+            // Validate column name
+            if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(columnName)) {
+                updateStatus('Error: Column name must start with a letter or underscore');
+                return;
+            }
+
+            let sql = `ALTER TABLE "${selectedTable}" ADD COLUMN "${columnName}" ${columnType}`;
+
+            if (defaultValue) {
+                if (defaultValue.toLowerCase() === 'null') {
+                    sql += ' DEFAULT NULL';
+                } else if (!isNaN(Number(defaultValue))) {
+                    sql += ` DEFAULT ${defaultValue}`;
+                } else {
+                    sql += ` DEFAULT '${defaultValue.replace(/'/g, "''")}'`;
+                }
+            }
+
+            try {
+                updateStatus('Adding column...');
+                await backendApi.exec(sql);
+                await backendApi.fireEditEvent({
+                    description: `Add column ${columnName} to ${selectedTable}`,
+                    operation: 'modify',
+                    targetTable: selectedTable,
+                    queryText: sql
+                });
+
+                closeModal('addColumnModal');
+                await loadTableColumns();
+                await loadTableData();
+                updateStatus(`Column "${columnName}" added - Ctrl+S to save`);
+
+            } catch (err) {
+                console.error('Add column failed:', err);
+                updateStatus(`Error: ${err.message}`);
+            }
+        }
+
+        // ================================================================
+        // SIDEBAR RESIZE
+        // ================================================================
+        (function setupSidebarResize() {
+            const sidebar = document.getElementById('sidebarPanel');
+            const handle = document.getElementById('resizeHandle');
+            let isResizing = false;
+
+            handle.addEventListener('mousedown', e => {
+                isResizing = true;
+                document.body.style.cursor = 'col-resize';
+                e.preventDefault();
+            });
+
+            document.addEventListener('mousemove', e => {
+                if (!isResizing) return;
+                const newWidth = Math.max(150, Math.min(400, e.clientX));
+                sidebar.style.width = newWidth + 'px';
+            });
+
+            document.addEventListener('mouseup', () => {
+                if (isResizing) {
+                    isResizing = false;
+                    document.body.style.cursor = '';
+                }
+            });
+        })();
+
+        // ================================================================
+        // KEYBOARD SHORTCUTS
+        // ================================================================
+        document.addEventListener('keydown', async (event) => {
+            // Cmd+C / Ctrl+C - Copy selected cell or rows to clipboard
+            if ((event.metaKey || event.ctrlKey) && event.key === 'c') {
+                // Don't intercept if we're editing a cell or in an input
+                if (editingCellInfo || document.activeElement.tagName === 'INPUT') {
+                    return;
+                }
+
+                // Priority: selected cell first, then selected rows
+                if (selectedCell) {
+                    event.preventDefault();
+                    await copyCellToClipboard();
+                } else if (selectedRowIds.size > 0 && gridData.length > 0) {
+                    event.preventDefault();
+                    await copySelectedRowsToClipboard();
+                }
+            }
+
+            // Cmd+A / Ctrl+A - Select all rows
+            if ((event.metaKey || event.ctrlKey) && event.key === 'a') {
+                // Don't intercept if we're editing a cell or in an input
+                if (editingCellInfo || document.activeElement.tagName === 'INPUT') {
+                    return;
+                }
+
+                if (selectedTable && gridData.length > 0) {
+                    event.preventDefault();
+                    selectAllRows();
+                }
+            }
+        });
+
+        /**
+         * Copy selected cell value to clipboard.
+         */
+        async function copyCellToClipboard() {
+            if (!selectedCell) return;
+
+            try {
+                const value = selectedCell.value;
+                let clipboardText;
+
+                if (value === null) {
+                    clipboardText = '';
+                } else if (value instanceof Uint8Array) {
+                    clipboardText = '[BLOB]';
+                } else {
+                    clipboardText = String(value);
+                }
+
+                await navigator.clipboard.writeText(clipboardText);
+                updateStatus('Copied cell value to clipboard');
+
+            } catch (err) {
+                console.error('Copy failed:', err);
+                updateStatus('Copy failed: ' + err.message);
+            }
+        }
+
+        /**
+         * Copy selected rows to clipboard as tab-separated values (TSV).
+         * Format: header row + data rows, tab-separated, newline-delimited.
+         */
+        async function copySelectedRowsToClipboard() {
+            if (selectedRowIds.size === 0 || gridData.length === 0) return;
+
+            try {
+                // Build header row
+                const headers = tableColumns.map(c => c.name).join('\t');
+
+                // Build data rows for selected rows only
+                const dataRows = [];
+                for (const row of gridData) {
+                    const rowId = row[0];
+                    if (selectedRowIds.has(rowId)) {
+                        // Skip rowid (index 0), get actual column values
+                        const values = [];
+                        for (let i = 1; i <= tableColumns.length; i++) {
+                            const val = row[i];
+                            if (val === null) {
+                                values.push('');
+                            } else if (val instanceof Uint8Array) {
+                                values.push('[BLOB]');
+                            } else {
+                                values.push(String(val));
+                            }
+                        }
+                        dataRows.push(values.join('\t'));
+                    }
+                }
+
+                // Combine header and data
+                const clipboardText = [headers, ...dataRows].join('\n');
+
+                // Copy to clipboard
+                await navigator.clipboard.writeText(clipboardText);
+                updateStatus(`Copied ${dataRows.length} row${dataRows.length > 1 ? 's' : ''} to clipboard`);
+
+            } catch (err) {
+                console.error('Copy failed:', err);
+                updateStatus('Copy failed: ' + err.message);
+            }
+        }
+
+        /**
+         * Select all rows in the current page.
+         * Optimized: updates selection state without full re-render, then updates UI.
+         */
+        function selectAllRows() {
+            if (gridData.length === 0) return;
+
+            // Clear cell selection when selecting rows
+            selectedCell = null;
+            updateCellSelectionUI();
+
+            // Check if all are already selected - if so, deselect all
+            const allSelected = gridData.every(row => selectedRowIds.has(row[0]));
+
+            if (allSelected) {
+                // Deselect all
+                selectedRowIds.clear();
+            } else {
+                // Select all visible rows
+                for (const row of gridData) {
+                    selectedRowIds.add(row[0]);
+                }
+            }
+
+            // Update UI without full re-render for better performance
+            updateRowSelectionUI();
+            updateToolbarButtons();
+        }
+
+        /**
+         * Update row selection UI without re-rendering entire grid.
+         * More efficient for large tables.
+         */
+        function updateRowSelectionUI() {
+            const rows = document.querySelectorAll('.data-row');
+            for (const row of rows) {
+                const rowId = parseInt(row.dataset.rowid, 10);
+                if (selectedRowIds.has(rowId)) {
+                    row.classList.add('selected');
+                } else {
+                    row.classList.remove('selected');
+                }
+            }
+        }
+
+        /**
+         * Handle click on '#' header to select/deselect all rows.
+         */
+        function onSelectAllClick(event) {
+            event.stopPropagation();
+            selectAllRows();
+        }
+
+        // ================================================================
+        // INITIALIZE
+        // ================================================================
+        initializeApp();
+    </script>
+    <!--BODY-->
+</body>
+</html>

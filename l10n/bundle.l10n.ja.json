@@ -1,0 +1,14 @@
+{
+  "Large Change Warning": "大規模変更の警告",
+  "You are about to make changes that affect many rows. Do you want to continue?": "多くの行に影響する変更を行おうとしています。続行しますか？",
+  "Continue": "続行",
+  "Cancel": "キャンセル",
+  "Large Selection Warning": "大規模選択の警告",
+  "You are attempting to select more than 10,000 rows. Large selections may impact performance. Do you want to open the export menu instead?": "10,000行以上を選択しようとしています。大規模な選択はパフォーマンスに影響を与える可能性があります。代わりにエクスポートメニューを開きますか？",
+  "Export data": "データをエクスポート",
+  "Unknown error": "不明なエラー",
+  "[{0}] occurred while applying unsaved changes": "未保存の変更を適用中に[{0}]が発生しました",
+  "The document was opened from a backup, but the unsaved changes could not be applied. The document will be opened in read-only mode.": "ドキュメントはバックアップから開かれましたが、未保存の変更を適用できませんでした。ドキュメントは読み取り専用モードで開かれます。",
+  "Document is read-only": "ドキュメントは読み取り専用です",
+  "Database too large for copy operation": "コピー操作には大きすぎるデータベース"
+}

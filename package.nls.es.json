@@ -1,0 +1,16 @@
+{
+  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer",
+  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer (detección automática)",
+  "sqlite-explorer.customEditor.readonly.displayName": "SQLite Explorer (solo lectura)",
+  "sqlite-explorer.customEditor.wasm.displayName": "SQLite Explorer (solo lectura, en memoria)",
+  "sqlite-explorer.config.maxFileSize.markdownDescription": "Tamaño máximo de archivo en MB que la extensión intentará abrir. Establezca en 0 para desactivar el límite. El límite estricto es de 4 GB, pero su sistema puede tener límites inferiores.\n\n__Advertencia__: Los archivos grandes pueden causar problemas de rendimiento o bloqueos.",
+  "sqlite-explorer.commands.exportTable.title": "Exportar tabla",
+  "sqlite-explorer.commands.refresh.title": "Actualizar base de datos",
+  "sqlite-explorer.config.instantCommit.never": "Nunca",
+  "sqlite-explorer.config.instantCommit.remoteOnly": "Solo remoto",
+  "sqlite-explorer.config.instantCommit.always": "Siempre",
+  "sqlite-explorer.config.instantCommit.markdownDescription": "Controla cuándo los cambios se guardan inmediatamente en la base de datos. Cuando está habilitado, las modificaciones se guardan instantáneamente sin necesidad de guardar manualmente.\n\n__Advertencia__: Los commits instantáneos usan sentencias SQL inversas para deshacer/rehacer, lo que puede no funcionar en todos los escenarios (por ejemplo, si otro proceso modificó la misma fila).",
+  "sqlite-explorer.config.doubleClickBehavior.modal": "Diálogo modal",
+  "sqlite-explorer.config.doubleClickBehavior.vscode": "Editor de VS Code",
+  "sqlite-explorer.config.doubleClickBehavior.markdownDescription": "Controla qué sucede al hacer doble clic en una celda en la vista de tabla.\n\n- **Diálogo modal**: Abre un diálogo modal para editar la celda (predeterminado)\n- **Editor de VS Code**: Abre el valor de la celda en una pestaña separada de VS Code"
+}

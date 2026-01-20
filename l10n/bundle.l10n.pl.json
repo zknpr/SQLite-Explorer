@@ -1,0 +1,14 @@
+{
+  "Large Change Warning": "Ostrzeżenie o dużej zmianie",
+  "You are about to make changes that affect many rows. Do you want to continue?": "Zamierzasz wprowadzić zmiany, które wpłyną na wiele wierszy. Czy chcesz kontynuować?",
+  "Continue": "Kontynuuj",
+  "Cancel": "Anuluj",
+  "Large Selection Warning": "Ostrzeżenie o dużym zaznaczeniu",
+  "You are attempting to select more than 10,000 rows. Large selections may impact performance. Do you want to open the export menu instead?": "Próbujesz zaznaczyć więcej niż 10 000 wierszy. Duże zaznaczenia mogą wpłynąć na wydajność. Czy chcesz zamiast tego otworzyć menu eksportu?",
+  "Export data": "Eksportuj dane",
+  "Unknown error": "Nieznany błąd",
+  "[{0}] occurred while applying unsaved changes": "[{0}] wystąpił podczas stosowania niezapisanych zmian",
+  "The document was opened from a backup, but the unsaved changes could not be applied. The document will be opened in read-only mode.": "Dokument został otwarty z kopii zapasowej, ale niezapisane zmiany nie mogły zostać zastosowane. Dokument zostanie otwarty w trybie tylko do odczytu.",
+  "Document is read-only": "Dokument jest tylko do odczytu",
+  "Database too large for copy operation": "Baza danych jest zbyt duża dla operacji kopiowania"
+}

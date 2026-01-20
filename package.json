@@ -1,0 +1,137 @@
+{
+  "icon": "media/icon.png",
+  "name": "sqlite-explorer",
+  "displayName": "SQLite Explorer",
+  "description": "A powerful SQLite database viewer and editor for VS Code",
+  "version": "1.0.0",
+  "publisher": "zknpr",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zknpr/sqlite-explorer"
+  },
+  "engines": {
+    "vscode": "^1.83.1"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "browser": "./out/extension-browser.js",
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
+  "l10n": "./l10n",
+  "contributes": {
+    "languages": [
+      {
+        "id": "sql",
+        "extensions": [
+          ".sqlite",
+          ".sqlite3",
+          ".db",
+          ".db3",
+          ".sdb",
+          ".s3db",
+          ".gpkg"
+        ]
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "sqlite-explorer.view",
+        "displayName": "SQLite Explorer",
+        "selector": [
+          {
+            "filenamePattern": "*.sqlite"
+          },
+          {
+            "filenamePattern": "*.sqlite3"
+          },
+          {
+            "filenamePattern": "*.db"
+          },
+          {
+            "filenamePattern": "*.db3"
+          },
+          {
+            "filenamePattern": "*.sdb"
+          },
+          {
+            "filenamePattern": "*.s3db"
+          }
+        ]
+      },
+      {
+        "viewType": "sqlite-explorer.option",
+        "displayName": "SQLite Explorer (Optional)",
+        "selector": [
+          {
+            "filenamePattern": "*"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "configuration": {
+      "title": "SQLite Explorer",
+      "properties": {
+        "sqliteExplorer.maxFileSize": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 4000,
+          "exclusiveMinimum": false,
+          "default": 200,
+          "markdownDescription": "Maximum file size in MB that can be opened. Set to 0 for unlimited."
+        },
+        "sqliteExplorer.defaultPageSize": {
+          "type": "number",
+          "minimum": 10,
+          "maximum": 100000,
+          "default": 1000,
+          "markdownDescription": "Default number of rows to display per page."
+        },
+        "sqliteExplorer.maxRows": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 10000000,
+          "default": 0,
+          "markdownDescription": "Maximum number of rows to load from a table. Set to 0 for unlimited."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "sqlite-explorer.refresh",
+        "title": "Refresh Database",
+        "category": "SQLite Explorer"
+      }
+    ]
+  },
+  "scripts": {
+    "clean": "rm -rf out && rm -rf assets",
+    "vscode:prepublish": "echo 'Skipping build for packaging'",
+    "compile:ext": "npm run compile:ext:cp & npm run compile:ext:js & wait",
+    "compile:ext:cp": "cp -r node_modules/@vscode/codicons node_modules/codicons",
+    "compile:ext:js": "node scripts/build.mjs",
+    "compile": "npm run clean && npm run compile:ext",
+    "build": "npm run compile",
+    "package": "npm run build && npx vsce package",
+    "package-all": "npm run build && npx vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "=1.83.1",
+    "esbuild": "^0.27.1",
+    "esbuild-plugin-polyfill-node": "^0.3.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@scure/base": "^2.0.0",
+    "@vscode/codicons": "^0.0.44",
+    "@vscode/extension-telemetry": "^1.2.0",
+    "@vscode/vsce": "^3.7.1",
+    "@workers/v8-value-serializer": "npm:@jsr/workers__v8-value-serializer@^0.5.6",
+    "sql.js": "^1.13.0"
+  }
+}

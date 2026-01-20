@@ -1,0 +1,14 @@
+{
+  "Large Change Warning": "大规模更改警告",
+  "You are about to make changes that affect many rows. Do you want to continue?": "您即将进行影响多行的更改。是否继续？",
+  "Continue": "继续",
+  "Cancel": "取消",
+  "Large Selection Warning": "大规模选择警告",
+  "You are attempting to select more than 10,000 rows. Large selections may impact performance. Do you want to open the export menu instead?": "您正在尝试选择超过 10,000 行。大规模选择可能影响性能。是否改为打开导出菜单？",
+  "Export data": "导出数据",
+  "Unknown error": "未知错误",
+  "[{0}] occurred while applying unsaved changes": "应用未保存的更改时发生 [{0}]",
+  "The document was opened from a backup, but the unsaved changes could not be applied. The document will be opened in read-only mode.": "文档已从备份打开，但无法应用未保存的更改。文档将以只读模式打开。",
+  "Document is read-only": "文档为只读",
+  "Database too large for copy operation": "数据库太大，无法执行复制操作"
+}

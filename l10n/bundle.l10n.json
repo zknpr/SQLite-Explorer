@@ -1,0 +1,14 @@
+{
+  "Large Change Warning": "Large Change Warning",
+  "You are about to make changes that affect many rows. Do you want to continue?": "You are about to make changes that affect many rows. Do you want to continue?",
+  "Continue": "Continue",
+  "Cancel": "Cancel",
+  "Large Selection Warning": "Large Selection Warning",
+  "You are attempting to select more than 10,000 rows. Large selections may impact performance. Do you want to open the export menu instead?": "You are attempting to select more than 10,000 rows. Large selections may impact performance. Do you want to open the export menu instead?",
+  "Export data": "Export data",
+  "Unknown error": "Unknown error",
+  "[{0}] occurred while applying unsaved changes": "[{0}] occurred while applying unsaved changes",
+  "The document was opened from a backup, but the unsaved changes could not be applied. The document will be opened in read-only mode.": "The document was opened from a backup, but the unsaved changes could not be applied. The document will be opened in read-only mode.",
+  "Document is read-only": "Document is read-only",
+  "Database too large for copy operation": "Database too large for copy operation"
+}

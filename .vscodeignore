@@ -1,0 +1,57 @@
+# Exclude everything by default
+**/*
+
+# Include compiled extension
+!out/
+!out/**
+
+# Include core UI and utilities
+!core/
+!core/**
+
+# Include WASM binary
+!assets/
+!assets/**
+
+# Include native binaries
+!natives/
+!natives/**
+
+# Include localization
+!l10n/
+!l10n/**
+
+# Include icon
+!media/icon.png
+
+# Include codicons for UI
+!node_modules/codicons/
+!node_modules/codicons/**
+
+# Include documentation
+!CHANGELOG.md
+!LICENSE.md
+!README.md
+
+# Include package manifest and translations
+!package.json
+!package.nls.*
+
+# Exclude source files (not needed in published extension)
+src/
+scripts/
+tsconfig.json
+CLAUDE.md
+
+# Exclude development files
+.git/
+.gitignore
+.tmp/
+*.local
+*.log
+
+# Exclude test files
+exampleFiles/
+mySolidTest/
+*.test.ts
+*.spec.ts

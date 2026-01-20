@@ -1,0 +1,16 @@
+{
+  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer",
+  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer (otomatik algılama)",
+  "sqlite-explorer.customEditor.readonly.displayName": "SQLite Explorer (salt okunur)",
+  "sqlite-explorer.customEditor.wasm.displayName": "SQLite Explorer (salt okunur, bellekte)",
+  "sqlite-explorer.config.maxFileSize.markdownDescription": "Uzantının açmayı deneyeceği maksimum dosya boyutu (MB). Limiti devre dışı bırakmak için 0 olarak ayarlayın. Kesin limit 4GB'dir, ancak sisteminiz daha düşük limitlere sahip olabilir.\n\n__Uyarı__: Büyük dosyalar performans sorunlarına veya donmalara neden olabilir.",
+  "sqlite-explorer.commands.exportTable.title": "Tabloyu dışa aktar",
+  "sqlite-explorer.commands.refresh.title": "Veritabanını yenile",
+  "sqlite-explorer.config.instantCommit.never": "Asla",
+  "sqlite-explorer.config.instantCommit.remoteOnly": "Yalnızca uzak",
+  "sqlite-explorer.config.instantCommit.always": "Her zaman",
+  "sqlite-explorer.config.instantCommit.markdownDescription": "Değişikliklerin veritabanına ne zaman anında kaydedileceğini kontrol eder. Etkinleştirildiğinde, değişiklikler manuel kaydetme gerektirmeden anında kaydedilir.\n\n__Uyarı__: Anında commit'ler geri al/yinele için ters SQL ifadeleri kullanır ve tüm senaryolarda çalışmayabilir (örneğin, başka bir işlem aynı satırı değiştirdiyse).",
+  "sqlite-explorer.config.doubleClickBehavior.modal": "Modal iletişim kutusu",
+  "sqlite-explorer.config.doubleClickBehavior.vscode": "VS Code Düzenleyici",
+  "sqlite-explorer.config.doubleClickBehavior.markdownDescription": "Tablo görünümünde bir hücreye çift tıkladığınızda ne olacağını kontrol eder.\n\n- **Modal iletişim kutusu**: Hücreyi düzenlemek için modal iletişim kutusu açar (varsayılan)\n- **VS Code Düzenleyici**: Hücre değerini ayrı bir VS Code sekmesinde açar"
+}

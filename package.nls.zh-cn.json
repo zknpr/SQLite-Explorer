@@ -1,0 +1,16 @@
+{
+  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer",
+  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer (自动检测)",
+  "sqlite-explorer.customEditor.readonly.displayName": "SQLite Explorer (只读)",
+  "sqlite-explorer.customEditor.wasm.displayName": "SQLite Explorer (只读，内存模式)",
+  "sqlite-explorer.config.maxFileSize.markdownDescription": "扩展程序尝试打开的最大文件大小（MB）。设置为 0 可禁用限制。硬限制为 4GB，但您的系统可能有更低的限制。\n\n__警告__：大文件可能导致性能问题或卡顿。",
+  "sqlite-explorer.commands.exportTable.title": "导出表",
+  "sqlite-explorer.commands.refresh.title": "刷新数据库",
+  "sqlite-explorer.config.instantCommit.never": "从不",
+  "sqlite-explorer.config.instantCommit.remoteOnly": "仅远程",
+  "sqlite-explorer.config.instantCommit.always": "总是",
+  "sqlite-explorer.config.instantCommit.markdownDescription": "控制更改何时立即保存到数据库。启用后，修改将立即保存，无需手动保存。\n\n__警告__：即时提交使用反向 SQL 语句进行撤销/重做，这在某些情况下可能不起作用（例如，如果另一个进程修改了同一行）。",
+  "sqlite-explorer.config.doubleClickBehavior.modal": "模态对话框",
+  "sqlite-explorer.config.doubleClickBehavior.vscode": "VS Code 编辑器",
+  "sqlite-explorer.config.doubleClickBehavior.markdownDescription": "控制在表视图中双击单元格时的行为。\n\n- **模态对话框**：打开模态对话框编辑单元格（默认）\n- **VS Code 编辑器**：在单独的 VS Code 标签页中打开单元格值"
+}

@@ -1,0 +1,14 @@
+{
+  "Large Change Warning": "Büyük değişiklik uyarısı",
+  "You are about to make changes that affect many rows. Do you want to continue?": "Birçok satırı etkileyen değişiklikler yapmak üzeresiniz. Devam etmek istiyor musunuz?",
+  "Continue": "Devam et",
+  "Cancel": "İptal",
+  "Large Selection Warning": "Büyük seçim uyarısı",
+  "You are attempting to select more than 10,000 rows. Large selections may impact performance. Do you want to open the export menu instead?": "10.000'den fazla satır seçmeye çalışıyorsunuz. Büyük seçimler performansı etkileyebilir. Bunun yerine dışa aktarma menüsünü açmak ister misiniz?",
+  "Export data": "Verileri dışa aktar",
+  "Unknown error": "Bilinmeyen hata",
+  "[{0}] occurred while applying unsaved changes": "Kaydedilmemiş değişiklikler uygulanırken [{0}] oluştu",
+  "The document was opened from a backup, but the unsaved changes could not be applied. The document will be opened in read-only mode.": "Belge yedekten açıldı, ancak kaydedilmemiş değişiklikler uygulanamadı. Belge salt okunur modda açılacak.",
+  "Document is read-only": "Belge salt okunur",
+  "Database too large for copy operation": "Veritabanı kopyalama işlemi için çok büyük"
+}

@@ -1,0 +1,16 @@
+{
+  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer",
+  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer (автоопределение)",
+  "sqlite-explorer.customEditor.readonly.displayName": "SQLite Explorer (только чтение)",
+  "sqlite-explorer.customEditor.wasm.displayName": "SQLite Explorer (только чтение, в памяти)",
+  "sqlite-explorer.config.maxFileSize.markdownDescription": "Максимальный размер файла в МБ, который расширение попытается открыть. Установите 0, чтобы отключить ограничение. Жёсткий лимит — 4 ГБ, но ваша система может иметь более низкие ограничения.\n\n__Внимание__: Большие файлы могут вызвать проблемы с производительностью или зависания.",
+  "sqlite-explorer.commands.exportTable.title": "Экспортировать таблицу",
+  "sqlite-explorer.commands.refresh.title": "Обновить базу данных",
+  "sqlite-explorer.config.instantCommit.never": "Никогда",
+  "sqlite-explorer.config.instantCommit.remoteOnly": "Только удалённо",
+  "sqlite-explorer.config.instantCommit.always": "Всегда",
+  "sqlite-explorer.config.instantCommit.markdownDescription": "Контролирует, когда изменения немедленно сохраняются в базу данных. При включении изменения сохраняются мгновенно без необходимости ручного сохранения.\n\n__Внимание__: Мгновенные коммиты используют обратные SQL-операторы для отмены/повтора, которые могут не работать во всех сценариях (например, если другой процесс изменил ту же строку).",
+  "sqlite-explorer.config.doubleClickBehavior.modal": "Модальное диалоговое окно",
+  "sqlite-explorer.config.doubleClickBehavior.vscode": "Редактор VS Code",
+  "sqlite-explorer.config.doubleClickBehavior.markdownDescription": "Контролирует, что происходит при двойном клике на ячейку в табличном представлении.\n\n- **Модальное диалоговое окно**: Открывает модальное окно для редактирования ячейки (по умолчанию)\n- **Редактор VS Code**: Открывает значение ячейки в отдельной вкладке VS Code"
+}

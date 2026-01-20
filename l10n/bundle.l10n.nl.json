@@ -1,0 +1,14 @@
+{
+  "Large Change Warning": "Waarschuwing grote wijziging",
+  "You are about to make changes that affect many rows. Do you want to continue?": "U staat op het punt wijzigingen aan te brengen die veel rijen beïnvloeden. Wilt u doorgaan?",
+  "Continue": "Doorgaan",
+  "Cancel": "Annuleren",
+  "Large Selection Warning": "Waarschuwing grote selectie",
+  "You are attempting to select more than 10,000 rows. Large selections may impact performance. Do you want to open the export menu instead?": "U probeert meer dan 10.000 rijen te selecteren. Grote selecties kunnen de prestaties beïnvloeden. Wilt u in plaats daarvan het exportmenu openen?",
+  "Export data": "Gegevens exporteren",
+  "Unknown error": "Onbekende fout",
+  "[{0}] occurred while applying unsaved changes": "[{0}] trad op tijdens het toepassen van niet-opgeslagen wijzigingen",
+  "The document was opened from a backup, but the unsaved changes could not be applied. The document will be opened in read-only mode.": "Het document is geopend vanuit een back-up, maar de niet-opgeslagen wijzigingen konden niet worden toegepast. Het document wordt geopend in alleen-lezen modus.",
+  "Document is read-only": "Document is alleen-lezen",
+  "Database too large for copy operation": "Database te groot voor kopieerbewerking"
+}

@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+out/
+assets/
+*.vsix
+
+# Temporary files
+.tmp/
+*.local
+*.log
+
+# Test files
+exampleFiles/
+mySolidTest/
+deno/
+
+# Generated files
+src/vendor/file-type-supported.ts
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# Archives
+*.zip
+*.tar.gz

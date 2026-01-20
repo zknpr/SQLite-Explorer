@@ -1,0 +1,14 @@
+{
+  "Large Change Warning": "Предупреждение о крупном изменении",
+  "You are about to make changes that affect many rows. Do you want to continue?": "Вы собираетесь внести изменения, затрагивающие много строк. Продолжить?",
+  "Continue": "Продолжить",
+  "Cancel": "Отмена",
+  "Large Selection Warning": "Предупреждение о большом выделении",
+  "You are attempting to select more than 10,000 rows. Large selections may impact performance. Do you want to open the export menu instead?": "Вы пытаетесь выбрать более 10 000 строк. Большие выделения могут повлиять на производительность. Открыть меню экспорта вместо этого?",
+  "Export data": "Экспортировать данные",
+  "Unknown error": "Неизвестная ошибка",
+  "[{0}] occurred while applying unsaved changes": "[{0}] произошла при применении несохранённых изменений",
+  "The document was opened from a backup, but the unsaved changes could not be applied. The document will be opened in read-only mode.": "Документ был открыт из резервной копии, но несохранённые изменения не удалось применить. Документ будет открыт в режиме только для чтения.",
+  "Document is read-only": "Документ доступен только для чтения",
+  "Database too large for copy operation": "База данных слишком велика для операции копирования"
+}

@@ -1,0 +1,16 @@
+{
+  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer",
+  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer (自動偵測)",
+  "sqlite-explorer.customEditor.readonly.displayName": "SQLite Explorer (唯讀)",
+  "sqlite-explorer.customEditor.wasm.displayName": "SQLite Explorer (唯讀，記憶體模式)",
+  "sqlite-explorer.config.maxFileSize.markdownDescription": "擴充功能嘗試開啟的最大檔案大小（MB）。設為 0 可停用限制。硬性限制為 4GB，但您的系統可能有更低的限制。\n\n__警告__：大型檔案可能導致效能問題或當機。",
+  "sqlite-explorer.commands.exportTable.title": "匯出資料表",
+  "sqlite-explorer.commands.refresh.title": "重新整理資料庫",
+  "sqlite-explorer.config.instantCommit.never": "永不",
+  "sqlite-explorer.config.instantCommit.remoteOnly": "僅遠端",
+  "sqlite-explorer.config.instantCommit.always": "總是",
+  "sqlite-explorer.config.instantCommit.markdownDescription": "控制變更何時立即儲存至資料庫。啟用時，修改將立即儲存，無需手動儲存。\n\n__警告__：即時提交使用反向 SQL 語句進行復原/重做，這在某些情況下可能無法運作（例如，如果另一個程序修改了同一列）。",
+  "sqlite-explorer.config.doubleClickBehavior.modal": "強制回應對話方塊",
+  "sqlite-explorer.config.doubleClickBehavior.vscode": "VS Code 編輯器",
+  "sqlite-explorer.config.doubleClickBehavior.markdownDescription": "控制在表格檢視中按兩下儲存格時的行為。\n\n- **強制回應對話方塊**：開啟強制回應對話方塊以編輯儲存格（預設）\n- **VS Code 編輯器**：在單獨的 VS Code 索引標籤中開啟儲存格值"
+}

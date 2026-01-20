@@ -1,0 +1,16 @@
+{
+  "sqlite-explorer.customEditor.option.displayName": "SQLite Explorer",
+  "sqlite-explorer.customEditor.view.displayName": "SQLite Explorer (automatische detectie)",
+  "sqlite-explorer.customEditor.readonly.displayName": "SQLite Explorer (alleen-lezen)",
+  "sqlite-explorer.customEditor.wasm.displayName": "SQLite Explorer (alleen-lezen, in geheugen)",
+  "sqlite-explorer.config.maxFileSize.markdownDescription": "Maximale bestandsgrootte in MB die de extensie probeert te openen. Stel in op 0 om de limiet uit te schakelen. De harde limiet is 4GB, maar uw systeem kan lagere limieten hebben.\n\n__Waarschuwing__: Grote bestanden kunnen prestatieproblemen of vastlopen veroorzaken.",
+  "sqlite-explorer.commands.exportTable.title": "Tabel exporteren",
+  "sqlite-explorer.commands.refresh.title": "Database vernieuwen",
+  "sqlite-explorer.config.instantCommit.never": "Nooit",
+  "sqlite-explorer.config.instantCommit.remoteOnly": "Alleen extern",
+  "sqlite-explorer.config.instantCommit.always": "Altijd",
+  "sqlite-explorer.config.instantCommit.markdownDescription": "Bepaalt wanneer wijzigingen onmiddellijk naar de database worden opgeslagen. Wanneer ingeschakeld, worden wijzigingen direct opgeslagen zonder handmatig opslaan.\n\n__Waarschuwing__: Directe commits gebruiken omgekeerde SQL-instructies voor ongedaan maken/opnieuw, die mogelijk niet in alle scenario's werken (bijv. als een ander proces dezelfde rij heeft gewijzigd).",
+  "sqlite-explorer.config.doubleClickBehavior.modal": "Modaal dialoogvenster",
+  "sqlite-explorer.config.doubleClickBehavior.vscode": "VS Code Editor",
+  "sqlite-explorer.config.doubleClickBehavior.markdownDescription": "Bepaalt wat er gebeurt wanneer u dubbelklikt op een cel in de tabelweergave.\n\n- **Modaal dialoogvenster**: Opent een modaal venster om de cel te bewerken (standaard)\n- **VS Code Editor**: Opent de celwaarde in een apart VS Code-tabblad"
+}
