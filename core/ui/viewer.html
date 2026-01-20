@@ -1567,7 +1567,7 @@
                     const originalColIdx = columnIndexMap.get(col.name);
                     const value = row[originalColIdx + 1]; // +1 because row[0] is rowid
                     const displayValue = formatCellValue(value);
-                    const isNull = value === null;
+                    const isNull = value === null || value === undefined;
                     const colWidth = columnWidths[col.name] || 120;
                     const isCellSelected = selectedCell && selectedCell.rowIdx === rowIdx && selectedCell.colIdx === originalColIdx;
                     const isColPinned = pinnedColumns.has(col.name);
@@ -1599,7 +1599,8 @@
         }
 
         function formatCellValue(value) {
-            if (value === null) return 'NULL';
+            // Handle null and undefined as NULL display
+            if (value === null || value === undefined) return 'NULL';
             if (value instanceof Uint8Array) return '[BLOB]';
             if (typeof value === 'string' && value.length > 100) {
                 return escapeHtml(value.substring(0, 100)) + '...';

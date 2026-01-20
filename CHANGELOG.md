@@ -7,6 +7,7 @@
 - Fixed telemetry error when connection string is empty
 - Fixed spam-clicking on cell borders preventing editing
 - Fixed cell selection blocking edit mode on other cells
+- Fixed empty column values showing 'undefined' instead of NULL
 - Improved cell selection speed (reduced debounce from 200ms to 80ms)
 - Added comprehensive error handling to prevent UI from breaking
 - Added failsafe timeout to recover from stuck states
