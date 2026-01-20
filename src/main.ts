@@ -19,9 +19,13 @@ export let GlobalOutputChannel: vsc.OutputChannel|null = null;
  * Registers custom editors for SQLite files and sets up commands.
  */
 export async function activate(context: vsc.ExtensionContext) {
-  // Telemetry is disabled (empty connection string)
-  const reporter = new TelemetryReporter(TelemetryConnectionString);
-  context.subscriptions.push(reporter);
+  // Only create TelemetryReporter if connection string is provided.
+  // An empty string causes the reporter to throw errors on every event.
+  let reporter: TelemetryReporter | undefined;
+  if (TelemetryConnectionString) {
+    reporter = new TelemetryReporter(TelemetryConnectionString);
+    context.subscriptions.push(reporter);
+  }
 
   console.log('[INFO]', new Date().toISOString(), '- Extension activated!');
 
@@ -64,7 +68,7 @@ const globalProviderSubs = new WeakSet<vsc.Disposable>();
  * Activate the custom editor providers for SQLite files.
  * Creates both the default view and optional view providers.
  */
-export async function activateProviders(context: vsc.ExtensionContext, reporter: TelemetryReporter) {
+export async function activateProviders(context: vsc.ExtensionContext, reporter?: TelemetryReporter) {
   // Clean up previous providers
   const prevSubs = context.subscriptions.filter(x => globalProviderSubs.has(x));
   for (const sub of prevSubs) context.subscriptions.splice(context.subscriptions.indexOf(sub), 1);

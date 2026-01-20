@@ -1018,6 +1018,11 @@
         // Cell editing state
         let editingCellInfo = null;
         let activeCellInput = null;
+        let isSavingCell = false; // Guard against concurrent save operations
+        let isLoadingData = false; // Guard against interactions during data loading
+        let lastDoubleClickTime = 0; // Debounce double-clicks
+        let isTransitioningEdit = false; // Guard during edit mode transition (prevents border click issues)
+        let transitionLockTimeout = null; // Failsafe timeout to release stuck lock
 
         // Cell selection state (for copying individual values)
         let selectedCell = null; // { rowIdx, colIdx, rowId, value }
@@ -1357,6 +1362,10 @@
         async function loadTableData() {
             if (!selectedTable || !isDbConnected) return;
 
+            // Prevent concurrent load operations
+            if (isLoadingData) return;
+            isLoadingData = true;
+
             showLoading();
 
             try {
@@ -1410,6 +1419,8 @@
                 console.error('Error loading data:', err);
                 updateStatus(`Error: ${err.message}`);
                 showErrorState(err.message);
+            } finally {
+                isLoadingData = false;
             }
         }
 
@@ -1608,39 +1619,57 @@
          * Uses debounce to allow double-click (edit) to take precedence.
          */
         function onCellClick(event, rowIdx, colIdx, rowId) {
-            event.stopPropagation(); // Prevent row click from firing
+            try {
+                event.stopPropagation(); // Prevent row click from firing
 
-            // Clear any pending cell click timer
-            if (cellClickTimer) {
-                clearTimeout(cellClickTimer);
-                cellClickTimer = null;
-            }
+                // Ignore clicks during loading, saving, edit transition, OR while editing
+                // When a cell is being edited, clicks should only trigger blur on the input
+                if (isLoadingData || isSavingCell || isTransitioningEdit || editingCellInfo) return;
 
-            // Delay selection to allow double-click to fire
-            cellClickTimer = setTimeout(() => {
-                cellClickTimer = null;
-
-                // Don't select if we're now in editing mode (double-click happened)
-                if (editingCellInfo) return;
-
-                const value = gridData[rowIdx][colIdx + 1];
-
-                // Toggle cell selection
-                if (selectedCell && selectedCell.rowIdx === rowIdx && selectedCell.colIdx === colIdx) {
-                    // Already selected - deselect
-                    selectedCell = null;
-                } else {
-                    // Select this cell
-                    selectedCell = { rowIdx, colIdx, rowId, value };
-                    // Clear row selection when selecting a cell
-                    selectedRowIds.clear();
+                // Clear any pending cell click timer
+                if (cellClickTimer) {
+                    clearTimeout(cellClickTimer);
+                    cellClickTimer = null;
                 }
 
-                // Update UI efficiently
-                updateCellSelectionUI();
-                updateRowSelectionUI();
-                updateToolbarButtons();
-            }, 200);
+                // Delay selection to allow double-click to fire
+                cellClickTimer = setTimeout(() => {
+                    try {
+                        cellClickTimer = null;
+
+                        // Don't select if we're now in editing mode (double-click happened)
+                        if (editingCellInfo) return;
+
+                        // Ignore if state changed during timeout
+                        if (isLoadingData || isSavingCell || isTransitioningEdit) return;
+
+                        // Guard against stale data
+                        if (!gridData[rowIdx]) return;
+
+                        const value = gridData[rowIdx][colIdx + 1];
+
+                        // Toggle cell selection
+                        if (selectedCell && selectedCell.rowIdx === rowIdx && selectedCell.colIdx === colIdx) {
+                            // Already selected - deselect
+                            selectedCell = null;
+                        } else {
+                            // Select this cell
+                            selectedCell = { rowIdx, colIdx, rowId, value };
+                            // Clear row selection when selecting a cell
+                            selectedRowIds.clear();
+                        }
+
+                        // Update UI efficiently
+                        updateCellSelectionUI();
+                        updateRowSelectionUI();
+                        updateToolbarButtons();
+                    } catch (err) {
+                        console.error('Error in cell click timeout:', err);
+                    }
+                }, 80);
+            } catch (err) {
+                console.error('Error in onCellClick:', err);
+            }
         }
 
         /**
@@ -1664,59 +1693,175 @@
             }
         }
 
-        function onCellDoubleClick(event, rowIdx, colIdx, rowId) {
-            event.stopPropagation();
+        async function onCellDoubleClick(event, rowIdx, colIdx, rowId) {
+            // Wrap entire function in try-catch to prevent UI from breaking
+            try {
+                event.stopPropagation();
+                event.preventDefault(); // Prevent text selection on rapid clicks
 
-            // Cancel any pending cell click timer since we're handling a double-click
-            if (cellClickTimer) {
-                clearTimeout(cellClickTimer);
-                cellClickTimer = null;
+                // CRITICAL: If we're already editing a cell, ignore double-clicks entirely
+                // This prevents issues when clicking on cell borders while the text cursor is active
+                // The only way to exit edit mode should be Enter, Escape, or blur (click outside)
+                if (editingCellInfo) {
+                    return;
+                }
+
+                // CRITICAL: Set transition guard IMMEDIATELY at entry point
+                // This must be the FIRST check to prevent border-click race conditions
+                // where multiple cells fire events simultaneously
+                if (isTransitioningEdit) {
+                    return;
+                }
+                // Lock immediately - before ANY other checks
+                isTransitioningEdit = true;
+
+                // Clear any existing failsafe timeout
+                if (transitionLockTimeout) {
+                    clearTimeout(transitionLockTimeout);
+                }
+                // Set failsafe timeout - if lock is held for more than 500ms, force release
+                // This prevents the UI from getting stuck if something goes wrong
+                transitionLockTimeout = setTimeout(() => {
+                    if (isTransitioningEdit) {
+                        console.warn('Transition lock was stuck - force releasing');
+                        isTransitioningEdit = false;
+                    }
+                    transitionLockTimeout = null;
+                }, 500);
+
+                // Helper to release lock safely
+                const releaseLock = (delay = 50) => {
+                    if (transitionLockTimeout) {
+                        clearTimeout(transitionLockTimeout);
+                        transitionLockTimeout = null;
+                    }
+                    setTimeout(() => { isTransitioningEdit = false; }, delay);
+                };
+
+                // Debounce rapid double-clicks (300ms minimum between double-clicks)
+                const now = Date.now();
+                if (now - lastDoubleClickTime < 300) {
+                    releaseLock();
+                    return;
+                }
+                lastDoubleClickTime = now;
+
+                // Prevent interactions during save or load operations
+                if (isSavingCell || isLoadingData) {
+                    releaseLock();
+                    return;
+                }
+
+                // Cancel any pending cell click timer since we're handling a double-click
+                if (cellClickTimer) {
+                    clearTimeout(cellClickTimer);
+                    cellClickTimer = null;
+                }
+
+                // Cancel any pending row click since we're handling a double-click
+                if (rowClickTimer) {
+                    clearTimeout(rowClickTimer);
+                    rowClickTimer = null;
+                }
+
+                // Only allow editing for tables, not views
+                // Views in SQLite are read-only unless they have INSTEAD OF triggers
+                if (selectedTableType !== 'table') {
+                    updateStatus('Views are read-only');
+                    releaseLock();
+                    return;
+                }
+
+                // Clear any existing cell selection when entering edit mode
+                // Must also update UI to remove the visual selection class
+                selectedCell = null;
+                selectedRowIds.clear();
+                updateCellSelectionUI();
+                updateRowSelectionUI();
+
+                // Use closest() to ensure we get the <td> cell, not a child element
+                // This is important because event.target could be an inner element
+                const cell = event.target.closest('td.data-cell');
+                if (!cell) {
+                    releaseLock();
+                    return;
+                }
+
+                // Validate cell matches expected indices (prevents wrong cell from border clicks)
+                const cellRowIdx = parseInt(cell.dataset.rowidx, 10);
+                const cellColIdx = parseInt(cell.dataset.colidx, 10);
+                if (isNaN(cellRowIdx) || isNaN(cellColIdx) || cellRowIdx !== rowIdx || cellColIdx !== colIdx) {
+                    // Click landed on a different cell than expected - abort
+                    console.warn('Cell mismatch: expected', rowIdx, colIdx, 'got', cellRowIdx, cellColIdx);
+                    releaseLock();
+                    return;
+                }
+
+                const column = tableColumns[colIdx];
+                if (!column) {
+                    releaseLock();
+                    return;
+                }
+
+                // Verify gridData still has this row (it might have been re-rendered)
+                if (!gridData[rowIdx]) {
+                    releaseLock();
+                    return;
+                }
+
+                const currentValue = gridData[rowIdx][colIdx + 1];
+
+                // Store the editing state: row index, column index, row ID, column name, and original value
+                editingCellInfo = { rowIdx, colIdx, rowId, columnName: column.name, originalValue: currentValue };
+
+                // Remove cell-selected class if present (in case UI update didn't catch it)
+                cell.classList.remove('cell-selected');
+
+                // Add editing class to cell for styling (removes padding, adds border)
+                cell.classList.add('editing');
+
+                // Create inline input element with the current value
+                // Null values are displayed as empty string for editing
+                cell.innerHTML = `<input type="text" class="cell-input" value="${currentValue === null ? '' : escapeHtml(String(currentValue))}">`;
+
+                activeCellInput = cell.querySelector('input');
+
+                // Guard against input creation failure
+                if (!activeCellInput) {
+                    console.error('Failed to create cell input');
+                    editingCellInfo = null;
+                    cell.classList.remove('editing');
+                    releaseLock();
+                    return;
+                }
+
+                activeCellInput.focus();
+                activeCellInput.select();
+
+                activeCellInput.addEventListener('keydown', onCellInputKeydown);
+                activeCellInput.addEventListener('blur', onCellInputBlur);
+
+                // Clear failsafe timeout since we completed successfully
+                if (transitionLockTimeout) {
+                    clearTimeout(transitionLockTimeout);
+                    transitionLockTimeout = null;
+                }
+                // Release lock after a short delay to ensure input is ready
+                setTimeout(() => { isTransitioningEdit = false; }, 100);
+
+            } catch (err) {
+                // Catch any uncaught exceptions to prevent UI from breaking
+                console.error('Error in onCellDoubleClick:', err);
+                // Reset all state to recover
+                isTransitioningEdit = false;
+                isSavingCell = false;
+                if (transitionLockTimeout) {
+                    clearTimeout(transitionLockTimeout);
+                    transitionLockTimeout = null;
+                }
+                cleanupCellEdit();
+                updateStatus('Error: ' + (err.message || String(err)));
             }
-
-            // Cancel any pending row click since we're handling a double-click
-            if (rowClickTimer) {
-                clearTimeout(rowClickTimer);
-                rowClickTimer = null;
-            }
-
-            // Only allow editing for tables, not views
-            // Views in SQLite are read-only unless they have INSTEAD OF triggers
-            if (selectedTableType !== 'table') {
-                updateStatus('Views are read-only');
-                return;
-            }
-
-            // If already editing another cell, save it first
-            if (editingCellInfo) {
-                saveCellEdit();
-            }
-
-            // Use closest() to ensure we get the <td> cell, not a child element
-            // This is important because event.target could be an inner element
-            const cell = event.target.closest('td.data-cell');
-            if (!cell) return; // Guard against null cell reference
-
-            const column = tableColumns[colIdx];
-            if (!column) return; // Guard against invalid column index
-
-            const currentValue = gridData[rowIdx][colIdx + 1];
-
-            // Store the editing state: row index, column index, row ID, column name, and original value
-            editingCellInfo = { rowIdx, colIdx, rowId, columnName: column.name, originalValue: currentValue };
-
-            // Add editing class to cell for styling (removes padding, adds border)
-            cell.classList.add('editing');
-
-            // Create inline input element with the current value
-            // Null values are displayed as empty string for editing
-            cell.innerHTML = `<input type="text" class="cell-input" value="${currentValue === null ? '' : escapeHtml(String(currentValue))}">`;
-
-            activeCellInput = cell.querySelector('input');
-            activeCellInput.focus();
-            activeCellInput.select();
-
-            activeCellInput.addEventListener('keydown', onCellInputKeydown);
-            activeCellInput.addEventListener('blur', onCellInputBlur);
         }
 
         /**
@@ -1759,6 +1904,8 @@
          * 6. Refresh the grid to show the updated value
          */
         async function saveCellEdit() {
+            // Guard against concurrent save operations (spam clicking protection)
+            if (isSavingCell) return;
             if (!editingCellInfo || !activeCellInput) return;
 
             const { rowIdx, colIdx, rowId, columnName, originalValue } = editingCellInfo;
@@ -1803,6 +1950,8 @@
             const updateSql = `UPDATE "${selectedTable}" SET "${columnName}" = ${sqlValue} WHERE rowid = ${rowId}`;
 
             try {
+                // Set saving flag to prevent concurrent operations
+                isSavingCell = true;
                 updateStatus('Saving...');
 
                 // Execute the UPDATE query via RPC to the extension host
@@ -1859,6 +2008,9 @@
 
                 updateStatus(`Save failed: ${errorMessage}`);
                 // Don't cleanup - let user retry or cancel
+            } finally {
+                // Always clear the saving flag
+                isSavingCell = false;
             }
         }
 
@@ -1963,7 +2115,7 @@
 
                 renderDataGrid();
                 updateToolbarButtons();
-            }, 200); // 200ms delay to allow double-click detection
+            }, 80); // Short delay to allow double-click detection
         }
 
         // ================================================================

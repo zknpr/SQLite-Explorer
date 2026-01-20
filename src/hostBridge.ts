@@ -82,7 +82,7 @@ export class HostBridge implements ToastService {
   async initialize() {
     const { document } = this;
     if (this.webviews.has(document.uri)) {
-      this.reporter.sendTelemetryEvent("open");
+      this.reporter?.sendTelemetryEvent("open");
       // Return connection info instead of proxying databaseOps directly.
       // The webview will call executeQuery(), serializeDatabase(), etc. directly on hostBridge.
       return {

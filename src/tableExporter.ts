@@ -30,7 +30,7 @@ interface DbParams {
  */
 export async function exportTableCommand(
   context: vsc.ExtensionContext,
-  reporter: TelemetryReporter,
+  reporter: TelemetryReporter | undefined,
   dbParams: DbParams,
   columns: string[],
   _dbOptions?: any,

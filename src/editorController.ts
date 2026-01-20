@@ -67,7 +67,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
   constructor(
     readonly viewType: string,
     readonly context: vsc.ExtensionContext,
-    readonly reporter: TelemetryReporter,
+    readonly reporter: TelemetryReporter | undefined,
     readonly outputChannel: vsc.OutputChannel | null,
     readonly isVerified: boolean,
     readonly accessToken?: string,
@@ -451,7 +451,7 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
 export function registerEditorProvider(
   viewType: string,
   context: vsc.ExtensionContext,
-  reporter: TelemetryReporter,
+  reporter: TelemetryReporter | undefined,
   outputChannel: vsc.OutputChannel | null,
   { verified, accessToken, readOnly }: { verified: boolean, accessToken?: string, readOnly?: boolean }
 ) {
