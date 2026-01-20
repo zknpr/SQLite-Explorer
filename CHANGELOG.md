@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.3
+
+### New Features
+
+- Column selection: Click on column header to select all cells in a column
+- Cmd/Ctrl+Click on column header to add column to existing selection
+- Visual indicator on column header when entire column is selected
+
 ## 1.0.2
 
 ### New Features

@@ -325,7 +325,7 @@
         .header-top {
             display: flex;
             align-items: center;
-            justify-content: space-between;
+            gap: 4px;
             height: 22px;
             cursor: pointer;
         }
@@ -360,6 +360,8 @@
             display: block;
             overflow: hidden;
             text-overflow: ellipsis;
+            flex: 1;
+            min-width: 0;
         }
 
         /* Sort indicator - displayed inline next to column name */
@@ -462,17 +464,28 @@
         }
 
         .header-cell:hover .pin-icon,
+        .header-cell:hover .select-column-icon,
         .data-cell.row-number:hover .pin-icon,
         .pin-icon.pinned {
             opacity: 0.5;
         }
 
-        .pin-icon:hover {
+        .pin-icon:hover,
+        .select-column-icon:hover {
             opacity: 1 !important;
         }
 
         .pin-icon.pinned {
             opacity: 0.8;
+        }
+
+        /* Select column icon - appears on hover, left of pin icon */
+        .select-column-icon {
+            opacity: 0;
+            cursor: pointer;
+            margin-right: 4px;
+            font-size: 12px;
+            vertical-align: middle;
         }
 
         .data-row {
@@ -526,9 +539,15 @@
         }
 
         .data-cell.cell-selected {
-            outline: 2px solid var(--accent-color);
-            outline-offset: -2px;
             background: var(--active-bg);
+        }
+
+        /* Header cell styling when entire column is selected */
+        .header-cell.column-selected {
+            background: var(--active-bg) !important;
+        }
+        .header-cell.column-selected .header-text {
+            color: var(--active-text);
         }
 
         .data-cell.editing {
@@ -1505,17 +1524,18 @@
                 const sortIndicator = isSorted ? `<span class="sort-indicator">${sortAscending ? '▲' : '▼'}</span>` : '';
                 html += `<th class="header-cell ${pinnedClass}" style="width:${colWidth}px;min-width:${colWidth}px;max-width:${colWidth}px;${pinnedStyle}" data-column="${escapeHtml(col.name)}">`;
                 html += `<div class="header-content">`;
-                // Top row: column name + sort indicator + pin icon
+                // Top row: column name + sort indicator + icons (select, pin)
                 html += `<div class="header-top" onclick="onColumnSort('${escapeHtml(col.name)}')">`;
                 html += `<span class="header-text">${escapeHtml(col.name)}${sortIndicator}</span>`;
+                html += `<span class="select-column-icon codicon codicon-selection" onclick="event.stopPropagation(); onColumnHeaderClick(event, '${escapeHtml(col.name)}')" title="Select entire column"></span>`;
                 html += `<span class="pin-icon codicon codicon-pin ${isPinned ? 'pinned' : ''}" onclick="event.stopPropagation(); toggleColumnPin(event, '${escapeHtml(col.name)}')" title="${isPinned ? 'Unpin column' : 'Pin column'}"></span>`;
                 html += `</div>`;
                 // Bottom row: filter input
-                html += `<div class="header-bottom">`;
+                html += `<div class="header-bottom" onclick="event.stopPropagation()">`;
                 html += `<input type="text" class="column-filter" data-column="${escapeHtml(col.name)}" value="${escapeHtml(filterValue)}" placeholder="Filter..." onclick="event.stopPropagation()" onkeyup="onColumnFilterChange(event, '${escapeHtml(col.name)}')">`;
                 html += `</div>`;
                 html += `</div>`; // End header-content
-                html += `<div class="resize-handle" onmousedown="startColumnResize(event, '${escapeHtml(col.name)}')"></div>`;
+                html += `<div class="resize-handle" onmousedown="event.stopPropagation(); startColumnResize(event, '${escapeHtml(col.name)}')"></div>`;
                 html += `</th>`;
             }
             html += '</tr></thead><tbody>';
@@ -1773,21 +1793,41 @@
         /**
          * Update cell selection UI without full re-render.
          * Supports multi-cell selection.
+         * Optimized for performance with large selections.
          */
         function updateCellSelectionUI() {
-            // Remove selection from all cells
-            const allCells = document.querySelectorAll('.data-cell.cell-selected');
-            for (const cell of allCells) {
-                cell.classList.remove('cell-selected');
+            // Build a Set of selected cell keys for O(1) lookup
+            const selectedSet = new Set();
+            const selectedByColumn = new Map();
+            for (const sc of selectedCells) {
+                selectedSet.add(`${sc.rowIdx},${sc.colIdx}`);
+                // Count cells per column for header highlighting
+                selectedByColumn.set(sc.colIdx, (selectedByColumn.get(sc.colIdx) || 0) + 1);
             }
 
-            // Add selection to all currently selected cells
-            for (const sc of selectedCells) {
-                const cell = document.querySelector(
-                    `.data-cell[data-rowidx="${sc.rowIdx}"][data-colidx="${sc.colIdx}"]`
-                );
-                if (cell) {
+            // Update all data cells in one pass
+            const allDataCells = document.querySelectorAll('.data-cell[data-rowidx]');
+            for (const cell of allDataCells) {
+                const rowIdx = cell.dataset.rowidx;
+                const colIdx = cell.dataset.colidx;
+                const key = `${rowIdx},${colIdx}`;
+                if (selectedSet.has(key)) {
                     cell.classList.add('cell-selected');
+                } else {
+                    cell.classList.remove('cell-selected');
+                }
+            }
+
+            // Update column headers - highlight if entire column is selected
+            const allHeaders = document.querySelectorAll('.header-cell[data-column]');
+            for (const header of allHeaders) {
+                const colName = header.dataset.column;
+                const colIdx = tableColumns.findIndex(c => c.name === colName);
+                const count = selectedByColumn.get(colIdx) || 0;
+                if (gridData.length > 0 && count === gridData.length) {
+                    header.classList.add('column-selected');
+                } else {
+                    header.classList.remove('column-selected');
                 }
             }
         }
@@ -2315,6 +2355,76 @@
                 sortAscending = true;
             }
             loadTableData();
+        }
+
+        /**
+         * Handle click on column header to select all cells in the column.
+         * - Click: Toggle column selection (select if not selected, deselect if already selected)
+         * - Cmd/Ctrl+Click: Add/remove column cells from existing selection
+         */
+        function onColumnHeaderClick(event, columnName) {
+            event.stopPropagation();
+
+            // Find the column index
+            const colIdx = tableColumns.findIndex(c => c.name === columnName);
+            if (colIdx === -1) return;
+
+            // Clear row selection when selecting cells
+            selectedRowIds.clear();
+
+            // Check if entire column is already selected
+            const columnCellCount = gridData.length;
+            let selectedInColumn = 0;
+            for (const sc of selectedCells) {
+                if (sc.colIdx === colIdx) selectedInColumn++;
+            }
+            const isColumnFullySelected = columnCellCount > 0 && selectedInColumn === columnCellCount;
+
+            // Handle Cmd+Click (Mac) or Ctrl+Click (Windows/Linux) to toggle column in selection
+            if (event.metaKey || event.ctrlKey) {
+                if (isColumnFullySelected) {
+                    // Remove this column's cells from selection
+                    selectedCells = selectedCells.filter(sc => sc.colIdx !== colIdx);
+                } else {
+                    // Add all cells in this column to the selection
+                    for (let rowIdx = 0; rowIdx < gridData.length; rowIdx++) {
+                        const rowId = gridData[rowIdx][0];
+                        const value = gridData[rowIdx][colIdx + 1];
+                        // Check if already selected
+                        const exists = selectedCells.some(sc => sc.rowIdx === rowIdx && sc.colIdx === colIdx);
+                        if (!exists) {
+                            selectedCells.push({ rowIdx, colIdx, rowId, value });
+                        }
+                    }
+                    // Update last selected for shift+click
+                    if (gridData.length > 0) {
+                        lastSelectedCell = { rowIdx: 0, colIdx, rowId: gridData[0][0], value: gridData[0][colIdx + 1] };
+                    }
+                }
+            } else {
+                // Single click - toggle behavior
+                if (isColumnFullySelected) {
+                    // Deselect - clear selection
+                    selectedCells = [];
+                    lastSelectedCell = null;
+                } else {
+                    // Select only this column's cells
+                    selectedCells = [];
+                    for (let rowIdx = 0; rowIdx < gridData.length; rowIdx++) {
+                        const rowId = gridData[rowIdx][0];
+                        const value = gridData[rowIdx][colIdx + 1];
+                        selectedCells.push({ rowIdx, colIdx, rowId, value });
+                    }
+                    // Update last selected for shift+click
+                    if (gridData.length > 0) {
+                        lastSelectedCell = { rowIdx: 0, colIdx, rowId: gridData[0][0], value: gridData[0][colIdx + 1] };
+                    }
+                }
+            }
+
+            updateCellSelectionUI();
+            updateRowSelectionUI();
+            updateToolbarButtons();
         }
 
         function onFilterChange() {
