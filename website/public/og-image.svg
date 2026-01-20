@@ -1,0 +1,16 @@
+<!--
+  OG Image Placeholder
+
+  This is a placeholder SVG for Open Graph social sharing previews.
+  Replace with an actual PNG (1200x630) showing the extension UI.
+
+  Save as: public/og-image.png
+-->
+<svg width="1200" height="630" viewBox="0 0 1200 630" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="630" fill="#0a0a0a"/>
+  <rect x="100" y="100" width="1000" height="430" rx="16" fill="#1a1a1a" stroke="#262626" stroke-width="2"/>
+  <text x="600" y="280" text-anchor="middle" fill="#ededed" font-family="system-ui" font-size="64" font-weight="bold">SQLite Explorer</text>
+  <text x="600" y="350" text-anchor="middle" fill="#a3a3a3" font-family="system-ui" font-size="28">View and Edit SQLite Databases in VS Code</text>
+  <rect x="450" y="400" width="300" height="50" rx="8" fill="#0070f3"/>
+  <text x="600" y="435" text-anchor="middle" fill="white" font-family="system-ui" font-size="20" font-weight="500">Install Extension</text>
+</svg>
