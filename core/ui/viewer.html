@@ -1068,6 +1068,48 @@
         let backendApi = null;
 
         // ================================================================
+        // ROW DATA ACCESSORS
+        // ================================================================
+        // Tables include rowid at index 0, views do not.
+        // These helpers abstract the offset difference.
+
+        /**
+         * Get the offset for column data in a row array.
+         * Tables: row[0] = rowid, data starts at index 1
+         * Views: no rowid, data starts at index 0
+         * @returns {number} The offset to add to column index
+         */
+        function getRowDataOffset() {
+            return selectedTableType === 'table' ? 1 : 0;
+        }
+
+        /**
+         * Get the row ID for a given row. For tables, this is the SQLite rowid.
+         * For views, we use a synthetic ID based on page offset + row index.
+         * @param {Array} row - The row data array
+         * @param {number} rowIdx - The index of the row in gridData
+         * @returns {number|string} The row identifier
+         */
+        function getRowId(row, rowIdx) {
+            if (selectedTableType === 'table') {
+                return row[0]; // SQLite rowid
+            }
+            // For views: use page-adjusted row index as synthetic ID
+            // This provides a stable identifier within the current view
+            return currentPageIndex * rowsPerPage + rowIdx;
+        }
+
+        /**
+         * Get a cell value from a row by column index.
+         * @param {Array} row - The row data array
+         * @param {number} colIdx - The column index (0-based, matching tableColumns)
+         * @returns {*} The cell value
+         */
+        function getCellValue(row, colIdx) {
+            return row[colIdx + getRowDataOffset()];
+        }
+
+        // ================================================================
         // RPC SETUP
         // ================================================================
         const vscodeApi = typeof acquireVsCodeApi !== 'undefined' ? acquireVsCodeApi() : null;
@@ -1423,8 +1465,12 @@
                 // Build data query with explicit column names for consistent ordering
                 // Use alias for rowid to prevent deduplication with INTEGER PRIMARY KEY columns
                 // This ensures native SQLite backend returns columns in the same order as PRAGMA table_info
+                // Note: Views don't have a rowid column - only include rowid for tables
                 const columnNames = tableColumns.map(c => `"${c.name}"`).join(', ');
-                let dataSql = `SELECT rowid AS _rowid_, ${columnNames} FROM "${selectedTable}"${whereClause}`;
+                const isTable = selectedTableType === 'table';
+                let dataSql = isTable
+                    ? `SELECT rowid AS _rowid_, ${columnNames} FROM "${selectedTable}"${whereClause}`
+                    : `SELECT ${columnNames} FROM "${selectedTable}"${whereClause}`;
                 if (sortedColumn) {
                     dataSql += ` ORDER BY "${sortedColumn}" ${sortAscending ? 'ASC' : 'DESC'}`;
                 }
@@ -1475,7 +1521,7 @@
                     // Sample first 10 rows to estimate content width
                     const colIdx = tableColumns.indexOf(col);
                     for (let i = 0; i < Math.min(10, gridData.length); i++) {
-                        const val = gridData[i][colIdx + 1];
+                        const val = getCellValue(gridData[i], colIdx);
                         const valStr = val === null ? 'NULL' : String(val);
                         maxDataLen = Math.max(maxDataLen, valStr.length);
                     }
@@ -1553,7 +1599,7 @@
             // Count pinned rows to calculate offsets
             const pinnedRowsList = [];
             for (let rowIdx = 0; rowIdx < gridData.length; rowIdx++) {
-                const rowId = gridData[rowIdx][0];
+                const rowId = getRowId(gridData[rowIdx], rowIdx);
                 if (pinnedRowIds.has(rowId)) {
                     pinnedRowsList.push({ rowIdx, rowId, row: gridData[rowIdx] });
                 }
@@ -1588,7 +1634,7 @@
                 for (let displayColIdx = 0; displayColIdx < orderedColumns.length; displayColIdx++) {
                     const col = orderedColumns[displayColIdx];
                     const originalColIdx = columnIndexMap.get(col.name);
-                    const value = row[originalColIdx + 1]; // +1 because row[0] is rowid
+                    const value = getCellValue(row, originalColIdx);
                     const displayValue = formatCellValue(value);
                     const isNull = value === null || value === undefined;
                     const colWidth = columnWidths[col.name] || 120;
@@ -1607,8 +1653,8 @@
             // Reorder rows: pinned rows first, then non-pinned rows
             // This ensures pinned rows are always rendered at the top
             const orderedRowIndices = [
-                ...gridData.map((row, idx) => ({ idx, rowId: row[0] })).filter(r => pinnedRowIds.has(r.rowId)),
-                ...gridData.map((row, idx) => ({ idx, rowId: row[0] })).filter(r => !pinnedRowIds.has(r.rowId))
+                ...gridData.map((row, idx) => ({ idx, rowId: getRowId(row, idx) })).filter(r => pinnedRowIds.has(r.rowId)),
+                ...gridData.map((row, idx) => ({ idx, rowId: getRowId(row, idx) })).filter(r => !pinnedRowIds.has(r.rowId))
             ];
 
             // Render all rows in reordered order (pinned rows first)
@@ -1651,7 +1697,7 @@
                 if (isLoadingData || isSavingCell || isTransitioningEdit || editingCellInfo) return;
 
                 // Get the cell value for selection
-                const value = gridData[rowIdx] ? gridData[rowIdx][colIdx + 1] : null;
+                const value = gridData[rowIdx] ? getCellValue(gridData[rowIdx], colIdx) : null;
                 const cellInfo = { rowIdx, colIdx, rowId, value };
 
                 // Handle Cmd+Shift+Click (Mac) or Ctrl+Shift+Click (Windows/Linux) for range selection
@@ -1669,8 +1715,8 @@
                     // Add all cells in the range to selection
                     for (let r = minRow; r <= maxRow; r++) {
                         for (let c = minCol; c <= maxCol; c++) {
-                            const rId = gridData[r] ? gridData[r][0] : null;
-                            const val = gridData[r] ? gridData[r][c + 1] : null;
+                            const rId = gridData[r] ? getRowId(gridData[r], r) : null;
+                            const val = gridData[r] ? getCellValue(gridData[r], c) : null;
                             // Check if cell is already selected
                             const existsIdx = selectedCells.findIndex(sc => sc.rowIdx === r && sc.colIdx === c);
                             if (existsIdx === -1) {
@@ -1702,8 +1748,8 @@
                     // Add all cells in the range to selection
                     for (let r = minRow; r <= maxRow; r++) {
                         for (let c = minCol; c <= maxCol; c++) {
-                            const rId = gridData[r] ? gridData[r][0] : null;
-                            const val = gridData[r] ? gridData[r][c + 1] : null;
+                            const rId = gridData[r] ? getRowId(gridData[r], r) : null;
+                            const val = gridData[r] ? getCellValue(gridData[r], c) : null;
                             selectedCells.push({ rowIdx: r, colIdx: c, rowId: rId, value: val });
                         }
                     }
@@ -1760,7 +1806,7 @@
                         // Guard against stale data
                         if (!gridData[rowIdx]) return;
 
-                        const cellValue = gridData[rowIdx][colIdx + 1];
+                        const cellValue = getCellValue(gridData[rowIdx], colIdx);
                         const cell = { rowIdx, colIdx, rowId, value: cellValue };
 
                         // Check if clicking on the only selected cell - deselect it
@@ -1949,7 +1995,7 @@
                     return;
                 }
 
-                const currentValue = gridData[rowIdx][colIdx + 1];
+                const currentValue = getCellValue(gridData[rowIdx], colIdx);
 
                 // Store the editing state: row index, column index, row ID, column name, and original value
                 editingCellInfo = { rowIdx, colIdx, rowId, columnName: column.name, originalValue: currentValue };
@@ -2118,7 +2164,7 @@
 
                 // Update local grid data optimistically
                 // Convert the value to the appropriate type for local display
-                gridData[rowIdx][colIdx + 1] = typedNewValue;
+                gridData[rowIdx][colIdx + getRowDataOffset()] = typedNewValue;
 
                 // Clean up editing state and refresh the view
                 cleanupCellEdit();
@@ -2388,8 +2434,8 @@
                 } else {
                     // Add all cells in this column to the selection
                     for (let rowIdx = 0; rowIdx < gridData.length; rowIdx++) {
-                        const rowId = gridData[rowIdx][0];
-                        const value = gridData[rowIdx][colIdx + 1];
+                        const rowId = getRowId(gridData[rowIdx], rowIdx);
+                        const value = getCellValue(gridData[rowIdx], colIdx);
                         // Check if already selected
                         const exists = selectedCells.some(sc => sc.rowIdx === rowIdx && sc.colIdx === colIdx);
                         if (!exists) {
@@ -2398,7 +2444,7 @@
                     }
                     // Update last selected for shift+click
                     if (gridData.length > 0) {
-                        lastSelectedCell = { rowIdx: 0, colIdx, rowId: gridData[0][0], value: gridData[0][colIdx + 1] };
+                        lastSelectedCell = { rowIdx: 0, colIdx, rowId: getRowId(gridData[0], 0), value: getCellValue(gridData[0], colIdx) };
                     }
                 }
             } else {
@@ -2411,13 +2457,13 @@
                     // Select only this column's cells
                     selectedCells = [];
                     for (let rowIdx = 0; rowIdx < gridData.length; rowIdx++) {
-                        const rowId = gridData[rowIdx][0];
-                        const value = gridData[rowIdx][colIdx + 1];
+                        const rowId = getRowId(gridData[rowIdx], rowIdx);
+                        const value = getCellValue(gridData[rowIdx], colIdx);
                         selectedCells.push({ rowIdx, colIdx, rowId, value });
                     }
                     // Update last selected for shift+click
                     if (gridData.length > 0) {
-                        lastSelectedCell = { rowIdx: 0, colIdx, rowId: gridData[0][0], value: gridData[0][colIdx + 1] };
+                        lastSelectedCell = { rowIdx: 0, colIdx, rowId: getRowId(gridData[0], 0), value: getCellValue(gridData[0], colIdx) };
                     }
                 }
             }
@@ -3039,13 +3085,14 @@
 
                 // Build data rows for selected rows only
                 const dataRows = [];
-                for (const row of gridData) {
-                    const rowId = row[0];
+                for (let rowIdx = 0; rowIdx < gridData.length; rowIdx++) {
+                    const row = gridData[rowIdx];
+                    const rowId = getRowId(row, rowIdx);
                     if (selectedRowIds.has(rowId)) {
-                        // Skip rowid (index 0), get actual column values
+                        // Get actual column values using the offset helper
                         const values = [];
-                        for (let i = 1; i <= tableColumns.length; i++) {
-                            const val = row[i];
+                        for (let colIdx = 0; colIdx < tableColumns.length; colIdx++) {
+                            const val = getCellValue(row, colIdx);
                             if (val === null) {
                                 values.push('');
                             } else if (val instanceof Uint8Array) {
@@ -3084,15 +3131,15 @@
             updateCellSelectionUI();
 
             // Check if all are already selected - if so, deselect all
-            const allSelected = gridData.every(row => selectedRowIds.has(row[0]));
+            const allSelected = gridData.every((row, idx) => selectedRowIds.has(getRowId(row, idx)));
 
             if (allSelected) {
                 // Deselect all
                 selectedRowIds.clear();
             } else {
                 // Select all visible rows
-                for (const row of gridData) {
-                    selectedRowIds.add(row[0]);
+                for (let rowIdx = 0; rowIdx < gridData.length; rowIdx++) {
+                    selectedRowIds.add(getRowId(gridData[rowIdx], rowIdx));
                 }
             }
 

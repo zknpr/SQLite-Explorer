@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.4
+
+### Bug Fixes
+
+- Fixed "no such column: rowid" error when viewing SQL views
+- Views now display correctly (read-only, as SQLite views don't have rowid)
+
 ## 1.0.3
 
 ### New Features
