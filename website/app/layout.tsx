@@ -11,6 +11,29 @@ import { SpeedInsights } from '@vercel/speed-insights/next';
 import './globals.css';
 
 /**
+ * Inline script to detect system color scheme preference.
+ * Runs before React hydration to prevent flash of wrong theme.
+ * Adds 'dark' class to <html> if user prefers dark mode.
+ */
+const themeScript = `
+  (function() {
+    try {
+      if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        document.documentElement.classList.add('dark');
+      }
+      // Listen for changes in system preference
+      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(e) {
+        if (e.matches) {
+          document.documentElement.classList.add('dark');
+        } else {
+          document.documentElement.classList.remove('dark');
+        }
+      });
+    } catch (e) {}
+  })();
+`;
+
+/**
  * Site metadata for SEO and social sharing.
  * Open Graph tags ensure proper previews on Twitter, LinkedIn, etc.
  */
@@ -35,7 +58,7 @@ export const metadata: Metadata = {
   openGraph: {
     type: "website",
     locale: "en_US",
-    url: "hhttps://vscode-sqlite-explorer.vercel.app/",
+    url: "https://vscode-sqlite-explorer.vercel.app/",
     siteName: "SQLite Explorer",
     title: "SQLite Explorer - VS Code Extension",
     description:
@@ -85,6 +108,10 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <head>
+        {/* Inline script for theme detection - runs before paint to prevent flash */}
+        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+      </head>
       <body>
         {children}
         {/* Vercel Analytics - automatically tracks page views and web vitals */}
