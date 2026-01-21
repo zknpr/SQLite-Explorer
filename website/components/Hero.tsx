@@ -4,107 +4,41 @@
  * The main above-the-fold section featuring:
  * - Headline and value proposition
  * - Call-to-action buttons (Install + GitHub)
- * - Placeholder mockup of the extension UI
+ * - Main screenshot of the extension UI
  *
  * Design: Minimal, centered layout with subtle animations.
  */
 
+import Image from 'next/image';
 import { Database, ExternalLink } from 'lucide-react';
 
 /**
- * PlaceholderMockup renders a stylized representation of the extension UI.
- * This will be replaced with actual screenshots later.
+ * MainScreenshot displays the actual extension screenshot.
+ * Uses Next.js Image component for optimization.
  */
-function PlaceholderMockup() {
+function MainScreenshot() {
   return (
-    <div className="relative w-full max-w-4xl mx-auto mt-12 animate-fade-in">
-      {/* Browser chrome / window frame */}
-      <div className="rounded-xl border border-[var(--border)] bg-[var(--muted)] overflow-hidden shadow-2xl">
-        {/* Title bar */}
-        <div className="flex items-center gap-2 px-4 py-3 border-b border-[var(--border)] bg-[var(--background)]">
-          <div className="flex gap-1.5">
-            <div className="w-3 h-3 rounded-full bg-red-500/80" />
-            <div className="w-3 h-3 rounded-full bg-yellow-500/80" />
-            <div className="w-3 h-3 rounded-full bg-green-500/80" />
-          </div>
-          <div className="flex-1 text-center">
-            <span className="text-xs text-[var(--muted-foreground)] font-mono">
-              database.sqlite — SQLite Explorer
-            </span>
-          </div>
-        </div>
-
-        {/* Mock VS Code layout */}
-        <div className="flex h-[400px]">
-          {/* Sidebar */}
-          <div className="w-48 border-r border-[var(--border)] bg-[var(--background)] p-3">
-            <div className="text-xs font-semibold text-[var(--muted-foreground)] uppercase tracking-wider mb-3">
-              Tables
-            </div>
-            {['users', 'products', 'orders', 'sessions'].map((table, i) => (
-              <div
-                key={table}
-                className={`flex items-center gap-2 px-2 py-1.5 rounded text-sm cursor-pointer transition-colors ${
-                  i === 0
-                    ? 'bg-[var(--accent)] text-white'
-                    : 'hover:bg-[var(--muted)] text-[var(--foreground)]'
-                }`}
-              >
-                <Database className="w-3.5 h-3.5" />
-                {table}
-              </div>
-            ))}
-          </div>
-
-          {/* Main content - table view */}
-          <div className="flex-1 p-4 bg-[var(--background)]">
-            {/* Table header */}
-            <div className="grid grid-cols-4 gap-4 pb-2 border-b border-[var(--border)] text-xs font-semibold text-[var(--muted-foreground)] uppercase tracking-wider">
-              <div>id</div>
-              <div>name</div>
-              <div>email</div>
-              <div>created_at</div>
-            </div>
-
-            {/* Table rows */}
-            {[
-              { id: 1, name: 'Alice', email: 'alice@example.com', date: '2024-01-15' },
-              { id: 2, name: 'Bob', email: 'bob@example.com', date: '2024-01-16' },
-              { id: 3, name: 'Charlie', email: 'charlie@example.com', date: '2024-01-17' },
-              { id: 4, name: 'Diana', email: 'diana@example.com', date: '2024-01-18' },
-              { id: 5, name: 'Eve', email: 'eve@example.com', date: '2024-01-19' },
-            ].map((row, i) => (
-              <div
-                key={row.id}
-                className={`grid grid-cols-4 gap-4 py-2 text-sm border-b border-[var(--border)] ${
-                  i === 1 ? 'bg-[var(--accent)]/10' : ''
-                }`}
-              >
-                <div className="text-[var(--muted-foreground)]">{row.id}</div>
-                <div>{row.name}</div>
-                <div className="text-[var(--accent)]">{row.email}</div>
-                <div className="text-[var(--muted-foreground)] font-mono text-xs">
-                  {row.date}
-                </div>
-              </div>
-            ))}
-
-            {/* Status bar hint */}
-            <div className="mt-4 text-xs text-[var(--muted-foreground)]">
-              5 rows · Double-click to edit · Ctrl+S to save
-            </div>
-          </div>
-        </div>
+    <div className="relative w-full max-w-5xl mx-auto mt-12 animate-fade-in">
+      {/* Screenshot with shadow and border */}
+      <div className="rounded-xl border border-[var(--border)] overflow-hidden shadow-2xl">
+        <Image
+          src="/main.png"
+          alt="SQLite Explorer - Database viewer and editor for VS Code"
+          width={1920}
+          height={1080}
+          className="w-full h-auto"
+          priority
+        />
       </div>
 
-      {/* Decorative gradient blur behind mockup */}
+      {/* Decorative gradient blur behind screenshot */}
       <div className="absolute -z-10 top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[400px] bg-[var(--accent)]/20 blur-[100px] rounded-full" />
     </div>
   );
 }
 
 /**
- * Hero section with headline, description, CTAs, and mockup.
+ * Hero section with headline, description, CTAs, and screenshot.
  */
 export default function Hero() {
   return (
@@ -165,8 +99,8 @@ export default function Hero() {
           </a>
         </div>
 
-        {/* Placeholder mockup */}
-        <PlaceholderMockup />
+        {/* Main screenshot */}
+        <MainScreenshot />
       </div>
     </section>
   );

@@ -2,7 +2,29 @@
 
 A powerful, open-source SQLite database viewer and editor for Visual Studio Code.
 
-![SQLite Explorer](media/icon.png)
+![SQLite Explorer](media/main.png)
+
+## Demos
+
+### Inline Editing
+Double-click any cell to edit. Add new rows and delete existing ones with ease.
+
+![Inline Editing](media/edit_cells_add_delete_rows.gif)
+
+### Pin Columns
+Keep important columns visible while scrolling horizontally through wide tables.
+
+![Pin Columns](media/pin_colums.gif)
+
+### Pin Rows
+Pin rows to the top for easy reference while navigating through data.
+
+![Pin Rows](media/pin_rows.gif)
+
+### Large Tables
+Handle tables with thousands of rows smoothly with virtualized scrolling.
+
+![Large Tables](media/large_tables.gif)
 
 ## Features
 
@@ -134,4 +156,4 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 
 ---
 
-**Made with AI assistance by [Claude Code](https://claude.ai/claude-code)**
+**Made with AI assistance by [Claude Code](https://claude.com/product/claude-code)**
