@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.5
+
+### New Features
+
+- **Fully customizable column widths**: Columns can now be resized to any width (minimum 30px). Resize handle extends beyond cell border for easier grabbing on narrow columns.
+- **Cell preview modal**: Click the expand icon on truncated cells to view and edit full content in a floating window. Includes JSON formatting, word wrap toggle, and character count.
+- **Delete columns**: Select a column (click header selection icon) and press Delete button to remove the column and all its data.
+- **Clear cell values (Cmd+Delete / Ctrl+Delete)**: Select cells and press Cmd+Delete (Mac) or Ctrl+Delete (Windows/Linux) to clear their values to NULL (or empty string for NOT NULL columns).
+
+### Improvements
+
+- Resize handle is now 10px wide with 4px extension beyond cell border for easier grabbing
+- Column width minimum reduced from 60px to 30px for compact display
+- Delete button now works for both row and column deletion
+
 ## 1.0.4
 
 ### Bug Fixes

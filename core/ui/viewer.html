@@ -307,7 +307,7 @@
             white-space: nowrap;
             overflow: visible; /* Allow filter to show */
             position: relative;
-            min-width: 60px;
+            /* No min-width here - inline styles control width for full customization */
             box-sizing: border-box;
             height: var(--header-height);
             max-height: var(--header-height);
@@ -340,20 +340,25 @@
             background: var(--hover-bg);
         }
 
-        /* Column resize handle */
+        /* Column resize handle - extends slightly beyond cell border for easier grabbing */
         .resize-handle {
             position: absolute;
-            right: 0;
+            right: -4px; /* Extend beyond cell border so it's always grabbable */
             top: 0;
             height: 100%;
-            width: 6px;
+            width: 10px; /* Wider grab area for easier resizing */
             cursor: col-resize;
             background: transparent;
+            z-index: 15; /* Above header content to ensure it's always clickable */
         }
 
         .resize-handle:hover,
         .resize-handle.resizing {
             background: var(--accent-color);
+            /* Show visible indicator only in the border area (4px wide) */
+            background-clip: padding-box;
+            border-left: 3px solid transparent;
+            border-right: 3px solid transparent;
         }
 
         .header-text {
@@ -816,6 +821,219 @@
             cursor: pointer;
             font-size: 13px;
         }
+
+        /* ================================================================
+           CELL PREVIEW/EDIT MODAL
+           Floating window for viewing and editing large cell values
+           ================================================================ */
+        .cell-preview-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1100; /* Above other modals */
+        }
+
+        .cell-preview-modal.hidden {
+            display: none;
+        }
+
+        .cell-preview-dialog {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            width: 600px;
+            max-width: 90vw;
+            max-height: 80vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+
+        .cell-preview-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--bg-tertiary);
+        }
+
+        .cell-preview-title {
+            font-weight: 600;
+            font-size: 13px;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .cell-preview-column-name {
+            color: var(--accent-color);
+            font-family: monospace;
+        }
+
+        .cell-preview-type-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            background: var(--bg-secondary);
+            border-radius: 3px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+        }
+
+        .cell-preview-close {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 18px;
+            padding: 4px 8px;
+            border-radius: 3px;
+        }
+
+        .cell-preview-close:hover {
+            background: var(--hover-bg);
+            color: var(--text-primary);
+        }
+
+        .cell-preview-body {
+            flex: 1;
+            padding: 16px;
+            overflow: auto;
+            min-height: 200px;
+            max-height: 60vh;
+        }
+
+        .cell-preview-textarea {
+            width: 100%;
+            height: 100%;
+            min-height: 180px;
+            padding: 12px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            color: var(--text-primary);
+            font-family: monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            resize: vertical;
+            box-sizing: border-box;
+        }
+
+        .cell-preview-textarea:focus {
+            outline: none;
+            border-color: var(--accent-color);
+        }
+
+        .cell-preview-textarea.readonly {
+            background: var(--bg-secondary);
+            cursor: default;
+        }
+
+        /* JSON formatting toolbar */
+        .cell-preview-toolbar {
+            padding: 8px 16px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .cell-preview-toolbar-btn {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 4px 10px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 11px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .cell-preview-toolbar-btn:hover {
+            background: var(--hover-bg);
+        }
+
+        .cell-preview-toolbar-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .cell-preview-toolbar-btn.active {
+            background: var(--accent-color);
+            border-color: var(--accent-color);
+            color: white;
+        }
+
+        .cell-preview-footer {
+            padding: 12px 16px;
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--bg-tertiary);
+        }
+
+        .cell-preview-info {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        .cell-preview-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        /* Cell text wrapper - used for overflow detection */
+        .data-cell .cell-text {
+            display: block;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        /* Expand icon - hidden by default, shown on hover when cell has overflow */
+        .data-cell .expand-icon {
+            display: none;
+            position: absolute;
+            right: 4px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 10px;
+            color: var(--text-secondary);
+            background: var(--bg-secondary);
+            padding: 2px 4px;
+            border-radius: 2px;
+            cursor: pointer;
+            z-index: 1;
+        }
+
+        .data-cell .expand-icon:hover {
+            color: var(--text-primary);
+            background: var(--hover-bg);
+        }
+
+        /* Show expand icon only when cell has overflow class AND is hovered */
+        .data-cell.has-overflow:hover .expand-icon {
+            display: inline-block;
+        }
+
+        .data-cell.has-overflow {
+            cursor: pointer;
+        }
+
+        .data-cell.has-overflow:hover {
+            background: var(--hover-bg);
+        }
     </style>
 </head>
 <body>
@@ -1015,6 +1233,44 @@
         </div>
     </div>
 
+    <!-- Cell Preview/Edit Modal - Floating window for viewing and editing large cell values -->
+    <div class="cell-preview-modal hidden" id="cellPreviewModal">
+        <div class="cell-preview-dialog">
+            <div class="cell-preview-header">
+                <div class="cell-preview-title">
+                    <span>Column:</span>
+                    <span class="cell-preview-column-name" id="cellPreviewColumnName"></span>
+                    <span class="cell-preview-type-badge" id="cellPreviewTypeBadge"></span>
+                </div>
+                <button class="cell-preview-close" onclick="closeCellPreview()">&times;</button>
+            </div>
+            <div class="cell-preview-toolbar">
+                <button class="cell-preview-toolbar-btn" id="formatJsonBtn" onclick="formatCellPreviewJson()" title="Format as JSON">
+                    <span class="codicon codicon-json"></span> Format JSON
+                </button>
+                <button class="cell-preview-toolbar-btn" id="compactJsonBtn" onclick="compactCellPreviewJson()" title="Compact JSON">
+                    <span class="codicon codicon-fold"></span> Compact
+                </button>
+                <button class="cell-preview-toolbar-btn" id="wrapTextBtn" onclick="toggleCellPreviewWrap()" title="Toggle word wrap">
+                    <span class="codicon codicon-word-wrap"></span> Wrap
+                </button>
+            </div>
+            <div class="cell-preview-body">
+                <textarea class="cell-preview-textarea" id="cellPreviewTextarea" spellcheck="false"></textarea>
+            </div>
+            <div class="cell-preview-footer">
+                <div class="cell-preview-info">
+                    <span id="cellPreviewCharCount">0 characters</span>
+                    <span id="cellPreviewReadonlyBadge" style="display:none;margin-left:8px;color:var(--warning-color);">Read-only (View)</span>
+                </div>
+                <div class="cell-preview-actions">
+                    <button class="btn-secondary" onclick="closeCellPreview()">Cancel</button>
+                    <button class="btn-primary" id="cellPreviewSaveBtn" onclick="saveCellPreview()">Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         // ================================================================
         // APPLICATION STATE
@@ -1060,6 +1316,15 @@
         // Pinned rows and columns
         let pinnedColumns = new Set(); // Set of column names
         let pinnedRowIds = new Set(); // Set of row IDs
+
+        // Cell preview modal state
+        // Stores info about the cell being previewed/edited in the floating window
+        let cellPreviewInfo = null; // { rowIdx, colIdx, rowId, columnName, originalValue }
+        let cellPreviewWrapEnabled = true; // Whether word wrap is enabled in the preview textarea
+
+        // Selected columns state - tracks which columns are fully selected (all cells in column selected)
+        // Used for column deletion feature
+        let selectedColumns = new Set(); // Set of column names that are fully selected
 
         // Schema cache
         let schemaCache = { tables: [], views: [], indexes: [] };
@@ -1393,6 +1658,7 @@
             filterQuery = '';
             selectedRowIds.clear();
             selectedCells = []; // Clear cell selection
+            selectedColumns.clear(); // Clear column selection
             lastSelectedCell = null;
             document.getElementById('filterInput').value = '';
 
@@ -1643,8 +1909,21 @@
                     const leftOffset = pinnedColumnOffsets.get(col.name);
                     const pinnedStyle = isColPinned ? `position:sticky;left:${leftOffset}px;` : '';
 
+                    // Check if this cell has content that could potentially overflow
+                    // We add the expand icon to all non-null, non-blob cells
+                    // The actual visibility is controlled dynamically based on real overflow detection
+                    const hasContent = !isNull && !(value instanceof Uint8Array);
+
                     // Use originalColIdx for data operations (edit, select) to maintain correct mapping
-                    rowHtml += `<td class="data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''}" style="width:${colWidth}px;min-width:${colWidth}px;max-width:${colWidth}px;${pinnedStyle}" data-rowidx="${rowIdx}" data-colidx="${originalColIdx}" onclick="onCellClick(event, ${rowIdx}, ${originalColIdx}, ${rowId})" ondblclick="onCellDoubleClick(event, ${rowIdx}, ${originalColIdx}, ${rowId})">${displayValue}</td>`;
+                    // Add position:relative for cells with content to position the expand icon
+                    const cellStyle = `width:${colWidth}px;min-width:${colWidth}px;max-width:${colWidth}px;${hasContent ? 'position:relative;' : ''}${pinnedStyle}`;
+                    rowHtml += `<td class="data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''}" style="${cellStyle}" data-rowidx="${rowIdx}" data-colidx="${originalColIdx}" onclick="onCellClick(event, ${rowIdx}, ${originalColIdx}, ${rowId})" ondblclick="onCellDoubleClick(event, ${rowIdx}, ${originalColIdx}, ${rowId})">`;
+                    rowHtml += `<span class="cell-text">${displayValue}</span>`;
+                    // Add expand icon for all cells with content - visibility controlled by CSS/JS based on overflow
+                    if (hasContent) {
+                        rowHtml += `<span class="expand-icon codicon codicon-link-external" onclick="event.stopPropagation(); openCellPreview(${rowIdx}, ${originalColIdx}, ${rowId})" title="View full content"></span>`;
+                    }
+                    rowHtml += `</td>`;
                 }
                 rowHtml += '</tr>';
                 return rowHtml;
@@ -1665,6 +1944,32 @@
 
             html += '</tbody></table>';
             container.innerHTML = html;
+
+            // After rendering, detect which cells have overflow and add the has-overflow class
+            updateCellOverflowStates();
+        }
+
+        /**
+         * Detect which cells have text overflow and update their has-overflow class.
+         * This is called after rendering and after column resize operations.
+         * Uses scrollWidth vs clientWidth comparison on the .cell-text span.
+         */
+        function updateCellOverflowStates() {
+            // Get all data cells that have a cell-text span (non-null, non-blob cells)
+            const cells = document.querySelectorAll('.data-cell');
+            for (const cell of cells) {
+                const textSpan = cell.querySelector('.cell-text');
+                if (!textSpan) {
+                    // No text span means null or blob value - no overflow possible
+                    cell.classList.remove('has-overflow');
+                    continue;
+                }
+
+                // Check if text overflows the cell
+                // scrollWidth > clientWidth means the text is wider than the visible area
+                const hasOverflow = textSpan.scrollWidth > textSpan.clientWidth;
+                cell.classList.toggle('has-overflow', hasOverflow);
+            }
         }
 
         function formatCellValue(value) {
@@ -1738,6 +2043,7 @@
 
                     // Clear current selection and select range
                     selectedCells = [];
+                    selectedColumns.clear(); // Clear column selection when doing range select
 
                     // Calculate range bounds
                     const minRow = Math.min(lastSelectedCell.rowIdx, rowIdx);
@@ -1815,12 +2121,14 @@
                             selectedCells[0].colIdx === colIdx) {
                             selectedCells = [];
                             lastSelectedCell = null;
+                            selectedColumns.clear(); // Clear column selection
                         } else {
                             // Single click - select only this cell (clear previous selection)
                             selectedCells = [cell];
                             lastSelectedCell = cell;
                             // Clear row selection when selecting a cell
                             selectedRowIds.clear();
+                            selectedColumns.clear(); // Clear column selection
                         }
 
                         // Update UI efficiently
@@ -1962,6 +2270,7 @@
                 selectedCells = [];
                 lastSelectedCell = null;
                 selectedRowIds.clear();
+                selectedColumns.clear(); // Clear column selection
                 updateCellSelectionUI();
                 updateRowSelectionUI();
 
@@ -2224,6 +2533,277 @@
         }
 
         // ================================================================
+        // CELL PREVIEW/EDIT MODAL
+        // Floating window for viewing and editing large cell values
+        // ================================================================
+
+        /**
+         * Open the cell preview modal for a cell with truncated content.
+         * This allows viewing and editing the full value in a larger textarea.
+         * @param {number} rowIdx - The row index in gridData
+         * @param {number} colIdx - The column index
+         * @param {number|string} rowId - The row identifier (rowid for tables, synthetic for views)
+         */
+        function openCellPreview(rowIdx, colIdx, rowId) {
+            // Cancel any ongoing inline cell edit first
+            if (editingCellInfo) {
+                cancelCellEdit();
+            }
+
+            const column = tableColumns[colIdx];
+            if (!column) return;
+
+            const row = gridData[rowIdx];
+            if (!row) return;
+
+            const value = getCellValue(row, colIdx);
+
+            // Store preview state for save operation
+            cellPreviewInfo = {
+                rowIdx,
+                colIdx,
+                rowId,
+                columnName: column.name,
+                originalValue: value
+            };
+
+            // Populate the modal UI
+            const modal = document.getElementById('cellPreviewModal');
+            const columnNameEl = document.getElementById('cellPreviewColumnName');
+            const typeBadgeEl = document.getElementById('cellPreviewTypeBadge');
+            const textarea = document.getElementById('cellPreviewTextarea');
+            const charCountEl = document.getElementById('cellPreviewCharCount');
+            const readonlyBadgeEl = document.getElementById('cellPreviewReadonlyBadge');
+            const saveBtnEl = document.getElementById('cellPreviewSaveBtn');
+            const wrapBtnEl = document.getElementById('wrapTextBtn');
+
+            // Set column name and type
+            columnNameEl.textContent = column.name;
+            typeBadgeEl.textContent = column.type || 'TEXT';
+
+            // Convert value to string for display
+            // Handle BLOB values specially
+            let displayValue = '';
+            if (value === null || value === undefined) {
+                displayValue = '';
+            } else if (value instanceof Uint8Array) {
+                // For BLOB data, show hex representation
+                displayValue = '[BLOB: ' + Array.from(value).map(b => b.toString(16).padStart(2, '0')).join(' ') + ']';
+            } else {
+                displayValue = String(value);
+            }
+
+            textarea.value = displayValue;
+
+            // Set readonly state for views
+            const isReadonly = selectedTableType !== 'table';
+            textarea.readOnly = isReadonly;
+            textarea.classList.toggle('readonly', isReadonly);
+            readonlyBadgeEl.style.display = isReadonly ? 'inline' : 'none';
+            saveBtnEl.disabled = isReadonly;
+            saveBtnEl.style.display = isReadonly ? 'none' : 'inline-block';
+
+            // Update character count
+            updateCellPreviewCharCount();
+
+            // Apply word wrap setting
+            textarea.style.whiteSpace = cellPreviewWrapEnabled ? 'pre-wrap' : 'pre';
+            textarea.style.overflowX = cellPreviewWrapEnabled ? 'hidden' : 'auto';
+            wrapBtnEl.classList.toggle('active', cellPreviewWrapEnabled);
+
+            // Show the modal
+            modal.classList.remove('hidden');
+
+            // Focus the textarea
+            textarea.focus();
+
+            // Add keyboard listener for Escape to close
+            textarea.addEventListener('keydown', onCellPreviewKeydown);
+        }
+
+        /**
+         * Handle keydown events in the cell preview textarea.
+         * Escape closes the modal, Ctrl+Enter saves.
+         */
+        function onCellPreviewKeydown(event) {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                closeCellPreview();
+            } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+                // Ctrl+Enter or Cmd+Enter to save
+                event.preventDefault();
+                saveCellPreview();
+            }
+        }
+
+        /**
+         * Update the character count display in the cell preview modal.
+         */
+        function updateCellPreviewCharCount() {
+            const textarea = document.getElementById('cellPreviewTextarea');
+            const charCountEl = document.getElementById('cellPreviewCharCount');
+            const len = textarea.value.length;
+            charCountEl.textContent = `${len.toLocaleString()} character${len !== 1 ? 's' : ''}`;
+        }
+
+        /**
+         * Close the cell preview modal without saving.
+         */
+        function closeCellPreview() {
+            const modal = document.getElementById('cellPreviewModal');
+            const textarea = document.getElementById('cellPreviewTextarea');
+
+            // Remove keydown listener
+            textarea.removeEventListener('keydown', onCellPreviewKeydown);
+
+            // Hide the modal
+            modal.classList.add('hidden');
+
+            // Clear the preview state
+            cellPreviewInfo = null;
+        }
+
+        /**
+         * Save the edited value from the cell preview modal.
+         * Uses the same logic as saveCellEdit but with the textarea value.
+         */
+        async function saveCellPreview() {
+            if (!cellPreviewInfo) return;
+            if (selectedTableType !== 'table') {
+                updateStatus('Views are read-only');
+                return;
+            }
+
+            const { rowIdx, colIdx, rowId, columnName, originalValue } = cellPreviewInfo;
+            const textarea = document.getElementById('cellPreviewTextarea');
+            const newValue = textarea.value;
+
+            // Compare values - convert both to strings for comparison
+            const origStr = originalValue === null ? '' : String(originalValue);
+            if (newValue === origStr) {
+                // No change, just close
+                closeCellPreview();
+                return;
+            }
+
+            // Determine the SQL value representation
+            const column = tableColumns[colIdx];
+            const isNotNull = column && column.notnull === 1;
+
+            let sqlValue;
+            if (newValue === '') {
+                if (isNotNull) {
+                    sqlValue = "''";
+                } else {
+                    sqlValue = 'NULL';
+                }
+            } else if (!isNaN(Number(newValue)) && newValue.trim() !== '') {
+                sqlValue = newValue;
+            } else {
+                sqlValue = `'${newValue.replace(/'/g, "''")}'`;
+            }
+
+            const updateSql = `UPDATE "${selectedTable}" SET "${columnName}" = ${sqlValue} WHERE rowid = ${rowId}`;
+
+            try {
+                updateStatus('Saving...');
+
+                await backendApi.exec(updateSql);
+
+                // Compute the typed new value for storage
+                const typedNewValue = newValue === '' ? (isNotNull ? '' : null) :
+                    (!isNaN(Number(newValue)) && newValue.trim() !== '' ? Number(newValue) : newValue);
+
+                // Fire edit event for undo/redo and dirty state tracking
+                await backendApi.fireEditEvent({
+                    label: `Edit ${columnName}`,
+                    description: `Edit ${columnName}`,
+                    modificationType: 'cell_update',
+                    targetTable: selectedTable,
+                    targetRowId: rowId,
+                    targetColumn: columnName,
+                    previousValue: originalValue,
+                    newValue: typedNewValue
+                });
+
+                // Update local grid data
+                gridData[rowIdx][colIdx + getRowDataOffset()] = typedNewValue;
+
+                // Close the modal and refresh
+                closeCellPreview();
+                await loadTableData();
+
+                updateStatus('Saved');
+            } catch (err) {
+                console.error('Save failed:', err);
+                let errorMessage = err.message || String(err);
+
+                if (errorMessage.includes('FOREIGN KEY constraint failed')) {
+                    errorMessage = 'Foreign key constraint: the value must reference an existing record in the related table';
+                } else if (errorMessage.includes('UNIQUE constraint failed')) {
+                    errorMessage = 'Unique constraint: this value already exists in the column';
+                } else if (errorMessage.includes('NOT NULL constraint failed')) {
+                    errorMessage = 'Not null constraint: this column cannot be empty';
+                } else if (errorMessage.includes('CHECK constraint failed')) {
+                    errorMessage = 'Check constraint: the value does not satisfy the column requirements';
+                }
+
+                updateStatus(`Save failed: ${errorMessage}`);
+            }
+        }
+
+        /**
+         * Format the cell preview textarea content as pretty-printed JSON.
+         * Only works if the content is valid JSON.
+         */
+        function formatCellPreviewJson() {
+            const textarea = document.getElementById('cellPreviewTextarea');
+            try {
+                const parsed = JSON.parse(textarea.value);
+                textarea.value = JSON.stringify(parsed, null, 2);
+                updateCellPreviewCharCount();
+            } catch (e) {
+                updateStatus('Content is not valid JSON');
+            }
+        }
+
+        /**
+         * Compact the cell preview textarea content as minified JSON.
+         * Only works if the content is valid JSON.
+         */
+        function compactCellPreviewJson() {
+            const textarea = document.getElementById('cellPreviewTextarea');
+            try {
+                const parsed = JSON.parse(textarea.value);
+                textarea.value = JSON.stringify(parsed);
+                updateCellPreviewCharCount();
+            } catch (e) {
+                updateStatus('Content is not valid JSON');
+            }
+        }
+
+        /**
+         * Toggle word wrap in the cell preview textarea.
+         */
+        function toggleCellPreviewWrap() {
+            cellPreviewWrapEnabled = !cellPreviewWrapEnabled;
+            const textarea = document.getElementById('cellPreviewTextarea');
+            const wrapBtnEl = document.getElementById('wrapTextBtn');
+
+            textarea.style.whiteSpace = cellPreviewWrapEnabled ? 'pre-wrap' : 'pre';
+            textarea.style.overflowX = cellPreviewWrapEnabled ? 'hidden' : 'auto';
+            wrapBtnEl.classList.toggle('active', cellPreviewWrapEnabled);
+        }
+
+        // Add input event listener for character count updates
+        document.addEventListener('DOMContentLoaded', () => {
+            const textarea = document.getElementById('cellPreviewTextarea');
+            if (textarea) {
+                textarea.addEventListener('input', updateCellPreviewCharCount);
+            }
+        });
+
+        // ================================================================
         // ROW SELECTION
         // ================================================================
 
@@ -2247,6 +2827,7 @@
             // Clear cell selection when selecting rows
             selectedCells = [];
             lastSelectedCell = null;
+            selectedColumns.clear(); // Clear column selection
             updateCellSelectionUI();
 
             // Handle selection immediately (no debounce)
@@ -2344,7 +2925,7 @@
             if (!resizingColumn) return;
 
             const deltaX = event.clientX - resizeStartX;
-            const newWidth = Math.max(60, resizeStartWidth + deltaX); // Minimum 60px
+            const newWidth = Math.max(30, resizeStartWidth + deltaX); // Minimum 30px for fully customizable widths
 
             // Update the column width in state
             columnWidths[resizingColumn] = newWidth;
@@ -2354,16 +2935,21 @@
             if (colIdx === -1) return;
 
             // Update the header cell width directly for smooth resizing
+            // Must update min-width and max-width too since they constrain the column
             const headerCell = document.querySelector(`th[data-column="${resizingColumn}"]`);
             if (headerCell) {
                 headerCell.style.width = `${newWidth}px`;
+                headerCell.style.minWidth = `${newWidth}px`;
+                headerCell.style.maxWidth = `${newWidth}px`;
             }
 
             // Update all data cells in this column for consistent width
             // Data cells are at colIdx + 1 (accounting for row number column)
+            // Must update all three width properties for proper resizing
             const dataCells = document.querySelectorAll(`.data-row td:nth-child(${colIdx + 2})`);
             for (const cell of dataCells) {
                 cell.style.width = `${newWidth}px`;
+                cell.style.minWidth = `${newWidth}px`;
                 cell.style.maxWidth = `${newWidth}px`;
             }
         }
@@ -2388,6 +2974,9 @@
             // Restore selection and cursor
             document.body.style.userSelect = '';
             document.body.style.cursor = '';
+
+            // Update overflow states after resize - some cells may now overflow or fit
+            updateCellOverflowStates();
         }
 
         // ================================================================
@@ -2431,6 +3020,8 @@
                 if (isColumnFullySelected) {
                     // Remove this column's cells from selection
                     selectedCells = selectedCells.filter(sc => sc.colIdx !== colIdx);
+                    // Remove from selectedColumns tracking
+                    selectedColumns.delete(columnName);
                 } else {
                     // Add all cells in this column to the selection
                     for (let rowIdx = 0; rowIdx < gridData.length; rowIdx++) {
@@ -2442,6 +3033,8 @@
                             selectedCells.push({ rowIdx, colIdx, rowId, value });
                         }
                     }
+                    // Track this column as fully selected
+                    selectedColumns.add(columnName);
                     // Update last selected for shift+click
                     if (gridData.length > 0) {
                         lastSelectedCell = { rowIdx: 0, colIdx, rowId: getRowId(gridData[0], 0), value: getCellValue(gridData[0], colIdx) };
@@ -2453,14 +3046,18 @@
                     // Deselect - clear selection
                     selectedCells = [];
                     lastSelectedCell = null;
+                    selectedColumns.clear();
                 } else {
                     // Select only this column's cells
                     selectedCells = [];
+                    selectedColumns.clear();
                     for (let rowIdx = 0; rowIdx < gridData.length; rowIdx++) {
                         const rowId = getRowId(gridData[rowIdx], rowIdx);
                         const value = getCellValue(gridData[rowIdx], colIdx);
                         selectedCells.push({ rowIdx, colIdx, rowId, value });
                     }
+                    // Track this column as fully selected
+                    selectedColumns.add(columnName);
                     // Update last selected for shift+click
                     if (gridData.length > 0) {
                         lastSelectedCell = { rowIdx: 0, colIdx, rowId: getRowId(gridData[0], 0), value: getCellValue(gridData[0], colIdx) };
@@ -2649,22 +3246,45 @@
         }
 
         function openDeleteModal() {
-            if (selectedRowIds.size === 0) return;
-
-            document.getElementById('deleteConfirmText').textContent =
-                `Are you sure you want to delete ${selectedRowIds.size} row${selectedRowIds.size > 1 ? 's' : ''}?`;
+            // Check if we're deleting columns or rows
+            if (selectedColumns.size > 0) {
+                // Deleting columns
+                const columnNames = Array.from(selectedColumns);
+                document.getElementById('deleteConfirmText').textContent =
+                    `Are you sure you want to delete ${columnNames.length} column${columnNames.length > 1 ? 's' : ''} (${columnNames.join(', ')})?` +
+                    ` This will permanently remove the column${columnNames.length > 1 ? 's' : ''} and all their data.`;
+            } else if (selectedRowIds.size > 0) {
+                // Deleting rows
+                document.getElementById('deleteConfirmText').textContent =
+                    `Are you sure you want to delete ${selectedRowIds.size} row${selectedRowIds.size > 1 ? 's' : ''}?`;
+            } else {
+                return; // Nothing selected
+            }
 
             openModal('deleteModal');
         }
 
         async function submitDelete() {
+            // Check if we're deleting columns or rows
+            if (selectedColumns.size > 0) {
+                await submitDeleteColumns();
+            } else if (selectedRowIds.size > 0) {
+                await submitDeleteRows();
+            }
+        }
+
+        /**
+         * Delete selected rows from the table.
+         * Executes DELETE SQL statement for each selected rowid.
+         */
+        async function submitDeleteRows() {
             if (selectedRowIds.size === 0) return;
 
             const rowIds = Array.from(selectedRowIds);
             const sql = `DELETE FROM "${selectedTable}" WHERE rowid IN (${rowIds.join(', ')})`;
 
             try {
-                updateStatus('Deleting...');
+                updateStatus('Deleting rows...');
                 await backendApi.exec(sql);
                 await backendApi.fireEditEvent({
                     description: `Delete ${rowIds.length} row${rowIds.length > 1 ? 's' : ''} from ${selectedTable}`,
@@ -2678,11 +3298,65 @@
                 selectedRowIds.clear();
                 await loadTableData();
                 updateToolbarButtons();
-                updateStatus(`Deleted - Ctrl+S to save`);
+                updateStatus(`Deleted ${rowIds.length} row${rowIds.length > 1 ? 's' : ''} - Ctrl+S to save`);
 
             } catch (err) {
-                console.error('Delete failed:', err);
+                console.error('Delete rows failed:', err);
                 updateStatus(`Error: ${err.message}`);
+            }
+        }
+
+        /**
+         * Delete selected columns from the table.
+         * SQLite doesn't support DROP COLUMN directly in older versions,
+         * so we need to recreate the table without the columns.
+         * In SQLite 3.35.0+ (2021), ALTER TABLE DROP COLUMN is supported.
+         */
+        async function submitDeleteColumns() {
+            if (selectedColumns.size === 0) return;
+
+            const columnNames = Array.from(selectedColumns);
+
+            try {
+                updateStatus('Deleting columns...');
+
+                // Delete columns one by one using ALTER TABLE DROP COLUMN
+                // Note: This requires SQLite 3.35.0+ (sql.js should support this)
+                for (const columnName of columnNames) {
+                    const sql = `ALTER TABLE "${selectedTable}" DROP COLUMN "${columnName}"`;
+                    await backendApi.exec(sql);
+                }
+
+                // Fire edit event for undo/redo tracking
+                await backendApi.fireEditEvent({
+                    description: `Delete column${columnNames.length > 1 ? 's' : ''} ${columnNames.join(', ')} from ${selectedTable}`,
+                    operation: 'drop_column',
+                    targetTable: selectedTable,
+                    affectedColumns: columnNames
+                });
+
+                closeModal('deleteModal');
+
+                // Clear selections
+                selectedColumns.clear();
+                selectedCells = [];
+                lastSelectedCell = null;
+
+                // Refresh the schema and table data since columns changed
+                await refreshSchema();
+                await loadTableColumns();
+                await loadTableData();
+                updateToolbarButtons();
+                updateStatus(`Deleted ${columnNames.length} column${columnNames.length > 1 ? 's' : ''} - Ctrl+S to save`);
+
+            } catch (err) {
+                console.error('Delete columns failed:', err);
+                // Provide helpful error message for common issues
+                let errorMessage = err.message || String(err);
+                if (errorMessage.includes('no such column') || errorMessage.includes('cannot drop')) {
+                    errorMessage = 'Cannot delete this column. It may be a primary key or referenced by other constraints.';
+                }
+                updateStatus(`Error: ${errorMessage}`);
             }
         }
 
@@ -2726,9 +3400,12 @@
 
         function updateToolbarButtons() {
             const hasTable = selectedTable && selectedTableType === 'table';
+            const hasRowSelection = selectedRowIds.size > 0;
+            const hasColumnSelection = selectedColumns.size > 0;
             document.getElementById('btnAddRow').disabled = !hasTable;
             document.getElementById('btnAddColumn').disabled = !hasTable;
-            document.getElementById('btnDeleteRows').disabled = !hasTable || selectedRowIds.size === 0;
+            // Enable delete button if rows OR columns are selected
+            document.getElementById('btnDeleteRows').disabled = !hasTable || (!hasRowSelection && !hasColumnSelection);
             document.getElementById('btnExport').disabled = !selectedTable;
         }
 
@@ -3003,6 +3680,20 @@
                     selectAllRows();
                 }
             }
+
+            // Cmd+Delete / Cmd+Backspace / Ctrl+Delete / Ctrl+Backspace - Clear selected cell values
+            if ((event.metaKey || event.ctrlKey) && (event.key === 'Delete' || event.key === 'Backspace')) {
+                // Don't intercept if we're editing a cell or in an input/textarea
+                if (editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') {
+                    return;
+                }
+
+                // Only works for tables (not views) and when cells are selected
+                if (selectedTable && selectedTableType === 'table' && selectedCells.length > 0) {
+                    event.preventDefault();
+                    await clearSelectedCellValues();
+                }
+            }
         });
 
         /**
@@ -3119,6 +3810,89 @@
         }
 
         /**
+         * Clear (set to NULL) the values of all selected cells.
+         * Executes UPDATE statements for each unique row/column combination.
+         * Fires edit events for undo/redo tracking.
+         */
+        async function clearSelectedCellValues() {
+            if (selectedCells.length === 0) return;
+            if (selectedTableType !== 'table') {
+                updateStatus('Views are read-only');
+                return;
+            }
+
+            try {
+                updateStatus('Clearing cells...');
+
+                // Group cells by rowId for more efficient updates
+                // Each cell needs its own UPDATE since we're clearing different columns
+                const updates = [];
+                for (const cell of selectedCells) {
+                    const column = tableColumns[cell.colIdx];
+                    if (!column) continue;
+
+                    // Check if column allows NULL
+                    const isNotNull = column.notnull === 1;
+                    const newValue = isNotNull ? '' : null;
+                    const sqlValue = isNotNull ? "''" : 'NULL';
+
+                    updates.push({
+                        rowId: cell.rowId,
+                        rowIdx: cell.rowIdx,
+                        colIdx: cell.colIdx,
+                        columnName: column.name,
+                        originalValue: cell.value,
+                        newValue: newValue,
+                        sql: `UPDATE "${selectedTable}" SET "${column.name}" = ${sqlValue} WHERE rowid = ${cell.rowId}`
+                    });
+                }
+
+                // Execute all updates
+                for (const update of updates) {
+                    await backendApi.exec(update.sql);
+                }
+
+                // Fire a single edit event for all the cleared cells
+                await backendApi.fireEditEvent({
+                    label: `Clear ${updates.length} cell${updates.length > 1 ? 's' : ''}`,
+                    description: `Clear ${updates.length} cell${updates.length > 1 ? 's' : ''} in ${selectedTable}`,
+                    modificationType: 'cell_clear',
+                    targetTable: selectedTable,
+                    affectedCells: updates.map(u => ({
+                        rowId: u.rowId,
+                        columnName: u.columnName,
+                        previousValue: u.originalValue,
+                        newValue: u.newValue
+                    }))
+                });
+
+                // Update local grid data
+                for (const update of updates) {
+                    gridData[update.rowIdx][update.colIdx + getRowDataOffset()] = update.newValue;
+                }
+
+                // Clear selection and refresh
+                selectedCells = [];
+                lastSelectedCell = null;
+                selectedColumns.clear();
+                await loadTableData();
+                updateToolbarButtons();
+                updateStatus(`Cleared ${updates.length} cell${updates.length > 1 ? 's' : ''} - Ctrl+S to save`);
+
+            } catch (err) {
+                console.error('Clear cells failed:', err);
+                let errorMessage = err.message || String(err);
+
+                // Handle common constraint errors
+                if (errorMessage.includes('NOT NULL constraint failed')) {
+                    errorMessage = 'Cannot clear: one or more columns require a value (NOT NULL constraint)';
+                }
+
+                updateStatus(`Clear failed: ${errorMessage}`);
+            }
+        }
+
+        /**
          * Select all rows in the current page.
          * Optimized: updates selection state without full re-render, then updates UI.
          */
@@ -3128,6 +3902,7 @@
             // Clear cell selection when selecting rows
             selectedCells = [];
             lastSelectedCell = null;
+            selectedColumns.clear(); // Clear column selection
             updateCellSelectionUI();
 
             // Check if all are already selected - if so, deselect all
