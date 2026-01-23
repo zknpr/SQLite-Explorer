@@ -305,8 +305,8 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     const htmlUri = vsc.Uri.joinPath(this.context.extensionUri, 'core', 'ui', 'viewer.html');
     const html = new TextDecoder().decode(await vsc.workspace.fs.readFile(htmlUri));
 
-    // Load codicons CSS
-    const codiconsUri = vsc.Uri.joinPath(this.context.extensionUri, 'node_modules', 'codicons', 'dist', 'codicon.css');
+    // Load codicons CSS from @vscode/codicons package
+    const codiconsUri = vsc.Uri.joinPath(this.context.extensionUri, 'node_modules', '@vscode', 'codicons', 'dist', 'codicon.css');
 
     // Build Content Security Policy
     const cspObj = {

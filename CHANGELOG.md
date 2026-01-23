@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.6
+
+### Bug Fixes
+
+- Fixed icons not showing
+
 ## 1.0.5
 
 ### New Features

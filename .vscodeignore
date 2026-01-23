@@ -24,9 +24,10 @@
 # Include icon
 !media/icon.png
 
-# Include codicons for UI
-!node_modules/codicons/
-!node_modules/codicons/**
+# Include codicons for UI (@vscode/codicons package)
+!node_modules/@vscode/
+!node_modules/@vscode/codicons/
+!node_modules/@vscode/codicons/**
 
 # Include documentation
 !CHANGELOG.md
