@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.7
+
+### New Features
+
+- **Primary key indicator**: Column headers now display a key icon for primary key columns, making it easy to identify primary keys at a glance.
+
+### Improvements
+
+- **Manual column filter**: Filters now require pressing Enter or clicking the search button to apply, instead of auto-filtering while typing. This provides better control and avoids unnecessary queries.
+
+### Bug Fixes
+
+- Fixed column filter returning no results causing headers to disappear, leaving users stuck with no way to clear the filter. Now shows a "No rows match the current filter" message while keeping filter inputs accessible.
+
 ## 1.0.6
 
 ### Bug Fixes

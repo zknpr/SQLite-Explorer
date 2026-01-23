@@ -328,6 +328,7 @@
             gap: 4px;
             height: 22px;
             cursor: pointer;
+            overflow: hidden;
         }
 
         .header-bottom {
@@ -362,9 +363,9 @@
         }
 
         .header-text {
-            display: block;
             overflow: hidden;
             text-overflow: ellipsis;
+            white-space: nowrap;
             flex: 1;
             min-width: 0;
         }
@@ -374,6 +375,14 @@
             font-size: 10px;
             margin-left: 4px;
             color: var(--text-secondary);
+        }
+
+        /* Primary key indicator - displayed before column name */
+        .key-icon {
+            font-size: 12px;
+            margin-right: 4px;
+            color: var(--vscode-editorWarning-foreground, #cca700);
+            flex-shrink: 0;
         }
 
         /* Row number header (#) - clickable for select all */
@@ -388,12 +397,13 @@
 
         /* Column filter input inside header cell */
         .column-filter {
-            width: 100%;
+            flex: 1;
+            min-width: 0;
             padding: 2px 6px;
             font-size: 11px;
             background: var(--bg-tertiary);
             border: 1px solid var(--border-color);
-            border-radius: 3px;
+            border-radius: 3px 0 0 3px;
             color: var(--text-primary);
             box-sizing: border-box;
             text-transform: none; /* Override header uppercase */
@@ -408,6 +418,30 @@
         .column-filter::placeholder {
             color: var(--text-secondary);
             opacity: 0.7;
+        }
+
+        /* Filter apply button - triggers filter on click */
+        .filter-apply-btn {
+            padding: 2px 6px;
+            font-size: 11px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-left: none;
+            border-radius: 0 3px 3px 0;
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .filter-apply-btn:hover {
+            background: var(--hover-bg);
+            color: var(--text-primary);
+        }
+
+        .filter-apply-btn .codicon {
+            font-size: 12px;
         }
 
         /* Pinned columns - sticky left positioning to stay visible when scrolling */
@@ -1764,7 +1798,12 @@
         function renderDataGrid() {
             const container = document.getElementById('gridContainer');
 
-            if (gridData.length === 0) {
+            // Check if any column filters are active
+            const hasActiveFilters = Object.values(columnFilters).some(v => v && v.trim() !== '');
+
+            // Only show empty state if table is truly empty (no filters active)
+            // If filters are active but no results, still show headers so user can clear filters
+            if (gridData.length === 0 && !hasActiveFilters && tableColumns.length === 0) {
                 container.innerHTML = `
                     <div class="empty-view">
                         <span class="empty-icon codicon codicon-database"></span>
@@ -1834,17 +1873,20 @@
                 const filterValue = columnFilters[col.name] || '';
                 // Build sort indicator HTML - shown next to column name
                 const sortIndicator = isSorted ? `<span class="sort-indicator">${sortAscending ? '▲' : '▼'}</span>` : '';
+                // Build primary key icon - shown before column name
+                const keyIcon = col.isPrimaryKey ? '<span class="key-icon codicon codicon-key" title="Primary Key"></span>' : '';
                 html += `<th class="header-cell ${pinnedClass}" style="width:${colWidth}px;min-width:${colWidth}px;max-width:${colWidth}px;${pinnedStyle}" data-column="${escapeHtml(col.name)}">`;
                 html += `<div class="header-content">`;
-                // Top row: column name + sort indicator + icons (select, pin)
+                // Top row: key icon + column name + sort indicator + icons (select, pin)
                 html += `<div class="header-top" onclick="onColumnSort('${escapeHtml(col.name)}')">`;
-                html += `<span class="header-text">${escapeHtml(col.name)}${sortIndicator}</span>`;
+                html += `${keyIcon}<span class="header-text">${escapeHtml(col.name)}${sortIndicator}</span>`;
                 html += `<span class="select-column-icon codicon codicon-selection" onclick="event.stopPropagation(); onColumnHeaderClick(event, '${escapeHtml(col.name)}')" title="Select entire column"></span>`;
                 html += `<span class="pin-icon codicon codicon-pin ${isPinned ? 'pinned' : ''}" onclick="event.stopPropagation(); toggleColumnPin(event, '${escapeHtml(col.name)}')" title="${isPinned ? 'Unpin column' : 'Pin column'}"></span>`;
                 html += `</div>`;
-                // Bottom row: filter input
+                // Bottom row: filter input with apply button
                 html += `<div class="header-bottom" onclick="event.stopPropagation()">`;
-                html += `<input type="text" class="column-filter" data-column="${escapeHtml(col.name)}" value="${escapeHtml(filterValue)}" placeholder="Filter..." onclick="event.stopPropagation()" onkeyup="onColumnFilterChange(event, '${escapeHtml(col.name)}')">`;
+                html += `<input type="text" class="column-filter" data-column="${escapeHtml(col.name)}" value="${escapeHtml(filterValue)}" placeholder="Filter..." onclick="event.stopPropagation()" onkeydown="onColumnFilterKeydown(event, '${escapeHtml(col.name)}')">`;
+                html += `<button class="filter-apply-btn" onclick="event.stopPropagation(); applyColumnFilter('${escapeHtml(col.name)}')" title="Apply filter (Enter)"><span class="codicon codicon-search"></span></button>`;
                 html += `</div>`;
                 html += `</div>`; // End header-content
                 html += `<div class="resize-handle" onmousedown="event.stopPropagation(); startColumnResize(event, '${escapeHtml(col.name)}')"></div>`;
@@ -1940,6 +1982,12 @@
             for (const { idx: rowIdx, rowId } of orderedRowIndices) {
                 const row = gridData[rowIdx];
                 html += renderRow(rowIdx, row, rowId);
+            }
+
+            // Show "no results" message when filters are active but no data matches
+            if (gridData.length === 0 && hasActiveFilters) {
+                const colSpan = orderedColumns.length + 1; // +1 for row number column
+                html += `<tr class="no-results-row"><td colspan="${colSpan}" style="text-align:center;padding:20px;color:var(--text-secondary);">No rows match the current filter. Modify or clear filters above.</td></tr>`;
             }
 
             html += '</tbody></table>';
@@ -3079,20 +3127,28 @@
             }, 300);
         }
 
-        // Column filter debounce timer
-        let columnFilterTimer = null;
+        /**
+         * Handle keydown in per-column filter input.
+         * Applies filter on Enter key press.
+         */
+        function onColumnFilterKeydown(event, columnName) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                applyColumnFilter(columnName);
+            }
+        }
 
         /**
-         * Handle change in per-column filter input.
-         * Uses debounce to avoid excessive queries while typing.
+         * Apply the column filter for a specific column.
+         * Called when user presses Enter or clicks the apply button.
          */
-        function onColumnFilterChange(event, columnName) {
-            clearTimeout(columnFilterTimer);
-            columnFilterTimer = setTimeout(() => {
-                columnFilters[columnName] = event.target.value.trim();
+        function applyColumnFilter(columnName) {
+            const input = document.querySelector(`.column-filter[data-column="${columnName}"]`);
+            if (input) {
+                columnFilters[columnName] = input.value.trim();
                 currentPageIndex = 0;
                 loadTableData();
-            }, 300);
+            }
         }
 
         // ================================================================
