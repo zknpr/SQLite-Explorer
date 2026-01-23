@@ -130,7 +130,7 @@ This extension was built from scratch using **Claude Opus 4.5** (with extended t
 
 ```bash
 # Clone the repository
-git clone https://github.com/nicepkg/sqlite-explorer.git
+git clone https://github.com/zknpr/sqlite-explorer.git
 cd sqlite-explorer
 
 # Install dependencies
