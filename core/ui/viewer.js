@@ -437,6 +437,13 @@ async function loadTableData() {
     if (isLoadingData) return;
     isLoadingData = true;
 
+    // Save scroll position BEFORE showLoading() destroys the content.
+    // This allows us to restore the user's view after re-rendering,
+    // which is especially important when filtering columns on the right side.
+    const container = document.getElementById('gridContainer');
+    const savedScrollLeft = container.scrollLeft;
+    const savedScrollTop = container.scrollTop;
+
     showLoading();
 
     try {
@@ -487,6 +494,12 @@ async function loadTableData() {
         gridData = dataResult[0]?.records || [];
 
         renderDataGrid();
+
+        // Restore scroll position after rendering.
+        // The scroll position was saved before showLoading() destroyed the content.
+        container.scrollLeft = savedScrollLeft;
+        container.scrollTop = savedScrollTop;
+
         updatePagination();
         updateStatus(`${totalRecordCount} records`);
 
@@ -504,6 +517,10 @@ async function loadTableData() {
 // ================================================================
 function renderDataGrid() {
     const container = document.getElementById('gridContainer');
+
+    // Save scroll position before re-rendering to preserve user's view
+    const savedScrollLeft = container.scrollLeft;
+    const savedScrollTop = container.scrollTop;
 
     // Check if any column filters are active
     const hasActiveFilters = Object.values(columnFilters).some(v => v && v.trim() !== '');
@@ -696,6 +713,12 @@ function renderDataGrid() {
 
     html += '</tbody></table>';
     container.innerHTML = html;
+
+    // Restore scroll position after rendering to preserve user's view.
+    // This is especially important when filtering columns - user expects to stay
+    // at the same horizontal scroll position after the table re-renders.
+    container.scrollLeft = savedScrollLeft;
+    container.scrollTop = savedScrollTop;
 
     // After rendering, detect which cells have overflow and add the has-overflow class
     updateCellOverflowStates();

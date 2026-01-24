@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.9
+
+### Bug Fixes
+
+- **Scroll position preserved when filtering**: Column filtering no longer resets the horizontal/vertical scroll position. When filtering columns on the far right of a wide table, the view now stays in place after the table re-renders.
+
 ## 1.0.8
 
 ### Improvements
