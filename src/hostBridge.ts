@@ -216,14 +216,27 @@ export class HostBridge implements ToastService {
   /**
    * Download a blob to the filesystem.
    *
+   * SECURITY: The filename is sanitized using path.basename to prevent
+   * path traversal attacks. An attacker could try to pass filenames like
+   * "../../etc/passwd" to write outside the intended directory.
+   *
    * @param data - Binary data to write
-   * @param download - Filename for the download
+   * @param download - Filename for the download (will be sanitized)
    * @param preserveFocus - Whether to keep focus on current editor
    */
   async downloadBlob(data: Uint8Array, download: string, preserveFocus: boolean) {
     const { document } = this;
     const { dirname } = document.fileParts;
-    const dlUri = vsc.Uri.joinPath(vsc.Uri.parse(dirname), download);
+
+    // SECURITY: Sanitize filename to prevent path traversal attacks.
+    // path.basename extracts just the filename, stripping any directory components.
+    // Example: "../../etc/passwd" becomes "passwd"
+    const sanitizedFilename = path.basename(download);
+    if (!sanitizedFilename) {
+      throw new Error('Invalid filename');
+    }
+
+    const dlUri = vsc.Uri.joinPath(vsc.Uri.parse(dirname), sanitizedFilename);
 
     await vsc.workspace.fs.writeFile(dlUri, data);
     if (!preserveFocus) await vsc.commands.executeCommand('vscode.open', dlUri);
@@ -421,12 +434,43 @@ export class HostBridge implements ToastService {
 
 /**
  * Check if a SQL statement is a write operation.
+ * Handles edge cases like leading comments and CTEs (WITH clauses).
  *
  * @param sql - SQL query string
  * @returns True if the query modifies data
  */
 function isWriteOperation(sql: string): boolean {
-  const normalized = sql.trim().toUpperCase();
+  // Remove leading/trailing whitespace
+  let normalized = sql.trim();
+
+  // Remove leading SQL comments (both -- and /* */ styles)
+  // This prevents attackers from hiding write operations behind comments
+  // Example: "/* log */ INSERT INTO..." should still be detected as a write
+
+  // Remove block comments /* ... */
+  normalized = normalized.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  // Remove line comments -- ...
+  normalized = normalized.replace(/--[^\n]*/g, '');
+
+  // Trim again after removing comments
+  normalized = normalized.trim().toUpperCase();
+
+  // Handle CTEs: WITH ... AS (...) INSERT/UPDATE/DELETE
+  // A CTE can precede a write operation
+  if (normalized.startsWith('WITH')) {
+    // Find the actual statement after the CTE(s)
+    // CTEs are followed by SELECT, INSERT, UPDATE, or DELETE
+    // We need to find the final statement keyword
+    const ctePattern = /\bWITH\b[\s\S]*?\b(SELECT|INSERT|UPDATE|DELETE)\b/i;
+    const match = normalized.match(ctePattern);
+    if (match) {
+      const keyword = match[1].toUpperCase();
+      return keyword === 'INSERT' || keyword === 'UPDATE' || keyword === 'DELETE';
+    }
+  }
+
+  // Standard write operation detection
   return normalized.startsWith('INSERT') ||
     normalized.startsWith('UPDATE') ||
     normalized.startsWith('DELETE') ||

@@ -30,6 +30,21 @@ import type {
 // ============================================================================
 
 /**
+ * Escape a SQL identifier (table name, column name) for safe use in queries.
+ * SQL identifiers are wrapped in double quotes, and any internal double quotes
+ * are escaped by doubling them (SQL standard).
+ *
+ * SECURITY: This prevents SQL injection via malicious table/column names.
+ * Example: A table named `foo"--DROP TABLE bar` becomes `"foo""--DROP TABLE bar"`
+ *
+ * @param identifier - The table or column name to escape
+ * @returns Safely escaped identifier wrapped in double quotes
+ */
+function escapeIdentifier(identifier: string): string {
+  return `"${identifier.replace(/"/g, '""')}"`;
+}
+
+/**
  * Convert a CellValue to SQL literal representation.
  * Handles NULL, numbers, strings, and binary data.
  */
@@ -398,7 +413,19 @@ export async function createNativeDatabaseConnection(
       const filePath = fileUri.fsPath;
 
       // Open database
-      await worker.call('open', [filePath, forceReadOnly ?? false]);
+      // Note: If this fails (e.g., SQLite error 14: unable to open database file),
+      // the error will propagate up. Common causes on macOS:
+      // - File doesn't exist
+      // - Permission denied (sandboxing, Gatekeeper)
+      // - File is locked by another process
+      // - Path encoding issues with special characters
+      try {
+        await worker.call('open', [filePath, forceReadOnly ?? false]);
+      } catch (err) {
+        // Re-throw with more context to help debugging
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`Failed to open database "${displayName}": ${message}. Path: ${filePath}`);
+      }
 
       // Create operations facade
       const operationsFacade: DatabaseOperations = {
@@ -439,7 +466,8 @@ export async function createNativeDatabaseConnection(
         undoModification: async (mod: ModificationEntry) => {
           if (mod.modificationType === 'cell_update' && mod.targetTable && mod.targetColumn && mod.targetRowId !== undefined) {
             const sqlValue = cellValueToSql(mod.previousValue);
-            const sql = `UPDATE "${mod.targetTable}" SET "${mod.targetColumn}" = ${sqlValue} WHERE rowid = ${mod.targetRowId}`;
+            // Use escapeIdentifier to prevent SQL injection via malicious table/column names
+            const sql = `UPDATE ${escapeIdentifier(mod.targetTable)} SET ${escapeIdentifier(mod.targetColumn)} = ${sqlValue} WHERE rowid = ${mod.targetRowId}`;
             await worker.call('query', [sql]);
           }
           // Other modification types can be added as needed
@@ -452,7 +480,8 @@ export async function createNativeDatabaseConnection(
         redoModification: async (mod: ModificationEntry) => {
           if (mod.modificationType === 'cell_update' && mod.targetTable && mod.targetColumn && mod.targetRowId !== undefined) {
             const sqlValue = cellValueToSql(mod.newValue);
-            const sql = `UPDATE "${mod.targetTable}" SET "${mod.targetColumn}" = ${sqlValue} WHERE rowid = ${mod.targetRowId}`;
+            // Use escapeIdentifier to prevent SQL injection via malicious table/column names
+            const sql = `UPDATE ${escapeIdentifier(mod.targetTable)} SET ${escapeIdentifier(mod.targetColumn)} = ${sqlValue} WHERE rowid = ${mod.targetRowId}`;
             await worker.call('query', [sql]);
           }
           // Other modification types can be added as needed

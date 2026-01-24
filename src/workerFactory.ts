@@ -90,7 +90,12 @@ interface WorkerMethods {
  * Create a database connection bundle.
  *
  * Attempts to use native SQLite (txiki-js) for better performance.
- * Falls back to sql.js (WebAssembly) when native is unavailable.
+ * Falls back to sql.js (WebAssembly) when native is unavailable or fails.
+ *
+ * IMPORTANT: The fallback to WASM happens at bundle creation time. If native
+ * backend creation succeeds but file open fails later (e.g., due to macOS
+ * sandboxing), we wrap the native bundle to catch those errors and create
+ * a hybrid that can fall back at connection time.
  *
  * @param extensionUri - Extension installation directory URI
  * @param _reporter - Optional telemetry reporter
@@ -106,7 +111,30 @@ export async function createDatabaseConnection(
     if (nativeSupport.isNativeAvailable(extensionPath)) {
       try {
         console.log('[SQLite Explorer] Using native SQLite backend');
-        return await nativeSupport.createNativeDatabaseConnection(extensionUri, _reporter);
+        const nativeBundle = await nativeSupport.createNativeDatabaseConnection(extensionUri, _reporter);
+
+        // Wrap the native bundle to provide fallback to WASM if file open fails
+        // This handles cases where native SQLite can't access a specific file
+        // (e.g., macOS sandboxing, permission issues, file locked)
+        const wasmBundlePromise = createWasmDatabaseConnection(extensionUri, _reporter);
+        let wasmBundle: DatabaseConnectionBundle | null = null;
+
+        return {
+          workerMethods: nativeBundle.workerMethods,
+          async establishConnection(fileUri, displayName, forceReadOnly, autoCommit) {
+            try {
+              // Try native first
+              return await nativeBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
+            } catch (nativeErr) {
+              // Native failed - fall back to WASM
+              console.warn('[SQLite Explorer] Native file open failed, falling back to WASM:', nativeErr);
+              if (!wasmBundle) {
+                wasmBundle = await wasmBundlePromise;
+              }
+              return wasmBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
+            }
+          }
+        };
       } catch (err) {
         console.warn('[SQLite Explorer] Native SQLite failed, falling back to WASM:', err);
       }

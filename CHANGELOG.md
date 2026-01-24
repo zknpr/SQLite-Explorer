@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.10
+
+### Security
+
+- **Fixed XSS vulnerability in schema names**: The `escapeHtml` function now escapes single quotes (`'` → `&#39;`), preventing DOM-based XSS attacks through malicious table or column names. Previously, a table named `user'); alert('XSS'); //` could execute arbitrary JavaScript when rendered in the sidebar.
+
+- **Fixed SQL injection in identifier escaping**: Table and column names are now properly escaped by doubling internal double quotes (SQL standard). Previously, identifiers like `table"--DROP TABLE other` could break out of the quoted context. Affected: `nativeWorker.ts` (undo/redo), `tableExporter.ts` (export queries).
+
+- **Fixed RPC prototype pollution**: The RPC message handler now uses `hasOwnProperty` check before invoking methods, preventing attackers from calling Object prototype methods like `constructor` or `__proto__`.
+
+- **Fixed path traversal in downloadBlob**: Filenames are now sanitized using `path.basename()` to prevent writing files outside the intended directory. Previously, a filename like `../../etc/passwd` could write to arbitrary locations.
+
+- **Fixed binary data serialization**: The undo/redo history tracker now properly serializes `Uint8Array` (BLOB data) using base64 encoding. Previously, `JSON.stringify` would corrupt binary data by converting it to `{"0": 1, "1": 2, ...}`.
+
+- **Improved write operation detection**: SQL write detection now handles leading comments (`/* */`, `--`) and CTEs (`WITH ... AS`). Previously, queries like `/* log */ INSERT INTO...` would not be detected as write operations.
+
+### Bug Fixes
+
+- **Native SQLite fallback to WASM**: When the native SQLite backend fails to open a specific file (e.g., due to macOS sandboxing, permission issues, or file locks), the extension now automatically falls back to the WASM backend instead of showing an error. This fixes "SQLite error 14: unable to open database file" on macOS.
+
 ## 1.0.9
 
 ### Bug Fixes

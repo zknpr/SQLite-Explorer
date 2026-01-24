@@ -18,6 +18,28 @@ interface DbParams {
 }
 
 /**
+ * Escape a SQL identifier (table name, column name) for safe use in queries.
+ * SQL identifiers are wrapped in double quotes, and any internal double quotes
+ * are escaped by doubling them (SQL standard).
+ *
+ * SECURITY: This prevents SQL injection via malicious table/column names.
+ * Example: A table named `foo"--DROP TABLE bar` becomes `"foo""--DROP TABLE bar"`
+ *
+ * @param identifier - The table or column name to escape
+ * @returns Safely escaped identifier wrapped in double quotes
+ */
+function escapeIdentifier(identifier: string): string {
+  return `"${identifier.replace(/"/g, '""')}"`;
+}
+
+// Legacy DbParams type for backward compatibility with webview
+interface DbParams {
+  filename?: string;
+  table: string;
+  name?: string;
+}
+
+/**
  * Export table data to CSV or JSON file.
  *
  * This command fetches all data from the specified table and saves it
@@ -73,8 +95,9 @@ export async function exportTableCommand(
     }
 
     // Fetch all data from the table
+    // Use escapeIdentifier to prevent SQL injection via malicious table names
     const result = await document.databaseOperations.executeQuery(
-      `SELECT * FROM "${tableName}"`
+      `SELECT * FROM ${escapeIdentifier(tableName)}`
     );
 
     if (!result || result.length === 0 || !result[0].values) {
@@ -193,11 +216,13 @@ function exportToSql(tableName: string, columns: string[], rows: CellValue[][]):
     return `'${String(value).replace(/'/g, "''")}'`;
   };
 
-  const columnList = columns.map(c => `"${c}"`).join(', ');
+  // Use escapeIdentifier to prevent SQL injection via malicious column names
+  const columnList = columns.map(c => escapeIdentifier(c)).join(', ');
 
   const statements = rows.map(row => {
     const values = row.map(escapeSqlValue).join(', ');
-    return `INSERT INTO "${tableName}" (${columnList}) VALUES (${values});`;
+    // Use escapeIdentifier for table name as well
+    return `INSERT INTO ${escapeIdentifier(tableName)} (${columnList}) VALUES (${values});`;
   });
 
   return statements.join('\n');

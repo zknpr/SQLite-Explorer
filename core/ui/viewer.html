@@ -292,7 +292,7 @@ let isDbConnected=!1,selectedTable=null,selectedTableType="table",currentPageInd
             <span class="empty-title">Error</span>
             <span class="empty-desc">${escapeHtml(e)}</span>
         </div>
-    `}function escapeHtml(e){return e==null?"":String(e).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}let columnDefCounter=0;function openCreateTableModal(){document.getElementById("newTableName").value="",document.getElementById("columnDefinitions").innerHTML="",columnDefCounter=0,addColumnDefinition(!0),openModal("createTableModal")}function addColumnDefinition(e=!1){const t=document.getElementById("columnDefinitions"),n=++columnDefCounter,o=`
+    `}function escapeHtml(e){return e==null?"":String(e).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}let columnDefCounter=0;function openCreateTableModal(){document.getElementById("newTableName").value="",document.getElementById("columnDefinitions").innerHTML="",columnDefCounter=0,addColumnDefinition(!0),openModal("createTableModal")}function addColumnDefinition(e=!1){const t=document.getElementById("columnDefinitions"),n=++columnDefCounter,o=`
         <div class="column-def-row" id="colDef_${n}" style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;">
             <input type="text" placeholder="Column name" class="col-name" style="flex: 2;" value="${e?"id":""}">
             <select class="col-type" style="flex: 1;">

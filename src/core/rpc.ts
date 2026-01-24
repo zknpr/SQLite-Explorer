@@ -178,6 +178,19 @@ export function processProtocolMessage(
   if (msg.kind === 'invoke' && localMethods && sendResponse) {
     const { correlationId, methodName, parameters } = msg;
 
+    // SECURITY: Validate method name to prevent prototype pollution attacks.
+    // An attacker could try to invoke 'constructor', '__proto__', 'toString', etc.
+    // We only allow methods that exist directly on the localMethods object,
+    // not inherited from Object.prototype.
+    if (!Object.prototype.hasOwnProperty.call(localMethods, methodName)) {
+      sendResponse({
+        kind: 'result',
+        correlationId,
+        errorText: `Unknown method: ${methodName}`
+      });
+      return true;
+    }
+
     const implementation = localMethods[methodName];
     if (typeof implementation !== 'function') {
       sendResponse({

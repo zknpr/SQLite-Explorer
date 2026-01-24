@@ -2221,13 +2221,25 @@ function showErrorState(message) {
     `;
 }
 
+/**
+ * Escape HTML special characters to prevent XSS attacks.
+ * Escapes: & < > " ' (ampersand, less-than, greater-than, double quote, single quote)
+ *
+ * SECURITY NOTE: Single quote escaping is critical because table/column names
+ * are used in onclick handlers with single-quoted strings, e.g.:
+ *   onclick="selectTableItem('${escapeHtml(name)}', 'table')"
+ * Without escaping single quotes, a malicious table name like:
+ *   user'); alert('XSS'); //
+ * would break out of the string and execute arbitrary JavaScript.
+ */
 function escapeHtml(str) {
     if (str === null || str === undefined) return '';
     return String(str)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 // ================================================================

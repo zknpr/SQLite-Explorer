@@ -3,7 +3,7 @@
   "name": "sqlite-explorer",
   "displayName": "SQLite Explorer",
   "description": "A powerful SQLite database viewer and editor for VS Code",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "publisher": "zknpr",
   "license": "MIT",
   "repository": {
