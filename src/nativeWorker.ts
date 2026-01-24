@@ -465,9 +465,17 @@ export async function createNativeDatabaseConnection(
          */
         undoModification: async (mod: ModificationEntry) => {
           if (mod.modificationType === 'cell_update' && mod.targetTable && mod.targetColumn && mod.targetRowId !== undefined) {
+            // SECURITY: Validate rowId is a number to prevent SQL injection.
+            // RecordId type allows string | number, but rowid should always be numeric.
+            // A compromised webview could send a malicious string like "1; DROP TABLE users; --"
+            const rowIdNum = Number(mod.targetRowId);
+            if (!Number.isFinite(rowIdNum)) {
+              throw new Error(`Invalid rowid: ${mod.targetRowId}`);
+            }
+
             const sqlValue = cellValueToSql(mod.previousValue);
             // Use escapeIdentifier to prevent SQL injection via malicious table/column names
-            const sql = `UPDATE ${escapeIdentifier(mod.targetTable)} SET ${escapeIdentifier(mod.targetColumn)} = ${sqlValue} WHERE rowid = ${mod.targetRowId}`;
+            const sql = `UPDATE ${escapeIdentifier(mod.targetTable)} SET ${escapeIdentifier(mod.targetColumn)} = ${sqlValue} WHERE rowid = ${rowIdNum}`;
             await worker.call('query', [sql]);
           }
           // Other modification types can be added as needed
@@ -479,9 +487,17 @@ export async function createNativeDatabaseConnection(
          */
         redoModification: async (mod: ModificationEntry) => {
           if (mod.modificationType === 'cell_update' && mod.targetTable && mod.targetColumn && mod.targetRowId !== undefined) {
+            // SECURITY: Validate rowId is a number to prevent SQL injection.
+            // RecordId type allows string | number, but rowid should always be numeric.
+            // A compromised webview could send a malicious string like "1; DROP TABLE users; --"
+            const rowIdNum = Number(mod.targetRowId);
+            if (!Number.isFinite(rowIdNum)) {
+              throw new Error(`Invalid rowid: ${mod.targetRowId}`);
+            }
+
             const sqlValue = cellValueToSql(mod.newValue);
             // Use escapeIdentifier to prevent SQL injection via malicious table/column names
-            const sql = `UPDATE ${escapeIdentifier(mod.targetTable)} SET ${escapeIdentifier(mod.targetColumn)} = ${sqlValue} WHERE rowid = ${mod.targetRowId}`;
+            const sql = `UPDATE ${escapeIdentifier(mod.targetTable)} SET ${escapeIdentifier(mod.targetColumn)} = ${sqlValue} WHERE rowid = ${rowIdNum}`;
             await worker.call('query', [sql]);
           }
           // Other modification types can be added as needed

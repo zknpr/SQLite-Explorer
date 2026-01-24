@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.11
+
+### Security
+
+- **Fixed SQL injection in webview queries**: The frontend viewer now uses `escapeIdentifier()` for all table and column names in SQL queries (SELECT, INSERT, UPDATE, DELETE, ALTER TABLE, CREATE TABLE, PRAGMA). Previously, table names containing double quotes like `my"table` would cause syntax errors or potential SQL injection.
+
+- **Fixed rowId injection vulnerability**: All SQL queries that use `rowid` in WHERE clauses now validate that the value is a finite number using `validateRowId()`. This prevents a compromised webview from injecting malicious SQL via crafted rowId values. Affected: `viewer.js` (UPDATE, DELETE queries), `nativeWorker.ts` (undo/redo operations).
+
+### Bug Fixes
+
+- **Fixed binary data serialization in undo history**: The main undo/redo tracker (`src/core/undo-history.ts`) now properly serializes `Uint8Array` (BLOB data) using base64 encoding. This ensures undo/redo works correctly when editing binary cells.
+
 ## 1.0.10
 
 ### Security

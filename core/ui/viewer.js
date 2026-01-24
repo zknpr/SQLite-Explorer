@@ -415,7 +415,8 @@ async function loadTableColumns() {
     if (!selectedTable) return;
 
     try {
-        const result = await backendApi.exec(`PRAGMA table_info("${selectedTable}")`);
+        // Use escapeIdentifier for table name to prevent SQL injection
+        const result = await backendApi.exec(`PRAGMA table_info(${escapeIdentifier(selectedTable)})`);
         tableColumns = (result[0]?.records || []).map(r => ({
             cid: r[0],
             name: r[1],
@@ -451,23 +452,26 @@ async function loadTableData() {
         const whereConditions = [];
 
         // Global filter (searches all columns)
+        // Use escapeIdentifier for column names to prevent SQL injection
         if (filterQuery) {
-            const globalConditions = tableColumns.map(c => `"${c.name}" LIKE '%${filterQuery.replace(/'/g, "''")}%'`).join(' OR ');
+            const globalConditions = tableColumns.map(c => `${escapeIdentifier(c.name)} LIKE '%${filterQuery.replace(/'/g, "''")}%'`).join(' OR ');
             whereConditions.push(`(${globalConditions})`);
         }
 
         // Column-specific filters (AND logic between columns)
+        // Use escapeIdentifier for column names to prevent SQL injection
         for (const [colName, filterValue] of Object.entries(columnFilters)) {
             if (filterValue && filterValue.trim()) {
                 const escaped = filterValue.replace(/'/g, "''");
-                whereConditions.push(`"${colName}" LIKE '%${escaped}%'`);
+                whereConditions.push(`${escapeIdentifier(colName)} LIKE '%${escaped}%'`);
             }
         }
 
         const whereClause = whereConditions.length > 0 ? ` WHERE ${whereConditions.join(' AND ')}` : '';
 
         // Get total count
-        const countSql = `SELECT COUNT(*) FROM "${selectedTable}"${whereClause}`;
+        // Use escapeIdentifier to prevent SQL injection via malicious table names
+        const countSql = `SELECT COUNT(*) FROM ${escapeIdentifier(selectedTable)}${whereClause}`;
         const countResult = await backendApi.exec(countSql);
         totalRecordCount = countResult[0]?.records?.[0]?.[0] || 0;
         totalPageCount = Math.max(1, Math.ceil(totalRecordCount / rowsPerPage));
@@ -480,13 +484,14 @@ async function loadTableData() {
         // Use alias for rowid to prevent deduplication with INTEGER PRIMARY KEY columns
         // This ensures native SQLite backend returns columns in the same order as PRAGMA table_info
         // Note: Views don't have a rowid column - only include rowid for tables
-        const columnNames = tableColumns.map(c => `"${c.name}"`).join(', ');
+        // Use escapeIdentifier for all table/column names to prevent SQL injection
+        const columnNames = tableColumns.map(c => escapeIdentifier(c.name)).join(', ');
         const isTable = selectedTableType === 'table';
         let dataSql = isTable
-            ? `SELECT rowid AS _rowid_, ${columnNames} FROM "${selectedTable}"${whereClause}`
-            : `SELECT ${columnNames} FROM "${selectedTable}"${whereClause}`;
+            ? `SELECT rowid AS _rowid_, ${columnNames} FROM ${escapeIdentifier(selectedTable)}${whereClause}`
+            : `SELECT ${columnNames} FROM ${escapeIdentifier(selectedTable)}${whereClause}`;
         if (sortedColumn) {
-            dataSql += ` ORDER BY "${sortedColumn}" ${sortAscending ? 'ASC' : 'DESC'}`;
+            dataSql += ` ORDER BY ${escapeIdentifier(sortedColumn)} ${sortAscending ? 'ASC' : 'DESC'}`;
         }
         dataSql += ` LIMIT ${rowsPerPage} OFFSET ${currentPageIndex * rowsPerPage}`;
 
@@ -1216,8 +1221,8 @@ async function saveCellEdit() {
     }
 
     // Build UPDATE query using rowid for precise row identification
-    // Column and table names are quoted to handle special characters/reserved words
-    const updateSql = `UPDATE "${selectedTable}" SET "${columnName}" = ${sqlValue} WHERE rowid = ${rowId}`;
+    // Use escapeIdentifier for table/column names and validateRowId for rowid to prevent SQL injection
+    const updateSql = `UPDATE ${escapeIdentifier(selectedTable)} SET ${escapeIdentifier(columnName)} = ${sqlValue} WHERE rowid = ${validateRowId(rowId)}`;
 
     try {
         // Set saving flag to prevent concurrent operations
@@ -1478,7 +1483,8 @@ async function saveCellPreview() {
         sqlValue = `'${newValue.replace(/'/g, "''")}'`;
     }
 
-    const updateSql = `UPDATE "${selectedTable}" SET "${columnName}" = ${sqlValue} WHERE rowid = ${rowId}`;
+    // Use escapeIdentifier for table/column names and validateRowId for rowid to prevent SQL injection
+    const updateSql = `UPDATE ${escapeIdentifier(selectedTable)} SET ${escapeIdentifier(columnName)} = ${sqlValue} WHERE rowid = ${validateRowId(rowId)}`;
 
     try {
         updateStatus('Saving...');
@@ -1985,12 +1991,13 @@ async function submitAddRow() {
     }
 
     // Second pass: build SQL
+    // Use escapeIdentifier for column names to prevent SQL injection
     for (const input of inputs) {
         const colName = input.dataset.column;
         const value = input.value.trim();
 
         if (value !== '') {
-            colNames.push(`"${colName}"`);
+            colNames.push(escapeIdentifier(colName));
             if (value.toLowerCase() === 'null') {
                 colValues.push('NULL');
             } else if (!isNaN(Number(value)) && value !== '') {
@@ -2002,10 +2009,11 @@ async function submitAddRow() {
     }
 
     let sql;
+    // Use escapeIdentifier for table name to prevent SQL injection
     if (colNames.length === 0) {
-        sql = `INSERT INTO "${selectedTable}" DEFAULT VALUES`;
+        sql = `INSERT INTO ${escapeIdentifier(selectedTable)} DEFAULT VALUES`;
     } else {
-        sql = `INSERT INTO "${selectedTable}" (${colNames.join(', ')}) VALUES (${colValues.join(', ')})`;
+        sql = `INSERT INTO ${escapeIdentifier(selectedTable)} (${colNames.join(', ')}) VALUES (${colValues.join(', ')})`;
     }
 
     try {
@@ -2064,7 +2072,9 @@ async function submitDeleteRows() {
     if (selectedRowIds.size === 0) return;
 
     const rowIds = Array.from(selectedRowIds);
-    const sql = `DELETE FROM "${selectedTable}" WHERE rowid IN (${rowIds.join(', ')})`;
+    // Use escapeIdentifier for table name and validateRowId for each rowid to prevent SQL injection
+    const validatedRowIds = rowIds.map(id => validateRowId(id));
+    const sql = `DELETE FROM ${escapeIdentifier(selectedTable)} WHERE rowid IN (${validatedRowIds.join(', ')})`;
 
     try {
         updateStatus('Deleting rows...');
@@ -2105,8 +2115,9 @@ async function submitDeleteColumns() {
 
         // Delete columns one by one using ALTER TABLE DROP COLUMN
         // Note: This requires SQLite 3.35.0+ (sql.js should support this)
+        // Use escapeIdentifier for table/column names to prevent SQL injection
         for (const columnName of columnNames) {
-            const sql = `ALTER TABLE "${selectedTable}" DROP COLUMN "${columnName}"`;
+            const sql = `ALTER TABLE ${escapeIdentifier(selectedTable)} DROP COLUMN ${escapeIdentifier(columnName)}`;
             await backendApi.exec(sql);
         }
 
@@ -2232,6 +2243,53 @@ function showErrorState(message) {
  *   user'); alert('XSS'); //
  * would break out of the string and execute arbitrary JavaScript.
  */
+/**
+ * Validate and sanitize a rowid for use in SQL queries.
+ * Rowids in SQLite are always 64-bit signed integers.
+ *
+ * SECURITY: This prevents SQL injection via malicious rowid values.
+ * While rowids should always be numeric, a compromised data source
+ * could send strings like "1; DROP TABLE users; --".
+ *
+ * @param {number|string} rowId - The rowid value to validate
+ * @returns {number} The validated numeric rowid
+ * @throws {Error} If rowId is not a valid number
+ */
+function validateRowId(rowId) {
+    const num = Number(rowId);
+    if (!Number.isFinite(num)) {
+        throw new Error(`Invalid rowid: ${rowId}`);
+    }
+    return num;
+}
+
+/**
+ * Escape a SQL identifier (table name, column name) for safe use in queries.
+ * SQL identifiers are wrapped in double quotes, and any internal double quotes
+ * are escaped by doubling them (SQL standard).
+ *
+ * SECURITY: This prevents SQL injection via malicious table/column names.
+ * Example: A table named `foo"--DROP TABLE bar` becomes `"foo""--DROP TABLE bar"`
+ *
+ * @param {string} identifier - The table or column name to escape
+ * @returns {string} Safely escaped identifier wrapped in double quotes
+ */
+function escapeIdentifier(identifier) {
+    if (identifier === null || identifier === undefined) return '""';
+    return `"${String(identifier).replace(/"/g, '""')}"`;
+}
+
+/**
+ * Escape HTML special characters to prevent XSS attacks.
+ * Escapes: & < > " ' (ampersand, less-than, greater-than, double quote, single quote)
+ *
+ * SECURITY NOTE: Single quote escaping is critical because table/column names
+ * are used in onclick handlers with single-quoted strings, e.g.:
+ *   onclick="selectTableItem('${escapeHtml(name)}', 'table')"
+ * Without escaping single quotes, a malicious table name like:
+ *   user'); alert('XSS'); //
+ * would break out of the string and execute arbitrary JavaScript.
+ */
 function escapeHtml(str) {
     if (str === null || str === undefined) return '';
     return String(str)
@@ -2318,7 +2376,8 @@ async function submitCreateTable() {
 
         if (!name) continue;
 
-        let def = `"${name}" ${type}`;
+        // Use escapeIdentifier for column name to prevent SQL injection
+        let def = `${escapeIdentifier(name)} ${type}`;
         if (isPK) def += ' PRIMARY KEY';
         if (isNN && !isPK) def += ' NOT NULL';
         colDefs.push(def);
@@ -2329,7 +2388,8 @@ async function submitCreateTable() {
         return;
     }
 
-    const sql = `CREATE TABLE "${tableName}" (${colDefs.join(', ')})`;
+    // Use escapeIdentifier for table name to prevent SQL injection
+    const sql = `CREATE TABLE ${escapeIdentifier(tableName)} (${colDefs.join(', ')})`;
 
     try {
         updateStatus('Creating table...');
@@ -2381,7 +2441,8 @@ async function submitAddColumn() {
         return;
     }
 
-    let sql = `ALTER TABLE "${selectedTable}" ADD COLUMN "${columnName}" ${columnType}`;
+    // Use escapeIdentifier for table/column names to prevent SQL injection
+    let sql = `ALTER TABLE ${escapeIdentifier(selectedTable)} ADD COLUMN ${escapeIdentifier(columnName)} ${columnType}`;
 
     if (defaultValue) {
         if (defaultValue.toLowerCase() === 'null') {
@@ -2621,6 +2682,7 @@ async function clearSelectedCellValues() {
 
         // Group cells by rowId for more efficient updates
         // Each cell needs its own UPDATE since we're clearing different columns
+        // Use escapeIdentifier for table/column names to prevent SQL injection
         const updates = [];
         for (const cell of selectedCells) {
             const column = tableColumns[cell.colIdx];
@@ -2638,7 +2700,8 @@ async function clearSelectedCellValues() {
                 columnName: column.name,
                 originalValue: cell.value,
                 newValue: newValue,
-                sql: `UPDATE "${selectedTable}" SET "${column.name}" = ${sqlValue} WHERE rowid = ${cell.rowId}`
+                // SECURITY: Use validateRowId to prevent SQL injection via compromised rowId
+                sql: `UPDATE ${escapeIdentifier(selectedTable)} SET ${escapeIdentifier(column.name)} = ${sqlValue} WHERE rowid = ${validateRowId(cell.rowId)}`
             });
         }
 
