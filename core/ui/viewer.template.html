@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQLite Explorer</title>
+    <!--HEAD-->
+    <style>
+<!--STYLES-->
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Panel -->
+        <div class="sidebar-panel" id="sidebarPanel">
+            <div class="sidebar-header">
+                <span>Explorer</span>
+                <div class="sidebar-actions">
+                    <button class="icon-button" onclick="reloadFromDisk()" title="Reload">
+                        <span class="codicon codicon-refresh"></span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Tables Section -->
+            <div class="section-title" data-section="tables" onclick="toggleSection('tables')">
+                <span class="arrow">▼</span>
+                <span>Tables</span>
+                <span class="badge" id="tablesBadge">0</span>
+                <button class="icon-button" onclick="event.stopPropagation(); openCreateTableModal()" title="Create Table" style="margin-left: auto;">
+                    <span class="codicon codicon-add"></span>
+                </button>
+            </div>
+            <ul class="item-list" id="tablesList"></ul>
+
+            <!-- Views Section -->
+            <div class="section-title collapsed" data-section="views" onclick="toggleSection('views')">
+                <span class="arrow">▼</span>
+                <span>Views</span>
+                <span class="badge" id="viewsBadge">0</span>
+            </div>
+            <ul class="item-list hidden" id="viewsList"></ul>
+
+            <!-- Indexes Section -->
+            <div class="section-title collapsed" data-section="indexes" onclick="toggleSection('indexes')">
+                <span class="arrow">▼</span>
+                <span>Indexes</span>
+                <span class="badge" id="indexesBadge">0</span>
+            </div>
+            <ul class="item-list hidden" id="indexesList"></ul>
+
+            <div class="resize-handle" id="resizeHandle"></div>
+        </div>
+
+        <!-- Main Panel -->
+        <div class="main-panel">
+            <!-- Toolbar -->
+            <div class="toolbar-panel">
+                <div class="toolbar-left">
+                    <div class="current-table" id="currentTable">
+                        <span class="codicon codicon-table"></span>
+                        <span id="tableNameLabel">No table selected</span>
+                    </div>
+                </div>
+                <div class="toolbar-right">
+                    <button class="toolbar-button" id="btnAddRow" onclick="openAddRowModal()" disabled>
+                        <span class="codicon codicon-add"></span> Add Row
+                    </button>
+                    <button class="toolbar-button" id="btnAddColumn" onclick="openAddColumnModal()" disabled>
+                        <span class="codicon codicon-insert"></span> Add Column
+                    </button>
+                    <button class="toolbar-button" id="btnDeleteRows" onclick="openDeleteModal()" disabled>
+                        <span class="codicon codicon-trash"></span> Delete
+                    </button>
+                    <button class="toolbar-button" id="btnExport" onclick="exportCurrentTable()" disabled>
+                        <span class="codicon codicon-export"></span> Export
+                    </button>
+                    <input type="text" class="filter-input" id="filterInput" placeholder="Filter..." onkeyup="onFilterChange()">
+                </div>
+            </div>
+
+            <!-- Grid Container -->
+            <div class="grid-container" id="gridContainer">
+                <div class="loading-view" id="loadingView">
+                    <div class="loading-spinner"></div>
+                    <span>Connecting to database...</span>
+                </div>
+            </div>
+
+            <!-- Footer -->
+            <div class="footer-panel">
+                <div class="footer-left">
+                    <span id="statusText">Ready</span>
+                </div>
+                <div class="footer-right">
+                    <div class="page-selector">
+                        <span>Rows:</span>
+                        <select id="pageSizeSelect" onchange="onPageSizeChange()">
+                            <option value="100">100</option>
+                            <option value="250">250</option>
+                            <option value="500" selected>500</option>
+                            <option value="1000">1000</option>
+                        </select>
+                    </div>
+                    <div class="pagination-controls">
+                        <button id="btnFirst" onclick="goToPage(0)" disabled>⏮</button>
+                        <button id="btnPrev" onclick="goToPage(currentPageIndex - 1)" disabled>◀</button>
+                        <span id="pageIndicator">0 / 0</span>
+                        <button id="btnNext" onclick="goToPage(currentPageIndex + 1)" disabled>▶</button>
+                        <button id="btnLast" onclick="goToPage(totalPageCount - 1)" disabled>⏭</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Row Modal -->
+    <div class="modal-overlay hidden" id="addRowModal">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <span class="modal-title">Add New Row</span>
+                <button class="modal-close" onclick="closeModal('addRowModal')">&times;</button>
+            </div>
+            <div class="modal-body" id="addRowForm"></div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="closeModal('addRowModal')">Cancel</button>
+                <button class="btn-primary" onclick="submitAddRow()">Add Row</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Delete Confirmation Modal -->
+    <div class="modal-overlay hidden" id="deleteModal">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <span class="modal-title">Confirm Delete</span>
+                <button class="modal-close" onclick="closeModal('deleteModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="deleteConfirmText">Are you sure you want to delete the selected rows?</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="closeModal('deleteModal')">Cancel</button>
+                <button class="btn-danger" onclick="submitDelete()">Delete</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Table Modal -->
+    <div class="modal-overlay hidden" id="createTableModal">
+        <div class="modal-dialog" style="width: 500px;">
+            <div class="modal-header">
+                <span class="modal-title">Create New Table</span>
+                <button class="modal-close" onclick="closeModal('createTableModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-field">
+                    <label>Table Name</label>
+                    <input type="text" id="newTableName" placeholder="my_table">
+                </div>
+                <div class="form-field">
+                    <label>Columns</label>
+                    <div id="columnDefinitions"></div>
+                    <button class="btn-secondary" onclick="addColumnDefinition()" style="margin-top: 8px;">+ Add Column</button>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="closeModal('createTableModal')">Cancel</button>
+                <button class="btn-primary" onclick="submitCreateTable()">Create Table</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Column Modal -->
+    <div class="modal-overlay hidden" id="addColumnModal">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <span class="modal-title">Add Column</span>
+                <button class="modal-close" onclick="closeModal('addColumnModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-field">
+                    <label>Column Name</label>
+                    <input type="text" id="newColumnName" placeholder="column_name">
+                </div>
+                <div class="form-field">
+                    <label>Type</label>
+                    <select id="newColumnType">
+                        <option value="TEXT">TEXT</option>
+                        <option value="INTEGER">INTEGER</option>
+                        <option value="REAL">REAL</option>
+                        <option value="BLOB">BLOB</option>
+                        <option value="NUMERIC">NUMERIC</option>
+                    </select>
+                </div>
+                <div class="form-field">
+                    <label>Default Value (optional)</label>
+                    <input type="text" id="newColumnDefault" placeholder="NULL">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="closeModal('addColumnModal')">Cancel</button>
+                <button class="btn-primary" onclick="submitAddColumn()">Add Column</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Cell Preview/Edit Modal - Floating window for viewing and editing large cell values -->
+    <div class="cell-preview-modal hidden" id="cellPreviewModal">
+        <div class="cell-preview-dialog">
+            <div class="cell-preview-header">
+                <div class="cell-preview-title">
+                    <span>Column:</span>
+                    <span class="cell-preview-column-name" id="cellPreviewColumnName"></span>
+                    <span class="cell-preview-type-badge" id="cellPreviewTypeBadge"></span>
+                </div>
+                <button class="cell-preview-close" onclick="closeCellPreview()">&times;</button>
+            </div>
+            <div class="cell-preview-toolbar">
+                <button class="cell-preview-toolbar-btn" id="formatJsonBtn" onclick="formatCellPreviewJson()" title="Format as JSON">
+                    <span class="codicon codicon-json"></span> Format JSON
+                </button>
+                <button class="cell-preview-toolbar-btn" id="compactJsonBtn" onclick="compactCellPreviewJson()" title="Compact JSON">
+                    <span class="codicon codicon-fold"></span> Compact
+                </button>
+                <button class="cell-preview-toolbar-btn" id="wrapTextBtn" onclick="toggleCellPreviewWrap()" title="Toggle word wrap">
+                    <span class="codicon codicon-word-wrap"></span> Wrap
+                </button>
+            </div>
+            <div class="cell-preview-body">
+                <textarea class="cell-preview-textarea" id="cellPreviewTextarea" spellcheck="false"></textarea>
+            </div>
+            <div class="cell-preview-footer">
+                <div class="cell-preview-info">
+                    <span id="cellPreviewCharCount">0 characters</span>
+                    <span id="cellPreviewReadonlyBadge" style="display:none;margin-left:8px;color:var(--warning-color);">Read-only (View)</span>
+                </div>
+                <div class="cell-preview-actions">
+                    <button class="btn-secondary" onclick="closeCellPreview()">Cancel</button>
+                    <button class="btn-primary" id="cellPreviewSaveBtn" onclick="saveCellPreview()">Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+<!--SCRIPTS-->
+    </script>
+    <!--BODY-->
+</body>
+</html>

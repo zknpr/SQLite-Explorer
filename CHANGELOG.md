@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.8
+
+### Improvements
+
+- **Column widths fit titles**: Column widths are now calculated based on the column name length, ensuring headers are fully visible. Long column names are truncated with ellipsis (max 250px).
+- **Default page size reduced**: Default rows per page changed from 1000 to 500 for better performance on large tables.
+- **Simplified page size options**: Removed 5000 and 10000 row options to prevent performance issues. Options are now 100/250/500/1000.
+
+### Internal
+
+- Refactored webview into separate source files (HTML template, CSS, JavaScript) for better maintainability. The build process bundles and minifies them into a single HTML file.
+
 ## 1.0.7
 
 ### New Features
@@ -13,6 +25,7 @@
 ### Bug Fixes
 
 - Fixed column filter returning no results causing headers to disappear, leaving users stuck with no way to clear the filter. Now shows a "No rows match the current filter" message while keeping filter inputs accessible.
+- Fixed "n.on is not a function" error when opening databases in VS Code Web. The browser worker communication now correctly uses addEventListener instead of Node.js-style .on() method.
 
 ## 1.0.6
 

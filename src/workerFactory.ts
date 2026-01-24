@@ -141,11 +141,19 @@ async function createWasmDatabaseConnection(
   const workerThread = new Worker(workerScriptPath);
 
   // Create IPC proxy for worker communication
+  // Browser Workers use addEventListener, Node.js Workers use .on()
   const workerProxy = connectWorkerPort<WorkerMethods>(
     {
       postMessage: (data: unknown) => workerThread.postMessage(data),
       on: (event: 'message', handler: (data: unknown) => void) => {
-        workerThread.on(event, handler);
+        if (import.meta.env.VSCODE_BROWSER_EXT) {
+          // Browser: Web Worker uses addEventListener with MessageEvent wrapper
+          workerThread.addEventListener(event, (e: MessageEvent) => handler(e.data));
+        } else {
+          // Node.js: worker_threads uses .on() with direct data
+          (workerThread as unknown as { on(event: string, handler: (data: unknown) => void): void })
+            .on(event, handler);
+        }
       }
     },
     ['initializeDatabase', 'runQuery', 'exportDatabase']

@@ -1,0 +1,1068 @@
+/**
+ * SQLite Explorer - Webview Styles
+ *
+ * This file contains all CSS styles for the SQLite Explorer webview UI.
+ * It is bundled into viewer.html at build time.
+ */
+
+/* ================================================================
+   CSS VARIABLES & RESET
+   ================================================================ */
+:root {
+    --bg-primary: var(--vscode-editor-background, #1e1e1e);
+    --bg-secondary: var(--vscode-sideBar-background, #252526);
+    --bg-tertiary: var(--vscode-input-background, #3c3c3c);
+    --bg-stripe: rgba(255, 255, 255, 0.02); /* Subtle stripe for alternating rows */
+    --text-primary: var(--vscode-editor-foreground, #cccccc);
+    --text-secondary: var(--vscode-descriptionForeground, #888888);
+    --border-color: var(--vscode-panel-border, #454545);
+    --accent-color: var(--vscode-focusBorder, #007acc);
+    --hover-bg: var(--vscode-list-hoverBackground, #2a2d2e);
+    --active-bg: var(--vscode-list-activeSelectionBackground, #094771);
+    --active-text: var(--vscode-list-activeSelectionForeground, #ffffff);
+    --error-color: var(--vscode-errorForeground, #f48771);
+    --success-color: var(--vscode-terminal-ansiGreen, #89d185);
+
+    --sidebar-width: 220px;
+    --toolbar-height: 36px;
+    --footer-height: 28px;
+    --row-height: 26px;
+    --header-height: 52px; /* Increased to accommodate filter input */
+    --row-num-width: 50px;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+    font-size: var(--vscode-font-size, 13px);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+}
+
+/* ================================================================
+   LAYOUT STRUCTURE
+   ================================================================ */
+.app-container {
+    display: flex;
+    width: 100%;
+    height: 100%;
+}
+
+.sidebar-panel {
+    width: var(--sidebar-width);
+    min-width: 150px;
+    max-width: 400px;
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border-color);
+    display: flex;
+    flex-direction: column;
+    position: relative;
+}
+
+.main-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* ================================================================
+   SIDEBAR STYLES
+   ================================================================ */
+.sidebar-header {
+    padding: 8px 12px;
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.sidebar-actions {
+    display: flex;
+    gap: 4px;
+}
+
+.icon-button {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 3px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.icon-button:hover {
+    background: var(--hover-bg);
+    color: var(--text-primary);
+}
+
+.section-title {
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    user-select: none;
+}
+
+.section-title:hover {
+    background: var(--hover-bg);
+}
+
+.section-title .arrow {
+    margin-right: 4px;
+    transition: transform 0.15s;
+}
+
+.section-title.collapsed .arrow {
+    transform: rotate(-90deg);
+}
+
+.section-title .badge {
+    margin-left: auto;
+    background: var(--bg-tertiary);
+    padding: 1px 6px;
+    border-radius: 10px;
+    font-size: 10px;
+}
+
+.item-list {
+    list-style: none;
+    overflow-y: auto;
+}
+
+.item-list.hidden {
+    display: none;
+}
+
+.list-item {
+    padding: 4px 12px 4px 24px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.list-item:hover {
+    background: var(--hover-bg);
+}
+
+.list-item.selected {
+    background: var(--active-bg);
+    color: var(--active-text);
+}
+
+.list-item .item-icon {
+    opacity: 0.7;
+    flex-shrink: 0;
+}
+
+.list-item .item-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.resize-handle {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 4px;
+    cursor: col-resize;
+}
+
+.resize-handle:hover {
+    background: var(--accent-color);
+}
+
+/* ================================================================
+   TOOLBAR STYLES
+   ================================================================ */
+.toolbar-panel {
+    height: var(--toolbar-height);
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    align-items: center;
+    padding: 0 8px;
+    gap: 8px;
+}
+
+.toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.toolbar-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.current-table {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 500;
+}
+
+.toolbar-button {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 4px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.toolbar-button:hover {
+    background: var(--hover-bg);
+}
+
+.toolbar-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.filter-input {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 4px 8px;
+    border-radius: 3px;
+    font-size: 12px;
+    width: 200px;
+}
+
+.filter-input:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+/* ================================================================
+   DATA GRID STYLES
+   ================================================================ */
+.grid-container {
+    flex: 1;
+    overflow: auto;
+    position: relative;
+}
+
+.data-grid {
+    border-collapse: collapse;
+    table-layout: fixed;
+    /* Use auto width to allow table to expand beyond container */
+    /* This enables horizontal scrolling in .grid-container */
+}
+
+.grid-header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--bg-secondary);
+}
+
+.grid-header tr {
+    height: var(--header-height);
+    max-height: var(--header-height);
+}
+
+.header-cell {
+    padding: 4px 8px;
+    text-align: left;
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border-color);
+    user-select: none;
+    white-space: nowrap;
+    overflow: visible; /* Allow filter to show */
+    position: relative;
+    /* No min-width here - inline styles control width for full customization */
+    box-sizing: border-box;
+    height: var(--header-height);
+    max-height: var(--header-height);
+    vertical-align: top;
+}
+
+/* Header cell content layout - column name + pin button on top, filter below */
+.header-content {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    gap: 2px;
+}
+
+.header-top {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 22px;
+    cursor: pointer;
+    overflow: hidden;
+}
+
+.header-bottom {
+    flex: 1;
+    display: flex;
+    align-items: center;
+}
+
+.header-cell:hover {
+    background: var(--hover-bg);
+}
+
+/* Column resize handle - extends slightly beyond cell border for easier grabbing */
+.header-cell .resize-handle {
+    position: absolute;
+    right: -4px; /* Extend beyond cell border so it's always grabbable */
+    top: 0;
+    height: 100%;
+    width: 10px; /* Wider grab area for easier resizing */
+    cursor: col-resize;
+    background: transparent;
+    z-index: 15; /* Above header content to ensure it's always clickable */
+}
+
+.header-cell .resize-handle:hover,
+.header-cell .resize-handle.resizing {
+    background: var(--accent-color);
+    /* Show visible indicator only in the border area (4px wide) */
+    background-clip: padding-box;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+}
+
+.header-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+}
+
+/* Sort indicator - displayed inline next to column name */
+.sort-indicator {
+    font-size: 10px;
+    margin-left: 4px;
+    color: var(--text-secondary);
+}
+
+/* Primary key indicator - displayed before column name */
+.key-icon {
+    font-size: 12px;
+    margin-right: 4px;
+    color: var(--vscode-editorWarning-foreground, #cca700);
+    flex-shrink: 0;
+}
+
+/* Row number header (#) - clickable for select all */
+.header-cell.row-number-header {
+    text-align: center;
+    cursor: pointer;
+}
+
+.header-cell.row-number-header:hover {
+    background: var(--hover-bg);
+}
+
+/* Column filter input inside header cell */
+.column-filter {
+    flex: 1;
+    min-width: 0;
+    padding: 2px 6px;
+    font-size: 11px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 3px 0 0 3px;
+    color: var(--text-primary);
+    box-sizing: border-box;
+    text-transform: none; /* Override header uppercase */
+    font-weight: normal;
+}
+
+.column-filter:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+.column-filter::placeholder {
+    color: var(--text-secondary);
+    opacity: 0.7;
+}
+
+/* Filter apply button - triggers filter on click */
+.filter-apply-btn {
+    padding: 2px 6px;
+    font-size: 11px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-left: none;
+    border-radius: 0 3px 3px 0;
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.filter-apply-btn:hover {
+    background: var(--hover-bg);
+    color: var(--text-primary);
+}
+
+.filter-apply-btn .codicon {
+    font-size: 12px;
+}
+
+/* Pinned columns - sticky left positioning to stay visible when scrolling */
+.header-cell.pinned,
+.data-cell.pinned {
+    z-index: 5;
+    background-color: var(--bg-secondary) !important;
+}
+
+.header-cell.pinned {
+    z-index: 12; /* Above data rows */
+    background-color: var(--bg-secondary) !important;
+}
+
+/* Pinned column cells should NOT become transparent on hover/selection */
+/* They keep their solid background to hide sliding content */
+.data-row:hover .data-cell.pinned,
+.data-row.selected .data-cell.pinned {
+    background-color: var(--bg-secondary) !important;
+}
+
+/* Pinned rows - sticky top (top offset set via inline style) */
+/* These rows must ALWAYS have a solid background to hide content sliding under them */
+/* Use a slightly different background to indicate pinned state */
+.data-row.pinned {
+    position: sticky;
+    z-index: 6;
+}
+
+.data-row.pinned td {
+    background-color: var(--bg-secondary) !important;
+}
+
+/* Pinned row cells should NOT become transparent on hover/selection */
+/* They keep their solid background to hide sliding content */
+.data-row.pinned:hover td,
+.data-row.pinned.selected td {
+    background-color: var(--bg-secondary) !important;
+}
+
+/* Cell that is both in pinned row AND pinned column */
+.data-row.pinned td.pinned {
+    background-color: var(--bg-secondary) !important;
+}
+
+/* Cells in pinned row AND pinned column keep solid background on hover/selection */
+.data-row.pinned:hover td.pinned,
+.data-row.pinned.selected td.pinned {
+    background-color: var(--bg-secondary) !important;
+}
+
+/* Pin indicator icon - using codicon */
+.pin-icon {
+    cursor: pointer;
+    opacity: 0;
+    margin-left: 4px;
+    font-size: 12px;
+    vertical-align: middle;
+}
+
+.header-cell:hover .pin-icon,
+.header-cell:hover .select-column-icon,
+.data-cell.row-number:hover .pin-icon,
+.pin-icon.pinned {
+    opacity: 0.5;
+}
+
+.pin-icon:hover,
+.select-column-icon:hover {
+    opacity: 1 !important;
+}
+
+.pin-icon.pinned {
+    opacity: 0.8;
+}
+
+/* Select column icon - appears on hover, left of pin icon */
+.select-column-icon {
+    opacity: 0;
+    cursor: pointer;
+    margin-right: 4px;
+    font-size: 12px;
+    vertical-align: middle;
+}
+
+.data-row {
+    height: var(--row-height);
+    max-height: var(--row-height);
+    background: var(--bg-primary);
+}
+
+/* All data cells inherit row background by default */
+.data-row td {
+    background: transparent;
+}
+
+/* Alternating row colors (zebra striping) */
+.data-row:nth-child(even) {
+    background: var(--bg-stripe);
+}
+
+.data-row:hover {
+    background: var(--hover-bg);
+}
+
+.data-row.selected {
+    background: var(--active-bg);
+}
+
+.data-cell {
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border-color);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    box-sizing: border-box;
+    height: var(--row-height);
+    max-height: var(--row-height);
+}
+
+/* Row number column (#) - subtle background to distinguish from data */
+.data-cell.row-number {
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    text-align: center;
+    font-size: 0.85em;
+    user-select: none;
+}
+
+.data-cell.null-value {
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+.data-cell.cell-selected {
+    background: var(--active-bg);
+}
+
+/* Header cell styling when entire column is selected */
+.header-cell.column-selected {
+    background: var(--active-bg) !important;
+}
+.header-cell.column-selected .header-text {
+    color: var(--active-text);
+}
+
+.data-cell.editing {
+    padding: 0;
+}
+
+.cell-input {
+    width: 100%;
+    height: 100%;
+    padding: 4px 8px;
+    border: 2px solid var(--accent-color);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: inherit;
+    outline: none;
+}
+
+/* ================================================================
+   EMPTY STATE & LOADING
+   ================================================================ */
+.empty-view {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-secondary);
+    gap: 12px;
+}
+
+.empty-view .empty-icon {
+    font-size: 48px;
+    opacity: 0.5;
+}
+
+.empty-view .empty-title {
+    font-size: 16px;
+    font-weight: 500;
+}
+
+.empty-view .empty-desc {
+    font-size: 13px;
+}
+
+.loading-view {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    gap: 12px;
+}
+
+.loading-spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid var(--border-color);
+    border-top-color: var(--accent-color);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+/* ================================================================
+   FOOTER STYLES
+   ================================================================ */
+.footer-panel {
+    height: var(--footer-height);
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border-color);
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    font-size: 12px;
+}
+
+.footer-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.footer-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.page-selector {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.page-selector select {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+}
+
+.pagination-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.pagination-controls button {
+    background: none;
+    border: none;
+    color: var(--text-primary);
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 3px;
+}
+
+.pagination-controls button:hover:not(:disabled) {
+    background: var(--hover-bg);
+}
+
+.pagination-controls button:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+}
+
+/* ================================================================
+   MODAL STYLES
+   ================================================================ */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.modal-overlay.hidden {
+    display: none;
+}
+
+.modal-dialog {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    min-width: 400px;
+    max-width: 600px;
+    max-height: 80vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.modal-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.modal-title {
+    font-weight: 600;
+    font-size: 14px;
+}
+
+.modal-close {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 18px;
+    padding: 4px;
+}
+
+.modal-close:hover {
+    color: var(--text-primary);
+}
+
+.modal-body {
+    padding: 16px;
+    overflow-y: auto;
+}
+
+.modal-footer {
+    padding: 12px 16px;
+    border-top: 1px solid var(--border-color);
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.form-field {
+    margin-bottom: 12px;
+}
+
+.form-field label {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.form-field input,
+.form-field select {
+    width: 100%;
+    padding: 6px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    color: var(--text-primary);
+    font-size: 13px;
+}
+
+.form-field input:focus,
+.form-field select:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+.btn-primary {
+    background: var(--accent-color);
+    border: none;
+    color: white;
+    padding: 6px 14px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 13px;
+}
+
+.btn-primary:hover {
+    opacity: 0.9;
+}
+
+.btn-secondary {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 6px 14px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 13px;
+}
+
+.btn-secondary:hover {
+    background: var(--hover-bg);
+}
+
+.btn-danger {
+    background: var(--error-color);
+    border: none;
+    color: white;
+    padding: 6px 14px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 13px;
+}
+
+/* ================================================================
+   CELL PREVIEW/EDIT MODAL
+   Floating window for viewing and editing large cell values
+   ================================================================ */
+.cell-preview-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1100; /* Above other modals */
+}
+
+.cell-preview-modal.hidden {
+    display: none;
+}
+
+.cell-preview-dialog {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    width: 600px;
+    max-width: 90vw;
+    max-height: 80vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+}
+
+.cell-preview-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--bg-tertiary);
+}
+
+.cell-preview-title {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.cell-preview-column-name {
+    color: var(--accent-color);
+    font-family: monospace;
+}
+
+.cell-preview-type-badge {
+    font-size: 10px;
+    padding: 2px 6px;
+    background: var(--bg-secondary);
+    border-radius: 3px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+}
+
+.cell-preview-close {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 18px;
+    padding: 4px 8px;
+    border-radius: 3px;
+}
+
+.cell-preview-close:hover {
+    background: var(--hover-bg);
+    color: var(--text-primary);
+}
+
+.cell-preview-body {
+    flex: 1;
+    padding: 16px;
+    overflow: auto;
+    min-height: 200px;
+    max-height: 60vh;
+}
+
+.cell-preview-textarea {
+    width: 100%;
+    height: 100%;
+    min-height: 180px;
+    padding: 12px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-family: monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    resize: vertical;
+    box-sizing: border-box;
+}
+
+.cell-preview-textarea:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+.cell-preview-textarea.readonly {
+    background: var(--bg-secondary);
+    cursor: default;
+}
+
+/* JSON formatting toolbar */
+.cell-preview-toolbar {
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.cell-preview-toolbar-btn {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 4px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.cell-preview-toolbar-btn:hover {
+    background: var(--hover-bg);
+}
+
+.cell-preview-toolbar-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.cell-preview-toolbar-btn.active {
+    background: var(--accent-color);
+    border-color: var(--accent-color);
+    color: white;
+}
+
+.cell-preview-footer {
+    padding: 12px 16px;
+    border-top: 1px solid var(--border-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--bg-tertiary);
+}
+
+.cell-preview-info {
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.cell-preview-actions {
+    display: flex;
+    gap: 8px;
+}
+
+/* Cell text wrapper - used for overflow detection */
+.data-cell .cell-text {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Expand icon - hidden by default, shown on hover when cell has overflow */
+.data-cell .expand-icon {
+    display: none;
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 10px;
+    color: var(--text-secondary);
+    background: var(--bg-secondary);
+    padding: 2px 4px;
+    border-radius: 2px;
+    cursor: pointer;
+    z-index: 1;
+}
+
+.data-cell .expand-icon:hover {
+    color: var(--text-primary);
+    background: var(--hover-bg);
+}
+
+/* Show expand icon only when cell has overflow class AND is hovered */
+.data-cell.has-overflow:hover .expand-icon {
+    display: inline-block;
+}
+
+.data-cell.has-overflow {
+    cursor: pointer;
+}
+
+.data-cell.has-overflow:hover {
+    background: var(--hover-bg);
+}

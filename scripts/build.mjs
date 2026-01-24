@@ -221,6 +221,69 @@ const copyAssets = async () => {
 };
 
 /**
+ * Bundle the webview HTML from separate source files.
+ *
+ * Reads the template HTML, CSS, and JavaScript files from core/ui/
+ * and bundles them into a single viewer.html file.
+ *
+ * Source files:
+ * - core/ui/viewer.template.html - HTML template with placeholders
+ * - core/ui/viewer.css - CSS styles
+ * - core/ui/viewer.js - JavaScript logic
+ *
+ * Output:
+ * - core/ui/viewer.html - Bundled HTML file ready for the webview
+ */
+const bundleWebview = async () => {
+  const templatePath = resolve('core', 'ui', 'viewer.template.html');
+  const cssPath = resolve('core', 'ui', 'viewer.css');
+  const jsPath = resolve('core', 'ui', 'viewer.js');
+  const outputPath = resolve('core', 'ui', 'viewer.html');
+
+  // Read source files
+  const template = fs.readFileSync(templatePath, 'utf-8');
+  const css = fs.readFileSync(cssPath, 'utf-8');
+  const js = fs.readFileSync(jsPath, 'utf-8');
+
+  // Optionally minify in production mode
+  let finalCss = css;
+  let finalJs = js;
+
+  if (!DEV) {
+    // Use esbuild to minify CSS
+    try {
+      const cssResult = await esbuild.transform(css, {
+        loader: 'css',
+        minify: true,
+      });
+      finalCss = cssResult.code;
+    } catch (err) {
+      console.warn('CSS minification failed, using original:', err.message);
+    }
+
+    // Use esbuild to minify JavaScript
+    try {
+      const jsResult = await esbuild.transform(js, {
+        loader: 'js',
+        minify: true,
+      });
+      finalJs = jsResult.code;
+    } catch (err) {
+      console.warn('JS minification failed, using original:', err.message);
+    }
+  }
+
+  // Bundle: replace placeholders with actual content
+  const bundled = template
+    .replace('<!--STYLES-->', finalCss)
+    .replace('<!--SCRIPTS-->', finalJs);
+
+  // Write the bundled HTML
+  fs.writeFileSync(outputPath, bundled, 'utf-8');
+  console.log('Bundled webview: core/ui/viewer.html');
+};
+
+/**
  * Main compilation function.
  * Runs all build targets in parallel for speed.
  */
@@ -231,6 +294,7 @@ const compileExt = async (target) => {
     compileNodeWorker(),
     compileBrowserWorker(),
     copyAssets(),
+    bundleWebview(),
   ]);
 };
 
