@@ -9,6 +9,8 @@
 - **Build**: Updated build system to bundle frontend modules using `esbuild`.
 - **Fix**: Resolved visual regression in cell editing mode where input styling was missing.
 - **Fix**: Resolved "not a function" error during cell updates in native backend by using explicit `run` command for write operations.
+- **Fix**: The export table dialog now defaults to the directory containing the database file, rather than the workspace root.
+- **Docs**: Added "Buy Me a Coffee" link to the README and package configuration.
 
 ## 1.0.11
 
