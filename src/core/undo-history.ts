@@ -248,8 +248,3 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
 // ============================================================================
 // Compatibility Aliases
 // ============================================================================
-
-/**
- * Alias for backward compatibility with existing code.
- */
-export { ModificationTracker as EditTracker };

@@ -30,7 +30,7 @@ interface WebviewBridgeFunctions {
 }
 
 // VS Code environment data passed to webview
-export type VSCODE_ENV = {
+type VSCODE_ENV = {
   webviewId: string,
   browserExt?: BoolString,
   appName: string,

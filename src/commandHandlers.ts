@@ -38,35 +38,3 @@ export async function deleteLicenseKeyCommand(context: vsc.ExtensionContext, rep
     modal: false
   });
 }
-
-/**
- * Calculate days since a timestamp.
- */
-export function calcDaysSinceIssued(issuedAt?: number) {
-  if (!issuedAt) return null;
-  const currentTime = Date.now() / 1000;
-  const diffSeconds = currentTime - issuedAt;
-  const diffDays = diffSeconds / (24 * 60 * 60);
-  return diffDays;
-}
-
-/**
- * Get payload from access token (stub).
- */
-export function getPayload(accessToken?: string) {
-  return null;
-}
-
-/**
- * Refresh access token (stub - always returns undefined).
- */
-export async function refreshAccessToken(context: vsc.ExtensionContext, licenseKey: string, accessToken?: string) {
-  return undefined;
-}
-
-/**
- * Verify token (stub - always returns null).
- */
-export async function verifyToken<PayloadType = any>(accessToken: string): Promise<PayloadType | null> {
-  return null;
-}

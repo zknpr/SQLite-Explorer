@@ -41,7 +41,7 @@ interface ResponseEnvelope {
 /**
  * Union of all protocol message types.
  */
-export type ProtocolEnvelope = InvocationEnvelope | ResponseEnvelope;
+type ProtocolEnvelope = InvocationEnvelope | ResponseEnvelope;
 
 // ============================================================================
 // State Management
@@ -276,63 +276,4 @@ export function connectWorkerPort<T extends object>(
   });
 
   return buildMethodProxy<T>(dispatcher, methodNames);
-}
-
-/**
- * Expose local methods to handle invocations from a worker.
- *
- * @param methods - Object with method implementations
- * @param port - Worker port for message passing
- */
-export function exposeMethodsToWorker(
-  methods: MethodImplementations,
-  port: WorkerPort
-): void {
-  const sendResponse: ResponseDispatcher = (response) => {
-    port.postMessage(response);
-  };
-
-  port.on('message', (data) => {
-    processProtocolMessage(data, methods, sendResponse);
-  });
-}
-
-// ============================================================================
-// Webview Helpers
-// ============================================================================
-
-/**
- * Webview-like interface for message passing.
- */
-interface WebviewPort {
-  postMessage(data: unknown): Thenable<boolean>;
-}
-
-/**
- * Create a method proxy for communicating with a webview.
- *
- * @param port - Webview port for message passing
- * @param methodNames - Methods to expose on proxy
- * @returns Proxy object for calling webview methods
- */
-export function connectWebviewPort<T extends object>(
-  port: WebviewPort,
-  methodNames: string[]
-): T {
-  const dispatcher: MessageDispatcher = (envelope) => {
-    port.postMessage(envelope);
-  };
-
-  return buildMethodProxy<T>(dispatcher, methodNames);
-}
-
-/**
- * Process a message received from a webview.
- * Call this in onDidReceiveMessage handler.
- *
- * @param message - Raw message from webview
- * @returns true if message was handled
- */
-export function processWebviewMessage(message: unknown): boolean {
-  return processProtocolMessage(message);
 }

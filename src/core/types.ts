@@ -165,18 +165,6 @@ export interface LabeledModification extends ModificationEntry {
 // ============================================================================
 
 /**
- * Database parameters for identifying a table/view.
- */
-export interface DataSourceParams {
-  /** Database filename */
-  databaseFile?: string;
-  /** Table or view name */
-  sourceName: string;
-  /** Display name */
-  displayLabel?: string;
-}
-
-/**
  * Interface for database operations exposed by worker.
  */
 export interface DatabaseOperations {
@@ -245,6 +233,9 @@ export interface DatabaseOperations {
 
   /** Test database connection */
   ping(): Promise<boolean>;
+
+  /** Write database directly to file system (optimization) */
+  writeToFile(path: string): Promise<void>;
 }
 
 /**
@@ -262,24 +253,25 @@ export interface CellUpdate {
 // Read Query Types
 // ============================================================================
 
-export interface ColumnFilter {
-  column: string;
-  value: string;
-}
-
 export interface TableQueryOptions {
   columns?: string[];
   orderBy?: string;
   orderDir?: 'ASC' | 'DESC';
   limit?: number;
   offset?: number;
-  filters?: ColumnFilter[];
+  filters?: {
+    column: string;
+    value: string;
+  }[];
   globalFilter?: string;
 }
 
 export interface TableCountOptions {
   columns?: string[];
-  filters?: ColumnFilter[];
+  filters?: {
+    column: string;
+    value: string;
+  }[];
   globalFilter?: string;
 }
 
@@ -293,6 +285,8 @@ export interface TableCountOptions {
 export interface DatabaseInitConfig {
   /** Database binary content */
   content: Uint8Array | null;
+  /** Path to database file (for direct reading in worker) */
+  filePath?: string;
   /** WAL file content if present */
   walContent?: Uint8Array | null;
   /** Maximum allowed file size */
@@ -313,14 +307,6 @@ export interface DatabaseInitResult {
   operations: DatabaseOperations;
   /** Whether opened in read-only mode */
   isReadOnly: boolean;
-}
-
-/**
- * Interface for worker-side database factory.
- */
-export interface DatabaseFactory {
-  /** Initialize a database from binary data */
-  initializeDatabase(filename: string, config: DatabaseInitConfig): Promise<DatabaseInitResult>;
 }
 
 // ============================================================================

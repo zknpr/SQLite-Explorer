@@ -49,9 +49,6 @@ if (!import.meta.env.VSCODE_BROWSER_EXT) {
 // Constants
 // ============================================================================
 
-/** Megabyte constant for file size calculations */
-export const MEGABYTE = 2 ** 20;
-
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -64,7 +61,7 @@ export const MEGABYTE = 2 ** 20;
 export function getMaximumFileSizeBytes(): number {
   const config = vsc.workspace.getConfiguration(ConfigurationSection);
   const sizeMB = config.get<number>('maxFileSize') ?? 200;
-  return sizeMB * MEGABYTE;
+  return sizeMB * (2 ** 20);
 }
 
 // ============================================================================
@@ -95,6 +92,7 @@ interface WorkerMethods {
   getPragmas(): Promise<Record<string, CellValue>>;
   setPragma(pragma: string, value: CellValue): Promise<void>;
   ping(): Promise<boolean>;
+  writeToFile(path: string): Promise<void>;
 }
 
 // ============================================================================
@@ -199,7 +197,7 @@ async function createWasmDatabaseConnection(
         }
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping']
+    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile']
   );
 
   // Termination handler
@@ -229,7 +227,28 @@ async function createWasmDatabaseConnection(
       autoCommit?: boolean
     ) {
       // Read database and WAL files
-      const [dbContent, walContent] = await loadDatabaseFiles(fileUri);
+      // Optimization: If running in Node and file is local, pass path to worker instead of reading content here
+      // This avoids blocking the extension host and transferring large buffers
+      const isNode = !import.meta.env.VSCODE_BROWSER_EXT;
+      const isLocal = fileUri.scheme === 'file';
+
+      let dbContent: Uint8Array | null = null;
+      let walContent: Uint8Array | null = null;
+      let filePath: string | undefined;
+
+      if (isNode && isLocal) {
+          // Check size limit first
+          const maxSize = getMaximumFileSizeBytes();
+          const fileStat = await vsc.workspace.fs.stat(fileUri);
+          if (maxSize !== 0 && fileStat.size > maxSize) {
+             // File too large - skip setting filePath, leave dbContent null
+             // The worker will fallback to creating an empty database
+          } else {
+             filePath = fileUri.fsPath;
+          }
+      } else {
+          [dbContent, walContent] = await loadDatabaseFiles(fileUri);
+      }
 
       // Load WASM binary from assets directory
       const wasmUri = vsc.Uri.joinPath(extensionUri, 'assets', 'sqlite3.wasm');
@@ -238,6 +257,7 @@ async function createWasmDatabaseConnection(
       // Initialize database configuration
       const initConfig: DatabaseInitConfig = {
         content: dbContent,
+        filePath,
         walContent,
         maxSize: getMaximumFileSizeBytes(),
         resourceMap: {},
@@ -286,7 +306,9 @@ async function createWasmDatabaseConnection(
         setPragma: (pragma: string, value: CellValue) =>
           workerProxy.setPragma(pragma, value),
         ping: () =>
-          workerProxy.ping()
+          workerProxy.ping(),
+        writeToFile: (path: string) =>
+          workerProxy.writeToFile(path)
       };
 
       return {

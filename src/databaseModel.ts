@@ -39,7 +39,7 @@ export type DocumentModification = LabeledModification;
 const CurrentExtension = vsc.extensions.getExtension(FullExtensionId);
 
 /** Running on local machine (not remote) */
-export const IsLocalMode = !vsc.env.remoteName;
+const IsLocalMode = !vsc.env.remoteName;
 
 /** Running on remote with workspace extension */
 export const IsRemoteWorkspaceMode =
@@ -313,6 +313,16 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
     // Export in-memory database to file (WASM engine only)
     // We always do this for WASM, regardless of auto-commit setting, because WASM is in-memory.
+    if (this.uri.scheme === 'file') {
+        try {
+            await this.databaseOperations.writeToFile(this.uri.fsPath);
+            return;
+        } catch (e) {
+            // Fallback if direct write fails
+            console.warn('Direct write failed, falling back to buffer transfer', e);
+        }
+    }
+
     const { filename } = this.fileParts;
     const binaryContent = await this.databaseOperations.serializeDatabase(filename);
     await vsc.workspace.fs.writeFile(this.uri, binaryContent);
@@ -323,6 +333,16 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   async saveAs(targetUri: vsc.Uri, cancellation: vsc.CancellationToken): Promise<void> {
     await this.ensureWritable();
+
+    if (targetUri.scheme === 'file') {
+        try {
+            // Use optimized write/vacuum if available
+            await this.databaseOperations.writeToFile(targetUri.fsPath);
+            return;
+        } catch (e) {
+             console.warn('Direct write failed, falling back to buffer transfer', e);
+        }
+    }
 
     const fileStat = await vsc.workspace.fs.stat(this.uri);
     if (fileStat.size > this.getFileSizeLimit()) {

@@ -172,4 +172,9 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         // Don't log pings to avoid spam
         return this.wrapped.ping();
     }
+
+    async writeToFile(path: string): Promise<void> {
+        this.log(`Writing to file: ${path}`, true);
+        return this.wrapped.writeToFile(path);
+    }
 }

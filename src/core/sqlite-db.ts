@@ -287,42 +287,67 @@ class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery('BEGIN TRANSACTION');
     try {
       const escapedTable = escapeIdentifier(table);
+      // Group updates by column and operation type for potentially better batching
+      // For now, prepare statements one by one is better than full re-parse
 
+      // We can't actually use a single prepared statement if the column name changes
+      // So we have to prepare per column or construct SQL dynamically.
+      // Given we have escapeIdentifier, dynamic SQL is safe enough but parsing is slow.
+      // Best approach for sql.js: Group by column.
+
+      const updatesByColumn = new Map<string, CellUpdate[]>();
       for (const update of updates) {
-        // Validate rowId
-        const rowIdNum = Number(update.rowId);
-        if (!Number.isFinite(rowIdNum)) throw new Error(`Invalid rowid: ${update.rowId}`);
-
-        const escapedColumn = escapeIdentifier(update.column);
-        let sql: string;
-
-        if (update.operation === 'json_patch') {
-             // Fallback to JS implementation of json_patch
-             // Fetch current value
-             const currentResult = await this.executeQuery(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`, [rowIdNum]);
-             let currentValue = currentResult[0]?.rows[0]?.[0];
-
-             // Parse current JSON
-             let currentObj = {};
-             if (typeof currentValue === 'string') {
-                 try { currentObj = JSON.parse(currentValue); } catch {}
-             }
-
-             // Apply patch
-             const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
-             const newValueObj = applyMergePatch(currentObj, patchObj);
-             const newValueStr = JSON.stringify(newValueObj);
-
-             sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
-             params = [newValueStr, rowIdNum];
-        } else {
-             // Standard set
-             sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
-             params = [update.value, rowIdNum];
-        }
-
-        await this.executeQuery(sql, params);
+          const key = `${update.column}|${update.operation || 'set'}`;
+          if (!updatesByColumn.has(key)) {
+              updatesByColumn.set(key, []);
+          }
+          updatesByColumn.get(key)!.push(update);
       }
+
+      for (const [key, columnUpdates] of updatesByColumn.entries()) {
+          const [column, op] = key.split('|');
+          const escapedColumn = escapeIdentifier(column);
+          const sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+
+          const stmt = this.instance.prepare(sql);
+          try {
+              for (const update of columnUpdates) {
+                  const rowIdNum = Number(update.rowId);
+
+                  if (op === 'json_patch') {
+                     // Patch logic (requires read-modify-write, can't fully optimize without user-defined functions)
+                     // Since we need to read, we can't just blind update.
+                     // For JSON patch, we sadly have to stick to the slower path or do a complex subquery if sqlite json1 is available.
+                     // Assuming standard sql.js build includes json1.
+                     // json_patch(col, patch) is available in modern SQLite.
+                     // Let's try to use native json_patch if possible, else fallback to JS.
+                     // Checking if json_patch exists? Hard to do cheaply.
+                     // Fallback to JS read-modify-write for safety.
+
+                     // Read
+                     const currentResult = this.instance.exec(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`, [rowIdNum]);
+                     const currentValue = currentResult[0]?.values[0]?.[0];
+
+                     let currentObj = {};
+                     if (typeof currentValue === 'string') {
+                         try { currentObj = JSON.parse(currentValue); } catch {}
+                     }
+
+                     const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
+                     const newValueObj = applyMergePatch(currentObj, patchObj);
+                     const newValueStr = JSON.stringify(newValueObj);
+
+                     stmt.run([newValueStr, rowIdNum]);
+                  } else {
+                      // Standard update
+                      stmt.run([update.value, rowIdNum]);
+                  }
+              }
+          } finally {
+              stmt.free();
+          }
+      }
+
       await this.executeQuery('COMMIT');
     } catch (err) {
       try { await this.executeQuery('ROLLBACK'); } catch {}
@@ -381,32 +406,24 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * Fetch database schema.
    */
   async fetchSchema(): Promise<SchemaSnapshot> {
-    // Get tables
-    const tablesResult = await this.executeQuery(
-      "SELECT name, sql FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-    );
-    // Get views
-    const viewsResult = await this.executeQuery(
-      "SELECT name, sql FROM sqlite_schema WHERE type='view' ORDER BY name"
-    );
-    // Get indexes
-    const indexesResult = await this.executeQuery(
-      "SELECT name, tbl_name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    // Combine schema queries into one
+    const schemaResult = await this.executeQuery(
+      "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
     );
 
-    const tables = (tablesResult[0]?.rows || []).map(row => ({
-      identifier: row[0] as string
-      // We could parse column count or details here if needed, but for now matching existing behavior
-    }));
+    const rows = schemaResult[0]?.rows || [];
 
-    const views = (viewsResult[0]?.rows || []).map(row => ({
-      identifier: row[0] as string
-    }));
+    const tables = rows
+        .filter(r => r[0] === 'table')
+        .map(r => ({ identifier: r[1] as string }));
 
-    const indexes = (indexesResult[0]?.rows || []).map(row => ({
-      identifier: row[0] as string,
-      parentTable: row[1] as string
-    }));
+    const views = rows
+        .filter(r => r[0] === 'view')
+        .map(r => ({ identifier: r[1] as string }));
+
+    const indexes = rows
+        .filter(r => r[0] === 'index')
+        .map(r => ({ identifier: r[1] as string, parentTable: r[2] as string }));
 
     return { tables, views, indexes };
   }
@@ -505,6 +522,21 @@ class WasmDatabaseEngine implements DatabaseOperations {
   shutdown(): void {
     this.instance.close();
   }
+
+  /**
+   * Write database directly to file system.
+   */
+  async writeToFile(path: string): Promise<void> {
+    const data = this.instance.export();
+
+    // Dynamic require to avoid bundling fs
+    if (typeof require === 'function') {
+        const fs = require('fs');
+        await fs.promises.writeFile(path, data);
+    } else {
+        throw new Error('File system access not available');
+    }
+  }
 }
 
 // ============================================================================
@@ -535,9 +567,30 @@ export async function createDatabaseEngine(
 
   // Create database instance
   let wasmInstance: WasmDatabaseInstance;
-  if (config.content && config.content.byteLength > 0) {
+  let buffer = config.content;
+
+  // If content is missing but filePath is provided, read from disk (Node.js only)
+  if (!buffer && config.filePath) {
+      try {
+          // Dynamic require to avoid bundling fs in browser builds if not polyfilled
+          // In actual build, this code path only runs in Node worker
+          if (typeof require === 'function') {
+              const fs = require('fs');
+              // Validate size
+              const stats = fs.statSync(config.filePath);
+              if (config.maxSize > 0 && stats.size > config.maxSize) {
+                  throw new Error('File too large');
+              }
+              buffer = fs.readFileSync(config.filePath);
+          }
+      } catch (e) {
+          console.error('Failed to read file in worker:', e);
+      }
+  }
+
+  if (buffer && buffer.byteLength > 0) {
     // Open existing database from binary
-    wasmInstance = new SqlJsModule.Database(new Uint8Array(config.content));
+    wasmInstance = new SqlJsModule.Database(new Uint8Array(buffer));
   } else {
     // Create new empty database
     wasmInstance = new SqlJsModule.Database();
@@ -633,7 +686,9 @@ export function createWorkerEndpoint() {
           setPragma: (pragma: string, value: CellValue) =>
             activeEngine!.setPragma(pragma, value),
           ping: () =>
-            activeEngine!.ping()
+            activeEngine!.ping(),
+          writeToFile: (path: string) =>
+            activeEngine!.writeToFile(path)
         },
         isReadOnly: result.isReadOnly
       };
@@ -730,6 +785,11 @@ export function createWorkerEndpoint() {
     async ping(): Promise<boolean> {
       if (!activeEngine) return false;
       return activeEngine.ping();
+    },
+
+    async writeToFile(path: string): Promise<void> {
+      if (!activeEngine) throw new Error('No database initialized');
+      return activeEngine.writeToFile(path);
     }
   };
 }

@@ -36,7 +36,6 @@ export const SyncedKeys = [
 
 // Display names
 export const Title = 'SQLite Explorer';
-export const ProcessTitle = 'SQLite Explorer Helper';
 
 // Copilot integration
 export const CopilotChatId = 'github.copilot-chat';

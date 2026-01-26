@@ -11,8 +11,6 @@
 
 import * as vsc from 'vscode';
 import { base58, base64urlnopad } from '@scure/base';
-import { Disposable } from './lifecycle';
-import { ReadableStream, WritableStream } from './platform/streams/webStreams';
 import { crypto } from './platform/cryptoShim';
 import { Title } from './config';
 
@@ -26,11 +24,7 @@ import { Title } from './config';
  */
 export const IsVSCode = vsc.env.uriScheme.includes('vscode');
 export const IsVSCodium = vsc.env.uriScheme.includes('vscodium');
-export const IsGitHubDotDev = vsc.env.uriScheme.includes('vscode') && vsc.env.appHost === 'github.dev';
-export const IsGitPodWeb = vsc.env.uriScheme.includes('gitpod-code') || vsc.env.appHost === 'Gitpod' || vsc.env.appName === 'Gitpod Code';
-export const IsGoogleIDX = vsc.env.appName.includes('IDX') || (vsc.env.appHost === 'web' && vsc.env.remoteName?.startsWith('idx'));
 export const IsCursorIDE = vsc.env.appName.includes('Cursor') || vsc.env.uriScheme.includes('cursor');
-export const IsDesktop = vsc.env.appHost === 'desktop';
 
 /**
  * Current UI language code (e.g., 'en', 'de', 'zh-cn').
@@ -113,192 +107,6 @@ export class WebviewCollection {
 }
 
 // ============================================================================
-// Content Cache
-// ============================================================================
-
-/**
- * Temporary cache for text editor contents.
- *
- * Periodically removes entries for documents that are no longer open.
- * Useful for preserving content during save operations.
- */
-export class ContentCache implements vsc.Disposable {
-  private storage = new Map<string, string>();
-  private cleanupTimer: ReturnType<typeof setInterval> | null;
-
-  constructor() {
-    // Run cleanup every minute
-    this.cleanupTimer = setInterval(() => this.removeStaleEntries(), 60_000);
-  }
-
-  /**
-   * Store content for a document URI.
-   */
-  set(uri: vsc.Uri, content: string): void {
-    this.removeStaleEntries();
-    this.storage.set(uri.toString(), content);
-  }
-
-  /**
-   * Retrieve cached content for a document URI.
-   */
-  get(uri: vsc.Uri): string | null {
-    return this.storage.get(uri.toString()) ?? null;
-  }
-
-  /**
-   * Remove entries for documents that are no longer open.
-   */
-  private removeStaleEntries(): void {
-    try {
-      const openDocs = vsc.workspace.textDocuments;
-      const openUriSet = new Set<string>(openDocs.map(doc => doc.uri.toString()));
-      for (const cachedUri of [...this.storage.keys()]) {
-        if (!openUriSet.has(cachedUri)) {
-          this.storage.delete(cachedUri);
-        }
-      }
-    } catch {
-      // Ignore errors during cleanup
-    }
-  }
-
-  /**
-   * Clear all cached content.
-   */
-  clear(): void {
-    this.storage.clear();
-  }
-
-  /**
-   * Release resources.
-   */
-  dispose(): void {
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer);
-      this.cleanupTimer = null;
-    }
-    this.storage.clear();
-  }
-}
-
-// ============================================================================
-// Webview Streaming
-// ============================================================================
-
-/**
- * Bidirectional stream wrapper for VS Code webview messaging.
- *
- * Provides ReadableStream and WritableStream interfaces over the
- * webview's postMessage API. Enables binary protocol overlays
- * for more efficient communication.
- */
-export class WebviewStream extends Disposable {
-  private inputStream: ReadableStream<Uint8Array>;
-  private outputStream: WritableStream<Uint8Array>;
-  private inputController!: ReadableStreamDefaultController<Uint8Array>;
-  private outputController!: WritableStreamDefaultController;
-  private inputClosed = false;
-  private outputClosed = false;
-
-  constructor(private readonly panel: vsc.WebviewPanel) {
-    super();
-
-    // Create input stream (receives data from webview)
-    this.inputStream = new ReadableStream<Uint8Array>({
-      start: (controller) => {
-        this.inputController = controller;
-
-        // Forward binary messages to stream
-        this._register(this.panel.webview.onDidReceiveMessage(msg => {
-          if (msg instanceof Uint8Array) {
-            controller.enqueue(msg);
-          }
-        }));
-
-        // Handle panel disposal
-        this._register(this.panel.onDidDispose(() => {
-          this.shutdown(new DOMException('Panel disposed', 'AbortError'));
-        }));
-      },
-      cancel: (reason) => {
-        this.inputClosed = true;
-        this.shutdown(reason);
-      }
-    });
-
-    // Create output stream (sends data to webview)
-    this.outputStream = new WritableStream<Uint8Array>({
-      start: (controller) => {
-        this.outputController = controller;
-      },
-      write: (chunk, controller) => {
-        try {
-          // Extract buffer view properties for transfer
-          const { buffer, byteOffset, byteLength } = chunk;
-          this.panel.webview.postMessage({ buffer, byteOffset, byteLength });
-        } catch (err) {
-          controller.error(err);
-        }
-      },
-      close: () => {
-        this.outputClosed = true;
-        this.shutdown(null);
-      },
-      abort: (reason) => {
-        this.outputClosed = true;
-        this.shutdown(reason);
-      }
-    });
-  }
-
-  /**
-   * Clean up stream resources.
-   */
-  private shutdown(reason?: unknown): void {
-    super.dispose();
-
-    // Close input stream
-    if (!this.inputClosed) {
-      this.inputClosed = true;
-      if (reason) {
-        this.inputController.error(reason);
-      } else {
-        this.inputController.close();
-      }
-    }
-
-    // Close output stream
-    if (!this.outputClosed) {
-      this.outputClosed = true;
-      if (this.outputStream.locked || reason) {
-        this.outputController.error(reason ?? new DOMException('Stream closed', 'AbortError'));
-      } else {
-        this.outputStream.getWriter().close().catch(() => { });
-      }
-    }
-  }
-
-  /** Stream for receiving data from webview */
-  get readable(): ReadableStream<Uint8Array> {
-    return this.inputStream;
-  }
-
-  /** Stream for sending data to webview */
-  get writable(): WritableStream<Uint8Array> {
-    return this.outputStream;
-  }
-
-  dispose(): void {
-    this.shutdown();
-  }
-
-  [Symbol.dispose](): void {
-    this.shutdown();
-  }
-}
-
-// ============================================================================
 // Content Security Policy
 // ============================================================================
 
@@ -376,12 +184,6 @@ export function getUriParts(uri: string | vsc.Uri): {
 // ============================================================================
 
 /**
- * Check if an error is an AbortError.
- */
-export const isAbortError = (err: unknown): err is Error =>
-  err instanceof Error && (err.name === 'AbortError' || err.message.startsWith('AbortError'));
-
-/**
  * Convert VS Code CancellationToken to standard AbortSignal.
  *
  * @param token - VS Code cancellation token (or null/undefined)
@@ -409,18 +211,13 @@ export function cancelTokenToAbortSignal<T extends vsc.CancellationToken | null 
 const textEncoder = new TextEncoder();
 
 /**
- * Encode string to UTF-8 bytes.
- */
-export const encodeUtf8 = (str: string): Uint8Array => textEncoder.encode(str);
-
-/**
  * Generate a short base58-encoded hash of a string.
  *
  * @param input - String to hash
  * @returns 6-byte SHA-256 hash encoded as base58
  */
 export async function shortHash(input: string): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest('SHA-256', encodeUtf8(input) as any);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', textEncoder.encode(input));
   const hashBytes = new Uint8Array(hashBuffer).subarray(0, 6);
   return base58.encode(hashBytes);
 }
@@ -433,7 +230,7 @@ export async function shortHash(input: string): Promise<string> {
  * @returns Truncated SHA-256 hash encoded as base64url
  */
 export async function hash64(input: string, length: number = 6): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest('SHA-256', encodeUtf8(input) as any);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', textEncoder.encode(input));
   const hashBytes = new Uint8Array(hashBuffer).subarray(0, length);
   return base64urlnopad.encode(hashBytes);
 }
@@ -458,31 +255,6 @@ export async function generateDatabaseDocumentKey(uri: vsc.Uri): Promise<string>
   const { basename, extname } = getUriParts(uri);
   const pathHash = await hash64(uri.path);
   return `${basename}${extname} <${pathHash}>`;
-}
-
-// ============================================================================
-// Disposable Utilities
-// ============================================================================
-
-/**
- * ES2022 Disposable symbol interface.
- */
-export type ESDisposable = {
-  [Symbol.dispose](): void;
-};
-
-/**
- * Add ES2022 Symbol.dispose to a VS Code Disposable.
- *
- * @param disposable - VS Code Disposable object
- * @returns Same object with Symbol.dispose added
- */
-export function assignESDispose<T extends vsc.Disposable>(disposable: T): T & ESDisposable {
-  return Object.assign(disposable, {
-    [Symbol.dispose]() {
-      disposable.dispose();
-    }
-  });
 }
 
 // ============================================================================

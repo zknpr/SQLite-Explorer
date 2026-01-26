@@ -64,9 +64,3 @@ if (parentPort) {
 } else {
   console.error('[DatabaseWorker] No parent port - invalid execution context');
 }
-
-// ============================================================================
-// Exports for Web Worker Compatibility
-// ============================================================================
-
-export { databaseEndpoint };

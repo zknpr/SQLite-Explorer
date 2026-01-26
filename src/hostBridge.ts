@@ -28,23 +28,6 @@ interface DbParams {
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
 
-// Initialization parameters for untitled documents
-export type UntitledInit = {
-  filename: string,
-  untitled: true,
-  editable?: boolean,
-  maxFileSize: number,
-};
-
-// Initialization parameters for regular files
-export type RegularInit = {
-  filename: string,
-  editable?: boolean,
-  maxFileSize: number,
-  value: Uint8ArrayLike
-  walValue?: Uint8ArrayLike
-};
-
 // Column type information
 interface ColumnTypeInfo {
   [key: string]: any;

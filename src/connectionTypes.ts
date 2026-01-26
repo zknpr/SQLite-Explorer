@@ -9,22 +9,6 @@ import type { Uri } from 'vscode';
 import type { DatabaseOperations } from './core/types';
 
 // ============================================================================
-// Utility Types
-// ============================================================================
-
-/**
- * Type that may be a value or a promise.
- */
-export type MaybeAsync<T> = T | PromiseLike<T>;
-
-/**
- * Interface for terminating worker threads.
- */
-export interface Terminable {
-  terminate(): void;
-}
-
-// ============================================================================
 // Connection Bundle Interface
 // ============================================================================
 
@@ -61,7 +45,10 @@ export interface DatabaseConnectionBundle {
     displayName: string,
     forceReadOnly?: boolean,
     autoCommit?: boolean
-  ): MaybeAsync<{
+  ): {
+    databaseOps: DatabaseOperations;
+    isReadOnly?: boolean;
+  } | PromiseLike<{
     databaseOps: DatabaseOperations;
     isReadOnly?: boolean;
   }>;

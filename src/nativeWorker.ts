@@ -788,6 +788,16 @@ export async function createNativeDatabaseConnection(
         },
 
         /**
+         * Write database to file.
+         */
+        writeToFile: async (path: string) => {
+           // Use VACUUM INTO for atomic backup
+           // Escaping path properly for SQL string literal
+           const escapedPath = path.replace(/'/g, "''");
+           await worker.call('exec', [`VACUUM INTO '${escapedPath}'`]);
+        },
+
+        /**
          * Update multiple cells in a batch.
          */
         updateCellBatch: async (table: string, updates: CellUpdate[]) => {

@@ -31,12 +31,5 @@ else
     echo "Tag v${VERSION} already exists"
 fi
 
-# Create GitHub release with the .vsix file
-echo "Creating GitHub release with $VSIX_FILE..."
-gh release create "v${VERSION}" \
-    --title "v${VERSION}" \
-    --notes "See [CHANGELOG.md](https://github.com/zknpr/SQLite-Explorer/blob/main/CHANGELOG.md) for details." \
-    "$VSIX_FILE"
-
 echo "Release v${VERSION} created successfully!"
 echo "https://github.com/zknpr/SQLite-Explorer/releases/tag/v${VERSION}"

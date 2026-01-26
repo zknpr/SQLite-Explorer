@@ -102,36 +102,3 @@ export function buildCountQuery(table: string, options: TableCountOptions): { sq
 
   return { sql, params };
 }
-
-/**
- * Helper to build count query with known columns for global filter
- */
-export function buildCountQueryWithColumns(table: string, columns: string[], options: TableCountOptions): { sql: string; params: any[] } {
-  const { filters = [], globalFilter } = options;
-
-  const escapedTable = escapeIdentifier(table);
-  let sql = `SELECT COUNT(*) as count FROM ${escapedTable}`;
-  const whereClauses: string[] = [];
-  const params: any[] = [];
-
-  for (const filter of filters) {
-    if (filter.value) {
-      whereClauses.push(`${escapeIdentifier(filter.column)} LIKE ?`);
-      params.push(`%${filter.value}%`);
-    }
-  }
-
-  if (globalFilter && columns.length > 0) {
-    const globalConditions = columns.map(col => `${escapeIdentifier(col)} LIKE ?`).join(' OR ');
-    whereClauses.push(`(${globalConditions})`);
-    for (let i = 0; i < columns.length; i++) {
-      params.push(`%${globalFilter}%`);
-    }
-  }
-
-  if (whereClauses.length > 0) {
-    sql += ` WHERE ${whereClauses.join(' AND ')}`;
-  }
-
-  return { sql, params };
-}
