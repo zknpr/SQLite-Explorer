@@ -184,7 +184,10 @@ async function handleRequest(request) {
         const [sql] = args;
         if (!db) throw new Error("Database not open");
         db.exec(sql);
-        result = { success: true, changes: db.totalChanges };
+        // Try to get changes if possible, though exec usually returns nothing
+        let changes = 0;
+        try { changes = db.totalChanges; } catch(e) {}
+        result = { success: true, changes };
         break;
       }
 
@@ -209,57 +212,63 @@ async function handleRequest(request) {
         let rowCount = 0;
 
         if (isSelectQuery) {
-          // For SELECT queries, use prepared statement with stmt.all()
-          console.error("[native-worker] preparing SELECT statement");
           const stmt = db.prepare(sql);
-          if (params && params.length > 0) {
-            stmt.bind(...params);
+          let rows;
+          try {
+            if (typeof stmt.all === 'function') {
+                if (params && params.length > 0) {
+                    rows = stmt.all(...params);
+                } else {
+                    rows = stmt.all();
+                }
+            } else {
+                // Fallback for iterators
+                rows = [];
+                if (params && params.length > 0 && typeof stmt.bind === 'function') {
+                    try { stmt.bind(...params); } catch(e) { console.error("bind failed", e); }
+                }
+                for (const row of stmt) {
+                    rows.push(row);
+                }
+            }
+          } finally {
+             if (typeof stmt.finalize === 'function') stmt.finalize();
           }
 
-          console.error("[native-worker] calling stmt.all()");
-          const rows = stmt.all();
           console.error("[native-worker] got rows:", rows?.length);
 
-          // Get column information from first row
           if (rows && rows.length > 0) {
             columns = Object.keys(rows[0]);
             values = rows.map(row => columns.map(col => row[col]));
             rowCount = rows.length;
           }
-
-          stmt.finalize();
         } else {
-          // For INSERT/UPDATE/DELETE/CREATE/ALTER/DROP, use db.exec()
-          // This is simpler and doesn't require prepared statement methods that may not exist
-          console.error("[native-worker] executing non-SELECT with db.exec()");
+          // Non-SELECT via query() - typically shouldn't happen for updateCell but good to support
+          console.error("[native-worker] executing non-SELECT via query()");
           if (params && params.length > 0) {
-            // If there are params, we need to use prepared statement
-            console.error("[native-worker] using prepared statement with params");
             const stmt = db.prepare(sql);
-            stmt.bind(...params);
-            // Try different methods that might exist in txiki-js SQLite
-            if (typeof stmt.run === 'function') {
-              console.error("[native-worker] using stmt.run()");
-              stmt.run();
-            } else if (typeof stmt.step === 'function') {
-              console.error("[native-worker] using stmt.step()");
-              stmt.step();
-            } else if (typeof stmt.execute === 'function') {
-              console.error("[native-worker] using stmt.execute()");
-              stmt.execute();
-            } else {
-              // Fall back to getting all (returns empty for non-SELECT)
-              console.error("[native-worker] fallback to stmt.all()");
-              stmt.all();
+            try {
+                if (typeof stmt.run === 'function') {
+                    stmt.run(...params);
+                } else if (typeof stmt.execute === 'function') {
+                    if (typeof stmt.bind === 'function') stmt.bind(...params);
+                    stmt.execute();
+                } else {
+                    if (typeof stmt.bind === 'function') stmt.bind(...params);
+                    stmt.step(); // or iterate
+                }
+            } finally {
+                if (typeof stmt.finalize === 'function') stmt.finalize();
             }
-            stmt.finalize();
           } else {
-            // No params, just use db.exec() which is simpler
-            console.error("[native-worker] using db.exec() directly");
             db.exec(sql);
           }
-          rowCount = db.totalChanges || 0;
-          console.error("[native-worker] totalChanges:", rowCount);
+
+          // Get changes
+          try {
+             const chg = db.prepare("SELECT changes() as c").all()[0].c;
+             rowCount = chg;
+          } catch(e) { rowCount = 0; }
         }
 
         result = {
@@ -275,20 +284,103 @@ async function handleRequest(request) {
         // Execute SQL for modifications (INSERT, UPDATE, DELETE)
         // args: [sql: string, params?: any[]]
         const [sql, params] = args;
+
+        // Debug logging to help diagnose edit issues
+        console.error("[native-worker] DEBUG: run called");
+        console.error("[native-worker] DEBUG: sql =", sql);
+        console.error("[native-worker] DEBUG: params =", JSON.stringify(params));
+
         if (!db) throw new Error("Database not open");
 
-        const stmt = db.prepare(sql);
-        if (params && params.length > 0) {
-          stmt.bind(...params);
+        // Use Prepared Statement for safety and consistency
+        let stmt;
+        try {
+          stmt = db.prepare(sql);
+        } catch (e) {
+          console.error("[native-worker] DEBUG: prepare failed", e);
+          throw new Error(`Prepare failed: ${e.message}`);
         }
 
-        stmt.run();
-        stmt.finalize();
+        if (!stmt) {
+          throw new Error("Prepare returned null/undefined");
+        }
 
-        result = {
-          changes: db.totalChanges,
-          lastInsertRowId: db.lastInsertRowId
-        };
+        try {
+          // Execute
+          if (typeof stmt.run === 'function') {
+            const runResult = params && params.length > 0 ? stmt.run(...params) : stmt.run();
+             // If run() returns an object with changes, use it
+             if (runResult && typeof runResult === 'object') {
+                result = {
+                    changes: runResult.changes !== undefined ? runResult.changes : 0,
+                    lastInsertRowId: runResult.lastInsertRowId !== undefined ? runResult.lastInsertRowId : 0
+                };
+             }
+          } else if (typeof stmt.step === 'function') {
+             if (params && params.length > 0 && typeof stmt.bind === 'function') {
+               try { stmt.bind(...params); } catch(e) { /* ignore */ }
+             }
+            stmt.step();
+          } else if (typeof stmt.execute === 'function') {
+             if (params && params.length > 0 && typeof stmt.bind === 'function') {
+               try { stmt.bind(...params); } catch(e) { /* ignore */ }
+             }
+            stmt.execute();
+          } else {
+             if (params && params.length > 0 && typeof stmt.bind === 'function') {
+               try { stmt.bind(...params); } catch(e) { /* ignore */ }
+             }
+             // Fallback: iterate
+             for (const _ of stmt) {}
+          }
+        } catch (e) {
+            console.error("[native-worker] DEBUG: execution failed", e);
+            throw e;
+        } finally {
+          if (stmt && typeof stmt.finalize === 'function') {
+            try { stmt.finalize(); } catch (e) { /* ignore */ }
+          }
+        }
+
+        if (!result) {
+            // tjs sqlite might not expose totalChanges/changes on db object
+            // We need to query for it if missing
+            if (db.changes !== undefined) {
+               result = {
+                 changes: db.changes,
+                 lastInsertRowId: db.lastInsertRowId || 0
+               };
+            } else {
+               try {
+                   const changesStmt = db.prepare("SELECT changes() as c, last_insert_rowid() as id");
+                   let row;
+                   if (typeof changesStmt.all === 'function') {
+                       const rows = changesStmt.all();
+                       if (rows && rows.length > 0) row = rows[0];
+                   } else {
+                       for (const r of changesStmt) { row = r; break; }
+                   }
+
+                   if (typeof changesStmt.finalize === 'function') {
+                       changesStmt.finalize();
+                   }
+
+                   if (row) {
+                       console.error("[native-worker] DEBUG: changes() query result:", JSON.stringify(row));
+                       result = {
+                           changes: row.c,
+                           lastInsertRowId: row.id
+                       };
+                   } else {
+                       result = { changes: 0, lastInsertRowId: 0 };
+                   }
+               } catch (e) {
+                   console.error("[native-worker] Failed to query changes:", e);
+                   result = { changes: 0, lastInsertRowId: 0 };
+               }
+            }
+        }
+        console.error("[native-worker] DEBUG: returning result:", JSON.stringify(result));
         break;
       }
 
@@ -297,32 +389,25 @@ async function handleRequest(request) {
       // ========================================
 
       case "prepare": {
-        // Prepare a statement for repeated execution
-        // args: [sql: string]
         const [sql] = args;
         if (!db) throw new Error("Database not open");
-
         const stmt = db.prepare(sql);
         const stmtId = ++stmtCounter;
         statements.set(stmtId, stmt);
-
         result = { stmtId };
         break;
       }
 
       case "stmtRun": {
-        // Run a prepared statement
-        // args: [stmtId: number, params?: any[]]
         const [stmtId, params] = args;
         const stmt = statements.get(stmtId);
         if (!stmt) throw new Error(`Statement ${stmtId} not found`);
-
         stmt.reset();
+        // if (params) stmt.bind(...params); // Simplified
         if (params && params.length > 0) {
-          stmt.bind(...params);
+            if (typeof stmt.bind === 'function') stmt.bind(...params);
         }
         stmt.run();
-
         result = {
           changes: db.totalChanges,
           lastInsertRowId: db.lastInsertRowId
@@ -331,23 +416,18 @@ async function handleRequest(request) {
       }
 
       case "stmtAll": {
-        // Get all rows from a prepared statement
-        // args: [stmtId: number, params?: any[]]
         const [stmtId, params] = args;
         const stmt = statements.get(stmtId);
         if (!stmt) throw new Error(`Statement ${stmtId} not found`);
-
         stmt.reset();
-        if (params && params.length > 0) {
-          stmt.bind(...params);
+         if (params && params.length > 0) {
+            if (typeof stmt.bind === 'function') stmt.bind(...params);
         }
-
         const rows = stmt.all();
         let columns = [];
         if (rows.length > 0) {
           columns = Object.keys(rows[0]);
         }
-
         result = {
           columns,
           values: rows.map(row => columns.map(col => row[col])),
@@ -357,8 +437,6 @@ async function handleRequest(request) {
       }
 
       case "stmtFinalize": {
-        // Finalize a prepared statement
-        // args: [stmtId: number]
         const [stmtId] = args;
         const stmt = statements.get(stmtId);
         if (stmt) {
@@ -374,7 +452,6 @@ async function handleRequest(request) {
       // ========================================
 
       case "getSchema": {
-        // Get database schema
         if (!db) throw new Error("Database not open");
 
         const tablesStmt = db.prepare(
@@ -407,27 +484,17 @@ async function handleRequest(request) {
       }
 
       case "export": {
-        // Export database as binary
-        // For databases opened directly on a file, changes are already persisted.
-        // We just need to read the current file content or use VACUUM INTO for a clean export.
         if (!db) throw new Error("Database not open");
-
         // Create a temporary file and use VACUUM INTO to get a consistent snapshot
         const tmpPath = `/tmp/sqlite-export-${Date.now()}.db`;
         db.exec(`VACUUM INTO '${tmpPath}'`);
-
-        // Read the file using tjs.readFile which returns a Uint8Array
         const content = await tjs.readFile(tmpPath);
-
-        // Clean up temp file
         await tjs.remove(tmpPath);
-
         result = { content };
         break;
       }
 
       case "ping": {
-        // Health check
         result = { pong: true, timestamp: Date.now() };
         break;
       }
@@ -439,8 +506,8 @@ async function handleRequest(request) {
     return { id, result };
 
   } catch (err) {
-    // Include method name in error for better debugging
     const errorMsg = err.message || String(err);
+    console.error(`[native-worker] ERROR in ${method}:`, errorMsg);
     return { id, error: `[${method}] ${errorMsg}` };
   }
 }
@@ -450,18 +517,15 @@ async function handleRequest(request) {
 // ============================================================================
 
 async function main() {
-  // Send ready signal
   console.error("[native-worker] Starting...");
   await writeMessage({ ready: true, version: "1.0.0" });
   console.error("[native-worker] Sent ready signal");
 
-  // Process messages until stdin closes
   while (true) {
     try {
       const request = await readMessage();
 
       if (request === null) {
-        // EOF - clean shutdown
         console.error("[native-worker] EOF received, shutting down");
         break;
       }
@@ -472,17 +536,12 @@ async function main() {
       await writeMessage(response);
 
     } catch (err) {
-      // Send error response
       console.error("[native-worker] Main loop error:", err.message || String(err));
       await writeMessage({ id: -1, error: err.message || String(err) });
     }
   }
 
-  // Cleanup
   if (db) {
-    for (const stmt of statements.values()) {
-      try { stmt.finalize(); } catch (e) { /* ignore */ }
-    }
     try { db.close(); } catch (e) { /* ignore */ }
   }
 }

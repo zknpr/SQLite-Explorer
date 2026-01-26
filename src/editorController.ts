@@ -216,8 +216,11 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       if (message?.channel === 'rpc' && message?.content?.kind === 'invoke') {
         const { messageId, targetMethod, payload } = message.content;
         const hostBridge = document.hostBridge as any;
-        const fn = hostBridge[targetMethod];
-        if (typeof fn === 'function') {
+
+        // Check if method exists on hostBridge
+        // This is safe because hostBridge is a class instance
+        if (typeof hostBridge[targetMethod] === 'function') {
+          const fn = hostBridge[targetMethod];
           Promise.resolve(fn.apply(hostBridge, payload || []))
             .then(result => {
               webviewPanel.webview.postMessage({

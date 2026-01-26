@@ -72,11 +72,11 @@ const baseConfig = {
 
 /**
  * Base configuration for worker entry point.
+ * Removed default format to enforce explicit selection in targets.
  */
 const baseWorkerConfig = {
   ...config,
   entryPoints: [resolve('src/databaseWorker.ts')],
-  format: 'esm',
   target: 'es2022',
   define: {
     ...envToDefine({
@@ -97,6 +97,7 @@ const compileNodeMain = () =>
     ...baseConfig,
     outfile: resolve(outDir, 'extension.js'),
     platform: 'node',
+    format: 'cjs',
     alias: {
       '@workers/v8-value-serializer/v8': 'node:v8',
     },
@@ -118,6 +119,7 @@ const compileBrowserMain = () =>
     ...baseConfig,
     outfile: resolve(outDir, 'extension-browser.js'),
     platform: 'browser',
+    format: 'esm',
     mainFields: ['browser', 'module', 'main'],
     external: [
       ...baseConfig.external,
@@ -157,8 +159,10 @@ const compileBrowserMain = () =>
 const compileNodeWorker = () =>
   esbuild.build({
     ...baseWorkerConfig,
-    outfile: resolve(outDir, 'worker.js'),
+    outfile: resolve(outDir, 'worker.cjs'),
     platform: 'node',
+    format: 'cjs',
+    external: ['worker_threads', 'node:v8'],
     alias: {
       '@workers/v8-value-serializer/v8': 'node:v8',
     },
@@ -180,6 +184,7 @@ const compileBrowserWorker = () =>
     ...baseWorkerConfig,
     outfile: resolve(outDir, 'worker-browser.js'),
     platform: 'browser',
+    format: 'esm',
     mainFields: ['browser', 'module', 'main'],
     external: ['fs/promises', 'path'],
     define: {
@@ -243,14 +248,33 @@ const bundleWebview = async () => {
   // Read source files
   const template = fs.readFileSync(templatePath, 'utf-8');
   const css = fs.readFileSync(cssPath, 'utf-8');
-  const js = fs.readFileSync(jsPath, 'utf-8');
 
-  // Optionally minify in production mode
+  // Bundle JavaScript using esbuild
+  // This allows using imports/exports in viewer.js and its modules
+  let finalJs = '';
+  try {
+    const jsResult = await esbuild.build({
+      entryPoints: [jsPath],
+      bundle: true,
+      write: false,
+      minify: !DEV,
+      format: 'iife',
+      target: 'es2020',
+      loader: {
+        '.js': 'js',
+        '.ts': 'ts'
+      }
+    });
+    finalJs = jsResult.outputFiles[0].text;
+  } catch (err) {
+    console.error('JS bundling failed:', err);
+    // Fallback to reading file directly if bundling fails (e.g. syntax errors during refactor)
+    finalJs = fs.readFileSync(jsPath, 'utf-8');
+  }
+
+  // Optionally minify CSS in production mode
   let finalCss = css;
-  let finalJs = js;
-
   if (!DEV) {
-    // Use esbuild to minify CSS
     try {
       const cssResult = await esbuild.transform(css, {
         loader: 'css',
@@ -259,17 +283,6 @@ const bundleWebview = async () => {
       finalCss = cssResult.code;
     } catch (err) {
       console.warn('CSS minification failed, using original:', err.message);
-    }
-
-    // Use esbuild to minify JavaScript
-    try {
-      const jsResult = await esbuild.transform(js, {
-        loader: 'js',
-        minify: true,
-      });
-      finalJs = jsResult.code;
-    } catch (err) {
-      console.warn('JS minification failed, using original:', err.message);
     }
   }
 

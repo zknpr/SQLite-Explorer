@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0
+
+- **Security**: Moved SQL generation for write operations (UPDATE, INSERT, DELETE) from the frontend to the backend to prevent SQL injection risks.
+- **Security**: Centralized SQL escaping logic in `src/core/sql-utils.ts`.
+- **Security**: Pinned GitHub Actions dependencies to specific commit hashes.
+- **Architecture**: Refactored the monolithic `viewer.js` into modular components (`core/ui/modules/`) for better maintainability.
+- **Build**: Updated build system to bundle frontend modules using `esbuild`.
+- **Fix**: Resolved visual regression in cell editing mode where input styling was missing.
+- **Fix**: Resolved "not a function" error during cell updates in native backend by using explicit `run` command for write operations.
+
 ## 1.0.11
 
 ### Security

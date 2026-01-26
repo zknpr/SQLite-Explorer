@@ -18,55 +18,26 @@ import type { TelemetryReporter } from '@vscode/extension-telemetry';
 import type { DatabaseConnectionBundle } from './connectionTypes';
 import type {
   CellValue,
+  RecordId,
   QueryResultSet,
   DatabaseOperations,
   DatabaseInitConfig,
   DatabaseInitResult,
-  ModificationEntry
+  ModificationEntry,
+  CellUpdate,
+  TableQueryOptions,
+  TableCountOptions,
+  SchemaSnapshot,
+  ColumnMetadata
 } from './core/types';
+import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
+import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 
 // ============================================================================
 // Utility Functions
 // ============================================================================
 
-/**
- * Escape a SQL identifier (table name, column name) for safe use in queries.
- * SQL identifiers are wrapped in double quotes, and any internal double quotes
- * are escaped by doubling them (SQL standard).
- *
- * SECURITY: This prevents SQL injection via malicious table/column names.
- * Example: A table named `foo"--DROP TABLE bar` becomes `"foo""--DROP TABLE bar"`
- *
- * @param identifier - The table or column name to escape
- * @returns Safely escaped identifier wrapped in double quotes
- */
-function escapeIdentifier(identifier: string): string {
-  return `"${identifier.replace(/"/g, '""')}"`;
-}
-
-/**
- * Convert a CellValue to SQL literal representation.
- * Handles NULL, numbers, strings, and binary data.
- */
-function cellValueToSql(value: CellValue | undefined): string {
-  if (value === null || value === undefined) {
-    return 'NULL';
-  }
-  if (typeof value === 'number') {
-    return String(value);
-  }
-  if (typeof value === 'string') {
-    // Escape single quotes by doubling them (SQL standard)
-    return `'${value.replace(/'/g, "''")}'`;
-  }
-  if (value instanceof Uint8Array) {
-    // Convert binary to hex blob literal
-    const hex = Array.from(value).map(b => b.toString(16).padStart(2, '0')).join('');
-    return `X'${hex}'`;
-  }
-  // Fallback for any other type
-  return `'${String(value).replace(/'/g, "''")}'`;
-}
+// Utility functions moved to src/core/sql-utils.ts
 
 // ============================================================================
 // Constants
@@ -347,6 +318,25 @@ class NativeWorkerProcess {
 // Database Connection Factory
 // ============================================================================
 
+// Helper to safely map rows by column name
+function mapRowsByName(result: any, mapping: Record<string, string>) {
+  if (!result || !result.columns || !result.values) return [];
+
+  const headers = result.columns as string[];
+  const headerMap = new Map(headers.map((h, i) => [h, i]));
+
+  return result.values.map((row: any[]) => {
+    const obj: any = {};
+    for (const [targetProp, sourceCol] of Object.entries(mapping)) {
+      const idx = headerMap.get(sourceCol);
+      if (idx !== undefined) {
+        obj[targetProp] = row[idx];
+      }
+    }
+    return obj;
+  });
+}
+
 /**
  * Check if native SQLite is available on this platform.
  *
@@ -473,7 +463,7 @@ export async function createNativeDatabaseConnection(
               throw new Error(`Invalid rowid: ${mod.targetRowId}`);
             }
 
-            const sqlValue = cellValueToSql(mod.previousValue);
+            const sqlValue = cellValueToSql(mod.priorValue);
             // Use escapeIdentifier to prevent SQL injection via malicious table/column names
             const sql = `UPDATE ${escapeIdentifier(mod.targetTable)} SET ${escapeIdentifier(mod.targetColumn)} = ${sqlValue} WHERE rowid = ${rowIdNum}`;
             await worker.call('query', [sql]);
@@ -504,7 +494,272 @@ export async function createNativeDatabaseConnection(
         },
 
         flushChanges: async () => {},
-        discardModifications: async () => {}
+        discardModifications: async () => {},
+
+        /**
+         * Update a single cell value.
+         */
+        updateCell: async (table: string, rowId: RecordId, column: string, value: CellValue) => {
+          // Validate rowId is a number
+          const rowIdNum = Number(rowId);
+          if (!Number.isFinite(rowIdNum)) {
+            throw new Error(`Invalid rowid: ${rowId}`);
+          }
+
+          const sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
+          await worker.call('run', [sql, [value, rowIdNum]]);
+        },
+
+        /**
+         * Insert a new row.
+         */
+        insertRow: async (table: string, data: Record<string, CellValue>) => {
+          const columns = Object.keys(data);
+          let sql: string;
+          let params: CellValue[] = [];
+
+          if (columns.length === 0) {
+            sql = `INSERT INTO ${escapeIdentifier(table)} DEFAULT VALUES`;
+          } else {
+            const colNames = columns.map(escapeIdentifier).join(', ');
+            const placeholders = columns.map(() => '?').join(', ');
+            params = columns.map(col => data[col]);
+            sql = `INSERT INTO ${escapeIdentifier(table)} (${colNames}) VALUES (${placeholders})`;
+          }
+
+          const result = await worker.call<{
+            changes: number;
+            lastInsertRowId: number | bigint;
+          }>('run', [sql, params]);
+
+          if (result && result.lastInsertRowId !== undefined) {
+            return Number(result.lastInsertRowId) as RecordId;
+          }
+          return undefined;
+        },
+
+        /**
+         * Delete rows by ID.
+         */
+        deleteRows: async (table: string, rowIds: RecordId[]) => {
+          if (rowIds.length === 0) return;
+
+          // Validate all row IDs
+          const validIds = rowIds.map(id => {
+            const num = Number(id);
+            if (!Number.isFinite(num)) throw new Error(`Invalid rowid: ${id}`);
+            return num;
+          });
+
+          const placeholders = validIds.map(() => '?').join(', ');
+          const sql = `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`;
+          await worker.call('run', [sql, validIds]);
+        },
+
+        /**
+         * Delete columns by name.
+         */
+        deleteColumns: async (table: string, columns: string[]) => {
+          if (columns.length === 0) return;
+
+          const escapedTable = escapeIdentifier(table);
+
+          for (const col of columns) {
+            const sql = `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`;
+            await worker.call('run', [sql]);
+          }
+        },
+
+        /**
+         * Create a new table.
+         */
+        createTable: async (table: string, columns: string[]) => {
+          // columns are expected to be valid column definition strings
+          const sql = `CREATE TABLE ${escapeIdentifier(table)} (${columns.join(', ')})`;
+          await worker.call('run', [sql]);
+        },
+
+        /**
+         * Fetch table data.
+         */
+        fetchTableData: async (table: string, options: TableQueryOptions) => {
+          const { sql, params } = buildSelectQuery(table, options);
+          const result = await worker.call<any>('query', [sql, params]);
+
+          let headers = result.columns;
+          let rows = result.values;
+
+          // Native worker returns columns based on Object.keys() which doesn't guarantee order.
+          // We need to ensure the result matches the requested column order from options.columns.
+          if (options.columns && options.columns.length > 0 && headers && rows) {
+            const expected = options.columns;
+
+            // Build map of lower-case header names to indices for robust matching
+            // We prioritize exact match, then case-insensitive
+            const headerIndexMap = new Map<string, number>();
+            headers.forEach((h: string, i: number) => {
+                headerIndexMap.set(h, i);
+                headerIndexMap.set(h.toLowerCase(), i);
+                // Also handle potentially quoted headers (though unlikely) by stripping quotes
+                const unquoted = h.replace(/^['"`]|['"`]$/g, '');
+                if (unquoted !== h) {
+                  headerIndexMap.set(unquoted, i);
+                  headerIndexMap.set(unquoted.toLowerCase(), i);
+                }
+            });
+
+            // Map expected columns to their indices in the result
+            const mapping = expected.map((c: string) => {
+                let idx = headerIndexMap.get(c);
+                if (idx === undefined) idx = headerIndexMap.get(c.toLowerCase());
+                return idx;
+            });
+
+            // If we found at least some columns, we attempt to reconstruct the row
+            // Missing columns will be undefined/null
+            if (mapping.some((idx: number | undefined) => idx !== undefined)) {
+              headers = expected;
+              rows = rows.map((row: any[]) => mapping.map((idx: number | undefined) =>
+                idx !== undefined ? row[idx as number] : null
+              ));
+            }
+          }
+
+          return {
+            headers: headers,
+            rows: rows,
+            columns: headers,
+            values: rows
+          };
+        },
+
+        /**
+         * Fetch table row count.
+         */
+        fetchTableCount: async (table: string, options: TableCountOptions) => {
+          const { sql, params } = buildCountQuery(table, options);
+          const result = await worker.call<any>('query', [sql, params]);
+          if (result && result.values && result.values.length > 0) {
+            return result.values[0][0];
+          }
+          return 0;
+        },
+
+        /**
+         * Fetch database schema.
+         */
+        fetchSchema: async () => {
+          // Get schema using getSchema method on native worker which is optimized
+          // native-worker.js has a 'getSchema' method that returns { schema: [...] }
+          // Let's check what it returns exactly.
+          // src/nativeWorker.js:
+          // case "getSchema":
+          // ... result = { schema: [{ name, sql, columns: [...] }] }
+          // This structure is a bit different from SchemaSnapshot which has { tables, views, indexes }
+
+          // Ideally we should unify. For now, let's use manual queries like WASM to be consistent and simple
+          // OR reuse the existing getSchema if it provides everything we need.
+          // The existing getSchema gets tables and their columns. It doesn't seem to get views or indexes explicitly in the same way?
+          // Actually it queries sqlite_master for tables.
+          // Let's stick to the SQL queries used in WASM implementation for consistency and to ensure we get views/indexes.
+
+          // Get tables
+          const tablesResult = await worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"]);
+          // Get views
+          const viewsResult = await worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='view' ORDER BY name"]);
+          // Get indexes
+          const indexesResult = await worker.call<any>('query', ["SELECT name, tbl_name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name"]);
+
+          const tables = mapRowsByName(tablesResult, { identifier: 'name' });
+          const views = mapRowsByName(viewsResult, { identifier: 'name' });
+          const indexes = mapRowsByName(indexesResult, { identifier: 'name', parentTable: 'tbl_name' });
+
+          return { tables, views, indexes } as SchemaSnapshot;
+        },
+
+        /**
+         * Get table metadata.
+         */
+        getTableInfo: async (table: string) => {
+          const result = await worker.call<any>('query', [`PRAGMA table_info(${escapeIdentifier(table)})`]);
+
+          // Map columns by name to handle unpredictable column order from native worker
+          const headers = result.columns as string[];
+          const idx = {
+            cid: headers.indexOf('cid'),
+            name: headers.indexOf('name'),
+            type: headers.indexOf('type'),
+            notnull: headers.indexOf('notnull'),
+            dflt_value: headers.indexOf('dflt_value'),
+            pk: headers.indexOf('pk')
+          };
+
+          return (result.values || []).map((row: any[]) => ({
+            ordinal: idx.cid >= 0 ? row[idx.cid] : row[0],
+            identifier: idx.name >= 0 ? row[idx.name] : row[1],
+            declaredType: idx.type >= 0 ? row[idx.type] : row[2],
+            isRequired: idx.notnull >= 0 ? row[idx.notnull] : row[3],
+            defaultExpression: idx.dflt_value >= 0 ? row[idx.dflt_value] : row[4],
+            primaryKeyPosition: idx.pk >= 0 ? row[idx.pk] : row[5]
+          }));
+        },
+
+        /**
+         * Test connection.
+         */
+        ping: async () => {
+          try {
+            await worker.call('query', ['SELECT 1']);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+
+        /**
+         * Update multiple cells in a batch.
+         */
+        updateCellBatch: async (table: string, updates: CellUpdate[]) => {
+          if (updates.length === 0) return;
+
+          // Use transaction
+          await worker.call('exec', ['BEGIN TRANSACTION']);
+          try {
+            for (const update of updates) {
+              // Validate rowId is a number
+              const rowIdNum = Number(update.rowId);
+              if (!Number.isFinite(rowIdNum)) {
+                throw new Error(`Invalid rowid: ${update.rowId}`);
+              }
+
+              const sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(update.column)} = ? WHERE rowid = ?`;
+              await worker.call('run', [sql, [update.value, rowIdNum]]);
+            }
+            await worker.call('exec', ['COMMIT']);
+          } catch (err) {
+            try { await worker.call('exec', ['ROLLBACK']); } catch {}
+            throw err;
+          }
+        },
+
+        /**
+         * Add a new column to a table.
+         */
+        addColumn: async (table: string, column: string, type: string, defaultValue?: string) => {
+          let sql = `ALTER TABLE ${escapeIdentifier(table)} ADD COLUMN ${escapeIdentifier(column)} ${type}`;
+
+          if (defaultValue !== undefined && defaultValue !== null && defaultValue !== '') {
+            if (defaultValue.toLowerCase() === 'null') {
+              sql += ' DEFAULT NULL';
+            } else if (!isNaN(Number(defaultValue))) {
+              sql += ` DEFAULT ${defaultValue}`;
+            } else {
+              sql += ` DEFAULT '${defaultValue.replace(/'/g, "''")}'`;
+            }
+          }
+
+          await worker.call('exec', [sql]);
+        }
       };
 
       return {
