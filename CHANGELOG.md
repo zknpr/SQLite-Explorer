@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.2
+
+### Performance
+- **Optimized Large File Handling**: Loading and saving large databases in VS Code Desktop now bypasses the extension host memory buffer, significantly reducing RAM usage and preventing crashes with large files (200MB+). Native backend now uses `VACUUM INTO` for atomic saves.
+- **Faster Batch Updates**: Cell updates are now grouped into a single transaction with prepared statements, drastically improving performance when updating multiple rows.
+- **Efficient Schema Loading**: Combined multiple schema queries into a single round-trip to the worker thread.
+
+### UI/UX
+- **Scrollable Sidebar**: The table/view list is now independently scrollable, ensuring the explorer header and configuration footer remain accessible even with hundreds of tables.
+- **Selection Clearing**: Pressing `Esc` key now unselects any highlighted cells or rows in the data grid.
+
+### Maintenance
+- **Cleanup**: Removed dead code, unused exports, and redundant polyfills to reduce bundle size and improve maintainability.
+
+
 ## 1.1.1
 
 ### New Features

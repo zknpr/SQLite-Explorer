@@ -88,6 +88,14 @@ body {
     justify-content: space-between;
     align-items: center;
     border-bottom: 1px solid var(--border-color);
+    flex-shrink: 0; /* Prevent header from shrinking */
+}
+
+.sidebar-scroll-area {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0; /* Crucial for nested flex scrolling */
 }
 
 .sidebar-actions {
@@ -146,7 +154,7 @@ body {
 
 .item-list {
     list-style: none;
-    overflow-y: auto;
+    /* overflow-y: auto; - Moved to parent .sidebar-scroll-area */
 }
 
 .item-list.hidden {

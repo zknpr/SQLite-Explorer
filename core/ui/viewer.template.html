@@ -22,48 +22,50 @@
                 </div>
             </div>
 
-            <!-- Tables Section -->
-            <div class="section-title" data-section="tables" onclick="toggleSection('tables')">
-                <span class="arrow">▼</span>
-                <span>Tables</span>
-                <span class="badge" id="tablesBadge">0</span>
-                <button class="icon-button" onclick="event.stopPropagation(); openCreateTableModal()" title="Create Table" style="margin-left: auto;">
-                    <span class="codicon codicon-add"></span>
-                </button>
-            </div>
-            <ul class="item-list" id="tablesList"></ul>
+            <div class="sidebar-scroll-area">
+                <!-- Tables Section -->
+                <div class="section-title" data-section="tables" onclick="toggleSection('tables')">
+                    <span class="arrow">▼</span>
+                    <span>Tables</span>
+                    <span class="badge" id="tablesBadge">0</span>
+                    <button class="icon-button" onclick="event.stopPropagation(); openCreateTableModal()" title="Create Table" style="margin-left: auto;">
+                        <span class="codicon codicon-add"></span>
+                    </button>
+                </div>
+                <ul class="item-list" id="tablesList"></ul>
 
-            <!-- Views Section -->
-            <div class="section-title collapsed" data-section="views" onclick="toggleSection('views')">
-                <span class="arrow">▼</span>
-                <span>Views</span>
-                <span class="badge" id="viewsBadge">0</span>
-            </div>
-            <ul class="item-list hidden" id="viewsList"></ul>
+                <!-- Views Section -->
+                <div class="section-title collapsed" data-section="views" onclick="toggleSection('views')">
+                    <span class="arrow">▼</span>
+                    <span>Views</span>
+                    <span class="badge" id="viewsBadge">0</span>
+                </div>
+                <ul class="item-list hidden" id="viewsList"></ul>
 
-            <!-- Indexes Section -->
-            <div class="section-title collapsed" data-section="indexes" onclick="toggleSection('indexes')">
-                <span class="arrow">▼</span>
-                <span>Indexes</span>
-                <span class="badge" id="indexesBadge">0</span>
-            </div>
-            <ul class="item-list hidden" id="indexesList"></ul>
+                <!-- Indexes Section -->
+                <div class="section-title collapsed" data-section="indexes" onclick="toggleSection('indexes')">
+                    <span class="arrow">▼</span>
+                    <span>Indexes</span>
+                    <span class="badge" id="indexesBadge">0</span>
+                </div>
+                <ul class="item-list hidden" id="indexesList"></ul>
 
-            <!-- Batch Update Section -->
-            <div class="section-title hidden" id="batchUpdateSectionTitle" data-section="batchUpdate" onclick="toggleSection('batchUpdate')">
-                <span class="arrow">▼</span>
-                <span>Batch Update</span>
-                <span class="badge" id="batchUpdateCount">0</span>
-            </div>
-            <div class="item-list hidden" id="batchUpdateList">
-                <div style="padding: 12px;">
-                    <button class="btn-primary" onclick="applyBatchUpdate()" style="width:100%; margin-bottom:12px">Apply Changes</button>
-                    <div id="batchUpdateFields"></div>
+                <!-- Batch Update Section -->
+                <div class="section-title hidden" id="batchUpdateSectionTitle" data-section="batchUpdate" onclick="toggleSection('batchUpdate')">
+                    <span class="arrow">▼</span>
+                    <span>Batch Update</span>
+                    <span class="badge" id="batchUpdateCount">0</span>
+                </div>
+                <div class="item-list hidden" id="batchUpdateList">
+                    <div style="padding: 12px;">
+                        <button class="btn-primary" onclick="applyBatchUpdate()" style="width:100%; margin-bottom:12px">Apply Changes</button>
+                        <div id="batchUpdateFields"></div>
+                    </div>
                 </div>
             </div>
 
             <!-- Configuration Section -->
-            <div class="section-title" onclick="openSettingsModal()" style="margin-top: auto; border-top: 1px solid var(--border-color);">
+            <div class="section-title" onclick="openSettingsModal()" style="border-top: 1px solid var(--border-color); flex-shrink: 0;">
                 <span class="codicon codicon-settings" style="margin-right: 6px;"></span>
                 <span>Configuration</span>
             </div>

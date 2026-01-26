@@ -5,7 +5,7 @@ import { state } from './state.js';
 import { backendApi } from './api.js';
 import { escapeHtml, validateRowId, escapeIdentifier, formatCellValue } from './utils.js';
 import { updateStatus } from './ui.js';
-import { renderDataGrid, loadTableData, updateSelectionStates } from './grid.js';
+import { renderDataGrid, loadTableData, updateSelectionStates, clearSelection } from './grid.js';
 import { getRowDataOffset, getCellValue } from './data-utils.js';
 
 // ================================================================
@@ -179,6 +179,7 @@ export function cancelCellEdit() {
     const { rowIdx, colIdx, originalValue } = state.editingCellInfo;
     cleanupCellEdit();
     updateCellDom(rowIdx, colIdx, originalValue);
+    clearSelection();
 }
 
 function cleanupCellEdit() {

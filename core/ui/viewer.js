@@ -59,7 +59,8 @@ import {
     onRowNumberClick,
     toggleRowPin,
     onSelectAllClick,
-    initGridInteraction
+    initGridInteraction,
+    clearSelection
 } from './modules/grid.js';
 import {
     openCellPreview,
@@ -174,6 +175,13 @@ async function initializeApp() {
 
         // Global shortcuts
         document.addEventListener('keydown', async (event) => {
+            // Escape
+            if (event.key === 'Escape') {
+                if (!state.editingCellInfo && !document.querySelector('.modal:not(.hidden)')) {
+                    clearSelection();
+                }
+            }
+
             // Cmd+C / Ctrl+C
             if ((event.metaKey || event.ctrlKey) && event.key === 'c') {
                 if (state.editingCellInfo || document.activeElement.tagName === 'INPUT') return;

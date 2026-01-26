@@ -890,6 +890,17 @@ export function onCellClick(event, rowIdx, colIdx, rowId) {
     updateBatchSidebar();
 }
 
+export function clearSelection() {
+    state.selectedCells = [];
+    state.selectedRowIds.clear();
+    state.selectedColumns.clear();
+    state.lastSelectedCell = null;
+
+    updateSelectionStates();
+    updateToolbarButtons();
+    updateBatchSidebar();
+}
+
 // Cell Double Click (Edit)
 export function onCellDoubleClick(event, rowIdx, colIdx, rowId) {
     if (state.cellEditBehavior === 'vscode') {
