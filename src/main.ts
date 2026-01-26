@@ -10,6 +10,7 @@ export type DbParams = {
   filename: string,
   table: string,
   name: string,
+  uri?: string,
 }
 
 export let GlobalOutputChannel: vsc.OutputChannel|null = null;

@@ -19,19 +19,20 @@ The extension uses a three-layer communication architecture:
     UI Layer              VS Code API             SQLite WASM
 ```
 
-1. **Webview Layer** (`core/ui/viewer.html`)
+1. **Webview Layer** (`core/ui/viewer.html` + `core/ui/modules/*.js`)
    - Renders the UI (table grid, sidebar, modals)
    - Handles user interactions (cell editing, row selection, CRUD operations)
    - Communicates with Extension Host via custom RPC protocol
+   - Modularized logic in `core/ui/modules/` (rpc, state, grid, sidebar, etc.)
 
-2. **Extension Host Layer** (`src/extension.ts`, `src/sqliteDocument.ts`, `src/sqliteEditorProvider.ts`)
+2. **Extension Host Layer** (`src/main.ts`, `src/databaseModel.ts`, `src/editorController.ts`)
    - Manages VS Code custom editor lifecycle
    - Bridges Webview and Worker communication
    - Handles file I/O via VS Code workspace API
    - Exposes `HostBridge` to the Webview
 
-3. **Worker Layer** (`src/worker.ts`)
-   - Runs WebAssembly SQLite (sql.js)
+3. **Worker Layer** (`src/databaseWorker.ts`, `src/nativeWorker.ts`)
+   - Runs WebAssembly SQLite (sql.js) or Native SQLite (txiki-js)
    - Executes all SQL queries
    - Handles database operations via `DatabaseOperations`
 
@@ -39,16 +40,18 @@ The extension uses a three-layer communication architecture:
 
 | File | Purpose |
 |------|---------|
-| `src/extension.ts` | Extension activation, command registration |
-| `src/sqliteEditorProvider.ts` | Custom editor provider (DatabaseViewerProvider, DatabaseEditorProvider) |
-| `src/sqliteDocument.ts` | Document model (DatabaseDocument), undo/redo, save/revert |
-| `src/webWorker.ts` | Worker bundle creation, file reading |
-| `src/worker.ts` | Worker entry point, exposes database operations |
-| `src/vscodeFns.ts` | HostBridge - functions exposed to webview (exec, export, etc.) |
-| `src/lib/types.ts` | Core type definitions (CellValue, RecordId, QueryResultSet, etc.) |
-| `src/lib/rpc.ts` | RPC utilities (buildMethodProxy, processProtocolMessage) |
-| `src/lib/sqlite-db.ts` | Database engine wrapper |
-| `src/lib/undo-history.ts` | ModificationTracker for undo/redo |
+| `src/main.ts` | Extension activation, command registration |
+| `src/editorController.ts` | Custom editor provider (DatabaseViewerProvider, DatabaseEditorProvider) |
+| `src/databaseModel.ts` | Document model (DatabaseDocument), undo/redo, save/revert |
+| `src/workerFactory.ts` | Worker bundle creation, file reading |
+| `src/databaseWorker.ts` | Worker entry point, exposes database operations |
+| `src/hostBridge.ts` | HostBridge - functions exposed to webview (exec, export, etc.) |
+| `src/core/types.ts` | Core type definitions (CellValue, RecordId, QueryResultSet, etc.) |
+| `src/core/rpc.ts` | RPC utilities (buildMethodProxy, processProtocolMessage) |
+| `src/core/sqlite-db.ts` | Database engine wrapper |
+| `src/core/query-builder.ts` | Safe SQL query construction |
+| `src/core/sql-utils.ts` | SQL utilities and escaping |
+| `src/core/undo-history.ts` | ModificationTracker for undo/redo |
 | `core/ui/viewer.html` | Standalone webview UI |
 | `assets/sqlite3.wasm` | SQLite WebAssembly binary |
 

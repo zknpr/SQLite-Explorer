@@ -14,13 +14,14 @@ import { ExtensionId, FullExtensionId, SidebarLeft, SidebarRight, UriScheme } fr
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata } from './core/types';
 
 // Legacy DbParams type for backward compatibility with webview
 interface DbParams {
   filename?: string;
   table: string;
   name?: string;
+  uri?: string;
 }
 
 // Type for Uint8Array-like objects (transferable over postMessage)
@@ -84,7 +85,6 @@ export class HostBridge implements ToastService {
     if (this.webviews.has(document.uri)) {
       this.reporter?.sendTelemetryEvent("open");
       // Return connection info instead of proxying databaseOps directly.
-      // The webview will call executeQuery(), serializeDatabase(), etc. directly on hostBridge.
       return {
         connected: true,
         filename: document.fileParts.filename,
@@ -95,32 +95,17 @@ export class HostBridge implements ToastService {
   }
 
   /**
-   * Execute a SQL query on the database.
-   * Exposed directly to avoid nested proxy issues.
-   *
-   * @param sql - The SQL query string to execute
-   * @param params - Optional array of parameters for parameterized queries
-   * @returns Query results from sql.js
+   * Test database connection.
    */
-  async exec(sql: string, params?: any[]) {
+  async ping() {
     const { document } = this;
     if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
+      return false;
     }
-    const result = await document.databaseOperations.executeQuery(sql, params);
-
-    // Fire edit event if this is a write operation
-    // This marks the document as dirty so VS Code knows to save
-    if (isWriteOperation(sql)) {
-      this.document.recordExternalModification({
-        label: 'SQL Query',
-        description: 'SQL Query',
-        modificationType: 'cell_update',
-        executedQuery: sql
-      });
+    if ('ping' in document.databaseOperations) {
+      return await (document.databaseOperations as any).ping();
     }
-
-    return result;
+    return false;
   }
 
   /**
@@ -137,6 +122,295 @@ export class HostBridge implements ToastService {
     }
     return document.databaseOperations.serializeDatabase(filename);
   }
+
+  /**
+   * Update a single cell value.
+   */
+  async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, originalValue?: CellValue) {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    // Check if the document is read-only
+    if (this.isReadOnly) {
+      throw new Error("Document is read-only");
+    }
+
+    // Use specific method instead of generic exec
+    // This allows the backend to handle safe SQL construction
+    // However, DatabaseOperations is an interface, so we need to cast or ensure methods exist
+    // We recently added these methods to DatabaseOperations interface
+    if ('updateCell' in document.databaseOperations) {
+      await (document.databaseOperations as any).updateCell(table, rowId, column, value);
+    } else {
+      // Fallback for older backend versions (shouldn't happen if built correctly)
+      throw new Error("Backend does not support updateCell");
+    }
+
+    // Fire edit event
+    this.document.recordExternalModification({
+      label: 'Update Cell',
+      description: `Update ${table}.${column}`,
+      modificationType: 'cell_update',
+      targetTable: table,
+      targetRowId: rowId,
+      targetColumn: column,
+      newValue: value,
+      priorValue: originalValue
+    });
+  }
+
+  /**
+   * Insert a new row.
+   */
+  async insertRow(table: string, data: Record<string, CellValue>) {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    if (this.isReadOnly) {
+      throw new Error("Document is read-only");
+    }
+
+    let rowId: RecordId | undefined;
+
+    if ('insertRow' in document.databaseOperations) {
+      rowId = await (document.databaseOperations as any).insertRow(table, data);
+    } else {
+      throw new Error("Backend does not support insertRow");
+    }
+
+    // Fire edit event
+    this.document.recordExternalModification({
+      label: 'Insert Row',
+      description: `Insert row into ${table}`,
+      modificationType: 'row_insert',
+      targetTable: table,
+      targetRowId: rowId
+    });
+
+    return rowId;
+  }
+
+  /**
+   * Delete rows.
+   */
+  async deleteRows(table: string, rowIds: RecordId[]) {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    if (this.isReadOnly) {
+      throw new Error("Document is read-only");
+    }
+
+    if ('deleteRows' in document.databaseOperations) {
+      await (document.databaseOperations as any).deleteRows(table, rowIds);
+    } else {
+      throw new Error("Backend does not support deleteRows");
+    }
+
+    // Fire edit event
+    this.document.recordExternalModification({
+      label: 'Delete Rows',
+      description: `Delete ${rowIds.length} rows from ${table}`,
+      modificationType: 'row_delete',
+      targetTable: table,
+      affectedRowIds: rowIds
+    });
+  }
+
+  /**
+   * Delete columns.
+   */
+  async deleteColumns(table: string, columns: string[]) {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    if (this.isReadOnly) {
+      throw new Error("Document is read-only");
+    }
+
+    if ('deleteColumns' in document.databaseOperations) {
+      await (document.databaseOperations as any).deleteColumns(table, columns);
+    } else {
+      throw new Error("Backend does not support deleteColumns");
+    }
+
+    // Fire edit event
+    this.document.recordExternalModification({
+      label: 'Delete Columns',
+      description: `Delete columns ${columns.join(', ')} from ${table}`,
+      modificationType: 'table_drop', // Approximate type
+      targetTable: table
+    });
+  }
+
+  /**
+   * Create a new table.
+   */
+  async createTable(table: string, columns: string[]) {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    if (this.isReadOnly) {
+      throw new Error("Document is read-only");
+    }
+
+    if ('createTable' in document.databaseOperations) {
+      await (document.databaseOperations as any).createTable(table, columns);
+    } else {
+      throw new Error("Backend does not support createTable");
+    }
+
+    // Fire edit event
+    this.document.recordExternalModification({
+      label: 'Create Table',
+      description: `Create table ${table}`,
+      modificationType: 'table_create',
+      targetTable: table
+    });
+  }
+
+  /**
+   * Update multiple cells in batch.
+   */
+  async updateCellBatch(table: string, updates: CellUpdate[], label: string) {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    if (this.isReadOnly) {
+      throw new Error("Document is read-only");
+    }
+
+    if ('updateCellBatch' in document.databaseOperations) {
+      await (document.databaseOperations as any).updateCellBatch(table, updates);
+    } else {
+      // Fallback: execute updates sequentially
+      for (const update of updates) {
+        await this.updateCell(table, update.rowId, update.column, update.value);
+      }
+      return;
+    }
+
+    // Fire batch edit event
+    this.document.recordExternalModification({
+      label: label || `Update ${updates.length} cells`,
+      description: `Update ${updates.length} cells in ${table}`,
+      modificationType: 'cell_update',
+      targetTable: table,
+      affectedCells: updates.map(u => ({
+        rowId: u.rowId,
+        columnName: u.column,
+        newValue: u.value
+      }))
+    });
+  }
+
+  /**
+   * Add a new column to a table.
+   */
+  async addColumn(table: string, column: string, type: string, defaultValue?: string) {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    if (this.isReadOnly) {
+      throw new Error("Document is read-only");
+    }
+
+    if ('addColumn' in document.databaseOperations) {
+      await (document.databaseOperations as any).addColumn(table, column, type, defaultValue);
+    } else {
+      throw new Error("Backend does not support addColumn");
+    }
+
+    // Fire edit event
+    this.document.recordExternalModification({
+      label: 'Add Column',
+      description: `Add column ${column} to ${table}`,
+      modificationType: 'column_add',
+      targetTable: table,
+      targetColumn: column
+    });
+  }
+
+  /**
+   * Fetch table data (SELECT).
+   */
+  async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    if ('fetchTableData' in document.databaseOperations) {
+      return await (document.databaseOperations as any).fetchTableData(table, options);
+    } else {
+      // Fallback or error? Since we are upgrading everything, throw error.
+      // Alternatively, we could implement fallback using exec, but that defeats the purpose of moving logic to backend.
+      throw new Error("Backend does not support fetchTableData");
+    }
+  }
+
+  /**
+   * Fetch table count (SELECT COUNT(*)).
+   */
+  async fetchTableCount(table: string, options: TableCountOptions): Promise<number> {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    if ('fetchTableCount' in document.databaseOperations) {
+      return await (document.databaseOperations as any).fetchTableCount(table, options);
+    } else {
+      throw new Error("Backend does not support fetchTableCount");
+    }
+  }
+
+  /**
+   * Fetch schema (tables, views, indexes).
+   */
+  async fetchSchema(): Promise<SchemaSnapshot> {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    if ('fetchSchema' in document.databaseOperations) {
+      return await (document.databaseOperations as any).fetchSchema();
+    } else {
+      throw new Error("Backend does not support fetchSchema");
+    }
+  }
+
+  /**
+   * Get table columns metadata.
+   */
+  async getTableInfo(table: string): Promise<ColumnMetadata[]> {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    if ('getTableInfo' in document.databaseOperations) {
+      return await (document.databaseOperations as any).getTableInfo(table);
+    } else {
+      throw new Error("Backend does not support getTableInfo");
+    }
+  }
+
 
   /**
    * Apply edits to the database.
@@ -417,7 +691,12 @@ export class HostBridge implements ToastService {
    * @param extras - Additional options
    */
   async exportTable(dbParams: DbParams, columns: string[], dbOptions?: any, tableStore?: any, exportOptions?: any, extras?: any) {
-    await vsc.commands.executeCommand(`${ExtensionId}.exportTable`, dbParams, columns, dbOptions, tableStore, exportOptions, extras);
+    // Inject the URI of the current document so the command knows which database to use
+    const enrichedParams = {
+      ...dbParams,
+      uri: this.document.uri.toString()
+    };
+    await vsc.commands.executeCommand(`${ExtensionId}.exportTable`, enrichedParams, columns, dbOptions, tableStore, exportOptions, extras);
   }
 
   /**
@@ -430,53 +709,6 @@ export class HostBridge implements ToastService {
     const uri = vsc.Uri.parse(uriString);
     return await vsc.workspace.fs.readFile(uri);
   }
-}
-
-/**
- * Check if a SQL statement is a write operation.
- * Handles edge cases like leading comments and CTEs (WITH clauses).
- *
- * @param sql - SQL query string
- * @returns True if the query modifies data
- */
-function isWriteOperation(sql: string): boolean {
-  // Remove leading/trailing whitespace
-  let normalized = sql.trim();
-
-  // Remove leading SQL comments (both -- and /* */ styles)
-  // This prevents attackers from hiding write operations behind comments
-  // Example: "/* log */ INSERT INTO..." should still be detected as a write
-
-  // Remove block comments /* ... */
-  normalized = normalized.replace(/\/\*[\s\S]*?\*\//g, '');
-
-  // Remove line comments -- ...
-  normalized = normalized.replace(/--[^\n]*/g, '');
-
-  // Trim again after removing comments
-  normalized = normalized.trim().toUpperCase();
-
-  // Handle CTEs: WITH ... AS (...) INSERT/UPDATE/DELETE
-  // A CTE can precede a write operation
-  if (normalized.startsWith('WITH')) {
-    // Find the actual statement after the CTE(s)
-    // CTEs are followed by SELECT, INSERT, UPDATE, or DELETE
-    // We need to find the final statement keyword
-    const ctePattern = /\bWITH\b[\s\S]*?\b(SELECT|INSERT|UPDATE|DELETE)\b/i;
-    const match = normalized.match(ctePattern);
-    if (match) {
-      const keyword = match[1].toUpperCase();
-      return keyword === 'INSERT' || keyword === 'UPDATE' || keyword === 'DELETE';
-    }
-  }
-
-  // Standard write operation detection
-  return normalized.startsWith('INSERT') ||
-    normalized.startsWith('UPDATE') ||
-    normalized.startsWith('DELETE') ||
-    normalized.startsWith('CREATE') ||
-    normalized.startsWith('ALTER') ||
-    normalized.startsWith('DROP');
 }
 
 /**

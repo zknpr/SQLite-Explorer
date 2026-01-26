@@ -147,6 +147,14 @@ npm run package
 
 Contributions are welcome! Please feel free to submit issues and pull requests.
 
+## Support
+
+If you find this extension useful, please consider buying me a coffee!
+
+<a href="https://buymeacoffee.com/zknpr">
+  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="200" />
+</a>
+
 ## Credits
 
 - **SQL.js** - WebAssembly SQLite implementation

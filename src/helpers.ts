@@ -420,7 +420,7 @@ export const encodeUtf8 = (str: string): Uint8Array => textEncoder.encode(str);
  * @returns 6-byte SHA-256 hash encoded as base58
  */
 export async function shortHash(input: string): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest('SHA-256', encodeUtf8(input));
+  const hashBuffer = await crypto.subtle.digest('SHA-256', encodeUtf8(input) as any);
   const hashBytes = new Uint8Array(hashBuffer).subarray(0, 6);
   return base58.encode(hashBytes);
 }
@@ -433,7 +433,7 @@ export async function shortHash(input: string): Promise<string> {
  * @returns Truncated SHA-256 hash encoded as base64url
  */
 export async function hash64(input: string, length: number = 6): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest('SHA-256', encodeUtf8(input));
+  const hashBuffer = await crypto.subtle.digest('SHA-256', encodeUtf8(input) as any);
   const hashBytes = new Uint8Array(hashBuffer).subarray(0, length);
   return base64urlnopad.encode(hashBytes);
 }

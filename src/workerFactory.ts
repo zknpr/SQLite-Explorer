@@ -21,7 +21,8 @@ import type {
   ModificationEntry,
   DatabaseOperations,
   DatabaseInitConfig,
-  DatabaseInitResult
+  DatabaseInitResult,
+  CellUpdate
 } from './core/types';
 
 import { Worker } from './platform/threadPool';
@@ -80,6 +81,18 @@ interface WorkerMethods {
   ): Promise<DatabaseInitResult>;
   runQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]>;
   exportDatabase(name: string): Promise<Uint8Array>;
+  updateCell(table: string, rowId: string | number, column: string, value: CellValue): Promise<void>;
+  insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
+  deleteRows(table: string, rowIds: (string | number)[]): Promise<void>;
+  deleteColumns(table: string, columns: string[]): Promise<void>;
+  createTable(table: string, columns: string[]): Promise<void>;
+  updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
+  addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
+  fetchTableData(table: string, options: any): Promise<any>;
+  fetchTableCount(table: string, options: any): Promise<number>;
+  fetchSchema(): Promise<any>;
+  getTableInfo(table: string): Promise<any>;
+  ping(): Promise<boolean>;
 }
 
 // ============================================================================
@@ -163,7 +176,7 @@ async function createWasmDatabaseConnection(
   // Determine worker script path based on environment
   const workerScriptPath = import.meta.env.VSCODE_BROWSER_EXT
     ? vsc.Uri.joinPath(extensionUri, 'out', 'worker-browser.js').toString()
-    : path.resolve(__dirname, './worker.js');
+    : path.resolve(__dirname, './worker.cjs');
 
   // Spawn worker thread
   const workerThread = new Worker(workerScriptPath);
@@ -184,7 +197,7 @@ async function createWasmDatabaseConnection(
         }
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase']
+    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'ping']
   );
 
   // Termination handler
@@ -243,7 +256,31 @@ async function createWasmDatabaseConnection(
         undoModification: async () => {},
         redoModification: async () => {},
         flushChanges: async () => {},
-        discardModifications: async () => {}
+        discardModifications: async () => {},
+        updateCell: (table: string, rowId: string | number, column: string, value: CellValue) =>
+          workerProxy.updateCell(table, rowId, column, value),
+        insertRow: (table: string, data: Record<string, CellValue>) =>
+          workerProxy.insertRow(table, data),
+        deleteRows: (table: string, rowIds: (string | number)[]) =>
+          workerProxy.deleteRows(table, rowIds),
+        deleteColumns: (table: string, columns: string[]) =>
+          workerProxy.deleteColumns(table, columns),
+        createTable: (table: string, columns: string[]) =>
+          workerProxy.createTable(table, columns),
+        updateCellBatch: (table: string, updates: CellUpdate[]) =>
+          workerProxy.updateCellBatch(table, updates),
+        addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
+          workerProxy.addColumn(table, column, type, defaultValue),
+        fetchTableData: (table: string, options: any) =>
+          workerProxy.fetchTableData(table, options),
+        fetchTableCount: (table: string, options: any) =>
+          workerProxy.fetchTableCount(table, options),
+        fetchSchema: () =>
+          workerProxy.fetchSchema(),
+        getTableInfo: (table: string) =>
+          workerProxy.getTableInfo(table),
+        ping: () =>
+          workerProxy.ping()
       };
 
       return {
@@ -275,7 +312,7 @@ async function loadDatabaseFiles(
   const maxSize = getMaximumFileSizeBytes();
 
   // Check file size
-  const fileStat = await vsc.workspace.fs.stat(uri).catch(() => ({ size: 0 }));
+  const fileStat = await Promise.resolve(vsc.workspace.fs.stat(uri)).catch(() => ({ size: 0 }));
   if (maxSize !== 0 && fileStat.size > maxSize) {
     // File exceeds size limit
     return [null, null];
@@ -287,6 +324,6 @@ async function loadDatabaseFiles(
   // Read both files concurrently
   return Promise.all([
     vsc.workspace.fs.readFile(uri),
-    vsc.workspace.fs.readFile(walUri).catch(() => null)
+    Promise.resolve(vsc.workspace.fs.readFile(walUri)).catch(() => null)
   ]);
 }

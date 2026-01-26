@@ -41,9 +41,9 @@ export interface DatabaseConnectionBundle {
    * Includes dispose symbol for cleanup.
    */
   workerMethods: {
-    initializeDatabase: (...args: unknown[]) => Promise<unknown>;
-    runQuery: (...args: unknown[]) => Promise<unknown>;
-    exportDatabase: (...args: unknown[]) => Promise<unknown>;
+    initializeDatabase: (...args: any[]) => Promise<unknown>;
+    runQuery: (...args: any[]) => Promise<unknown>;
+    exportDatabase: (...args: any[]) => Promise<unknown>;
     [Symbol.dispose]: () => void;
   };
 

@@ -143,6 +143,13 @@ export interface ModificationEntry {
   executedQuery?: string;
   /** Multiple affected rows */
   affectedRowIds?: RecordId[];
+  /** Multiple affected cells (for batch updates) */
+  affectedCells?: {
+    rowId: RecordId;
+    columnName: string;
+    priorValue?: CellValue;
+    newValue?: CellValue;
+  }[];
 }
 
 /**
@@ -196,6 +203,77 @@ export interface DatabaseOperations {
 
   /** Discard pending changes */
   discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
+
+  /** Update a single cell value */
+  updateCell(table: string, rowId: RecordId, column: string, value: CellValue): Promise<void>;
+
+  /** Insert a new row */
+  insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined>;
+
+  /** Delete rows by ID */
+  deleteRows(table: string, rowIds: RecordId[]): Promise<void>;
+
+  /** Delete columns by name */
+  deleteColumns(table: string, columns: string[]): Promise<void>;
+
+  /** Create a new table */
+  createTable(table: string, columns: string[]): Promise<void>;
+
+  /** Update multiple cells in a batch */
+  updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
+
+  /** Add a new column to a table */
+  addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
+
+  /** Fetch table data */
+  fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
+
+  /** Fetch table row count */
+  fetchTableCount(table: string, options: TableCountOptions): Promise<number>;
+
+  /** Fetch database schema */
+  fetchSchema(): Promise<SchemaSnapshot>;
+
+  /** Get table metadata (columns) */
+  getTableInfo(table: string): Promise<ColumnMetadata[]>;
+
+  /** Test database connection */
+  ping(): Promise<boolean>;
+}
+
+/**
+ * Represents a single cell update.
+ */
+export interface CellUpdate {
+  rowId: RecordId;
+  column: string;
+  value: CellValue;
+  originalValue?: CellValue;
+}
+
+// ============================================================================
+// Read Query Types
+// ============================================================================
+
+export interface ColumnFilter {
+  column: string;
+  value: string;
+}
+
+export interface TableQueryOptions {
+  columns?: string[];
+  orderBy?: string;
+  orderDir?: 'ASC' | 'DESC';
+  limit?: number;
+  offset?: number;
+  filters?: ColumnFilter[];
+  globalFilter?: string;
+}
+
+export interface TableCountOptions {
+  columns?: string[];
+  filters?: ColumnFilter[];
+  globalFilter?: string;
 }
 
 // ============================================================================

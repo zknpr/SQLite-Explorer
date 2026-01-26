@@ -9,34 +9,14 @@ import * as vsc from 'vscode';
 import type { TelemetryReporter } from '@vscode/extension-telemetry';
 import type { CellValue } from './core/types';
 import { DocumentRegistry } from './databaseModel';
+import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
 
 // Legacy DbParams type for backward compatibility with webview
 interface DbParams {
   filename?: string;
   table: string;
   name?: string;
-}
-
-/**
- * Escape a SQL identifier (table name, column name) for safe use in queries.
- * SQL identifiers are wrapped in double quotes, and any internal double quotes
- * are escaped by doubling them (SQL standard).
- *
- * SECURITY: This prevents SQL injection via malicious table/column names.
- * Example: A table named `foo"--DROP TABLE bar` becomes `"foo""--DROP TABLE bar"`
- *
- * @param identifier - The table or column name to escape
- * @returns Safely escaped identifier wrapped in double quotes
- */
-function escapeIdentifier(identifier: string): string {
-  return `"${identifier.replace(/"/g, '""')}"`;
-}
-
-// Legacy DbParams type for backward compatibility with webview
-interface DbParams {
-  filename?: string;
-  table: string;
-  name?: string;
+  uri?: string;
 }
 
 /**
@@ -84,9 +64,24 @@ export async function exportTableCommand(
 
     // Find the active document to get database access
     let document = null;
-    for (const [, doc] of DocumentRegistry) {
-      document = doc;
-      break;
+
+    // 1. Try to find by URI if provided (most reliable)
+    if (dbParams.uri) {
+      for (const [, doc] of DocumentRegistry) {
+        if (doc.uri.toString() === dbParams.uri) {
+          document = doc;
+          break;
+        }
+      }
+    }
+
+    // 2. Fallback: pick the first one (legacy behavior)
+    // This assumes there is only one active database editor
+    if (!document) {
+      for (const [, doc] of DocumentRegistry) {
+        document = doc;
+        break;
+      }
     }
 
     if (!document || !document.databaseOperations) {
@@ -129,8 +124,10 @@ export async function exportTableCommand(
     }
 
     // Show save dialog
+    // Set default directory to the database file's directory using joinPath
+    // This prevents the dialog from defaulting to the root directory '/'
     const uri = await vsc.window.showSaveDialog({
-      defaultUri: vsc.Uri.file(`${tableName}.${defaultExt}`),
+      defaultUri: vsc.Uri.joinPath(document.uri, '..', `${tableName}.${defaultExt}`),
       filters: {
         [format.label]: [defaultExt],
         'All Files': ['*']
@@ -205,22 +202,11 @@ function exportToJson(columns: string[], rows: CellValue[][]): string {
  * Generates INSERT statements that can be used to recreate the data.
  */
 function exportToSql(tableName: string, columns: string[], rows: CellValue[][]): string {
-  const escapeSqlValue = (value: CellValue): string => {
-    if (value === null || value === undefined) return 'NULL';
-    if (typeof value === 'number') return String(value);
-    if (value instanceof Uint8Array) {
-      // Binary data as hex
-      return `X'${Array.from(value).map(b => b.toString(16).padStart(2, '0')).join('')}'`;
-    }
-    // String - escape single quotes
-    return `'${String(value).replace(/'/g, "''")}'`;
-  };
-
   // Use escapeIdentifier to prevent SQL injection via malicious column names
   const columnList = columns.map(c => escapeIdentifier(c)).join(', ');
 
   const statements = rows.map(row => {
-    const values = row.map(escapeSqlValue).join(', ');
+    const values = row.map(cellValueToSql).join(', ');
     // Use escapeIdentifier for table name as well
     return `INSERT INTO ${escapeIdentifier(tableName)} (${columnList}) VALUES (${values});`;
   });

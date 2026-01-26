@@ -43,47 +43,76 @@ interface NodeMessagePort {
 
 const isBrowserRuntime = import.meta.env.VSCODE_BROWSER_EXT;
 
+let WorkerImpl: any;
+let MessageChannelImpl: any;
+let MessagePortImpl: any;
+let BroadcastChannelImpl: any;
+let parentPortImpl: any;
+
+if (isBrowserRuntime) {
+  WorkerImpl = globalThis.Worker;
+  MessageChannelImpl = globalThis.MessageChannel;
+  MessagePortImpl = globalThis.MessagePort;
+  BroadcastChannelImpl = globalThis.BroadcastChannel;
+  parentPortImpl = globalThis;
+} else {
+  // Node.js environment
+  try {
+    // Explicit string for static analysis if needed, but we rely on build config to externalize it
+    const wt = require('worker_threads');
+
+    WorkerImpl = wt.Worker;
+    MessageChannelImpl = wt.MessageChannel;
+    MessagePortImpl = wt.MessagePort;
+    BroadcastChannelImpl = wt.BroadcastChannel;
+    parentPortImpl = wt.parentPort;
+
+    if (!parentPortImpl) {
+       // In main thread, parentPort is null. In worker thread, it should be defined.
+       // We can check isMainThread to be sure.
+       if (!wt.isMainThread) {
+          console.error('[ThreadPool] worker_threads.parentPort is null in a worker thread!');
+       }
+    }
+  } catch (e) {
+    console.error('[ThreadPool] Failed to load worker_threads:', e);
+    // Fallback? No, we need worker_threads in Node.
+    throw e;
+  }
+}
+
+
 /**
  * Cross-platform Worker constructor.
  * Browser: Web Worker API
  * Node.js: worker_threads.Worker
  */
-export const Worker: typeof globalThis.Worker = isBrowserRuntime
-  ? globalThis.Worker
-  : require('worker_threads').Worker;
+export const Worker = WorkerImpl;
 
 /**
  * Cross-platform MessageChannel for bidirectional communication.
  * Browser: Web MessageChannel API
  * Node.js: worker_threads.MessageChannel
  */
-export const MessageChannel: typeof globalThis.MessageChannel = isBrowserRuntime
-  ? globalThis.MessageChannel
-  : require('worker_threads').MessageChannel;
+export const MessageChannel = MessageChannelImpl;
 
 /**
  * Cross-platform MessagePort for message passing.
  * Browser: Web MessagePort API
  * Node.js: worker_threads.MessagePort
  */
-export const MessagePort: typeof globalThis.MessagePort = isBrowserRuntime
-  ? globalThis.MessagePort
-  : require('worker_threads').MessagePort;
+export const MessagePort = MessagePortImpl;
 
 /**
  * Cross-platform BroadcastChannel for pub/sub messaging.
  * Browser: Web BroadcastChannel API
  * Node.js: worker_threads.BroadcastChannel
  */
-export const BroadcastChannel: typeof globalThis.BroadcastChannel = isBrowserRuntime
-  ? globalThis.BroadcastChannel
-  : require('worker_threads').BroadcastChannel;
+export const BroadcastChannel = BroadcastChannelImpl;
 
 /**
  * Reference to the parent context for worker-side communication.
  * Browser: globalThis (messages go to/from spawning window)
  * Node.js: worker_threads.parentPort
  */
-export const parentPort: BrowserMessagePort | NodeMessagePort = isBrowserRuntime
-  ? globalThis
-  : require('worker_threads').parentPort;
+export const parentPort = parentPortImpl;

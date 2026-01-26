@@ -3,12 +3,16 @@
   "name": "sqlite-explorer",
   "displayName": "SQLite Explorer",
   "description": "A powerful SQLite database viewer and editor for VS Code",
-  "version": "1.0.11",
+  "version": "1.1.0",
   "publisher": "zknpr",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/zknpr/sqlite-explorer"
+  },
+  "funding": {
+    "type": "individual",
+    "url": "https://buymeacoffee.com/zknpr"
   },
   "engines": {
     "vscode": "^1.83.1"
@@ -118,12 +122,16 @@
     "compile": "npm run clean && npm run compile:ext",
     "build": "npm run compile",
     "package": "npm run build && npx vsce package",
-    "package-all": "npm run build && npx vsce package"
+    "package-all": "npm run build && npx vsce package",
+    "test": "npx tsx --test tests/unit/*.test.ts"
   },
   "devDependencies": {
+    "@types/node": "^20.19.30",
     "@types/vscode": "=1.83.1",
     "esbuild": "^0.27.1",
     "esbuild-plugin-polyfill-node": "^0.3.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   },
   "dependencies": {
