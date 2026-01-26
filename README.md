@@ -151,7 +151,9 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 
 If you find this extension useful, please consider buying me a coffee!
 
-[![Buy Me A Coffee](https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png)](https://buymeacoffee.com/zknpr)
+<a href="https://buymeacoffee.com/zknpr">
+  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="200" />
+</a>
 
 ## Credits
 
