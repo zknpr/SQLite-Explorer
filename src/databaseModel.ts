@@ -20,6 +20,7 @@ import { createDatabaseConnection, getMaximumFileSizeBytes } from './workerFacto
 
 import { ModificationTracker } from './core/undo-history';
 import type { LabeledModification, DatabaseOperations } from './core/types';
+import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
 
 // ============================================================================
 // Types
@@ -116,6 +117,15 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       );
       databaseOps = result.databaseOps;
       forceReadOnly = result.isReadOnly;
+
+      // Wrap with logger if output channel is available
+      if (viewerProvider.outputChannel) {
+        databaseOps = new LoggingDatabaseOperations(
+          databaseOps,
+          filename,
+          viewerProvider.outputChannel
+        );
+      }
     } catch (err) {
       throw err;
     }
@@ -301,12 +311,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       return;
     }
 
-    if (!this.autoCommitEnabled) {
-      // Export in-memory database to file (WASM engine only)
-      const { filename } = this.fileParts;
-      const binaryContent = await this.databaseOperations.serializeDatabase(filename);
-      await vsc.workspace.fs.writeFile(this.uri, binaryContent);
-    }
+    // Export in-memory database to file (WASM engine only)
+    // We always do this for WASM, regardless of auto-commit setting, because WASM is in-memory.
+    const { filename } = this.fileParts;
+    const binaryContent = await this.databaseOperations.serializeDatabase(filename);
+    await vsc.workspace.fs.writeFile(this.uri, binaryContent);
   }
 
   /**
@@ -384,7 +393,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
   get cellEditBehavior(): string {
     const config = vsc.workspace.getConfiguration(ConfigurationSection);
-    return config.get<string>('doubleClickBehavior', 'modal');
+    return config.get<string>('doubleClickBehavior', 'inline');
   }
 
   /**

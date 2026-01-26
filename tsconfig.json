@@ -11,5 +11,5 @@
 		"noEmit": true,
 		"allowImportingTsExtensions": true
 	},
-	"exclude": [],
+	"exclude": ["website", "node_modules"],
 }

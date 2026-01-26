@@ -499,15 +499,25 @@ export async function createNativeDatabaseConnection(
         /**
          * Update a single cell value.
          */
-        updateCell: async (table: string, rowId: RecordId, column: string, value: CellValue) => {
+        updateCell: async (table: string, rowId: RecordId, column: string, value: CellValue, patch?: string) => {
           // Validate rowId is a number
           const rowIdNum = Number(rowId);
           if (!Number.isFinite(rowIdNum)) {
             throw new Error(`Invalid rowid: ${rowId}`);
           }
 
-          const sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
-          await worker.call('run', [sql, [value, rowIdNum]]);
+          let sql: string;
+          let params: CellValue[];
+
+          if (patch) {
+            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(${escapeIdentifier(column)}, ?) WHERE rowid = ?`;
+            params = [patch, rowIdNum];
+          } else {
+            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
+            params = [value, rowIdNum];
+          }
+
+          await worker.call('run', [sql, params]);
         },
 
         /**
@@ -705,6 +715,67 @@ export async function createNativeDatabaseConnection(
         },
 
         /**
+         * Get database PRAGMA settings.
+         */
+        getPragmas: async () => {
+          const pragmasToFetch = [
+            'foreign_keys',
+            'journal_mode',
+            'synchronous',
+            'cache_size',
+            'locking_mode',
+            'temp_store',
+            'encoding',
+            'auto_vacuum'
+          ];
+
+          const result: Record<string, CellValue> = {};
+
+          for (const pragma of pragmasToFetch) {
+            const res = await worker.call<any>('query', [`PRAGMA ${pragma}`]);
+            if (res && res.values && res.values.length > 0) {
+              result[pragma] = res.values[0][0];
+            }
+          }
+
+          return result;
+        },
+
+        /**
+         * Set database PRAGMA value.
+         */
+        setPragma: async (pragma: string, value: CellValue) => {
+          // Validate pragma name
+          const allowedPragmas = [
+            'foreign_keys',
+            'journal_mode',
+            'synchronous',
+            'cache_size',
+            'locking_mode',
+            'temp_store',
+            'auto_vacuum'
+          ];
+
+          if (!allowedPragmas.includes(pragma)) {
+            throw new Error(`Invalid or disallowed PRAGMA: ${pragma}`);
+          }
+
+          // Value sanitization depends on type
+          let sql: string;
+          if (typeof value === 'string') {
+              sql = `PRAGMA ${pragma} = '${value.replace(/'/g, "''")}'`;
+          } else if (typeof value === 'number') {
+              sql = `PRAGMA ${pragma} = ${value}`;
+          } else if (typeof value === 'boolean') {
+              sql = `PRAGMA ${pragma} = ${value ? 'ON' : 'OFF'}`;
+          } else {
+              throw new Error(`Invalid PRAGMA value type: ${typeof value}`);
+          }
+
+          await worker.call('exec', [sql]);
+        },
+
+        /**
          * Test connection.
          */
         ping: async () => {
@@ -725,6 +796,8 @@ export async function createNativeDatabaseConnection(
           // Use transaction
           await worker.call('exec', ['BEGIN TRANSACTION']);
           try {
+            const escapedTable = escapeIdentifier(table);
+
             for (const update of updates) {
               // Validate rowId is a number
               const rowIdNum = Number(update.rowId);
@@ -732,8 +805,21 @@ export async function createNativeDatabaseConnection(
                 throw new Error(`Invalid rowid: ${update.rowId}`);
               }
 
-              const sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(update.column)} = ? WHERE rowid = ?`;
-              await worker.call('run', [sql, [update.value, rowIdNum]]);
+              const escapedColumn = escapeIdentifier(update.column);
+              let sql: string;
+              let params: CellValue[];
+
+              if (update.operation === 'json_patch') {
+                // json_patch(col, patch)
+                sql = `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(${escapedColumn}, ?) WHERE rowid = ?`;
+                params = [update.value, rowIdNum];
+              } else {
+                // Standard set
+                sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+                params = [update.value, rowIdNum];
+              }
+
+              await worker.call('run', [sql, params]);
             }
             await worker.call('exec', ['COMMIT']);
           } catch (err) {

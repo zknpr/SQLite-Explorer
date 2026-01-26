@@ -807,7 +807,13 @@ body {
     color: var(--text-secondary);
 }
 
-.form-field input,
+.form-field input[type="checkbox"] {
+    width: auto;
+    /* Margin handled by flex gap in parent label */
+    margin-right: 0;
+}
+
+.form-field input:not([type="checkbox"]),
 .form-field select {
     width: 100%;
     padding: 6px 10px;
@@ -1073,4 +1079,11 @@ body {
 
 .data-cell.has-overflow:hover {
     background: var(--hover-bg);
+}
+
+/* Drag & Drop */
+.data-cell.drag-over {
+    outline: 2px dashed var(--accent-color);
+    background-color: var(--hover-bg);
+    outline-offset: -2px;
 }

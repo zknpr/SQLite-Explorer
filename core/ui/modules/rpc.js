@@ -2,66 +2,10 @@
  * RPC Communication Layer
  */
 import { state } from './state.js';
-import { loadTableData } from './grid.js'; // We'll create this later
+import { loadTableData } from './grid.js';
+import { handleRpcResponse, sendRpcResult, sendRpcError } from './api.js';
 
-const vscodeApi = typeof acquireVsCodeApi !== 'undefined' ? acquireVsCodeApi() : null;
-
-// Message ID tracking
-let rpcMessageId = 0;
-const pendingRpcCalls = new Map();
-
-/**
- * Send an RPC request to the extension host.
- */
-export function sendRpcRequest(method, args) {
-    return new Promise((resolve, reject) => {
-        const messageId = `rpc_${++rpcMessageId}_${Date.now()}`;
-
-        const timeoutId = setTimeout(() => {
-            if (pendingRpcCalls.has(messageId)) {
-                pendingRpcCalls.delete(messageId);
-                reject(new Error(`RPC timeout: ${method}`));
-            }
-        }, 30000);
-
-        pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
-
-        if (vscodeApi) {
-            vscodeApi.postMessage({
-                channel: 'rpc',
-                content: {
-                    kind: 'invoke',
-                    messageId,
-                    targetMethod: method,
-                    payload: args
-                }
-            });
-        }
-    });
-}
-
-// Backend API proxy
-export const backendApi = {
-    initialize: () => sendRpcRequest('initialize', []),
-    exportDb: (filename) => sendRpcRequest('exportDb', [filename]),
-    refreshFile: () => sendRpcRequest('refreshFile', []),
-    fireEditEvent: (edit) => sendRpcRequest('fireEditEvent', [edit]),
-    exportTable: (dbParams, columns) => sendRpcRequest('exportTable', [dbParams, columns]),
-
-    // New safe methods
-    updateCell: (table, rowId, column, value, originalValue) => sendRpcRequest('updateCell', [table, rowId, column, value, originalValue]),
-    insertRow: (table, data) => sendRpcRequest('insertRow', [table, data]),
-    deleteRows: (table, rowIds) => sendRpcRequest('deleteRows', [table, rowIds]),
-    deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),
-    createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
-    updateCellBatch: (table, updates, label) => sendRpcRequest('updateCellBatch', [table, updates, label]),
-    addColumn: (table, column, type, defaultValue) => sendRpcRequest('addColumn', [table, column, type, defaultValue]),
-    fetchTableData: (table, options) => sendRpcRequest('fetchTableData', [table, options]),
-    fetchTableCount: (table, options) => sendRpcRequest('fetchTableCount', [table, options]),
-    fetchSchema: () => sendRpcRequest('fetchSchema', []),
-    getTableInfo: (table) => sendRpcRequest('getTableInfo', [table]),
-    ping: () => sendRpcRequest('ping', [])
-};
+export { backendApi } from './api.js';
 
 /**
  * Methods called by the extension host.
@@ -84,6 +28,7 @@ const webviewMethods = {
     },
 
     async updateCellEditBehavior(value) {
+        state.cellEditBehavior = value;
         return { success: true };
     },
 
@@ -111,31 +56,13 @@ export function initRpc() {
             if (typeof method === 'function') {
                 Promise.resolve(method.apply(webviewMethods, parameters || []))
                     .then(result => {
-                        if (vscodeApi) {
-                            vscodeApi.postMessage({
-                                kind: 'result',
-                                correlationId,
-                                payload: result
-                            });
-                        }
+                        sendRpcResult(correlationId, result);
                     })
                     .catch(err => {
-                        if (vscodeApi) {
-                            vscodeApi.postMessage({
-                                kind: 'result',
-                                correlationId,
-                                errorText: err instanceof Error ? err.message : String(err)
-                            });
-                        }
+                        sendRpcError(correlationId, err instanceof Error ? err.message : String(err));
                     });
             } else {
-                if (vscodeApi) {
-                    vscodeApi.postMessage({
-                        kind: 'result',
-                        correlationId,
-                        errorText: `Unknown method: ${methodName}`
-                    });
-                }
+                sendRpcError(correlationId, `Unknown method: ${methodName}`);
             }
             return;
         }
@@ -145,17 +72,7 @@ export function initRpc() {
 
         const message = envelope.content;
         if (message && message.kind === 'response') {
-            const pending = pendingRpcCalls.get(message.messageId);
-            if (pending) {
-                clearTimeout(pending.timeoutId);
-                pendingRpcCalls.delete(message.messageId);
-
-                if (message.success) {
-                    pending.resolve(message.data);
-                } else {
-                    pending.reject(new Error(message.errorMessage || 'RPC failed'));
-                }
-            }
+            handleRpcResponse(message);
         }
     });
 }

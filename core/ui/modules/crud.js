@@ -2,7 +2,7 @@
  * CRUD Operations (Create, Delete Rows/Columns/Tables)
  */
 import { state } from './state.js';
-import { backendApi } from './rpc.js';
+import { backendApi } from './api.js';
 import { updateStatus, updateToolbarButtons } from './ui.js';
 import { openModal, closeModal } from './modals.js';
 import { loadTableData, loadTableColumns } from './grid.js';
@@ -162,15 +162,6 @@ async function submitDeleteColumns() {
 }
 
 // ================================================================
-// EXPORT
-// ================================================================
-
-export async function exportCurrentTable() {
-    if (!state.selectedTable) return;
-    await backendApi.exportTable({ table: state.selectedTable }, state.tableColumns.map(c => c.name));
-}
-
-// ================================================================
 // CREATE TABLE
 // ================================================================
 
@@ -198,11 +189,11 @@ export function addColumnDefinition(isFirst = false) {
                 <option value="BLOB">BLOB</option>
                 <option value="NUMERIC">NUMERIC</option>
             </select>
-            <label style="display: flex; align-items: center; gap: 4px;">
-                <input type="checkbox" class="col-pk" ${isFirst ? 'checked' : ''}> PK
+            <label style="display: flex; align-items: center; gap: 4px; cursor: pointer;">
+                <input type="checkbox" class="col-pk" ${isFirst ? 'checked' : ''} style="margin:0;"> PK
             </label>
-            <label style="display: flex; align-items: center; gap: 4px;">
-                <input type="checkbox" class="col-nn"> NN
+            <label style="display: flex; align-items: center; gap: 4px; cursor: pointer;">
+                <input type="checkbox" class="col-nn" style="margin:0;"> NN
             </label>
             <button class="icon-button" onclick="removeColumnDefinition(${colId})" title="Remove" ${isFirst ? 'disabled' : ''}>
                 <span class="codicon codicon-close"></span>

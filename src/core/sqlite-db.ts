@@ -21,6 +21,7 @@ import type {
 } from './types';
 import { escapeIdentifier, cellValueToSql } from './sql-utils';
 import { buildSelectQuery, buildCountQuery } from './query-builder';
+import { applyMergePatch } from './json-utils';
 
 // ============================================================================
 // Internal sql.js Types
@@ -147,15 +148,44 @@ class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Update a single cell value.
    */
-  async updateCell(table: string, rowId: RecordId, column: string, value: CellValue): Promise<void> {
+  async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<void> {
     // Validate rowId is a number
     const rowIdNum = Number(rowId);
     if (!Number.isFinite(rowIdNum)) {
       throw new Error(`Invalid rowid: ${rowId}`);
     }
 
-    const sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
-    await this.executeQuery(sql, [value, rowIdNum]);
+    let sql: string;
+    let params: CellValue[];
+
+    if (patch) {
+        // Fallback to JS implementation of json_patch
+        // Fetch current value
+        const currentResult = await this.executeQuery(`SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} WHERE rowid = ?`, [rowIdNum]);
+        let currentValue = currentResult[0]?.rows[0]?.[0];
+
+        // Parse current JSON
+        let currentObj = {};
+        if (typeof currentValue === 'string') {
+            try { currentObj = JSON.parse(currentValue); } catch {}
+        } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
+             // Already an object? (unlikely from SQLite unless using some extension, usually string)
+             currentObj = currentValue;
+        }
+
+        // Apply patch
+        const patchObj = typeof patch === 'string' ? JSON.parse(patch) : patch;
+        const newValueObj = applyMergePatch(currentObj, patchObj);
+        const newValueStr = JSON.stringify(newValueObj);
+
+        sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
+        params = [newValueStr, rowIdNum];
+    } else {
+        sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
+        params = [value, rowIdNum];
+    }
+
+    await this.executeQuery(sql, params);
   }
 
   /**
@@ -256,8 +286,42 @@ class WasmDatabaseEngine implements DatabaseOperations {
     // Use transaction for performance and atomicity
     await this.executeQuery('BEGIN TRANSACTION');
     try {
+      const escapedTable = escapeIdentifier(table);
+
       for (const update of updates) {
-        await this.updateCell(table, update.rowId, update.column, update.value);
+        // Validate rowId
+        const rowIdNum = Number(update.rowId);
+        if (!Number.isFinite(rowIdNum)) throw new Error(`Invalid rowid: ${update.rowId}`);
+
+        const escapedColumn = escapeIdentifier(update.column);
+        let sql: string;
+
+        if (update.operation === 'json_patch') {
+             // Fallback to JS implementation of json_patch
+             // Fetch current value
+             const currentResult = await this.executeQuery(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`, [rowIdNum]);
+             let currentValue = currentResult[0]?.rows[0]?.[0];
+
+             // Parse current JSON
+             let currentObj = {};
+             if (typeof currentValue === 'string') {
+                 try { currentObj = JSON.parse(currentValue); } catch {}
+             }
+
+             // Apply patch
+             const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
+             const newValueObj = applyMergePatch(currentObj, patchObj);
+             const newValueStr = JSON.stringify(newValueObj);
+
+             sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+             params = [newValueStr, rowIdNum];
+        } else {
+             // Standard set
+             sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+             params = [update.value, rowIdNum];
+        }
+
+        await this.executeQuery(sql, params);
       }
       await this.executeQuery('COMMIT');
     } catch (err) {
@@ -360,6 +424,67 @@ class WasmDatabaseEngine implements DatabaseOperations {
       defaultExpression: row[4],
       primaryKeyPosition: row[5] as number
     }));
+  }
+
+  /**
+   * Get PRAGMA settings.
+   */
+  async getPragmas(): Promise<Record<string, CellValue>> {
+    const pragmasToFetch = [
+      'foreign_keys',
+      'journal_mode',
+      'synchronous',
+      'cache_size',
+      'locking_mode',
+      'temp_store',
+      'encoding',
+      'auto_vacuum'
+    ];
+
+    const result: Record<string, CellValue> = {};
+
+    for (const pragma of pragmasToFetch) {
+      const res = await this.executeQuery(`PRAGMA ${pragma}`);
+      if (res[0]?.rows?.[0]) {
+        result[pragma] = res[0].rows[0][0];
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Set PRAGMA value.
+   */
+  async setPragma(pragma: string, value: CellValue): Promise<void> {
+    // Validate pragma name to prevent SQL injection
+    const allowedPragmas = [
+      'foreign_keys',
+      'journal_mode',
+      'synchronous',
+      'cache_size',
+      'locking_mode',
+      'temp_store',
+      'auto_vacuum'
+    ];
+
+    if (!allowedPragmas.includes(pragma)) {
+      throw new Error(`Invalid or disallowed PRAGMA: ${pragma}`);
+    }
+
+    // Value sanitization depends on type
+    let sql: string;
+    if (typeof value === 'string') {
+        sql = `PRAGMA ${pragma} = '${value.replace(/'/g, "''")}'`;
+    } else if (typeof value === 'number') {
+        sql = `PRAGMA ${pragma} = ${value}`;
+    } else if (typeof value === 'boolean') {
+        sql = `PRAGMA ${pragma} = ${value ? 'ON' : 'OFF'}`;
+    } else {
+        throw new Error(`Invalid PRAGMA value type: ${typeof value}`);
+    }
+
+    await this.executeQuery(sql);
   }
 
   /**
@@ -503,6 +628,10 @@ export function createWorkerEndpoint() {
             activeEngine!.fetchSchema(),
           getTableInfo: (table: string) =>
             activeEngine!.getTableInfo(table),
+          getPragmas: () =>
+            activeEngine!.getPragmas(),
+          setPragma: (pragma: string, value: CellValue) =>
+            activeEngine!.setPragma(pragma, value),
           ping: () =>
             activeEngine!.ping()
         },
@@ -586,6 +715,16 @@ export function createWorkerEndpoint() {
     async getTableInfo(table: string): Promise<ColumnMetadata[]> {
       if (!activeEngine) throw new Error('No database initialized');
       return activeEngine.getTableInfo(table);
+    },
+
+    async getPragmas(): Promise<Record<string, CellValue>> {
+      if (!activeEngine) throw new Error('No database initialized');
+      return activeEngine.getPragmas();
+    },
+
+    async setPragma(pragma: string, value: CellValue): Promise<void> {
+      if (!activeEngine) throw new Error('No database initialized');
+      return activeEngine.setPragma(pragma, value);
     },
 
     async ping(): Promise<boolean> {

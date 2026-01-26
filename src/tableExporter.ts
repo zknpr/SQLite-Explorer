@@ -37,7 +37,7 @@ export async function exportTableCommand(
   columns: string[],
   _dbOptions?: any,
   _tableStore?: any,
-  _exportOptions?: any,
+  _exportOptions?: { format?: string, header?: boolean, includeTableName?: boolean, rowIds?: (string | number)[] },
   _extras?: any
 ) {
   try {
@@ -47,20 +47,25 @@ export async function exportTableCommand(
       return;
     }
 
-    // Ask user for export format
-    const format = await vsc.window.showQuickPick(
-      [
-        { label: 'CSV', description: 'Comma-separated values', value: 'csv' },
-        { label: 'JSON', description: 'JavaScript Object Notation', value: 'json' },
-        { label: 'SQL', description: 'SQL INSERT statements', value: 'sql' }
-      ],
-      {
-        placeHolder: 'Select export format',
-        title: `Export "${tableName}"`
-      }
-    );
+    let formatValue: string | undefined = _exportOptions?.format;
 
-    if (!format) return; // User cancelled
+    // If format not provided in options, ask user
+    if (!formatValue) {
+      const formatPick = await vsc.window.showQuickPick(
+        [
+          { label: 'CSV', description: 'Comma-separated values', value: 'csv' },
+          { label: 'JSON', description: 'JavaScript Object Notation', value: 'json' },
+          { label: 'SQL', description: 'SQL INSERT statements', value: 'sql' },
+          { label: 'Excel', description: 'CSV with encoding for Excel', value: 'excel' }
+        ],
+        {
+          placeHolder: 'Select export format',
+          title: `Export "${tableName}"`
+        }
+      );
+      if (!formatPick) return; // User cancelled
+      formatValue = formatPick.value;
+    }
 
     // Find the active document to get database access
     let document = null;
@@ -89,14 +94,31 @@ export async function exportTableCommand(
       return;
     }
 
-    // Fetch all data from the table
+    // Fetch data from the table
     // Use escapeIdentifier to prevent SQL injection via malicious table names
-    const result = await document.databaseOperations.executeQuery(
-      `SELECT * FROM ${escapeIdentifier(tableName)}`
-    );
+    // Respect selected columns
+    let queryColumns = '*';
+    if (columns && columns.length > 0) {
+      queryColumns = columns.map(escapeIdentifier).join(', ');
+    }
+
+    let sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
+    const params: any[] = [];
+
+    // Filter by row IDs if provided
+    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
+        const rowIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+        if (rowIds.length > 0) {
+            const placeholders = rowIds.map(() => '?').join(', ');
+            sql += ` WHERE rowid IN (${placeholders})`;
+            params.push(...rowIds);
+        }
+    }
+
+    const result = await document.databaseOperations.executeQuery(sql, params);
 
     if (!result || result.length === 0 || !result[0].values) {
-      vsc.window.showInformationMessage(`Table "${tableName}" is empty`);
+      vsc.window.showInformationMessage(`Table "${tableName}" is empty or no rows match selection`);
       return;
     }
 
@@ -106,9 +128,17 @@ export async function exportTableCommand(
     let content: string;
     let defaultExt: string;
 
-    switch (format.value) {
+    const includeHeader = _exportOptions?.header ?? true;
+    const includeTableName = _exportOptions?.includeTableName ?? true;
+
+    switch (formatValue) {
+      case 'excel':
+        // Excel prefers CSV with BOM for UTF-8
+        content = '\uFEFF' + exportToCsv(columnNames, rows, includeHeader);
+        defaultExt = 'csv';
+        break;
       case 'csv':
-        content = exportToCsv(columnNames, rows);
+        content = exportToCsv(columnNames, rows, includeHeader);
         defaultExt = 'csv';
         break;
       case 'json':
@@ -116,10 +146,11 @@ export async function exportTableCommand(
         defaultExt = 'json';
         break;
       case 'sql':
-        content = exportToSql(tableName, columnNames, rows);
+        content = exportToSql(tableName, columnNames, rows, includeTableName);
         defaultExt = 'sql';
         break;
       default:
+        vsc.window.showErrorMessage(`Unsupported export format: ${formatValue}`);
         return;
     }
 
@@ -129,10 +160,10 @@ export async function exportTableCommand(
     const uri = await vsc.window.showSaveDialog({
       defaultUri: vsc.Uri.joinPath(document.uri, '..', `${tableName}.${defaultExt}`),
       filters: {
-        [format.label]: [defaultExt],
+        [formatValue.toUpperCase()]: [defaultExt],
         'All Files': ['*']
       },
-      title: `Export "${tableName}" as ${format.label}`
+      title: `Export "${tableName}" as ${formatValue.toUpperCase()}`
     });
 
     if (!uri) return; // User cancelled
@@ -155,7 +186,7 @@ export async function exportTableCommand(
  * Convert data to CSV format.
  * Handles proper escaping of values containing commas, quotes, or newlines.
  */
-function exportToCsv(columns: string[], rows: CellValue[][]): string {
+function exportToCsv(columns: string[], rows: CellValue[][], includeHeader: boolean = true): string {
   const escapeCsvValue = (value: CellValue): string => {
     if (value === null || value === undefined) return '';
     if (value instanceof Uint8Array) return '[BLOB]';
@@ -167,12 +198,16 @@ function exportToCsv(columns: string[], rows: CellValue[][]): string {
     return str;
   };
 
-  const headerLine = columns.map(escapeCsvValue).join(',');
-  const dataLines = rows.map(row =>
-    row.map(escapeCsvValue).join(',')
-  );
+  const lines = [];
+  if (includeHeader) {
+    lines.push(columns.map(escapeCsvValue).join(','));
+  }
 
-  return [headerLine, ...dataLines].join('\n');
+  rows.forEach(row => {
+    lines.push(row.map(escapeCsvValue).join(','));
+  });
+
+  return lines.join('\n');
 }
 
 /**
@@ -201,14 +236,15 @@ function exportToJson(columns: string[], rows: CellValue[][]): string {
  * Convert data to SQL INSERT statements.
  * Generates INSERT statements that can be used to recreate the data.
  */
-function exportToSql(tableName: string, columns: string[], rows: CellValue[][]): string {
+function exportToSql(tableName: string, columns: string[], rows: CellValue[][], includeTableName: boolean = true): string {
   // Use escapeIdentifier to prevent SQL injection via malicious column names
   const columnList = columns.map(c => escapeIdentifier(c)).join(', ');
+  const targetTable = includeTableName ? escapeIdentifier(tableName) : 'table_name';
 
   const statements = rows.map(row => {
     const values = row.map(cellValueToSql).join(', ');
     // Use escapeIdentifier for table name as well
-    return `INSERT INTO ${escapeIdentifier(tableName)} (${columnList}) VALUES (${values});`;
+    return `INSERT INTO ${targetTable} (${columnList}) VALUES (${values});`;
   });
 
   return statements.join('\n');

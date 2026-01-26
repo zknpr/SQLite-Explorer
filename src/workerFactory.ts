@@ -92,6 +92,8 @@ interface WorkerMethods {
   fetchTableCount(table: string, options: any): Promise<number>;
   fetchSchema(): Promise<any>;
   getTableInfo(table: string): Promise<any>;
+  getPragmas(): Promise<Record<string, CellValue>>;
+  setPragma(pragma: string, value: CellValue): Promise<void>;
   ping(): Promise<boolean>;
 }
 
@@ -197,7 +199,7 @@ async function createWasmDatabaseConnection(
         }
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'ping']
+    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping']
   );
 
   // Termination handler
@@ -279,6 +281,10 @@ async function createWasmDatabaseConnection(
           workerProxy.fetchSchema(),
         getTableInfo: (table: string) =>
           workerProxy.getTableInfo(table),
+        getPragmas: () =>
+          workerProxy.getPragmas(),
+        setPragma: (pragma: string, value: CellValue) =>
+          workerProxy.setPragma(pragma, value),
         ping: () =>
           workerProxy.ping()
       };

@@ -2,9 +2,10 @@ import "./shims"
 import * as vsc from 'vscode';
 import { TelemetryReporter } from '@vscode/extension-telemetry';
 import { exportTableCommand } from './commandHandlers';
-import { ExtensionId, FullExtensionId, FileNestingPatternsAdded, FistInstallMs, NestingPattern, SyncedKeys, TelemetryConnectionString, Title } from './config';
+import { ExtensionId, FullExtensionId, FileNestingPatternsAdded, FistInstallMs, NestingPattern, SyncedKeys, TelemetryConnectionString, Title, UriScheme } from './config';
 import { disposeAll } from './lifecycle';
 import { registerEditorProvider } from './editorController';
+import { SQLiteFileSystemProvider } from './virtualFileSystem';
 
 export type DbParams = {
   filename: string,
@@ -80,6 +81,9 @@ export async function activateProviders(context: vsc.ExtensionContext, reporter?
   // Create output channel for SQL logging
   const channel = GlobalOutputChannel = vsc.window.createOutputChannel(Title, 'sql');
   subs.push(channel);
+
+  // Register file system provider
+  subs.push(vsc.workspace.registerFileSystemProvider(UriScheme, new SQLiteFileSystemProvider(), { isCaseSensitive: true }));
 
   // Register the main editor provider (default for .sqlite, .db, etc.)
   subs.push(registerEditorProvider(`${ExtensionId}.view`, context, reporter, channel, { verified: true }));

@@ -54,5 +54,9 @@ export const state = {
     scrollPosition: { top: 0, left: 0 },
 
     // Schema cache
-    schemaCache: { tables: [], views: [], indexes: [] }
+    schemaCache: { tables: [], views: [], indexes: [] },
+
+    // Settings
+    dateFormat: 'raw', // 'raw', 'local', 'iso', 'relative'
+    cellEditBehavior: 'inline' // 'inline', 'modal', 'vscode'
 };

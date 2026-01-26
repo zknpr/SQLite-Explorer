@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.1.1
+
+### New Features
+
+- **Virtual File System Integration**: Edit cell contents in a full VS Code editor tab. Perfect for large JSON blobs, SQL queries, or extensive text data. Saving the file automatically updates the database.
+- **Batch Updates**: New sidebar panel allows updating specific columns for multiple selected rows simultaneously.
+- **Database Settings Editor**: A new UI to inspect and configure SQLite pragmas (Journal Mode, Foreign Keys, Synchronous, Cache Size, etc.) and extension preferences.
+- **Drag & Drop Binary Upload**: Drag files from your OS or VS Code Explorer directly onto a cell to upload them as BLOB data.
+- **Smart JSON Patching**: Edits to JSON cells now use **RFC 7396 Merge Patching**, sending only the specific changes to the database rather than rewriting the entire string.
+- **SQL Query Logging**: View all executed SQL queries (Reads and Writes) in the VS Code Output panel for debugging and auditing.
+
+### Improvements
+
+- **Export Options**: Added granular controls to export dialogs (Include/Exclude headers for CSV/Excel, Toggle Table Name for SQL).
+- **Export Selection**: Added ability to export only the currently selected rows.
+- **Auto-Open JSON**: The editor now detects JSON content and offers to open it in a specialized preview or VS Code editor.
+
+### Security
+
+- **Dependency Updates**: Updated various dependencies to patch known security vulnerabilities and improve stability, including `brace-expansion`, `semver`, `lodash`, `qs`, and `minimist`.
+
+
 ## 1.1.0
 
 - **Security**: Moved SQL generation for write operations (UPDATE, INSERT, DELETE) from the frontend to the backend to prevent SQL injection risks.

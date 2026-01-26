@@ -205,7 +205,7 @@ export interface DatabaseOperations {
   discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
 
   /** Update a single cell value */
-  updateCell(table: string, rowId: RecordId, column: string, value: CellValue): Promise<void>;
+  updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<void>;
 
   /** Insert a new row */
   insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined>;
@@ -237,6 +237,12 @@ export interface DatabaseOperations {
   /** Get table metadata (columns) */
   getTableInfo(table: string): Promise<ColumnMetadata[]>;
 
+  /** Get PRAGMA settings */
+  getPragmas(): Promise<Record<string, CellValue>>;
+
+  /** Set PRAGMA value */
+  setPragma(pragma: string, value: CellValue): Promise<void>;
+
   /** Test database connection */
   ping(): Promise<boolean>;
 }
@@ -249,6 +255,7 @@ export interface CellUpdate {
   column: string;
   value: CellValue;
   originalValue?: CellValue;
+  operation?: 'set' | 'json_patch';
 }
 
 // ============================================================================

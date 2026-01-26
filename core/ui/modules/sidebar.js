@@ -2,10 +2,11 @@
  * Sidebar and Schema Logic
  */
 import { state } from './state.js';
-import { backendApi } from './rpc.js';
+import { backendApi } from './api.js';
 import { escapeHtml } from './utils.js';
 import { updateStatus } from './ui.js';
-import { loadTableData, loadTableColumns } from './grid.js'; // Will define later
+import { loadTableData, loadTableColumns } from './grid.js';
+import { getRowDataOffset, getRowId } from './data-utils.js';
 
 export async function refreshSchema() {
     if (!state.isDbConnected) return;
@@ -80,6 +81,234 @@ export function renderSidebar() {
                     </div>
                 </li>
             `).join('');
+        }
+    }
+}
+
+export function updateBatchSidebar() {
+    const title = document.getElementById('batchUpdateSectionTitle');
+    const list = document.getElementById('batchUpdateList');
+    const countBadge = document.getElementById('batchUpdateCount');
+    const fieldsContainer = document.getElementById('batchUpdateFields');
+
+    if (!title || !list || !countBadge || !fieldsContainer) return;
+
+    const cellCount = state.selectedCells.length;
+
+    if (cellCount === 0) {
+        title.classList.add('hidden');
+        list.classList.add('hidden');
+        return;
+    }
+
+    title.classList.remove('hidden');
+    list.classList.remove('hidden');
+    title.classList.remove('collapsed');
+
+    countBadge.textContent = cellCount;
+
+    // Analyze selected cells - Group by column
+    const columns = new Map();
+
+    for (const cell of state.selectedCells) {
+        if (!columns.has(cell.colIdx)) {
+            const colDef = state.tableColumns[cell.colIdx];
+            columns.set(cell.colIdx, {
+                name: colDef.name,
+                type: colDef.type,
+                values: new Set()
+            });
+        }
+        columns.get(cell.colIdx).values.add(cell.value);
+    }
+
+    let html = '';
+
+    for (const [colIdx, colInfo] of columns) {
+        const uniqueValues = Array.from(colInfo.values);
+        const isMixed = uniqueValues.length > 1;
+
+        let valueDisplay = '';
+        if (isMixed) {
+            valueDisplay = '(mixed values)';
+        } else {
+            const val = uniqueValues[0];
+            if (val === null) valueDisplay = 'NULL';
+            else if (val instanceof Uint8Array) valueDisplay = '[BLOB]';
+            else valueDisplay = String(val);
+        }
+
+        html += `
+            <div class="form-field batch-field" data-colidx="${colIdx}" style="margin-bottom:8px">
+                <label style="font-size:11px; color:var(--text-secondary)">${escapeHtml(colInfo.name)} <span style="opacity:0.7">${colInfo.type || ''}</span></label>
+                <div style="display:flex; gap:4px">
+                    <input type="text" class="batch-input" placeholder="${escapeHtml(valueDisplay)}" data-colidx="${colIdx}" style="flex:1; min-width:0">
+                    <button class="btn-secondary" style="padding:2px 6px;" title="Set to NULL" onclick="setBatchNull(${colIdx})">NULL</button>
+                    <button class="btn-secondary" style="padding:2px 6px;" title="JSON Patch" onclick="toggleBatchPatch(${colIdx}, this)">{}</button>
+                </div>
+            </div>
+        `;
+    }
+
+    fieldsContainer.innerHTML = html;
+}
+
+export async function applyBatchUpdate() {
+    if (state.selectedCells.length === 0) return;
+
+    const inputs = document.querySelectorAll('.batch-input');
+    const updates = [];
+
+    for (const input of inputs) {
+        const isNull = input.dataset.isnull === 'true';
+        const isPatch = input.dataset.ispatch === 'true';
+        const value = input.value;
+
+        // Skip if empty and not explicitly set to NULL (and not patch with content)
+        if (value === "" && !isNull) continue;
+
+        const colIdx = parseInt(input.dataset.colidx, 10);
+        const colDef = state.tableColumns[colIdx];
+
+        // Prepare value
+        let finalValue = value;
+        let operation = 'set';
+
+        if (isNull) {
+            finalValue = null;
+        } else if (isPatch) {
+            operation = 'json_patch';
+            // Validate JSON
+            try {
+                JSON.parse(value);
+            } catch (e) {
+                updateStatus(`Invalid JSON for patch in ${colDef.name}`);
+                return;
+            }
+        } else {
+             // Basic type coercion
+             if (colDef.type === 'INTEGER' || colDef.type === 'REAL' || colDef.type === 'NUMERIC') {
+                 if (!isNaN(Number(value)) && value.trim() !== '') {
+                     finalValue = Number(value);
+                 }
+             }
+        }
+
+        // Apply to all selected cells in this column
+        for (const cell of state.selectedCells) {
+            if (cell.colIdx === colIdx) {
+                updates.push({
+                    rowId: cell.rowId,
+                    column: colDef.name,
+                    value: finalValue,
+                    originalValue: cell.value,
+                    operation,
+                    rowIdx: cell.rowIdx, // Local metadata
+                    colIdx: cell.colIdx  // Local metadata
+                });
+            }
+        }
+    }
+
+    if (updates.length === 0) {
+        updateStatus('No values entered for batch update');
+        return;
+    }
+
+    try {
+        updateStatus(`Updating ${updates.length} cells...`);
+        const label = `Batch update ${updates.length} cells`;
+
+        // Strip extra metadata for backend
+        const backendUpdates = updates.map(u => ({
+            rowId: u.rowId,
+            column: u.column,
+            value: u.value,
+            originalValue: u.originalValue,
+            operation: u.operation
+        }));
+
+        await backendApi.updateCellBatch(state.selectedTable, backendUpdates, label);
+
+        // Update local grid data
+        // For JSON patch, we don't know the new value without re-querying or implementing patch logic locally.
+        // Easiest is to reload.
+        const hasPatch = updates.some(u => u.operation === 'json_patch');
+
+        if (!hasPatch) {
+            for (const u of updates) {
+                state.gridData[u.rowIdx][u.colIdx + getRowDataOffset()] = u.value;
+            }
+        }
+
+        // Refresh grid and sidebar
+        await loadTableData(false);
+
+        // If we kept selection, update values in selectedCells
+        // This is tricky if we don't have the new values from backend (for patches).
+        // Since we reloaded table data, `state.gridData` is fresh.
+        // We can re-populate `state.selectedCells` from `state.gridData` based on indices/rowIds?
+        // `loadTableData` preserves scroll but not selection logic?
+        // `grid.js` `loadTableData`:
+        // `renderDataGrid` uses `state.selectedCells`.
+        // But `state.selectedCells` has stale values.
+
+        // We should refresh `state.selectedCells` values from fresh `state.gridData`.
+        const freshSelectedCells = [];
+        for (const oldCell of state.selectedCells) {
+            // Find corresponding row in new gridData
+            // If pagination/sort changed, indices might be wrong, but we didn't change those.
+            // However, we re-fetched, so rows might have moved if we sorted by the column we updated?
+            // Assuming stable order for now.
+            const newValue = state.gridData[oldCell.rowIdx][oldCell.colIdx + getRowDataOffset()];
+            freshSelectedCells.push({ ...oldCell, value: newValue });
+        }
+        state.selectedCells = freshSelectedCells;
+
+        updateBatchSidebar();
+
+        updateStatus('Batch update completed');
+
+    } catch (err) {
+        console.error('Batch update failed:', err);
+        updateStatus(`Batch update failed: ${err.message}`);
+    }
+}
+
+export function setBatchNull(colIdx) {
+    const input = document.querySelector(`.batch-input[data-colidx="${colIdx}"]`);
+    const btn = document.querySelector(`.batch-field[data-colidx="${colIdx}"] button[title="JSON Patch"]`);
+
+    if (input) {
+        input.value = '';
+        input.placeholder = 'SET TO NULL';
+        input.dataset.isnull = 'true';
+        input.dataset.ispatch = 'false';
+        input.style.fontStyle = 'italic';
+        if (btn) {
+            btn.style.background = '';
+            btn.style.color = '';
+        }
+    }
+}
+
+export function toggleBatchPatch(colIdx, btn) {
+    const input = document.querySelector(`.batch-input[data-colidx="${colIdx}"]`);
+    if (input) {
+        const isPatch = input.dataset.ispatch === 'true';
+
+        if (!isPatch) {
+            input.dataset.ispatch = 'true';
+            input.dataset.isnull = 'false';
+            input.placeholder = 'JSON Patch (e.g. {"a": 1})';
+            input.style.fontStyle = 'normal';
+            btn.style.background = 'var(--accent-color)';
+            btn.style.color = 'white';
+        } else {
+            input.dataset.ispatch = 'false';
+            input.placeholder = '(mixed values)';
+            btn.style.background = '';
+            btn.style.color = '';
         }
     }
 }

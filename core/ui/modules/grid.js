@@ -2,10 +2,12 @@
  * Data Grid Rendering and Logic
  */
 import { state } from './state.js';
-import { backendApi } from './rpc.js';
+import { backendApi } from './api.js';
 import { escapeHtml, escapeIdentifier, formatCellValue } from './utils.js';
 import { updateStatus, showLoading, showErrorState, updateToolbarButtons } from './ui.js';
-import { openCellPreview, startCellEdit } from './edit.js';
+import { openCellPreview, startCellEdit, openCellInVsCode } from './edit.js';
+import { updateBatchSidebar } from './sidebar.js';
+import { getRowId, getRowDataOffset, getCellValue } from './data-utils.js';
 
 // Optimization: Track selected element IDs to avoid expensive querySelectorAll
 let lastSelectedCellIds = new Set();
@@ -398,7 +400,7 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
             const col = orderedColumns[displayColIdx];
             const originalColIdx = columnIndexMap.get(col.name);
             const value = getCellValue(row, originalColIdx);
-            const displayValue = formatCellValue(value);
+            const displayValue = formatCellValue(value, col.type, state.dateFormat, col.name);
             const isNull = value === null || value === undefined;
             const isCellSelected = selectedCellKeys.has(`${rowIdx},${originalColIdx}`);
             const isColPinned = state.pinnedColumns.has(col.name);
@@ -518,20 +520,7 @@ export function updateSelectionStates() {
     }
 }
 
-export function getRowDataOffset() {
-    return state.selectedTableType === 'table' ? 1 : 0;
-}
-
-export function getRowId(row, rowIdx) {
-    if (state.selectedTableType === 'table') {
-        return row[0]; // SQLite rowid
-    }
-    return state.currentPageIndex * state.rowsPerPage + rowIdx;
-}
-
-export function getCellValue(row, colIdx) {
-    return row[colIdx + getRowDataOffset()];
-}
+export { getRowId, getRowDataOffset, getCellValue } from './data-utils.js';
 
 export function updatePagination() {
     document.getElementById('pageIndicator').textContent = `${state.currentPageIndex + 1} / ${state.totalPageCount}`;
@@ -558,6 +547,14 @@ export function onPageSizeChange() {
     state.rowsPerPage = parseInt(document.getElementById('pageSizeSelect').value, 10);
     state.currentPageIndex = 0;
     loadTableData();
+}
+
+export function onDateFormatChange() {
+    const select = document.getElementById('dateFormatSelect');
+    if (select) {
+        state.dateFormat = select.value;
+        renderDataGrid();
+    }
 }
 
 export function goToPage(pageIndex) {
@@ -651,6 +648,7 @@ export function onColumnHeaderClick(event, columnName) {
     state.lastSelectedCell = null;
     updateSelectionStates();
     updateToolbarButtons();
+    updateBatchSidebar();
 }
 
 // Column Pinning
@@ -778,6 +776,7 @@ export function onRowNumberClick(event, rowId) {
 
     updateSelectionStates();
     updateToolbarButtons();
+    updateBatchSidebar();
 }
 
 export function onSelectAllClick(event) {
@@ -811,6 +810,7 @@ export function onSelectAllClick(event) {
 
     updateSelectionStates();
     updateToolbarButtons();
+    updateBatchSidebar();
 }
 
 // Cell Click (Selection)
@@ -887,9 +887,39 @@ export function onCellClick(event, rowIdx, colIdx, rowId) {
 
     updateSelectionStates();
     updateToolbarButtons();
+    updateBatchSidebar();
 }
 
 // Cell Double Click (Edit)
 export function onCellDoubleClick(event, rowIdx, colIdx, rowId) {
-    startCellEdit(rowIdx, colIdx, rowId);
+    if (state.cellEditBehavior === 'vscode') {
+        // Need to simulate opening preview first to set state.cellPreviewInfo if openCellInVsCode depends on it?
+        // openCellInVsCode uses state.cellPreviewInfo.
+        // We should refactor openCellInVsCode or set the info directly.
+
+        // Actually openCellInVsCode requires state.cellPreviewInfo to be set.
+        // And openCellPreview sets it.
+        // Let's manually set it or refactor.
+        // Refactoring openCellInVsCode to take params is better, but for now let's set state.
+
+        const column = state.tableColumns[colIdx];
+        if (!column) return;
+        const row = state.gridData[rowIdx];
+        if (!row) return;
+        const value = getCellValue(row, colIdx);
+
+        state.cellPreviewInfo = {
+            rowIdx,
+            colIdx,
+            rowId,
+            columnName: column.name,
+            originalValue: value
+        };
+        openCellInVsCode();
+
+    } else if (state.cellEditBehavior === 'modal') {
+        openCellPreview(rowIdx, colIdx, rowId);
+    } else {
+        startCellEdit(rowIdx, colIdx, rowId);
+    }
 }

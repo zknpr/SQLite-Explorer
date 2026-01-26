@@ -3,7 +3,7 @@
   "name": "sqlite-explorer",
   "displayName": "SQLite Explorer",
   "description": "A powerful SQLite database viewer and editor for VS Code",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "publisher": "zknpr",
   "license": "MIT",
   "repository": {
@@ -102,6 +102,26 @@
           "maximum": 10000000,
           "default": 0,
           "markdownDescription": "Maximum number of rows to load from a table. Set to 0 for unlimited."
+        },
+        "sqliteExplorer.instantCommit": {
+          "type": "string",
+          "enum": [
+            "always",
+            "never",
+            "remote-only"
+          ],
+          "default": "never",
+          "markdownDescription": "Controls when changes are saved to disk.\n- `always`: Changes are saved immediately.\n- `never`: Changes are kept in memory until manually saved.\n- `remote-only`: Auto-save only in remote workspaces."
+        },
+        "sqliteExplorer.doubleClickBehavior": {
+          "type": "string",
+          "enum": [
+            "inline",
+            "modal",
+            "vscode"
+          ],
+          "default": "inline",
+          "markdownDescription": "Controls the action when double-clicking a cell.\n- `inline`: Start inline editing (default).\n- `modal`: Open detail preview modal.\n- `vscode`: Open in VS Code editor tab."
         }
       }
     },

@@ -2,13 +2,24 @@
  * SQLite Explorer - Main Entry Point
  */
 import { state } from './modules/state.js';
-import { initRpc, backendApi } from './modules/rpc.js';
+import { initRpc } from './modules/rpc.js';
+import { backendApi } from './modules/api.js';
 import {
     reloadFromDisk,
     toggleSection,
     selectTableItem,
-    refreshSchema
+    refreshSchema,
+    updateBatchSidebar,
+    applyBatchUpdate,
+    setBatchNull,
+    toggleBatchPatch
 } from './modules/sidebar.js';
+import {
+    openExportModal,
+    submitExport,
+    onExportFormatChange
+} from './modules/export.js';
+
 import {
     openCreateTableModal,
     openAddRowModal,
@@ -19,8 +30,7 @@ import {
     submitCreateTable,
     addColumnDefinition,
     removeColumnDefinition,
-    submitAddColumn,
-    exportCurrentTable
+    submitAddColumn
 } from './modules/crud.js';
 import {
     updateStatus,
@@ -37,6 +47,7 @@ import {
     loadTableData,
     onFilterChange,
     onPageSizeChange,
+    onDateFormatChange,
     goToPage,
     onColumnSort,
     onColumnHeaderClick,
@@ -56,13 +67,22 @@ import {
     saveCellPreview,
     formatCellPreviewJson,
     compactCellPreviewJson,
-    toggleCellPreviewWrap
+    toggleCellPreviewWrap,
+    openCellInVsCode
 } from './modules/edit.js';
 import {
     copyCellsToClipboard,
     copySelectedRowsToClipboard,
     clearSelectedCellValues
 } from './modules/clipboard.js';
+import {
+    openSettingsModal,
+    updateExtensionSetting,
+    updatePragma
+} from './modules/settings.js';
+import {
+    initDragAndDrop
+} from './modules/dnd.js';
 
 // Initialize RPC system
 initRpc();
@@ -82,9 +102,12 @@ Object.assign(window, {
     addColumnDefinition,
     removeColumnDefinition,
     submitAddColumn,
-    exportCurrentTable,
+    openExportModal,
+    submitExport,
+    onExportFormatChange,
     onFilterChange,
     onPageSizeChange,
+    onDateFormatChange,
     goToPage,
     onColumnSort,
     onColumnHeaderClick,
@@ -104,12 +127,27 @@ Object.assign(window, {
     formatCellPreviewJson,
     compactCellPreviewJson,
     toggleCellPreviewWrap,
+    openCellInVsCode,
+    openSettingsModal,
+    updateExtensionSetting,
+    updatePragma,
+    applyBatchUpdate,
+    setBatchNull,
+    toggleBatchPatch,
     closeModal
 });
 
 // Main initialization
 async function initializeApp() {
     try {
+        // Read configuration from environment
+        const vscodeEnv = document.getElementById('vscode-env');
+        if (vscodeEnv) {
+             if (vscodeEnv.dataset.cellEditBehavior) {
+                 state.cellEditBehavior = vscodeEnv.dataset.cellEditBehavior;
+             }
+        }
+
         updateStatus('Connecting to database...');
 
         const result = await backendApi.initialize();
@@ -132,6 +170,7 @@ async function initializeApp() {
         // Initialize UI components
         initSidebarResize();
         initGridInteraction();
+        initDragAndDrop();
 
         // Global shortcuts
         document.addEventListener('keydown', async (event) => {

@@ -49,6 +49,25 @@
             </div>
             <ul class="item-list hidden" id="indexesList"></ul>
 
+            <!-- Batch Update Section -->
+            <div class="section-title hidden" id="batchUpdateSectionTitle" data-section="batchUpdate" onclick="toggleSection('batchUpdate')">
+                <span class="arrow">▼</span>
+                <span>Batch Update</span>
+                <span class="badge" id="batchUpdateCount">0</span>
+            </div>
+            <div class="item-list hidden" id="batchUpdateList">
+                <div style="padding: 12px;">
+                    <button class="btn-primary" onclick="applyBatchUpdate()" style="width:100%; margin-bottom:12px">Apply Changes</button>
+                    <div id="batchUpdateFields"></div>
+                </div>
+            </div>
+
+            <!-- Configuration Section -->
+            <div class="section-title" onclick="openSettingsModal()" style="margin-top: auto; border-top: 1px solid var(--border-color);">
+                <span class="codicon codicon-settings" style="margin-right: 6px;"></span>
+                <span>Configuration</span>
+            </div>
+
             <div class="resize-handle" id="resizeHandle"></div>
         </div>
 
@@ -72,7 +91,7 @@
                     <button class="toolbar-button" id="btnDeleteRows" onclick="openDeleteModal()" disabled>
                         <span class="codicon codicon-trash"></span> Delete
                     </button>
-                    <button class="toolbar-button" id="btnExport" onclick="exportCurrentTable()" disabled>
+                    <button class="toolbar-button" id="btnExport" onclick="openExportModal()" disabled>
                         <span class="codicon codicon-export"></span> Export
                     </button>
                     <input type="text" class="filter-input" id="filterInput" placeholder="Filter..." onkeyup="onFilterChange()">
@@ -100,6 +119,15 @@
                             <option value="250">250</option>
                             <option value="500" selected>500</option>
                             <option value="1000">1000</option>
+                        </select>
+                    </div>
+                    <div class="page-selector">
+                        <span>Date Format:</span>
+                        <select id="dateFormatSelect" onchange="onDateFormatChange()">
+                            <option value="raw">Raw</option>
+                            <option value="local">Local</option>
+                            <option value="iso">ISO</option>
+                            <option value="relative">Relative</option>
                         </select>
                     </div>
                     <div class="pagination-controls">
@@ -205,6 +233,59 @@
         </div>
     </div>
 
+    <!-- Export Modal -->
+    <div class="modal-overlay hidden" id="exportModal">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <span class="modal-title">Export Table</span>
+                <button class="modal-close" onclick="closeModal('exportModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-field">
+                    <label>Format</label>
+                    <select id="exportFormat" onchange="onExportFormatChange()">
+                        <option value="csv">CSV</option>
+                        <option value="json">JSON</option>
+                        <option value="sql">SQL INSERT</option>
+                        <option value="excel">Excel</option>
+                    </select>
+                </div>
+                <div class="form-field">
+                    <label>Columns</label>
+                    <div id="exportColumns" style="max-height: 150px; overflow-y: auto; border: 1px solid var(--border-color); padding: 8px; border-radius: 3px; background: var(--bg-primary);">
+                        <!-- Columns populated by JS -->
+                    </div>
+                </div>
+                <div class="form-field">
+                    <label>Options</label>
+                    <div id="exportOptions">
+                        <!-- Options populated by JS based on format -->
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="closeModal('exportModal')">Cancel</button>
+                <button class="btn-primary" onclick="submitExport()">Export</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div class="modal-overlay hidden" id="settingsModal">
+        <div class="modal-dialog" style="width: 600px;">
+            <div class="modal-header">
+                <span class="modal-title">Configuration</span>
+                <button class="modal-close" onclick="closeModal('settingsModal')">&times;</button>
+            </div>
+            <div class="modal-body" id="pragmaSettingsContainer">
+                <!-- Populated by JS -->
+            </div>
+            <div class="modal-footer">
+                <button class="btn-primary" onclick="closeModal('settingsModal')">Close</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Cell Preview/Edit Modal - Floating window for viewing and editing large cell values -->
     <div class="cell-preview-modal hidden" id="cellPreviewModal">
         <div class="cell-preview-dialog">
@@ -225,6 +306,10 @@
                 </button>
                 <button class="cell-preview-toolbar-btn" id="wrapTextBtn" onclick="toggleCellPreviewWrap()" title="Toggle word wrap">
                     <span class="codicon codicon-word-wrap"></span> Wrap
+                </button>
+                <div style="flex: 1"></div>
+                <button class="cell-preview-toolbar-btn" id="openInVsCodeBtn" onclick="openCellInVsCode()" title="Edit in VS Code editor">
+                    <span class="codicon codicon-code"></span> Edit in VS Code
                 </button>
             </div>
             <div class="cell-preview-body">

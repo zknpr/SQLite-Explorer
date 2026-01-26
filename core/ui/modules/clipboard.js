@@ -2,9 +2,10 @@
  * Clipboard Operations
  */
 import { state } from './state.js';
-import { backendApi } from './rpc.js';
+import { backendApi } from './api.js';
 import { updateStatus, updateToolbarButtons } from './ui.js';
-import { loadTableData, getRowDataOffset } from './grid.js';
+import { loadTableData } from './grid.js';
+import { getRowDataOffset } from './data-utils.js';
 import { validateRowId, escapeIdentifier } from './utils.js';
 
 export async function copyCellsToClipboard() {

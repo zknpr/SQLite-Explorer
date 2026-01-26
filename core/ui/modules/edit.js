@@ -2,10 +2,11 @@
  * Cell Editing and Preview Logic
  */
 import { state } from './state.js';
-import { backendApi } from './rpc.js';
+import { backendApi } from './api.js';
 import { escapeHtml, validateRowId, escapeIdentifier, formatCellValue } from './utils.js';
 import { updateStatus } from './ui.js';
-import { renderDataGrid, loadTableData, getRowDataOffset, getCellValue, updateSelectionStates } from './grid.js';
+import { renderDataGrid, loadTableData, updateSelectionStates } from './grid.js';
+import { getRowDataOffset, getCellValue } from './data-utils.js';
 
 // ================================================================
 // INLINE EDITING
@@ -39,6 +40,21 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
     if (value instanceof Uint8Array) {
         openCellPreview(rowIdx, colIdx, rowId);
         return;
+    }
+
+    // Auto-open JSON in modal
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if ((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+            (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+            try {
+                JSON.parse(trimmed);
+                openCellPreview(rowIdx, colIdx, rowId);
+                return;
+            } catch (e) {
+                // Not valid JSON, continue to inline edit
+            }
+        }
     }
 
     state.editingCellInfo = {
@@ -177,6 +193,44 @@ function cleanupCellEdit() {
 // ================================================================
 // CELL PREVIEW MODAL
 // ================================================================
+
+
+export async function openCellInVsCode() {
+    if (!state.cellPreviewInfo) return;
+
+    const { rowIdx, colIdx, rowId, columnName, originalValue } = state.cellPreviewInfo;
+    const column = state.tableColumns[colIdx];
+
+    // We need to determine if it's text, json, blob, etc.
+    // For now passing value as is.
+    // We pass metadata to help extension determine extension/language.
+
+    // We get the webview id from dataset if available or assume 'default'
+    const webviewId = document.getElementById('vscode-env')?.dataset.webviewId || 'default';
+
+    try {
+        updateStatus('Opening in VS Code...');
+        // Close the preview modal as we are moving to VS Code editor
+        closeCellPreview();
+
+        await backendApi.openCellEditor(
+            { table: state.selectedTable, name: '' }, // dbParams
+            validateRowId(rowId),
+            columnName,
+            {}, // colTypes
+            {
+                value: originalValue,
+                type: { type: column.type }, // Pass column type
+                webviewId,
+                rowCount: state.gridData.length
+            }
+        );
+        updateStatus('Opened in VS Code');
+    } catch (err) {
+        console.error('Failed to open in VS Code:', err);
+        updateStatus(`Error: ${err.message}`);
+    }
+}
 
 export function openCellPreview(rowIdx, colIdx, rowId) {
     if (state.editingCellInfo) {
@@ -368,7 +422,8 @@ function updateCellDom(rowIdx, colIdx, value) {
         cellEl.classList.remove('null-value');
     }
 
-    const displayValue = formatCellValue(value);
+    const col = state.tableColumns[colIdx];
+    const displayValue = formatCellValue(value, col?.type, state.dateFormat, col?.name);
     const hasContent = value !== null && value !== undefined && !(value instanceof Uint8Array);
 
     let html = `<span class="cell-text">${displayValue}</span>`;

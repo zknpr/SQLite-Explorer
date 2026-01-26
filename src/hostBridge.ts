@@ -10,11 +10,12 @@ import * as vsc from 'vscode';
 import * as path from 'path';
 
 import { DatabaseEditorProvider, DatabaseViewerProvider } from './editorController';
-import { ExtensionId, FullExtensionId, SidebarLeft, SidebarRight, UriScheme } from './config';
+import { ConfigurationSection, ExtensionId, FullExtensionId, SidebarLeft, SidebarRight, UriScheme } from './config';
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
 import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata } from './core/types';
+import { generateMergePatch } from './core/json-utils';
 
 // Legacy DbParams type for backward compatibility with webview
 interface DbParams {
@@ -137,12 +138,39 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
+    let patch: string | undefined;
+
+    // Try to generate a JSON patch if applicable
+    if (
+      typeof value === 'string' &&
+      typeof originalValue === 'string' &&
+      (value.startsWith('{') || value.startsWith('[')) &&
+      (originalValue.startsWith('{') || originalValue.startsWith('['))
+    ) {
+      try {
+        const originalObj = JSON.parse(originalValue);
+        const newObj = JSON.parse(value);
+
+        // Only patch if valid JSON objects (not arrays, primitives, null)
+        // SQLite json_patch merge behavior is specific to objects.
+        // RFC 7396 defines how arrays are replaced entirely.
+        if (originalObj && typeof originalObj === 'object' && !Array.isArray(originalObj) &&
+            newObj && typeof newObj === 'object' && !Array.isArray(newObj)) {
+
+            const patchObj = generateMergePatch(originalObj, newObj);
+            if (patchObj !== undefined) {
+                patch = JSON.stringify(patchObj);
+            }
+        }
+      } catch {
+        // Not valid JSON or parse error, ignore and do full update
+      }
+    }
+
     // Use specific method instead of generic exec
     // This allows the backend to handle safe SQL construction
-    // However, DatabaseOperations is an interface, so we need to cast or ensure methods exist
-    // We recently added these methods to DatabaseOperations interface
     if ('updateCell' in document.databaseOperations) {
-      await (document.databaseOperations as any).updateCell(table, rowId, column, value);
+      await document.databaseOperations.updateCell(table, rowId, column, value, patch);
     } else {
       // Fallback for older backend versions (shouldn't happen if built correctly)
       throw new Error("Backend does not support updateCell");
@@ -411,6 +439,43 @@ export class HostBridge implements ToastService {
     }
   }
 
+  /**
+   * Get database PRAGMA settings.
+   */
+  async getPragmas(): Promise<Record<string, CellValue>> {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    if ('getPragmas' in document.databaseOperations) {
+      return await (document.databaseOperations as any).getPragmas();
+    } else {
+      throw new Error("Backend does not support getPragmas");
+    }
+  }
+
+  /**
+   * Set database PRAGMA value.
+   */
+  async setPragma(pragma: string, value: CellValue): Promise<void> {
+    const { document } = this;
+    if (!document.databaseOperations) {
+      throw new Error("Database not initialized");
+    }
+
+    if (this.isReadOnly) {
+      throw new Error("Document is read-only");
+    }
+
+    if ('setPragma' in document.databaseOperations) {
+      await (document.databaseOperations as any).setPragma(pragma, value);
+    } else {
+      throw new Error("Backend does not support setPragma");
+    }
+  }
+
+
 
   /**
    * Apply edits to the database.
@@ -610,18 +675,35 @@ export class HostBridge implements ToastService {
       let cellParts: string[];
 
       if (rowId === '__create__.sql') {
-        cellParts = [params.table, params.name || '', '__create__.sql'];
+        cellParts = [params.table, params.name || '-', '__create__.sql'];
       } else {
         // Determine file extension based on content type
         const extname = await determineCellExtension(colTypes, value, type);
         const cellFilename = (colName || 'cell') + extname;
 
         // Use simple path structure
-        cellParts = [params.table, params.name || '', String(rowId), cellFilename];
+        cellParts = [params.table, params.name || '-', String(rowId), cellFilename];
       }
 
-      const encodedParts = cellParts.map(x => x.replaceAll(path.sep, encodeURIComponent(path.sep)));
-      const cellUri = vsc.Uri.joinPath(vsc.Uri.parse(await document.documentKey), ...encodedParts).with({ scheme: UriScheme, query: `webview-id=${webviewId}` });
+      // Ensure documentKey is safe for URI path
+      const docKey = await document.documentKey;
+
+      // Construct URI path explicitly: /docKey/table/schema/rowId/filename
+      // We map empty strings to empty strings, join will produce // for empty schema
+      // But we filter empty segments in FS provider, so we should arguably NOT produce empty segments here if we want to match length 4 logic?
+      // Or we produce empty segment and FS provider sees 5 parts with one empty?
+      // filter(p => p.length > 0) removes empty segments!
+      // So if schema is empty, [docKey, table, '', rowId, filename] -> join('/') -> docKey/table//rowId/filename
+      // split('/').filter(...) -> [docKey, table, rowId, filename] (4 parts)
+      // This matches the 4-part logic in virtualFileSystem.ts!
+
+      const uriPath = [docKey, ...cellParts].map(p => encodeURIComponent(p)).join('/');
+
+      const cellUri = vsc.Uri.from({
+          scheme: UriScheme,
+          path: '/' + uriPath,
+          query: `webview-id=${webviewId}`
+      });
 
       await vsc.commands.executeCommand('vscode.open', cellUri, vsc.ViewColumn.Two);
     }
@@ -669,6 +751,30 @@ export class HostBridge implements ToastService {
       openExportDialog();
     }
     return answer?.value === 'continue';
+  }
+
+  /**
+   * Get extension settings.
+   */
+  async getExtensionSettings() {
+    return {
+      autoCommit: this.document.autoCommitEnabled,
+      cellEditBehavior: this.document.cellEditBehavior
+    };
+  }
+
+  /**
+   * Update extension setting.
+   */
+  async updateExtensionSetting(key: string, value: any) {
+    if (key === 'autoCommit') {
+      this.document.autoCommitEnabled = !!value;
+      // Update persistent configuration
+      await vsc.workspace.getConfiguration(ConfigurationSection).update('instantCommit', value ? 'always' : 'never', vsc.ConfigurationTarget.Global);
+    } else if (key === 'doubleClickBehavior') {
+        // Update persistent configuration
+        await vsc.workspace.getConfiguration(ConfigurationSection).update('doubleClickBehavior', value, vsc.ConfigurationTarget.Global);
+    }
   }
 
   /**
