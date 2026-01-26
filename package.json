@@ -10,6 +10,10 @@
     "type": "git",
     "url": "https://github.com/zknpr/sqlite-explorer"
   },
+  "funding": {
+    "type": "individual",
+    "url": "https://buymeacoffee.com/zknpr"
+  },
   "engines": {
     "vscode": "^1.83.1"
   },

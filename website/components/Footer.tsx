@@ -27,6 +27,10 @@ const links = [
     label: 'MIT License',
     href: 'https://github.com/zknpr/sqlite-explorer/blob/main/LICENSE.md',
   },
+  {
+    label: 'Buy Me a Coffee',
+    href: 'https://buymeacoffee.com/zknpr',
+  },
 ];
 
 /**
