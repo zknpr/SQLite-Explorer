@@ -124,8 +124,10 @@ export async function exportTableCommand(
     }
 
     // Show save dialog
+    // Set default directory to the database file's directory using joinPath
+    // This prevents the dialog from defaulting to the root directory '/'
     const uri = await vsc.window.showSaveDialog({
-      defaultUri: vsc.Uri.file(`${tableName}.${defaultExt}`),
+      defaultUri: vsc.Uri.joinPath(document.uri, '..', `${tableName}.${defaultExt}`),
       filters: {
         [format.label]: [defaultExt],
         'All Files': ['*']
