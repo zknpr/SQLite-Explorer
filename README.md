@@ -101,6 +101,8 @@ code --install-extension zknpr.sqlite-explorer
 | `sqliteExplorer.maxFileSize` | `200` | Maximum file size in MB (0 = unlimited) |
 | `sqliteExplorer.defaultPageSize` | `1000` | Rows per page |
 | `sqliteExplorer.maxRows` | `0` | Maximum rows to load (0 = unlimited) |
+| `sqliteExplorer.instantCommit` | `never` | Auto-save strategy (`always`, `never`, `remote-only`) |
+| `sqliteExplorer.doubleClickBehavior` | `inline` | Double-click action (`inline`, `modal`, `vscode`) |
 
 ## Supported File Types
 

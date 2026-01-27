@@ -12,7 +12,7 @@ else
     VERSION=$(node -p "require('./package.json').version")
 fi
 
-VSIX_FILE="sqlite-explorer-${VERSION}.vsix"
+VSIX_FILE="release/sqlite-explorer-${VERSION}.vsix"
 
 # Verify .vsix file exists
 if [ ! -f "$VSIX_FILE" ]; then
