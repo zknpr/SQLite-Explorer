@@ -1,7 +1,7 @@
 import "./shims"
 import * as vsc from 'vscode';
 import { TelemetryReporter } from '@vscode/extension-telemetry';
-import { exportTableCommand } from './commandHandlers';
+import { exportTableCommand } from './tableExporter';
 import { ExtensionId, FullExtensionId, FileNestingPatternsAdded, FistInstallMs, NestingPattern, SyncedKeys, TelemetryConnectionString, Title, UriScheme } from './config';
 import { disposeAll } from './lifecycle';
 import { registerEditorProvider } from './editorController';

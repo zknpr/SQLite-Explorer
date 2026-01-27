@@ -41,7 +41,11 @@ export async function copyCellsToClipboard() {
                     let val = cellMap.has(key) ? cellMap.get(key) : '';
                     if (val === null || val === undefined) val = '';
                     else if (val instanceof Uint8Array) val = '[BLOB]';
-                    else val = String(val); // TODO: Escape tabs/newlines?
+                    else {
+                        val = String(val);
+                        // Escape tabs and newlines to preserve grid structure in clipboard
+                        val = val.replace(/\t/g, ' ').replace(/\n/g, ' ');
+                    }
                     rowValues.push(val);
                 }
                 lines.push(rowValues.join('\t'));

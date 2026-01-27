@@ -7,8 +7,6 @@
 import * as vsc from 'vscode';
 import type { TelemetryReporter } from '@vscode/extension-telemetry';
 
-export { exportTableCommand } from './tableExporter';
-
 /**
  * Placeholder for license key command.
  * This extension is open source and does not require a license.

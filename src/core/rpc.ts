@@ -169,7 +169,7 @@ type MethodImplementations = Record<string, (...args: any[]) => unknown>;
 /**
  * Response dispatcher type.
  */
-type ResponseDispatcher = (response: ResponseEnvelope) => void;
+type ResponseDispatcher = (response: ResponseEnvelope, transfer?: any[]) => void;
 
 /**
  * Process an incoming protocol message.
@@ -224,11 +224,20 @@ export function processProtocolMessage(
     Promise.resolve()
       .then(() => implementation.apply(localMethods, parameters))
       .then(result => {
+        // Handle zero-copy Transfer wrapper in return value
+        let payload = result;
+        let transferables: any[] | undefined;
+
+        if (result instanceof Transfer) {
+          payload = result.value;
+          transferables = result.transferables;
+        }
+
         sendResponse({
           kind: 'result',
           correlationId,
-          payload: result
-        });
+          payload
+        }, transferables);
       })
       .catch(err => {
         sendResponse({

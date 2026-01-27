@@ -39,8 +39,8 @@ if (parentPort) {
     const wasHandled = processProtocolMessage(
       envelope,
       databaseEndpoint as Record<string, (...args: unknown[]) => unknown>,
-      (response) => {
-        parentPort!.postMessage(response);
+      (response, transfer) => {
+        parentPort!.postMessage(response, transfer);
       }
     );
 
