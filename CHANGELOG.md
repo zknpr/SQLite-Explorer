@@ -2,6 +2,10 @@
 
 ## 1.1.4
 
+### Bug Fixes
+
+- **Fixed Sticky Column Headers Transparency**: Resolved a visual bug where sticky column headers would become transparent when hovered or selected, causing the data scrolling underneath to show through. The headers now maintain their opacity while correctly displaying hover and selection states.
+
 ## 1.1.3
 
 ### Security

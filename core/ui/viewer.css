@@ -347,7 +347,8 @@ body {
 }
 
 .header-cell:hover {
-    background: var(--hover-bg);
+    /* Layer hover background over secondary background to ensure opacity for sticky header */
+    background: linear-gradient(var(--hover-bg), var(--hover-bg)), var(--bg-secondary);
 }
 
 /* Column resize handle - extends slightly beyond cell border for easier grabbing */
@@ -602,7 +603,8 @@ body {
 
 /* Header cell styling when entire column is selected */
 .header-cell.column-selected {
-    background: var(--active-bg) !important;
+    /* Layer active background over secondary background to ensure opacity for sticky header */
+    background: linear-gradient(var(--active-bg), var(--active-bg)), var(--bg-secondary) !important;
 }
 .header-cell.column-selected .header-text {
     color: var(--active-text);
