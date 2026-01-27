@@ -265,7 +265,7 @@ export class HostBridge implements ToastService {
   /**
    * Create a new table.
    */
-  async createTable(table: string, columns: string[]) {
+  async createTable(table: string, columns: any[]) {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
@@ -796,6 +796,13 @@ export class HostBridge implements ToastService {
    */
   async readWorkspaceFileUri(uriString: string): Promise<Uint8Array> {
     const uri = vsc.Uri.parse(uriString);
+
+    // SECURITY: Ensure the file is within the current workspace to prevent arbitrary file reads.
+    const workspaceFolder = vsc.workspace.getWorkspaceFolder(uri);
+    if (!workspaceFolder) {
+      throw new Error(`Access denied: File is not in the current workspace.`);
+    }
+
     return await vsc.workspace.fs.readFile(uri);
   }
 }

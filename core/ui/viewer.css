@@ -284,15 +284,14 @@ body {
 }
 
 .data-grid {
-    border-collapse: collapse;
+    border-collapse: separate;
+    border-spacing: 0;
     table-layout: fixed;
     /* Use auto width to allow table to expand beyond container */
     /* This enables horizontal scrolling in .grid-container */
 }
 
 .grid-header {
-    position: sticky;
-    top: 0;
     z-index: 10;
     background: var(--bg-secondary);
 }
@@ -313,7 +312,10 @@ body {
     user-select: none;
     white-space: nowrap;
     overflow: visible; /* Allow filter to show */
-    position: relative;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--bg-secondary);
     /* No min-width here - inline styles control width for full customization */
     box-sizing: border-box;
     height: var(--header-height);
@@ -396,6 +398,7 @@ body {
 .header-cell.row-number-header {
     text-align: center;
     cursor: pointer;
+    box-shadow: 1px 0 0 0 var(--border-color); /* Simulate border */
 }
 
 .header-cell.row-number-header:hover {
@@ -456,6 +459,9 @@ body {
 .data-cell.pinned {
     z-index: 5;
     background-color: var(--bg-secondary) !important;
+    border-right: 1px solid var(--border-color);
+    border-left: 1px solid var(--border-color); /* Separator from previous column (row #) */
+    box-shadow: none;
 }
 
 .header-cell.pinned {
@@ -480,6 +486,8 @@ body {
 
 .data-row.pinned td {
     background-color: var(--bg-secondary) !important;
+    /* For pinned rows, we want a bottom border/shadow */
+    box-shadow: 0 1px 0 0 var(--border-color);
 }
 
 /* Pinned row cells should NOT become transparent on hover/selection */
@@ -492,6 +500,9 @@ body {
 /* Cell that is both in pinned row AND pinned column */
 .data-row.pinned td.pinned {
     background-color: var(--bg-secondary) !important;
+    /* Both right and bottom shadows */
+    box-shadow: 1px 0 0 0 var(--border-color), 0 1px 0 0 var(--border-color);
+    z-index: 15 !important; /* Highest priority */
 }
 
 /* Cells in pinned row AND pinned column keep solid background on hover/selection */
@@ -577,6 +588,7 @@ body {
     text-align: center;
     font-size: 0.85em;
     user-select: none;
+    box-shadow: 1px 0 0 0 var(--border-color);
 }
 
 .data-cell.null-value {

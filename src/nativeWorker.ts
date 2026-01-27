@@ -583,9 +583,25 @@ export async function createNativeDatabaseConnection(
         /**
          * Create a new table.
          */
-        createTable: async (table: string, columns: string[]) => {
-          // columns are expected to be valid column definition strings
-          const sql = `CREATE TABLE ${escapeIdentifier(table)} (${columns.join(', ')})`;
+        createTable: async (table: string, columns: any[]) => {
+          // Construct SQL from structured column definitions
+          // columns is now ColumnDefinition[]
+          const colDefs = columns.map(col => {
+            // If it's a string, it's legacy/unsafe mode - SHOULD NOT HAPPEN with new frontend
+            // But we can support it if we must, or throw.
+            if (typeof col === 'string') {
+               // Fallback or Error? Let's Error to be strict about SQLi.
+               throw new Error('Legacy string column definitions not supported for security');
+            }
+
+            let def = `${escapeIdentifier(col.name)} ${col.type}`;
+            if (col.primaryKey) def += ' PRIMARY KEY';
+            if (col.notNull && !col.primaryKey) def += ' NOT NULL';
+            // Default value handling?
+            return def;
+          });
+
+          const sql = `CREATE TABLE ${escapeIdentifier(table)} (${colDefs.join(', ')})`;
           await worker.call('run', [sql]);
         },
 

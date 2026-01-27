@@ -52,6 +52,10 @@ The extension uses a three-layer communication architecture:
 | `src/core/query-builder.ts` | Safe SQL query construction |
 | `src/core/sql-utils.ts` | SQL utilities and escaping |
 | `src/core/undo-history.ts` | ModificationTracker for undo/redo |
+| `src/virtualFileSystem.ts` | Virtual FS provider for editing cells in tabs |
+| `src/loggingDatabaseOperations.ts` | Decorator for logging SQL queries |
+| `core/ui/modules/settings.js` | UI logic for database settings/pragma editor |
+| `core/ui/modules/batch.js` | UI logic for batch row updates |
 | `core/ui/viewer.html` | Standalone webview UI |
 | `assets/sqlite3.wasm` | SQLite WebAssembly binary |
 
@@ -155,6 +159,21 @@ The webview handles inline editing:
 2. Enter key → `saveCellEdit()` sends UPDATE via `backendApi.exec()`
 3. Escape key → `cancelCellEdit()` discards changes
 
+### Virtual File System
+
+The extension registers a `FileSystemProvider` to allow editing cell contents in full VS Code editors:
+1. `hostBridge.openCellEditor()` opens a custom URI.
+2. `SQLiteFileSystemProvider.readFile()` queries the cell data.
+3. `SQLiteFileSystemProvider.writeFile()` triggers `document.databaseOperations.updateCell()`.
+
+### SQL Logging
+
+Database operations are wrapped in `LoggingDatabaseOperations` which writes all executed SQL (both read and write) to the "SQLite Explorer" output channel for debugging.
+
+### Settings & Pragmas
+
+The webview provides a UI to configure SQLite PRAGMAs (e.g., WAL mode, Foreign Keys) directly via `hostBridge.setPragma()`.
+
 ## Configuration
 
 Settings in `package.json` → `contributes.configuration`:
@@ -164,6 +183,8 @@ Settings in `package.json` → `contributes.configuration`:
 | `sqliteExplorer.maxFileSize` | 200 | Max file size in MB (0 = unlimited) |
 | `sqliteExplorer.maxRows` | 0 | Max rows to display (0 = unlimited) |
 | `sqliteExplorer.defaultPageSize` | 1000 | Default page size for pagination |
+| `sqliteExplorer.instantCommit` | "never" | Auto-save strategy (always/never/remote-only) |
+| `sqliteExplorer.doubleClickBehavior` | "inline" | Double-click action (inline/modal/vscode) |
 
 ## Extension Identifiers
 
@@ -204,6 +225,7 @@ ConfigurationSection = 'sqliteExplorer'
 - [ ] Auto-select first table on load
 - [ ] Click table rows to select
 - [ ] Double-click cells to edit
+- [ ] Verify pinned columns stay attached during horizontal scroll
 - [ ] Add new rows
 - [ ] Delete selected rows
 - [ ] Undo/redo operations

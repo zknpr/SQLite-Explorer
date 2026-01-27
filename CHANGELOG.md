@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.3
+
+### Security
+
+- **Strict Table Creation**: `createTable` now requires structured column definitions instead of raw strings. This prevents potential SQL injection vulnerabilities where malicious column definitions could be passed to the table creation query.
+- **Workspace Isolation**: `readWorkspaceFileUri` now validates that the requested file is located within the current workspace folder, preventing unauthorized access to files outside the project scope.
+
+### Bug Fixes
+
+- **Fixed Pinned Column Layout**: Resolved an issue where pinned columns would detach from the left border when horizontal scrolling was active. Fixed sticky positioning logic in the data grid to ensure headers and rows stay correctly aligned.
+
 ## 1.1.2
 
 ### Performance

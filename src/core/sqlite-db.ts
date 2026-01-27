@@ -250,30 +250,20 @@ class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Create a new table.
    */
-  async createTable(table: string, columns: string[]): Promise<void> {
+  async createTable(table: string, columns: any[]): Promise<void> {
     if (columns.length === 0) throw new Error('At least one column is required');
 
-    // columns array is expected to contain full column definitions (e.g. "id INTEGER PRIMARY KEY")
-    // We assume the caller (backend/frontend) passes pre-validated/escaped definitions or we blindly trust them?
-    // The previous frontend code constructed "escapeIdentifier(name) type constraints".
-    // We should probably accept structured column definitions to be safe, but for now matching existing logic.
-    // Ideally, we should pass { name, type, constraints } objects.
-    // However, to keep changes minimal and safer than raw SQL, we will accept the definitions string but verify it doesn't contain dangerous characters if possible,
-    // OR we change the signature to accept structured data.
+    const colDefs = columns.map(col => {
+      if (typeof col === 'string') {
+         throw new Error('Legacy string column definitions not supported for security');
+      }
+      let def = `${escapeIdentifier(col.name)} ${col.type}`;
+      if (col.primaryKey) def += ' PRIMARY KEY';
+      if (col.notNull && !col.primaryKey) def += ' NOT NULL';
+      return def;
+    });
 
-    // Let's change the signature in types.ts later if needed, but for now let's stick to the plan of moving SQL generation.
-    // If we pass raw column definitions string, we are still vulnerable if the definition string is constructed poorly.
-    // The frontend code: let def = `${escapeIdentifier(name)} ${type}`; ... colDefs.push(def);
-    // So the frontend IS escaping the identifier. The type is from a select box (safe).
-    // So passing the array of definitions strings is relatively safe assuming the frontend uses escapeIdentifier.
-    // But to be safer, let's just accept the raw SQL for the column list since it's `CREATE TABLE tbl ( ... )`.
-
-    // Actually, looking at `submitCreateTable` in `viewer.js`:
-    // It constructs: `CREATE TABLE ${escapeIdentifier(tableName)} (${colDefs.join(', ')})`
-    // colDefs are constructed using escapeIdentifier.
-
-    // Implementing `createTable(table, columnDefs)`:
-    const sql = `CREATE TABLE ${escapeIdentifier(table)} (${columns.join(', ')})`;
+    const sql = `CREATE TABLE ${escapeIdentifier(table)} (${colDefs.join(', ')})`;
     await this.executeQuery(sql);
   }
 

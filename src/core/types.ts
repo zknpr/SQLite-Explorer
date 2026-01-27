@@ -205,7 +205,7 @@ export interface DatabaseOperations {
   deleteColumns(table: string, columns: string[]): Promise<void>;
 
   /** Create a new table */
-  createTable(table: string, columns: string[]): Promise<void>;
+  createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
 
   /** Update multiple cells in a batch */
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
@@ -247,6 +247,17 @@ export interface CellUpdate {
   value: CellValue;
   originalValue?: CellValue;
   operation?: 'set' | 'json_patch';
+}
+
+/**
+ * Definition for a new column when creating a table.
+ */
+export interface ColumnDefinition {
+  name: string;
+  type: string;
+  primaryKey: boolean;
+  notNull: boolean;
+  defaultValue?: string;
 }
 
 // ============================================================================

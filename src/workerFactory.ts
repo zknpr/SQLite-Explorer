@@ -82,7 +82,7 @@ interface WorkerMethods {
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   deleteRows(table: string, rowIds: (string | number)[]): Promise<void>;
   deleteColumns(table: string, columns: string[]): Promise<void>;
-  createTable(table: string, columns: string[]): Promise<void>;
+  createTable(table: string, columns: any[]): Promise<void>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
   fetchTableData(table: string, options: any): Promise<any>;

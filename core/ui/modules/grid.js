@@ -21,19 +21,93 @@ export function initGridInteraction() {
     const container = document.getElementById('gridContainer');
     if (!container) return;
 
-    // Single Click Handler
+    // --- Mousedown Delegation (Resize) ---
+    container.addEventListener('mousedown', (event) => {
+        if (event.target.classList.contains('resize-handle')) {
+            event.stopPropagation();
+            const headerCell = event.target.closest('.header-cell');
+            if (headerCell && headerCell.dataset.column) {
+                startColumnResize(event, headerCell.dataset.column);
+            }
+        }
+    });
+
+    // --- Keydown Delegation (Filters) ---
+    container.addEventListener('keydown', (event) => {
+        if (event.target.classList.contains('column-filter')) {
+            const colName = event.target.dataset.column;
+            if (colName) onColumnFilterKeydown(event, colName);
+        }
+    });
+
+    // --- Click Delegation ---
     container.addEventListener('click', (event) => {
         const target = event.target;
+
+        // --- Header Interactions ---
+        if (target.closest('.grid-header')) {
+            // 1. Filter Apply Button
+            if (target.closest('.filter-apply-btn')) {
+                event.stopPropagation();
+                const headerCell = target.closest('.header-cell');
+                if (headerCell && headerCell.dataset.column) {
+                    applyColumnFilter(headerCell.dataset.column);
+                }
+                return;
+            }
+
+            // 2. Prevent sort when clicking inputs/bottom area
+            if (target.closest('.header-bottom') || target.closest('.column-filter')) {
+                event.stopPropagation();
+                return;
+            }
+
+            // 3. Column Selection Icon
+            if (target.closest('.select-column-icon')) {
+                event.stopPropagation();
+                const headerCell = target.closest('.header-cell');
+                if (headerCell && headerCell.dataset.column) {
+                    onColumnHeaderClick(event, headerCell.dataset.column);
+                }
+                return;
+            }
+
+            // 4. Header Pin Icon
+            if (target.closest('.pin-icon')) {
+                event.stopPropagation();
+                const headerCell = target.closest('.header-cell');
+                if (headerCell && headerCell.dataset.column) {
+                    toggleColumnPin(event, headerCell.dataset.column);
+                }
+                return;
+            }
+
+            // 5. Select All (Row Number Header)
+            if (target.closest('.row-number-header')) {
+                onSelectAllClick(event);
+                return;
+            }
+
+            // 6. Sort (Header Top)
+            const headerTop = target.closest('.header-top');
+            if (headerTop) {
+                const headerCell = headerTop.closest('.header-cell');
+                if (headerCell && headerCell.dataset.column) {
+                    onColumnSort(headerCell.dataset.column);
+                }
+                return;
+            }
+            return;
+        }
+
+        // --- Body Interactions ---
 
         // 1. Row Pin Icon
         if (target.closest('.pin-icon')) {
             const rowEl = target.closest('.data-row');
             if (rowEl) {
                 const rowId = rowEl.dataset.rowid;
-                // Handle type conversion if needed, but toggleRowPin handles string/number mix via Set checks usually?
-                // Actually toggleRowPin expects rowId. state.pinnedRowIds uses strictly what is passed.
-                // In inline, it passed ${rowId} which was number.
-                // Here dataset.rowid is string. We should convert if it looks like a number.
+                // Handle type conversion
                 const safeRowId = resolveRowIdType(rowId);
                 toggleRowPin(event, safeRowId);
             }
@@ -263,6 +337,10 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 // ================================================================
 
 export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
+    const headerHeight = 52;
+    const rowHeight = 26;
+    const rowNumWidth = 50;
+
     const container = document.getElementById('gridContainer');
     // If explicit scroll positions not provided, capture current
     const currentScrollLeft = container ? container.scrollLeft : 0;
@@ -312,7 +390,9 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
 
     // Pinned column offsets
     const pinnedColumnOffsets = new Map();
-    let cumulativeLeft = 50;
+    // Start 1px to the left to create a slight overlap (49px instead of 50px).
+    // This physically covers any sub-pixel gap between the row number column and the first pinned column.
+    let cumulativeLeft = rowNumWidth - 1;
     for (const col of orderedColumns) {
         if (state.pinnedColumns.has(col.name)) {
             pinnedColumnOffsets.set(col.name, cumulativeLeft);
@@ -325,7 +405,7 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     state.tableColumns.forEach((col, idx) => columnIndexMap.set(col.name, idx));
 
     // Header cells
-    html += '<th class="header-cell row-number-header" style="width:50px;position:sticky;left:0;z-index:11;background:var(--bg-secondary)" onclick="onSelectAllClick(event)" title="Click to select all rows"><div class="header-content"><div class="header-top" style="height:100%;justify-content:center">#</div></div></th>';
+    html += `<th class="header-cell row-number-header" style="width:${rowNumWidth}px;min-width:${rowNumWidth}px;max-width:${rowNumWidth}px;position:sticky;left:0;top:0;z-index:11;background:var(--bg-secondary)" onclick="onSelectAllClick(event)" title="Click to select all rows"><div class="header-content"><div class="header-top" style="height:100%;justify-content:center">#</div></div></th>`;
 
     for (const col of orderedColumns) {
         const isSorted = state.sortedColumn === col.name;
@@ -358,8 +438,6 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     html += '</tr></thead><tbody>';
 
     // Rows
-    const headerHeight = 51;
-    const rowHeight = 25;
 
     // Pinned rows logic
     const pinnedRowsList = [];
@@ -391,7 +469,7 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
 
         let rowHtml = `<tr id="row-${rowIdx}" class="data-row ${isSelected ? 'selected' : ''} ${isRowPinned ? 'pinned' : ''}" style="${pinnedRowStyle}" data-rowid="${rowId}" data-rowidx="${rowIdx}">`;
 
-        rowHtml += `<td class="data-cell row-number" style="width:50px;position:sticky;left:0;z-index:${rowNumZIndex};">`;
+        rowHtml += `<td class="data-cell row-number" style="width:${rowNumWidth}px;min-width:${rowNumWidth}px;max-width:${rowNumWidth}px;position:sticky;left:0;z-index:${rowNumZIndex};">`;
         rowHtml += `${state.currentPageIndex * state.rowsPerPage + rowIdx + 1}`;
         rowHtml += `<span class="pin-icon codicon codicon-pin ${isRowPinned ? 'pinned' : ''}" title="${isRowPinned ? 'Unpin row' : 'Pin row'}"></span>`;
         rowHtml += `</td>`;

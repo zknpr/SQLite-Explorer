@@ -31,7 +31,8 @@ cd "$SCRIPT_DIR"
 # Extension info
 EXT_NAME="sqlite-explorer"
 EXT_VERSION=$(node -p "require('./package.json').version")
-VSIX_FILE="${EXT_NAME}-${EXT_VERSION}.vsix"
+RELEASE_DIR="release"
+VSIX_FILE="${RELEASE_DIR}/${EXT_NAME}-${EXT_VERSION}.vsix"
 
 echo -e "${BLUE}=================================${NC}"
 echo -e "${BLUE}  SQLite Explorer Installer${NC}"
@@ -95,8 +96,12 @@ if [ "$CLEAN" = true ]; then
     rm -rf out
     rm -rf assets
     rm -f *.vsix
+    rm -rf "$RELEASE_DIR"
     echo -e "${GREEN}✓ Clean complete${NC}"
 fi
+
+# Ensure release directory exists
+mkdir -p "$RELEASE_DIR"
 
 # Build unless skipped
 if [ "$SKIP_BUILD" = false ]; then

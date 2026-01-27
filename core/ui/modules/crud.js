@@ -232,10 +232,12 @@ export async function submitCreateTable() {
 
         if (!name) continue;
 
-        let def = `${escapeIdentifier(name)} ${type}`;
-        if (isPK) def += ' PRIMARY KEY';
-        if (isNN && !isPK) def += ' NOT NULL';
-        colDefs.push(def);
+        colDefs.push({
+            name: name,
+            type: type,
+            primaryKey: isPK,
+            notNull: isNN
+        });
     }
 
     if (colDefs.length === 0) {
