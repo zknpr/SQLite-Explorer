@@ -2,6 +2,21 @@
 
 ## 1.1.5
 
+### Performance
+
+- **Zero-Copy Data Transfer**: Implemented `Transfer` wrapper for RPC to enable zero-copy transfer of ArrayBuffers between extension host and worker. This significantly reduces memory usage and startup time when opening large databases.
+- **Optimized Batch Updates**: Rewrote the batch update logic in the sidebar to use O(N) lookup instead of O(N*M), dramatically improving performance when updating many rows simultaneously.
+- **Efficient Query Execution**: Refactored `fetchTableData` and JSON patch operations to reuse prepared statements and avoid unnecessary intermediate object allocation.
+
+### Improvements
+
+- **Drag & Drop**: Relaxed security restrictions on `readWorkspaceFileUri` to allow dropping files from VS Code's "Open Editors" view or when running in Single File mode.
+
+### Maintenance
+
+- **Refactoring**: Extracted `DocumentRegistry` to a separate file to resolve circular dependencies and improve code organization.
+- **Cleanup**: Removed unused core modules.
+
 ## 1.1.4
 
 ### Bug Fixes

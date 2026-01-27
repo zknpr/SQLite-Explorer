@@ -89,6 +89,14 @@ The extension uses a custom RPC protocol for cross-boundary communication:
 }
 ```
 
+**Zero-Copy Transfer:**
+To transfer large binary data (ArrayBuffers) without copying, use the `Transfer` wrapper in the RPC layer.
+```typescript
+// workerFactory.ts
+const data = new Uint8Array(...);
+workerProxy.method(new Transfer(data, [data.buffer]));
+```
+
 ## Build System
 
 ### Build Commands
