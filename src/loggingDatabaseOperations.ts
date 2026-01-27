@@ -16,7 +16,8 @@ import type {
     TableQueryOptions,
     TableCountOptions,
     SchemaSnapshot,
-    ColumnMetadata
+    ColumnMetadata,
+    ColumnDefinition
 } from './core/types';
 import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -114,8 +115,9 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.deleteColumns(table, columns);
     }
 
-    async createTable(table: string, columns: string[]): Promise<void> {
-        const sql = `CREATE TABLE ${escapeIdentifier(table)} (${columns.join(', ')})`;
+    async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {
+        const columnDefs = columns.map(c => `${c.name} ${c.type}`).join(', ');
+        const sql = `CREATE TABLE ${escapeIdentifier(table)} (${columnDefs})`;
         this.log(sql, true);
         return this.wrapped.createTable(table, columns);
     }

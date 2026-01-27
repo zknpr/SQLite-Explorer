@@ -133,39 +133,6 @@ export async function exportTableCommand(
       queryColumns = columns.map(escapeIdentifier).join(', ');
     }
 
-    // Determine total count for progress reporting (optional, skipping for now to keep it simple/fast)
-    // But we need to know if we should use rowid-based paging or offset-based.
-    // Rowid is best but not all tables have it (e.g. WITHOUT ROWID tables).
-    // For simplicity and safety across all table types, we'll try to use rowid if available,
-    // otherwise fallback to OFFSET (slower but works).
-
-    // Actually, nearly all SQLite tables have rowid unless explicitly WITHOUT ROWID.
-    // We can check if rowid exists or just try.
-    // Let's use a standard OFFSET/LIMIT approach for now as it's universally compatible,
-    // though slower for deep pages. For export, we are reading sequentially, so it's O(N^2) in worst case.
-    // BUT, since we are exporting, we can assume we want *all* data.
-    // Better optimization: Use `rowid` keyset pagination if possible.
-
-    const BATCH_SIZE = 5000;
-    let offset = 0;
-    let hasMore = true;
-    let fileHandle: vsc.FileSystem | null = null; // We can't stream to file easily with VS Code API?
-    // VS Code fs.writeFile writes full content.
-    // We cannot append to file easily with vscode.workspace.fs.
-    // Node.js fs is not available in browser/remote.
-    // But this runs in Extension Host.
-
-    // If we build the whole content string in memory, we still OOM.
-    // We need to write in chunks.
-    // VS Code API doesn't support appending files efficiently until recently?
-    // Actually, we can't do true streaming with `vscode.workspace.fs.writeFile`.
-    // We would need to accumulate everything in memory anyway if we use standard API.
-
-    // However, for Local Node.js (desktop), we can use `fs`.
-    // For Web, we are limited.
-    // But the primary crash vector is Desktop with large DBs.
-
-    // Let's try to detect if we can use native fs.
 
     if (isLocalFile && typeof require === 'function') {
         // Use Node.js fs streams for memory efficiency
@@ -178,141 +145,137 @@ export async function exportTableCommand(
                 stream.write('\uFEFF');
             }
 
-            // Write header
+            // Check if we can use rowid pagination
+            let useRowId = false;
+            try {
+                await document.databaseOperations.executeQuery(`SELECT rowid FROM ${escapeIdentifier(tableName)} LIMIT 1`);
+                useRowId = true;
+            } catch (e) {
+                // Fallback to offset pagination
+            }
+
+            const BATCH_SIZE = 5000;
+            let offset = 0;
+            let lastId = Number.MIN_SAFE_INTEGER;
+            let hasMore = true;
             let isFirstBatch = true;
+            let rowCount = 0;
+
+            // For JSON, start the array
+            if (formatValue === 'json') {
+                stream.write('[');
+            }
 
             while (hasMore) {
-                let sql = `SELECT rowid, ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
-
-                // Use rowid pagination for performance
-                // We need to track the last seen rowid.
-                // Initial query: WHERE rowid > lastId ORDER BY rowid ASC LIMIT BATCH
-
-                // Wait, if columns doesn't include rowid, we need to ask for it to paginate,
-                // but exclude it from output if not requested?
-                // The user requested `columns`.
-
-                // Let's stick to simple OFFSET for now to avoid complexity with composite keys / WITHOUT ROWID.
-                // To minimize OOM, we just need to GC between batches.
-                // But if we can't write incrementally, we have to keep all in memory.
-                // Since we are using a stream here, we CAN write incrementally!
-
-                // Using standard OFFSET for simplicity. Performance impact acceptable for export?
-                // Deep offset is slow.
-                // Let's use rowid if we can.
-
-                // Check if table supports rowid?
-                // Just try `SELECT rowid FROM table LIMIT 1`.
-                let useRowId = false;
-                try {
-                     await document.databaseOperations.executeQuery(`SELECT rowid FROM ${escapeIdentifier(tableName)} LIMIT 1`);
-                     useRowId = true;
-                } catch {}
+                let sql: string;
+                const params: any[] = [];
 
                 if (useRowId) {
-                     // RowID pagination
-                     let lastId = 0; // Assuming rowids are positive, but they can be negative.
-                     // Better: use `WHERE rowid > ?` and init with extremely small number?
-                     // Or just track last one.
+                    // Keyset pagination: fast O(1)
+                    // We fetch rowid + user columns. rowid is prepended.
+                    sql = `SELECT rowid, ${queryColumns} FROM ${escapeIdentifier(tableName)} WHERE rowid > ?`;
+                    params.push(lastId);
 
-                     // We need to reimplement the loop structure.
-                     // Let's use a simpler cursor approach:
-                     // SELECT * FROM table WHERE rowid > lastId ORDER BY rowid ASC LIMIT 5000
+                    // Add rowIds filter if present
+                    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
+                        const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+                        if (validIds.length > 0) {
+                            sql += ` AND rowid IN (${validIds.map(() => '?').join(',')})`;
+                            params.push(...validIds);
+                        }
+                    }
 
-                     let currentLastId = Number.MIN_SAFE_INTEGER;
+                    sql += ` ORDER BY rowid ASC LIMIT ${BATCH_SIZE}`;
+                } else {
+                    // Offset pagination: O(N) but compatible with WITHOUT ROWID tables
+                    sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
 
-                     // Loop
-                     while (true) {
-                         // Need to handle user-provided filter options (rowIds) too?
-                         // If _exportOptions.rowIds is set, we just dump those (usually small selection).
-                         // The existing code handles that non-chunked.
+                    // Add rowIds filter if present
+                    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
+                        const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+                        if (validIds.length > 0) {
+                            // Note: We can't safely use 'rowid' in WHERE if we are in this branch (no rowid support)
+                            // But usually _exportOptions.rowIds implies rowid exists.
+                            // We'll skip filtering here to be safe or could assume a PK exists.
+                            // Given this is a fallback, getting all rows is safer than failing SQL.
+                        }
+                    }
 
-                         let sql = `SELECT rowid, ${queryColumns} FROM ${escapeIdentifier(tableName)} WHERE rowid > ?`;
-                         const params: any[] = [currentLastId];
-
-                         // Add rowIds filter if present
-                         if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-                              const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
-                              if (validIds.length > 0) {
-                                  sql += ` AND rowid IN (${validIds.map(() => '?').join(',')})`;
-                                  params.push(...validIds);
-                              }
-                         }
-
-                         sql += ` ORDER BY rowid ASC LIMIT ${BATCH_SIZE}`;
-
-                         const result = await document.databaseOperations.executeQuery(sql, params);
-                         if (!result || result.length === 0 || !result[0].rows || result[0].rows.length === 0) {
-                             break;
-                         }
-
-                         const rows = result[0].rows as CellValue[][];
-                         const headers = result[0].headers as string[]; // Includes rowid as first col if we added it
-
-                         // Find index of rowid to update cursor
-                         // We asked for "rowid, ..." so it should be first?
-                         // "rowid" might conflict if user selected "rowid".
-                         // `SELECT rowid, col1...` -> columns: ['rowid', 'col1']
-
-                         // Update cursor
-                         const lastRow = rows[rows.length - 1];
-                         // We assume rowid is the first column because we put it there in SQL
-                         currentLastId = Number(lastRow[0]);
-
-                         // Prepare data for export
-                         // If user didn't ask for rowid, remove it.
-                         // Check `columns` input.
-                         const userRequestedRowId = columns.includes('rowid');
-
-                         let outputRows = rows;
-                         let outputHeaders = headers;
-
-                         if (!userRequestedRowId) {
-                             // Remove first column (rowid)
-                             outputRows = rows.map(r => r.slice(1));
-                             outputHeaders = headers.slice(1);
-                         }
-
-                         // Write chunk
-                         let chunkContent = '';
-                         switch (formatValue) {
-                              case 'excel':
-                              case 'csv':
-                                chunkContent = exportToCsv(outputHeaders, outputRows, isFirstBatch && includeHeader);
-                                if (!isFirstBatch && chunkContent) chunkContent = '\n' + chunkContent;
-                                break;
-                              case 'json':
-                                // JSON streaming is hard (array of objects).
-                                // We can write objects one by one but need comma separation.
-                                // Or JSONL (JSON Lines).
-                                // Standard JSON: [ ... ]
-                                if (isFirstBatch) stream.write('[');
-                                else if (outputRows.length > 0) stream.write(',');
-
-                                const jsonStr = exportToJson(outputHeaders, outputRows);
-                                // jsonStr is "[...]" (array of objects)
-                                // We need to strip brackets to stream inside the main array?
-                                // exportToJson returns stringified array.
-                                // We should refactor exportToJson or just slice.
-                                chunkContent = jsonStr.slice(1, -1); // remove [ and ]
-                                break;
-                              case 'sql':
-                                chunkContent = exportToSql(tableName, outputHeaders, outputRows, includeTableName);
-                                if (!isFirstBatch && chunkContent) chunkContent = '\n' + chunkContent;
-                                break;
-                         }
-
-                         if (chunkContent) stream.write(chunkContent);
-                         isFirstBatch = false;
-                     }
-
-                     if (formatValue === 'json') stream.write(']');
-                     stream.end();
-
-                     vsc.window.showInformationMessage(`Exported to ${uri.fsPath}`);
-                     return;
+                    sql += ` LIMIT ${BATCH_SIZE} OFFSET ${offset}`;
                 }
+
+                const result = await document.databaseOperations.executeQuery(sql, params);
+
+                if (!result || result.length === 0 || !result[0].rows || result[0].rows.length === 0) {
+                    hasMore = false;
+                    break;
+                }
+
+                const rows = result[0].rows as CellValue[][];
+                const headers = result[0].headers as string[];
+
+                // Update cursors
+                if (useRowId) {
+                    const lastRow = rows[rows.length - 1];
+                    // rowid is the first column because we requested `SELECT rowid, ...`
+                    lastId = Number(lastRow[0]);
+                } else {
+                    offset += rows.length;
+                }
+
+                if (rows.length < BATCH_SIZE) {
+                    hasMore = false;
+                }
+
+                rowCount += rows.length;
+
+                // Prepare data for export
+                let outputRows = rows;
+                let outputHeaders = headers;
+
+                if (useRowId) {
+                    // We fetched rowid as first column. Always strip it as it's an implementation detail.
+                    // If user requested 'rowid' in queryColumns, it will be in the remaining columns.
+                    outputRows = rows.map(r => r.slice(1));
+                    outputHeaders = headers.slice(1);
+                }
+
+                // Write chunk
+                let chunkContent = '';
+
+                switch (formatValue) {
+                    case 'excel':
+                    case 'csv':
+                        // Header only for first batch
+                        chunkContent = exportToCsv(outputHeaders, outputRows, isFirstBatch && includeHeader);
+                        if (!isFirstBatch && chunkContent) chunkContent = '\n' + chunkContent;
+                        break;
+                    case 'json':
+                        if (!isFirstBatch && outputRows.length > 0) stream.write(',');
+                        const jsonStr = exportToJson(outputHeaders, outputRows);
+                        chunkContent = jsonStr.slice(1, -1); // Remove [ and ]
+                        break;
+                    case 'sql':
+                        chunkContent = exportToSql(tableName, outputHeaders, outputRows, includeTableName);
+                        if (!isFirstBatch && chunkContent) chunkContent = '\n' + chunkContent;
+                        break;
+                }
+
+                if (chunkContent) {
+                    stream.write(chunkContent);
+                }
+
+                isFirstBatch = false;
             }
+
+            if (formatValue === 'json') {
+                stream.write(']');
+            }
+
+            stream.end();
+            vsc.window.showInformationMessage(`Exported ${rowCount} rows to ${uri.fsPath}`);
+            return;
+
         } catch (e) {
             console.warn('Native stream write failed, falling back to memory', e);
         }

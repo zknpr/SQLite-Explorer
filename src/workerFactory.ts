@@ -22,7 +22,8 @@ import type {
   DatabaseOperations,
   DatabaseInitConfig,
   DatabaseInitResult,
-  CellUpdate
+  CellUpdate,
+  ColumnDefinition
 } from './core/types';
 
 import { Worker } from './platform/threadPool';
@@ -82,7 +83,7 @@ interface WorkerMethods {
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   deleteRows(table: string, rowIds: (string | number)[]): Promise<void>;
   deleteColumns(table: string, columns: string[]): Promise<void>;
-  createTable(table: string, columns: any[]): Promise<void>;
+  createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
   fetchTableData(table: string, options: any): Promise<any>;
@@ -302,7 +303,7 @@ async function createWasmDatabaseConnection(
           workerProxy.deleteRows(table, rowIds),
         deleteColumns: (table: string, columns: string[]) =>
           workerProxy.deleteColumns(table, columns),
-        createTable: (table: string, columns: string[]) =>
+        createTable: (table: string, columns: ColumnDefinition[]) =>
           workerProxy.createTable(table, columns),
         updateCellBatch: (table: string, updates: CellUpdate[]) =>
           workerProxy.updateCellBatch(table, updates),

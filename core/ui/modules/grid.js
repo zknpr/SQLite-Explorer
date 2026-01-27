@@ -342,23 +342,29 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     const rowNumWidth = 50;
 
     const container = document.getElementById('gridContainer');
+    if (!container) return;
+
     // If explicit scroll positions not provided, capture current
-    const currentScrollLeft = container ? container.scrollLeft : 0;
-    const currentScrollTop = container ? container.scrollTop : 0;
+    const currentScrollLeft = container.scrollLeft;
+    const currentScrollTop = container.scrollTop;
 
     const finalScrollLeft = savedScrollLeft !== null ? savedScrollLeft : currentScrollLeft;
     const finalScrollTop = savedScrollTop !== null ? savedScrollTop : currentScrollTop;
 
     const hasActiveFilters = Object.values(state.columnFilters).some(v => v && v.trim() !== '');
 
+    // Clear container
+    container.innerHTML = '';
+
     if (state.gridData.length === 0 && !hasActiveFilters && state.tableColumns.length === 0) {
-        container.innerHTML = `
-            <div class="empty-view">
-                <span class="empty-icon codicon codicon-database"></span>
-                <span class="empty-title">No data</span>
-                <span class="empty-desc">This table is empty</span>
-            </div>
+        const emptyView = document.createElement('div');
+        emptyView.className = 'empty-view';
+        emptyView.innerHTML = `
+            <span class="empty-icon codicon codicon-database"></span>
+            <span class="empty-title">No data</span>
+            <span class="empty-desc">This table is empty</span>
         `;
+        container.appendChild(emptyView);
         return;
     }
 
@@ -370,7 +376,12 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
         }
     }
 
-    let html = '<table class="data-grid"><thead class="grid-header"><tr>';
+    const table = document.createElement('table');
+    table.className = 'data-grid';
+
+    const thead = document.createElement('thead');
+    thead.className = 'grid-header';
+    const headerTr = document.createElement('tr');
 
     // Calculate column widths if needed
     if (Object.keys(state.columnWidths).length === 0 && state.gridData.length > 0) {
@@ -391,7 +402,6 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     // Pinned column offsets
     const pinnedColumnOffsets = new Map();
     // Start 1px to the left to create a slight overlap (49px instead of 50px).
-    // This physically covers any sub-pixel gap between the row number column and the first pinned column.
     let cumulativeLeft = rowNumWidth - 1;
     for (const col of orderedColumns) {
         if (state.pinnedColumns.has(col.name)) {
@@ -405,39 +415,70 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     state.tableColumns.forEach((col, idx) => columnIndexMap.set(col.name, idx));
 
     // Header cells
-    html += `<th class="header-cell row-number-header" style="width:${rowNumWidth}px;min-width:${rowNumWidth}px;max-width:${rowNumWidth}px;position:sticky;left:0;top:0;z-index:11;background:var(--bg-secondary)" onclick="onSelectAllClick(event)" title="Click to select all rows"><div class="header-content"><div class="header-top" style="height:100%;justify-content:center">#</div></div></th>`;
+    const rowNumTh = document.createElement('th');
+    rowNumTh.className = 'header-cell row-number-header';
+    Object.assign(rowNumTh.style, {
+        width: `${rowNumWidth}px`,
+        minWidth: `${rowNumWidth}px`,
+        maxWidth: `${rowNumWidth}px`,
+        position: 'sticky',
+        left: '0',
+        top: '0',
+        zIndex: '11',
+        background: 'var(--bg-secondary)'
+    });
+    rowNumTh.title = 'Click to select all rows';
+    rowNumTh.innerHTML = '<div class="header-content"><div class="header-top" style="height:100%;justify-content:center">#</div></div>';
+    headerTr.appendChild(rowNumTh);
 
     for (const col of orderedColumns) {
         const isSorted = state.sortedColumn === col.name;
         const isPinned = state.pinnedColumns.has(col.name);
         const isColumnSelected = state.selectedColumns.has(col.name);
-        const pinnedClass = isPinned ? 'pinned' : '';
-        const selectedClass = isColumnSelected ? 'column-selected' : '';
-        const leftOffset = pinnedColumnOffsets.get(col.name);
-        const pinnedStyle = isPinned ? `position:sticky;left:${leftOffset}px;` : '';
         const colWidth = state.columnWidths[col.name] || 120;
         const filterValue = state.columnFilters[col.name] || '';
+
+        const th = document.createElement('th');
+        th.className = `header-cell ${isPinned ? 'pinned' : ''} ${isColumnSelected ? 'column-selected' : ''}`;
+        Object.assign(th.style, {
+            width: `${colWidth}px`,
+            minWidth: `${colWidth}px`,
+            maxWidth: `${colWidth}px`
+        });
+
+        if (isPinned) {
+            th.style.position = 'sticky';
+            th.style.left = `${pinnedColumnOffsets.get(col.name)}px`;
+        }
+        th.dataset.column = col.name;
+
+        const safeColName = escapeHtml(col.name);
+        const safeFilterValue = escapeHtml(filterValue);
         const sortIndicator = isSorted ? `<span class="sort-indicator">${state.sortAscending ? '▲' : '▼'}</span>` : '';
         const keyIcon = col.isPrimaryKey ? '<span class="key-icon codicon codicon-key" title="Primary Key"></span>' : '';
+        const pinClass = isPinned ? 'pinned' : '';
+        const pinTitle = isPinned ? 'Unpin column' : 'Pin column';
 
-        html += `<th class="header-cell ${pinnedClass} ${selectedClass}" style="width:${colWidth}px;min-width:${colWidth}px;max-width:${colWidth}px;${pinnedStyle}" data-column="${escapeHtml(col.name)}">`;
-        html += `<div class="header-content">`;
-        html += `<div class="header-top" onclick="onColumnSort('${escapeHtml(col.name)}')">`;
-        html += `${keyIcon}<span class="header-text">${escapeHtml(col.name)}${sortIndicator}</span>`;
-        html += `<span class="select-column-icon codicon codicon-selection" onclick="event.stopPropagation(); onColumnHeaderClick(event, '${escapeHtml(col.name)}')" title="Select entire column"></span>`;
-        html += `<span class="pin-icon codicon codicon-pin ${isPinned ? 'pinned' : ''}" onclick="event.stopPropagation(); toggleColumnPin(event, '${escapeHtml(col.name)}')" title="${isPinned ? 'Unpin column' : 'Pin column'}"></span>`;
-        html += `</div>`;
-        html += `<div class="header-bottom" onclick="event.stopPropagation()">`;
-        html += `<input type="text" class="column-filter" data-column="${escapeHtml(col.name)}" value="${escapeHtml(filterValue)}" placeholder="Filter..." onclick="event.stopPropagation()" onkeydown="onColumnFilterKeydown(event, '${escapeHtml(col.name)}')">`;
-        html += `<button class="filter-apply-btn" onclick="event.stopPropagation(); applyColumnFilter('${escapeHtml(col.name)}')" title="Apply filter (Enter)"><span class="codicon codicon-search"></span></button>`;
-        html += `</div>`;
-        html += `</div>`;
-        html += `<div class="resize-handle" onmousedown="event.stopPropagation(); startColumnResize(event, '${escapeHtml(col.name)}')"></div>`;
-        html += `</th>`;
+        th.innerHTML = `
+            <div class="header-content">
+                <div class="header-top">
+                    ${keyIcon}<span class="header-text">${safeColName}${sortIndicator}</span>
+                    <span class="select-column-icon codicon codicon-selection" title="Select entire column"></span>
+                    <span class="pin-icon codicon codicon-pin ${pinClass}" title="${pinTitle}"></span>
+                </div>
+                <div class="header-bottom">
+                    <input type="text" class="column-filter" data-column="${safeColName}" value="${safeFilterValue}" placeholder="Filter...">
+                    <button class="filter-apply-btn" title="Apply filter (Enter)"><span class="codicon codicon-search"></span></button>
+                </div>
+            </div>
+            <div class="resize-handle"></div>
+        `;
+        headerTr.appendChild(th);
     }
-    html += '</tr></thead><tbody>';
+    thead.appendChild(headerTr);
+    table.appendChild(thead);
 
-    // Rows
+    const tbody = document.createElement('tbody');
 
     // Pinned rows logic
     const pinnedRowsList = [];
@@ -459,20 +500,37 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
         ...state.gridData.map((row, idx) => ({ idx, rowId: getRowId(row, idx) })).filter(r => !state.pinnedRowIds.has(r.rowId))
     ];
 
+    const fragment = document.createDocumentFragment();
+
     for (const { idx: rowIdx, rowId } of orderedRowIndices) {
         const row = state.gridData[rowIdx];
         const isSelected = state.selectedRowIds.has(rowId);
         const isRowPinned = state.pinnedRowIds.has(rowId);
-        const topOffset = pinnedRowOffsets.get(rowId);
-        const pinnedRowStyle = isRowPinned ? `top:${topOffset}px;` : '';
-        const rowNumZIndex = isRowPinned ? 8 : 2;
 
-        let rowHtml = `<tr id="row-${rowIdx}" class="data-row ${isSelected ? 'selected' : ''} ${isRowPinned ? 'pinned' : ''}" style="${pinnedRowStyle}" data-rowid="${rowId}" data-rowidx="${rowIdx}">`;
+        const tr = document.createElement('tr');
+        tr.id = `row-${rowIdx}`;
+        tr.className = `data-row ${isSelected ? 'selected' : ''} ${isRowPinned ? 'pinned' : ''}`;
+        tr.dataset.rowid = rowId;
+        tr.dataset.rowidx = rowIdx;
 
-        rowHtml += `<td class="data-cell row-number" style="width:${rowNumWidth}px;min-width:${rowNumWidth}px;max-width:${rowNumWidth}px;position:sticky;left:0;z-index:${rowNumZIndex};">`;
-        rowHtml += `${state.currentPageIndex * state.rowsPerPage + rowIdx + 1}`;
-        rowHtml += `<span class="pin-icon codicon codicon-pin ${isRowPinned ? 'pinned' : ''}" title="${isRowPinned ? 'Unpin row' : 'Pin row'}"></span>`;
-        rowHtml += `</td>`;
+        if (isRowPinned) {
+            tr.style.top = `${pinnedRowOffsets.get(rowId)}px`;
+        }
+
+        const rowNumTd = document.createElement('td');
+        rowNumTd.className = 'data-cell row-number';
+        Object.assign(rowNumTd.style, {
+            width: `${rowNumWidth}px`,
+            minWidth: `${rowNumWidth}px`,
+            maxWidth: `${rowNumWidth}px`,
+            position: 'sticky',
+            left: '0',
+            zIndex: isRowPinned ? '8' : '2'
+        });
+
+        const rowNumVal = state.currentPageIndex * state.rowsPerPage + rowIdx + 1;
+        rowNumTd.innerHTML = `${rowNumVal}<span class="pin-icon codicon codicon-pin ${isRowPinned ? 'pinned' : ''}" title="${isRowPinned ? 'Unpin row' : 'Pin row'}"></span>`;
+        tr.appendChild(rowNumTd);
 
         for (let displayColIdx = 0; displayColIdx < orderedColumns.length; displayColIdx++) {
             const col = orderedColumns[displayColIdx];
@@ -482,31 +540,64 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
             const isNull = value === null || value === undefined;
             const isCellSelected = selectedCellKeys.has(`${rowIdx},${originalColIdx}`);
             const isColPinned = state.pinnedColumns.has(col.name);
-            const leftOffset = pinnedColumnOffsets.get(col.name);
-            const pinnedStyle = isColPinned ? `position:sticky;left:${leftOffset}px;` : '';
             const hasContent = !isNull && !(value instanceof Uint8Array);
             const colWidth = state.columnWidths[col.name] || 120;
-            const cellStyle = `width:${colWidth}px;min-width:${colWidth}px;max-width:${colWidth}px;${hasContent ? 'position:relative;' : ''}${pinnedStyle}`;
 
-            // Removed inline click handlers in favor of delegation
-            rowHtml += `<td id="cell-${rowIdx}-${originalColIdx}" class="data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''}" style="${cellStyle}" data-rowidx="${rowIdx}" data-colidx="${originalColIdx}">`;
-            rowHtml += `<span class="cell-text">${displayValue}</span>`;
-            if (hasContent) {
-                rowHtml += `<span class="expand-icon codicon codicon-link-external" title="View full content"></span>`;
+            const td = document.createElement('td');
+            td.id = `cell-${rowIdx}-${originalColIdx}`;
+            td.className = `data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''}`;
+            td.dataset.rowidx = rowIdx;
+            td.dataset.colidx = originalColIdx;
+
+            Object.assign(td.style, {
+                width: `${colWidth}px`,
+                minWidth: `${colWidth}px`,
+                maxWidth: `${colWidth}px`
+            });
+
+            if (hasContent) td.style.position = 'relative';
+
+            if (isColPinned) {
+                td.style.position = 'sticky';
+                td.style.left = `${pinnedColumnOffsets.get(col.name)}px`;
             }
-            rowHtml += `</td>`;
+
+            const textSpan = document.createElement('span');
+            textSpan.className = 'cell-text';
+            textSpan.textContent = displayValue;
+            td.appendChild(textSpan);
+
+            if (hasContent) {
+                const iconSpan = document.createElement('span');
+                iconSpan.className = 'expand-icon codicon codicon-link-external';
+                iconSpan.title = 'View full content';
+                td.appendChild(iconSpan);
+            }
+
+            tr.appendChild(td);
         }
-        rowHtml += '</tr>';
-        html += rowHtml;
+        fragment.appendChild(tr);
     }
 
     if (state.gridData.length === 0 && hasActiveFilters) {
-        const colSpan = orderedColumns.length + 1;
-        html += `<tr class="no-results-row"><td colspan="${colSpan}" style="text-align:center;padding:20px;color:var(--text-secondary);">No rows match the current filter. Modify or clear filters above.</td></tr>`;
+        const tr = document.createElement('tr');
+        tr.className = 'no-results-row';
+        const td = document.createElement('td');
+        td.colSpan = orderedColumns.length + 1;
+        Object.assign(td.style, {
+            textAlign: 'center',
+            padding: '20px',
+            color: 'var(--text-secondary)'
+        });
+        td.textContent = 'No rows match the current filter. Modify or clear filters above.';
+        tr.appendChild(td);
+        fragment.appendChild(tr);
     }
 
-    html += '</tbody></table>';
-    container.innerHTML = html;
+    tbody.appendChild(fragment);
+    table.appendChild(tbody);
+    container.appendChild(table);
+
     container.scrollLeft = finalScrollLeft;
     container.scrollTop = finalScrollTop;
 

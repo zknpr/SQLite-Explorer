@@ -109,7 +109,6 @@ function formatDate(value, format) {
 
         const parsed = Date.parse(dateStr);
         if (isNaN(parsed)) {
-            // console.log('Failed to parse date:', value);
             return null; // Not a valid date
         }
         date = new Date(parsed);

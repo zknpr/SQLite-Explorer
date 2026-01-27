@@ -535,42 +535,6 @@ export class HostBridge implements ToastService {
     throw new Error("Document not found in webviews");
   }
 
-  /**
-   * Download a blob to the filesystem.
-   *
-   * SECURITY: The filename is sanitized using path.basename to prevent
-   * path traversal attacks. An attacker could try to pass filenames like
-   * "../../etc/passwd" to write outside the intended directory.
-   *
-   * @param data - Binary data to write
-   * @param download - Filename for the download (will be sanitized)
-   * @param preserveFocus - Whether to keep focus on current editor
-   */
-  async downloadBlob(data: Uint8Array, download: string, preserveFocus: boolean) {
-    const { document } = this;
-    const { dirname } = document.fileParts;
-
-    // SECURITY: Sanitize filename to prevent path traversal attacks.
-    // path.basename extracts just the filename, stripping any directory components.
-    // Example: "../../etc/passwd" becomes "passwd"
-    const sanitizedFilename = path.basename(download);
-    if (!sanitizedFilename) {
-      throw new Error('Invalid filename');
-    }
-
-    const dlUri = vsc.Uri.joinPath(vsc.Uri.parse(dirname), sanitizedFilename);
-
-    await vsc.workspace.fs.writeFile(dlUri, data);
-    if (!preserveFocus) await vsc.commands.executeCommand('vscode.open', dlUri);
-    return;
-  }
-
-  /**
-   * Open the extension store page.
-   */
-  async openExtensionStorePage() {
-    await vsc.commands.executeCommand('extension.open', FullExtensionId);
-  }
 
   /**
    * Fire an edit event to mark the document as dirty.
@@ -758,15 +722,6 @@ export class HostBridge implements ToastService {
         // Update persistent configuration
         await vsc.workspace.getConfiguration(ConfigurationSection).update('doubleClickBehavior', value, vsc.ConfigurationTarget.Global);
     }
-  }
-
-  /**
-   * Update the auto-commit setting.
-   *
-   * @param value - New auto-commit value
-   */
-  updateAutoCommit(value: boolean) {
-    this.document.autoCommitEnabled = value;
   }
 
   /**

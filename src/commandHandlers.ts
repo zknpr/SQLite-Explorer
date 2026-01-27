@@ -18,21 +18,3 @@ export async function enterLicenseKeyCommand(context: vsc.ExtensionContext, repo
   });
 }
 
-/**
- * Placeholder for access token command.
- */
-export async function enterAccessTokenCommand(context: vsc.ExtensionContext, reporter?: TelemetryReporter) {
-  vsc.window.showInformationMessage('SQLite Explorer is open source and free to use!', {
-    modal: true,
-    detail: 'No access token is required. All features are available.'
-  });
-}
-
-/**
- * Placeholder for delete license command.
- */
-export async function deleteLicenseKeyCommand(context: vsc.ExtensionContext, reporter?: TelemetryReporter) {
-  vsc.window.showInformationMessage('No license to deactivate.', {
-    modal: false
-  });
-}

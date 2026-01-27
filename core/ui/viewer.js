@@ -157,7 +157,6 @@ async function initializeApp() {
         }
 
         state.isDbConnected = true;
-        console.log('Connected to database:', result.filename);
 
         // Test connection
         await backendApi.ping();

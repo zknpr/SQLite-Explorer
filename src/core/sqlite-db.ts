@@ -17,7 +17,8 @@ import type {
   TableQueryOptions,
   TableCountOptions,
   SchemaSnapshot,
-  ColumnMetadata
+  ColumnMetadata,
+  ColumnDefinition
 } from './types';
 import { escapeIdentifier, cellValueToSql } from './sql-utils';
 import { buildSelectQuery, buildCountQuery } from './query-builder';
@@ -250,7 +251,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Create a new table.
    */
-  async createTable(table: string, columns: any[]): Promise<void> {
+  async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {
     if (columns.length === 0) throw new Error('At least one column is required');
 
     const colDefs = columns.map(col => {
@@ -709,7 +710,7 @@ export function createWorkerEndpoint() {
             activeEngine!.deleteRows(table, rowIds),
           deleteColumns: (table: string, columns: string[]) =>
             activeEngine!.deleteColumns(table, columns),
-          createTable: (table: string, columns: string[]) =>
+          createTable: (table: string, columns: ColumnDefinition[]) =>
             activeEngine!.createTable(table, columns),
           updateCellBatch: (table: string, updates: CellUpdate[]) =>
             activeEngine!.updateCellBatch(table, updates),
@@ -779,7 +780,7 @@ export function createWorkerEndpoint() {
       return activeEngine.deleteColumns(table, columns);
     },
 
-    async createTable(table: string, columns: string[]): Promise<void> {
+    async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {
       if (!activeEngine) throw new Error('No database initialized');
       return activeEngine.createTable(table, columns);
     },

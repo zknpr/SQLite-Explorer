@@ -23,22 +23,11 @@ const webviewMethods = {
         return { success: true };
     },
 
-    async updateAutoCommit(value) {
-        return { success: true };
-    },
-
     async updateCellEditBehavior(value) {
         state.cellEditBehavior = value;
         return { success: true };
     },
 
-    async updateViewState(state) {
-        return { success: true };
-    },
-
-    async updateCopilotActive(active) {
-        return { success: true };
-    }
 };
 
 /**

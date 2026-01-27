@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.6
+
+### Performance
+
+- **Large Export Optimization**: Implemented streaming and keyset pagination for table exports, preventing OOM crashes on large datasets.
+- **Rendering Optimization**: Refactored data grid rendering to use `DocumentFragment` for reduced DOM thrashing.
+
+### Maintenance
+
+- **Cleanup**: Removed dead code and unused RPC methods (`enterAccessTokenCommand`, `downloadBlob`, etc.).
+- **Cleanup**: Removed unused files and debug logging.
+
 ## 1.1.5
 
 ### Bug Fixes

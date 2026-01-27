@@ -24,8 +24,6 @@ interface WebviewBridgeFunctions {
   updateColorScheme(scheme: 'light' | 'dark'): Promise<void>;
   updateAutoCommit(value: boolean): Promise<void>;
   updateCellEditBehavior(value: string): Promise<void>;
-  updateViewState(state: { visible: boolean; active: boolean }): Promise<void>;
-  updateCopilotActive(active: boolean): Promise<void>;
   refreshContent(filename: string): Promise<void>;
 }
 
@@ -125,10 +123,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     // Update webview settings when configuration changes
     this._register(vsc.workspace.onDidChangeConfiguration(e => {
       if (e.affectsConfiguration(`${ConfigurationSection}.instantCommit`)) {
-        const value = document.autoCommitEnabled = isAutoCommitEnabled();
-        for (const bridge of this.#iterateWebviewBridges(document.uri)) {
-          bridge.updateAutoCommit(value).catch(console.warn);
-        }
+        document.autoCommitEnabled = isAutoCommitEnabled();
       }
 
       if (e.affectsConfiguration(`${ConfigurationSection}.doubleClickBehavior`)) {
@@ -140,7 +135,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     }));
 
     // Listen for when this document gains focus to trigger pending saves
-    this._register(vsc.window.onDidChangeActiveTextEditor(editor => {
+    this._register(vsc.window.onDidChangeActiveTextEditor(_ => {
     }));
   }
 
@@ -166,28 +161,12 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
   /**
    * Create handler for webview panel view state changes.
    */
-  #createViewStateChangeHandler = (webviewPanel: vsc.WebviewPanel, document: DatabaseDocument) => (e: vsc.WebviewPanelOnDidChangeViewStateEvent) => {
-    const bridge = this.webviewBridges.get(webviewPanel);
-    if (bridge) {
-      bridge.updateViewState({
-        visible: e.webviewPanel.visible,
-        active: e.webviewPanel.active,
-      }).catch(() => { });
-    }
+  #createViewStateChangeHandler = (_webviewPanel: vsc.WebviewPanel, document: DatabaseDocument) => (e: vsc.WebviewPanelOnDidChangeViewStateEvent) => {
     // If the webview panel is active and there is a pending save, save the document
     document.hasActiveViewer = e.webviewPanel.active;
     if (e.webviewPanel.active && document.hasPendingSave) {
       document.triggerSave().catch(() => { });
     }
-  };
-
-  /**
-   * Create handler for extension changes (e.g., Copilot activation).
-   */
-  #createExtensionChangeHandler = (webviewPanel: vsc.WebviewPanel) => () => {
-    const chat = vsc.extensions.getExtension(CopilotChatId);
-    const bridge = this.webviewBridges.get(webviewPanel);
-    bridge?.updateCopilotActive(!!chat?.isActive || IsCursorIDE).catch(() => { });
   };
 
   /**
@@ -209,7 +188,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     // Create RPC proxy for webview communication
     const webviewBridge = buildMethodProxy<WebviewBridgeFunctions>(
       (msg) => webviewPanel.webview.postMessage(msg),
-      ['updateColorScheme', 'updateAutoCommit', 'updateCellEditBehavior', 'updateViewState', 'updateCopilotActive', 'refreshContent']
+      ['updateColorScheme', 'updateCellEditBehavior', 'refreshContent']
     );
     this.webviewBridges.set(webviewPanel, webviewBridge);
 
@@ -296,8 +275,6 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
 
     webviewPanel.onDidChangeViewState(this.#createViewStateChangeHandler(webviewPanel, document)),
       webviewPanel.onDidDispose(this.#createPanelDisposeHandler(webviewPanel));
-
-    vsc.extensions.onDidChange(this.#createExtensionChangeHandler(webviewPanel));
   }
 
   /**

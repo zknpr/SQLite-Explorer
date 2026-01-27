@@ -58,39 +58,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 return new Uint8Array(0);
             }
 
-            // Fetch cell data
-            // We need to construct a query.
-            // RowId handling:
-            // If table, rowId is the actual rowid (number).
-            // If not table (view), we can't easily fetch by rowId unless we know the PK or if we passed the row number?
-            // The extension passes `rowId` which is what the webview uses.
-            // In webview `grid.js`, `getRowId` returns `row[0]` (rowid) for tables.
-            // For views, it returns index.
-            // But `hostBridge.ts` calls `openCellEditor` with `rowId`.
-            // `DatabaseOperations.updateCell` expects `rowid`.
-            // If it's a view, we can't really update it usually.
-            // `readFile` is for viewing too.
-            // If it's a view, `rowId` might be just an index?
-            // `hostBridge.ts`:
-            // `if (rowId === '__create__.sql')`
-            // else `cellParts = [params.table, ..., String(rowId), ...]`
-            // If we are in a View, `openCellEditor` might be called with row index?
-            // But `updateCell` checks `Number.isFinite(rowId)`.
-            // For editing, we restrict to Tables.
-            // For viewing, we might allow Views.
-            // If it's a view, we need to fetch by LIMIT/OFFSET?
-            // `SELECT col FROM table LIMIT 1 OFFSET rowId`?
-            // That assumes stable ordering which might not be true without ORDER BY.
-            // But `rowId` from webview for View is just index on current page?
-            // Actually `grid.js`: `getRowId` -> `currentPageIndex * rowsPerPage + rowIdx`.
-            // So it is the absolute offset.
-
-            // Let's check `fetchTableData` implementation in `sqlite-db.ts`.
-            // It uses OFFSET.
-
-            // So if we know it's a view (or we just treat it as offset if we can't find rowid column?),
-            // we could try to fetch.
-            // But safely, let's assume `rowId` is a SQLite RowID for tables.
+            
 
             const isTable = true; // We mostly support tables for editing.
 
@@ -142,21 +110,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 throw vsc.FileSystemError.Unavailable('Invalid Row ID');
             }
 
-            // Detect if binary
-            // If the column type is BLOB, we should probably save as binary.
-            // But we don't have column type info here easily without querying.
-            // However, `content` IS Uint8Array.
-            // If the user edited text, it's UTF-8 bytes.
-            // If it was binary, they probably used a hex editor or similar extension?
-            // Or just edited as text.
-            // We'll treat it as string if it looks like UTF-8, else blob?
-            // Actually, for SQLite, we can just save the value.
-            // If we blindly save Uint8Array to SQLite, it will be BLOB.
-            // If we convert to string, it will be TEXT.
-
-            // We should try to guess or use the previous type?
-            // Let's fetch the current value type?
-            // Or just check if the content is valid UTF-8?
+           
 
             let value: string | Uint8Array = content;
 

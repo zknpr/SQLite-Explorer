@@ -8,7 +8,6 @@ import { getRowId, getRowDataOffset } from './data-utils.js';
 import { formatCellValue } from './utils.js';
 
 export function initDragAndDrop() {
-    console.log('Initializing Drag and Drop');
     const container = document.getElementById('gridContainer');
     if (!container) {
         console.error('gridContainer not found');
@@ -23,7 +22,6 @@ export function initDragAndDrop() {
     container.addEventListener('dragover', onDragOver);
     container.addEventListener('dragleave', onDragLeave);
     container.addEventListener('drop', onDrop);
-    console.log('Drag and Drop initialized');
 }
 
 let lastHighlightedCell = null;
@@ -56,10 +54,6 @@ function onDragLeave(e) {
 
 async function onDrop(e) {
     e.preventDefault();
-    console.log('Drop detected');
-    console.log('dataTransfer types:', e.dataTransfer.types);
-    console.log('dataTransfer files length:', e.dataTransfer.files.length);
-    console.log('dataTransfer items length:', e.dataTransfer.items.length);
 
     if (lastHighlightedCell) {
         lastHighlightedCell.classList.remove('drag-over');
@@ -68,7 +62,6 @@ async function onDrop(e) {
 
     const cell = e.target.closest('.data-cell');
     if (!cell || cell.classList.contains('row-number')) {
-        console.log('Drop target is not a valid data cell');
         return;
     }
 
@@ -82,7 +75,6 @@ async function onDrop(e) {
     // Check for VS Code internal URI list (dragging from Explorer)
     const uriList = e.dataTransfer.getData('text/uri-list');
     if (uriList) {
-        console.log('Found URI list:', uriList);
         const uris = uriList.split(/\r?\n/);
         if (uris.length > 0 && uris[0]) {
             let uri = uris[0];
@@ -100,8 +92,6 @@ async function onDrop(e) {
             return;
         }
     }
-
-    console.log('No handled content found in drop');
 }
 
 async function handleFileUpload(cell, fileName, fileBlob) {
