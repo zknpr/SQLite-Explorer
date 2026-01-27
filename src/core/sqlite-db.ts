@@ -303,11 +303,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
           // Optimize JSON patch read by preparing the SELECT statement
           let selectStmt: any = null;
-          if (op === 'json_patch') {
-             selectStmt = this.instance.prepare(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`);
-          }
 
           try {
+              if (op === 'json_patch') {
+                 selectStmt = this.instance.prepare(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`);
+              }
+
               for (const update of columnUpdates) {
                   const rowIdNum = Number(update.rowId);
 
@@ -322,6 +323,11 @@ class WasmDatabaseEngine implements DatabaseOperations {
                         if (row && row.length > 0) {
                             currentValue = row[0];
                         }
+
+                        // Reset statement is generally required in C API but sql.js get() might handle it?
+                        // Actually get() automatically resets if stepping is done?
+                        // For safety in a loop with get():
+                        selectStmt.reset();
                      }
 
                      let currentObj = {};
@@ -378,12 +384,31 @@ class WasmDatabaseEngine implements DatabaseOperations {
    */
   async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
     const { sql, params } = buildSelectQuery(table, options);
-    const result = await this.executeQuery(sql, params);
-    if (result && result.length > 0) {
-      return result[0];
+
+    // Use prepare/step/get to avoid overhead of exec() which builds intermediate objects
+    // and to allow for potentially better memory management in the future
+    let stmt: any = null;
+    try {
+        stmt = this.instance.prepare(sql, params);
+        const rows: CellValue[][] = [];
+
+        while (stmt.step()) {
+            rows.push(stmt.get());
+        }
+
+        const headers = stmt.getColumnNames();
+        return {
+            headers,
+            rows,
+            columns: headers,
+            values: rows
+        };
+    } catch (err) {
+        const errorDetail = err instanceof Error ? err.message : String(err);
+        throw new Error(`Fetch failed: ${errorDetail}`);
+    } finally {
+        if (stmt) stmt.free();
     }
-    // Return empty result set structure
-    return { headers: [], rows: [] };
   }
 
   /**
@@ -587,7 +612,27 @@ export async function createDatabaseEngine(
 
   if (buffer && buffer.byteLength > 0) {
     // Open existing database from binary
-    wasmInstance = new SqlJsModule.Database(new Uint8Array(buffer));
+    // Avoid creating an intermediate copy if possible
+    // buffer is often a Node Buffer or Uint8Array.
+    // Creating new Uint8Array(buffer) copies the data.
+    // We should pass the existing buffer or a view of it.
+
+    // sql.js Database constructor copies data into WASM heap anyway.
+    // We just want to avoid the intermediate JS copy.
+
+    // If it's a Buffer, it's already a Uint8Array instance in modern Node
+    // But passing it to new Uint8Array() creates a copy.
+    // We can pass it directly if it's compatible, or create a view.
+
+    const data = (buffer.buffer && buffer.byteLength === buffer.buffer.byteLength)
+        ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+        : buffer;
+
+    wasmInstance = new SqlJsModule.Database(data);
+
+    // Help GC
+    buffer = null;
+    config.content = null;
   } else {
     // Create new empty database
     wasmInstance = new SqlJsModule.Database();

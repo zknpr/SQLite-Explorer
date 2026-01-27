@@ -1,5 +1,7 @@
 # Changelog
 
+## 1.1.5
+
 ## 1.1.4
 
 ### Bug Fixes

@@ -82,9 +82,16 @@ const INVOCATION_TIMEOUT_MS = 30000;
 // ============================================================================
 
 /**
+ * Wrapper to explicitly mark data for transfer (zero-copy)
+ */
+export class Transfer<T> {
+  constructor(public readonly value: T, public readonly transferables: any[]) {}
+}
+
+/**
  * Dispatcher function type for sending messages.
  */
-type MessageDispatcher = (envelope: ProtocolEnvelope) => void;
+type MessageDispatcher = (envelope: ProtocolEnvelope, transfer?: any[]) => void;
 
 /**
  * Build a proxy object that forwards method calls to a remote context.
@@ -109,6 +116,18 @@ export function buildMethodProxy<T extends object>(
       return new Promise((resolve, reject) => {
         const correlationId = generateCorrelationId();
 
+        // Handle Transfer wrappers
+        const transferList: any[] = [];
+        const cleanParameters = parameters.map(p => {
+          if (p instanceof Transfer) {
+            if (p.transferables) {
+                transferList.push(...p.transferables);
+            }
+            return p.value;
+          }
+          return p;
+        });
+
         // Set up expiration timer
         const expirationTimer = setTimeout(() => {
           if (pendingInvocations.has(correlationId)) {
@@ -129,8 +148,8 @@ export function buildMethodProxy<T extends object>(
           kind: 'invoke',
           correlationId,
           methodName,
-          parameters
-        });
+          parameters: cleanParameters
+        }, transferList);
       });
     };
   }
@@ -267,8 +286,21 @@ export function connectWorkerPort<T extends object>(
   port: WorkerPort,
   methodNames: string[]
 ): T {
-  const dispatcher: MessageDispatcher = (envelope) => {
-    port.postMessage(envelope);
+  const dispatcher: MessageDispatcher = (envelope, transfer) => {
+    // Check if port supports transfer list (Browser/Node worker compatible)
+    if (transfer && transfer.length > 0 && typeof port.postMessage === 'function') {
+        // Try to pass transfer list
+        try {
+            // @ts-ignore - Handle mixed signatures of postMessage
+            port.postMessage(envelope, transfer);
+        } catch (e) {
+            // Fallback if transfer fails (e.g. not supported in this env)
+            console.warn('Transfer failed, falling back to copy', e);
+            port.postMessage(envelope);
+        }
+    } else {
+        port.postMessage(envelope);
+    }
   };
 
   port.on('message', (data) => {

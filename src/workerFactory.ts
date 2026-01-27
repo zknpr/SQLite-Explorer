@@ -14,7 +14,7 @@ import type { TelemetryReporter } from '@vscode/extension-telemetry';
 import * as vsc from 'vscode';
 import path from 'path';
 
-import { connectWorkerPort, buildMethodProxy } from './core/rpc';
+import { connectWorkerPort, buildMethodProxy, Transfer } from './core/rpc';
 import type {
   CellValue,
   QueryResultSet,
@@ -266,7 +266,22 @@ async function createWasmDatabaseConnection(
       };
 
       // Initialize database in worker
-      const result = await workerProxy.initializeDatabase(displayName, initConfig);
+      // Use Transfer wrapper to zero-copy transfer the array buffers
+      const transferables: any[] = [];
+      if (initConfig.content && initConfig.content.buffer) {
+          transferables.push(initConfig.content.buffer);
+      }
+      if (initConfig.walContent && initConfig.walContent.buffer) {
+          transferables.push(initConfig.walContent.buffer);
+      }
+      if (initConfig.wasmBinary && initConfig.wasmBinary.buffer) {
+          transferables.push(initConfig.wasmBinary.buffer);
+      }
+
+      const result = await workerProxy.initializeDatabase(
+          displayName,
+          new Transfer(initConfig, transferables) as any // Cast to satisfy type signature
+      );
 
       // Create operations facade that routes to worker
       const operationsFacade: DatabaseOperations = {

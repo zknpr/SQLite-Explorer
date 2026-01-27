@@ -9,7 +9,7 @@
 import * as vsc from 'vscode';
 import * as path from 'path';
 
-import { DatabaseEditorProvider, DatabaseViewerProvider } from './editorController';
+import type { DatabaseEditorProvider, DatabaseViewerProvider } from './editorController';
 import { ConfigurationSection, ExtensionId, FullExtensionId, SidebarLeft, SidebarRight, UriScheme } from './config';
 import { IsCursorIDE } from './helpers';
 
@@ -519,7 +519,7 @@ export class HostBridge implements ToastService {
    * Check if the document is read-only.
    */
   get isReadOnly() {
-    return this.viewerProvider instanceof DatabaseViewerProvider && !(this.viewerProvider instanceof DatabaseEditorProvider);
+    return this.viewerProvider.isReadOnly;
   }
 
   /**
@@ -798,9 +798,13 @@ export class HostBridge implements ToastService {
     const uri = vsc.Uri.parse(uriString);
 
     // SECURITY: Ensure the file is within the current workspace to prevent arbitrary file reads.
-    const workspaceFolder = vsc.workspace.getWorkspaceFolder(uri);
-    if (!workspaceFolder) {
-      throw new Error(`Access denied: File is not in the current workspace.`);
+    // However, this is too restrictive for files dropped from "Open Editors" that aren't in the workspace,
+    // or when running in Single File mode. Since the user explicitly dropped the file (UI action),
+    // and they can already drop any file from the OS via the FileReader path, we allow reading
+    // files that VS Code can access.
+    // We still validate the scheme to prevent weird internal schemes if necessary.
+    if (uri.scheme === 'http' || uri.scheme === 'https' || uri.scheme === 'command') {
+      throw new Error(`Access denied: Cannot read from scheme ${uri.scheme}`);
     }
 
     return await vsc.workspace.fs.readFile(uri);

@@ -159,7 +159,18 @@ export async function applyBatchUpdate() {
     const inputs = document.querySelectorAll('.batch-input');
     const updates = [];
 
+    // Map inputs by column index for O(1) lookup
+    const inputsByCol = new Map();
     for (const input of inputs) {
+        inputsByCol.set(parseInt(input.dataset.colidx, 10), input);
+    }
+
+    // Process all selected cells
+    // This is O(N) where N is number of selected cells
+    for (const cell of state.selectedCells) {
+        const input = inputsByCol.get(cell.colIdx);
+        if (!input) continue;
+
         const isNull = input.dataset.isnull === 'true';
         const isPatch = input.dataset.ispatch === 'true';
         const value = input.value;
@@ -167,8 +178,7 @@ export async function applyBatchUpdate() {
         // Skip if empty and not explicitly set to NULL (and not patch with content)
         if (value === "" && !isNull) continue;
 
-        const colIdx = parseInt(input.dataset.colidx, 10);
-        const colDef = state.tableColumns[colIdx];
+        const colDef = state.tableColumns[cell.colIdx];
 
         // Prepare value
         let finalValue = value;
@@ -180,10 +190,17 @@ export async function applyBatchUpdate() {
             operation = 'json_patch';
             // Validate JSON
             try {
+                // If it's a patch, validation happens once per input ideally,
+                // but here we do it per cell unless we cache it.
+                // Given we're optimizing, let's trust the input loop?
+                // Actually, let's just parse it. JSON.parse is fast enough for typical patch sizes.
                 JSON.parse(value);
             } catch (e) {
-                updateStatus(`Invalid JSON for patch in ${colDef.name}`);
-                return;
+                // We should ideally validate before this loop.
+                // But for now, just abort or skip.
+                // Since this is inside the loop, we might show error multiple times if we're not careful.
+                // Let's validate inputs FIRST.
+                continue;
             }
         } else {
              // Basic type coercion
@@ -194,18 +211,27 @@ export async function applyBatchUpdate() {
              }
         }
 
-        // Apply to all selected cells in this column
-        for (const cell of state.selectedCells) {
-            if (cell.colIdx === colIdx) {
-                updates.push({
-                    rowId: cell.rowId,
-                    column: colDef.name,
-                    value: finalValue,
-                    originalValue: cell.value,
-                    operation,
-                    rowIdx: cell.rowIdx, // Local metadata
-                    colIdx: cell.colIdx  // Local metadata
-                });
+        updates.push({
+            rowId: cell.rowId,
+            column: colDef.name,
+            value: finalValue,
+            originalValue: cell.value,
+            operation,
+            rowIdx: cell.rowIdx, // Local metadata
+            colIdx: cell.colIdx  // Local metadata
+        });
+    }
+
+    // Pre-validate JSON patches to avoid issues in the loop above
+    for (const input of inputs) {
+        if (input.dataset.ispatch === 'true') {
+            try {
+                JSON.parse(input.value);
+            } catch (e) {
+                const colIdx = parseInt(input.dataset.colidx, 10);
+                const colDef = state.tableColumns[colIdx];
+                updateStatus(`Invalid JSON for patch in ${colDef.name}`);
+                return;
             }
         }
     }

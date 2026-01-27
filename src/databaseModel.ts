@@ -15,6 +15,7 @@ import { Disposable } from './lifecycle';
 import { cancelTokenToAbortSignal, getUriParts, generateDatabaseDocumentKey } from './helpers';
 import { HostBridge } from './hostBridge';
 import { DatabaseConnectionBundle } from './connectionTypes';
+import { DocumentRegistry } from './documentRegistry';
 
 import { createDatabaseConnection, getMaximumFileSizeBytes } from './workerFactory';
 
@@ -55,9 +56,6 @@ export const SupportsWriteMode = IsLocalMode || IsRemoteWorkspaceMode;
 
 /** Maximum modifications to track */
 const MODIFICATION_LIMIT = 100;
-
-/** Global registry for document lookup */
-export const DocumentRegistry = new Map<string, DatabaseDocument>();
 
 /**
  * Get auto-commit setting from configuration.

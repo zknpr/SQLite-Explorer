@@ -77,6 +77,13 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
   }
 
   /**
+   * Check if the provider is read-only.
+   */
+  get isReadOnly(): boolean {
+    return true;
+  }
+
+  /**
    * Open a SQLite database as a custom document.
    *
    * @param uri - Database file URI
@@ -386,6 +393,13 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
  * Extends the read-only provider with edit, save, and revert capabilities.
  */
 export class DatabaseEditorProvider extends DatabaseViewerProvider implements vsc.CustomEditorProvider<DatabaseDocument> {
+  /**
+   * Check if the provider is read-only.
+   */
+  get isReadOnly(): boolean {
+    return false;
+  }
+
   /**
    * Configure event listeners including edit tracking.
    */
