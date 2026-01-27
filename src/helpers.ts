@@ -10,7 +10,7 @@
  */
 
 import * as vsc from 'vscode';
-import { base58, base64urlnopad } from '@scure/base';
+import { base64urlnopad } from '@scure/base';
 import { crypto } from './platform/cryptoShim';
 import { Title } from './config';
 
@@ -210,17 +210,6 @@ export function cancelTokenToAbortSignal<T extends vsc.CancellationToken | null 
 /** UTF-8 text encoder instance */
 const textEncoder = new TextEncoder();
 
-/**
- * Generate a short base58-encoded hash of a string.
- *
- * @param input - String to hash
- * @returns 6-byte SHA-256 hash encoded as base58
- */
-export async function shortHash(input: string): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest('SHA-256', textEncoder.encode(input));
-  const hashBytes = new Uint8Array(hashBuffer).subarray(0, 6);
-  return base58.encode(hashBytes);
-}
 
 /**
  * Generate a base64url-encoded hash of a string.
@@ -229,18 +218,12 @@ export async function shortHash(input: string): Promise<string> {
  * @param length - Number of bytes to use (default 6)
  * @returns Truncated SHA-256 hash encoded as base64url
  */
-export async function hash64(input: string, length: number = 6): Promise<string> {
+async function hash64(input: string, length: number = 6): Promise<string> {
   const hashBuffer = await crypto.subtle.digest('SHA-256', textEncoder.encode(input));
   const hashBytes = new Uint8Array(hashBuffer).subarray(0, length);
   return base64urlnopad.encode(hashBytes);
 }
 
-/**
- * Get a short hash of the machine ID for anonymization.
- */
-export async function getShortMachineId(): Promise<string> {
-  return shortHash(vsc.env.machineId);
-}
 
 /**
  * Generate a unique key for a database document.
@@ -277,23 +260,6 @@ export function doTry<T extends (...args: unknown[]) => unknown>(fn: T): ReturnT
   }
 }
 
-/**
- * Execute an async function and suppress any errors.
- *
- * @param fn - Async function to execute
- * @returns Promise resolving to function result or undefined on error
- */
-export async function doTryAsync<T extends (...args: unknown[]) => Promise<unknown>>(
-  fn: T
-): Promise<Awaited<ReturnType<T>> | undefined> {
-  try {
-    return await fn() as Awaited<ReturnType<T>>;
-  } catch (err) {
-    if (import.meta.env.DEV) {
-      console.warn(`[${Title}]`, err instanceof Error ? err.message : String(err));
-    }
-  }
-}
 
 // ============================================================================
 // String Utilities
@@ -371,23 +337,3 @@ export function toBoolString(value?: boolean | null): BoolString | undefined {
   return undefined;
 }
 
-// ============================================================================
-// Binary Utilities
-// ============================================================================
-
-/**
- * Concatenate multiple Uint8Array chunks into one.
- *
- * @param chunks - Array of Uint8Array chunks
- * @returns Single concatenated Uint8Array
- */
-export function concat(chunks: Uint8Array[]): Uint8Array {
-  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return result;
-}
