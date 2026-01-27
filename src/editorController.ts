@@ -14,7 +14,6 @@ import { ConfigurationSection, CopilotChatId, ExtensionId, FistInstallMs, FullEx
 import { Disposable } from './lifecycle';
 import { IsVSCode, IsVSCodium, WebviewCollection, cspUtil, doTry, toDatasetAttrs, themeToCss, uiKindToString, BoolString, toBoolString, IsCursorIDE, lang } from './helpers';
 
-import { enterLicenseKeyCommand } from './commandHandlers';
 import { SupportsWriteMode, IsRemoteWorkspaceMode, DatabaseDocument, isAutoCommitEnabled } from './databaseModel';
 
 import { buildMethodProxy, processProtocolMessage } from './core/rpc';
@@ -356,12 +355,6 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     return preparedHtml;
   }
 
-  /**
-   * Enter license key command handler.
-   */
-  enterLicenseKey() {
-    return enterLicenseKeyCommand(this.context, this.reporter);
-  }
 }
 
 /**

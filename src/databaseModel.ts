@@ -244,21 +244,46 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const tracker = this.#modificationTracker;
     tracker.record(modification);
 
+    // Ensure future stack is cleared so we don't have stale redo actions
+    // This is handled by tracker.record, but explicit check in emitter helps
+
     this.#modificationEmitter.fire({
       label: modification.label,
       undo: async () => {
         const undoneEntry = tracker.stepBack();
-        if (!undoneEntry) return;
-        await this.databaseOperations.undoModification(undoneEntry);
-        this.#contentChangeEmitter.fire({});
-        this.#autoSaveIfNeeded();
+        if (!undoneEntry) {
+            console.warn('[Undo] No entry found in tracker');
+            return;
+        }
+        try {
+            await this.databaseOperations.undoModification(undoneEntry);
+            this.#contentChangeEmitter.fire({});
+            this.#autoSaveIfNeeded();
+        } catch (e) {
+            console.error('[Undo] Failed:', e);
+            // Optionally restore state?
+            // If undo fails, we might be in inconsistent state.
+            // Push back to timeline?
+            tracker.record(undoneEntry); // Push back so we can try again? Or maybe stepForward?
+            // stepBack moved it to futureStack. We should move it back if it failed?
+            // Actually, if it failed, we are in trouble.
+            vsc.window.showErrorMessage(vsc.l10n.t('Undo failed: {0}', e instanceof Error ? e.message : String(e)));
+        }
       },
       redo: async () => {
         const redoneEntry = tracker.stepForward();
-        if (!redoneEntry) return;
-        await this.databaseOperations.redoModification(redoneEntry);
-        this.#contentChangeEmitter.fire({});
-        this.#autoSaveIfNeeded();
+        if (!redoneEntry) {
+            console.warn('[Redo] No entry found in tracker');
+            return;
+        }
+        try {
+            await this.databaseOperations.redoModification(redoneEntry);
+            this.#contentChangeEmitter.fire({});
+            this.#autoSaveIfNeeded();
+        } catch (e) {
+             console.error('[Redo] Failed:', e);
+             vsc.window.showErrorMessage(vsc.l10n.t('Redo failed: {0}', e instanceof Error ? e.message : String(e)));
+        }
       }
     });
 

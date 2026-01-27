@@ -55,7 +55,6 @@ The extension uses a three-layer communication architecture:
 | `src/virtualFileSystem.ts` | Virtual FS provider for editing cells in tabs |
 | `src/loggingDatabaseOperations.ts` | Decorator for logging SQL queries |
 | `core/ui/modules/settings.js` | UI logic for database settings/pragma editor |
-| `core/ui/modules/batch.js` | UI logic for batch row updates |
 | `core/ui/viewer.html` | Standalone webview UI |
 | `assets/sqlite3.wasm` | SQLite WebAssembly binary |
 

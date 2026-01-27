@@ -199,7 +199,8 @@ export class HostBridge implements ToastService {
       description: `Insert row into ${table}`,
       modificationType: 'row_insert',
       targetTable: table,
-      targetRowId: rowId
+      targetRowId: rowId,
+      rowData: data
     });
 
     return rowId;
@@ -218,6 +219,41 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
+    // Capture row data before deletion for undo
+    let deletedRowsData: { rowId: RecordId; row: Record<string, CellValue> }[] = [];
+    try {
+        const validIds = rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+        if (validIds.length > 0) {
+            const placeholders = validIds.map(() => '?').join(', ');
+            // We select rowid to map back correctly, though we already have IDs.
+            // Using * to get all columns.
+            const sql = `SELECT rowid, * FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`;
+            const result = await document.databaseOperations.executeQuery(sql, validIds);
+
+            if (result && result.length > 0 && result[0].rows) {
+                const headers = result[0].headers;
+                const rows = result[0].rows;
+
+                deletedRowsData = rows.map(r => {
+                    const rowData: Record<string, CellValue> = {};
+                    // First col is rowid because we asked for it
+                    const rId = r[0] as number;
+                  
+
+                    for (let i = 0; i < headers.length; i++) {
+                        const name = headers[i];
+                        if (name !== 'rowid') {
+                            rowData[name] = r[i];
+                        }
+                    }
+                    return { rowId: rId, row: rowData };
+                });
+            }
+        }
+    } catch (e) {
+        console.warn('Failed to fetch rows for undo history:', e);
+    }
+
     if ('deleteRows' in document.databaseOperations) {
       await (document.databaseOperations as any).deleteRows(table, rowIds);
     } else {
@@ -230,7 +266,8 @@ export class HostBridge implements ToastService {
       description: `Delete ${rowIds.length} rows from ${table}`,
       modificationType: 'row_delete',
       targetTable: table,
-      affectedRowIds: rowIds
+      affectedRowIds: rowIds,
+      deletedRows: deletedRowsData
     });
   }
 
@@ -286,7 +323,8 @@ export class HostBridge implements ToastService {
       label: 'Create Table',
       description: `Create table ${table}`,
       modificationType: 'table_create',
-      targetTable: table
+      targetTable: table,
+      tableDef: { columns }
     });
   }
 
@@ -322,7 +360,8 @@ export class HostBridge implements ToastService {
       affectedCells: updates.map(u => ({
         rowId: u.rowId,
         columnName: u.column,
-        newValue: u.value
+        newValue: u.value,
+        priorValue: u.originalValue
       }))
     });
   }
@@ -352,7 +391,8 @@ export class HostBridge implements ToastService {
       description: `Add column ${column} to ${table}`,
       modificationType: 'column_add',
       targetTable: table,
-      targetColumn: column
+      targetColumn: column,
+      columnDef: { type, defaultValue }
     });
   }
 
@@ -545,19 +585,6 @@ export class HostBridge implements ToastService {
     this.document.recordExternalModification(edit);
   }
 
-  /**
-   * Enter license key dialog.
-   */
-  async enterLicenseKey() {
-    try {
-      await this.viewerProvider.enterLicenseKey();
-    } catch (err) {
-      vsc.window.showErrorMessage(`'Enter License Key' resulted in an error`, {
-        modal: true,
-        detail: err instanceof Error ? err.message : String(err)
-      });
-    }
-  }
 
   /**
    * Save sidebar state to global storage.
@@ -635,15 +662,9 @@ export class HostBridge implements ToastService {
       // Ensure documentKey is safe for URI path
       const docKey = await document.documentKey;
 
-      // Construct URI path explicitly: /docKey/table/schema/rowId/filename
-      // We map empty strings to empty strings, join will produce // for empty schema
-      // But we filter empty segments in FS provider, so we should arguably NOT produce empty segments here if we want to match length 4 logic?
-      // Or we produce empty segment and FS provider sees 5 parts with one empty?
-      // filter(p => p.length > 0) removes empty segments!
-      // So if schema is empty, [docKey, table, '', rowId, filename] -> join('/') -> docKey/table//rowId/filename
-      // split('/').filter(...) -> [docKey, table, rowId, filename] (4 parts)
-      // This matches the 4-part logic in virtualFileSystem.ts!
-
+      // Construct URI path explicitly: /docKey/table/rowId/filename
+      // Empty segments (like schema name if not present) are filtered out by split().filter()
+      // in the file system provider, ensuring the path parts match the expected structure.
       const uriPath = [docKey, ...cellParts].map(p => encodeURIComponent(p)).join('/');
 
       const cellUri = vsc.Uri.from({

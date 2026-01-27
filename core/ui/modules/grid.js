@@ -205,6 +205,22 @@ export async function loadTableColumns() {
             dflt_value: r.defaultExpression,
             isPrimaryKey: r.primaryKeyPosition > 0
         })).sort((a, b) => a.cid - b.cid);
+
+        // Sanitize state based on new columns
+        const colNames = new Set(state.tableColumns.map(c => c.name));
+
+        // 1. Reset sort if column is gone
+        if (state.sortedColumn && !colNames.has(state.sortedColumn)) {
+            state.sortedColumn = null;
+            state.sortAscending = true;
+        }
+
+        // 2. Clear filters for deleted columns
+        for (const col of Object.keys(state.columnFilters)) {
+            if (!colNames.has(col)) {
+                delete state.columnFilters[col];
+            }
+        }
     } catch (err) {
         console.error('Error loading columns:', err);
         updateStatus('Error loading columns');
@@ -257,23 +273,9 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         const isTable = state.selectedTableType === 'table';
         const columnNames = state.tableColumns.map(c => c.name);
 
-        // For tables, we need rowid. We can't ask `fetchTableData` to add it automatically easily without schema knowledge.
-        // But we can ask for 'rowid' as a column.
-        // The previous logic was: `SELECT rowid AS _rowid_, ...`
-        // `query-builder` does `SELECT ${escapedColumns} ...`
-        // So we can pass `['rowid AS _rowid_', ...columnNames]`?
-        // `query-builder` escapes columns. `escapeIdentifier('rowid AS _rowid_')` -> `"rowid AS _rowid_"` which is invalid SQL.
-        // We need to modify query-builder to handle aliases or just special case rowid.
-        // OR we just request `rowid` and `*`?
-
-        // Let's modify `query-builder.ts` to allow raw columns or aliases?
-        // Or handle the rowid requirement in `fetchTableData` backend side.
-
-        // Actually, let's just pass `rowid` in columns if it's a table.
-        // But `rowid` isn't in `state.tableColumns`.
-        // If we request `columns: ['rowid', 'name']`, query builder does `SELECT "rowid", "name"`. This works.
+        // For tables, we need to explicitly request the 'rowid' column to handle row identification.
         // The frontend expects rowid at index 0 for tables (see `getRowId` and `getRowDataOffset`).
-
+        // Query builder handles the construction: SELECT "rowid", "col1", ...
         const queryColumns = isTable ? ['rowid', ...columnNames] : columnNames;
 
         const queryOptions = {
@@ -564,7 +566,9 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
 
             const textSpan = document.createElement('span');
             textSpan.className = 'cell-text';
-            textSpan.textContent = displayValue;
+            // Use innerHTML because formatCellValue returns HTML-escaped string.
+            // Using textContent would double-escape characters (showing &quot; instead of ").
+            textSpan.innerHTML = displayValue;
             td.appendChild(textSpan);
 
             if (hasContent) {
@@ -885,10 +889,9 @@ function onColumnResize(event) {
         cell.style.maxWidth = `${newWidth}px`;
     }
 
-    // If we are resizing a pinned column, we might need to re-render to update subsequent pinned columns' left offsets
+    // If we are resizing a pinned column, subsequent pinned columns' offsets might change.
+    // We defer the full re-render to stopColumnResize to avoid performance degradation during drag.
     if (state.pinnedColumns.has(state.resizingColumn)) {
-        // Debounce full re-render? Or just let it be slightly off during drag?
-        // Full re-render is heavy. Let's leave it for stopColumnResize
     }
 }
 
@@ -911,13 +914,9 @@ function stopColumnResize() {
 
 // Row Selection
 export function onRowClick(event, rowId, rowIdx) {
-    // Selection logic handled in onRowNumberClick mostly, but we can support clicking anywhere on row
-    // But we need to distinguish from cell selection.
-    // Viewer.js `onRowClick` was empty/not used for selection logic except triggering fire event?
-    // Looking at viewer.js: onRowClick was defined but empty in logic I saw?
-    // Wait, viewer.js `onRowClick` had: `data-rowid="${rowId}" data-rowidx="${rowIdx}" onclick="onRowClick(event, ${rowId}, ${rowIdx})"`
-    // But I didn't see the implementation in the snippets.
-    // Let's assume standard row selection if not clicking a cell with content.
+    // Row selection is primarily handled by `onRowNumberClick`.
+    // This handler remains as a hook for potential future row-click behaviors
+    // that differ from cell selection.
 }
 
 export function onRowNumberClick(event, rowId) {
@@ -1073,15 +1072,7 @@ export function clearSelection() {
 // Cell Double Click (Edit)
 export function onCellDoubleClick(event, rowIdx, colIdx, rowId) {
     if (state.cellEditBehavior === 'vscode') {
-        // Need to simulate opening preview first to set state.cellPreviewInfo if openCellInVsCode depends on it?
-        // openCellInVsCode uses state.cellPreviewInfo.
-        // We should refactor openCellInVsCode or set the info directly.
-
-        // Actually openCellInVsCode requires state.cellPreviewInfo to be set.
-        // And openCellPreview sets it.
-        // Let's manually set it or refactor.
-        // Refactoring openCellInVsCode to take params is better, but for now let's set state.
-
+        // Prepare preview info for VS Code editor
         const column = state.tableColumns[colIdx];
         if (!column) return;
         const row = state.gridData[rowIdx];

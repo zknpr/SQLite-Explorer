@@ -208,9 +208,16 @@ async function initializeApp() {
             if ((event.metaKey || event.ctrlKey) && (event.key === 'Delete' || event.key === 'Backspace')) {
                 if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
 
-                if (state.selectedTable && state.selectedTableType === 'table' && state.selectedCells.length > 0) {
+                if (state.selectedTable && state.selectedTableType === 'table') {
                     event.preventDefault();
-                    await clearSelectedCellValues();
+                    // Priority: Columns -> Rows -> Cells (Clear)
+                    if (state.selectedColumns.size > 0) {
+                        await submitDelete();
+                    } else if (state.selectedRowIds.size > 0) {
+                        await submitDelete();
+                    } else if (state.selectedCells.length > 0) {
+                        await clearSelectedCellValues();
+                    }
                 }
             }
         });

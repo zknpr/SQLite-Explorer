@@ -69,9 +69,9 @@ export async function copySelectedRowsToClipboard() {
         // Collect rows
         const dataRows = [];
         for (let i = 0; i < state.gridData.length; i++) {
-            // Use getRowId logic but we don't import it here directly, assume row[0] if table
-            // Actually let's just use the selectedRowIds map against the grid data
-            // We need to re-derive row IDs for checking
+            // Derive row ID to check against the selection set.
+            // For tables, the row ID is always at index 0.
+            // For views (which lack rowid), use the calculated pagination index.
             const row = state.gridData[i];
             let rowId;
             if (state.selectedTableType === 'table') {
@@ -146,7 +146,7 @@ export async function clearSelectedCellValues() {
         state.selectedColumns.clear();
 
         // Full reload or just local update?
-        // Let's do loadTableData to be safe
+        // Perform a full reload to ensure UI consistency with backend state.
         await loadTableData();
         updateToolbarButtons();
         updateStatus(`${label} - Ctrl+S to save`);

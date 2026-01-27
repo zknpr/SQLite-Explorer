@@ -470,11 +470,19 @@ body {
     background-color: var(--bg-secondary) !important;
 }
 
-/* Pinned column cells should NOT become transparent on hover/selection */
-/* They keep their solid background to hide sliding content */
-.data-row:hover .data-cell.pinned,
+/* Pinned column cells should show selection color when row is selected */
 .data-row.selected .data-cell.pinned {
-    background-color: var(--bg-secondary) !important;
+    background: linear-gradient(var(--active-bg), var(--active-bg)), var(--bg-secondary) !important;
+}
+
+/* Pinned column cells should show selection color when column is selected */
+.header-cell.pinned.column-selected {
+    background: linear-gradient(var(--active-bg), var(--active-bg)), var(--bg-secondary) !important;
+}
+
+/* Pinned column cells should show selection color when cell is selected */
+.data-cell.pinned.cell-selected {
+    background: linear-gradient(var(--active-bg), var(--active-bg)), var(--bg-secondary) !important;
 }
 
 /* Pinned rows - sticky top (top offset set via inline style) */
@@ -491,11 +499,10 @@ body {
     box-shadow: 0 1px 0 0 var(--border-color);
 }
 
-/* Pinned row cells should NOT become transparent on hover/selection */
-/* They keep their solid background to hide sliding content */
-.data-row.pinned:hover td,
+/* Pinned row cells should show selection color when selected */
+/* We layer the active background over the secondary background to ensure opacity */
 .data-row.pinned.selected td {
-    background-color: var(--bg-secondary) !important;
+    background: linear-gradient(var(--active-bg), var(--active-bg)), var(--bg-secondary) !important;
 }
 
 /* Cell that is both in pinned row AND pinned column */
@@ -506,10 +513,9 @@ body {
     z-index: 15 !important; /* Highest priority */
 }
 
-/* Cells in pinned row AND pinned column keep solid background on hover/selection */
-.data-row.pinned:hover td.pinned,
+/* Selected cell in pinned row/col */
 .data-row.pinned.selected td.pinned {
-    background-color: var(--bg-secondary) !important;
+    background: linear-gradient(var(--active-bg), var(--active-bg)), var(--bg-secondary) !important;
 }
 
 /* Pin indicator icon - using codicon */

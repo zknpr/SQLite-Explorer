@@ -113,18 +113,163 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
   /**
    * Undo a modification.
-   * Handled at extension level through history tracking.
    */
-  async undoModification(_mod: ModificationEntry): Promise<void> {
-    // Extension handles undo via re-executing inverse queries
+  async undoModification(mod: ModificationEntry): Promise<void> {
+    const { modificationType, targetTable, targetRowId, targetColumn, priorValue, affectedCells, deletedRows, columnDef } = mod;
+    if (!targetTable) return;
+
+    switch (modificationType) {
+        case 'cell_update':
+            if (affectedCells) {
+                // Batch undo
+                // We shouldn't use a single transaction if the extension handles it, but here we can to be safe.
+                await this.executeQuery('BEGIN TRANSACTION');
+                try {
+                    for (const cell of affectedCells) {
+                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.priorValue);
+                    }
+                    await this.executeQuery('COMMIT');
+                } catch (e) {
+                    await this.executeQuery('ROLLBACK');
+                    throw e;
+                }
+            } else if (targetRowId !== undefined && targetColumn) {
+                // Single cell undo
+                await this.updateCell(targetTable, targetRowId, targetColumn, priorValue);
+            }
+            break;
+
+        case 'row_insert':
+            // Undo insert = delete row
+            if (targetRowId !== undefined) {
+                await this.deleteRows(targetTable, [targetRowId]);
+            }
+            break;
+
+        case 'row_delete':
+            // Undo delete = re-insert rows
+            if (deletedRows && deletedRows.length > 0) {
+                await this.executeQuery('BEGIN TRANSACTION');
+                try {
+                    for (const { rowId, row } of deletedRows) {
+                        // row already contains rowid if needed (handled in HostBridge)
+                        await this.insertRow(targetTable, row);
+                    }
+                    await this.executeQuery('COMMIT');
+                } catch (e) {
+                    await this.executeQuery('ROLLBACK');
+                    throw e;
+                }
+            }
+            break;
+
+        case 'column_add':
+            // Undo add column = drop column
+            if (targetColumn) {
+                await this.deleteColumns(targetTable, [targetColumn]);
+            }
+            break;
+
+        case 'column_drop':
+            // Undo drop column = add column + restore values
+            if (deletedColumns) {
+                await this.executeQuery('BEGIN TRANSACTION');
+                try {
+                    for (const col of deletedColumns) {
+                        await this.addColumn(targetTable, col.name, col.type);
+                        // Restore values
+                     
+                        const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`;
+                        const stmt = this.instance.prepare(sql);
+                        try {
+                            for (const { rowId, value } of col.data) {
+                                stmt.run([value, Number(rowId)]);
+                            }
+                        } finally {
+                            stmt.free();
+                        }
+                    }
+                    await this.executeQuery('COMMIT');
+                } catch (e) {
+                    await this.executeQuery('ROLLBACK');
+                    throw e;
+                }
+            }
+            break;
+
+        case 'table_create':
+            // Undo create table = drop table
+            await this.executeQuery(`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`);
+            break;
+    }
   }
 
   /**
    * Redo a modification.
-   * Handled at extension level through history tracking.
    */
-  async redoModification(_mod: ModificationEntry): Promise<void> {
-    // Extension handles redo via re-executing queries
+  async redoModification(mod: ModificationEntry): Promise<void> {
+    const { modificationType, targetTable, targetRowId, targetColumn, newValue, affectedCells, affectedRowIds, rowData, tableDef, columnDef } = mod;
+    if (!targetTable) return;
+
+    switch (modificationType) {
+        case 'cell_update':
+            if (affectedCells) {
+                // Batch redo
+                await this.executeQuery('BEGIN TRANSACTION');
+                try {
+                    for (const cell of affectedCells) {
+                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.newValue);
+                    }
+                    await this.executeQuery('COMMIT');
+                } catch (e) {
+                    await this.executeQuery('ROLLBACK');
+                    throw e;
+                }
+            } else if (targetRowId !== undefined && targetColumn) {
+                await this.updateCell(targetTable, targetRowId, targetColumn, newValue);
+            }
+            break;
+
+        case 'row_insert':
+            // Redo insert = insert again
+            if (rowData) {
+                // If we have the original rowId, enforce it to maintain history consistency
+                const dataToInsert = targetRowId !== undefined
+                    ? { ...rowData, rowid: targetRowId }
+                    : rowData;
+                await this.insertRow(targetTable, dataToInsert);
+            }
+            break;
+
+        case 'row_delete':
+            // Redo delete = delete rows
+            if (affectedRowIds) {
+                await this.deleteRows(targetTable, affectedRowIds);
+            }
+            break;
+
+        case 'column_add':
+            // Redo add column = add column
+            if (targetColumn && columnDef) {
+                await this.addColumn(targetTable, targetColumn, columnDef.type, columnDef.defaultValue);
+            }
+            break;
+
+        case 'column_drop':
+            // Redo drop column = drop column
+            if (deletedColumns) {
+                const colNames = deletedColumns.map(c => c.name);
+                await this.deleteColumns(targetTable, colNames);
+            }
+            break;
+
+        case 'table_create':
+            // Redo create table
+            if (tableDef && tableDef.columns) {
+                await this.createTable(targetTable, tableDef.columns);
+            }
+            break;
+    }
   }
 
   /**
@@ -325,9 +470,8 @@ class WasmDatabaseEngine implements DatabaseOperations {
                             currentValue = row[0];
                         }
 
-                        // Reset statement is generally required in C API but sql.js get() might handle it?
-                        // Actually get() automatically resets if stepping is done?
-                        // For safety in a loop with get():
+                        // According to sqlite3 C API documentation, sqlite3_reset() is required to reuse a prepared statement.
+                        // Ideally, we should ensure the statement is reset for the next iteration.
                         selectStmt.reset();
                      }
 

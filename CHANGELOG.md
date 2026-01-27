@@ -2,15 +2,27 @@
 
 ## 1.1.6
 
+### New Features
+
+- **Comprehensive Undo/Redo**: Added full support for undoing and redoing all operations including row/column creation and deletion, batch updates, and drag-and-drop.
+- **Smart Delete**: `Cmd+Delete` (or `Ctrl+Delete`) now intelligently deletes selected columns or rows, or clears selected cells if no structure is selected.
+
 ### Performance
 
 - **Large Export Optimization**: Implemented streaming and keyset pagination for table exports, preventing OOM crashes on large datasets.
 - **Rendering Optimization**: Refactored data grid rendering to use `DocumentFragment` for reduced DOM thrashing.
+- **Batch Update Optimization**: Refactored `applyBatchUpdate` to parse JSON patches once per column instead of per cell.
+
+### Bug Fixes
+
+- **JSON Visualization**: Fixed double-escaping of HTML entities in the data grid, ensuring JSON objects display correctly.
+- **Pinned Highlighting**: Improved visual styling for pinned rows and columns to maintain legibility when selected.
 
 ### Maintenance
 
-- **Cleanup**: Removed dead code and unused RPC methods (`enterAccessTokenCommand`, `downloadBlob`, etc.).
-- **Cleanup**: Removed unused files and debug logging.
+- **Cleanup**: Removed dead code, unused RPC methods (`enterAccessTokenCommand`, `downloadBlob`), and unused files (`batch.js`).
+- **Dependency Cleanup**: Removed unused `@workers/v8-value-serializer` and moved `@vscode/vsce` to devDependencies.
+- **Refactoring**: Converted internal monologue comments to professional documentation.
 
 ## 1.1.5
 

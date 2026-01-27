@@ -98,9 +98,6 @@ const compileNodeMain = () =>
     outfile: resolve(outDir, 'extension.js'),
     platform: 'node',
     format: 'cjs',
-    alias: {
-      '@workers/v8-value-serializer/v8': 'node:v8',
-    },
     define: {
       ...baseConfig.define,
       ...envToDefine({
@@ -163,9 +160,6 @@ const compileNodeWorker = () =>
     platform: 'node',
     format: 'cjs',
     external: ['worker_threads', 'node:v8'],
-    alias: {
-      '@workers/v8-value-serializer/v8': 'node:v8',
-    },
     define: {
       ...baseWorkerConfig.define,
       ...envToDefine({

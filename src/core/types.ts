@@ -119,6 +119,7 @@ export type ModificationType =
   | 'row_delete'
   | 'table_create'
   | 'column_add'
+  | 'column_drop'
   | 'table_drop';
 
 /**
@@ -149,6 +150,20 @@ export interface ModificationEntry {
     columnName: string;
     priorValue?: CellValue;
     newValue?: CellValue;
+  }[];
+  /** Row data for insert/delete undo/redo */
+  rowData?: Record<string, CellValue>;
+  /** Multiple deleted rows data */
+  deletedRows?: { rowId: RecordId; row: Record<string, CellValue> }[];
+  /** Table definition for create/drop undo/redo */
+  tableDef?: { columns: ColumnDefinition[] };
+  /** Column definition for add/drop undo/redo */
+  columnDef?: { type: string; defaultValue?: string };
+  /** Deleted columns data for column_drop undo */
+  deletedColumns?: {
+      name: string;
+      type: string;
+      data: { rowId: RecordId; value: CellValue }[];
   }[];
 }
 

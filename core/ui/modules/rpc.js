@@ -2,7 +2,8 @@
  * RPC Communication Layer
  */
 import { state } from './state.js';
-import { loadTableData } from './grid.js';
+import { loadTableData, loadTableColumns } from './grid.js';
+import { refreshSchema } from './sidebar.js';
 import { handleRpcResponse, sendRpcResult, sendRpcError } from './api.js';
 
 export { backendApi } from './api.js';
@@ -12,8 +13,33 @@ export { backendApi } from './api.js';
  */
 const webviewMethods = {
     async refreshContent(filename) {
-        if (state.isDbConnected && state.selectedTable) {
-            await loadTableData(false);
+        if (state.isDbConnected) {
+            // Refresh schema to reflect added/removed tables or views
+            await refreshSchema();
+
+            // Validate if selected table still exists
+            const tableExists = state.schemaCache.tables.some(t => t.name === state.selectedTable) ||
+                                state.schemaCache.views.some(v => v.name === state.selectedTable);
+
+            if (!tableExists && state.selectedTable) {
+                // Table was deleted (e.g. undo create table)
+                state.selectedTable = null;
+                state.selectedTableType = null;
+                // Show empty state
+                document.getElementById('tableNameLabel').textContent = 'No table selected';
+                document.getElementById('gridContainer').innerHTML = `
+                    <div class="empty-view">
+                        <span class="empty-icon codicon codicon-database"></span>
+                        <span class="empty-title">Select a table</span>
+                        <span class="empty-desc">Choose a table from the sidebar to view data</span>
+                    </div>
+                `;
+            } else if (state.selectedTable) {
+                // Refresh columns to reflect added/removed columns
+                await loadTableColumns();
+                // Refresh data to reflect row changes
+                await loadTableData(false);
+            }
         }
         return { success: true };
     },

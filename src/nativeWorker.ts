@@ -476,46 +476,177 @@ export async function createNativeDatabaseConnection(
 
         /**
          * Undo a modification by executing the inverse SQL.
-         * For cell updates: sets the value back to previousValue.
          */
         undoModification: async (mod: ModificationEntry) => {
-          if (mod.modificationType === 'cell_update' && mod.targetTable && mod.targetColumn && mod.targetRowId !== undefined) {
-            // SECURITY: Validate rowId is a number to prevent SQL injection.
-            // RecordId type allows string | number, but rowid should always be numeric.
-            // A compromised webview could send a malicious string like "1; DROP TABLE users; --"
-            const rowIdNum = Number(mod.targetRowId);
-            if (!Number.isFinite(rowIdNum)) {
-              throw new Error(`Invalid rowid: ${mod.targetRowId}`);
-            }
+          const { modificationType, targetTable, targetRowId, targetColumn, priorValue, affectedCells, deletedRows, columnDef } = mod;
+          if (!targetTable) return;
 
-            const sqlValue = cellValueToSql(mod.priorValue);
-            // Use escapeIdentifier to prevent SQL injection via malicious table/column names
-            const sql = `UPDATE ${escapeIdentifier(mod.targetTable)} SET ${escapeIdentifier(mod.targetColumn)} = ${sqlValue} WHERE rowid = ${rowIdNum}`;
-            await worker.call('query', [sql]);
+          switch (modificationType) {
+            case 'cell_update':
+              if (affectedCells) {
+                // Batch undo
+                const updates = affectedCells.map(c => ({
+                    rowId: c.rowId,
+                    column: c.columnName,
+                    value: c.priorValue
+                } as CellUpdate));
+                await worker.call('execBatch', [
+                    updates.map(u => ({
+                        sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(u.column)} = ? WHERE rowid = ?`,
+                        params: [u.value, Number(u.rowId)]
+                    }))
+                ]);
+              } else if (targetRowId !== undefined && targetColumn) {
+                const rowIdNum = Number(targetRowId);
+                const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(targetColumn)} = ? WHERE rowid = ?`;
+                await worker.call('run', [sql, [priorValue, rowIdNum]]);
+              }
+              break;
+
+            case 'row_insert':
+              if (targetRowId !== undefined) {
+                await worker.call('run', [`DELETE FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`, [Number(targetRowId)]]);
+              }
+              break;
+
+            case 'row_delete':
+              if (deletedRows && deletedRows.length > 0) {
+                const batch = [];
+                for (const { rowId, row } of deletedRows) {
+                    // row already contains rowid if needed
+                    const columns = Object.keys(row);
+                    const colNames = columns.map(escapeIdentifier).join(', ');
+                    const placeholders = columns.map(() => '?').join(', ');
+                    const params = columns.map(c => row[c]);
+                    batch.push({
+                        sql: `INSERT INTO ${escapeIdentifier(targetTable)} (${colNames}) VALUES (${placeholders})`,
+                        params
+                    });
+                }
+                await worker.call('execBatch', [batch]);
+              }
+              break;
+
+            case 'column_add':
+              if (targetColumn) {
+                await worker.call('run', [`ALTER TABLE ${escapeIdentifier(targetTable)} DROP COLUMN ${escapeIdentifier(targetColumn)}`]);
+              }
+              break;
+
+            case 'column_drop':
+                if (deletedColumns) {
+                    const batch = [];
+                    // 1. Add columns back
+                    for (const col of deletedColumns) {
+                        // We can't batch DDL usually, so run immediately
+                        await worker.call('run', [`ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(col.name)} ${col.type}`]);
+                    }
+                    // 2. Restore values
+                    for (const col of deletedColumns) {
+                        for (const { rowId, value } of col.data) {
+                            batch.push({
+                                sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`,
+                                params: [value, Number(rowId)]
+                            });
+                        }
+                    }
+                    if (batch.length > 0) {
+                        await worker.call('execBatch', [batch]);
+                    }
+                }
+                break;
+
+            case 'table_create':
+                await worker.call('run', [`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`]);
+                break;
           }
-          // Other modification types can be added as needed
         },
 
         /**
          * Redo a modification by re-executing the original change.
-         * For cell updates: sets the value to newValue.
          */
         redoModification: async (mod: ModificationEntry) => {
-          if (mod.modificationType === 'cell_update' && mod.targetTable && mod.targetColumn && mod.targetRowId !== undefined) {
-            // SECURITY: Validate rowId is a number to prevent SQL injection.
-            // RecordId type allows string | number, but rowid should always be numeric.
-            // A compromised webview could send a malicious string like "1; DROP TABLE users; --"
-            const rowIdNum = Number(mod.targetRowId);
-            if (!Number.isFinite(rowIdNum)) {
-              throw new Error(`Invalid rowid: ${mod.targetRowId}`);
-            }
+          const { modificationType, targetTable, targetRowId, targetColumn, newValue, affectedCells, affectedRowIds, rowData, tableDef, columnDef } = mod;
+          if (!targetTable) return;
 
-            const sqlValue = cellValueToSql(mod.newValue);
-            // Use escapeIdentifier to prevent SQL injection via malicious table/column names
-            const sql = `UPDATE ${escapeIdentifier(mod.targetTable)} SET ${escapeIdentifier(mod.targetColumn)} = ${sqlValue} WHERE rowid = ${rowIdNum}`;
-            await worker.call('query', [sql]);
+          switch (modificationType) {
+            case 'cell_update':
+              if (affectedCells) {
+                const updates = affectedCells.map(c => ({
+                    rowId: c.rowId,
+                    column: c.columnName,
+                    value: c.newValue
+                } as CellUpdate));
+                await worker.call('execBatch', [
+                    updates.map(u => ({
+                        sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(u.column)} = ? WHERE rowid = ?`,
+                        params: [u.value, Number(u.rowId)]
+                    }))
+                ]);
+              } else if (targetRowId !== undefined && targetColumn) {
+                const rowIdNum = Number(targetRowId);
+                const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(targetColumn)} = ? WHERE rowid = ?`;
+                await worker.call('run', [sql, [newValue, rowIdNum]]);
+              }
+              break;
+
+            case 'row_insert':
+              if (rowData) {
+                const dataToInsert = targetRowId !== undefined ? { ...rowData, rowid: targetRowId } : rowData;
+                const columns = Object.keys(dataToInsert);
+                const colNames = columns.map(escapeIdentifier).join(', ');
+                const placeholders = columns.map(() => '?').join(', ');
+                const params = columns.map(c => dataToInsert[c]);
+                await worker.call('run', [`INSERT INTO ${escapeIdentifier(targetTable)} (${colNames}) VALUES (${placeholders})`, params]);
+              }
+              break;
+
+            case 'row_delete':
+              if (affectedRowIds && affectedRowIds.length > 0) {
+                const ids = affectedRowIds.map(id => Number(id));
+                const placeholders = ids.map(() => '?').join(', ');
+                await worker.call('run', [`DELETE FROM ${escapeIdentifier(targetTable)} WHERE rowid IN (${placeholders})`, ids]);
+              }
+              break;
+
+            case 'column_add':
+              if (targetColumn && columnDef) {
+                 let sql = `ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(targetColumn)} ${columnDef.type}`;
+                 if (columnDef.defaultValue !== undefined && columnDef.defaultValue !== null && columnDef.defaultValue !== '') {
+                    // Re-use logic from addColumn or simplify (assuming simple defaults here)
+                    if (columnDef.defaultValue.toLowerCase() === 'null') {
+                        sql += ' DEFAULT NULL';
+                    } else if (!isNaN(Number(columnDef.defaultValue))) {
+                        sql += ` DEFAULT ${columnDef.defaultValue}`;
+                    } else {
+                        sql += ` DEFAULT '${columnDef.defaultValue.replace(/'/g, "''")}'`;
+                    }
+                 }
+                 await worker.call('run', [sql]);
+              }
+              break;
+
+            case 'column_drop':
+              if (deletedColumns) {
+                  for (const col of deletedColumns) {
+                      await worker.call('run', [`ALTER TABLE ${escapeIdentifier(targetTable)} DROP COLUMN ${escapeIdentifier(col.name)}`]);
+                  }
+              }
+              break;
+
+            case 'table_create':
+              if (tableDef && tableDef.columns) {
+                  // Re-use createTable logic
+                  const colDefs = tableDef.columns.map(col => {
+                    let def = `${escapeIdentifier(col.name)} ${col.type}`;
+                    if (col.primaryKey) def += ' PRIMARY KEY';
+                    if (col.notNull && !col.primaryKey) def += ' NOT NULL';
+                    return def;
+                  });
+                  await worker.call('run', [`CREATE TABLE ${escapeIdentifier(targetTable)} (${colDefs.join(', ')})`]);
+              }
+              break;
           }
-          // Other modification types can be added as needed
         },
 
         flushChanges: async () => {},
@@ -612,10 +743,8 @@ export async function createNativeDatabaseConnection(
           // Construct SQL from structured column definitions
           // columns is now ColumnDefinition[]
           const colDefs = columns.map(col => {
-            // If it's a string, it's legacy/unsafe mode - SHOULD NOT HAPPEN with new frontend
-            // But we can support it if we must, or throw.
+            // If it's a string, it indicates legacy/unsafe mode which is not supported.
             if (typeof col === 'string') {
-               // Fallback or Error? Let's Error to be strict about SQLi.
                throw new Error('Legacy string column definitions not supported for security');
             }
 
@@ -700,19 +829,8 @@ export async function createNativeDatabaseConnection(
          * Fetch database schema.
          */
         fetchSchema: async () => {
-          // Get schema using getSchema method on native worker which is optimized
-          // native-worker.js has a 'getSchema' method that returns { schema: [...] }
-          // Let's check what it returns exactly.
-          // src/nativeWorker.js:
-          // case "getSchema":
-          // ... result = { schema: [{ name, sql, columns: [...] }] }
-          // This structure is a bit different from SchemaSnapshot which has { tables, views, indexes }
-
-          // Ideally we should unify. For now, let's use manual queries like WASM to be consistent and simple
-          // OR reuse the existing getSchema if it provides everything we need.
-          // The existing getSchema gets tables and their columns. It doesn't seem to get views or indexes explicitly in the same way?
-          // Actually it queries sqlite_master for tables.
-          // Let's stick to the SQL queries used in WASM implementation for consistency and to ensure we get views/indexes.
+          // Use standard SQL queries to fetch schema information for consistency with the WASM implementation.
+          // This ensures we get tables, views, and indexes in a uniform format.
 
           // Run queries in parallel
           const [tablesResult, viewsResult, indexesResult] = await Promise.all([

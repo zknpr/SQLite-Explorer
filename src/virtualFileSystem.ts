@@ -60,9 +60,9 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
             
 
-            const isTable = true; // We mostly support tables for editing.
-
-            // Ideally we check if table exists and is a table.
+            // We assume the target is a table for editing purposes.
+            // Future improvement: verify if the target is a valid table or view in the schema.
+            const isTable = true;
 
             const colName = column;
             const rowIdNum = Number(rowId);
@@ -80,9 +80,8 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             const value = result?.[0]?.rows?.[0]?.[0];
 
             if (value === null) {
-                // Return empty or specific indicator?
-                // VS Code editor expects text.
-                return new Uint8Array(0); // Empty file for NULL
+                // Return empty content for NULL values as VS Code expects a string/buffer.
+                return new Uint8Array(0);
             }
 
             if (value instanceof Uint8Array) {
@@ -166,8 +165,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         // Note: VS Code URIs usually have a leading slash in path
         const pathParts = uri.path.split('/').filter(p => p.length > 0);
 
-        // We expect at least 4 parts: docKey, table, name, rowid, filename
-        // Actually:
+        // Path format structure:
         // [0] documentKey
         // [1] table
         // [2] name (optional grouping)

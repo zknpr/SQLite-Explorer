@@ -6,7 +6,7 @@ import { backendApi } from './api.js';
 import { escapeHtml } from './utils.js';
 import { updateStatus } from './ui.js';
 import { loadTableData, loadTableColumns } from './grid.js';
-import { getRowDataOffset, getRowId } from './data-utils.js';
+import { getRowDataOffset } from './data-utils.js';
 
 export async function refreshSchema() {
     if (!state.isDbConnected) return;
@@ -157,16 +157,29 @@ export async function applyBatchUpdate() {
     if (state.selectedCells.length === 0) return;
 
     const inputs = document.querySelectorAll('.batch-input');
-    const updates = [];
 
-    // Map inputs by column index for O(1) lookup
+    // 1. Validation and Setup Phase
+    // Map inputs by column index for O(1) lookup and validate JSON patches once
     const inputsByCol = new Map();
     for (const input of inputs) {
-        inputsByCol.set(parseInt(input.dataset.colidx, 10), input);
+        const colIdx = parseInt(input.dataset.colidx, 10);
+        inputsByCol.set(colIdx, input);
+
+        if (input.dataset.ispatch === 'true') {
+            try {
+                JSON.parse(input.value);
+            } catch (e) {
+                const colDef = state.tableColumns[colIdx];
+                updateStatus(`Invalid JSON for patch in ${colDef.name}`);
+                return;
+            }
+        }
     }
 
-    // Process all selected cells
-    // This is O(N) where N is number of selected cells
+    const updates = [];
+
+    // 2. Processing Phase
+    // Process all selected cells (O(N)) without repetitive parsing
     for (const cell of state.selectedCells) {
         const input = inputsByCol.get(cell.colIdx);
         if (!input) continue;
@@ -188,20 +201,7 @@ export async function applyBatchUpdate() {
             finalValue = null;
         } else if (isPatch) {
             operation = 'json_patch';
-            // Validate JSON
-            try {
-                // If it's a patch, validation happens once per input ideally,
-                // but here we do it per cell unless we cache it.
-                // Given we're optimizing, let's trust the input loop?
-                // Actually, let's just parse it. JSON.parse is fast enough for typical patch sizes.
-                JSON.parse(value);
-            } catch (e) {
-                // We should ideally validate before this loop.
-                // But for now, just abort or skip.
-                // Since this is inside the loop, we might show error multiple times if we're not careful.
-                // Let's validate inputs FIRST.
-                continue;
-            }
+            // Already validated above
         } else {
              // Basic type coercion
              if (colDef.type === 'INTEGER' || colDef.type === 'REAL' || colDef.type === 'NUMERIC') {
@@ -220,20 +220,6 @@ export async function applyBatchUpdate() {
             rowIdx: cell.rowIdx, // Local metadata
             colIdx: cell.colIdx  // Local metadata
         });
-    }
-
-    // Pre-validate JSON patches to avoid issues in the loop above
-    for (const input of inputs) {
-        if (input.dataset.ispatch === 'true') {
-            try {
-                JSON.parse(input.value);
-            } catch (e) {
-                const colIdx = parseInt(input.dataset.colidx, 10);
-                const colDef = state.tableColumns[colIdx];
-                updateStatus(`Invalid JSON for patch in ${colDef.name}`);
-                return;
-            }
-        }
     }
 
     if (updates.length === 0) {
@@ -257,8 +243,8 @@ export async function applyBatchUpdate() {
         await backendApi.updateCellBatch(state.selectedTable, backendUpdates, label);
 
         // Update local grid data
-        // For JSON patch, we don't know the new value without re-querying or implementing patch logic locally.
-        // Easiest is to reload.
+        // For JSON patches, the new value is not immediately known without re-querying or
+        // implementing complex local patch logic. We reload the data to ensure consistency.
         const hasPatch = updates.some(u => u.operation === 'json_patch');
 
         if (!hasPatch) {
@@ -270,16 +256,9 @@ export async function applyBatchUpdate() {
         // Refresh grid and sidebar
         await loadTableData(false);
 
-        // If we kept selection, update values in selectedCells
-        // This is tricky if we don't have the new values from backend (for patches).
-        // Since we reloaded table data, `state.gridData` is fresh.
-        // We can re-populate `state.selectedCells` from `state.gridData` based on indices/rowIds?
-        // `loadTableData` preserves scroll but not selection logic?
-        // `grid.js` `loadTableData`:
-        // `renderDataGrid` uses `state.selectedCells`.
-        // But `state.selectedCells` has stale values.
-
-        // We should refresh `state.selectedCells` values from fresh `state.gridData`.
+        // Refresh selected cell values from the newly loaded grid data.
+        // This ensures that `state.selectedCells` contains up-to-date values (including those
+        // updated via JSON patch) while preserving the selection state.
         const freshSelectedCells = [];
         for (const oldCell of state.selectedCells) {
             // Find corresponding row in new gridData
