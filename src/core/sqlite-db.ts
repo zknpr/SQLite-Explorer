@@ -300,23 +300,29 @@ class WasmDatabaseEngine implements DatabaseOperations {
           const sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
 
           const stmt = this.instance.prepare(sql);
+
+          // Optimize JSON patch read by preparing the SELECT statement
+          let selectStmt: any = null;
+          if (op === 'json_patch') {
+             selectStmt = this.instance.prepare(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`);
+          }
+
           try {
               for (const update of columnUpdates) {
                   const rowIdNum = Number(update.rowId);
 
                   if (op === 'json_patch') {
-                     // Patch logic (requires read-modify-write, can't fully optimize without user-defined functions)
-                     // Since we need to read, we can't just blind update.
-                     // For JSON patch, we sadly have to stick to the slower path or do a complex subquery if sqlite json1 is available.
-                     // Assuming standard sql.js build includes json1.
-                     // json_patch(col, patch) is available in modern SQLite.
-                     // Let's try to use native json_patch if possible, else fallback to JS.
-                     // Checking if json_patch exists? Hard to do cheaply.
-                     // Fallback to JS read-modify-write for safety.
-
-                     // Read
-                     const currentResult = this.instance.exec(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`, [rowIdNum]);
-                     const currentValue = currentResult[0]?.values[0]?.[0];
+                     // Read using prepared statement
+                     // selectStmt.get([rowIdNum]) returns [val] or undefined
+                     // sql.js documentation says get() returns array of values
+                     let currentValue = null;
+                     if (selectStmt) {
+                        // stmt.get(params) returns the row as an array of values
+                        const row = selectStmt.get([rowIdNum]);
+                        if (row && row.length > 0) {
+                            currentValue = row[0];
+                        }
+                     }
 
                      let currentObj = {};
                      if (typeof currentValue === 'string') {
@@ -335,6 +341,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
               }
           } finally {
               stmt.free();
+              if (selectStmt) selectStmt.free();
           }
       }
 

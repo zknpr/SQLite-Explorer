@@ -127,7 +127,8 @@ class NativeWorkerProcess {
     timeout: NodeJS.Timeout;
   }>();
 
-  private buffer = Buffer.alloc(0);
+  private chunks: Buffer[] = [];
+  private chunksTotalLength = 0;
   private expectedLength = -1;
 
   constructor(
@@ -246,26 +247,39 @@ class NativeWorkerProcess {
    * Handle incoming data from stdout.
    */
   private handleData(chunk: Buffer): void {
-    // Append to buffer
-    this.buffer = Buffer.concat([this.buffer, chunk]);
+    this.chunks.push(chunk);
+    this.chunksTotalLength += chunk.length;
 
-    // Process complete messages
-    while (this.buffer.length >= HEADER_SIZE) {
+    while (this.chunksTotalLength >= HEADER_SIZE) {
       if (this.expectedLength < 0) {
         // Read length header
-        this.expectedLength = this.buffer.readUInt32BE(0);
+        if (this.chunks[0].length >= HEADER_SIZE) {
+          // Fast path: header is in the first chunk
+          this.expectedLength = this.chunks[0].readUInt32BE(0);
+        } else {
+          // Slow path: header is split across chunks
+          const header = Buffer.alloc(HEADER_SIZE);
+          let copied = 0;
+          for (const c of this.chunks) {
+            const len = Math.min(c.length, HEADER_SIZE - copied);
+            c.copy(header, copied, 0, len);
+            copied += len;
+            if (copied === HEADER_SIZE) break;
+          }
+          this.expectedLength = header.readUInt32BE(0);
+        }
       }
 
       const totalNeeded = HEADER_SIZE + this.expectedLength;
-      if (this.buffer.length < totalNeeded) {
+      if (this.chunksTotalLength < totalNeeded) {
         // Need more data
         break;
       }
 
-      // Extract message body
-      const body = this.buffer.slice(HEADER_SIZE, totalNeeded);
-      this.buffer = this.buffer.slice(totalNeeded);
-      this.expectedLength = -1;
+      // We have the full message
+      // Note: We concat only when we have the full message, avoiding O(N^2) copying for large payloads
+      const fullBuffer = Buffer.concat(this.chunks);
+      const body = fullBuffer.subarray(HEADER_SIZE, totalNeeded);
 
       // Deserialize and handle
       try {
@@ -273,6 +287,17 @@ class NativeWorkerProcess {
         this.handleMessage(msg);
       } catch (err) {
         console.error('[NativeWorker] Failed to deserialize message:', err);
+      }
+
+      // Handle remaining data
+      const remaining = fullBuffer.subarray(totalNeeded);
+      this.chunks = [];
+      this.chunksTotalLength = 0;
+      this.expectedLength = -1;
+
+      if (remaining.length > 0) {
+        this.chunks.push(remaining);
+        this.chunksTotalLength = remaining.length;
       }
     }
   }
@@ -689,12 +714,12 @@ export async function createNativeDatabaseConnection(
           // Actually it queries sqlite_master for tables.
           // Let's stick to the SQL queries used in WASM implementation for consistency and to ensure we get views/indexes.
 
-          // Get tables
-          const tablesResult = await worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"]);
-          // Get views
-          const viewsResult = await worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='view' ORDER BY name"]);
-          // Get indexes
-          const indexesResult = await worker.call<any>('query', ["SELECT name, tbl_name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name"]);
+          // Run queries in parallel
+          const [tablesResult, viewsResult, indexesResult] = await Promise.all([
+            worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"]),
+            worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='view' ORDER BY name"]),
+            worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name"])
+          ]);
 
           const tables = mapRowsByName(tablesResult, { identifier: 'name' });
           const views = mapRowsByName(viewsResult, { identifier: 'name' });
@@ -819,38 +844,35 @@ export async function createNativeDatabaseConnection(
         updateCellBatch: async (table: string, updates: CellUpdate[]) => {
           if (updates.length === 0) return;
 
-          // Use transaction
-          await worker.call('exec', ['BEGIN TRANSACTION']);
-          try {
-            const escapedTable = escapeIdentifier(table);
+          const batchItems: { sql: string; params: CellValue[] }[] = [];
+          const escapedTable = escapeIdentifier(table);
 
-            for (const update of updates) {
-              // Validate rowId is a number
-              const rowIdNum = Number(update.rowId);
-              if (!Number.isFinite(rowIdNum)) {
-                throw new Error(`Invalid rowid: ${update.rowId}`);
-              }
-
-              const escapedColumn = escapeIdentifier(update.column);
-              let sql: string;
-              let params: CellValue[];
-
-              if (update.operation === 'json_patch') {
-                // json_patch(col, patch)
-                sql = `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(${escapedColumn}, ?) WHERE rowid = ?`;
-                params = [update.value, rowIdNum];
-              } else {
-                // Standard set
-                sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
-                params = [update.value, rowIdNum];
-              }
-
-              await worker.call('run', [sql, params]);
+          for (const update of updates) {
+            // Validate rowId is a number
+            const rowIdNum = Number(update.rowId);
+            if (!Number.isFinite(rowIdNum)) {
+              throw new Error(`Invalid rowid: ${update.rowId}`);
             }
-            await worker.call('exec', ['COMMIT']);
-          } catch (err) {
-            try { await worker.call('exec', ['ROLLBACK']); } catch {}
-            throw err;
+
+            const escapedColumn = escapeIdentifier(update.column);
+            let sql: string;
+            let params: CellValue[];
+
+            if (update.operation === 'json_patch') {
+              // json_patch(col, patch)
+              sql = `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(${escapedColumn}, ?) WHERE rowid = ?`;
+              params = [update.value, rowIdNum];
+            } else {
+              // Standard set
+              sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+              params = [update.value, rowIdNum];
+            }
+
+            batchItems.push({ sql, params });
+          }
+
+          if (batchItems.length > 0) {
+            await worker.call('execBatch', [batchItems]);
           }
         },
 
