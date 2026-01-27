@@ -115,7 +115,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * Undo a modification.
    */
   async undoModification(mod: ModificationEntry): Promise<void> {
-    const { modificationType, targetTable, targetRowId, targetColumn, priorValue, affectedCells, deletedRows, columnDef } = mod;
+    const { modificationType, targetTable, targetRowId, targetColumn, priorValue, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
     if (!targetTable) return;
 
     switch (modificationType) {
@@ -208,7 +208,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * Redo a modification.
    */
   async redoModification(mod: ModificationEntry): Promise<void> {
-    const { modificationType, targetTable, targetRowId, targetColumn, newValue, affectedCells, affectedRowIds, rowData, tableDef, columnDef } = mod;
+    const { modificationType, targetTable, targetRowId, targetColumn, newValue, affectedCells, affectedRowIds, rowData, tableDef, columnDef, deletedColumns } = mod;
     if (!targetTable) return;
 
     switch (modificationType) {

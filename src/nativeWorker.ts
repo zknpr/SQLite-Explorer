@@ -478,7 +478,7 @@ export async function createNativeDatabaseConnection(
          * Undo a modification by executing the inverse SQL.
          */
         undoModification: async (mod: ModificationEntry) => {
-          const { modificationType, targetTable, targetRowId, targetColumn, priorValue, affectedCells, deletedRows, columnDef } = mod;
+          const { modificationType, targetTable, targetRowId, targetColumn, priorValue, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
           if (!targetTable) return;
 
           switch (modificationType) {
@@ -566,7 +566,7 @@ export async function createNativeDatabaseConnection(
          * Redo a modification by re-executing the original change.
          */
         redoModification: async (mod: ModificationEntry) => {
-          const { modificationType, targetTable, targetRowId, targetColumn, newValue, affectedCells, affectedRowIds, rowData, tableDef, columnDef } = mod;
+          const { modificationType, targetTable, targetRowId, targetColumn, newValue, affectedCells, affectedRowIds, rowData, tableDef, columnDef, deletedColumns } = mod;
           if (!targetTable) return;
 
           switch (modificationType) {

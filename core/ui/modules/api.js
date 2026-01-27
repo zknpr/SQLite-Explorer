@@ -114,5 +114,7 @@ export const backendApi = {
     updateExtensionSetting: (key, value) => sendRpcRequest('updateExtensionSetting', [key, value]),
     ping: () => sendRpcRequest('ping', []),
     openCellEditor: (params, rowId, colName, colTypes, options) => sendRpcRequest('openCellEditor', [params, rowId, colName, colTypes, options]),
-    readWorkspaceFileUri: (uri) => sendRpcRequest('readWorkspaceFileUri', [uri])
+    readWorkspaceFileUri: (uri) => sendRpcRequest('readWorkspaceFileUri', [uri]),
+    triggerUndo: () => sendRpcRequest('triggerUndo', []),
+    triggerRedo: () => sendRpcRequest('triggerRedo', [])
 };

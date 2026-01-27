@@ -174,6 +174,29 @@ async function initializeApp() {
 
         // Global shortcuts
         document.addEventListener('keydown', async (event) => {
+            // Undo / Redo - Handled natively by VS Code for Custom Editors
+            // We only need to handle it if we want to override default behavior or if native handling fails.
+            // Currently, explicit handling causes "already an undo or redo operation running" race conditions.
+            /*
+            if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') {
+                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
+
+                event.preventDefault();
+                if (event.shiftKey) {
+                    await backendApi.triggerRedo();
+                } else {
+                    await backendApi.triggerUndo();
+                }
+            }
+
+            if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'y') {
+                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
+
+                event.preventDefault();
+                await backendApi.triggerRedo();
+            }
+            */
+
             // Escape
             if (event.key === 'Escape') {
                 if (!state.editingCellInfo && !document.querySelector('.modal:not(.hidden)')) {

@@ -16,6 +16,7 @@ import { IsCursorIDE } from './helpers';
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
 import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata } from './core/types';
 import { generateMergePatch } from './core/json-utils';
+import { escapeIdentifier } from './core/sql-utils';
 
 // Legacy DbParams type for backward compatibility with webview
 interface DbParams {
@@ -246,6 +247,9 @@ export class HostBridge implements ToastService {
                             rowData[name] = r[i];
                         }
                     }
+                    // Explicitly include rowid in the row data to ensure it's restored with the same ID
+                    rowData['rowid'] = rId;
+
                     return { rowId: rId, row: rowData };
                 });
             }
@@ -284,6 +288,47 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
+    // Capture column data before deletion for undo
+    let deletedColumnsData: { name: string; type: string; data: { rowId: RecordId; value: CellValue }[] }[] = [];
+    try {
+        // Get column types first
+        const tableInfo = await document.databaseOperations.getTableInfo(table);
+        const colMap = new Map(tableInfo.map(c => [c.identifier, c.declaredType]));
+
+        // Fetch data for each column
+        for (const col of columns) {
+            const type = colMap.get(col) || 'TEXT'; // Default to TEXT if unknown
+
+            // We need rowid to restore values correctly
+            const sql = `SELECT rowid, ${escapeIdentifier(col)} FROM ${escapeIdentifier(table)}`;
+            const result = await document.databaseOperations.executeQuery(sql);
+
+            if (result && result.length > 0 && result[0].rows) {
+                const rows = result[0].rows;
+                const colData = rows.map(r => ({
+                    rowId: r[0] as RecordId,
+                    value: r[1]
+                }));
+
+                deletedColumnsData.push({
+                    name: col,
+                    type,
+                    data: colData
+                });
+            } else {
+                // Empty table or no results, still track the column definition
+                deletedColumnsData.push({
+                    name: col,
+                    type,
+                    data: []
+                });
+            }
+        }
+    } catch (e) {
+        console.warn('Failed to fetch column data for undo history:', e);
+        // Proceed with deletion even if history capture fails, but warn
+    }
+
     if ('deleteColumns' in document.databaseOperations) {
       await (document.databaseOperations as any).deleteColumns(table, columns);
     } else {
@@ -294,8 +339,9 @@ export class HostBridge implements ToastService {
     this.document.recordExternalModification({
       label: 'Delete Columns',
       description: `Delete columns ${columns.join(', ')} from ${table}`,
-      modificationType: 'table_drop', // Approximate type
-      targetTable: table
+      modificationType: 'column_drop',
+      targetTable: table,
+      deletedColumns: deletedColumnsData
     });
   }
 
@@ -553,6 +599,20 @@ export class HostBridge implements ToastService {
       throw new Error("Database not initialized");
     }
     return document.databaseOperations.discardModifications(edits, signal);
+  }
+
+  /**
+   * Trigger VS Code Undo command.
+   */
+  async triggerUndo() {
+    await vsc.commands.executeCommand('undo');
+  }
+
+  /**
+   * Trigger VS Code Redo command.
+   */
+  async triggerRedo() {
+    await vsc.commands.executeCommand('redo');
   }
 
   /**
