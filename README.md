@@ -35,11 +35,21 @@ Handle tables with thousands of rows smoothly with virtualized scrolling.
 - **Column sorting** - Click headers to sort ascending/descending
 - **Column filtering** - Filter data in real-time with per-column search
 - **Pagination** - Navigate through large datasets efficiently
+- **SQL Logging** - View executed queries in the Output panel for debugging
 
 ### Inline Editing
 - **Double-click to edit** - Modify cell values directly in the table view
+- **VS Code Editor Integration** - Edit large cell values (JSON, SQL) in a full VS Code editor tab
+- **Batch Updates** - Update specific columns for multiple selected rows simultaneously
 - **Row operations** - Insert new rows and delete existing ones
+- **Drag & Drop** - Upload files as BLOBs by dragging them onto cells
 - **Undo/Redo support** - Full edit history with Ctrl+Z / Ctrl+Y
+
+### Advanced Features
+- **Database Settings** - Configure SQLite pragmas (WAL mode, Foreign Keys, etc.) via a GUI
+- **JSON Patching** - Smart updates for JSON fields using RFC 7396 Merge Patching
+- **Export** - Export tables or selection to CSV, JSON, SQL, or Excel formats
+
 
 ### Cross-Platform
 - **WebAssembly-powered** - Uses sql.js for universal compatibility
