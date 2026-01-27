@@ -2,6 +2,10 @@
 
 ## 1.1.5
 
+### Bug Fixes
+
+- **Fixed Export Table Crash**: Resolved a `ReferenceError` when exporting tables caused by accessing the file URI before initialization. The export dialog now correctly prompts for a destination before processing.
+
 ### Performance
 
 - **Zero-Copy Data Transfer**: Implemented `Transfer` wrapper for RPC to enable zero-copy transfer of ArrayBuffers between extension host and worker. This significantly reduces memory usage and startup time when opening large databases.

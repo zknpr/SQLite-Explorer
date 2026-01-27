@@ -95,6 +95,36 @@ export async function exportTableCommand(
       return;
     }
 
+    const includeHeader = _exportOptions?.header ?? true;
+    const includeTableName = _exportOptions?.includeTableName ?? true;
+
+    // Determine extension
+    let defaultExt = 'csv';
+    switch (formatValue) {
+      case 'json': defaultExt = 'json'; break;
+      case 'sql': defaultExt = 'sql'; break;
+      case 'excel': defaultExt = 'csv'; break;
+      case 'csv': defaultExt = 'csv'; break;
+      default:
+        vsc.window.showErrorMessage(`Unsupported export format: ${formatValue}`);
+        return;
+    }
+
+    // Show save dialog
+    // Set default directory to the database file's directory using joinPath
+    // This prevents the dialog from defaulting to the root directory '/'
+    const uri = await vsc.window.showSaveDialog({
+      defaultUri: vsc.Uri.joinPath(document.uri, '..', `${tableName}.${defaultExt}`),
+      filters: {
+        [formatValue.toUpperCase()]: [defaultExt],
+        'All Files': ['*']
+      },
+      title: `Export "${tableName}" as ${formatValue.toUpperCase()}`
+    });
+
+    if (!uri) return; // User cancelled
+    const isLocalFile = uri.scheme === 'file';
+
     // Fetch data from the table in chunks to avoid OOM
     // Use escapeIdentifier to prevent SQL injection via malicious table names
     // Respect selected columns
@@ -136,7 +166,6 @@ export async function exportTableCommand(
     // But the primary crash vector is Desktop with large DBs.
 
     // Let's try to detect if we can use native fs.
-    const isLocalFile = uri.scheme === 'file';
 
     if (isLocalFile && typeof require === 'function') {
         // Use Node.js fs streams for memory efficiency
@@ -316,47 +345,25 @@ export async function exportTableCommand(
     const rows = (result[0].values || result[0].rows) as CellValue[][];
 
     let content: string;
-    let defaultExt: string;
-
-    const includeHeader = _exportOptions?.header ?? true;
-    const includeTableName = _exportOptions?.includeTableName ?? true;
 
     switch (formatValue) {
       case 'excel':
         // Excel prefers CSV with BOM for UTF-8
         content = '\uFEFF' + exportToCsv(columnNames, rows, includeHeader);
-        defaultExt = 'csv';
         break;
       case 'csv':
         content = exportToCsv(columnNames, rows, includeHeader);
-        defaultExt = 'csv';
         break;
       case 'json':
         content = exportToJson(columnNames, rows);
-        defaultExt = 'json';
         break;
       case 'sql':
         content = exportToSql(tableName, columnNames, rows, includeTableName);
-        defaultExt = 'sql';
         break;
       default:
         vsc.window.showErrorMessage(`Unsupported export format: ${formatValue}`);
         return;
     }
-
-    // Show save dialog
-    // Set default directory to the database file's directory using joinPath
-    // This prevents the dialog from defaulting to the root directory '/'
-    const uri = await vsc.window.showSaveDialog({
-      defaultUri: vsc.Uri.joinPath(document.uri, '..', `${tableName}.${defaultExt}`),
-      filters: {
-        [formatValue.toUpperCase()]: [defaultExt],
-        'All Files': ['*']
-      },
-      title: `Export "${tableName}" as ${formatValue.toUpperCase()}`
-    });
-
-    if (!uri) return; // User cancelled
 
     // Write file
     await vsc.workspace.fs.writeFile(uri, Buffer.from(content, 'utf-8'));
