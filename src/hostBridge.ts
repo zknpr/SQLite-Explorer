@@ -834,7 +834,7 @@ export class HostBridge implements ToastService {
     const uri = vsc.Uri.parse(uriString);
 
     // SECURITY: Block dangerous URI schemes that could execute code or fetch remote resources
-    const blockedSchemes = ['http', 'https', 'command', 'javascript', 'data', 'vscode-command'];
+    const blockedSchemes = ['http', 'https', 'command', 'javascript', 'data', 'vbscript', 'vscode-command'];
     if (blockedSchemes.includes(uri.scheme)) {
       throw new Error(`Access denied: Cannot read from scheme "${uri.scheme}"`);
     }
