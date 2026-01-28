@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.7
+
+### Security
+
+- **Workspace Isolation**: Enforced stricter file access controls. The extension now prevents reading files outside the current workspace when using drag-and-drop or URI uploads.
+- **Log Sanitization**: Implemented PII masking in the Output channel. Email addresses in SQL queries are now redacted, and large values (BLOBs, long strings) are truncated in logs to prevent sensitive data leakage and improve readability.
+
 ## 1.1.6
 
 ### New Features

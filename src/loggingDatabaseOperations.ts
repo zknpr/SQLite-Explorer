@@ -33,15 +33,45 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.engineKind;
     }
 
+    private sanitizeValue(value: any): string {
+        if (value === null) return 'null';
+        if (value === undefined) return 'undefined';
+        if (typeof value === 'string') {
+            if (value.length > 100) {
+                return `"${value.substring(0, 100)}...[TRUNCATED]"`;
+            }
+            return `"${value}"`;
+        }
+        if (value instanceof Uint8Array || (typeof value === 'object' && value && 'buffer' in value)) {
+            return `[BLOB ${value.byteLength} bytes]`;
+        }
+        if (typeof value === 'object') {
+             try {
+                 return JSON.stringify(value).substring(0, 100) + '...';
+             } catch {
+                 return '[Object]';
+             }
+        }
+        return String(value);
+    }
+
     private log(message: string, isWrite: boolean = false) {
         const timestamp = new Date().toISOString().split('T')[1].slice(0, -1);
         const type = isWrite ? '[WRITE]' : '[read] ';
-        this.outputChannel.appendLine(`${timestamp} ${type} [${this.filename}] ${message}`);
+
+        // Basic PII/Secret masking in the log message itself if it contains SQL values directly
+        // This is a heuristic attempt to mask email-like or key-like patterns in raw SQL
+        let safeMessage = message;
+
+        // Mask email addresses
+        safeMessage = safeMessage.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '***@***.***');
+
+        this.outputChannel.appendLine(`${timestamp} ${type} [${this.filename}] ${safeMessage}`);
     }
 
     async executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> {
         const isWrite = /^(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|BEGIN|COMMIT|ROLLBACK)/i.test(sql.trim());
-        const paramStr = params && params.length > 0 ? ` -- params: ${JSON.stringify(params)}` : '';
+        const paramStr = params && params.length > 0 ? ` -- params: [${params.map(p => this.sanitizeValue(p)).join(', ')}]` : '';
         this.log(`${sql}${paramStr}`, isWrite);
         return this.wrapped.executeQuery(sql, params);
     }
@@ -80,9 +110,9 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         // Reconstruct SQL for logging
         let sql;
         if (patch) {
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(${escapeIdentifier(column)}, ${cellValueToSql(patch)}) WHERE rowid = ${rowId}`;
+            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(${escapeIdentifier(column)}, ${this.sanitizeValue(patch)}) WHERE rowid = ${rowId}`;
         } else {
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ${cellValueToSql(value)} WHERE rowid = ${rowId}`;
+            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ${this.sanitizeValue(value)} WHERE rowid = ${rowId}`;
         }
         this.log(sql, true);
         return this.wrapped.updateCell(table, rowId, column, value, patch);
@@ -95,7 +125,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
             sql = `INSERT INTO ${escapeIdentifier(table)} DEFAULT VALUES`;
         } else {
             const colNames = columns.map(escapeIdentifier).join(', ');
-            const values = columns.map(c => cellValueToSql(data[c])).join(', ');
+            // Use sanitizeValue for logging values
+            const values = columns.map(c => this.sanitizeValue(data[c])).join(', ');
             sql = `INSERT INTO ${escapeIdentifier(table)} (${colNames}) VALUES (${values})`;
         }
         this.log(sql, true);
@@ -138,14 +169,14 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
 
     async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
         const { sql, params } = buildSelectQuery(table, options);
-        const paramStr = params && params.length > 0 ? ` -- params: ${JSON.stringify(params)}` : '';
+        const paramStr = params && params.length > 0 ? ` -- params: [${params.map(p => this.sanitizeValue(p)).join(', ')}]` : '';
         this.log(`${sql}${paramStr}`, false);
         return this.wrapped.fetchTableData(table, options);
     }
 
     async fetchTableCount(table: string, options: TableCountOptions): Promise<number> {
         const { sql, params } = buildCountQuery(table, options);
-        const paramStr = params && params.length > 0 ? ` -- params: ${JSON.stringify(params)}` : '';
+        const paramStr = params && params.length > 0 ? ` -- params: [${params.map(p => this.sanitizeValue(p)).join(', ')}]` : '';
         this.log(`${sql}${paramStr}`, false);
         return this.wrapped.fetchTableCount(table, options);
     }
@@ -166,7 +197,7 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
     }
 
     async setPragma(pragma: string, value: CellValue): Promise<void> {
-        this.log(`PRAGMA ${pragma} = ${value}`, true);
+        this.log(`PRAGMA ${pragma} = ${this.sanitizeValue(value)}`, true);
         return this.wrapped.setPragma(pragma, value);
     }
 

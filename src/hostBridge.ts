@@ -834,11 +834,14 @@ export class HostBridge implements ToastService {
     const uri = vsc.Uri.parse(uriString);
 
     // SECURITY: Ensure the file is within the current workspace to prevent arbitrary file reads.
-    // However, this is too restrictive for files dropped from "Open Editors" that aren't in the workspace,
-    // or when running in Single File mode. Since the user explicitly dropped the file (UI action),
-    // and they can already drop any file from the OS via the FileReader path, we allow reading
-    // files that VS Code can access.
-    // We still validate the scheme to prevent weird internal schemes if necessary.
+    // The audit identified this as a risk. We now enforce that the file must be within the workspace.
+    const workspaceFolder = vsc.workspace.getWorkspaceFolder(uri);
+    if (!workspaceFolder) {
+      // If the file is not in the workspace, we deny access to prevent arbitrary file reading (e.g. /etc/passwd).
+      // This might limit dropping files from outside the workspace, but it is necessary for security.
+      throw new Error(`Access denied: File ${uri.fsPath} is not in the current workspace.`);
+    }
+
     if (uri.scheme === 'http' || uri.scheme === 'https' || uri.scheme === 'command') {
       throw new Error(`Access denied: Cannot read from scheme ${uri.scheme}`);
     }
