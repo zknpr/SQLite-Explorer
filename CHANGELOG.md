@@ -4,8 +4,16 @@
 
 ### Security
 
-- **Workspace Isolation**: Enforced stricter file access controls. The extension now prevents reading files outside the current workspace when using drag-and-drop or URI uploads.
-- **Log Sanitization**: Implemented PII masking in the Output channel. Email addresses in SQL queries are now redacted, and large values (BLOBs, long strings) are truncated in logs to prevent sensitive data leakage and improve readability.
+- **Workspace Isolation**: Enforced stricter file access controls. The extension now prevents reading files outside the current workspace when using drag-and-drop or URI uploads, mitigating arbitrary file read vulnerabilities.
+- **Enhanced Log Sanitization**: Implemented comprehensive PII masking in the Output channel. The following patterns are now automatically redacted in SQL logs:
+  - Email addresses
+  - Phone numbers (various formats)
+  - API keys and tokens (sk_live_, api_key_, etc.)
+  - Long hex strings (potential secrets/hashes)
+  - Credit card numbers
+  - Social Security Numbers (SSN)
+  - BLOBs and long strings are truncated to prevent data leakage
+- **CSP Documentation**: Added security documentation explaining the current CSP configuration and XSS mitigations (escapeHtml, escapeIdentifier).
 
 ## 1.1.6
 

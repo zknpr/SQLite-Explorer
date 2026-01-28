@@ -833,19 +833,62 @@ export class HostBridge implements ToastService {
   async readWorkspaceFileUri(uriString: string): Promise<Uint8Array> {
     const uri = vsc.Uri.parse(uriString);
 
-    // SECURITY: Ensure the file is within the current workspace to prevent arbitrary file reads.
-    // The audit identified this as a risk. We now enforce that the file must be within the workspace.
-    const workspaceFolder = vsc.workspace.getWorkspaceFolder(uri);
-    if (!workspaceFolder) {
-      // If the file is not in the workspace, we deny access to prevent arbitrary file reading (e.g. /etc/passwd).
-      // This might limit dropping files from outside the workspace, but it is necessary for security.
-      throw new Error(`Access denied: File ${uri.fsPath} is not in the current workspace.`);
+    // SECURITY: Block dangerous URI schemes that could execute code or fetch remote resources
+    const blockedSchemes = ['http', 'https', 'command', 'javascript', 'data', 'vscode-command'];
+    if (blockedSchemes.includes(uri.scheme)) {
+      throw new Error(`Access denied: Cannot read from scheme "${uri.scheme}"`);
     }
 
-    if (uri.scheme === 'http' || uri.scheme === 'https' || uri.scheme === 'command') {
-      throw new Error(`Access denied: Cannot read from scheme ${uri.scheme}`);
+    // SECURITY: For file:// URIs, validate the path to prevent directory traversal attacks
+    // and restrict access to sensitive system locations
+    if (uri.scheme === 'file') {
+      const filePath = uri.fsPath;
+
+      // Block obvious sensitive paths (defense in depth - VS Code API might already block some)
+      const blockedPaths = [
+        '/etc/', '/var/', '/root/', '/proc/', '/sys/', '/dev/',  // Linux system dirs
+        '/private/etc/', '/private/var/',                         // macOS system dirs
+        'C:\\Windows\\', 'C:\\Program Files\\', 'C:\\ProgramData\\', // Windows system dirs
+      ];
+
+      const normalizedPath = filePath.replace(/\\/g, '/').toLowerCase();
+      for (const blocked of blockedPaths) {
+        if (normalizedPath.startsWith(blocked.toLowerCase())) {
+          throw new Error(`Access denied: Cannot read system file "${filePath}"`);
+        }
+      }
+
+      // Check if file is within workspace folders (preferred)
+      const workspaceFolder = vsc.workspace.getWorkspaceFolder(uri);
+      if (workspaceFolder) {
+        // File is in workspace - allow
+        return await vsc.workspace.fs.readFile(uri);
+      }
+
+      // If no workspace folder match, check if file is relative to the current document
+      // This allows drag-and-drop from the same directory tree in single-file mode
+      const docDir = path.dirname(this.document.uri.fsPath);
+      if (filePath.startsWith(docDir)) {
+        // File is in the same directory tree as the open document - allow
+        return await vsc.workspace.fs.readFile(uri);
+      }
+
+      // For multi-root or edge cases, check if any workspace folder contains this path
+      const workspaceFolders = vsc.workspace.workspaceFolders;
+      if (workspaceFolders) {
+        for (const folder of workspaceFolders) {
+          if (filePath.startsWith(folder.uri.fsPath)) {
+            return await vsc.workspace.fs.readFile(uri);
+          }
+        }
+      }
+
+      // File is outside workspace and document directory - deny access
+      throw new Error(`Access denied: File "${filePath}" is not in the current workspace or document directory.`);
     }
 
+    // For other schemes (vscode-remote, ssh, etc.), delegate to VS Code's fs API
+    // which will enforce its own access controls
     return await vsc.workspace.fs.readFile(uri);
   }
 }

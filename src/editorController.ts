@@ -297,6 +297,13 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     // Build Content Security Policy
     const cspObj = {
       [cspUtil.defaultSrc]: [webview.cspSource],
+      // SECURITY NOTE (Audit 10.1): 'unsafe-inline' is required because the webview HTML uses
+      // inline event handlers (onclick, onchange, etc.) in 70+ places. Removing this would require
+      // refactoring all handlers to use addEventListener. The XSS risk is mitigated by:
+      // 1. All cell values are HTML-escaped via escapeHtml() before rendering
+      // 2. Table/column names are escaped via escapeIdentifier()
+      // 3. The webview is sandboxed and cannot access the file system directly
+      // TODO: Future security hardening - refactor to remove inline handlers and disable unsafe-inline
       [cspUtil.scriptSrc]: [webview.cspSource, cspUtil.wasmUnsafeEval, "'unsafe-inline'"],
       [cspUtil.styleSrc]: [webview.cspSource, cspUtil.inlineStyle],
       [cspUtil.imgSrc]: [webview.cspSource, cspUtil.data, cspUtil.blob],
