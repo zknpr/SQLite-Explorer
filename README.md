@@ -172,7 +172,7 @@ If you find this extension useful, please consider buying me a coffee!
 </span>
 <span>
 <a href="https://ko-fi.com/zknpr">
-  <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi" height="50" />
+  <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi" height="100" />
 </a>
 </span>
 
