@@ -4,7 +4,7 @@
   "regions": ["iad1"],
   "headers": [
     {
-      "source": "/demo/viewer.html",
+      "source": "/sqlite-viewer/(.*)",
       "headers": [
         {
           "key": "X-Content-Type-Options",

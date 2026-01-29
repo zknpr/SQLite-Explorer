@@ -2,6 +2,8 @@
 
 A powerful, open-source SQLite database viewer and editor for Visual Studio Code.
 
+**[Try it in your browser](https://vscode-sqlite-explorer.vercel.app/demo)** | **[Website](https://vscode-sqlite-explorer.vercel.app/)**
+
 ![SQLite Explorer](media/main.png)
 
 ## Demos

@@ -297,13 +297,13 @@ const bundleWebview = async () => {
  * parent window communication instead of VS Code API.
  *
  * Output:
- * - website/public/demo/viewer.html - Bundled HTML for web demo
+ * - website/public/sqlite-viewer/viewer.html - Bundled HTML for web demo
  */
 const bundleWebDemoViewer = async () => {
   const templatePath = resolve('core', 'ui', 'viewer.template.html');
   const cssPath = resolve('core', 'ui', 'viewer.css');
   const jsPath = resolve('core', 'ui', 'web-viewer.js');
-  const outputDir = resolve('website', 'public', 'demo');
+  const outputDir = resolve('website', 'public', 'sqlite-viewer');
   const outputPath = resolve(outputDir, 'viewer.html');
 
   // Ensure output directory exists
@@ -375,7 +375,7 @@ const bundleWebDemoViewer = async () => {
 
   // Write the bundled HTML
   fs.writeFileSync(outputPath, bundled, 'utf-8');
-  console.log('Bundled web demo viewer: website/public/demo/viewer.html');
+  console.log('Bundled web demo viewer: website/public/sqlite-viewer/viewer.html');
 };
 
 /**

@@ -261,7 +261,7 @@ export default function DemoPage() {
     }
 
     // Create new worker (classic worker, not module, to support importScripts)
-    const worker = new Worker('/demo/worker.js');
+    const worker = new Worker('/sqlite-viewer/worker.js');
     workerRef.current = worker;
 
     // Handle worker messages
@@ -603,7 +603,7 @@ export default function DemoPage() {
         {status === 'ready' && (
           <iframe
             ref={iframeRef}
-            src="/demo/viewer.html"
+            src="/sqlite-viewer/viewer.html"
             className="flex-1 border-0"
             title="SQLite Viewer"
           />
