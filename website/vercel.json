@@ -4,6 +4,19 @@
   "regions": ["iad1"],
   "headers": [
     {
+      "source": "/demo/viewer.html",
+      "headers": [
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "SAMEORIGIN"
+        }
+      ]
+    },
+    {
       "source": "/(.*)",
       "headers": [
         {
