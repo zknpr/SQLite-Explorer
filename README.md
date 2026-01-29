@@ -167,12 +167,12 @@ If you find this extension useful, please consider buying me a coffee!
 
 <span>
 <a href="https://buymeacoffee.com/zknpr">
-  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="200" height="50"/>
+  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="60"/>
 </a>
 </span>
 <span>
 <a href="https://ko-fi.com/zknpr">
-  <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi" height="100" />
+  <img src="https://storage.ko-fi.com/cdn/kofi2.png?v=3" alt="Support me on Ko-fi" height="60" />
 </a>
 </span>
 
