@@ -720,6 +720,30 @@ async function ping() {
   }
 }
 
+/**
+ * Refresh file from disk - no-op in web mode since there's no disk file.
+ * Just returns success to satisfy the viewer's reload request.
+ *
+ * @returns {Promise<void>}
+ */
+async function refreshFile() {
+  // In web demo, there's no file to refresh from
+  // The database exists only in memory
+  return;
+}
+
+/**
+ * Fire an edit event - no-op in web mode.
+ * VS Code extension uses this for undo/redo tracking.
+ *
+ * @param {Object} _edit - Edit details (ignored)
+ * @returns {Promise<void>}
+ */
+async function fireEditEvent(_edit) {
+  // No-op in web demo - no undo/redo integration
+  return;
+}
+
 // ============================================================================
 // RPC Message Handler
 // ============================================================================
@@ -745,7 +769,9 @@ const methods = {
   createTable,
   updateCellBatch,
   addColumn,
-  ping
+  ping,
+  refreshFile,
+  fireEditEvent
 };
 
 /**
