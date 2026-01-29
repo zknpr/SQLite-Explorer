@@ -226,12 +226,13 @@ async function fetchSchema() {
   if (!db) throw new Error('No database initialized');
 
   // Get tables
+  // Note: Property names must match VS Code extension format (identifier, parentTable, etc.)
   const tablesResult = db.exec(`
     SELECT name FROM sqlite_master
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
     ORDER BY name
   `);
-  const tables = (tablesResult[0]?.values || []).map(row => ({ name: row[0] }));
+  const tables = (tablesResult[0]?.values || []).map(row => ({ identifier: row[0] }));
 
   // Get views
   const viewsResult = db.exec(`
@@ -239,7 +240,7 @@ async function fetchSchema() {
     WHERE type = 'view'
     ORDER BY name
   `);
-  const views = (viewsResult[0]?.values || []).map(row => ({ name: row[0] }));
+  const views = (viewsResult[0]?.values || []).map(row => ({ identifier: row[0] }));
 
   // Get indexes
   const indexesResult = db.exec(`
@@ -248,8 +249,8 @@ async function fetchSchema() {
     ORDER BY name
   `);
   const indexes = (indexesResult[0]?.values || []).map(row => ({
-    name: row[0],
-    table: row[1]
+    identifier: row[0],
+    parentTable: row[1]
   }));
 
   return { tables, views, indexes };
@@ -270,13 +271,14 @@ async function getTableInfo(table) {
     return [];
   }
 
+  // Property names must match VS Code extension format
   return results[0].values.map(row => ({
-    cid: row[0],
-    name: row[1],
-    type: row[2],
-    notnull: row[3],
-    defaultValue: row[4],
-    pk: row[5]
+    ordinal: row[0],
+    identifier: row[1],
+    declaredType: row[2],
+    isRequired: row[3],
+    defaultExpression: row[4],
+    primaryKeyPosition: row[5]
   }));
 }
 
