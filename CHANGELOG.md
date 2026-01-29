@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0
+
+### New Features
+
+- **Web Demo**: Added a standalone web preview at `/demo` on the website. Users can now try SQLite Explorer directly in their browser without installing the VS Code extension.
+  - Upload your own SQLite databases via drag-and-drop or file picker
+  - Try sample databases (Chinook, Northwind)
+  - Full editing capabilities (CRUD operations, cell editing)
+  - All processing happens client-side using WebAssembly - no data is sent to servers
+  - Download modified databases back to your computer
+
+### Website
+
+- Added "Try in Browser" button to the hero section linking to the web demo
+- Bundled sample databases for the demo (Chinook ~1MB, Northwind ~25MB)
+
 ## 1.1.7
 
 ### Security

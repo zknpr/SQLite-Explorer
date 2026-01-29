@@ -55,7 +55,12 @@ The extension uses a three-layer communication architecture:
 | `src/virtualFileSystem.ts` | Virtual FS provider for editing cells in tabs |
 | `src/loggingDatabaseOperations.ts` | Decorator for logging SQL queries |
 | `core/ui/modules/settings.js` | UI logic for database settings/pragma editor |
+| `core/ui/modules/web-api.js` | Web demo API module (parent window communication) |
 | `core/ui/viewer.html` | Standalone webview UI |
+| `core/ui/web-viewer.js` | Web demo entry point |
+| `website/app/demo/page.tsx` | Web demo React page |
+| `website/public/demo/worker.js` | Web demo SQLite worker |
+| `website/public/demo/viewer.html` | Web demo bundled viewer |
 | `assets/sqlite3.wasm` | SQLite WebAssembly binary |
 
 ### RPC Protocol
@@ -121,7 +126,43 @@ DEV=1 node scripts/build.mjs
 - `out/worker.js` - Node.js worker
 - `out/worker-browser.js` - Browser worker
 - `core/ui/viewer.html` - Webview UI
+- `website/public/demo/viewer.html` - Web demo viewer (bundled)
 - `assets/sqlite3.wasm` - SQLite WASM binary
+
+### Web Demo
+
+The project includes a standalone web demo at `/demo` on the website. This allows users to try SQLite Explorer in their browser without installing the VS Code extension.
+
+**Architecture:**
+```
+┌─────────────────┐     ┌─────────────────┐
+│   React Page    │ ←→  │   Web Worker    │
+│  (demo/page.tsx)│     │   (worker.js)   │
+└─────────────────┘     └─────────────────┘
+        ↓                       ↑
+   ┌────────────┐         sql.js WASM
+   │   iframe   │
+   │(viewer.html)│
+   └────────────┘
+```
+
+**Key differences from VS Code extension:**
+- Uses `window.parent.postMessage` instead of VS Code API
+- Loads sql.js directly from CDN
+- No file system access (upload-only)
+- No undo/redo integration
+
+**Building the web demo:**
+```bash
+# Build extension (includes web demo viewer)
+node scripts/build.mjs
+
+# Generate sample databases
+node scripts/generate-samples.mjs
+
+# Build website
+cd website && npm run build
+```
 
 ### Build Configuration
 

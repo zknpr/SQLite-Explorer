@@ -291,6 +291,94 @@ const bundleWebview = async () => {
 };
 
 /**
+ * Bundle the web demo viewer HTML.
+ *
+ * Creates a standalone viewer for the website demo that uses
+ * parent window communication instead of VS Code API.
+ *
+ * Output:
+ * - website/public/demo/viewer.html - Bundled HTML for web demo
+ */
+const bundleWebDemoViewer = async () => {
+  const templatePath = resolve('core', 'ui', 'viewer.template.html');
+  const cssPath = resolve('core', 'ui', 'viewer.css');
+  const jsPath = resolve('core', 'ui', 'web-viewer.js');
+  const outputDir = resolve('website', 'public', 'demo');
+  const outputPath = resolve(outputDir, 'viewer.html');
+
+  // Ensure output directory exists
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
+  }
+
+  // Read source files
+  const template = fs.readFileSync(templatePath, 'utf-8');
+  const css = fs.readFileSync(cssPath, 'utf-8');
+
+  // Plugin to replace api.js imports with web-api.js
+  const webApiPlugin = {
+    name: 'web-api-plugin',
+    setup(build) {
+      // Intercept imports of api.js and redirect to web-api.js
+      build.onResolve({ filter: /\/api\.js$/ }, args => {
+        // Only redirect if it's from the modules directory
+        if (args.importer.includes('core/ui/modules') || args.importer.includes('core/ui/web-viewer')) {
+          return {
+            path: resolve('core', 'ui', 'modules', 'web-api.js'),
+          };
+        }
+        return null;
+      });
+    }
+  };
+
+  // Bundle JavaScript using esbuild with web-api plugin
+  let finalJs = '';
+  try {
+    const jsResult = await esbuild.build({
+      entryPoints: [jsPath],
+      bundle: true,
+      write: false,
+      minify: !DEV,
+      format: 'iife',
+      target: 'es2020',
+      plugins: [webApiPlugin],
+      loader: {
+        '.js': 'js',
+        '.ts': 'ts'
+      }
+    });
+    finalJs = jsResult.outputFiles[0].text;
+  } catch (err) {
+    console.error('Web demo JS bundling failed:', err);
+    return;
+  }
+
+  // Minify CSS in production mode
+  let finalCss = css;
+  if (!DEV) {
+    try {
+      const cssResult = await esbuild.transform(css, {
+        loader: 'css',
+        minify: true,
+      });
+      finalCss = cssResult.code;
+    } catch (err) {
+      console.warn('CSS minification failed, using original:', err.message);
+    }
+  }
+
+  // Bundle: replace placeholders with actual content
+  const bundled = template
+    .replace('<!--STYLES-->', finalCss)
+    .replace('<!--SCRIPTS-->', finalJs);
+
+  // Write the bundled HTML
+  fs.writeFileSync(outputPath, bundled, 'utf-8');
+  console.log('Bundled web demo viewer: website/public/demo/viewer.html');
+};
+
+/**
  * Main compilation function.
  * Runs all build targets in parallel for speed.
  */
@@ -302,6 +390,7 @@ const compileExt = async (target) => {
     compileBrowserWorker(),
     copyAssets(),
     bundleWebview(),
+    bundleWebDemoViewer(),
   ]);
 };
 

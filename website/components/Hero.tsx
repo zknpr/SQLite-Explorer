@@ -10,7 +10,7 @@
  */
 
 import Image from 'next/image';
-import { Database, ExternalLink } from 'lucide-react';
+import { Database, ExternalLink, Play } from 'lucide-react';
 
 /**
  * MainScreenshot displays the actual extension screenshot.
@@ -74,6 +74,15 @@ export default function Hero() {
           >
             Install Extension
             <ExternalLink className="w-4 h-4" />
+          </a>
+
+          {/* Try Demo CTA */}
+          <a
+            href="/demo"
+            className="inline-flex items-center gap-2 px-6 py-3 rounded-lg border border-[var(--accent)] text-[var(--accent)] bg-[var(--accent)]/10 font-medium hover:bg-[var(--accent)]/20 transition-colors"
+          >
+            <Play className="w-4 h-4" />
+            Try in Browser
           </a>
 
           {/* Secondary CTA - GitHub */}
