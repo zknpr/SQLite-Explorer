@@ -76,7 +76,7 @@ if (isBrowserRuntime) {
     }
   } catch (e) {
     console.error('[ThreadPool] Failed to load worker_threads:', e);
-    // Fallback? No, we need worker_threads in Node.
+   
     throw e;
   }
 }
