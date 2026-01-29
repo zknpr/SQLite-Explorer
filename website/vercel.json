@@ -4,37 +4,7 @@
   "regions": ["iad1"],
   "headers": [
     {
-      "source": "/sqlite-viewer/(.*)",
-      "headers": [
-        {
-          "key": "X-Content-Type-Options",
-          "value": "nosniff"
-        },
-        {
-          "key": "X-Frame-Options",
-          "value": "SAMEORIGIN"
-        }
-      ]
-    },
-    {
-      "source": "/(.*)",
-      "headers": [
-        {
-          "key": "X-Content-Type-Options",
-          "value": "nosniff"
-        },
-        {
-          "key": "X-Frame-Options",
-          "value": "DENY"
-        },
-        {
-          "key": "X-XSS-Protection",
-          "value": "1; mode=block"
-        }
-      ]
-    },
-    {
-      "source": "/(.*)\\.(js|css|woff2?|png|jpg|jpeg|gif|ico|svg)",
+      "source": "/(.*)\\.(js|css|woff2?|png|jpg|jpeg|gif|ico|svg|db)",
       "headers": [
         {
           "key": "Cache-Control",
