@@ -4,6 +4,19 @@
   "regions": ["iad1"],
   "headers": [
     {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "X-Frame-Options",
+          "value": ""
+        },
+        {
+          "key": "Content-Security-Policy",
+          "value": "frame-ancestors 'self' https://*.vercel.app https://localhost:*"
+        }
+      ]
+    },
+    {
       "source": "/(.*)\\.(js|css|woff2?|png|jpg|jpeg|gif|ico|svg|db)",
       "headers": [
         {

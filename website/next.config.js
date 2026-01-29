@@ -18,9 +18,11 @@ const nextConfig = {
             key: 'X-DNS-Prefetch-Control',
             value: 'on',
           },
+          // X-Frame-Options removed to allow iframe embedding for demo
+          // Security is maintained via Content-Security-Policy frame-ancestors
           {
-            key: 'X-Frame-Options',
-            value: 'SAMEORIGIN',
+            key: 'Content-Security-Policy',
+            value: "frame-ancestors 'self' https://*.vercel.app https://localhost:*",
           },
           {
             key: 'X-Content-Type-Options',
