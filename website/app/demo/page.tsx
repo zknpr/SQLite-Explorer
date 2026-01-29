@@ -525,7 +525,7 @@ export default function DemoPage() {
             </>
           )}
           <a
-            href="https://github.com/znkpr/sqlite-explorer"
+            href="https://github.com/zknpr/sqlite-explorer"
             target="_blank"
             rel="noopener noreferrer"
             className="p-2 text-neutral-400 hover:text-white transition-colors"
