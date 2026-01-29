@@ -485,7 +485,7 @@ export default function DemoPage() {
             </>
           )}
           <a
-            href="https://github.com/nicepkg/sqlite-explorer"
+            href="https://github.com/znkpr/sqlite-explorer"
             target="_blank"
             rel="noopener noreferrer"
             className="p-2 text-neutral-400 hover:text-white transition-colors"
