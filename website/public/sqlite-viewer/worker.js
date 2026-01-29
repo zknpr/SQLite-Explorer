@@ -147,6 +147,144 @@ async function exportDatabase(_name) {
 }
 
 /**
+ * Export a table to various formats (CSV, JSON, SQL).
+ * For web demo, returns the data which the parent page will download.
+ *
+ * @param {Object} dbParams - Database parameters with 'table' property
+ * @param {Array<string>} columns - Columns to export
+ * @param {Object} _dbOptions - Database options (unused)
+ * @param {Object} _tableStore - Table store (unused)
+ * @param {Object} exportOptions - Export options including 'format'
+ * @returns {Promise<Object>} Export result with content and filename
+ */
+async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOptions = {}) {
+  if (!db) throw new Error('No database initialized');
+
+  const table = dbParams?.table;
+  if (!table) throw new Error('No table specified');
+
+  const { format = 'csv', header = true, includeTableName = true, rowIds = null } = exportOptions;
+  const safeTable = table.replace(/"/g, '""');
+
+  // Build column list
+  const columnList = columns && columns.length > 0
+    ? columns.map(c => `"${c.replace(/"/g, '""')}"`).join(', ')
+    : '*';
+
+  // Build query
+  let sql = `SELECT ${columnList} FROM "${safeTable}"`;
+
+  // Filter by rowIds if specified
+  if (rowIds && rowIds.length > 0) {
+    const placeholders = rowIds.map(() => '?').join(', ');
+    sql += ` WHERE rowid IN (${placeholders})`;
+  }
+
+  const results = db.exec(sql, rowIds || []);
+
+  if (results.length === 0) {
+    return { content: '', filename: `${table}.${format}`, mimeType: 'text/plain' };
+  }
+
+  const headers = results[0].columns;
+  const rows = results[0].values;
+
+  let content = '';
+  let mimeType = 'text/plain';
+  let filename = `${table}.${format}`;
+
+  switch (format) {
+    case 'csv':
+      content = exportToCsv(headers, rows, header);
+      mimeType = 'text/csv';
+      break;
+    case 'json':
+      content = exportToJson(headers, rows);
+      mimeType = 'application/json';
+      break;
+    case 'sql':
+      content = exportToSql(table, headers, rows, includeTableName);
+      mimeType = 'text/sql';
+      break;
+    case 'excel':
+      // For Excel, just use CSV format (Excel can open CSV)
+      content = exportToCsv(headers, rows, header);
+      mimeType = 'text/csv';
+      filename = `${table}.csv`;
+      break;
+    default:
+      throw new Error(`Unsupported export format: ${format}`);
+  }
+
+  return { content, filename, mimeType };
+}
+
+/**
+ * Convert data to CSV format.
+ */
+function exportToCsv(headers, rows, includeHeader) {
+  const escapeCell = (val) => {
+    if (val === null || val === undefined) return '';
+    if (val instanceof Uint8Array) return '[BLOB]';
+    const str = String(val);
+    // Escape quotes and wrap in quotes if contains comma, quote, or newline
+    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  };
+
+  const lines = [];
+  if (includeHeader) {
+    lines.push(headers.map(escapeCell).join(','));
+  }
+  for (const row of rows) {
+    lines.push(row.map(escapeCell).join(','));
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Convert data to JSON format.
+ */
+function exportToJson(headers, rows) {
+  const data = rows.map(row => {
+    const obj = {};
+    for (let i = 0; i < headers.length; i++) {
+      let val = row[i];
+      if (val instanceof Uint8Array) {
+        val = `[BLOB: ${val.length} bytes]`;
+      }
+      obj[headers[i]] = val;
+    }
+    return obj;
+  });
+  return JSON.stringify(data, null, 2);
+}
+
+/**
+ * Convert data to SQL INSERT statements.
+ */
+function exportToSql(table, headers, rows, includeTableName) {
+  const tableName = includeTableName ? `"${table.replace(/"/g, '""')}"` : '"table_name"';
+  const columnList = headers.map(h => `"${h.replace(/"/g, '""')}"`).join(', ');
+
+  const escapeValue = (val) => {
+    if (val === null || val === undefined) return 'NULL';
+    if (val instanceof Uint8Array) return 'NULL'; // Can't represent BLOB in SQL text
+    if (typeof val === 'number') return String(val);
+    return `'${String(val).replace(/'/g, "''")}'`;
+  };
+
+  const statements = rows.map(row => {
+    const values = row.map(escapeValue).join(', ');
+    return `INSERT INTO ${tableName} (${columnList}) VALUES (${values});`;
+  });
+
+  return statements.join('\n');
+}
+
+/**
  * Fetch table data with pagination and filtering.
  *
  * @param {string} table - Table name
@@ -593,6 +731,7 @@ const methods = {
   initializeDatabase,
   runQuery,
   exportDatabase,
+  exportTable,
   fetchTableData,
   fetchTableCount,
   fetchSchema,

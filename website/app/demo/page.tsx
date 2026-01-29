@@ -202,6 +202,46 @@ export default function DemoPage() {
         return;
       }
 
+      // Special handling for exportTable - trigger download after getting result
+      if (targetMethod === 'exportTable') {
+        callWorker(targetMethod, payload as unknown[] || [])
+          .then((result) => {
+            const exportResult = result as { content: string; filename: string; mimeType: string };
+            // Trigger download
+            const blob = new Blob([exportResult.content], { type: exportResult.mimeType });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = exportResult.filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            event.source?.postMessage({
+              channel: 'rpc',
+              content: {
+                kind: 'response',
+                messageId,
+                success: true,
+                data: { success: true }
+              }
+            }, '*' as WindowPostMessageOptions);
+          })
+          .catch((error) => {
+            event.source?.postMessage({
+              channel: 'rpc',
+              content: {
+                kind: 'response',
+                messageId,
+                success: false,
+                errorMessage: error.message
+              }
+            }, '*' as WindowPostMessageOptions);
+          });
+        return;
+      }
+
       // Forward all other calls to worker
       callWorker(targetMethod as string, payload as unknown[] || [])
         .then((result) => {
