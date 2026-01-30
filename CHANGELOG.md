@@ -2,6 +2,18 @@
 
 ## 1.2.1
 
+### Improvements
+
+- **Enhanced Grid Selection**:
+  - Added range selection for rows and columns using `Shift + Click`.
+  - Added multi-range selection for rows and columns using `Cmd/Ctrl + Shift + Click`.
+  - Prevented default browser text selection highlight (blue background) when selecting cells, rows, or columns.
+
+### Maintenance
+
+- **Dependency Updates**: Updated core dependencies including `react-dom`, `@vscode/extension-telemetry`, and build tools.
+- **Engine Update**: Bumped minimum VS Code engine requirement to `^1.108.1` to match type definitions.
+
 ## 1.2.0
 
 ### New Features
