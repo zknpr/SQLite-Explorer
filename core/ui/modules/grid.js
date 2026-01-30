@@ -290,11 +290,6 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
         const dataResult = await backendApi.fetchTableData(state.selectedTable, queryOptions);
 
-        // Data result rows now include rowid at index 0 if we requested it.
-        // `grid.js` logic: `getRowId` uses `row[0]`. `getCellValue` uses `colIdx + getRowDataOffset()`.
-        // `getRowDataOffset` returns 1 if table (skipping rowid).
-        // So if `dataResult.rows` has `[rowid, col1, col2]`, it matches the expectation!
-
         state.gridData = dataResult.rows || [];
 
         // If not showing spinner (background refresh), capture the current scroll position

@@ -82,7 +82,7 @@ export async function exportTableCommand(
     }
 
     // 2. Fallback: pick the first one (legacy behavior)
-    // This assumes there is only one active database editor
+    // Assumes single active database editor
     if (!document) {
       for (const [, doc] of DocumentRegistry) {
         document = doc;

@@ -423,13 +423,11 @@ class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery('BEGIN TRANSACTION');
     try {
       const escapedTable = escapeIdentifier(table);
-      // Group updates by column and operation type for potentially better batching
-      // For now, prepare statements one by one is better than full re-parse
+      // Group updates by column and operation type
+      // Prepare statements one by one avoids full re-parse
 
-      // We can't actually use a single prepared statement if the column name changes
-      // So we have to prepare per column or construct SQL dynamically.
-      // Given we have escapeIdentifier, dynamic SQL is safe enough but parsing is slow.
-      // Best approach for sql.js: Group by column.
+      // Prepare per column.
+      // Group by column.
 
       const updatesByColumn = new Map<string, CellUpdate[]>();
       for (const update of updates) {
@@ -757,17 +755,7 @@ export async function createDatabaseEngine(
 
   if (buffer && buffer.byteLength > 0) {
     // Open existing database from binary
-    // Avoid creating an intermediate copy if possible
-    // buffer is often a Node Buffer or Uint8Array.
-    // Creating new Uint8Array(buffer) copies the data.
-    // We should pass the existing buffer or a view of it.
-
-    // sql.js Database constructor copies data into WASM heap anyway.
-    // We just want to avoid the intermediate JS copy.
-
-    // If it's a Buffer, it's already a Uint8Array instance in modern Node
-    // But passing it to new Uint8Array() creates a copy.
-    // We can pass it directly if it's compatible, or create a view.
+    // Avoid creating an intermediate copy
 
     const data = (buffer.buffer && buffer.byteLength === buffer.buffer.byteLength)
         ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)

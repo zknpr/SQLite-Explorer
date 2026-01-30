@@ -261,12 +261,6 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             this.#autoSaveIfNeeded();
         } catch (e) {
             console.error('[Undo] Failed:', e);
-            // Optionally restore state?
-            // If undo fails, we might be in inconsistent state.
-            // Push back to timeline?
-            tracker.record(undoneEntry); // Push back so we can try again? Or maybe stepForward?
-            // stepBack moved it to futureStack. We should move it back if it failed?
-            // Actually, if it failed, we are in trouble.
             vsc.window.showErrorMessage(vsc.l10n.t('Undo failed: {0}', e instanceof Error ? e.message : String(e)));
         }
       },

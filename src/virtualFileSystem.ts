@@ -16,13 +16,11 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     }
 
     async stat(uri: vsc.Uri): Promise<vsc.FileStat> {
-        // We can just return a generic file stat for now, as we dynamically generate content
-        // For directories, we might need to be more specific if we want to support browsing
-        // But for openCellEditor, we point directly to a file.
+        // Return generic file stat
         const { rowId } = this.parseUri(uri);
 
         const now = Date.now();
-        const isDir = false; // We only support files for now (cells)
+        const isDir = false; // Only files (cells) supported
 
         return {
             type: isDir ? vsc.FileType.Directory : vsc.FileType.File,
@@ -48,7 +46,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         try {
             if (rowId === '__create__.sql') {
                 // Fetch create statement
-                // We can query sqlite_schema
+                // Query sqlite_schema
                 const sql = `SELECT sql FROM sqlite_schema WHERE type IN ('table', 'view') AND name = ?`;
                 const result = await document.databaseOperations.executeQuery(sql, [table]);
                 const createSql = result?.[0]?.rows?.[0]?.[0];
@@ -72,8 +70,8 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             }
 
             // For tables, use WHERE rowid = ?
-            // We need to escape identifiers.
-            // We can reuse `fetchTableData` or `executeQuery`.
+            // Escape identifiers.
+            // Reuse `fetchTableData` or `executeQuery`.
             const query = `SELECT "${colName.replace(/"/g, '""')}" FROM "${table.replace(/"/g, '""')}" WHERE rowid = ?`;
             const result = await document.databaseOperations.executeQuery(query, [rowIdNum]);
 

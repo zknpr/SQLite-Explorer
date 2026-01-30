@@ -202,10 +202,6 @@ export async function openCellInVsCode() {
     const { rowIdx, colIdx, rowId, columnName, originalValue } = state.cellPreviewInfo;
     const column = state.tableColumns[colIdx];
 
-    // We need to determine if it's text, json, blob, etc.
-    // For now passing value as is.
-    // We pass metadata to help extension determine extension/language.
-
     // We get the webview id from dataset if available or assume 'default'
     const webviewId = document.getElementById('vscode-env')?.dataset.webviewId || 'default';
 

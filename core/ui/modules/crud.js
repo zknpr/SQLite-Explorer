@@ -116,8 +116,6 @@ async function submitDeleteRows() {
     if (state.selectedRowIds.size === 0) return;
 
     const rowIds = Array.from(state.selectedRowIds);
-    // Validation happens in HostBridge/backend now but good to be type-safe here?
-    // They are stored as numbers in state mostly.
 
     try {
         updateStatus('Deleting rows...');

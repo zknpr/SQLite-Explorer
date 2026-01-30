@@ -145,8 +145,6 @@ export async function clearSelectedCellValues() {
         state.lastSelectedCell = null;
         state.selectedColumns.clear();
 
-        // Full reload or just local update?
-        // Perform a full reload to ensure UI consistency with backend state.
         await loadTableData();
         updateToolbarButtons();
         updateStatus(`${label} - Ctrl+S to save`);

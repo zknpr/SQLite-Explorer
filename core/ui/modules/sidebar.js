@@ -262,9 +262,6 @@ export async function applyBatchUpdate() {
         const freshSelectedCells = [];
         for (const oldCell of state.selectedCells) {
             // Find corresponding row in new gridData
-            // If pagination/sort changed, indices might be wrong, but we didn't change those.
-            // However, we re-fetched, so rows might have moved if we sorted by the column we updated?
-            // Assuming stable order for now.
             const newValue = state.gridData[oldCell.rowIdx][oldCell.colIdx + getRowDataOffset()];
             freshSelectedCells.push({ ...oldCell, value: newValue });
         }

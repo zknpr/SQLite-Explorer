@@ -69,7 +69,6 @@ if (isBrowserRuntime) {
 
     if (!parentPortImpl) {
        // In main thread, parentPort is null. In worker thread, it should be defined.
-       // We can check isMainThread to be sure.
        if (!wt.isMainThread) {
           console.error('[ThreadPool] worker_threads.parentPort is null in a worker thread!');
        }

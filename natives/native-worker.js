@@ -342,7 +342,7 @@ async function handleRequest(request) {
              result = runResult;
           } else {
               // tjs sqlite might not expose totalChanges/changes on db object
-              // We need to query for it if missing
+              // Query for value if missing
               if (db.changes !== undefined) {
                  result = {
                    changes: db.changes,

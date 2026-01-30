@@ -44,9 +44,6 @@ function onDragOver(e) {
 }
 
 function onDragLeave(e) {
-    // Only remove if leaving the cell (not entering a child)
-    // But dragleave fires when entering a child too.
-    // Simpler to rely on dragover to manage the class, or clean up if leaving grid.
     if (e.target === lastHighlightedCell) {
         // This flickers. Rely on dragover.
     }
@@ -78,8 +75,7 @@ async function onDrop(e) {
         const uris = uriList.split(/\r?\n/);
         if (uris.length > 0 && uris[0]) {
             let uri = uris[0];
-            // Decode URI if needed, but VS Code usually provides encoded URIs
-            // We need a name. Try to extract from URI.
+            // Extract name from URI
             let name = 'unknown_file';
             try {
                 // Simple parsing for name
@@ -109,14 +105,7 @@ async function handleFileUpload(cell, fileName, fileBlob) {
 async function handleUriUpload(cell, fileName, uri) {
     try {
         updateStatus(`Fetching ${fileName}...`);
-        // Use backend to read file from workspace
-        // Response should be the buffer/array
         const result = await backendApi.readWorkspaceFileUri(uri);
-
-        // Result comes back as the data structure from RPC.
-        // HostBridge returns Uint8Array.
-        // PostMessage serialization handles Uint8Array correctly usually.
-        // If it comes as { type: 'Buffer', data: [...] } (Node Buffer serialization), we need to handle it.
 
         let uint8Array;
         if (result instanceof Uint8Array) {
@@ -124,10 +113,8 @@ async function handleUriUpload(cell, fileName, uri) {
         } else if (result && result.type === 'Buffer' && Array.isArray(result.data)) {
             uint8Array = new Uint8Array(result.data);
         } else if (result && typeof result === 'object' && Object.keys(result).some(k => !isNaN(k))) {
-             // Sometimes obj-like {0: x, 1: y...}
              uint8Array = new Uint8Array(Object.values(result));
         } else {
-             // Fallback or error
              console.error('Unknown data format from backend:', result);
              throw new Error('Received invalid data format from backend');
         }

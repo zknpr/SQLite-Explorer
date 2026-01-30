@@ -89,9 +89,7 @@ function formatDate(value, format) {
     if (value instanceof Date) {
         date = value;
     } else if (typeof value === 'number') {
-        // Assume unix timestamp (seconds if small, millis if large?)
-        // SQLite often uses seconds (REAL or INTEGER)
-        // If it's small (e.g. < 10^11), assume seconds.
+        // Assume unix timestamp
         if (value < 100000000000) {
             date = new Date(value * 1000);
         } else {

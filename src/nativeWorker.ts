@@ -770,12 +770,12 @@ export async function createNativeDatabaseConnection(
           let rows = result.values;
 
           // Native worker returns columns based on Object.keys() which doesn't guarantee order.
-          // We need to ensure the result matches the requested column order from options.columns.
+          // Ensure the result matches the requested column order from options.columns.
           if (options.columns && options.columns.length > 0 && headers && rows) {
             const expected = options.columns;
 
             // Build map of lower-case header names to indices for robust matching
-            // We prioritize exact match, then case-insensitive
+            // Prioritize exact match, then case-insensitive
             const headerIndexMap = new Map<string, number>();
             headers.forEach((h: string, i: number) => {
                 headerIndexMap.set(h, i);

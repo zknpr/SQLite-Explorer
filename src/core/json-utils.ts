@@ -78,7 +78,7 @@ export function applyMergePatch(target: any, patch: any): any {
         target = {};
     } else {
         // Clone target to avoid mutation if we want immutability,
-        // but for now let's clone shallowly to be safe.
+        // Clone shallowly for safety.
         target = { ...target };
     }
 

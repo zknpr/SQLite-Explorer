@@ -454,8 +454,6 @@ export class HostBridge implements ToastService {
     if ('fetchTableData' in document.databaseOperations) {
       return await (document.databaseOperations as any).fetchTableData(table, options);
     } else {
-      // Fallback or error? Since we are upgrading everything, throw error.
-      // Alternatively, we could implement fallback using exec, but that defeats the purpose of moving logic to backend.
       throw new Error("Backend does not support fetchTableData");
     }
   }
