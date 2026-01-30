@@ -19,7 +19,7 @@
  * sql.js CDN URL for the JavaScript module.
  * Using jsDelivr for reliable global CDN delivery.
  */
-const SQL_JS_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.11.0/sql-wasm.js';
+const SQL_JS_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.13.0/sql-wasm.js';
 
 // ============================================================================
 // State
@@ -89,7 +89,7 @@ async function initializeDatabase(filename, config) {
       sqlConfig.wasmBinary = config.wasmBinary;
     } else {
       // Default to CDN WASM
-      sqlConfig.locateFile = (file) => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.11.0/${file}`;
+      sqlConfig.locateFile = (file) => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.13.0/${file}`;
     }
 
     SQL = await self.initSqlJs(sqlConfig);

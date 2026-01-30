@@ -369,7 +369,11 @@ const bundleWebDemoViewer = async () => {
   }
 
   // Bundle: replace placeholders with actual content
+  // Inject Codicon font for web demo (VS Code extension handles this via local resources or CSP-friendly URI)
+  const codiconLink = '<link rel="stylesheet" href="https://unpkg.com/@vscode/codicons@0.0.36/dist/codicon.css">';
+
   const bundled = template
+    .replace('<!--HEAD-->', codiconLink)
     .replace('<!--STYLES-->', finalCss)
     .replace('<!--SCRIPTS-->', finalJs);
 
