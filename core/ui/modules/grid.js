@@ -131,7 +131,8 @@ export function initGridInteraction() {
             const rowEl = target.closest('.data-row');
             if (rowEl) {
                 const rowId = resolveRowIdType(rowEl.dataset.rowid);
-                onRowNumberClick(event, rowId);
+                const rowIdx = parseInt(rowEl.dataset.rowidx, 10);
+                onRowNumberClick(event, rowId, rowIdx);
             }
             return;
         }
@@ -764,17 +765,58 @@ export function onColumnHeaderClick(event, columnName) {
     const colIdx = state.tableColumns.findIndex(c => c.name === columnName);
     if (colIdx === -1) return;
 
+    // Prevent default to avoid text selection highlight
+    if (event.shiftKey || event.metaKey || event.ctrlKey) {
+        event.preventDefault();
+    }
+
     state.selectedRowIds.clear();
 
-    const columnCellCount = state.gridData.length;
-    let selectedInColumn = 0;
-    for (const sc of state.selectedCells) {
-        if (sc.colIdx === colIdx) selectedInColumn++;
-    }
-    const isColumnFullySelected = columnCellCount > 0 && selectedInColumn === columnCellCount;
+    // Range Selection (Shift)
+    if (event.shiftKey && state.lastSelectedColumnIndex !== null) {
+        if (!(event.metaKey || event.ctrlKey)) {
+            // Clear previous if not adding to selection
+            state.selectedCells = [];
+            state.selectedColumns.clear();
+        }
 
-    if ((event.metaKey || event.ctrlKey)) {
+        const start = Math.min(state.lastSelectedColumnIndex, colIdx);
+        const end = Math.max(state.lastSelectedColumnIndex, colIdx);
+
+        const existingSet = new Set();
+        // If appending, index existing selected cells for efficiency
+        if (state.selectedCells.length > 0) {
+            for (const sc of state.selectedCells) {
+                existingSet.add(`${sc.rowIdx},${sc.colIdx}`);
+            }
+        }
+
+        for (let c = start; c <= end; c++) {
+            const colName = state.tableColumns[c].name;
+            state.selectedColumns.add(colName);
+
+            for (let r = 0; r < state.gridData.length; r++) {
+                if (!existingSet.has(`${r},${c}`)) {
+                    const rowId = getRowId(state.gridData[r], r);
+                    const value = getCellValue(state.gridData[r], c);
+                    state.selectedCells.push({ rowIdx: r, colIdx: c, rowId, value });
+                    existingSet.add(`${r},${c}`);
+                }
+            }
+        }
+    }
+    // Multi Selection (Cmd/Ctrl)
+    else if ((event.metaKey || event.ctrlKey)) {
         // Toggle add/remove column
+
+        // Check if this specific column is fully selected
+        const columnCellCount = state.gridData.length;
+        let selectedInColumn = 0;
+        for (const sc of state.selectedCells) {
+            if (sc.colIdx === colIdx) selectedInColumn++;
+        }
+        const isColumnFullySelected = columnCellCount > 0 && selectedInColumn === columnCellCount;
+
         if (isColumnFullySelected) {
             state.selectedCells = state.selectedCells.filter(sc => sc.colIdx !== colIdx);
             state.selectedColumns.delete(columnName);
@@ -795,11 +837,21 @@ export function onColumnHeaderClick(event, columnName) {
             }
             state.selectedColumns.add(columnName);
         }
+        state.lastSelectedColumnIndex = colIdx;
     } else {
+        // Check if this specific column is fully selected
+        const columnCellCount = state.gridData.length;
+        let selectedInColumn = 0;
+        for (const sc of state.selectedCells) {
+            if (sc.colIdx === colIdx) selectedInColumn++;
+        }
+        const isColumnFullySelected = columnCellCount > 0 && selectedInColumn === columnCellCount;
+
         // Toggle selection if this column is already fully selected and is the only column selected
         if (isColumnFullySelected && state.selectedColumns.size === 1 && state.selectedColumns.has(columnName)) {
             state.selectedCells = [];
             state.selectedColumns.clear();
+            state.lastSelectedColumnIndex = null;
         } else {
             // Select only this column
             state.selectedCells = [];
@@ -810,6 +862,7 @@ export function onColumnHeaderClick(event, columnName) {
                 state.selectedCells.push({ rowIdx: r, colIdx, rowId, value });
             }
             state.selectedColumns.add(columnName);
+            state.lastSelectedColumnIndex = colIdx;
         }
     }
 
@@ -914,26 +967,50 @@ export function onRowClick(event, rowId, rowIdx) {
     // that differ from cell selection.
 }
 
-export function onRowNumberClick(event, rowId) {
+export function onRowNumberClick(event, rowId, rowIdx) {
     event.stopPropagation();
+    // Prevent default to avoid text selection highlight
+    if (event.shiftKey || event.metaKey || event.ctrlKey) {
+        event.preventDefault();
+    }
 
     // Clear cell selection
     state.selectedCells = [];
     state.lastSelectedCell = null;
     state.selectedColumns.clear();
 
-    if (event.ctrlKey || event.metaKey) {
+    // Range Selection (Shift)
+    if (event.shiftKey && state.lastSelectedRowIndex !== null) {
+        if (!(event.metaKey || event.ctrlKey)) {
+            state.selectedRowIds.clear();
+        }
+
+        const start = Math.min(state.lastSelectedRowIndex, rowIdx);
+        const end = Math.max(state.lastSelectedRowIndex, rowIdx);
+
+        for (let i = start; i <= end; i++) {
+            const id = getRowId(state.gridData[i], i);
+            state.selectedRowIds.add(id);
+        }
+    }
+    // Multi Selection (Cmd/Ctrl)
+    else if (event.ctrlKey || event.metaKey) {
         if (state.selectedRowIds.has(rowId)) {
             state.selectedRowIds.delete(rowId);
         } else {
             state.selectedRowIds.add(rowId);
         }
-    } else {
+        state.lastSelectedRowIndex = rowIdx;
+    }
+    // Single Selection
+    else {
         if (state.selectedRowIds.has(rowId) && state.selectedRowIds.size === 1) {
             state.selectedRowIds.delete(rowId);
+            state.lastSelectedRowIndex = null;
         } else {
             state.selectedRowIds.clear();
             state.selectedRowIds.add(rowId);
+            state.lastSelectedRowIndex = rowIdx;
         }
     }
 
@@ -985,6 +1062,7 @@ export function onCellClick(event, rowIdx, colIdx, rowId) {
 
     // Range selection
     if ((event.metaKey || event.ctrlKey) && event.shiftKey && state.lastSelectedCell) {
+        event.preventDefault(); // Prevent text selection
         state.selectedRowIds.clear();
 
         const minRow = Math.min(state.lastSelectedCell.rowIdx, rowIdx);
@@ -1013,6 +1091,7 @@ export function onCellClick(event, rowIdx, colIdx, rowId) {
     }
     // Multi selection
     else if (event.metaKey || event.ctrlKey) {
+        event.preventDefault(); // Prevent text selection
         state.selectedRowIds.clear();
         const existingIdx = state.selectedCells.findIndex(sc => sc.rowIdx === rowIdx && sc.colIdx === colIdx);
         if (existingIdx >= 0) {
@@ -1024,6 +1103,7 @@ export function onCellClick(event, rowIdx, colIdx, rowId) {
     }
     // Shift selection (range from last)
     else if (event.shiftKey && state.lastSelectedCell) {
+        event.preventDefault(); // Prevent text selection
         state.selectedRowIds.clear();
         state.selectedCells = []; // Reset and select range
 

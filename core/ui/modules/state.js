@@ -29,6 +29,8 @@ export const state = {
     // Cell selection state
     selectedCells: [],
     lastSelectedCell: null,
+    lastSelectedColumnIndex: null, // For column range selection
+    lastSelectedRowIndex: null,    // For row range selection
 
     // Column resize state
     columnWidths: {},
