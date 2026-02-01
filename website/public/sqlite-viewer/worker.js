@@ -657,7 +657,7 @@ async function createTable(table, columns) {
     let def = `"${name}" ${col.type || 'TEXT'}`;
     if (col.pk) def += ' PRIMARY KEY';
     if (col.notnull) def += ' NOT NULL';
-    if (col.defaultValue !== undefined && col.defaultValue !== null) {
+    if (col.defaultValue !== undefined && col.defaultValue !== null && col.defaultValue !== "") {
       def += ` DEFAULT ${col.defaultValue}`;
     }
     return def;
@@ -702,7 +702,7 @@ async function addColumn(table, column, type, defaultValue) {
   const safeColumn = column.replace(/"/g, '""');
 
   let sql = `ALTER TABLE "${safeTable}" ADD COLUMN "${safeColumn}" ${type}`;
-  if (defaultValue !== undefined && defaultValue !== null) {
+  if (defaultValue !== undefined && defaultValue !== null && defaultValue !== "") {
     sql += ` DEFAULT ${defaultValue}`;
   }
 
