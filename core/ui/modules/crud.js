@@ -9,6 +9,30 @@ import { loadTableData, loadTableColumns } from './grid.js';
 import { refreshSchema } from './sidebar.js';
 import { escapeHtml, validateRowId, escapeIdentifier } from './utils.js';
 
+export function initCrud() {
+    // Add Row
+    document.getElementById('btnSubmitAddRow')?.addEventListener('click', submitAddRow);
+
+    // Delete
+    document.getElementById('btnSubmitDelete')?.addEventListener('click', submitDelete);
+
+    // Create Table
+    document.getElementById('btnSubmitCreateTable')?.addEventListener('click', submitCreateTable);
+    document.getElementById('btnAddColumnDef')?.addEventListener('click', () => addColumnDefinition());
+
+    // Delegation for removing column definitions
+    document.getElementById('columnDefinitions')?.addEventListener('click', (e) => {
+        const btn = e.target.closest('.btn-remove-col');
+        if (btn) {
+            const colId = btn.dataset.colid;
+            removeColumnDefinition(colId);
+        }
+    });
+
+    // Add Column
+    document.getElementById('btnSubmitAddColumn')?.addEventListener('click', submitAddColumn);
+}
+
 // ================================================================
 // ADD ROW
 // ================================================================
@@ -17,16 +41,49 @@ export function openAddRowModal() {
     if (!state.selectedTable || state.selectedTableType !== 'table') return;
 
     const form = document.getElementById('addRowForm');
-    form.innerHTML = state.tableColumns.map(col => {
+    form.replaceChildren(); // Clear existing content
+
+    state.tableColumns.forEach(col => {
         const isRequired = col.notnull === 1 && !col.isPrimaryKey;
-        const requiredLabel = isRequired ? ' <span style="color: var(--error-color)">*</span>' : '';
-        return `
-        <div class="form-field">
-            <label>${escapeHtml(col.name)}${requiredLabel} <span style="opacity:0.5">(${col.type})</span></label>
-            <input type="text" data-column="${escapeHtml(col.name)}" data-required="${isRequired}" placeholder="${col.isPrimaryKey ? 'Auto (Primary Key)' : (isRequired ? 'Required' : 'NULL')}" ${col.isPrimaryKey ? 'disabled' : ''}>
-        </div>
-    `;
-    }).join('');
+
+        const div = document.createElement('div');
+        div.className = 'form-field';
+
+        const label = document.createElement('label');
+        label.textContent = col.name;
+
+        if (isRequired) {
+            const reqSpan = document.createElement('span');
+            reqSpan.style.color = 'var(--error-color)';
+            reqSpan.textContent = '*';
+            label.appendChild(document.createTextNode(' '));
+            label.appendChild(reqSpan);
+        }
+
+        const typeSpan = document.createElement('span');
+        typeSpan.style.opacity = '0.5';
+        typeSpan.textContent = ` (${col.type})`;
+        label.appendChild(document.createTextNode(' '));
+        label.appendChild(typeSpan);
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.dataset.column = col.name;
+        input.dataset.required = isRequired.toString();
+
+        if (col.isPrimaryKey) {
+            input.placeholder = 'Auto (Primary Key)';
+            input.disabled = true;
+        } else if (isRequired) {
+            input.placeholder = 'Required';
+        } else {
+            input.placeholder = 'NULL';
+        }
+
+        div.appendChild(label);
+        div.appendChild(input);
+        form.appendChild(div);
+    });
 
     openModal('addRowModal');
 }
@@ -167,7 +224,8 @@ let columnDefCounter = 0;
 
 export function openCreateTableModal() {
     document.getElementById('newTableName').value = '';
-    document.getElementById('columnDefinitions').innerHTML = '';
+    const container = document.getElementById('columnDefinitions');
+    container.replaceChildren();
     columnDefCounter = 0;
     addColumnDefinition(true);
     openModal('createTableModal');
@@ -177,28 +235,86 @@ export function addColumnDefinition(isFirst = false) {
     const container = document.getElementById('columnDefinitions');
     const colId = ++columnDefCounter;
 
-    const html = `
-        <div class="column-def-row" id="colDef_${colId}" style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;">
-            <input type="text" placeholder="Column name" class="col-name" style="flex: 2;" value="${isFirst ? 'id' : ''}">
-            <select class="col-type" style="flex: 1;">
-                <option value="INTEGER" ${isFirst ? 'selected' : ''}>INTEGER</option>
-                <option value="TEXT" ${!isFirst ? 'selected' : ''}>TEXT</option>
-                <option value="REAL">REAL</option>
-                <option value="BLOB">BLOB</option>
-                <option value="NUMERIC">NUMERIC</option>
-            </select>
-            <label style="display: flex; align-items: center; gap: 4px; cursor: pointer;">
-                <input type="checkbox" class="col-pk" ${isFirst ? 'checked' : ''} style="margin:0;"> PK
-            </label>
-            <label style="display: flex; align-items: center; gap: 4px; cursor: pointer;">
-                <input type="checkbox" class="col-nn" style="margin:0;"> NN
-            </label>
-            <button class="icon-button" onclick="removeColumnDefinition(${colId})" title="Remove" ${isFirst ? 'disabled' : ''}>
-                <span class="codicon codicon-close"></span>
-            </button>
-        </div>
-    `;
-    container.insertAdjacentHTML('beforeend', html);
+    const rowDiv = document.createElement('div');
+    rowDiv.className = 'column-def-row';
+    rowDiv.id = `colDef_${colId}`;
+    Object.assign(rowDiv.style, {
+        display: 'flex',
+        gap: '8px',
+        marginBottom: '8px',
+        alignItems: 'center'
+    });
+
+    // Name Input
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.placeholder = 'Column name';
+    nameInput.className = 'col-name';
+    nameInput.style.flex = '2';
+    if (isFirst) nameInput.value = 'id';
+    rowDiv.appendChild(nameInput);
+
+    // Type Select
+    const typeSelect = document.createElement('select');
+    typeSelect.className = 'col-type';
+    typeSelect.style.flex = '1';
+    ['INTEGER', 'TEXT', 'REAL', 'BLOB', 'NUMERIC'].forEach(type => {
+        const option = document.createElement('option');
+        option.value = type;
+        option.textContent = type;
+        if (isFirst && type === 'INTEGER') option.selected = true;
+        if (!isFirst && type === 'TEXT') option.selected = true;
+        typeSelect.appendChild(option);
+    });
+    rowDiv.appendChild(typeSelect);
+
+    // PK Checkbox
+    const pkLabel = document.createElement('label');
+    Object.assign(pkLabel.style, {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '4px',
+        cursor: 'pointer'
+    });
+    const pkInput = document.createElement('input');
+    pkInput.type = 'checkbox';
+    pkInput.className = 'col-pk';
+    pkInput.style.margin = '0';
+    if (isFirst) pkInput.checked = true;
+    pkLabel.appendChild(pkInput);
+    pkLabel.appendChild(document.createTextNode(' PK'));
+    rowDiv.appendChild(pkLabel);
+
+    // NN Checkbox
+    const nnLabel = document.createElement('label');
+    Object.assign(nnLabel.style, {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '4px',
+        cursor: 'pointer'
+    });
+    const nnInput = document.createElement('input');
+    nnInput.type = 'checkbox';
+    nnInput.className = 'col-nn';
+    nnInput.style.margin = '0';
+    nnLabel.appendChild(nnInput);
+    nnLabel.appendChild(document.createTextNode(' NN'));
+    rowDiv.appendChild(nnLabel);
+
+    // Remove Button
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'icon-button btn-remove-col';
+    removeBtn.dataset.colid = colId.toString();
+    removeBtn.title = 'Remove';
+    if (isFirst) removeBtn.disabled = true;
+
+    const iconSpan = document.createElement('span');
+    iconSpan.className = 'codicon codicon-close';
+    removeBtn.appendChild(iconSpan);
+
+    rowDiv.appendChild(removeBtn);
+
+    container.appendChild(rowDiv);
 }
 
 export function removeColumnDefinition(colId) {

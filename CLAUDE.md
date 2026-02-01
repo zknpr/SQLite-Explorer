@@ -43,7 +43,7 @@ The extension uses a three-layer communication architecture:
 | `src/main.ts` | Extension activation, command registration |
 | `src/editorController.ts` | Custom editor provider (DatabaseViewerProvider, DatabaseEditorProvider) |
 | `src/databaseModel.ts` | Document model (DatabaseDocument), undo/redo, save/revert |
-| `src/workerFactory.ts` | Worker bundle creation, file reading |
+| `src/workerFactory.ts` | Worker instantiation, connection setup, file reading |
 | `src/databaseWorker.ts` | Worker entry point, exposes database operations |
 | `src/hostBridge.ts` | HostBridge - functions exposed to webview (exec, export, etc.) |
 | `src/core/types.ts` | Core type definitions (CellValue, RecordId, QueryResultSet, etc.) |
@@ -65,36 +65,61 @@ The extension uses a three-layer communication architecture:
 
 ### RPC Protocol
 
-The extension uses a custom RPC protocol for cross-boundary communication:
+The extension uses two distinct RPC protocols for cross-boundary communication.
 
-**Message Format (Webview → Extension):**
+**1. Core RPC (Worker Communication & Extension → Webview)**
+Defined in `src/core/rpc.ts`, used for all Worker communication and when the Extension invokes Webview methods.
+
+*Request:*
+```javascript
+{
+  kind: 'invoke',
+  correlationId: 'ipc_...',
+  methodName: 'methodName',
+  parameters: [arg1, arg2, ...]
+}
+```
+
+*Response:*
+```javascript
+{
+  kind: 'result',
+  correlationId: 'ipc_...',
+  payload: result, // or errorText: "error"
+}
+```
+
+**2. Webview RPC (Webview → Extension)**
+Used when the Webview invokes Extension Host methods.
+
+*Request:*
 ```javascript
 {
   channel: 'rpc',
   content: {
     kind: 'invoke',
-    messageId: 'unique-id',
+    messageId: 'rpc_...',
     targetMethod: 'methodName',
     payload: [arg1, arg2, ...]
   }
 }
 ```
 
-**Response Format (Extension → Webview):**
+*Response:*
 ```javascript
 {
   channel: 'rpc',
   content: {
     kind: 'response',
-    messageId: 'unique-id',
+    messageId: 'rpc_...',
     success: true,
-    data: result
+    data: result // or errorMessage: "error"
   }
 }
 ```
 
 **Zero-Copy Transfer:**
-To transfer large binary data (ArrayBuffers) without copying, use the `Transfer` wrapper in the RPC layer.
+To transfer large binary data (ArrayBuffers) without copying, use the `Transfer` wrapper in the RPC layer (supported in Core RPC).
 ```typescript
 // workerFactory.ts
 const data = new Uint8Array(...);
@@ -117,6 +142,9 @@ DEV=1 node scripts/build.mjs
 
 # Quick install (build + package + install)
 ./install.sh
+
+# Run unit tests
+npm test
 ```
 
 ### Build Outputs

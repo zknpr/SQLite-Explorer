@@ -5,32 +5,16 @@ import { state } from './modules/state.js';
 import { initRpc } from './modules/rpc.js';
 import { backendApi } from './modules/api.js';
 import {
-    reloadFromDisk,
-    toggleSection,
-    selectTableItem,
-    refreshSchema,
-    updateBatchSidebar,
-    applyBatchUpdate,
-    setBatchNull,
-    toggleBatchPatch
+    initSidebar,
+    refreshSchema
 } from './modules/sidebar.js';
 import {
-    openExportModal,
-    submitExport,
-    onExportFormatChange
+    initExport
 } from './modules/export.js';
 
 import {
-    openCreateTableModal,
-    openAddRowModal,
-    openAddColumnModal,
-    openDeleteModal,
-    submitAddRow,
-    submitDelete,
-    submitCreateTable,
-    addColumnDefinition,
-    removeColumnDefinition,
-    submitAddColumn
+    initCrud,
+    submitDelete
 } from './modules/crud.js';
 import {
     updateStatus,
@@ -39,37 +23,17 @@ import {
     initSidebarResize
 } from './modules/ui.js';
 import {
-    closeModal
+    initModals
 } from './modules/modals.js';
 import {
-    onCellClick,
-    onCellDoubleClick,
     loadTableData,
-    onFilterChange,
-    onPageSizeChange,
-    onDateFormatChange,
-    goToPage,
-    onColumnSort,
-    onColumnHeaderClick,
-    toggleColumnPin,
-    onColumnFilterKeydown,
-    applyColumnFilter,
-    startColumnResize,
-    onRowClick,
-    onRowNumberClick,
-    toggleRowPin,
     onSelectAllClick,
     initGridInteraction,
+    initGridControls,
     clearSelection
 } from './modules/grid.js';
 import {
-    openCellPreview,
-    closeCellPreview,
-    saveCellPreview,
-    formatCellPreviewJson,
-    compactCellPreviewJson,
-    toggleCellPreviewWrap,
-    openCellInVsCode
+    initEdit
 } from './modules/edit.js';
 import {
     copyCellsToClipboard,
@@ -77,9 +41,7 @@ import {
     clearSelectedCellValues
 } from './modules/clipboard.js';
 import {
-    openSettingsModal,
-    updateExtensionSetting,
-    updatePragma
+    initSettings
 } from './modules/settings.js';
 import {
     initDragAndDrop
@@ -88,59 +50,21 @@ import {
 // Initialize RPC system
 initRpc();
 
-// Attach functions to window for HTML event handlers
-Object.assign(window, {
-    reloadFromDisk,
-    toggleSection,
-    selectTableItem,
-    openCreateTableModal,
-    openAddRowModal,
-    openAddColumnModal,
-    openDeleteModal,
-    submitAddRow,
-    submitDelete,
-    submitCreateTable,
-    addColumnDefinition,
-    removeColumnDefinition,
-    submitAddColumn,
-    openExportModal,
-    submitExport,
-    onExportFormatChange,
-    onFilterChange,
-    onPageSizeChange,
-    onDateFormatChange,
-    goToPage,
-    onColumnSort,
-    onColumnHeaderClick,
-    toggleColumnPin,
-    onColumnFilterKeydown,
-    applyColumnFilter,
-    startColumnResize,
-    onRowClick,
-    onRowNumberClick,
-    toggleRowPin,
-    onSelectAllClick,
-    onCellClick,
-    onCellDoubleClick,
-    openCellPreview,
-    closeCellPreview,
-    saveCellPreview,
-    formatCellPreviewJson,
-    compactCellPreviewJson,
-    toggleCellPreviewWrap,
-    openCellInVsCode,
-    openSettingsModal,
-    updateExtensionSetting,
-    updatePragma,
-    applyBatchUpdate,
-    setBatchNull,
-    toggleBatchPatch,
-    closeModal
-});
-
 // Main initialization
 async function initializeApp() {
     try {
+        // Initialize Modules (Event Listeners)
+        initSidebar();
+        initCrud();
+        initExport();
+        initModals();
+        initSettings();
+        initEdit();
+        initGridControls();
+        initGridInteraction();
+        initSidebarResize();
+        initDragAndDrop();
+
         // Read configuration from environment
         const vscodeEnv = document.getElementById('vscode-env');
         if (vscodeEnv) {
@@ -167,46 +91,20 @@ async function initializeApp() {
         updateStatus('Ready');
         showEmptyState();
 
-        // Initialize UI components
-        initSidebarResize();
-        initGridInteraction();
-        initDragAndDrop();
-
         // Global shortcuts
         document.addEventListener('keydown', async (event) => {
             // Undo / Redo - Handled natively by VS Code for Custom Editors
-            // We only need to handle it if we want to override default behavior or if native handling fails.
-            // Currently, explicit handling causes "already an undo or redo operation running" race conditions.
-            /*
-            if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') {
-                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
-
-                event.preventDefault();
-                if (event.shiftKey) {
-                    await backendApi.triggerRedo();
-                } else {
-                    await backendApi.triggerUndo();
-                }
-            }
-
-            if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'y') {
-                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
-
-                event.preventDefault();
-                await backendApi.triggerRedo();
-            }
-            */
 
             // Escape
             if (event.key === 'Escape') {
-                if (!state.editingCellInfo && !document.querySelector('.modal:not(.hidden)')) {
+                if (!state.editingCellInfo && !document.querySelector('.modal-overlay:not(.hidden)')) {
                     clearSelection();
                 }
             }
 
             // Cmd+C / Ctrl+C
             if ((event.metaKey || event.ctrlKey) && event.key === 'c') {
-                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT') return;
+                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
 
                 if (state.selectedCells.length > 0) {
                     event.preventDefault();
@@ -219,7 +117,7 @@ async function initializeApp() {
 
             // Cmd+A / Ctrl+A
             if ((event.metaKey || event.ctrlKey) && event.key === 'a') {
-                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT') return;
+                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
 
                 if (state.selectedTable) {
                     event.preventDefault();

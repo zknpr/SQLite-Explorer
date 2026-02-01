@@ -8,32 +8,16 @@
 import { state } from './modules/state.js';
 import { handleRpcResponse, sendRpcResult, sendRpcError, backendApi } from './modules/web-api.js';
 import {
-    reloadFromDisk,
-    toggleSection,
-    selectTableItem,
-    refreshSchema,
-    updateBatchSidebar,
-    applyBatchUpdate,
-    setBatchNull,
-    toggleBatchPatch
+    initSidebar,
+    refreshSchema
 } from './modules/sidebar.js';
 import {
-    openExportModal,
-    submitExport,
-    onExportFormatChange
+    initExport
 } from './modules/export.js';
 
 import {
-    openCreateTableModal,
-    openAddRowModal,
-    openAddColumnModal,
-    openDeleteModal,
-    submitAddRow,
-    submitDelete,
-    submitCreateTable,
-    addColumnDefinition,
-    removeColumnDefinition,
-    submitAddColumn
+    initCrud,
+    submitDelete
 } from './modules/crud.js';
 import {
     updateStatus,
@@ -42,36 +26,17 @@ import {
     initSidebarResize
 } from './modules/ui.js';
 import {
-    closeModal
+    initModals
 } from './modules/modals.js';
 import {
-    onCellClick,
-    onCellDoubleClick,
     loadTableData,
-    onFilterChange,
-    onPageSizeChange,
-    onDateFormatChange,
-    goToPage,
-    onColumnSort,
-    onColumnHeaderClick,
-    toggleColumnPin,
-    onColumnFilterKeydown,
-    applyColumnFilter,
-    startColumnResize,
-    onRowClick,
-    onRowNumberClick,
-    toggleRowPin,
     onSelectAllClick,
     initGridInteraction,
+    initGridControls,
     clearSelection
 } from './modules/grid.js';
 import {
-    openCellPreview,
-    closeCellPreview,
-    saveCellPreview,
-    formatCellPreviewJson,
-    compactCellPreviewJson,
-    toggleCellPreviewWrap
+    initEdit
 } from './modules/edit.js';
 import {
     copyCellsToClipboard,
@@ -79,9 +44,7 @@ import {
     clearSelectedCellValues
 } from './modules/clipboard.js';
 import {
-    openSettingsModal,
-    updateExtensionSetting,
-    updatePragma
+    initSettings
 } from './modules/settings.js';
 import {
     initDragAndDrop
@@ -162,62 +125,28 @@ function initWebRpc() {
 // Initialize web RPC
 initWebRpc();
 
-// Attach functions to window for HTML event handlers
-Object.assign(window, {
-    reloadFromDisk,
-    toggleSection,
-    selectTableItem,
-    openCreateTableModal,
-    openAddRowModal,
-    openAddColumnModal,
-    openDeleteModal,
-    submitAddRow,
-    submitDelete,
-    submitCreateTable,
-    addColumnDefinition,
-    removeColumnDefinition,
-    submitAddColumn,
-    openExportModal,
-    submitExport,
-    onExportFormatChange,
-    onFilterChange,
-    onPageSizeChange,
-    onDateFormatChange,
-    goToPage,
-    onColumnSort,
-    onColumnHeaderClick,
-    toggleColumnPin,
-    onColumnFilterKeydown,
-    applyColumnFilter,
-    startColumnResize,
-    onRowClick,
-    onRowNumberClick,
-    toggleRowPin,
-    onSelectAllClick,
-    onCellClick,
-    onCellDoubleClick,
-    openCellPreview,
-    closeCellPreview,
-    saveCellPreview,
-    formatCellPreviewJson,
-    compactCellPreviewJson,
-    toggleCellPreviewWrap,
-    // openCellInVsCode - not available in web mode
-    openSettingsModal,
-    updateExtensionSetting,
-    updatePragma,
-    applyBatchUpdate,
-    setBatchNull,
-    toggleBatchPatch,
-    closeModal
-});
-
 // ============================================================================
 // Main initialization
 // ============================================================================
 
 async function initializeApp() {
     try {
+        // Initialize Modules (Event Listeners)
+        initSidebar();
+        initCrud();
+        initExport();
+        initModals();
+        initSettings();
+        initEdit();
+        initGridControls();
+        initGridInteraction();
+        initSidebarResize();
+        initDragAndDrop();
+
+        // Hide VS Code-specific buttons
+        const vscodeBtn = document.getElementById('openInVsCodeBtn');
+        if (vscodeBtn) vscodeBtn.style.display = 'none';
+
         updateStatus('Connecting to database...');
 
         // Initialize connection - parent window handles this
@@ -233,20 +162,11 @@ async function initializeApp() {
         updateStatus('Ready');
         showEmptyState();
 
-        // Initialize UI components
-        initSidebarResize();
-        initGridInteraction();
-        initDragAndDrop();
-
-        // Hide VS Code-specific buttons
-        const vscodeBtn = document.getElementById('openInVsCodeBtn');
-        if (vscodeBtn) vscodeBtn.style.display = 'none';
-
         // Global shortcuts
         document.addEventListener('keydown', async (event) => {
             // Escape
             if (event.key === 'Escape') {
-                if (!state.editingCellInfo && !document.querySelector('.modal:not(.hidden)')) {
+                if (!state.editingCellInfo && !document.querySelector('.modal-overlay:not(.hidden)')) {
                     clearSelection();
                 }
             }

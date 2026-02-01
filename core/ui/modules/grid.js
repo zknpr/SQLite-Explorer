@@ -17,6 +17,17 @@ let lastSelectedRowIds = new Set();
 // EVENT DELEGATION
 // ================================================================
 
+export function initGridControls() {
+    document.getElementById('filterInput')?.addEventListener('keyup', onFilterChange);
+    document.getElementById('pageSizeSelect')?.addEventListener('change', onPageSizeChange);
+    document.getElementById('dateFormatSelect')?.addEventListener('change', onDateFormatChange);
+
+    document.getElementById('btnFirst')?.addEventListener('click', () => goToPage(0));
+    document.getElementById('btnPrev')?.addEventListener('click', () => goToPage(state.currentPageIndex - 1));
+    document.getElementById('btnNext')?.addEventListener('click', () => goToPage(state.currentPageIndex + 1));
+    document.getElementById('btnLast')?.addEventListener('click', () => goToPage(state.totalPageCount - 1));
+}
+
 export function initGridInteraction() {
     const container = document.getElementById('gridContainer');
     if (!container) return;

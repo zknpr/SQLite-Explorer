@@ -8,6 +8,17 @@ import { updateStatus } from './ui.js';
 import { renderDataGrid, loadTableData, updateSelectionStates, clearSelection } from './grid.js';
 import { getRowDataOffset, getCellValue } from './data-utils.js';
 
+export function initEdit() {
+    // Cell Preview Modal
+    document.getElementById('btnCloseCellPreview')?.addEventListener('click', closeCellPreview);
+    document.getElementById('formatJsonBtn')?.addEventListener('click', formatCellPreviewJson);
+    document.getElementById('compactJsonBtn')?.addEventListener('click', compactCellPreviewJson);
+    document.getElementById('wrapTextBtn')?.addEventListener('click', toggleCellPreviewWrap);
+    document.getElementById('openInVsCodeBtn')?.addEventListener('click', openCellInVsCode);
+    document.getElementById('btnCancelCellPreview')?.addEventListener('click', closeCellPreview);
+    document.getElementById('cellPreviewSaveBtn')?.addEventListener('click', saveCellPreview);
+}
+
 // ================================================================
 // INLINE EDITING
 // ================================================================

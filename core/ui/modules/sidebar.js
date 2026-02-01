@@ -7,6 +7,89 @@ import { escapeHtml } from './utils.js';
 import { updateStatus } from './ui.js';
 import { loadTableData, loadTableColumns } from './grid.js';
 import { getRowDataOffset } from './data-utils.js';
+import { openCreateTableModal } from './crud.js';
+import { openSettingsModal } from './settings.js';
+
+export function initSidebar() {
+    const sidebarPanel = document.getElementById('sidebarPanel');
+    if (!sidebarPanel) return;
+
+    sidebarPanel.addEventListener('click', (event) => {
+        const target = event.target;
+
+        // 1. Configuration Button
+        if (target.closest('#btnOpenSettings')) {
+            openSettingsModal();
+            return;
+        }
+
+        // 2. Create Table Button
+        if (target.closest('#btnOpenCreateTable')) {
+            event.stopPropagation();
+            openCreateTableModal();
+            return;
+        }
+
+        // 3. Reload Button
+        if (target.closest('#btnReload')) {
+            reloadFromDisk();
+            return;
+        }
+
+        // 4. Batch Update Apply
+        if (target.closest('#btnApplyBatchUpdate')) {
+            applyBatchUpdate();
+            return;
+        }
+
+        // 5. Table/View Selection
+        const listItem = target.closest('.list-item');
+        if (listItem) {
+            // Check if it's a table/view item (has data attributes)
+            const name = listItem.dataset.name;
+            const type = listItem.dataset.type;
+
+            if (name && type) {
+                selectTableItem(name, type);
+                return;
+            }
+        }
+
+        // 6. Section Toggling
+        // Check if we clicked the section header
+        const sectionTitle = target.closest('.section-title');
+        if (sectionTitle) {
+            // Ignore clicks on buttons inside the header (e.g. Create Table) or settings
+            if (target.closest('.icon-button') || sectionTitle.id === 'btnOpenSettings') return;
+
+            const section = sectionTitle.dataset.section;
+            if (section) {
+                toggleSection(section);
+            }
+        }
+
+        // 7. Batch Update Actions
+        const nullBtn = target.closest('.btn-batch-null');
+        if (nullBtn) {
+            const field = nullBtn.closest('.batch-field');
+            if (field) {
+                const colIdx = parseInt(field.dataset.colidx, 10);
+                setBatchNull(colIdx);
+            }
+            return;
+        }
+
+        const patchBtn = target.closest('.btn-batch-patch');
+        if (patchBtn) {
+            const field = patchBtn.closest('.batch-field');
+            if (field) {
+                const colIdx = parseInt(field.dataset.colidx, 10);
+                toggleBatchPatch(colIdx, patchBtn);
+            }
+            return;
+        }
+    });
+}
 
 export async function refreshSchema() {
     if (!state.isDbConnected) return;
@@ -35,52 +118,88 @@ export function renderSidebar() {
     if (viewsBadge) viewsBadge.textContent = state.schemaCache.views.length;
     if (indexesBadge) indexesBadge.textContent = state.schemaCache.indexes.length;
 
-    const tablesList = document.getElementById('tablesList');
-    if (tablesList) {
-        if (state.schemaCache.tables.length === 0) {
-            tablesList.innerHTML = '<li class="list-item" style="opacity:0.5">No tables</li>';
-        } else {
-            tablesList.innerHTML = state.schemaCache.tables.map(t => `
-                <li class="list-item ${state.selectedTable === t.name && state.selectedTableType === 'table' ? 'selected' : ''}"
-                    onclick="selectTableItem('${escapeHtml(t.name)}', 'table')"
-                    title="${escapeHtml(t.name)}">
-                    <span class="item-icon codicon codicon-table"></span>
-                    <span class="item-name">${escapeHtml(t.name)}</span>
-                </li>
-            `).join('');
-        }
-    }
+    // Helper to render list
+    const renderList = (listId, items, type, iconClass, emptyText) => {
+        const list = document.getElementById(listId);
+        if (!list) return;
 
-    const viewsList = document.getElementById('viewsList');
-    if (viewsList) {
-        if (state.schemaCache.views.length === 0) {
-            viewsList.innerHTML = '<li class="list-item" style="opacity:0.5">No views</li>';
-        } else {
-            viewsList.innerHTML = state.schemaCache.views.map(v => `
-                <li class="list-item ${state.selectedTable === v.name && state.selectedTableType === 'view' ? 'selected' : ''}"
-                    onclick="selectTableItem('${escapeHtml(v.name)}', 'view')"
-                    title="${escapeHtml(v.name)}">
-                    <span class="item-icon codicon codicon-eye"></span>
-                    <span class="item-name">${escapeHtml(v.name)}</span>
-                </li>
-            `).join('');
+        list.replaceChildren(); // Clear list
+
+        if (items.length === 0) {
+            const li = document.createElement('li');
+            li.className = 'list-item';
+            li.style.opacity = '0.5';
+            li.textContent = emptyText;
+            list.appendChild(li);
+            return;
         }
-    }
+
+        const fragment = document.createDocumentFragment();
+        items.forEach(item => {
+            const li = document.createElement('li');
+            li.className = 'list-item';
+            if (state.selectedTable === item.name && state.selectedTableType === type) {
+                li.classList.add('selected');
+            }
+            // Data attributes for delegation
+            li.dataset.name = item.name;
+            if (type) li.dataset.type = type;
+            li.title = item.name;
+
+            const icon = document.createElement('span');
+            icon.className = `item-icon codicon ${iconClass}`;
+            li.appendChild(icon);
+
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'item-name';
+            nameSpan.textContent = item.name;
+            li.appendChild(nameSpan);
+
+            fragment.appendChild(li);
+        });
+        list.appendChild(fragment);
+    };
+
+    renderList('tablesList', state.schemaCache.tables, 'table', 'codicon-table', 'No tables');
+    renderList('viewsList', state.schemaCache.views, 'view', 'codicon-eye', 'No views');
 
     const indexesList = document.getElementById('indexesList');
     if (indexesList) {
+        indexesList.replaceChildren();
         if (state.schemaCache.indexes.length === 0) {
-            indexesList.innerHTML = '<li class="list-item" style="opacity:0.5">No indexes</li>';
+            const li = document.createElement('li');
+            li.className = 'list-item';
+            li.style.opacity = '0.5';
+            li.textContent = 'No indexes';
+            indexesList.appendChild(li);
         } else {
-            indexesList.innerHTML = state.schemaCache.indexes.map(i => `
-                <li class="list-item" title="${escapeHtml(i.name)} on ${escapeHtml(i.table)}">
-                    <span class="item-icon codicon codicon-list-selection"></span>
-                    <div class="item-content">
-                        <span class="item-name">${escapeHtml(i.name)}</span>
-                        <span class="item-detail">${escapeHtml(i.table)}</span>
-                    </div>
-                </li>
-            `).join('');
+            const fragment = document.createDocumentFragment();
+            state.schemaCache.indexes.forEach(i => {
+                const li = document.createElement('li');
+                li.className = 'list-item';
+                li.title = `${i.name} on ${i.table}`;
+
+                const icon = document.createElement('span');
+                icon.className = 'item-icon codicon codicon-list-selection';
+                li.appendChild(icon);
+
+                const content = document.createElement('div');
+                content.className = 'item-content';
+
+                const nameSpan = document.createElement('span');
+                nameSpan.className = 'item-name';
+                nameSpan.textContent = i.name;
+                content.appendChild(nameSpan);
+
+                const detailSpan = document.createElement('span');
+                detailSpan.className = 'item-detail';
+                detailSpan.textContent = i.table;
+                content.appendChild(detailSpan);
+
+                li.appendChild(content);
+                fragment.appendChild(li);
+            });
+            indexesList.appendChild(fragment);
         }
     }
 }
@@ -122,7 +241,7 @@ export function updateBatchSidebar() {
         columns.get(cell.colIdx).values.add(cell.value);
     }
 
-    let html = '';
+    fieldsContainer.replaceChildren();
 
     for (const [colIdx, colInfo] of columns) {
         const uniqueValues = Array.from(colInfo.values);
@@ -138,19 +257,55 @@ export function updateBatchSidebar() {
             else valueDisplay = String(val);
         }
 
-        html += `
-            <div class="form-field batch-field" data-colidx="${colIdx}" style="margin-bottom:8px">
-                <label style="font-size:11px; color:var(--text-secondary)">${escapeHtml(colInfo.name)} <span style="opacity:0.7">${colInfo.type || ''}</span></label>
-                <div style="display:flex; gap:4px">
-                    <input type="text" class="batch-input" placeholder="${escapeHtml(valueDisplay)}" data-colidx="${colIdx}" style="flex:1; min-width:0">
-                    <button class="btn-secondary" style="padding:2px 6px;" title="Set to NULL" onclick="setBatchNull(${colIdx})">NULL</button>
-                    <button class="btn-secondary" style="padding:2px 6px;" title="JSON Patch" onclick="toggleBatchPatch(${colIdx}, this)">{}</button>
-                </div>
-            </div>
-        `;
-    }
+        const div = document.createElement('div');
+        div.className = 'form-field batch-field';
+        div.dataset.colidx = colIdx;
+        div.style.marginBottom = '8px';
 
-    fieldsContainer.innerHTML = html;
+        const label = document.createElement('label');
+        label.style.fontSize = '11px';
+        label.style.color = 'var(--text-secondary)';
+
+        const nameText = document.createTextNode(colInfo.name + ' ');
+        label.appendChild(nameText);
+
+        const typeSpan = document.createElement('span');
+        typeSpan.style.opacity = '0.7';
+        typeSpan.textContent = colInfo.type || '';
+        label.appendChild(typeSpan);
+
+        div.appendChild(label);
+
+        const controlsDiv = document.createElement('div');
+        controlsDiv.style.display = 'flex';
+        controlsDiv.style.gap = '4px';
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'batch-input';
+        input.placeholder = valueDisplay;
+        input.dataset.colidx = colIdx;
+        input.style.flex = '1';
+        input.style.minWidth = '0';
+        controlsDiv.appendChild(input);
+
+        const nullBtn = document.createElement('button');
+        nullBtn.className = 'btn-secondary btn-batch-null';
+        nullBtn.style.padding = '2px 6px';
+        nullBtn.title = 'Set to NULL';
+        nullBtn.textContent = 'NULL';
+        controlsDiv.appendChild(nullBtn);
+
+        const patchBtn = document.createElement('button');
+        patchBtn.className = 'btn-secondary btn-batch-patch';
+        patchBtn.style.padding = '2px 6px';
+        patchBtn.title = 'JSON Patch';
+        patchBtn.textContent = '{}';
+        controlsDiv.appendChild(patchBtn);
+
+        div.appendChild(controlsDiv);
+        fieldsContainer.appendChild(div);
+    }
 }
 
 export async function applyBatchUpdate() {
@@ -159,7 +314,6 @@ export async function applyBatchUpdate() {
     const inputs = document.querySelectorAll('.batch-input');
 
     // 1. Validation and Setup Phase
-    // Map inputs by column index for O(1) lookup and validate JSON patches once
     const inputsByCol = new Map();
     for (const input of inputs) {
         const colIdx = parseInt(input.dataset.colidx, 10);
@@ -179,7 +333,6 @@ export async function applyBatchUpdate() {
     const updates = [];
 
     // 2. Processing Phase
-    // Process all selected cells (O(N)) without repetitive parsing
     for (const cell of state.selectedCells) {
         const input = inputsByCol.get(cell.colIdx);
         if (!input) continue;
@@ -201,7 +354,6 @@ export async function applyBatchUpdate() {
             finalValue = null;
         } else if (isPatch) {
             operation = 'json_patch';
-            // Already validated above
         } else {
              // Basic type coercion
              if (colDef.type === 'INTEGER' || colDef.type === 'REAL' || colDef.type === 'NUMERIC') {
@@ -243,8 +395,6 @@ export async function applyBatchUpdate() {
         await backendApi.updateCellBatch(state.selectedTable, backendUpdates, label);
 
         // Update local grid data
-        // For JSON patches, the new value is not immediately known without re-querying or
-        // implementing complex local patch logic. We reload the data to ensure consistency.
         const hasPatch = updates.some(u => u.operation === 'json_patch');
 
         if (!hasPatch) {
@@ -256,12 +406,8 @@ export async function applyBatchUpdate() {
         // Refresh grid and sidebar
         await loadTableData(false);
 
-        // Refresh selected cell values from the newly loaded grid data.
-        // This ensures that `state.selectedCells` contains up-to-date values (including those
-        // updated via JSON patch) while preserving the selection state.
         const freshSelectedCells = [];
         for (const oldCell of state.selectedCells) {
-            // Find corresponding row in new gridData
             const newValue = state.gridData[oldCell.rowIdx][oldCell.colIdx + getRowDataOffset()];
             freshSelectedCells.push({ ...oldCell, value: newValue });
         }
@@ -279,7 +425,7 @@ export async function applyBatchUpdate() {
 
 export function setBatchNull(colIdx) {
     const input = document.querySelector(`.batch-input[data-colidx="${colIdx}"]`);
-    const btn = document.querySelector(`.batch-field[data-colidx="${colIdx}"] button[title="JSON Patch"]`);
+    const btn = document.querySelector(`.batch-field[data-colidx="${colIdx}"] .btn-batch-patch`);
 
     if (input) {
         input.value = '';

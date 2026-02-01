@@ -7,6 +7,11 @@ import { updateStatus } from './ui.js';
 import { openModal, closeModal } from './modals.js';
 import { escapeHtml } from './utils.js';
 
+export function initExport() {
+    document.getElementById('btnSubmitExport')?.addEventListener('click', submitExport);
+    document.getElementById('exportFormat')?.addEventListener('change', onExportFormatChange);
+}
+
 export function openExportModal() {
     if (!state.selectedTable) return;
 
@@ -19,12 +24,35 @@ export function openExportModal() {
     // Populate columns list
     const columnsContainer = document.getElementById('exportColumns');
     if (columnsContainer) {
-        columnsContainer.innerHTML = state.tableColumns.map(col => `
-            <label style="display:flex; align-items:center; gap:3px; margin-bottom:4px; font-size:13px; cursor:pointer;">
-                <input type="checkbox" class="export-col-check" value="${escapeHtml(col.name)}" checked style="margin:0;">
-                ${escapeHtml(col.name)}
-            </label>
-        `).join('');
+        columnsContainer.replaceChildren(); // Clear existing
+
+        state.tableColumns.forEach(col => {
+            const div = document.createElement('div');
+            // We use a div wrapper or just append label directly as container is flex/block?
+            // Original code used labels directly inside container.
+
+            const label = document.createElement('label');
+            Object.assign(label.style, {
+                display: 'flex',
+                alignItems: 'center',
+                gap: '3px',
+                marginBottom: '4px',
+                fontSize: '13px',
+                cursor: 'pointer'
+            });
+
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.className = 'export-col-check';
+            input.value = col.name;
+            input.checked = true;
+            input.style.margin = '0';
+
+            label.appendChild(input);
+            label.appendChild(document.createTextNode(col.name));
+
+            columnsContainer.appendChild(label);
+        });
     }
 
     // Update options based on default format
@@ -37,22 +65,51 @@ export function onExportFormatChange() {
     const format = document.getElementById('exportFormat').value;
     const optionsContainer = document.getElementById('exportOptions');
 
-    let html = '';
-    if (format === 'csv' || format === 'excel') {
-        html += `
-            <label style="display:flex; align-items:center; gap:3px; margin-bottom:4px; font-size:13px; cursor:pointer;">
-                <input type="checkbox" id="exportHeader" checked style="margin:0;"> Include Headers
-            </label>
-        `;
-    } else if (format === 'sql') {
-        html += `
-            <label style="display:flex; align-items:center; gap:3px; margin-bottom:4px; font-size:13px; cursor:pointer;">
-                <input type="checkbox" id="exportTableName" checked style="margin:0;"> Include Table Name
-            </label>
-        `;
-    }
+    // Clear existing
+    optionsContainer.replaceChildren();
 
-    optionsContainer.innerHTML = html;
+    if (format === 'csv' || format === 'excel') {
+        const label = document.createElement('label');
+        Object.assign(label.style, {
+            display: 'flex',
+            alignItems: 'center',
+            gap: '3px',
+            marginBottom: '4px',
+            fontSize: '13px',
+            cursor: 'pointer'
+        });
+
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.id = 'exportHeader';
+        input.checked = true;
+        input.style.margin = '0';
+
+        label.appendChild(input);
+        label.appendChild(document.createTextNode(' Include Headers'));
+        optionsContainer.appendChild(label);
+
+    } else if (format === 'sql') {
+        const label = document.createElement('label');
+        Object.assign(label.style, {
+            display: 'flex',
+            alignItems: 'center',
+            gap: '3px',
+            marginBottom: '4px',
+            fontSize: '13px',
+            cursor: 'pointer'
+        });
+
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.id = 'exportTableName';
+        input.checked = true;
+        input.style.margin = '0';
+
+        label.appendChild(input);
+        label.appendChild(document.createTextNode(' Include Table Name'));
+        optionsContainer.appendChild(label);
+    }
 }
 
 export async function submitExport() {

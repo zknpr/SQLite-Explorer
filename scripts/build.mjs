@@ -375,7 +375,8 @@ const bundleWebDemoViewer = async () => {
   const bundled = template
     .replace('<!--HEAD-->', codiconLink)
     .replace('<!--STYLES-->', finalCss)
-    .replace('<!--SCRIPTS-->', finalJs);
+    .replace('<!--SCRIPTS-->', finalJs)
+    .replace('nonce="<!--NONCE-->"', ''); // Remove nonce for static web demo
 
   // Write the bundled HTML
   fs.writeFileSync(outputPath, bundled, 'utf-8');
