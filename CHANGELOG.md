@@ -2,6 +2,18 @@
 
 ## 1.2.2
 
+### Security
+
+- **Web API Hardening**: Restricted `postMessage` communication in the Web API module to trusted origins, preventing unauthorized access when embedded in untrusted contexts.
+- **XSS Prevention**: Refactored the Data Grid rendering logic to use `textContent` instead of `innerHTML`. This eliminates Cross-Site Scripting (XSS) risks from malicious database content.
+- **SQL Injection Prevention**: Implemented strict validation for SQL types in DDL statements (`CREATE TABLE`, `ALTER TABLE`, `ADD COLUMN`). Column definitions are now validated against a safe pattern to prevent injection attacks.
+- **Form Safety**: Added explicit `type="button"` attributes to all UI buttons to prevent accidental form submissions.
+
+### Maintenance
+
+- **Type Safety**: Enhanced TypeScript type safety in `HostBridge` by removing `any` casts and improving `DatabaseOperations` interfaces.
+- **Documentation**: Updated `CLAUDE.md` with comprehensive security standards regarding CSP, XSS prevention, and SQL injection hardening.
+
 ## 1.2.1
 
 ### Improvements
