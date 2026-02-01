@@ -3,7 +3,7 @@
  */
 import { state } from './state.js';
 import { backendApi } from './api.js';
-import { escapeHtml, escapeIdentifier, formatCellValue } from './utils.js';
+import { escapeHtml, escapeIdentifier, formatCellValue, formatCellValueAsText } from './utils.js';
 import { updateStatus, showLoading, showErrorState, updateToolbarButtons } from './ui.js';
 import { openCellPreview, startCellEdit, openCellInVsCode } from './edit.js';
 import { updateBatchSidebar } from './sidebar.js';
@@ -545,7 +545,7 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
             const col = orderedColumns[displayColIdx];
             const originalColIdx = columnIndexMap.get(col.name);
             const value = getCellValue(row, originalColIdx);
-            const displayValue = formatCellValue(value, col.type, state.dateFormat, col.name);
+            const displayValue = formatCellValueAsText(value, col.type, state.dateFormat, col.name);
             const isNull = value === null || value === undefined;
             const isCellSelected = selectedCellKeys.has(`${rowIdx},${originalColIdx}`);
             const isColPinned = state.pinnedColumns.has(col.name);
@@ -573,9 +573,9 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
 
             const textSpan = document.createElement('span');
             textSpan.className = 'cell-text';
-            // Use innerHTML because formatCellValue returns HTML-escaped string.
-            // Using textContent would double-escape characters (showing &quot; instead of ").
-            textSpan.innerHTML = displayValue;
+            // Use textContent for security (prevents XSS).
+            // formatCellValueAsText returns unescaped text suitable for textContent.
+            textSpan.textContent = displayValue;
             td.appendChild(textSpan);
 
             if (hasContent) {

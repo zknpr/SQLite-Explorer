@@ -13,6 +13,11 @@ const parentWindow = window.parent;
 let rpcMessageId = 0;
 const pendingRpcCalls = new Map();
 
+// Helper to determine target origin
+function getTargetOrigin() {
+    return window.location.ancestorOrigins?.[0] || '*';
+}
+
 /**
  * Send an RPC request to the parent window.
  * @param {string} method - Method name to call
@@ -41,7 +46,7 @@ export function sendRpcRequest(method, args) {
                 targetMethod: method,
                 payload: args
             }
-        }, '*');
+        }, getTargetOrigin());
     });
 }
 
@@ -76,7 +81,7 @@ export function sendRpcResult(correlationId, result) {
         kind: 'result',
         correlationId,
         payload: result
-    }, '*');
+    }, getTargetOrigin());
 }
 
 /**
@@ -89,7 +94,7 @@ export function sendRpcError(correlationId, errorText) {
         kind: 'result',
         correlationId,
         errorText
-    }, '*');
+    }, getTargetOrigin());
 }
 
 // Backend API proxy

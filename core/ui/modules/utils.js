@@ -58,6 +58,30 @@ export function formatCellValue(value, columnType = null, dateFormat = 'raw', co
 }
 
 /**
+ * Format a cell value for display as plain text (no HTML escaping).
+ * Use this when setting textContent.
+ */
+export function formatCellValueAsText(value, columnType = null, dateFormat = 'raw', columnName = null) {
+    // Handle null and undefined as NULL display
+    if (value === null || value === undefined) return 'NULL';
+    if (value instanceof Uint8Array) return '[BLOB]';
+
+    // Date formatting
+    if (dateFormat !== 'raw') {
+        const isDate = isDateType(columnType, columnName);
+        if (isDate) {
+            const formatted = formatDate(value, dateFormat);
+            if (formatted) return formatted;
+        }
+    }
+
+    if (typeof value === 'string' && value.length > 100) {
+        return value.substring(0, 100) + '...';
+    }
+    return String(value);
+}
+
+/**
  * Check if a column type indicates a date/time.
  */
 function isDateType(type, name) {

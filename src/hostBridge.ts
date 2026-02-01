@@ -88,7 +88,7 @@ export class HostBridge implements ToastService {
       return false;
     }
     if ('ping' in document.databaseOperations) {
-      return await (document.databaseOperations as any).ping();
+      return await document.databaseOperations.ping();
     }
     return false;
   }
@@ -189,7 +189,7 @@ export class HostBridge implements ToastService {
     let rowId: RecordId | undefined;
 
     if ('insertRow' in document.databaseOperations) {
-      rowId = await (document.databaseOperations as any).insertRow(table, data);
+      rowId = await document.databaseOperations.insertRow(table, data);
     } else {
       throw new Error("Backend does not support insertRow");
     }
@@ -259,7 +259,7 @@ export class HostBridge implements ToastService {
     }
 
     if ('deleteRows' in document.databaseOperations) {
-      await (document.databaseOperations as any).deleteRows(table, rowIds);
+      await document.databaseOperations.deleteRows(table, rowIds);
     } else {
       throw new Error("Backend does not support deleteRows");
     }
@@ -330,7 +330,7 @@ export class HostBridge implements ToastService {
     }
 
     if ('deleteColumns' in document.databaseOperations) {
-      await (document.databaseOperations as any).deleteColumns(table, columns);
+      await document.databaseOperations.deleteColumns(table, columns);
     } else {
       throw new Error("Backend does not support deleteColumns");
     }
@@ -348,7 +348,7 @@ export class HostBridge implements ToastService {
   /**
    * Create a new table.
    */
-  async createTable(table: string, columns: any[]) {
+  async createTable(table: string, columns: import('./core/types').ColumnDefinition[]) {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
@@ -359,7 +359,7 @@ export class HostBridge implements ToastService {
     }
 
     if ('createTable' in document.databaseOperations) {
-      await (document.databaseOperations as any).createTable(table, columns);
+      await document.databaseOperations.createTable(table, columns);
     } else {
       throw new Error("Backend does not support createTable");
     }
@@ -388,7 +388,7 @@ export class HostBridge implements ToastService {
     }
 
     if ('updateCellBatch' in document.databaseOperations) {
-      await (document.databaseOperations as any).updateCellBatch(table, updates);
+      await document.databaseOperations.updateCellBatch(table, updates);
     } else {
       // Fallback: execute updates sequentially
       for (const update of updates) {
@@ -426,7 +426,7 @@ export class HostBridge implements ToastService {
     }
 
     if ('addColumn' in document.databaseOperations) {
-      await (document.databaseOperations as any).addColumn(table, column, type, defaultValue);
+      await document.databaseOperations.addColumn(table, column, type, defaultValue);
     } else {
       throw new Error("Backend does not support addColumn");
     }
@@ -452,7 +452,7 @@ export class HostBridge implements ToastService {
     }
 
     if ('fetchTableData' in document.databaseOperations) {
-      return await (document.databaseOperations as any).fetchTableData(table, options);
+      return await document.databaseOperations.fetchTableData(table, options);
     } else {
       throw new Error("Backend does not support fetchTableData");
     }
@@ -468,7 +468,7 @@ export class HostBridge implements ToastService {
     }
 
     if ('fetchTableCount' in document.databaseOperations) {
-      return await (document.databaseOperations as any).fetchTableCount(table, options);
+      return await document.databaseOperations.fetchTableCount(table, options);
     } else {
       throw new Error("Backend does not support fetchTableCount");
     }
@@ -484,7 +484,7 @@ export class HostBridge implements ToastService {
     }
 
     if ('fetchSchema' in document.databaseOperations) {
-      return await (document.databaseOperations as any).fetchSchema();
+      return await document.databaseOperations.fetchSchema();
     } else {
       throw new Error("Backend does not support fetchSchema");
     }
@@ -500,7 +500,7 @@ export class HostBridge implements ToastService {
     }
 
     if ('getTableInfo' in document.databaseOperations) {
-      return await (document.databaseOperations as any).getTableInfo(table);
+      return await document.databaseOperations.getTableInfo(table);
     } else {
       throw new Error("Backend does not support getTableInfo");
     }
@@ -516,7 +516,7 @@ export class HostBridge implements ToastService {
     }
 
     if ('getPragmas' in document.databaseOperations) {
-      return await (document.databaseOperations as any).getPragmas();
+      return await document.databaseOperations.getPragmas();
     } else {
       throw new Error("Backend does not support getPragmas");
     }
@@ -536,7 +536,7 @@ export class HostBridge implements ToastService {
     }
 
     if ('setPragma' in document.databaseOperations) {
-      await (document.databaseOperations as any).setPragma(pragma, value);
+      await document.databaseOperations.setPragma(pragma, value);
     } else {
       throw new Error("Backend does not support setPragma");
     }

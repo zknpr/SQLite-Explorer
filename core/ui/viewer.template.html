@@ -16,7 +16,7 @@
             <div class="sidebar-header">
                 <span>Explorer</span>
                 <div class="sidebar-actions">
-                    <button class="icon-button" id="btnReload" title="Reload">
+                    <button type="button" class="icon-button" id="btnReload" title="Reload">
                         <span class="codicon codicon-refresh"></span>
                     </button>
                 </div>
@@ -28,7 +28,7 @@
                     <span class="arrow">▼</span>
                     <span>Tables</span>
                     <span class="badge" id="tablesBadge">0</span>
-                    <button class="icon-button" id="btnOpenCreateTable" title="Create Table" style="margin-left: auto;">
+                    <button type="button" class="icon-button" id="btnOpenCreateTable" title="Create Table" style="margin-left: auto;">
                         <span class="codicon codicon-add"></span>
                     </button>
                 </div>
@@ -58,7 +58,7 @@
                 </div>
                 <div class="item-list hidden" id="batchUpdateList">
                     <div style="padding: 12px;">
-                        <button class="btn-primary" id="btnApplyBatchUpdate" style="width:100%; margin-bottom:12px">Apply Changes</button>
+                        <button type="button" class="btn-primary" id="btnApplyBatchUpdate" style="width:100%; margin-bottom:12px">Apply Changes</button>
                         <div id="batchUpdateFields"></div>
                     </div>
                 </div>
@@ -84,16 +84,16 @@
                     </div>
                 </div>
                 <div class="toolbar-right">
-                    <button class="toolbar-button" id="btnAddRow" disabled>
+                    <button type="button" class="toolbar-button" id="btnAddRow" disabled>
                         <span class="codicon codicon-add"></span> Add Row
                     </button>
-                    <button class="toolbar-button" id="btnAddColumn" disabled>
+                    <button type="button" class="toolbar-button" id="btnAddColumn" disabled>
                         <span class="codicon codicon-insert"></span> Add Column
                     </button>
-                    <button class="toolbar-button" id="btnDeleteRows" disabled>
+                    <button type="button" class="toolbar-button" id="btnDeleteRows" disabled>
                         <span class="codicon codicon-trash"></span> Delete
                     </button>
-                    <button class="toolbar-button" id="btnExport" disabled>
+                    <button type="button" class="toolbar-button" id="btnExport" disabled>
                         <span class="codicon codicon-export"></span> Export
                     </button>
                     <input type="text" class="filter-input" id="filterInput" placeholder="Filter...">
@@ -133,11 +133,11 @@
                         </select>
                     </div>
                     <div class="pagination-controls">
-                        <button id="btnFirst" disabled>⏮</button>
-                        <button id="btnPrev" disabled>◀</button>
+                        <button type="button" id="btnFirst" disabled>⏮</button>
+                        <button type="button" id="btnPrev" disabled>◀</button>
                         <span id="pageIndicator">0 / 0</span>
-                        <button id="btnNext" disabled>▶</button>
-                        <button id="btnLast" disabled>⏭</button>
+                        <button type="button" id="btnNext" disabled>▶</button>
+                        <button type="button" id="btnLast" disabled>⏭</button>
                     </div>
                 </div>
             </div>
@@ -149,12 +149,12 @@
         <div class="modal-dialog">
             <div class="modal-header">
                 <span class="modal-title">Add New Row</span>
-                <button class="modal-close" data-modal="addRowModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="addRowModal">&times;</button>
             </div>
             <div class="modal-body" id="addRowForm"></div>
             <div class="modal-footer">
-                <button class="btn-secondary modal-cancel" data-modal="addRowModal">Cancel</button>
-                <button class="btn-primary" id="btnSubmitAddRow">Add Row</button>
+                <button type="button" class="btn-secondary modal-cancel" data-modal="addRowModal">Cancel</button>
+                <button type="button" class="btn-primary" id="btnSubmitAddRow">Add Row</button>
             </div>
         </div>
     </div>
@@ -164,14 +164,14 @@
         <div class="modal-dialog">
             <div class="modal-header">
                 <span class="modal-title">Confirm Delete</span>
-                <button class="modal-close" data-modal="deleteModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="deleteModal">&times;</button>
             </div>
             <div class="modal-body">
                 <p id="deleteConfirmText">Are you sure you want to delete the selected rows?</p>
             </div>
             <div class="modal-footer">
-                <button class="btn-secondary modal-cancel" data-modal="deleteModal">Cancel</button>
-                <button class="btn-danger" id="btnSubmitDelete">Delete</button>
+                <button type="button" class="btn-secondary modal-cancel" data-modal="deleteModal">Cancel</button>
+                <button type="button" class="btn-danger" id="btnSubmitDelete">Delete</button>
             </div>
         </div>
     </div>
@@ -181,7 +181,7 @@
         <div class="modal-dialog" style="width: 500px;">
             <div class="modal-header">
                 <span class="modal-title">Create New Table</span>
-                <button class="modal-close" data-modal="createTableModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="createTableModal">&times;</button>
             </div>
             <div class="modal-body">
                 <div class="form-field">
@@ -191,12 +191,12 @@
                 <div class="form-field">
                     <label>Columns</label>
                     <div id="columnDefinitions"></div>
-                    <button class="btn-secondary" id="btnAddColumnDef" style="margin-top: 8px;">+ Add Column</button>
+                    <button type="button" class="btn-secondary" id="btnAddColumnDef" style="margin-top: 8px;">+ Add Column</button>
                 </div>
             </div>
             <div class="modal-footer">
-                <button class="btn-secondary modal-cancel" data-modal="createTableModal">Cancel</button>
-                <button class="btn-primary" id="btnSubmitCreateTable">Create Table</button>
+                <button type="button" class="btn-secondary modal-cancel" data-modal="createTableModal">Cancel</button>
+                <button type="button" class="btn-primary" id="btnSubmitCreateTable">Create Table</button>
             </div>
         </div>
     </div>
@@ -206,7 +206,7 @@
         <div class="modal-dialog">
             <div class="modal-header">
                 <span class="modal-title">Add Column</span>
-                <button class="modal-close" data-modal="addColumnModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="addColumnModal">&times;</button>
             </div>
             <div class="modal-body">
                 <div class="form-field">
@@ -229,8 +229,8 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button class="btn-secondary modal-cancel" data-modal="addColumnModal">Cancel</button>
-                <button class="btn-primary" id="btnSubmitAddColumn">Add Column</button>
+                <button type="button" class="btn-secondary modal-cancel" data-modal="addColumnModal">Cancel</button>
+                <button type="button" class="btn-primary" id="btnSubmitAddColumn">Add Column</button>
             </div>
         </div>
     </div>
@@ -240,7 +240,7 @@
         <div class="modal-dialog">
             <div class="modal-header">
                 <span class="modal-title">Export Table</span>
-                <button class="modal-close" data-modal="exportModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="exportModal">&times;</button>
             </div>
             <div class="modal-body">
                 <div class="form-field">
@@ -266,8 +266,8 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button class="btn-secondary modal-cancel" data-modal="exportModal">Cancel</button>
-                <button class="btn-primary" id="btnSubmitExport">Export</button>
+                <button type="button" class="btn-secondary modal-cancel" data-modal="exportModal">Cancel</button>
+                <button type="button" class="btn-primary" id="btnSubmitExport">Export</button>
             </div>
         </div>
     </div>
@@ -277,13 +277,13 @@
         <div class="modal-dialog" style="width: 600px;">
             <div class="modal-header">
                 <span class="modal-title">Configuration</span>
-                <button class="modal-close" data-modal="settingsModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="settingsModal">&times;</button>
             </div>
             <div class="modal-body" id="pragmaSettingsContainer">
                 <!-- Populated by JS -->
             </div>
             <div class="modal-footer">
-                <button class="btn-primary modal-cancel" data-modal="settingsModal">Close</button>
+                <button type="button" class="btn-primary modal-cancel" data-modal="settingsModal">Close</button>
             </div>
         </div>
     </div>
@@ -297,20 +297,20 @@
                     <span class="cell-preview-column-name" id="cellPreviewColumnName"></span>
                     <span class="cell-preview-type-badge" id="cellPreviewTypeBadge"></span>
                 </div>
-                <button class="cell-preview-close" id="btnCloseCellPreview">&times;</button>
+                <button type="button" class="cell-preview-close" id="btnCloseCellPreview">&times;</button>
             </div>
             <div class="cell-preview-toolbar">
-                <button class="cell-preview-toolbar-btn" id="formatJsonBtn" title="Format as JSON">
+                <button type="button" class="cell-preview-toolbar-btn" id="formatJsonBtn" title="Format as JSON">
                     <span class="codicon codicon-json"></span> Format JSON
                 </button>
-                <button class="cell-preview-toolbar-btn" id="compactJsonBtn" title="Compact JSON">
+                <button type="button" class="cell-preview-toolbar-btn" id="compactJsonBtn" title="Compact JSON">
                     <span class="codicon codicon-fold"></span> Compact
                 </button>
-                <button class="cell-preview-toolbar-btn" id="wrapTextBtn" title="Toggle word wrap">
+                <button type="button" class="cell-preview-toolbar-btn" id="wrapTextBtn" title="Toggle word wrap">
                     <span class="codicon codicon-word-wrap"></span> Wrap
                 </button>
                 <div style="flex: 1"></div>
-                <button class="cell-preview-toolbar-btn" id="openInVsCodeBtn" title="Edit in VS Code editor">
+                <button type="button" class="cell-preview-toolbar-btn" id="openInVsCodeBtn" title="Edit in VS Code editor">
                     <span class="codicon codicon-code"></span> Edit in VS Code
                 </button>
             </div>
@@ -323,8 +323,8 @@
                     <span id="cellPreviewReadonlyBadge" style="display:none;margin-left:8px;color:var(--warning-color);">Read-only (View)</span>
                 </div>
                 <div class="cell-preview-actions">
-                    <button class="btn-secondary" id="btnCancelCellPreview">Cancel</button>
-                    <button class="btn-primary" id="cellPreviewSaveBtn">Save</button>
+                    <button type="button" class="btn-secondary" id="btnCancelCellPreview">Cancel</button>
+                    <button type="button" class="btn-primary" id="cellPreviewSaveBtn">Save</button>
                 </div>
             </div>
         </div>

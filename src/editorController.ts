@@ -301,6 +301,10 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       // SECURITY NOTE: 'unsafe-inline' removed for scripts.
       // Inline event handlers have been refactored to use addEventListener.
       // wasm-unsafe-eval is still required for sql.js WASM compilation.
+      //
+      // NOTE: 'unsafe-inline' for styles is currently REQUIRED by the data grid implementation
+      // (grid.js) which uses dynamic inline styles for column widths, sticky positioning,
+      // and resize handles. Removing this would require a major refactor of the grid layout.
       [cspUtil.scriptSrc]: [webview.cspSource, cspUtil.wasmUnsafeEval, `'nonce-${nonce}'`],
       [cspUtil.styleSrc]: [webview.cspSource, cspUtil.inlineStyle],
       [cspUtil.imgSrc]: [webview.cspSource, cspUtil.data, cspUtil.blob],
