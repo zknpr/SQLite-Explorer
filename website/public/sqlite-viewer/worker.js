@@ -573,13 +573,17 @@ async function insertRow(table, data) {
   const columns = Object.keys(data);
   const values = Object.values(data);
 
-  const columnList = columns.map(c => `"${c.replace(/"/g, '""')}"`).join(', ');
-  const placeholders = columns.map(() => '?').join(', ');
+  if (columns.length === 0) {
+    db.run(`INSERT INTO "${safeTable}" DEFAULT VALUES`);
+  } else {
+    const columnList = columns.map(c => `"${c.replace(/"/g, '""')}"`).join(', ');
+    const placeholders = columns.map(() => '?').join(', ');
 
-  db.run(
-    `INSERT INTO "${safeTable}" (${columnList}) VALUES (${placeholders})`,
-    values
-  );
+    db.run(
+      `INSERT INTO "${safeTable}" (${columnList}) VALUES (${placeholders})`,
+      values
+    );
+  }
 
   // Get last inserted row ID
   const result = db.exec('SELECT last_insert_rowid()');
