@@ -22,6 +22,36 @@ export function escapeIdentifier(identifier: string): string {
 }
 
 /**
+ * Validate a SQL type definition to ensure it is safe.
+ * Allows standard SQLite types and common variants.
+ *
+ * @param type - The type string to validate (e.g. "INTEGER", "VARCHAR(255)")
+ * @throws Error if the type is potentially unsafe
+ */
+export function validateSqlType(type: string): void {
+  if (!type || typeof type !== 'string') {
+    throw new Error('Invalid SQL type: Type must be a non-empty string');
+  }
+
+  // Check for dangerous characters that could be used for injection
+  // Disallow: quotes, semicolons, dashes (comments), slashes, asterisks
+  if (/['";\-\/\*]/.test(type)) {
+     throw new Error(`Invalid SQL type: "${type}" contains potentially unsafe characters`);
+  }
+
+  // Strict validation pattern
+  // Matches:
+  // 1. Start with alphanumeric words/spaces (e.g. "INTEGER", "UNSIGNED INT")
+  // 2. Optional: Parentheses with numbers/commas (e.g. "(255)", "(10, 2)")
+  // 3. Optional: Trailing alphanumeric words/spaces (e.g. "UNSIGNED")
+  const validPattern = /^[a-zA-Z0-9_\s]+(?:\([0-9\s,]+\)[a-zA-Z0-9_\s]*)?$/;
+
+  if (!validPattern.test(type.trim())) {
+     throw new Error(`Invalid SQL type: "${type}" does not match allowed format`);
+  }
+}
+
+/**
  * Convert a CellValue to SQL literal representation.
  * Handles NULL, numbers, strings, and binary data.
  */

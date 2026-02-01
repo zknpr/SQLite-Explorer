@@ -1,8 +1,47 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { escapeIdentifier, cellValueToSql } from '../../src/core/sql-utils';
+import { escapeIdentifier, cellValueToSql, validateSqlType } from '../../src/core/sql-utils';
 
 describe('SQL Utils', () => {
+  describe('validateSqlType', () => {
+    it('should accept valid simple types', () => {
+      assert.doesNotThrow(() => validateSqlType('INTEGER'));
+      assert.doesNotThrow(() => validateSqlType('TEXT'));
+      assert.doesNotThrow(() => validateSqlType('BLOB'));
+    });
+
+    it('should accept types with length/precision', () => {
+      assert.doesNotThrow(() => validateSqlType('VARCHAR(255)'));
+      assert.doesNotThrow(() => validateSqlType('DECIMAL(10, 5)'));
+      assert.doesNotThrow(() => validateSqlType('NUMERIC(10,5)'));
+    });
+
+    it('should accept types with modifiers', () => {
+      assert.doesNotThrow(() => validateSqlType('UNSIGNED INTEGER'));
+      assert.doesNotThrow(() => validateSqlType('INTEGER UNSIGNED'));
+      assert.doesNotThrow(() => validateSqlType('INT(10) UNSIGNED'));
+    });
+
+    it('should reject types with dangerous characters', () => {
+      assert.throws(() => validateSqlType('TEXT; DROP TABLE foo'), /unsafe characters/);
+      assert.throws(() => validateSqlType("VARCHAR(20)'"), /unsafe characters/);
+      assert.throws(() => validateSqlType('INT -- comment'), /unsafe characters/);
+      assert.throws(() => validateSqlType('INT /* comment */'), /unsafe characters/);
+    });
+
+    it('should reject malformed types', () => {
+      assert.throws(() => validateSqlType('INTEGER)'), /match allowed format/);
+      assert.throws(() => validateSqlType('(INTEGER)'), /match allowed format/);
+      assert.throws(() => validateSqlType('VARCHAR(20))'), /match allowed format/);
+    });
+
+    it('should reject empty or invalid inputs', () => {
+      // @ts-ignore
+      assert.throws(() => validateSqlType(null), /non-empty string/);
+      assert.throws(() => validateSqlType(''), /non-empty string/);
+    });
+  });
+
   describe('escapeIdentifier', () => {
     it('should escape simple identifiers', () => {
       assert.strictEqual(escapeIdentifier('foo'), '"foo"');

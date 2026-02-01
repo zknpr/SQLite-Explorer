@@ -30,7 +30,7 @@ import type {
   SchemaSnapshot,
   ColumnMetadata
 } from './core/types';
-import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
+import { escapeIdentifier, cellValueToSql, validateSqlType } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 
 // ============================================================================
@@ -538,6 +538,7 @@ export async function createNativeDatabaseConnection(
                     const batch = [];
                     // 1. Add columns back
                     for (const col of deletedColumns) {
+                        validateSqlType(col.type); // Validate type
                         // We can't batch DDL usually, so run immediately
                         await worker.call('run', [`ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(col.name)} ${col.type}`]);
                     }
@@ -611,6 +612,7 @@ export async function createNativeDatabaseConnection(
 
             case 'column_add':
               if (targetColumn && columnDef) {
+                 validateSqlType(columnDef.type);
                  let sql = `ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(targetColumn)} ${columnDef.type}`;
                  if (columnDef.defaultValue !== undefined && columnDef.defaultValue !== null && columnDef.defaultValue !== '') {
                     // Re-use logic from addColumn or simplify (assuming simple defaults here)
@@ -638,6 +640,7 @@ export async function createNativeDatabaseConnection(
               if (tableDef && tableDef.columns) {
                   // Re-use createTable logic
                   const colDefs = tableDef.columns.map(col => {
+                    validateSqlType(col.type);
                     let def = `${escapeIdentifier(col.name)} ${col.type}`;
                     if (col.primaryKey) def += ' PRIMARY KEY';
                     if (col.notNull && !col.primaryKey) def += ' NOT NULL';
@@ -747,6 +750,8 @@ export async function createNativeDatabaseConnection(
             if (typeof col === 'string') {
                throw new Error('Legacy string column definitions not supported for security');
             }
+
+            validateSqlType(col.type);
 
             let def = `${escapeIdentifier(col.name)} ${col.type}`;
             if (col.primaryKey) def += ' PRIMARY KEY';
@@ -998,6 +1003,7 @@ export async function createNativeDatabaseConnection(
          * Add a new column to a table.
          */
         addColumn: async (table: string, column: string, type: string, defaultValue?: string) => {
+          validateSqlType(type);
           let sql = `ALTER TABLE ${escapeIdentifier(table)} ADD COLUMN ${escapeIdentifier(column)} ${type}`;
 
           if (defaultValue !== undefined && defaultValue !== null && defaultValue !== '') {
