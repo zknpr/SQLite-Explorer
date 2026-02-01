@@ -126,6 +126,22 @@ const data = new Uint8Array(...);
 workerProxy.method(new Transfer(data, [data.buffer]));
 ```
 
+## Security Standards
+
+### Content Security Policy (CSP)
+- **Scripts**: Strict nonce-based policy. No `'unsafe-inline'` allowed.
+- **Styles**: `'unsafe-inline'` allowed (currently required for dynamic grid layout/resizing).
+- **Isolation**: Webview communicates only via RPC.
+
+### Cross-Site Scripting (XSS) Prevention
+- **Grid Rendering**: Always use `textContent` for cell values. Never use `innerHTML` with untrusted data.
+- **Formatting**: Use `formatCellValueAsText()` for safe display strings.
+
+### SQL Injection Prevention
+- **Query Parameters**: Use prepared statements (`?` placeholders) for all values.
+- **Identifiers**: Always use `escapeIdentifier()` for table/column names.
+- **Schema Validation**: Use `validateSqlType()` for all user-provided SQL types in DDL.
+
 ## Build System
 
 ### Build Commands
