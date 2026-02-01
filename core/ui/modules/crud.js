@@ -10,7 +10,12 @@ import { refreshSchema } from './sidebar.js';
 import { escapeHtml, validateRowId, escapeIdentifier } from './utils.js';
 
 export function initCrud() {
-    // Add Row
+    // --- Toolbar Buttons ---
+    document.getElementById('btnAddRow')?.addEventListener('click', openAddRowModal);
+    document.getElementById('btnDeleteRows')?.addEventListener('click', openDeleteModal);
+    document.getElementById('btnAddColumn')?.addEventListener('click', openAddColumnModal);
+
+    // Add Row (Modal Submit)
     document.getElementById('btnSubmitAddRow')?.addEventListener('click', submitAddRow);
 
     // Delete

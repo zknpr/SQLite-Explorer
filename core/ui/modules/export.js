@@ -8,6 +8,7 @@ import { openModal, closeModal } from './modals.js';
 import { escapeHtml } from './utils.js';
 
 export function initExport() {
+    document.getElementById('btnExport')?.addEventListener('click', openExportModal);
     document.getElementById('btnSubmitExport')?.addEventListener('click', submitExport);
     document.getElementById('exportFormat')?.addEventListener('change', onExportFormatChange);
 }
