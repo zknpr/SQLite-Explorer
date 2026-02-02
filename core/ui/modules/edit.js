@@ -3,7 +3,7 @@
  */
 import { state } from './state.js';
 import { backendApi } from './api.js';
-import { escapeHtml, validateRowId, escapeIdentifier, formatCellValue } from './utils.js';
+import { escapeHtml, validateRowId, escapeIdentifier, formatCellValue, formatCellValueAsText } from './utils.js';
 import { updateStatus } from './ui.js';
 import { renderDataGrid, loadTableData, updateSelectionStates, clearSelection } from './grid.js';
 import { getRowDataOffset, getCellValue } from './data-utils.js';
@@ -441,20 +441,24 @@ function updateCellDom(rowIdx, colIdx, value) {
     }
 
     const col = state.tableColumns[colIdx];
-    const displayValue = formatCellValue(value, col?.type, state.dateFormat, col?.name);
+    const displayValue = formatCellValueAsText(value, col?.type, state.dateFormat, col?.name);
     const hasContent = value !== null && value !== undefined && !(value instanceof Uint8Array);
 
-    let html = `<span class="cell-text">${displayValue}</span>`;
-    if (hasContent) {
-        html += `<span class="expand-icon codicon codicon-link-external" title="View full content"></span>`;
-    }
+    // Use DOM creation with textContent for XSS prevention (defense-in-depth)
+    cellEl.textContent = '';
+    const textSpan = document.createElement('span');
+    textSpan.className = 'cell-text';
+    textSpan.textContent = displayValue;
+    cellEl.appendChild(textSpan);
 
-    cellEl.innerHTML = html;
+    if (hasContent) {
+        const expandIcon = document.createElement('span');
+        expandIcon.className = 'expand-icon codicon codicon-link-external';
+        expandIcon.title = 'View full content';
+        cellEl.appendChild(expandIcon);
+    }
 
     // Check overflow
-    const textSpan = cellEl.querySelector('.cell-text');
-    if (textSpan) {
-        const hasOverflow = textSpan.scrollWidth > textSpan.clientWidth;
-        cellEl.classList.toggle('has-overflow', hasOverflow);
-    }
+    const hasOverflow = textSpan.scrollWidth > textSpan.clientWidth;
+    cellEl.classList.toggle('has-overflow', hasOverflow);
 }

@@ -616,10 +616,11 @@ export async function createNativeDatabaseConnection(
                  validateSqlType(columnDef.type);
                  let sql = `ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(targetColumn)} ${columnDef.type}`;
                  if (columnDef.defaultValue !== undefined && columnDef.defaultValue !== null && columnDef.defaultValue !== '') {
-                    // Re-use logic from addColumn or simplify (assuming simple defaults here)
+                    // Strict numeric validation for default values
                     if (columnDef.defaultValue.toLowerCase() === 'null') {
                         sql += ' DEFAULT NULL';
-                    } else if (!isNaN(Number(columnDef.defaultValue))) {
+                    } else if (/^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(columnDef.defaultValue)) {
+                        // Strict numeric pattern: optional sign, digits with optional decimal, optional exponent
                         sql += ` DEFAULT ${columnDef.defaultValue}`;
                     } else {
                         sql += ` DEFAULT '${columnDef.defaultValue.replace(/'/g, "''")}'`;
@@ -1012,7 +1013,8 @@ export async function createNativeDatabaseConnection(
           if (defaultValue !== undefined && defaultValue !== null && defaultValue !== '') {
             if (defaultValue.toLowerCase() === 'null') {
               sql += ' DEFAULT NULL';
-            } else if (!isNaN(Number(defaultValue))) {
+            } else if (/^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(defaultValue)) {
+              // Strict numeric pattern: optional sign, digits with optional decimal, optional exponent
               sql += ` DEFAULT ${defaultValue}`;
             } else {
               sql += ` DEFAULT '${defaultValue.replace(/'/g, "''")}'`;

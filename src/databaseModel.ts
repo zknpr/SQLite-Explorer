@@ -18,6 +18,7 @@ import { DatabaseConnectionBundle } from './connectionTypes';
 import { DocumentRegistry } from './documentRegistry';
 
 import { createDatabaseConnection, getMaximumFileSizeBytes } from './workerFactory';
+import { GlobalOutputChannel } from './main';
 
 import { ModificationTracker } from './core/undo-history';
 import type { LabeledModification, DatabaseOperations } from './core/types';
@@ -322,8 +323,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       // Just ensure WAL is checkpointed for consistency
       try {
         await this.databaseOperations.executeQuery('PRAGMA wal_checkpoint(PASSIVE)');
-      } catch {
+      } catch (err) {
         // Ignore checkpoint errors - database may not be using WAL mode
+        // Log at debug level for troubleshooting if needed
+        GlobalOutputChannel?.appendLine(`[WAL checkpoint skipped] ${err instanceof Error ? err.message : String(err)}`);
       }
       return;
     }
@@ -399,7 +402,12 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
           this.#savePending = true;
         }
       }
-    } catch { }
+    } catch (err) {
+      // Log auto-save failures to output channel for debugging
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      GlobalOutputChannel?.appendLine(`[Auto-save failed] ${errorMessage}`);
+      console.error('[Auto-save failed]', err);
+    }
   }
 
   #hasActiveViewer = false;

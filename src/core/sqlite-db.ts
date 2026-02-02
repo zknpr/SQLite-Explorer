@@ -20,7 +20,7 @@ import type {
   ColumnMetadata,
   ColumnDefinition
 } from './types';
-import { escapeIdentifier, cellValueToSql } from './sql-utils';
+import { escapeIdentifier, cellValueToSql, validateSqlType } from './sql-utils';
 import { buildSelectQuery, buildCountQuery } from './query-builder';
 import { applyMergePatch } from './json-utils';
 
@@ -405,6 +405,8 @@ class WasmDatabaseEngine implements DatabaseOperations {
       if (typeof col === 'string') {
          throw new Error('Legacy string column definitions not supported for security');
       }
+      // Validate SQL type to prevent injection via malicious type definitions
+      validateSqlType(col.type);
       let def = `${escapeIdentifier(col.name)} ${col.type}`;
       if (col.primaryKey) def += ' PRIMARY KEY';
       if (col.notNull && !col.primaryKey) def += ' NOT NULL';
@@ -506,13 +508,17 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * Add a new column to a table.
    */
   async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {
+    // Validate SQL type to prevent injection via malicious type definitions
+    validateSqlType(type);
     let sql = `ALTER TABLE ${escapeIdentifier(table)} ADD COLUMN ${escapeIdentifier(column)} ${type}`;
 
     if (defaultValue !== undefined && defaultValue !== null && defaultValue !== '') {
-      // Basic SQL safe default value handling
+      // SQL safe default value handling with strict validation
       if (defaultValue.toLowerCase() === 'null') {
         sql += ' DEFAULT NULL';
-      } else if (!isNaN(Number(defaultValue))) {
+      } else if (/^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(defaultValue)) {
+        // Strict numeric pattern: optional sign, digits with optional decimal, optional exponent
+        // This prevents hex (0x), special values, and other edge cases
         sql += ` DEFAULT ${defaultValue}`;
       } else {
         sql += ` DEFAULT '${defaultValue.replace(/'/g, "''")}'`;

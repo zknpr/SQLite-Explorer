@@ -5,7 +5,7 @@ import { backendApi } from './api.js';
 import { updateStatus } from './ui.js';
 import { state } from './state.js';
 import { getRowId, getRowDataOffset } from './data-utils.js';
-import { formatCellValue } from './utils.js';
+import { formatCellValueAsText } from './utils.js';
 
 export function initDragAndDrop() {
     const container = document.getElementById('gridContainer');
@@ -186,12 +186,19 @@ function formatBytes(bytes) {
 }
 
 function updateCellDom(cell, value) {
-    const displayValue = formatCellValue(value);
-    const hasContent = true; // It's a BLOB now
+    const displayValue = formatCellValueAsText(value);
 
-    let html = `<span class="cell-text">${displayValue}</span>`;
-    html += `<span class="expand-icon codicon codicon-link-external" title="View full content"></span>`;
+    // Use DOM creation with textContent for XSS prevention (defense-in-depth)
+    cell.textContent = '';
+    const textSpan = document.createElement('span');
+    textSpan.className = 'cell-text';
+    textSpan.textContent = displayValue;
+    cell.appendChild(textSpan);
 
-    cell.innerHTML = html;
+    const expandIcon = document.createElement('span');
+    expandIcon.className = 'expand-icon codicon codicon-link-external';
+    expandIcon.title = 'View full content';
+    cell.appendChild(expandIcon);
+
     cell.classList.remove('null-value');
 }

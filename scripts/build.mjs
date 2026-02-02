@@ -246,25 +246,19 @@ const bundleWebview = async () => {
   // Bundle JavaScript using esbuild
   // This allows using imports/exports in viewer.js and its modules
   let finalJs = '';
-  try {
-    const jsResult = await esbuild.build({
-      entryPoints: [jsPath],
-      bundle: true,
-      write: false,
-      minify: !DEV,
-      format: 'iife',
-      target: 'es2020',
-      loader: {
-        '.js': 'js',
-        '.ts': 'ts'
-      }
-    });
-    finalJs = jsResult.outputFiles[0].text;
-  } catch (err) {
-    console.error('JS bundling failed:', err);
-    // Fallback to reading file directly if bundling fails (e.g. syntax errors during refactor)
-    finalJs = fs.readFileSync(jsPath, 'utf-8');
-  }
+  const jsResult = await esbuild.build({
+    entryPoints: [jsPath],
+    bundle: true,
+    write: false,
+    minify: !DEV,
+    format: 'iife',
+    target: 'es2020',
+    loader: {
+      '.js': 'js',
+      '.ts': 'ts'
+    }
+  });
+  finalJs = jsResult.outputFiles[0].text;
 
   // Optionally minify CSS in production mode
   let finalCss = css;
@@ -384,19 +378,60 @@ const bundleWebDemoViewer = async () => {
 };
 
 /**
+ * Validate that required output files exist after build.
+ * Throws error if any required files are missing.
+ */
+const validateBuildOutputs = () => {
+  const requiredFiles = [
+    'out/extension.js',
+    'out/extension-browser.js',
+    'out/worker.cjs',
+    'out/worker-browser.js',
+    'assets/sqlite3.wasm',
+    'core/ui/viewer.html'
+  ];
+
+  const missingFiles = requiredFiles.filter(file => !fs.existsSync(resolve(file)));
+  if (missingFiles.length > 0) {
+    throw new Error(`Build validation failed: missing files: ${missingFiles.join(', ')}`);
+  }
+};
+
+/**
  * Main compilation function.
- * Runs all build targets in parallel for speed.
+ * Runs all build targets in parallel for speed with proper error handling.
  */
 const compileExt = async (target) => {
-  await Promise.all([
-    compileNodeMain(),
-    compileBrowserMain(),
-    compileNodeWorker(),
-    compileBrowserWorker(),
-    copyAssets(),
-    bundleWebview(),
-    bundleWebDemoViewer(),
-  ]);
+  // Define build tasks with names for error reporting
+  const buildTasks = [
+    { name: 'compileNodeMain', fn: compileNodeMain },
+    { name: 'compileBrowserMain', fn: compileBrowserMain },
+    { name: 'compileNodeWorker', fn: compileNodeWorker },
+    { name: 'compileBrowserWorker', fn: compileBrowserWorker },
+    { name: 'copyAssets', fn: copyAssets },
+    { name: 'bundleWebview', fn: bundleWebview },
+    { name: 'bundleWebDemoViewer', fn: bundleWebDemoViewer },
+  ];
+
+  // Run all tasks in parallel and collect results
+  const results = await Promise.allSettled(buildTasks.map(task => task.fn()));
+
+  // Check for failures and report which tasks failed
+  const failures = results
+    .map((result, idx) => ({ result, task: buildTasks[idx] }))
+    .filter(({ result }) => result.status === 'rejected');
+
+  if (failures.length > 0) {
+    console.error('\n=== Build Failures ===');
+    for (const { result, task } of failures) {
+      console.error(`\n[${task.name}] FAILED:`);
+      console.error(result.reason);
+    }
+    throw new Error(`Build failed: ${failures.length} task(s) failed: ${failures.map(f => f.task.name).join(', ')}`);
+  }
+
+  // Validate all required outputs exist
+  validateBuildOutputs();
 };
 
 // Run if executed directly

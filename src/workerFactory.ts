@@ -227,109 +227,115 @@ async function createWasmDatabaseConnection(
       forceReadOnly?: boolean,
       autoCommit?: boolean
     ) {
-      // Read database and WAL files
-      // Optimization: If running in Node and file is local, pass path to worker instead of reading content here
-      // This avoids blocking the extension host and transferring large buffers
-      const isNode = !import.meta.env.VSCODE_BROWSER_EXT;
-      const isLocal = fileUri.scheme === 'file';
+      try {
+        // Read database and WAL files
+        // Optimization: If running in Node and file is local, pass path to worker instead of reading content here
+        // This avoids blocking the extension host and transferring large buffers
+        const isNode = !import.meta.env.VSCODE_BROWSER_EXT;
+        const isLocal = fileUri.scheme === 'file';
 
-      let dbContent: Uint8Array | null = null;
-      let walContent: Uint8Array | null = null;
-      let filePath: string | undefined;
+        let dbContent: Uint8Array | null = null;
+        let walContent: Uint8Array | null = null;
+        let filePath: string | undefined;
 
-      if (isNode && isLocal) {
-          // Check size limit first
-          const maxSize = getMaximumFileSizeBytes();
-          const fileStat = await vsc.workspace.fs.stat(fileUri);
-          if (maxSize !== 0 && fileStat.size > maxSize) {
-             throw new Error(`File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
-          } else {
-             filePath = fileUri.fsPath;
-          }
-      } else {
-          [dbContent, walContent] = await loadDatabaseFiles(fileUri);
+        if (isNode && isLocal) {
+            // Check size limit first
+            const maxSize = getMaximumFileSizeBytes();
+            const fileStat = await vsc.workspace.fs.stat(fileUri);
+            if (maxSize !== 0 && fileStat.size > maxSize) {
+               throw new Error(`File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
+            } else {
+               filePath = fileUri.fsPath;
+            }
+        } else {
+            [dbContent, walContent] = await loadDatabaseFiles(fileUri);
+        }
+
+        // Load WASM binary from assets directory
+        const wasmUri = vsc.Uri.joinPath(extensionUri, 'assets', 'sqlite3.wasm');
+        const wasmContent = await vsc.workspace.fs.readFile(wasmUri);
+
+        // Initialize database configuration
+        const initConfig: DatabaseInitConfig = {
+          content: dbContent,
+          filePath,
+          walContent,
+          maxSize: getMaximumFileSizeBytes(),
+          resourceMap: {},
+          wasmBinary: wasmContent,
+          readOnlyMode: forceReadOnly ?? false
+        };
+
+        // Initialize database in worker
+        // Use Transfer wrapper to zero-copy transfer the array buffers
+        const transferables: any[] = [];
+        if (initConfig.content && initConfig.content.buffer) {
+            transferables.push(initConfig.content.buffer);
+        }
+        if (initConfig.walContent && initConfig.walContent.buffer) {
+            transferables.push(initConfig.walContent.buffer);
+        }
+        if (initConfig.wasmBinary && initConfig.wasmBinary.buffer) {
+            transferables.push(initConfig.wasmBinary.buffer);
+        }
+
+        const result = await workerProxy.initializeDatabase(
+            displayName,
+            new Transfer(initConfig, transferables) as any // Cast to satisfy type signature
+        );
+
+        // Create operations facade that routes to worker
+        const operationsFacade: DatabaseOperations = {
+          engineKind: Promise.resolve('wasm'),
+          executeQuery: (sql: string, params?: CellValue[]) =>
+            workerProxy.runQuery(sql, params),
+          serializeDatabase: (name: string) => workerProxy.exportDatabase(name),
+          applyModifications: async () => {},
+          undoModification: async () => {},
+          redoModification: async () => {},
+          flushChanges: async () => {},
+          discardModifications: async () => {},
+          updateCell: (table: string, rowId: string | number, column: string, value: CellValue) =>
+            workerProxy.updateCell(table, rowId, column, value),
+          insertRow: (table: string, data: Record<string, CellValue>) =>
+            workerProxy.insertRow(table, data),
+          deleteRows: (table: string, rowIds: (string | number)[]) =>
+            workerProxy.deleteRows(table, rowIds),
+          deleteColumns: (table: string, columns: string[]) =>
+            workerProxy.deleteColumns(table, columns),
+          createTable: (table: string, columns: ColumnDefinition[]) =>
+            workerProxy.createTable(table, columns),
+          updateCellBatch: (table: string, updates: CellUpdate[]) =>
+            workerProxy.updateCellBatch(table, updates),
+          addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
+            workerProxy.addColumn(table, column, type, defaultValue),
+          fetchTableData: (table: string, options: any) =>
+            workerProxy.fetchTableData(table, options),
+          fetchTableCount: (table: string, options: any) =>
+            workerProxy.fetchTableCount(table, options),
+          fetchSchema: () =>
+            workerProxy.fetchSchema(),
+          getTableInfo: (table: string) =>
+            workerProxy.getTableInfo(table),
+          getPragmas: () =>
+            workerProxy.getPragmas(),
+          setPragma: (pragma: string, value: CellValue) =>
+            workerProxy.setPragma(pragma, value),
+          ping: () =>
+            workerProxy.ping(),
+          writeToFile: (path: string) =>
+            workerProxy.writeToFile(path)
+        };
+
+        return {
+          databaseOps: operationsFacade,
+          isReadOnly: result.isReadOnly ?? false
+        };
+      } catch (err) {
+        // Terminate worker on connection failure to prevent leak
+        terminateWorker();
+        throw err;
       }
-
-      // Load WASM binary from assets directory
-      const wasmUri = vsc.Uri.joinPath(extensionUri, 'assets', 'sqlite3.wasm');
-      const wasmContent = await vsc.workspace.fs.readFile(wasmUri);
-
-      // Initialize database configuration
-      const initConfig: DatabaseInitConfig = {
-        content: dbContent,
-        filePath,
-        walContent,
-        maxSize: getMaximumFileSizeBytes(),
-        resourceMap: {},
-        wasmBinary: wasmContent,
-        readOnlyMode: forceReadOnly ?? false
-      };
-
-      // Initialize database in worker
-      // Use Transfer wrapper to zero-copy transfer the array buffers
-      const transferables: any[] = [];
-      if (initConfig.content && initConfig.content.buffer) {
-          transferables.push(initConfig.content.buffer);
-      }
-      if (initConfig.walContent && initConfig.walContent.buffer) {
-          transferables.push(initConfig.walContent.buffer);
-      }
-      if (initConfig.wasmBinary && initConfig.wasmBinary.buffer) {
-          transferables.push(initConfig.wasmBinary.buffer);
-      }
-
-      const result = await workerProxy.initializeDatabase(
-          displayName,
-          new Transfer(initConfig, transferables) as any // Cast to satisfy type signature
-      );
-
-      // Create operations facade that routes to worker
-      const operationsFacade: DatabaseOperations = {
-        engineKind: Promise.resolve('wasm'),
-        executeQuery: (sql: string, params?: CellValue[]) =>
-          workerProxy.runQuery(sql, params),
-        serializeDatabase: (name: string) => workerProxy.exportDatabase(name),
-        applyModifications: async () => {},
-        undoModification: async () => {},
-        redoModification: async () => {},
-        flushChanges: async () => {},
-        discardModifications: async () => {},
-        updateCell: (table: string, rowId: string | number, column: string, value: CellValue) =>
-          workerProxy.updateCell(table, rowId, column, value),
-        insertRow: (table: string, data: Record<string, CellValue>) =>
-          workerProxy.insertRow(table, data),
-        deleteRows: (table: string, rowIds: (string | number)[]) =>
-          workerProxy.deleteRows(table, rowIds),
-        deleteColumns: (table: string, columns: string[]) =>
-          workerProxy.deleteColumns(table, columns),
-        createTable: (table: string, columns: ColumnDefinition[]) =>
-          workerProxy.createTable(table, columns),
-        updateCellBatch: (table: string, updates: CellUpdate[]) =>
-          workerProxy.updateCellBatch(table, updates),
-        addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
-          workerProxy.addColumn(table, column, type, defaultValue),
-        fetchTableData: (table: string, options: any) =>
-          workerProxy.fetchTableData(table, options),
-        fetchTableCount: (table: string, options: any) =>
-          workerProxy.fetchTableCount(table, options),
-        fetchSchema: () =>
-          workerProxy.fetchSchema(),
-        getTableInfo: (table: string) =>
-          workerProxy.getTableInfo(table),
-        getPragmas: () =>
-          workerProxy.getPragmas(),
-        setPragma: (pragma: string, value: CellValue) =>
-          workerProxy.setPragma(pragma, value),
-        ping: () =>
-          workerProxy.ping(),
-        writeToFile: (path: string) =>
-          workerProxy.writeToFile(path)
-      };
-
-      return {
-        databaseOps: operationsFacade,
-        isReadOnly: result.isReadOnly ?? false
-      };
     }
   };
 }
