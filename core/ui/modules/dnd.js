@@ -45,7 +45,7 @@ function onDragOver(e) {
 
 function onDragLeave(e) {
     if (e.target === lastHighlightedCell) {
-        // This flickers. Rely on dragover.
+        // Rely on dragover
     }
 }
 

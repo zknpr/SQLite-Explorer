@@ -942,7 +942,6 @@ function onColumnResize(event) {
     }
 
     // Need to account for pinned columns offsets potentially changing if we resize a pinned column
-    // But for now just updating the cells is enough visually
     const dataCells = document.querySelectorAll(`.data-row td:nth-child(${colIdx + 2})`); // +2 because nth-child is 1-based and we have row number column
     for (const cell of dataCells) {
         cell.style.width = `${newWidth}px`;
@@ -1096,7 +1095,6 @@ export function onCellClick(event, rowIdx, colIdx, rowId) {
                     const rId = getRowId(state.gridData[r], r);
                     const val = getCellValue(state.gridData[r], c);
                     state.selectedCells.push({ rowIdx: r, colIdx: c, rowId: rId, value: val });
-                    // Add to Set to prevent duplicates if we encounter same cell again (unlikely here but good practice)
                     existingSet.add(`${r},${c}`);
                 }
             }

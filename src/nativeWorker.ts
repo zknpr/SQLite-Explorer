@@ -760,7 +760,6 @@ export async function createNativeDatabaseConnection(
             let def = `${escapeIdentifier(col.name)} ${col.type}`;
             if (col.primaryKey) def += ' PRIMARY KEY';
             if (col.notNull && !col.primaryKey) def += ' NOT NULL';
-            // Default value handling?
             return def;
           });
 

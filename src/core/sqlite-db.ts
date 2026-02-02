@@ -122,7 +122,6 @@ class WasmDatabaseEngine implements DatabaseOperations {
         case 'cell_update':
             if (affectedCells) {
                 // Batch undo
-                // We shouldn't use a single transaction if the extension handles it, but here we can to be safe.
                 await this.executeQuery('BEGIN TRANSACTION');
                 try {
                     for (const cell of affectedCells) {
@@ -471,8 +470,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
                             currentValue = row[0];
                         }
 
-                        // According to sqlite3 C API documentation, sqlite3_reset() is required to reuse a prepared statement.
-                        // Ideally, we should ensure the statement is reset for the next iteration.
+                        // sqlite3_reset() is required to reuse a prepared statement.
                         selectStmt.reset();
                      }
 
@@ -512,7 +510,6 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
     if (defaultValue !== undefined && defaultValue !== null && defaultValue !== '') {
       // Basic SQL safe default value handling
-      // Ideally we would parse this better or accept a typed value, but matching existing logic
       if (defaultValue.toLowerCase() === 'null') {
         sql += ' DEFAULT NULL';
       } else if (!isNaN(Number(defaultValue))) {

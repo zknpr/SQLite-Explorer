@@ -194,10 +194,7 @@ export async function exportTableCommand(
                     if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
                         const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
                         if (validIds.length > 0) {
-                            // Note: We can't safely use 'rowid' in WHERE if we are in this branch (no rowid support)
-                            // But usually _exportOptions.rowIds implies rowid exists.
-                            // We'll skip filtering here to be safe or could assume a PK exists.
-                            // Given this is a fallback, getting all rows is safer than failing SQL.
+                            // Filter logic for non-rowid tables would go here
                         }
                     }
 

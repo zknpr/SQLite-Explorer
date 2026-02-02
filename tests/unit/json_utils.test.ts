@@ -94,14 +94,6 @@ describe('JSON Merge Patch (RFC 7396)', () => {
 
             // Result should have both
             assert.deepStrictEqual(result, { a: { x: 1, y: 2 } });
-
-            // Original logic in applyMergePatch creates a shallow copy of the target level being patched,
-            // but it modifies nested objects if they are reused?
-            // Let's verify implementation behavior.
-            // The implementation:
-            // target = { ...target } (shallow clone)
-            // target[key] = applyMergePatch(target[key], val)
-            // So it should be structurally shared but safe for the root.
         });
     });
 });

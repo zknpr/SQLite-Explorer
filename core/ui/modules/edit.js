@@ -329,9 +329,6 @@ export function closeCellPreview() {
     const modal = document.getElementById('cellPreviewModal');
     modal.classList.add('hidden');
     state.cellPreviewInfo = null;
-
-    // Clean up event listeners?
-    // Usually fine as elements persist and we overwrite oninput/onkeydown next open
 }
 
 export async function saveCellPreview() {

@@ -29,7 +29,6 @@ export function openExportModal() {
 
         state.tableColumns.forEach(col => {
             const div = document.createElement('div');
-            // We use a div wrapper or just append label directly as container is flex/block?
             // Original code used labels directly inside container.
 
             const label = document.createElement('label');
