@@ -21,23 +21,66 @@ function getTargetOrigin() {
     return window.location.ancestorOrigins?.[0] || '*';
 }
 
+// ============================================================================
+// Base64 Encoding Utilities
+// ============================================================================
+
+/**
+ * Encode Uint8Array to Base64 string.
+ * Uses native btoa with chunked processing to avoid call stack limits on large arrays.
+ *
+ * @param {Uint8Array} bytes - Binary data to encode
+ * @returns {string} Base64 encoded string
+ */
+function uint8ArrayToBase64(bytes) {
+    // Process in 32KB chunks to avoid call stack size limits with String.fromCharCode.apply
+    const CHUNK_SIZE = 32768;
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+        const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
+        binary += String.fromCharCode.apply(null, chunk);
+    }
+    return btoa(binary);
+}
+
+/**
+ * Decode Base64 string to Uint8Array.
+ *
+ * @param {string} base64 - Base64 encoded string
+ * @returns {Uint8Array} Decoded binary data
+ */
+function base64ToUint8Array(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+}
+
+// ============================================================================
+// RPC Serialization
+// ============================================================================
+
 /**
  * Serialize a value for RPC transmission.
- * Converts Uint8Array to a serializable format since JSON.stringify produces {} for typed arrays.
+ * Converts Uint8Array to Base64 format for efficient transfer.
  *
- * Note: Large Uint8Arrays (>10MB) will temporarily double memory usage during serialization.
+ * Performance: Base64 encoding is ~33% larger than binary but significantly faster
+ * and more compact than array-of-numbers JSON serialization (which was ~300% larger).
  *
  * @param {*} value - Value to serialize
  * @returns {*} Serialized value
  */
 function serializeValue(value) {
-    // Handle Uint8Array by converting to marker object with array data
+    // Handle Uint8Array by converting to Base64 marker object
     if (value instanceof Uint8Array) {
-        return { __type: 'Uint8Array', data: Array.from(value) };
+        return { __type: 'Uint8Array', base64: uint8ArrayToBase64(value) };
     }
     // Handle other ArrayBuffer views (like DataView)
     if (ArrayBuffer.isView(value)) {
-        return { __type: 'Uint8Array', data: Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) };
+        const uint8 = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        return { __type: 'Uint8Array', base64: uint8ArrayToBase64(uint8) };
     }
     // Recursively serialize arrays
     if (Array.isArray(value)) {
@@ -67,8 +110,9 @@ function serializeArgs(args) {
 /**
  * Deserialize a value from RPC response.
  * Converts serialized Uint8Array markers back to actual Uint8Array instances.
+ * Supports both Base64 format (new) and array format (legacy) for backward compatibility.
  *
- * Security: Only deserializes objects that have exactly __type and data keys
+ * Security: Only deserializes objects that have exactly the expected marker keys
  * to prevent marker collision with user data.
  *
  * @param {*} value - Value to deserialize
@@ -77,13 +121,22 @@ function serializeArgs(args) {
 function deserializeValue(value) {
     // Check for Uint8Array serialization marker
     if (value && typeof value === 'object' && !Array.isArray(value)) {
-        // Security: Validate marker has ONLY __type and data keys to prevent collision
+        const keys = Object.keys(value);
+
+        // Check for Base64 format (new, preferred): { __type: 'Uint8Array', base64: '...' }
+        if (value.__type === 'Uint8Array' && typeof value.base64 === 'string') {
+            if (keys.length === 2 && keys.includes('__type') && keys.includes('base64')) {
+                return base64ToUint8Array(value.base64);
+            }
+        }
+
+        // Check for array format (legacy): { __type: 'Uint8Array', data: [...] }
         if (value.__type === 'Uint8Array' && Array.isArray(value.data)) {
-            const keys = Object.keys(value);
             if (keys.length === 2 && keys.includes('__type') && keys.includes('data')) {
                 return new Uint8Array(value.data);
             }
         }
+
         // Recursively deserialize object properties
         const result = {};
         for (const key of Object.keys(value)) {

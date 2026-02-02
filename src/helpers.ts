@@ -122,6 +122,7 @@ export const cspUtil = {
   fontSrc: 'font-src',
   frameSrc: 'frame-src',
   childSrc: 'child-src',
+  mediaSrc: 'media-src',  // Required for video/audio blob playback in blob inspector
 
   // Source values
   self: "'self'",

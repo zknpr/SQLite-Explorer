@@ -18,24 +18,54 @@ import { SupportsWriteMode, IsRemoteWorkspaceMode, DatabaseDocument, isAutoCommi
 
 import { buildMethodProxy, processProtocolMessage } from './core/rpc';
 
+// ============================================================================
+// Base64 Encoding Utilities
+// ============================================================================
+
+/**
+ * Encode Uint8Array to Base64 string.
+ * Uses Buffer for efficient encoding in Node.js environment.
+ *
+ * @param bytes - Binary data to encode
+ * @returns Base64 encoded string
+ */
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString('base64');
+}
+
+/**
+ * Decode Base64 string to Uint8Array.
+ *
+ * @param base64 - Base64 encoded string
+ * @returns Decoded binary data
+ */
+function base64ToUint8Array(base64: string): Uint8Array {
+  return new Uint8Array(Buffer.from(base64, 'base64'));
+}
+
+// ============================================================================
+// RPC Serialization
+// ============================================================================
+
 /**
  * Serialize a value for RPC transmission.
- * Converts Uint8Array to a serializable format since postMessage converts typed arrays to {}.
+ * Converts Uint8Array to Base64 format for efficient transfer.
  *
- * Note: Large Uint8Arrays (>10MB) will temporarily double memory usage during serialization.
- * Consider using structured clone with transferables for large binary data if performance becomes an issue.
+ * Performance: Base64 encoding is ~33% larger than binary but significantly faster
+ * and more compact than array-of-numbers JSON serialization (which was ~300% larger).
  *
  * @param value - Value to serialize
  * @returns Serialized value safe for postMessage
  */
 function serializeValue(value: unknown): unknown {
-  // Handle Uint8Array by converting to marker object with array data
+  // Handle Uint8Array by converting to Base64 marker object
   if (value instanceof Uint8Array) {
-    return { __type: 'Uint8Array', data: Array.from(value) };
+    return { __type: 'Uint8Array', base64: uint8ArrayToBase64(value) };
   }
   // Handle other ArrayBuffer views (like DataView)
   if (ArrayBuffer.isView(value)) {
-    return { __type: 'Uint8Array', data: Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) };
+    const uint8 = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    return { __type: 'Uint8Array', base64: uint8ArrayToBase64(uint8) };
   }
   // Recursively serialize plain object properties only
   // Using Object.prototype.toString for robust object detection (handles null prototype)
@@ -57,8 +87,9 @@ function serializeValue(value: unknown): unknown {
 /**
  * Deserialize a value from RPC transmission.
  * Converts serialized Uint8Array markers back to actual Uint8Array instances.
+ * Supports both Base64 format (new) and array format (legacy) for backward compatibility.
  *
- * Security: Only deserializes objects that have exactly __type and data keys
+ * Security: Only deserializes objects that have exactly the expected marker keys
  * to prevent marker collision with user data.
  *
  * @param value - Value to deserialize
@@ -68,13 +99,22 @@ function deserializeValue(value: unknown): unknown {
   // Check for our Uint8Array serialization marker
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     const obj = value as Record<string, unknown>;
-    // Security: Validate marker has ONLY __type and data keys to prevent collision with user data
+    const keys = Object.keys(obj);
+
+    // Check for Base64 format (new, preferred): { __type: 'Uint8Array', base64: '...' }
+    if (obj.__type === 'Uint8Array' && typeof obj.base64 === 'string') {
+      if (keys.length === 2 && keys.includes('__type') && keys.includes('base64')) {
+        return base64ToUint8Array(obj.base64);
+      }
+    }
+
+    // Check for array format (legacy): { __type: 'Uint8Array', data: [...] }
     if (obj.__type === 'Uint8Array' && Array.isArray(obj.data)) {
-      const keys = Object.keys(obj);
       if (keys.length === 2 && keys.includes('__type') && keys.includes('data')) {
         return new Uint8Array(obj.data as number[]);
       }
     }
+
     // Recursively deserialize object properties
     const result: Record<string, unknown> = {};
     for (const key of Object.keys(obj)) {
@@ -394,6 +434,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       [cspUtil.fontSrc]: [webview.cspSource],
       [cspUtil.frameSrc]: [cspUtil.none],
       [cspUtil.childSrc]: [cspUtil.blob],
+      [cspUtil.mediaSrc]: [cspUtil.blob],  // Required for video/audio blob playback in blob inspector
     };
 
     // Only set csp for hosts that are known to correctly set `webview.cspSource`

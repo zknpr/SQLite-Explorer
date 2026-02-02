@@ -19,6 +19,9 @@ export class BlobInspector {
         this.currentColName = null;
         this.currentCellInfo = null;
 
+        // Track upload state to prevent multiple concurrent uploads and enable proper cleanup
+        this.isUploading = false;
+
         this.setupEventListeners();
     }
 
@@ -49,7 +52,30 @@ export class BlobInspector {
         }
     }
 
+    /**
+     * Set upload state and update UI accordingly.
+     * Disables buttons during upload to prevent concurrent operations.
+     *
+     * @param {boolean} uploading - Whether upload is in progress
+     */
+    setUploadState(uploading) {
+        this.isUploading = uploading;
+        const replaceBtn = document.getElementById('blob-replace-btn');
+        const downloadBtn = document.getElementById('blob-download-btn');
+
+        if (replaceBtn) {
+            replaceBtn.disabled = uploading;
+            replaceBtn.textContent = uploading ? 'Uploading...' : 'Replace';
+        }
+        if (downloadBtn) {
+            downloadBtn.disabled = uploading;
+        }
+    }
+
     async handleReplace() {
+        // Prevent concurrent uploads
+        if (this.isUploading) return;
+
         try {
             // Check fileOperations setting to determine behavior
             const settings = await backendApi.getExtensionSettings();
@@ -112,13 +138,22 @@ export class BlobInspector {
 
     async uploadFile(file) {
         if (!this.currentRowId || !this.currentColName) return;
+        if (this.isUploading) return;
+
+        this.setUploadState(true);
 
         try {
             updateStatus(`Reading ${file.name}...`);
             const buffer = await file.arrayBuffer();
             const uint8Array = new Uint8Array(buffer);
 
-            updateStatus(`Uploading ${file.name}...`);
+            // Warn about large files that may be slow
+            const sizeMB = uint8Array.length / (1024 * 1024);
+            if (sizeMB > 10) {
+                updateStatus(`Uploading ${file.name} (${sizeMB.toFixed(1)}MB - this may take a while)...`);
+            } else {
+                updateStatus(`Uploading ${file.name}...`);
+            }
 
             const { rowIdx, colIdx } = this.currentCellInfo;
             const originalValue = this.currentData;
@@ -143,7 +178,15 @@ export class BlobInspector {
 
         } catch (err) {
             console.error('Replace failed:', err);
-            updateStatus(`Replace failed: ${err.message}`);
+            // Provide helpful error message for timeouts
+            let errorMessage = err.message || String(err);
+            if (errorMessage.includes('timeout')) {
+                errorMessage = 'Upload timed out. Try a smaller file or increase the timeout.';
+            }
+            updateStatus(`Replace failed: ${errorMessage}`);
+        } finally {
+            // Always reset upload state to restore UI functionality
+            this.setUploadState(false);
         }
     }
 
@@ -153,6 +196,9 @@ export class BlobInspector {
     }
 
     cleanup() {
+        // Reset upload state to ensure buttons are re-enabled
+        this.setUploadState(false);
+
         if (this.currentObjectUrl) {
             URL.revokeObjectURL(this.currentObjectUrl);
             this.currentObjectUrl = null;
