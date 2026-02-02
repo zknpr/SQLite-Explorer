@@ -9,8 +9,8 @@
 // Use parent window for RPC instead of VS Code API
 const parentWindow = window.parent;
 
-// Default RPC timeout in milliseconds
-const RPC_TIMEOUT_MS = 30000;
+// Default RPC timeout in milliseconds (60s to accommodate large blob operations)
+const RPC_TIMEOUT_MS = 60000;
 
 // Message ID tracking
 let rpcMessageId = 0;

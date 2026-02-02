@@ -147,10 +147,18 @@ export class BlobInspector {
             const buffer = await file.arrayBuffer();
             const uint8Array = new Uint8Array(buffer);
 
-            // Warn about large files that may be slow
             const sizeMB = uint8Array.length / (1024 * 1024);
+
+            // Reject files larger than 50MB to prevent extension freeze
+            // Large blobs require synchronous Base64 encoding which blocks the UI thread
+            const MAX_BLOB_SIZE_MB = 50;
+            if (sizeMB > MAX_BLOB_SIZE_MB) {
+                throw new Error(`File too large (${sizeMB.toFixed(1)}MB). Maximum size is ${MAX_BLOB_SIZE_MB}MB to prevent freezing.`);
+            }
+
+            // Warn about moderately large files
             if (sizeMB > 10) {
-                updateStatus(`Uploading ${file.name} (${sizeMB.toFixed(1)}MB - this may take a while)...`);
+                updateStatus(`Uploading ${file.name} (${sizeMB.toFixed(1)}MB - this may take a moment)...`);
             } else {
                 updateStatus(`Uploading ${file.name}...`);
             }

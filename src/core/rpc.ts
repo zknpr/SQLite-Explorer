@@ -73,9 +73,9 @@ interface PendingInvocation {
 const pendingInvocations = new Map<MessageCorrelationId, PendingInvocation>();
 
 /**
- * Default timeout for remote invocations (30 seconds).
+ * Default timeout for remote invocations (60 seconds to accommodate large blob operations).
  */
-const INVOCATION_TIMEOUT_MS = 30000;
+const INVOCATION_TIMEOUT_MS = 60000;
 
 // ============================================================================
 // Proxy Factory
