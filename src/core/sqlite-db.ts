@@ -126,7 +126,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
                 await this.executeQuery('BEGIN TRANSACTION');
                 try {
                     for (const cell of affectedCells) {
-                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.priorValue);
+                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.priorValue ?? null);
                     }
                     await this.executeQuery('COMMIT');
                 } catch (e) {
@@ -135,7 +135,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
                 }
             } else if (targetRowId !== undefined && targetColumn) {
                 // Single cell undo
-                await this.updateCell(targetTable, targetRowId, targetColumn, priorValue);
+                await this.updateCell(targetTable, targetRowId, targetColumn, priorValue ?? null);
             }
             break;
 
@@ -218,7 +218,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
                 await this.executeQuery('BEGIN TRANSACTION');
                 try {
                     for (const cell of affectedCells) {
-                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.newValue);
+                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.newValue ?? null);
                     }
                     await this.executeQuery('COMMIT');
                 } catch (e) {
@@ -226,7 +226,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
                     throw e;
                 }
             } else if (targetRowId !== undefined && targetColumn) {
-                await this.updateCell(targetTable, targetRowId, targetColumn, newValue);
+                await this.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
             }
             break;
 
@@ -282,13 +282,16 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
   /**
    * Discard pending modifications.
-   * Handled at extension level through history tracking.
+   * Reverts changes by undoing them in reverse order.
    */
   async discardModifications(
-    _mods: ModificationEntry[],
+    mods: ModificationEntry[],
     _signal?: AbortSignal
   ): Promise<void> {
-    // Extension handles rollback via history
+    // Apply undos in reverse order (LIFO)
+    for (let i = mods.length - 1; i >= 0; i--) {
+        await this.undoModification(mods[i]);
+    }
   }
 
   /**

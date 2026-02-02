@@ -23,7 +23,7 @@ export const NestingPattern = "${capture}.${extname}-*";
 export const FileNestingPatternsAdded = 'fileNestingPatternsAdded';
 
 // Storage keys
-export const FistInstallMs = 'fistInstallMs';
+export const FirstInstallMs = 'firstInstallMs';
 export const SidebarLeft = 'sidebarLeft';
 export const SidebarRight = 'sidebarRight';
 
@@ -31,7 +31,7 @@ export const SidebarRight = 'sidebarRight';
 export const SyncedKeys = [
   FullExtensionId,
   FileNestingPatternsAdded,
-  FistInstallMs,
+  FirstInstallMs,
 ];
 
 // Display names

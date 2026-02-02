@@ -3,6 +3,8 @@ import { DocumentRegistry } from './documentRegistry';
 import { UriScheme } from './config';
 import { Disposable } from './lifecycle';
 
+import type { DatabaseDocument } from './databaseModel';
+
 export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     readonly onDidChangeFile: vsc.Event<vsc.FileChangeEvent[]>;
     private _emitter = new vsc.EventEmitter<vsc.FileChangeEvent[]>();
@@ -113,18 +115,11 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
             // Try to decode as UTF-8
             try {
-                // Check for null bytes to guess binary
-                let isBinary = false;
-                for (let i = 0; i < Math.min(content.length, 1000); i++) {
-                    if (content[i] === 0) {
-                        isBinary = true;
-                        break;
-                    }
-                }
-
-                if (!isBinary) {
-                    value = new TextDecoder('utf-8', { fatal: true }).decode(content);
-                }
+                // We strictly try to decode as UTF-8. If the content contains invalid UTF-8 sequences,
+                // the TextDecoder with { fatal: true } will throw, and we will fall back to treating it as a BLOB.
+                // This allows saving text containing null bytes (which are valid in UTF-8/SQL TEXT)
+                // while correctly handling actual binary data.
+                value = new TextDecoder('utf-8', { fatal: true }).decode(content);
             } catch {
                 // Keep as Uint8Array (BLOB)
             }
@@ -158,7 +153,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         throw vsc.FileSystemError.NoPermissions();
     }
 
-    private parseUri(uri: vsc.Uri): { document: any, table: string, rowId: string, column: string } {
+    private parseUri(uri: vsc.Uri): { document: DatabaseDocument, table: string, rowId: string, column: string } {
         // Path format: /<document_key>/<table>/<name>/<rowid>/<filename>
         // Note: VS Code URIs usually have a leading slash in path
         const pathParts = uri.path.split('/').filter(p => p.length > 0);

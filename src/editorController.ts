@@ -10,7 +10,7 @@ import type { TelemetryReporter } from '@vscode/extension-telemetry';
 import * as vsc from 'vscode';
 
 import { crypto } from './platform/cryptoShim';
-import { ConfigurationSection, CopilotChatId, ExtensionId, FistInstallMs, FullExtensionId, Ns, SidebarLeft, SidebarRight } from './config';
+import { ConfigurationSection, CopilotChatId, ExtensionId, FirstInstallMs, FullExtensionId, Ns, SidebarLeft, SidebarRight } from './config';
 import { Disposable } from './lifecycle';
 import { IsVSCode, IsVSCodium, WebviewCollection, cspUtil, doTry, toDatasetAttrs, themeToCss, uiKindToString, BoolString, toBoolString, IsCursorIDE, lang } from './helpers';
 
@@ -97,10 +97,6 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     const document = await DatabaseDocument.create(this, uri, openContext, token);
 
     this.configureEventHandlers(document);
-
-    document.onDidDispose(() => {
-      this.dispose();
-    });
 
     return document;
   }
@@ -336,7 +332,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       accessToken: this.accessToken,
       uiKind: uiKindToString(uiKind),
       machineId: vsc.env.machineId,
-      firstInstall: doTry(() => new Date(this.context.globalState.get<number>(FistInstallMs) ?? Date.now()).toISOString()),
+      firstInstall: doTry(() => new Date(this.context.globalState.get<number>(FirstInstallMs) ?? Date.now()).toISOString()),
       sidebarLeft: this.context.globalState.get<number>(SidebarLeft)?.toString(),
       sidebarRight: this.context.globalState.get<number>(SidebarRight)?.toString(),
       panelVisible: toBoolString(webviewPanel.visible),

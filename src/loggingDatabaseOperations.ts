@@ -215,6 +215,9 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.setPragma(pragma, value);
     }
 
+    async ping(): Promise<boolean> {
+        return this.wrapped.ping();
+    }
 
     async writeToFile(path: string): Promise<void> {
         this.log(`Writing to file: ${path}`, true);

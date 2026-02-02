@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.3
+
+### Bug Fixes
+
+- **Revert Functionality**: Fixed a critical bug where the "Revert File" action was not actually rolling back data. Implemented the missing `discardModifications` logic in both WASM and Native backends to ensure changes are properly undone.
+- **Large File UX**: Added an explicit error message when opening files larger than `sqliteExplorer.maxFileSize` (default 200MB), instead of silently loading an empty database.
+- **Extension Lifecycle**: Fixed a bug where closing a single database tab would inadvertently dispose the entire editor provider, breaking the extension for subsequent file opens.
+
+### Security
+
+- **Asset Integrity**: Hardened the extension package by bundling Codicons font assets directly into the `assets/` directory instead of referencing `node_modules` at runtime. This improves stability and aligns with VS Code packaging best practices.
+
+### Maintenance
+
+- **Test Coverage**: Added comprehensive test suites for `revert` logic and JSON Merge Patch (RFC 7396) utilities, increasing test count from 25 to 39.
+- **Web Demo**: Updated the web demo build to use the correct version of `@vscode/codicons` (0.0.44) to match the extension.
+
 ## 1.2.2
 
 ### Security

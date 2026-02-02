@@ -196,8 +196,10 @@ export function initGridInteraction() {
 
 function resolveRowIdType(idStr) {
     if (idStr === undefined || idStr === null) return idStr;
+    // Row IDs in SQLite are integers, but if using 'WITHOUT ROWID' tables, PK could be anything.
+    // However, for standard tables, we try to keep them as numbers to match what the backend returns.
     const num = Number(idStr);
-    return isNaN(num) ? idStr : num;
+    return !isNaN(num) && idStr.trim() !== '' ? num : idStr;
 }
 
 // ================================================================

@@ -5,6 +5,9 @@
 
 const vscodeApi = typeof acquireVsCodeApi !== 'undefined' ? acquireVsCodeApi() : null;
 
+// Default RPC timeout in milliseconds
+const RPC_TIMEOUT_MS = 30000;
+
 // Message ID tracking
 let rpcMessageId = 0;
 const pendingRpcCalls = new Map();
@@ -21,7 +24,7 @@ export function sendRpcRequest(method, args) {
                 pendingRpcCalls.delete(messageId);
                 reject(new Error(`RPC timeout: ${method}`));
             }
-        }, 30000);
+        }, RPC_TIMEOUT_MS);
 
         pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
 

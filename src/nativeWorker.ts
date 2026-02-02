@@ -28,7 +28,8 @@ import type {
   TableQueryOptions,
   TableCountOptions,
   SchemaSnapshot,
-  ColumnMetadata
+  ColumnMetadata,
+  ColumnDefinition
 } from './core/types';
 import { escapeIdentifier, cellValueToSql, validateSqlType } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -653,7 +654,11 @@ export async function createNativeDatabaseConnection(
         },
 
         flushChanges: async () => {},
-        discardModifications: async () => {},
+        discardModifications: async (mods: ModificationEntry[]) => {
+            for (let i = mods.length - 1; i >= 0; i--) {
+                await operationsFacade.undoModification(mods[i]);
+            }
+        },
 
         /**
          * Update a single cell value.
@@ -742,9 +747,8 @@ export async function createNativeDatabaseConnection(
         /**
          * Create a new table.
          */
-        createTable: async (table: string, columns: any[]) => {
+        createTable: async (table: string, columns: ColumnDefinition[]) => {
           // Construct SQL from structured column definitions
-          // columns is now ColumnDefinition[]
           const colDefs = columns.map(col => {
             // If it's a string, it indicates legacy/unsafe mode which is not supported.
             if (typeof col === 'string') {

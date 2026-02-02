@@ -2,7 +2,7 @@ import "./shims"
 import * as vsc from 'vscode';
 import { TelemetryReporter } from '@vscode/extension-telemetry';
 import { exportTableCommand } from './tableExporter';
-import { ExtensionId, FullExtensionId, FileNestingPatternsAdded, FistInstallMs, NestingPattern, SyncedKeys, TelemetryConnectionString, Title, UriScheme } from './config';
+import { ExtensionId, FullExtensionId, FileNestingPatternsAdded, FirstInstallMs, NestingPattern, SyncedKeys, TelemetryConnectionString, Title, UriScheme } from './config';
 import { disposeAll } from './lifecycle';
 import { registerEditorProvider } from './editorController';
 import { SQLiteFileSystemProvider } from './virtualFileSystem';
@@ -52,9 +52,9 @@ export async function activate(context: vsc.ExtensionContext) {
   addFileNestingPatternsOnce(context);
 
   // Track first install time
-  const firstInstall = context.globalState.get<number>(FistInstallMs);
+  const firstInstall = context.globalState.get<number>(FirstInstallMs);
   if (firstInstall === undefined) {
-    context.globalState.update(FistInstallMs, Date.now());
+    context.globalState.update(FirstInstallMs, Date.now());
   }
 
   // Store current version

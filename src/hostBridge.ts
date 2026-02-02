@@ -792,7 +792,7 @@ export class HostBridge implements ToastService {
   /**
    * Update extension setting.
    */
-  async updateExtensionSetting(key: string, value: any) {
+  async updateExtensionSetting(key: string, value: boolean | string) {
     if (key === 'autoCommit') {
       this.document.autoCommitEnabled = !!value;
       // Update persistent configuration
@@ -842,47 +842,35 @@ export class HostBridge implements ToastService {
     if (uri.scheme === 'file') {
       const filePath = uri.fsPath;
 
-      // Block obvious sensitive paths (defense in depth - VS Code API might already block some)
-      const blockedPaths = [
-        '/etc/', '/var/', '/root/', '/proc/', '/sys/', '/dev/',  // Linux system dirs
-        '/private/etc/', '/private/var/',                         // macOS system dirs
-        'C:\\Windows\\', 'C:\\Program Files\\', 'C:\\ProgramData\\', // Windows system dirs
-      ];
+      // SECURITY: Whitelist approach
+      // Only allow access to files in:
+      // 1. Explicit workspace folders
+      // 2. The same directory as the open database (or subdirectories)
 
-      const normalizedPath = filePath.replace(/\\/g, '/').toLowerCase();
-      for (const blocked of blockedPaths) {
-        if (normalizedPath.startsWith(blocked.toLowerCase())) {
-          throw new Error(`Access denied: Cannot read system file "${filePath}"`);
-        }
-      }
-
-      // Check if file is within workspace folders (preferred)
+      // 1. Check if file is within workspace folders
       const workspaceFolder = vsc.workspace.getWorkspaceFolder(uri);
       if (workspaceFolder) {
-        // File is in workspace - allow
         return await vsc.workspace.fs.readFile(uri);
       }
 
-      // If no workspace folder match, check if file is relative to the current document
+      // 2. Check if file is in the same directory tree as the open document
       // This allows drag-and-drop from the same directory tree in single-file mode
       const docDir = path.dirname(this.document.uri.fsPath);
-      if (filePath.startsWith(docDir)) {
-        // File is in the same directory tree as the open document - allow
-        return await vsc.workspace.fs.readFile(uri);
+
+      // Use path.relative to safely check containment
+      // This handles platform-specific separators and normalization automatically
+      const relative = path.relative(docDir, filePath);
+
+      // If relative path starts with '..' or is absolute (on some platforms relative might return abs if on diff drive),
+      // then it is outside the docDir.
+      // Also check if it's the docDir itself (relative === '')
+      const isInside = !relative.startsWith('..') && !path.isAbsolute(relative);
+
+      if (!isInside) {
+         throw new Error(`Access denied: File "${filePath}" is not in the current workspace or document directory.`);
       }
 
-      // For multi-root or edge cases, check if any workspace folder contains this path
-      const workspaceFolders = vsc.workspace.workspaceFolders;
-      if (workspaceFolders) {
-        for (const folder of workspaceFolders) {
-          if (filePath.startsWith(folder.uri.fsPath)) {
-            return await vsc.workspace.fs.readFile(uri);
-          }
-        }
-      }
-
-      // File is outside workspace and document directory - deny access
-      throw new Error(`Access denied: File "${filePath}" is not in the current workspace or document directory.`);
+      return await vsc.workspace.fs.readFile(uri);
     }
 
     // For other schemes (vscode-remote, ssh, etc.), delegate to VS Code's fs API

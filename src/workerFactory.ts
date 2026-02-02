@@ -242,8 +242,7 @@ async function createWasmDatabaseConnection(
           const maxSize = getMaximumFileSizeBytes();
           const fileStat = await vsc.workspace.fs.stat(fileUri);
           if (maxSize !== 0 && fileStat.size > maxSize) {
-             // File too large - skip setting filePath, leave dbContent null
-             // The worker will fallback to creating an empty database
+             throw new Error(`File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
           } else {
              filePath = fileUri.fsPath;
           }
@@ -358,8 +357,7 @@ async function loadDatabaseFiles(
   // Check file size
   const fileStat = await Promise.resolve(vsc.workspace.fs.stat(uri)).catch(() => ({ size: 0 }));
   if (maxSize !== 0 && fileStat.size > maxSize) {
-    // File exceeds size limit
-    return [null, null];
+    throw new Error(`File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
   }
 
   // Construct WAL file URI

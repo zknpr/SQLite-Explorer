@@ -2,12 +2,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { ModificationTracker } from '../../src/core/undo-history';
+import { ModificationType } from '../../src/core/types';
 
 // Mock types
 interface MockMod {
     label: string;
     description: string;
-    modificationType: string;
+    modificationType: ModificationType;
     targetTable: string;
     [key: string]: any;
 }

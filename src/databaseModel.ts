@@ -376,9 +376,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   async revert(cancellation: vsc.CancellationToken): Promise<void> {
     await this.ensureWritable();
+    const uncommitted = this.#modificationTracker.getUncommittedEntries();
     this.#modificationTracker.rollbackToCheckpoint();
     await this.databaseOperations.discardModifications(
-      this.#modificationTracker.getUncommittedEntries(),
+      uncommitted,
       cancelTokenToAbortSignal(cancellation)
     );
     this.#contentChangeEmitter.fire({});
