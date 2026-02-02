@@ -783,9 +783,14 @@ export class HostBridge implements ToastService {
    * Get extension settings.
    */
   async getExtensionSettings() {
+    // Read fileOperations setting from VS Code configuration
+    const config = vsc.workspace.getConfiguration(ConfigurationSection);
+    const fileOperations = config.get<string>('fileOperations', 'native');
+    
     return {
       autoCommit: this.document.autoCommitEnabled,
-      cellEditBehavior: this.document.cellEditBehavior
+      cellEditBehavior: this.document.cellEditBehavior,
+      fileOperations: fileOperations
     };
   }
 
@@ -876,6 +881,53 @@ export class HostBridge implements ToastService {
     // For other schemes (vscode-remote, ssh, etc.), delegate to VS Code's fs API
     // which will enforce its own access controls
     return await vsc.workspace.fs.readFile(uri);
+  }
+
+  /**
+   * Save a file to the workspace via dialog.
+   */
+  async saveFile(filename: string, data: Uint8ArrayLike): Promise<void> {
+    // Use the database file's directory as the default location
+    const dbDir = path.dirname(this.document.uri.fsPath);
+    const defaultPath = path.join(dbDir, filename);
+    
+    const uri = await vsc.window.showSaveDialog({
+        defaultUri: vsc.Uri.file(defaultPath),
+        saveLabel: 'Save Blob'
+    });
+
+    if (uri) {
+        // Convert data to Uint8Array if needed
+        let buffer: Uint8Array;
+        if (data instanceof Uint8Array) {
+            buffer = data;
+        } else {
+            buffer = new Uint8Array(data.buffer || (data as any), data.byteOffset, data.byteLength);
+        }
+        await vsc.workspace.fs.writeFile(uri, buffer);
+    }
+  }
+
+  /**
+   * Select a file from the workspace via dialog.
+   */
+  async selectFile(): Promise<{ name: string, data: Uint8Array } | undefined> {
+    const uris = await vsc.window.showOpenDialog({
+        canSelectFiles: true,
+        canSelectFolders: false,
+        canSelectMany: false,
+        openLabel: 'Select File to Upload'
+    });
+
+    if (uris && uris.length > 0) {
+        const uri = uris[0];
+        const data = await vsc.workspace.fs.readFile(uri);
+        return {
+            name: path.basename(uri.fsPath),
+            data: data
+        };
+    }
+    return undefined;
   }
 }
 

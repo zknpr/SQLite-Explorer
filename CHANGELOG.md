@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.2.4
+
+### New Features
+
+- **Blob Inspector**: Added comprehensive blob preview and editing modal:
+  - **Image Preview**: View PNG, JPEG, GIF, BMP, and WebP images directly in the inspector
+  - **Audio Preview**: Play MP3, OGG, WAV, and FLAC audio files with native controls
+  - **Video Preview**: Play MP4, WebM, MOV, and AVI video files with native controls
+  - **PDF Preview**: View PDF documents inline with download fallback
+  - **Text/JSON Preview**: View and format text and JSON content
+  - **Hex View**: Inspect raw binary data in hex dump format
+  - **Download**: Save any blob to disk with auto-detected file extension
+  - **Replace**: Upload a new file to replace existing blob data
+
+### Bug Fixes
+
+- **Blob Replace**: Fixed blob replacement failing with empty data. The issue was caused by `Uint8Array` being serialized to `{}` (empty object) during RPC postMessage communication. Implemented proper serialization/deserialization for both request and response payloads.
+
+### Technical
+
+- **RPC Serialization**: Added bidirectional `Uint8Array` serialization in the RPC layer:
+  - Extension host now serializes `Uint8Array` in responses before sending to webview
+  - Webview now deserializes `Uint8Array` markers in received responses
+  - Uses `{__type: 'Uint8Array', data: [...]}` marker format for safe JSON transmission
+
 ## 1.2.3
 
 ### Bug Fixes

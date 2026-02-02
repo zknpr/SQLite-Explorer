@@ -330,6 +330,34 @@
         </div>
     </div>
 
+    <!-- Blob Inspector Modal -->
+    <div id="blob-inspector-modal" class="modal-overlay hidden">
+        <div class="modal-dialog blob-inspector" style="min-width: 600px; height: 600px;">
+            <div class="modal-header">
+                <span class="modal-title">BLOB Inspector</span>
+                <button type="button" class="modal-close" data-modal="blob-inspector-modal">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 0; display: flex; flex-direction: column; flex: 1; overflow: hidden;">
+                <div class="tabs" style="display: flex; border-bottom: 1px solid var(--border-color); background: var(--bg-tertiary);">
+                    <button class="tab-btn active" data-tab="preview" style="padding: 8px 16px; border: none; background: none; color: var(--text-primary); cursor: pointer; border-bottom: 2px solid var(--accent-color);">Preview</button>
+                    <button class="tab-btn" data-tab="hex" style="padding: 8px 16px; border: none; background: none; color: var(--text-secondary); cursor: pointer;">Hex</button>
+                </div>
+                <div id="blob-info" style="padding: 8px 16px; font-size: 11px; color: var(--text-secondary); border-bottom: 1px solid var(--border-color);"></div>
+                <div class="tab-content" id="tab-preview" style="flex: 1; overflow: auto; padding: 16px; display: flex; align-items: center; justify-content: center; background: var(--bg-primary);">
+                    <!-- Dynamic Content -->
+                    <span style="color: var(--text-secondary);">Select a BLOB to inspect</span>
+                </div>
+                <div class="tab-content" id="tab-hex" style="display: none; flex: 1; overflow: auto;">
+                    <textarea readonly class="hex-dump" style="width: 100%; height: 100%; resize: none; border: none; padding: 12px; font-family: monospace; background: var(--bg-primary); color: var(--text-primary); outline: none;"></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="blob-replace-btn" class="btn-secondary">Replace...</button>
+                <button id="blob-download-btn" class="btn-primary">Download</button>
+            </div>
+        </div>
+    </div>
+
     <script nonce="<!--NONCE-->">
 <!--SCRIPTS-->
     </script>

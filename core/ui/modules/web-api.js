@@ -22,6 +22,64 @@ function getTargetOrigin() {
 }
 
 /**
+ * Serialize a value for RPC transmission.
+ * Converts Uint8Array to a serializable format since JSON.stringify produces {} for typed arrays.
+ * @param {*} value - Value to serialize
+ * @returns {*} Serialized value
+ */
+function serializeValue(value) {
+    if (value instanceof Uint8Array) {
+        // Convert to object with type marker and array data
+        return { __type: 'Uint8Array', data: Array.from(value) };
+    }
+    if (Array.isArray(value)) {
+        return value.map(serializeValue);
+    }
+    if (value && typeof value === 'object' && value.constructor === Object) {
+        const result = {};
+        for (const key of Object.keys(value)) {
+            result[key] = serializeValue(value[key]);
+        }
+        return result;
+    }
+    return value;
+}
+
+/**
+ * Serialize arguments array for RPC transmission.
+ * @param {Array} args - Arguments to serialize
+ * @returns {Array} Serialized arguments
+ */
+function serializeArgs(args) {
+    return args.map(serializeValue);
+}
+
+/**
+ * Deserialize a value from RPC response.
+ * Converts serialized Uint8Array markers back to actual Uint8Array instances.
+ * @param {*} value - Value to deserialize
+ * @returns {*} Deserialized value
+ */
+function deserializeValue(value) {
+    // Check for Uint8Array serialization marker
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+        if (value.__type === 'Uint8Array' && Array.isArray(value.data)) {
+            return new Uint8Array(value.data);
+        }
+        // Recursively deserialize object properties
+        const result = {};
+        for (const key of Object.keys(value)) {
+            result[key] = deserializeValue(value[key]);
+        }
+        return result;
+    }
+    if (Array.isArray(value)) {
+        return value.map(deserializeValue);
+    }
+    return value;
+}
+
+/**
  * Send an RPC request to the parent window.
  * @param {string} method - Method name to call
  * @param {Array} args - Arguments for the method
@@ -40,6 +98,9 @@ export function sendRpcRequest(method, args) {
 
         pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
 
+        // Serialize args to handle Uint8Array and other non-JSON-safe types
+        const serializedArgs = serializeArgs(args);
+
         // Post message to parent window instead of VS Code API
         parentWindow.postMessage({
             channel: 'rpc',
@@ -47,7 +108,7 @@ export function sendRpcRequest(method, args) {
                 kind: 'invoke',
                 messageId,
                 targetMethod: method,
-                payload: args
+                payload: serializedArgs
             }
         }, getTargetOrigin());
     });
@@ -66,7 +127,9 @@ export function handleRpcResponse(message) {
         pendingRpcCalls.delete(message.messageId);
 
         if (message.success) {
-            pending.resolve(message.data);
+            // Deserialize the response data to restore Uint8Array instances
+            const deserializedData = deserializeValue(message.data);
+            pending.resolve(deserializedData);
         } else {
             pending.reject(new Error(message.errorMessage || 'RPC failed'));
         }
@@ -132,5 +195,41 @@ export const backendApi = {
     openCellEditor: () => Promise.resolve({ success: false, message: 'Not available in web mode' }),
     readWorkspaceFileUri: () => Promise.resolve(null),
     triggerUndo: () => Promise.resolve(),
-    triggerRedo: () => Promise.resolve()
+    triggerRedo: () => Promise.resolve(),
+
+    // Web-compatible implementations for Blob Inspector
+    saveFile: (filename, data) => {
+        const blob = new Blob([data]);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 100);
+        return Promise.resolve();
+    },
+    selectFile: () => {
+        return new Promise((resolve) => {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.style.display = 'none';
+            input.onchange = async (e) => {
+                if (e.target.files.length > 0) {
+                    const file = e.target.files[0];
+                    const buffer = await file.arrayBuffer();
+                    resolve({
+                        name: file.name,
+                        data: new Uint8Array(buffer)
+                    });
+                } else {
+                    resolve(undefined);
+                }
+            };
+            document.body.appendChild(input);
+            input.click();
+            setTimeout(() => document.body.removeChild(input), 1000);
+        });
+    }
 };

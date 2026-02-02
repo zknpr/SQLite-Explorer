@@ -7,8 +7,13 @@ import { escapeHtml, validateRowId, escapeIdentifier, formatCellValue } from './
 import { updateStatus } from './ui.js';
 import { renderDataGrid, loadTableData, updateSelectionStates, clearSelection } from './grid.js';
 import { getRowDataOffset, getCellValue } from './data-utils.js';
+import { BlobInspector } from './blob-inspector.js';
+
+let blobInspector;
 
 export function initEdit() {
+    blobInspector = new BlobInspector(backendApi);
+
     // Cell Preview Modal
     document.getElementById('btnCloseCellPreview')?.addEventListener('click', closeCellPreview);
     document.getElementById('formatJsonBtn')?.addEventListener('click', formatCellPreviewJson);
@@ -252,6 +257,14 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     if (!row) return;
 
     const value = getCellValue(row, colIdx);
+
+    // Delegate BLOB inspection
+    if (value instanceof Uint8Array) {
+        if (blobInspector) {
+            blobInspector.inspect(value, rowId, column.name, rowIdx, colIdx);
+        }
+        return;
+    }
 
     state.cellPreviewInfo = {
         rowIdx,

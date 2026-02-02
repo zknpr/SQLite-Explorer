@@ -13,6 +13,64 @@ let rpcMessageId = 0;
 const pendingRpcCalls = new Map();
 
 /**
+ * Serialize a value for RPC transmission.
+ * Converts Uint8Array to a serializable format since JSON.stringify produces {} for typed arrays.
+ * @param {*} value - Value to serialize
+ * @returns {*} Serialized value
+ */
+function serializeValue(value) {
+    if (value instanceof Uint8Array) {
+        // Convert to object with type marker and array data
+        return { __type: 'Uint8Array', data: Array.from(value) };
+    }
+    if (Array.isArray(value)) {
+        return value.map(serializeValue);
+    }
+    if (value && typeof value === 'object' && value.constructor === Object) {
+        const result = {};
+        for (const key of Object.keys(value)) {
+            result[key] = serializeValue(value[key]);
+        }
+        return result;
+    }
+    return value;
+}
+
+/**
+ * Serialize arguments array for RPC transmission.
+ * @param {Array} args - Arguments to serialize
+ * @returns {Array} Serialized arguments
+ */
+function serializeArgs(args) {
+    return args.map(serializeValue);
+}
+
+/**
+ * Deserialize a value from RPC response.
+ * Converts serialized Uint8Array markers back to actual Uint8Array instances.
+ * @param {*} value - Value to deserialize
+ * @returns {*} Deserialized value
+ */
+function deserializeValue(value) {
+    // Check for Uint8Array serialization marker from extension host
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+        if (value.__type === 'Uint8Array' && Array.isArray(value.data)) {
+            return new Uint8Array(value.data);
+        }
+        // Recursively deserialize object properties
+        const result = {};
+        for (const key of Object.keys(value)) {
+            result[key] = deserializeValue(value[key]);
+        }
+        return result;
+    }
+    if (Array.isArray(value)) {
+        return value.map(deserializeValue);
+    }
+    return value;
+}
+
+/**
  * Send an RPC request to the extension host.
  */
 export function sendRpcRequest(method, args) {
@@ -29,13 +87,15 @@ export function sendRpcRequest(method, args) {
         pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
 
         if (vscodeApi) {
+            // Serialize args to handle Uint8Array and other non-JSON-safe types
+            const serializedArgs = serializeArgs(args);
             vscodeApi.postMessage({
                 channel: 'rpc',
                 content: {
                     kind: 'invoke',
                     messageId,
                     targetMethod: method,
-                    payload: args
+                    payload: serializedArgs
                 }
             });
         } else {
@@ -57,7 +117,9 @@ export function handleRpcResponse(message) {
         pendingRpcCalls.delete(message.messageId);
 
         if (message.success) {
-            pending.resolve(message.data);
+            // Deserialize the response data to restore Uint8Array instances
+            const deserializedData = deserializeValue(message.data);
+            pending.resolve(deserializedData);
         } else {
             pending.reject(new Error(message.errorMessage || 'RPC failed'));
         }
@@ -118,6 +180,8 @@ export const backendApi = {
     ping: () => sendRpcRequest('ping', []),
     openCellEditor: (params, rowId, colName, colTypes, options) => sendRpcRequest('openCellEditor', [params, rowId, colName, colTypes, options]),
     readWorkspaceFileUri: (uri) => sendRpcRequest('readWorkspaceFileUri', [uri]),
+    saveFile: (filename, data) => sendRpcRequest('saveFile', [filename, data]),
+    selectFile: () => sendRpcRequest('selectFile', []),
     triggerUndo: () => sendRpcRequest('triggerUndo', []),
     triggerRedo: () => sendRpcRequest('triggerRedo', [])
 };

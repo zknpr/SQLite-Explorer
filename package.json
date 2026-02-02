@@ -3,7 +3,7 @@
   "name": "sqlite-explorer",
   "displayName": "SQLite Explorer",
   "description": "A powerful SQLite database viewer and editor for VS Code",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "publisher": "zknpr",
   "license": "MIT",
   "repository": {
@@ -132,6 +132,15 @@
           ],
           "default": "inline",
           "markdownDescription": "Controls the action when double-clicking a cell.\n- `inline`: Start inline editing (default).\n- `modal`: Open detail preview modal.\n- `vscode`: Open in VS Code editor tab."
+        },
+        "sqliteExplorer.fileOperations": {
+          "type": "string",
+          "enum": [
+            "native",
+            "web"
+          ],
+          "default": "native",
+          "markdownDescription": "Controls how file operations (save/upload) behave in the blob inspector.\n- `native`: Use VS Code file dialogs (default).\n- `web`: Use browser download/upload (for web demo compatibility)."
         }
       }
     },

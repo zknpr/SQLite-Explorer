@@ -18,6 +18,72 @@ import { SupportsWriteMode, IsRemoteWorkspaceMode, DatabaseDocument, isAutoCommi
 
 import { buildMethodProxy, processProtocolMessage } from './core/rpc';
 
+/**
+ * Serialize a value for RPC transmission.
+ * Converts Uint8Array to a serializable format since postMessage converts typed arrays to {}.
+ * @param value - Value to serialize
+ * @returns Serialized value safe for postMessage
+ */
+function serializeValue(value: unknown): unknown {
+  // Handle Uint8Array by converting to marker object with array data
+  if (value instanceof Uint8Array) {
+    return { __type: 'Uint8Array', data: Array.from(value) };
+  }
+  // Handle ArrayBuffer views (like DataView)
+  if (ArrayBuffer.isView(value)) {
+    return { __type: 'Uint8Array', data: Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) };
+  }
+  // Recursively serialize object properties
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const obj = value as Record<string, unknown>;
+    const result: Record<string, unknown> = {};
+    for (const key of Object.keys(obj)) {
+      result[key] = serializeValue(obj[key]);
+    }
+    return result;
+  }
+  // Recursively serialize arrays
+  if (Array.isArray(value)) {
+    return value.map(serializeValue);
+  }
+  return value;
+}
+
+/**
+ * Deserialize a value from RPC transmission.
+ * Converts serialized Uint8Array markers back to actual Uint8Array instances.
+ * @param value - Value to deserialize
+ * @returns Deserialized value
+ */
+function deserializeValue(value: unknown): unknown {
+  // Check for our Uint8Array serialization marker
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const obj = value as Record<string, unknown>;
+    if (obj.__type === 'Uint8Array' && Array.isArray(obj.data)) {
+      return new Uint8Array(obj.data as number[]);
+    }
+    // Recursively deserialize object properties
+    const result: Record<string, unknown> = {};
+    for (const key of Object.keys(obj)) {
+      result[key] = deserializeValue(obj[key]);
+    }
+    return result;
+  }
+  if (Array.isArray(value)) {
+    return value.map(deserializeValue);
+  }
+  return value;
+}
+
+/**
+ * Deserialize an arguments array from RPC transmission.
+ * @param args - Arguments to deserialize
+ * @returns Deserialized arguments
+ */
+function deserializeArgs(args: unknown[]): unknown[] {
+  return args.map(deserializeValue);
+}
+
 // Webview functions interface - methods the webview exposes to extension
 interface WebviewBridgeFunctions {
   updateColorScheme(scheme: 'light' | 'dark'): Promise<void>;
@@ -198,19 +264,25 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
         const { messageId, targetMethod, payload } = message.content;
         const hostBridge = document.hostBridge as any;
 
+        // Deserialize payload to restore Uint8Array instances
+        const deserializedPayload = deserializeArgs(payload || []);
+
         // Check if method exists on hostBridge
         // This is safe because hostBridge is a class instance
         if (typeof hostBridge[targetMethod] === 'function') {
           const fn = hostBridge[targetMethod];
-          Promise.resolve(fn.apply(hostBridge, payload || []))
+          Promise.resolve(fn.apply(hostBridge, deserializedPayload))
             .then(result => {
+              // Serialize result to handle Uint8Array and other typed arrays
+              // which get converted to {} by postMessage JSON serialization
+              const serializedResult = serializeValue(result);
               webviewPanel.webview.postMessage({
                 channel: 'rpc',
                 content: {
                   kind: 'response',
                   messageId,
                   success: true,
-                  data: result
+                  data: serializedResult
                 }
               });
             })
@@ -244,12 +316,14 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
         const hostBridge = document.hostBridge as any;
         const fn = hostBridge[message.method];
         if (typeof fn === 'function') {
-          Promise.resolve(fn.apply(hostBridge, message.args))
+          Promise.resolve(fn.apply(hostBridge, deserializeArgs(message.args || [])))
             .then(result => {
+              // Serialize result to handle Uint8Array
+              const serializedResult = serializeValue(result);
               webviewPanel.webview.postMessage({
                 type: 'rpc-response',
                 id: message.id,
-                result
+                result: serializedResult
               });
             })
             .catch(err => {
