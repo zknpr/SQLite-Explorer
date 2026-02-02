@@ -31,3 +31,4 @@ Thumbs.db
 # Archives
 *.zip
 tmp/
+.worktrees/
