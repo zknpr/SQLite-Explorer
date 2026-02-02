@@ -126,6 +126,17 @@ const data = new Uint8Array(...);
 workerProxy.method(new Transfer(data, [data.buffer]));
 ```
 
+**Uint8Array Serialization:**
+`Uint8Array` cannot be directly serialized via `postMessage` (becomes `{}`). The RPC layer uses a marker format:
+```javascript
+// Serialized format (safe for JSON)
+{ __type: 'Uint8Array', data: [72, 101, 108, 108, 111] }
+
+// Security: Marker must have exactly 2 keys (__type, data) to prevent collision with user data
+```
+- Webview serializes in requests, deserializes in responses (`core/ui/modules/api.js`)
+- Extension host deserializes in requests, serializes in responses (`src/editorController.ts`)
+
 ## Security Standards
 
 ### Content Security Policy (CSP)
@@ -147,6 +158,9 @@ workerProxy.method(new Transfer(data, [data.buffer]));
 ### Build Commands
 
 ```bash
+# Install dependencies
+npm install
+
 # Full build (compiles extension + worker)
 node scripts/build.mjs
 
@@ -266,6 +280,14 @@ Database operations are wrapped in `LoggingDatabaseOperations` which writes all 
 
 The webview provides a UI to configure SQLite PRAGMAs (e.g., WAL mode, Foreign Keys) directly via `hostBridge.setPragma()`.
 
+### Blob Inspector
+
+The Blob Inspector (`core/ui/modules/blob-inspector.js`) provides preview and editing for BLOB data:
+- **Supported previews**: Images (PNG, JPEG, GIF, WebP), Audio (MP3, WAV, OGG, FLAC), Video (MP4, WebM, MOV), PDF, Text/JSON
+- **Hex view**: Raw binary inspection
+- **Download/Replace**: Save blobs to disk or upload new files
+- Uses `backendApi` (not `hostBridge` directly) to ensure proper Uint8Array serialization
+
 ## Configuration
 
 Settings in `package.json` → `contributes.configuration`:
@@ -293,7 +315,7 @@ ConfigurationSection = 'sqliteExplorer'
 ### Common Issues
 
 1. **RPC timeout**: Check that message format matches expected protocol
-2. **CSP errors**: Verify Content-Security-Policy in `sqliteEditorProvider.ts`
+2. **CSP errors**: Verify Content-Security-Policy in `editorController.ts`
 3. **Worker not loading**: Check worker path resolution in `webWorker.ts`
 4. **WASM not found**: Ensure `assets/sqlite3.wasm` exists after build
 

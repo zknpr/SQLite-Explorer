@@ -60,7 +60,9 @@ export class BlobInspector {
                 this.showFileInput();
             } else {
                 // Native mode: Use VS Code API to select file
-                // Use backendApi which properly serializes/deserializes Uint8Array
+                // NOTE: Use backendApi instead of this.hostBridge because backendApi has the
+                // proper serialize/deserialize layer for Uint8Array data. While hostBridge
+                // also uses RPC, backendApi ensures consistent handling across all callers.
                 const result = await backendApi.selectFile();
                 if (result) {
                     // Data should already be a Uint8Array after deserialization

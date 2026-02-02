@@ -21,6 +21,10 @@ import { buildMethodProxy, processProtocolMessage } from './core/rpc';
 /**
  * Serialize a value for RPC transmission.
  * Converts Uint8Array to a serializable format since postMessage converts typed arrays to {}.
+ *
+ * Note: Large Uint8Arrays (>10MB) will temporarily double memory usage during serialization.
+ * Consider using structured clone with transferables for large binary data if performance becomes an issue.
+ *
  * @param value - Value to serialize
  * @returns Serialized value safe for postMessage
  */
@@ -29,12 +33,13 @@ function serializeValue(value: unknown): unknown {
   if (value instanceof Uint8Array) {
     return { __type: 'Uint8Array', data: Array.from(value) };
   }
-  // Handle ArrayBuffer views (like DataView)
+  // Handle other ArrayBuffer views (like DataView)
   if (ArrayBuffer.isView(value)) {
     return { __type: 'Uint8Array', data: Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) };
   }
-  // Recursively serialize object properties
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
+  // Recursively serialize plain object properties only
+  // Using Object.prototype.toString for robust object detection (handles null prototype)
+  if (value && typeof value === 'object' && Object.prototype.toString.call(value) === '[object Object]') {
     const obj = value as Record<string, unknown>;
     const result: Record<string, unknown> = {};
     for (const key of Object.keys(obj)) {
@@ -52,6 +57,10 @@ function serializeValue(value: unknown): unknown {
 /**
  * Deserialize a value from RPC transmission.
  * Converts serialized Uint8Array markers back to actual Uint8Array instances.
+ *
+ * Security: Only deserializes objects that have exactly __type and data keys
+ * to prevent marker collision with user data.
+ *
  * @param value - Value to deserialize
  * @returns Deserialized value
  */
@@ -59,8 +68,12 @@ function deserializeValue(value: unknown): unknown {
   // Check for our Uint8Array serialization marker
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     const obj = value as Record<string, unknown>;
+    // Security: Validate marker has ONLY __type and data keys to prevent collision with user data
     if (obj.__type === 'Uint8Array' && Array.isArray(obj.data)) {
-      return new Uint8Array(obj.data as number[]);
+      const keys = Object.keys(obj);
+      if (keys.length === 2 && keys.includes('__type') && keys.includes('data')) {
+        return new Uint8Array(obj.data as number[]);
+      }
     }
     // Recursively deserialize object properties
     const result: Record<string, unknown> = {};

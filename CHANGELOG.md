@@ -21,9 +21,10 @@
 ### Technical
 
 - **RPC Serialization**: Added bidirectional `Uint8Array` serialization in the RPC layer:
-  - Extension host now serializes `Uint8Array` in responses before sending to webview
-  - Webview now deserializes `Uint8Array` markers in received responses
+  - Webview serializes `Uint8Array` in requests and deserializes in responses
+  - Extension host deserializes `Uint8Array` in requests and serializes in responses
   - Uses `{__type: 'Uint8Array', data: [...]}` marker format for safe JSON transmission
+  - Security: Marker objects must have exactly `__type` and `data` keys to prevent collision with user data
 
 ## 1.2.3
 

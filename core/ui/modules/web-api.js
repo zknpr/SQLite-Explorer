@@ -24,18 +24,28 @@ function getTargetOrigin() {
 /**
  * Serialize a value for RPC transmission.
  * Converts Uint8Array to a serializable format since JSON.stringify produces {} for typed arrays.
+ *
+ * Note: Large Uint8Arrays (>10MB) will temporarily double memory usage during serialization.
+ *
  * @param {*} value - Value to serialize
  * @returns {*} Serialized value
  */
 function serializeValue(value) {
+    // Handle Uint8Array by converting to marker object with array data
     if (value instanceof Uint8Array) {
-        // Convert to object with type marker and array data
         return { __type: 'Uint8Array', data: Array.from(value) };
     }
+    // Handle other ArrayBuffer views (like DataView)
+    if (ArrayBuffer.isView(value)) {
+        return { __type: 'Uint8Array', data: Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) };
+    }
+    // Recursively serialize arrays
     if (Array.isArray(value)) {
         return value.map(serializeValue);
     }
-    if (value && typeof value === 'object' && value.constructor === Object) {
+    // Recursively serialize plain object properties only
+    // Using Object.prototype.toString for robust object detection (handles null prototype)
+    if (value && typeof value === 'object' && Object.prototype.toString.call(value) === '[object Object]') {
         const result = {};
         for (const key of Object.keys(value)) {
             result[key] = serializeValue(value[key]);
@@ -57,14 +67,22 @@ function serializeArgs(args) {
 /**
  * Deserialize a value from RPC response.
  * Converts serialized Uint8Array markers back to actual Uint8Array instances.
+ *
+ * Security: Only deserializes objects that have exactly __type and data keys
+ * to prevent marker collision with user data.
+ *
  * @param {*} value - Value to deserialize
  * @returns {*} Deserialized value
  */
 function deserializeValue(value) {
     // Check for Uint8Array serialization marker
     if (value && typeof value === 'object' && !Array.isArray(value)) {
+        // Security: Validate marker has ONLY __type and data keys to prevent collision
         if (value.__type === 'Uint8Array' && Array.isArray(value.data)) {
-            return new Uint8Array(value.data);
+            const keys = Object.keys(value);
+            if (keys.length === 2 && keys.includes('__type') && keys.includes('data')) {
+                return new Uint8Array(value.data);
+            }
         }
         // Recursively deserialize object properties
         const result = {};
