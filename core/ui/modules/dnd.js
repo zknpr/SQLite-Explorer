@@ -2,10 +2,17 @@
  * Drag and Drop Support for BLOBs
  */
 import { backendApi } from './api.js';
-import { updateStatus } from './ui.js';
+import { updateStatus, showLoading } from './ui.js';
 import { state } from './state.js';
 import { getRowId, getRowDataOffset } from './data-utils.js';
 import { formatCellValueAsText } from './utils.js';
+import { renderDataGrid } from './grid.js';
+
+// Maximum blob size in bytes (50MB) to prevent UI freeze during Base64 encoding
+const MAX_BLOB_SIZE_BYTES = 50 * 1024 * 1024;
+
+// Track upload state to prevent concurrent uploads and allow proper cleanup
+let isUploading = false;
 
 export function initDragAndDrop() {
     const container = document.getElementById('gridContainer');
@@ -91,6 +98,14 @@ async function onDrop(e) {
 }
 
 async function handleFileUpload(cell, fileName, fileBlob) {
+    // Early size check before reading file
+    if (fileBlob.size > MAX_BLOB_SIZE_BYTES) {
+        const sizeMB = (fileBlob.size / (1024 * 1024)).toFixed(1);
+        const limitMB = (MAX_BLOB_SIZE_BYTES / (1024 * 1024)).toFixed(0);
+        updateStatus(`File too large (${sizeMB}MB). Maximum is ${limitMB}MB.`);
+        return;
+    }
+
     try {
         updateStatus(`Reading ${fileName}...`);
         const buffer = await readFileAsArrayBuffer(fileBlob);
@@ -127,6 +142,20 @@ async function handleUriUpload(cell, fileName, uri) {
 }
 
 async function uploadDataToCell(cell, fileName, uint8Array) {
+    // Prevent concurrent uploads
+    if (isUploading) {
+        updateStatus('Upload already in progress...');
+        return;
+    }
+
+    // Check file size limit to prevent UI freeze during Base64 encoding
+    if (uint8Array.byteLength > MAX_BLOB_SIZE_BYTES) {
+        const sizeMB = (uint8Array.byteLength / (1024 * 1024)).toFixed(1);
+        const limitMB = (MAX_BLOB_SIZE_BYTES / (1024 * 1024)).toFixed(0);
+        updateStatus(`File too large (${sizeMB}MB). Maximum is ${limitMB}MB.`);
+        return;
+    }
+
     const rowIdx = parseInt(cell.dataset.rowidx, 10);
     const colIdx = parseInt(cell.dataset.colidx, 10);
 
@@ -141,6 +170,10 @@ async function uploadDataToCell(cell, fileName, uint8Array) {
         updateStatus('Cannot upload to a view');
         return;
     }
+
+    // Set upload state to block other operations
+    isUploading = true;
+    state.isLoadingData = true;
 
     try {
         updateStatus(`Uploading ${fileName} (${formatBytes(uint8Array.byteLength)})...`);
@@ -164,7 +197,15 @@ async function uploadDataToCell(cell, fileName, uint8Array) {
         updateStatus(`Uploaded ${fileName}`);
     } catch (err) {
         console.error('Upload failed:', err);
-        updateStatus(`Upload failed: ${err.message}`);
+        let errorMessage = err.message || String(err);
+        if (errorMessage.includes('timeout')) {
+            errorMessage = 'Upload timed out. Try a smaller file.';
+        }
+        updateStatus(`Upload failed: ${errorMessage}`);
+    } finally {
+        // Always reset upload state to restore functionality
+        isUploading = false;
+        state.isLoadingData = false;
     }
 }
 
