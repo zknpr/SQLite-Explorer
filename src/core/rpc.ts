@@ -111,22 +111,42 @@ export function buildMethodProxy<T extends object>(
 ): T {
   const proxyObject: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
 
+  /**
+   * Recursively extract Transfer wrappers from a value.
+   * Returns the unwrapped value and collects transferables into the provided array.
+   */
+  const extractTransferables = (value: unknown, transferList: any[]): unknown => {
+    // Handle Transfer wrapper
+    if (value instanceof Transfer) {
+      if (value.transferables) {
+        transferList.push(...value.transferables);
+      }
+      return value.value;
+    }
+    // Recursively handle arrays
+    if (Array.isArray(value)) {
+      return value.map(item => extractTransferables(item, transferList));
+    }
+    // Recursively handle plain objects
+    if (value && typeof value === 'object' && Object.prototype.toString.call(value) === '[object Object]') {
+      const result: Record<string, unknown> = {};
+      for (const key of Object.keys(value as Record<string, unknown>)) {
+        result[key] = extractTransferables((value as Record<string, unknown>)[key], transferList);
+      }
+      return result;
+    }
+    // Return primitives and other types as-is
+    return value;
+  };
+
   for (const methodName of methodNames) {
     proxyObject[methodName] = (...parameters: unknown[]) => {
       return new Promise((resolve, reject) => {
         const correlationId = generateCorrelationId();
 
-        // Handle Transfer wrappers
+        // Handle Transfer wrappers (including nested ones)
         const transferList: any[] = [];
-        const cleanParameters = parameters.map(p => {
-          if (p instanceof Transfer) {
-            if (p.transferables) {
-                transferList.push(...p.transferables);
-            }
-            return p.value;
-          }
-          return p;
-        });
+        const cleanParameters = parameters.map(p => extractTransferables(p, transferList));
 
         // Set up expiration timer
         const expirationTimer = setTimeout(() => {

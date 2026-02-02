@@ -285,6 +285,15 @@ async function createWasmDatabaseConnection(
         );
 
         // Create operations facade that routes to worker
+        // Helper: Wrap Uint8Array values in Transfer for zero-copy transfer to worker
+        // This significantly improves performance for blob operations by avoiding buffer copying
+        const wrapForTransfer = (value: CellValue): CellValue => {
+          if (value instanceof Uint8Array && value.buffer) {
+            return new Transfer(value, [value.buffer]) as unknown as CellValue;
+          }
+          return value;
+        };
+
         const operationsFacade: DatabaseOperations = {
           engineKind: Promise.resolve('wasm'),
           executeQuery: (sql: string, params?: CellValue[]) =>
@@ -296,17 +305,29 @@ async function createWasmDatabaseConnection(
           flushChanges: async () => {},
           discardModifications: async () => {},
           updateCell: (table: string, rowId: string | number, column: string, value: CellValue) =>
-            workerProxy.updateCell(table, rowId, column, value),
-          insertRow: (table: string, data: Record<string, CellValue>) =>
-            workerProxy.insertRow(table, data),
+            workerProxy.updateCell(table, rowId, column, wrapForTransfer(value)),
+          insertRow: (table: string, data: Record<string, CellValue>) => {
+            // Wrap any Uint8Array values in the data object for zero-copy transfer
+            const wrappedData: Record<string, CellValue> = {};
+            for (const key of Object.keys(data)) {
+              wrappedData[key] = wrapForTransfer(data[key]);
+            }
+            return workerProxy.insertRow(table, wrappedData);
+          },
           deleteRows: (table: string, rowIds: (string | number)[]) =>
             workerProxy.deleteRows(table, rowIds),
           deleteColumns: (table: string, columns: string[]) =>
             workerProxy.deleteColumns(table, columns),
           createTable: (table: string, columns: ColumnDefinition[]) =>
             workerProxy.createTable(table, columns),
-          updateCellBatch: (table: string, updates: CellUpdate[]) =>
-            workerProxy.updateCellBatch(table, updates),
+          updateCellBatch: (table: string, updates: CellUpdate[]) => {
+            // Wrap any Uint8Array values in updates for zero-copy transfer
+            const wrappedUpdates = updates.map(u => ({
+              ...u,
+              value: wrapForTransfer(u.value)
+            }));
+            return workerProxy.updateCellBatch(table, wrappedUpdates);
+          },
           addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
             workerProxy.addColumn(table, column, type, defaultValue),
           fetchTableData: (table: string, options: any) =>
