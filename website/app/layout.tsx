@@ -54,7 +54,7 @@ export const metadata: Metadata = {
   authors: [{ name: "zknpr" }],
   creator: "zknpr",
   publisher: "zknpr",
-  metadataBase: new URL("https://vscode-sqlite-explorer.vercel.app/"),
+  metadataBase: new URL("https://sqlite-explorer.zknpr.xyz/"),
   icons: {
     icon: [
       { url: '/favicon.ico', sizes: 'any' },
@@ -72,7 +72,7 @@ export const metadata: Metadata = {
   openGraph: {
     type: "website",
     locale: "en_US",
-    url: "https://vscode-sqlite-explorer.vercel.app/",
+    url: "https://sqlite-explorer.zknpr.xyz/",
     siteName: "SQLite Explorer",
     title: "SQLite Explorer - VS Code Extension",
     description:
