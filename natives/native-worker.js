@@ -328,10 +328,20 @@ async function handleRequest(request) {
         // args: [sql: string, params?: any[]]
         const [sql, params] = args;
 
-        // Debug logging to help diagnose edit issues
-        console.error("[native-worker] DEBUG: run called");
+        // Debug logging - avoid JSON.stringify on binary data
+        console.error("[native-worker] Received request: run");
         console.error("[native-worker] DEBUG: sql =", sql);
-        console.error("[native-worker] DEBUG: params =", JSON.stringify(params));
+        // Log param types and sizes instead of full content to avoid huge logs for binary data
+        if (params && params.length > 0) {
+          const paramInfo = params.map((p, i) => {
+            if (p instanceof Uint8Array) return `[${i}]: Uint8Array(${p.length})`;
+            if (typeof p === 'string' && p.length > 100) return `[${i}]: string(${p.length} chars)`;
+            return `[${i}]: ${typeof p === 'object' ? JSON.stringify(p) : p}`;
+          });
+          console.error("[native-worker] DEBUG: params =", paramInfo.join(', '));
+        } else {
+          console.error("[native-worker] DEBUG: params = (none)");
+        }
 
         if (!db) throw new Error("Database not open");
 
@@ -364,7 +374,6 @@ async function handleRequest(request) {
                      }
 
                      if (row) {
-                         console.error("[native-worker] DEBUG: changes() query result:", JSON.stringify(row));
                          result = {
                              changes: row.c,
                              lastInsertRowId: row.id
@@ -382,7 +391,7 @@ async function handleRequest(request) {
             console.error("[native-worker] DEBUG: execution failed", e);
             throw e;
         }
-        console.error("[native-worker] DEBUG: returning result:", JSON.stringify(result));
+        console.error("[native-worker] DEBUG: run complete, changes:", result?.changes);
         break;
       }
 

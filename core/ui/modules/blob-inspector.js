@@ -150,7 +150,6 @@ export class BlobInspector {
             const sizeMB = uint8Array.length / (1024 * 1024);
 
             // Reject files larger than 50MB to prevent extension freeze
-            // Large blobs require synchronous Base64 encoding which blocks the UI thread
             const MAX_BLOB_SIZE_MB = 50;
             if (sizeMB > MAX_BLOB_SIZE_MB) {
                 throw new Error(`File too large (${sizeMB.toFixed(1)}MB). Maximum size is ${MAX_BLOB_SIZE_MB}MB to prevent freezing.`);

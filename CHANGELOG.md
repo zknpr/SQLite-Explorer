@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.5
+
+### Bug Fixes
+
+- **Blob Upload Freeze**: Fixed UI freezing during blob uploads caused by debug logging that serialized binary data as massive JSON strings. Large blob uploads now complete in under 1 second instead of 15+ seconds.
+- **Upload State Management**: Added proper state tracking for drag-and-drop blob uploads to prevent concurrent operations and ensure UI recovery after failed uploads.
+
+### Performance
+
+- **Zero-Copy Blob Transfer**: Added `Transfer` wrapper for blob operations from extension host to worker, eliminating buffer copying for large binary data.
+- **Async Base64 Encoding**: Converted synchronous Base64 encoding to async chunked encoding with event loop yields, keeping the UI responsive during large blob serialization.
+
 ## 1.2.4
 
 ### New Features

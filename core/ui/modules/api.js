@@ -17,14 +17,49 @@ const pendingRpcCalls = new Map();
 // ============================================================================
 
 /**
- * Encode Uint8Array to Base64 string.
- * Uses native btoa with chunked processing to avoid call stack limits on large arrays.
+ * Encode Uint8Array to Base64 string asynchronously.
+ * Uses chunked processing with microtask yields to prevent UI blocking.
+ *
+ * For small arrays (< 64KB), uses synchronous encoding for speed.
+ * For larger arrays, yields control between chunks to keep UI responsive.
+ *
+ * @param {Uint8Array} bytes - Binary data to encode
+ * @returns {Promise<string>} Base64 encoded string
+ */
+async function uint8ArrayToBase64Async(bytes) {
+    // For small arrays, synchronous encoding is fast enough and avoids async overhead
+    const SYNC_THRESHOLD = 65536; // 64KB
+    if (bytes.length <= SYNC_THRESHOLD) {
+        return uint8ArrayToBase64Sync(bytes);
+    }
+
+    // For larger arrays, use chunked async encoding to prevent UI freeze
+    // Process in chunks and yield to the event loop between chunks
+    const CHUNK_SIZE = 32768; // 32KB per chunk
+    let binary = '';
+
+    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+        const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
+        binary += String.fromCharCode.apply(null, chunk);
+
+        // Yield to event loop every few chunks to allow UI updates
+        // Using a microtask (Promise.resolve) for minimal delay while still allowing repaints
+        if (i > 0 && (i / CHUNK_SIZE) % 4 === 0) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+    }
+
+    return btoa(binary);
+}
+
+/**
+ * Synchronous Base64 encoding for small arrays.
+ * Used when async overhead isn't worth it.
  *
  * @param {Uint8Array} bytes - Binary data to encode
  * @returns {string} Base64 encoded string
  */
-function uint8ArrayToBase64(bytes) {
-    // Process in 32KB chunks to avoid call stack size limits with String.fromCharCode.apply
+function uint8ArrayToBase64Sync(bytes) {
     const CHUNK_SIZE = 32768;
     let binary = '';
     for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
@@ -54,35 +89,38 @@ function base64ToUint8Array(base64) {
 // ============================================================================
 
 /**
- * Serialize a value for RPC transmission.
+ * Serialize a value for RPC transmission (async version).
  * Converts Uint8Array to Base64 format for efficient transfer.
+ * Uses async encoding to prevent UI blocking for large binary data.
  *
  * Performance: Base64 encoding is ~33% larger than binary but significantly faster
  * and more compact than array-of-numbers JSON serialization (which was ~300% larger).
  *
  * @param {*} value - Value to serialize
- * @returns {*} Serialized value
+ * @returns {Promise<*>} Serialized value
  */
-function serializeValue(value) {
+async function serializeValueAsync(value) {
     // Handle Uint8Array by converting to Base64 marker object
     if (value instanceof Uint8Array) {
-        return { __type: 'Uint8Array', base64: uint8ArrayToBase64(value) };
+        const base64 = await uint8ArrayToBase64Async(value);
+        return { __type: 'Uint8Array', base64 };
     }
     // Handle other ArrayBuffer views (like DataView)
     if (ArrayBuffer.isView(value)) {
         const uint8 = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-        return { __type: 'Uint8Array', base64: uint8ArrayToBase64(uint8) };
+        const base64 = await uint8ArrayToBase64Async(uint8);
+        return { __type: 'Uint8Array', base64 };
     }
     // Recursively serialize arrays
     if (Array.isArray(value)) {
-        return value.map(serializeValue);
+        return Promise.all(value.map(serializeValueAsync));
     }
     // Recursively serialize plain object properties only
     // Using Object.prototype.toString for robust object detection (handles null prototype)
     if (value && typeof value === 'object' && Object.prototype.toString.call(value) === '[object Object]') {
         const result = {};
         for (const key of Object.keys(value)) {
-            result[key] = serializeValue(value[key]);
+            result[key] = await serializeValueAsync(value[key]);
         }
         return result;
     }
@@ -90,12 +128,12 @@ function serializeValue(value) {
 }
 
 /**
- * Serialize arguments array for RPC transmission.
+ * Serialize arguments array for RPC transmission (async version).
  * @param {Array} args - Arguments to serialize
- * @returns {Array} Serialized arguments
+ * @returns {Promise<Array>} Serialized arguments
  */
-function serializeArgs(args) {
-    return args.map(serializeValue);
+async function serializeArgsAsync(args) {
+    return Promise.all(args.map(serializeValueAsync));
 }
 
 /**
@@ -143,11 +181,16 @@ function deserializeValue(value) {
 
 /**
  * Send an RPC request to the extension host.
+ * Uses async serialization to prevent UI blocking during large blob encoding.
  */
-export function sendRpcRequest(method, args) {
-    return new Promise((resolve, reject) => {
-        const messageId = `rpc_${++rpcMessageId}_${Date.now()}`;
+export async function sendRpcRequest(method, args) {
+    const messageId = `rpc_${++rpcMessageId}_${Date.now()}`;
 
+    // Serialize args asynchronously to handle Uint8Array without blocking UI
+    // This is done before setting up the timeout to ensure encoding time is included
+    const serializedArgs = await serializeArgsAsync(args);
+
+    return new Promise((resolve, reject) => {
         const timeoutId = setTimeout(() => {
             if (pendingRpcCalls.has(messageId)) {
                 pendingRpcCalls.delete(messageId);
@@ -158,8 +201,6 @@ export function sendRpcRequest(method, args) {
         pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
 
         if (vscodeApi) {
-            // Serialize args to handle Uint8Array and other non-JSON-safe types
-            const serializedArgs = serializeArgs(args);
             vscodeApi.postMessage({
                 channel: 'rpc',
                 content: {
