@@ -174,13 +174,24 @@ async function createWasmDatabaseConnection(
   extensionUri: vsc.Uri,
   _reporter?: TelemetryReporter
 ): Promise<DatabaseConnectionBundle> {
-  // Determine worker script path based on environment
-  const workerScriptPath = import.meta.env.VSCODE_BROWSER_EXT
-    ? vsc.Uri.joinPath(extensionUri, 'out', 'worker-browser.js').toString()
-    : path.resolve(__dirname, './worker.cjs');
-
   // Spawn worker thread
-  const workerThread = new Worker(workerScriptPath);
+  // Browser: Web Workers can't load from vscode-vfs:// URIs directly.
+  // Use fetch to load the worker script as a Blob and create a Blob URL.
+  // Node.js: Use require path directly.
+  let workerThread: InstanceType<typeof Worker>;
+
+  if (import.meta.env.VSCODE_BROWSER_EXT) {
+    // Browser environment: fetch worker script and create Blob URL
+    const workerScriptUri = vsc.Uri.joinPath(extensionUri, 'out', 'worker-browser.js');
+    const workerContent = await vsc.workspace.fs.readFile(workerScriptUri);
+    const blob = new Blob([workerContent], { type: 'application/javascript' });
+    const blobUrl = URL.createObjectURL(blob);
+    workerThread = new Worker(blobUrl);
+  } else {
+    // Node.js environment: use file path directly
+    const workerScriptPath = path.resolve(__dirname, './worker.cjs');
+    workerThread = new Worker(workerScriptPath);
+  }
 
   // Create IPC proxy for worker communication
   // Browser Workers use addEventListener, Node.js Workers use .on()

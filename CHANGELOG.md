@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.7
+
+### Bug Fixes
+
+- **VS Code Web Worker Loading**: Fixed database files not loading in VS Code Web. Web Workers cannot load scripts from `vscode-vfs://` URIs directly. Now uses the VS Code workspace.fs API to read the worker script and creates a Blob URL for Worker instantiation.
+
 ## 1.2.6
 
 ### Bug Fixes
