@@ -116,7 +116,7 @@ const compileBrowserMain = () =>
     ...baseConfig,
     outfile: resolve(outDir, 'extension-browser.js'),
     platform: 'browser',
-    format: 'esm',
+    format: 'iife',
     mainFields: ['browser', 'module', 'main'],
     external: [
       ...baseConfig.external,

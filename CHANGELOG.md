@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.6
+
+### Bug Fixes
+
+- **VS Code Web Compatibility**: Fixed extension failing to load in VS Code Web (vscode.dev) with "Cannot use import statement outside a module" error. The browser extension bundle was incorrectly built with ESM format, which VS Code Web's extension host cannot evaluate. Changed build output to IIFE format for proper compatibility.
+
+### Performance
+
+- **Web Demo Static Generation**: Fixed slow page loads for the `/demo` page by enabling static generation. The page is now pre-rendered at build time and served from Vercel's edge CDN, eliminating serverless function cold starts. This dramatically improves TTFB and FCP, especially for users in distant regions (e.g., Japan saw 8.35s FCP reduced to sub-second loads).
+
 ## 1.2.5
 
 ### Bug Fixes
