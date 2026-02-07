@@ -3,7 +3,7 @@
  *
  * Constructs safe SQL queries for read operations.
  */
-import { escapeIdentifier } from './sql-utils';
+import { escapeIdentifier, escapeLikePattern } from './sql-utils';
 import { TableQueryOptions, TableCountOptions } from './types';
 
 /**
@@ -34,18 +34,18 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
   // Column filters
   for (const filter of filters) {
     if (filter.value) {
-      whereClauses.push(`${escapeIdentifier(filter.column)} LIKE ?`);
-      params.push(`%${filter.value}%`);
+      whereClauses.push(`${escapeIdentifier(filter.column)} LIKE ? ESCAPE '\\'`);
+      params.push(`%${escapeLikePattern(filter.value)}%`);
     }
   }
 
   // Global filter
   if (globalFilter) {
-    const globalConditions = columns.map(col => `${escapeIdentifier(col)} LIKE ?`).join(' OR ');
+    const globalConditions = columns.map(col => `${escapeIdentifier(col)} LIKE ? ESCAPE '\\'`).join(' OR ');
     whereClauses.push(`(${globalConditions})`);
     // Add param for each column in the OR clause
     for (let i = 0; i < columns.length; i++) {
-      params.push(`%${globalFilter}%`);
+      params.push(`%${escapeLikePattern(globalFilter)}%`);
     }
   }
 
@@ -82,17 +82,17 @@ export function buildCountQuery(table: string, options: TableCountOptions): { sq
   // Column filters
   for (const filter of filters) {
     if (filter.value) {
-      whereClauses.push(`${escapeIdentifier(filter.column)} LIKE ?`);
-      params.push(`%${filter.value}%`);
+      whereClauses.push(`${escapeIdentifier(filter.column)} LIKE ? ESCAPE '\\'`);
+      params.push(`%${escapeLikePattern(filter.value)}%`);
     }
   }
 
   // Global filter
   if (globalFilter && columns.length > 0) {
-    const globalConditions = columns.map(col => `${escapeIdentifier(col)} LIKE ?`).join(' OR ');
+    const globalConditions = columns.map(col => `${escapeIdentifier(col)} LIKE ? ESCAPE '\\'`).join(' OR ');
     whereClauses.push(`(${globalConditions})`);
     for (let i = 0; i < columns.length; i++) {
-      params.push(`%${globalFilter}%`);
+      params.push(`%${escapeLikePattern(globalFilter)}%`);
     }
   }
 

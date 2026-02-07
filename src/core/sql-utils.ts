@@ -74,3 +74,18 @@ export function cellValueToSql(value: CellValue | undefined): string {
   // Fallback for any other type
   return `'${String(value).replace(/'/g, "''")}'`;
 }
+
+/**
+ * Escapes characters that have special meaning in SQL LIKE clauses.
+ *
+ * @param pattern - The string to escape.
+ * @param escapeChar - The escape character to use (default: '\').
+ * @returns The escaped string.
+ */
+export function escapeLikePattern(pattern: string, escapeChar: string = '\\'): string {
+  // Escape the escape character itself, then the wildcards % and _
+  // We need to escape the escapeChar for use in regex
+  const escapedEscapeChar = escapeChar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const regex = new RegExp(`[${escapedEscapeChar}%_]`, 'g');
+  return pattern.replace(regex, (match) => escapeChar + match);
+}

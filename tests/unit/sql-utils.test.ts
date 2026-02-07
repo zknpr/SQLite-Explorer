@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { escapeIdentifier, cellValueToSql, validateSqlType } from '../../src/core/sql-utils';
+import { escapeIdentifier, cellValueToSql, validateSqlType, escapeLikePattern } from '../../src/core/sql-utils';
 
 describe('SQL Utils', () => {
   describe('validateSqlType', () => {
@@ -83,6 +83,26 @@ describe('SQL Utils', () => {
     it('should handle Uint8Array (blobs)', () => {
       const data = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
       assert.strictEqual(cellValueToSql(data), "X'deadbeef'");
+    });
+  });
+
+  describe('escapeLikePattern', () => {
+    it('should escape wildcards', () => {
+      assert.strictEqual(escapeLikePattern('foo%bar'), 'foo\\%bar');
+      assert.strictEqual(escapeLikePattern('foo_bar'), 'foo\\_bar');
+    });
+
+    it('should escape the escape character', () => {
+      assert.strictEqual(escapeLikePattern('foo\\bar'), 'foo\\\\bar');
+    });
+
+    it('should escape multiple occurrences', () => {
+      assert.strictEqual(escapeLikePattern('%_%'), '\\%\\_\\%');
+    });
+
+    it('should support custom escape character', () => {
+      assert.strictEqual(escapeLikePattern('foo%bar', '$'), 'foo$%bar');
+      assert.strictEqual(escapeLikePattern('foo$bar', '$'), 'foo$$bar');
     });
   });
 });

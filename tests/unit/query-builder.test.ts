@@ -20,8 +20,17 @@ describe('Query Builder', () => {
         filters: [{ column: 'name', value: 'John' }]
       };
       const { sql, params } = buildSelectQuery('users', options);
-      assert.strictEqual(sql, 'SELECT * FROM "users" WHERE "name" LIKE ?');
+      assert.strictEqual(sql, 'SELECT * FROM "users" WHERE "name" LIKE ? ESCAPE \'\\\'');
       assert.deepStrictEqual(params, ['%John%']);
+    });
+
+    it('should escape wildcards in filters', () => {
+      const options = {
+        filters: [{ column: 'name', value: '100%' }]
+      };
+      const { sql, params } = buildSelectQuery('users', options);
+      assert.strictEqual(sql, 'SELECT * FROM "users" WHERE "name" LIKE ? ESCAPE \'\\\'');
+      assert.deepStrictEqual(params, ['%100\\%%']);
     });
 
     it('should handle pagination and sorting', () => {
