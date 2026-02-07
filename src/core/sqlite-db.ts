@@ -850,11 +850,11 @@ export async function createDatabaseEngine(
           if (typeof require === 'function') {
               const fs = require('fs');
               // Validate size
-              const stats = fs.statSync(config.filePath);
+              const stats = await fs.promises.stat(config.filePath);
               if (config.maxSize > 0 && stats.size > config.maxSize) {
                   throw new Error('File too large');
               }
-              buffer = fs.readFileSync(config.filePath);
+              buffer = await fs.promises.readFile(config.filePath);
           }
       } catch (e) {
           console.error('Failed to read file in worker:', e);
