@@ -60,9 +60,13 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
             
 
-            // We assume the target is a table for editing purposes.
-            // Future improvement: verify if the target is a valid table or view in the schema.
-            const isTable = true;
+            // Verify if the target is a valid table or view in the schema.
+            const checkQuery = `SELECT 1 FROM sqlite_schema WHERE type IN ('table', 'view') AND name = ?`;
+            const checkResult = await document.databaseOperations.executeQuery(checkQuery, [table]);
+
+            if (!checkResult?.[0]?.rows?.length) {
+                throw vsc.FileSystemError.FileNotFound(uri);
+            }
 
             const colName = column;
             const rowIdNum = Number(rowId);
