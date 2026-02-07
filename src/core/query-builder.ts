@@ -31,23 +31,9 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
   const whereClauses: string[] = [];
   const params: any[] = [];
 
-  // Column filters
-  for (const filter of filters) {
-    if (filter.value) {
-      whereClauses.push(`${escapeIdentifier(filter.column)} LIKE ?`);
-      params.push(`%${filter.value}%`);
-    }
-  }
-
-  // Global filter
-  if (globalFilter) {
-    const globalConditions = columns.map(col => `${escapeIdentifier(col)} LIKE ?`).join(' OR ');
-    whereClauses.push(`(${globalConditions})`);
-    // Add param for each column in the OR clause
-    for (let i = 0; i < columns.length; i++) {
-      params.push(`%${globalFilter}%`);
-    }
-  }
+  const { conditions, params: filterParams } = buildFilterConditions(filters, globalFilter, columns);
+  whereClauses.push(...conditions);
+  params.push(...filterParams);
 
   if (whereClauses.length > 0) {
     sql += ` WHERE ${whereClauses.join(' AND ')}`;
@@ -79,26 +65,47 @@ export function buildCountQuery(table: string, options: TableCountOptions): { sq
   const whereClauses: string[] = [];
   const params: any[] = [];
 
-  // Column filters
-  for (const filter of filters) {
-    if (filter.value) {
-      whereClauses.push(`${escapeIdentifier(filter.column)} LIKE ?`);
-      params.push(`%${filter.value}%`);
-    }
-  }
-
-  // Global filter
-  if (globalFilter && columns.length > 0) {
-    const globalConditions = columns.map(col => `${escapeIdentifier(col)} LIKE ?`).join(' OR ');
-    whereClauses.push(`(${globalConditions})`);
-    for (let i = 0; i < columns.length; i++) {
-      params.push(`%${globalFilter}%`);
-    }
-  }
+  const { conditions, params: filterParams } = buildFilterConditions(filters, globalFilter, columns);
+  whereClauses.push(...conditions);
+  params.push(...filterParams);
 
   if (whereClauses.length > 0) {
     sql += ` WHERE ${whereClauses.join(' AND ')}`;
   }
 
   return { sql, params };
+}
+
+/**
+ * Helper to build WHERE conditions for column filters and global search.
+ */
+function buildFilterConditions(
+  filters: { column: string; value: string }[] = [],
+  globalFilter: string | undefined,
+  searchColumns: string[]
+): { conditions: string[]; params: any[] } {
+  const conditions: string[] = [];
+  const params: any[] = [];
+
+  // Column filters
+  for (const filter of filters) {
+    if (filter.value) {
+      conditions.push(`${escapeIdentifier(filter.column)} LIKE ?`);
+      params.push(`%${filter.value}%`);
+    }
+  }
+
+  // Global filter
+  if (globalFilter && searchColumns.length > 0) {
+    const globalConditions = searchColumns
+      .map(col => `${escapeIdentifier(col)} LIKE ?`)
+      .join(' OR ');
+
+    conditions.push(`(${globalConditions})`);
+    for (let i = 0; i < searchColumns.length; i++) {
+      params.push(`%${globalFilter}%`);
+    }
+  }
+
+  return { conditions, params };
 }
