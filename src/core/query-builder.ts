@@ -3,7 +3,7 @@
  *
  * Constructs safe SQL queries for read operations.
  */
-import { escapeIdentifier } from './sql-utils';
+import { escapeIdentifier, escapeLikePattern } from './sql-utils';
 import { TableQueryOptions, TableCountOptions } from './types';
 
 /**
@@ -90,20 +90,20 @@ function buildFilterConditions(
   // Column filters
   for (const filter of filters) {
     if (filter.value) {
-      conditions.push(`${escapeIdentifier(filter.column)} LIKE ?`);
-      params.push(`%${filter.value}%`);
+      conditions.push(`${escapeIdentifier(filter.column)} LIKE ? ESCAPE '\\'`);
+      params.push(`%${escapeLikePattern(filter.value)}%`);
     }
   }
 
   // Global filter
   if (globalFilter && searchColumns.length > 0) {
     const globalConditions = searchColumns
-      .map(col => `${escapeIdentifier(col)} LIKE ?`)
+      .map(col => `${escapeIdentifier(col)} LIKE ? ESCAPE '\\'`)
       .join(' OR ');
 
     conditions.push(`(${globalConditions})`);
     for (let i = 0; i < searchColumns.length; i++) {
-      params.push(`%${globalFilter}%`);
+      params.push(`%${escapeLikePattern(globalFilter)}%`);
     }
   }
 

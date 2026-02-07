@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { escapeIdentifier, cellValueToSql, validateSqlType } from '../../src/core/sql-utils';
+import { escapeIdentifier, cellValueToSql, validateSqlType, escapeLikePattern } from '../../src/core/sql-utils';
 
 describe('SQL Utils', () => {
   describe('validateSqlType', () => {
@@ -90,6 +90,25 @@ describe('SQL Utils', () => {
       const output = cellValueToSql(input);
       // 'foo\0bar' -> 66 6f 6f 00 62 61 72
       assert.strictEqual(output, "CAST(X'666f6f00626172' AS TEXT)");
+    });
+  });
+
+  describe('escapeLikePattern', () => {
+    it('should escape wildcards', () => {
+      assert.strictEqual(escapeLikePattern('foo%bar'), 'foo\\%bar');
+      assert.strictEqual(escapeLikePattern('foo_bar'), 'foo\\_bar');
+    });
+
+    it('should escape the escape character', () => {
+      assert.strictEqual(escapeLikePattern('foo\\bar'), 'foo\\\\bar');
+    });
+
+    it('should escape multiple wildcards', () => {
+      assert.strictEqual(escapeLikePattern('100%_test'), '100\\%\\_test');
+    });
+
+    it('should handle strings without wildcards', () => {
+      assert.strictEqual(escapeLikePattern('normal text'), 'normal text');
     });
   });
 });

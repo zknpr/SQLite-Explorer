@@ -18,7 +18,11 @@ export function cancelTokenToAbortSignal<T extends CancellationToken | null | un
   if (token.isCancellationRequested) {
     controller.abort();
   } else {
-    token.onCancellationRequested(() => controller.abort());
+    // Store the disposable and clean it up after abort to prevent memory leak
+    const disposable = token.onCancellationRequested(() => {
+      controller.abort();
+      disposable.dispose();
+    });
   }
   return controller.signal as any;
 }

@@ -20,8 +20,17 @@ describe('Query Builder', () => {
         filters: [{ column: 'name', value: 'John' }]
       };
       const { sql, params } = buildSelectQuery('users', options);
-      assert.strictEqual(sql, 'SELECT * FROM "users" WHERE "name" LIKE ?');
+      assert.strictEqual(sql, 'SELECT * FROM "users" WHERE "name" LIKE ? ESCAPE \'\\\'');
       assert.deepStrictEqual(params, ['%John%']);
+    });
+
+    it('should escape wildcards in filters', () => {
+      const options = {
+        filters: [{ column: 'name', value: '100%' }]
+      };
+      const { sql, params } = buildSelectQuery('users', options);
+      assert.strictEqual(sql, 'SELECT * FROM "users" WHERE "name" LIKE ? ESCAPE \'\\\'');
+      assert.deepStrictEqual(params, ['%100\\%%']);
     });
 
     it('should handle pagination and sorting', () => {
@@ -41,7 +50,7 @@ describe('Query Builder', () => {
         globalFilter: 'test'
       };
       const { sql, params } = buildSelectQuery('products', options);
-      assert.strictEqual(sql, 'SELECT "name", "description" FROM "products" WHERE ("name" LIKE ? OR "description" LIKE ?)');
+      assert.strictEqual(sql, 'SELECT "name", "description" FROM "products" WHERE ("name" LIKE ? ESCAPE \'\\\' OR "description" LIKE ? ESCAPE \'\\\')');
       assert.deepStrictEqual(params, ['%test%', '%test%']);
     });
 
@@ -51,7 +60,7 @@ describe('Query Builder', () => {
         globalFilter: 'test'
       };
       const { sql, params } = buildSelectQuery('products', options);
-      assert.strictEqual(sql, 'SELECT * FROM "products" WHERE ("*" LIKE ?)');
+      assert.strictEqual(sql, 'SELECT * FROM "products" WHERE ("*" LIKE ? ESCAPE \'\\\')');
       assert.deepStrictEqual(params, ['%test%']);
     });
 
@@ -80,7 +89,7 @@ describe('Query Builder', () => {
         globalFilter: 'test'
       };
       const { sql, params } = buildCountQuery('products', options);
-      assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM "products" WHERE ("name" LIKE ? OR "description" LIKE ?)');
+      assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM "products" WHERE ("name" LIKE ? ESCAPE \'\\\' OR "description" LIKE ? ESCAPE \'\\\')');
       assert.deepStrictEqual(params, ['%test%', '%test%']);
     });
 
