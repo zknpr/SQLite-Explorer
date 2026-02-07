@@ -10,7 +10,7 @@
  */
 
 // Determine runtime environment and export appropriate crypto implementation
-const isBrowserRuntime = import.meta.env.VSCODE_BROWSER_EXT;
+const isBrowserRuntime = import.meta.env?.VSCODE_BROWSER_EXT;
 
 // In browser: use native Web Crypto API
 // In Node.js: use the webcrypto module from Node's crypto package
