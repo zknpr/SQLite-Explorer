@@ -623,6 +623,11 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
   /**
    * Fetch table data using options.
+   *
+   * NOTE: This method intentionally bypasses the query timeout mechanism.
+   * Unlike raw executeQuery(), fetchTableData() always includes pagination
+   * (LIMIT/OFFSET) which naturally bounds the result size and execution time.
+   * The query builder enforces these limits, making timeout unnecessary here.
    */
   async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
     const { sql, params } = buildSelectQuery(table, options);
@@ -874,7 +879,7 @@ export async function createDatabaseEngine(
     wasmInstance = new SqlJsModule.Database();
   }
 
-  const engine = new WasmDatabaseEngine(wasmInstance);
+  const engine = new WasmDatabaseEngine(wasmInstance, config.queryTimeout);
 
   return {
     operations: engine,

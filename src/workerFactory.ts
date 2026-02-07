@@ -65,6 +65,19 @@ export function getMaximumFileSizeBytes(): number {
   return sizeMB * (2 ** 20);
 }
 
+/** Default query timeout in milliseconds (30 seconds) */
+const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+
+/**
+ * Retrieve query timeout from user configuration.
+ *
+ * @returns Query timeout in milliseconds
+ */
+export function getQueryTimeout(): number {
+  const config = vsc.workspace.getConfiguration(ConfigurationSection);
+  return config.get<number>('queryTimeout', DEFAULT_QUERY_TIMEOUT_MS);
+}
+
 // ============================================================================
 // Worker Interface Types
 // ============================================================================
@@ -280,7 +293,8 @@ async function createWasmDatabaseConnection(
           maxSize: getMaximumFileSizeBytes(),
           resourceMap: {},
           wasmBinary: wasmContent,
-          readOnlyMode: forceReadOnly ?? false
+          readOnlyMode: forceReadOnly ?? false,
+          queryTimeout: getQueryTimeout()
         };
 
         // Initialize database in worker

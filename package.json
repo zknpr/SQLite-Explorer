@@ -141,6 +141,20 @@
           ],
           "default": "native",
           "markdownDescription": "Controls how file operations (save/upload) behave in the blob inspector.\n- `native`: Use VS Code file dialogs (default).\n- `web`: Use browser download/upload (for web demo compatibility)."
+        },
+        "sqliteExplorer.queryTimeout": {
+          "type": "number",
+          "minimum": 1000,
+          "maximum": 600000,
+          "default": 30000,
+          "markdownDescription": "Maximum time in milliseconds for query execution before timeout. Prevents runaway queries from freezing the extension. Set to a higher value for complex queries on large databases."
+        },
+        "sqliteExplorer.maxUndoMemory": {
+          "type": "number",
+          "minimum": 1048576,
+          "maximum": 536870912,
+          "default": 52428800,
+          "markdownDescription": "Maximum memory in bytes for undo/redo history. When exceeded, oldest entries are discarded. Default is 50MB (52428800 bytes)."
         }
       }
     },

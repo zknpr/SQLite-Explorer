@@ -141,7 +141,7 @@ workerProxy.method(new Transfer(data, [data.buffer]));
 
 ### Content Security Policy (CSP)
 - **Scripts**: Strict nonce-based policy. No `'unsafe-inline'` allowed.
-- **Styles**: `'unsafe-inline'` allowed (currently required for dynamic grid layout/resizing).
+- **Styles**: No `'unsafe-inline'` allowed. Dynamic inline styles are applied via CSSOM (`element.style.prop = ...`) which is permitted by CSP with `'self'`.
 - **Isolation**: Webview communicates only via RPC.
 
 ### Cross-Site Scripting (XSS) Prevention

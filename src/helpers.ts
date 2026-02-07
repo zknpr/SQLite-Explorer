@@ -129,7 +129,6 @@ export const cspUtil = {
   none: "'none'",
   data: 'data:',
   blob: 'blob:',
-  inlineStyle: "'unsafe-inline'",
   unsafeEval: "'unsafe-eval'",
   wasmUnsafeEval: "'wasm-unsafe-eval'",
 

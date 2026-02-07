@@ -24,6 +24,9 @@
 - **Type Safety**: Replaced `any[]` with proper `Transferable[]` types throughout the RPC layer, removing `@ts-ignore` comments.
 - **Memory Leak Fix**: Fixed listener leak in `cancelTokenToAbortSignal` by properly disposing the cancellation listener after abort.
 - **Table Existence Validation**: Virtual file system now validates table/view existence before attempting cell reads.
+- **Configurable Query Timeout**: Added `sqliteExplorer.queryTimeout` setting (default 30s) to control query execution timeout.
+- **Configurable Undo Memory**: Added `sqliteExplorer.maxUndoMemory` setting (default 50MB) to control undo/redo history memory limit.
+- **Full CSP Compliance**: Removed all `'unsafe-inline'` usage from both scripts and styles. Dynamic styles now use CSSOM which is CSP-compliant.
 
 ### Refactoring
 
