@@ -12,7 +12,7 @@ import { BlobInspector } from './blob-inspector.js';
 let blobInspector;
 
 export function initEdit() {
-    blobInspector = new BlobInspector(backendApi);
+    blobInspector = new BlobInspector();
 
     // Cell Preview Modal
     document.getElementById('btnCloseCellPreview')?.addEventListener('click', closeCellPreview);

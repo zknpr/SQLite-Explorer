@@ -5,8 +5,7 @@ import { updateStatus } from './ui.js';
 import { validateRowId } from './utils.js';
 
 export class BlobInspector {
-    constructor(hostBridge) {
-        this.hostBridge = hostBridge;
+    constructor() {
         this.currentObjectUrl = null;
         this.modal = document.getElementById('blob-inspector-modal');
         this.previewContainer = document.getElementById('tab-preview');
@@ -86,9 +85,8 @@ export class BlobInspector {
                 this.showFileInput();
             } else {
                 // Native mode: Use VS Code API to select file
-                // NOTE: Use backendApi instead of this.hostBridge because backendApi has the
-                // proper serialize/deserialize layer for Uint8Array data. While hostBridge
-                // also uses RPC, backendApi ensures consistent handling across all callers.
+                // NOTE: Use backendApi directly because it has the proper serialize/deserialize
+                // layer for Uint8Array data, ensuring consistent handling across all callers.
                 const result = await backendApi.selectFile();
                 if (result) {
                     // Data should already be a Uint8Array after deserialization
