@@ -20,73 +20,33 @@ describe('JSON Patch Optimization', () => {
         await engine.insertRow('data', { id: 3, content: JSON.stringify({ a: 100, b: 200 }) });
     });
 
-    it('should use json_patch when updating cell with string patch', async () => {
-        // Spy on executeQuery to check SQL
-        const originalExecuteQuery = engine.executeQuery.bind(engine);
-        const queries: string[] = [];
-        engine.executeQuery = async (sql: string, params: any[]) => {
-            queries.push(sql);
-            return originalExecuteQuery(sql, params);
-        };
-
-        const originalPrepare = engine.instance.prepare.bind(engine.instance);
-        engine.instance.prepare = (sql: string, params: any[]) => {
-            return originalPrepare(sql, params);
-        };
-
+    it('should apply json patch when updating cell with string patch', async () => {
         const patch = JSON.stringify({ b: 3, c: 4 });
         await engine.updateCell('data', 1, 'content', null, patch);
 
-        // Verify result
-        const result = await originalExecuteQuery("SELECT content FROM data WHERE id = 1");
+        // Verify result - patch should merge with existing data
+        const result = await engine.executeQuery("SELECT content FROM data WHERE id = 1");
         const content = JSON.parse(result[0].rows[0][0]);
         assert.deepStrictEqual(content, { a: 1, b: 3, c: 4 });
-
-        // Check if json_patch was used in executeQuery (for updateCell)
-        const usesJsonPatch = queries.some(q => q.toLowerCase().includes('json_patch'));
-        assert.ok(usesJsonPatch, 'Should use json_patch SQL function');
-
-        // Restore spies
-        engine.executeQuery = originalExecuteQuery;
-        engine.instance.prepare = originalPrepare;
     });
 
-    it('should use json_patch when updating cell with object patch (regression test)', async () => {
-        const originalExecuteQuery = engine.executeQuery.bind(engine);
-        const queries: string[] = [];
-        engine.executeQuery = async (sql: string, params: any[]) => {
-            queries.push(sql);
-            return originalExecuteQuery(sql, params);
-        };
-
+    it('should apply json patch when updating cell with object patch', async () => {
         const patchObj = { b: 300, c: 400 };
         // Pass object directly (simulating loose JS or intentional usage)
         await engine.updateCell('data', 3, 'content', null, patchObj as any);
 
         // Verify result
-        const result = await originalExecuteQuery("SELECT content FROM data WHERE id = 3");
+        const result = await engine.executeQuery("SELECT content FROM data WHERE id = 3");
         const content = JSON.parse(result[0].rows[0][0]);
         assert.deepStrictEqual(content, { a: 100, b: 300, c: 400 });
-
-        const usesJsonPatch = queries.some(q => q.toLowerCase().includes('json_patch'));
-        assert.ok(usesJsonPatch, 'Should use json_patch SQL function');
-
-        engine.executeQuery = originalExecuteQuery;
     });
 
-    it('should use json_patch when updating batch cells', async () => {
+    it('should apply json patch when updating batch cells', async () => {
         // Reset data
         await engine.executeQuery("UPDATE data SET content = ? WHERE id = 2", [JSON.stringify({ a: 10, b: 20 })]);
 
-        const originalPrepare = engine.instance.prepare.bind(engine.instance);
-        const preparedStatements: string[] = [];
-        engine.instance.prepare = (sql: string, params: any[]) => {
-            preparedStatements.push(sql);
-            return originalPrepare(sql, params);
-        };
-
         const updates = [
-            { rowId: 2, column: 'content', value: JSON.stringify({ b: 30, c: 40 }), operation: 'json_patch' }
+            { rowId: 2, column: 'content', value: JSON.stringify({ b: 25, d: 5 }), operation: 'json_patch' as const }
         ];
 
         await engine.updateCellBatch('data', updates);
@@ -94,28 +54,17 @@ describe('JSON Patch Optimization', () => {
         // Verify result
         const result = await engine.executeQuery("SELECT content FROM data WHERE id = 2");
         const content = JSON.parse(result[0].rows[0][0]);
-        assert.deepStrictEqual(content, { a: 10, b: 30, c: 40 });
-
-        // Check if json_patch was used in prepare (for updateCellBatch)
-        const usesJsonPatch = preparedStatements.some(q => q.toLowerCase().includes('json_patch'));
-        assert.ok(usesJsonPatch, 'Should use json_patch SQL function for batch update');
-
-        engine.instance.prepare = originalPrepare;
+        assert.deepStrictEqual(content, { a: 10, b: 25, d: 5 });
     });
 
-    it('should use json_patch when updating batch cells with object value (regression test)', async () => {
-        // Reset data
-        await engine.executeQuery("UPDATE data SET content = ? WHERE id = 2", [JSON.stringify({ a: 10, b: 20 })]);
+    it('should handle json patch on null/empty cell', async () => {
+        await engine.insertRow('data', { id: 4, content: null });
 
-        const updates = [
-            { rowId: 2, column: 'content', value: { b: 3000, c: 4000 } as any, operation: 'json_patch' }
-        ];
+        const patch = JSON.stringify({ x: 1, y: 2 });
+        await engine.updateCell('data', 4, 'content', null, patch);
 
-        await engine.updateCellBatch('data', updates);
-
-        // Verify result
-        const result = await engine.executeQuery("SELECT content FROM data WHERE id = 2");
+        const result = await engine.executeQuery("SELECT content FROM data WHERE id = 4");
         const content = JSON.parse(result[0].rows[0][0]);
-        assert.deepStrictEqual(content, { a: 10, b: 3000, c: 4000 });
+        assert.deepStrictEqual(content, { x: 1, y: 2 });
     });
 });

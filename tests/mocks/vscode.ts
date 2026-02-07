@@ -45,6 +45,40 @@ export class Uri {
     }
 }
 
+// Mock env object for IsVSCode check
+export const env = {
+    uriScheme: 'vscode',
+    appName: 'Visual Studio Code',
+    appRoot: '/app',
+    language: 'en',
+    machineId: 'test-machine-id',
+    sessionId: 'test-session-id',
+    isNewAppInstall: false,
+    isTelemetryEnabled: false,
+    remoteName: undefined,
+    shell: '/bin/bash',
+    uiKind: 1, // Desktop
+    clipboard: {
+        readText: async () => '',
+        writeText: async (_text: string) => {}
+    },
+    openExternal: async (_uri: Uri) => true
+};
+
+// Mock UIKind enum
+export enum UIKind {
+    Desktop = 1,
+    Web = 2
+}
+
+// Mock ColorThemeKind enum
+export enum ColorThemeKind {
+    Light = 1,
+    Dark = 2,
+    HighContrast = 3,
+    HighContrastLight = 4
+}
+
 export class FileSystemError extends Error {
     code: string;
     constructor(message: string, code: string) {

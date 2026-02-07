@@ -82,9 +82,16 @@ describe('SQLiteFileSystemProvider', () => {
         });
 
         it('should read regular string cell', async () => {
+            // The virtualFileSystem first checks if table exists, then queries the cell
+            let queryCount = 0;
             const dbOps = {
                 executeQuery: mock.fn(async (sql: string, params: any[]) => {
-                    // Check query structure
+                    queryCount++;
+                    if (sql.includes('sqlite_schema')) {
+                        // Table existence check - return that table exists
+                        return [{ rows: [['users']] }];
+                    }
+                    // Cell query
                     assert.match(sql, /SELECT "name" FROM "users" WHERE rowid = \?/);
                     assert.deepStrictEqual(params, [1]);
                     return [{ rows: [['Alice']] }];
@@ -101,7 +108,12 @@ describe('SQLiteFileSystemProvider', () => {
 
         it('should handle null values as empty content', async () => {
             const dbOps = {
-                executeQuery: mock.fn(async () => [{ rows: [[null]] }])
+                executeQuery: mock.fn(async (sql: string) => {
+                    if (sql.includes('sqlite_schema')) {
+                        return [{ rows: [['users']] }];
+                    }
+                    return [{ rows: [[null]] }];
+                })
             };
             setupMockDocument(docKey, dbOps);
 
@@ -114,7 +126,12 @@ describe('SQLiteFileSystemProvider', () => {
         it('should return Uint8Array (BLOB) as is', async () => {
             const blob = new Uint8Array([1, 2, 3, 4]);
             const dbOps = {
-                executeQuery: mock.fn(async () => [{ rows: [[blob]] }])
+                executeQuery: mock.fn(async (sql: string) => {
+                    if (sql.includes('sqlite_schema')) {
+                        return [{ rows: [['users']] }];
+                    }
+                    return [{ rows: [[blob]] }];
+                })
             };
             setupMockDocument(docKey, dbOps);
 
@@ -124,10 +141,19 @@ describe('SQLiteFileSystemProvider', () => {
             assert.deepStrictEqual(content, blob);
         });
 
-        it('should return invalid row ID message', async () => {
-            setupMockDocument(docKey);
+        it('should return invalid row ID message for non-numeric row ID', async () => {
+            const dbOps = {
+                executeQuery: mock.fn(async (sql: string) => {
+                    if (sql.includes('sqlite_schema')) {
+                        return [{ rows: [['users']] }];
+                    }
+                    return [{ rows: [] }];
+                })
+            };
+            setupMockDocument(docKey, dbOps);
             const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/invalid-id/col.txt`);
 
+            // The code returns a message instead of throwing for invalid row IDs
             const content = await provider.readFile(uri);
             const text = new TextDecoder().decode(content);
 
