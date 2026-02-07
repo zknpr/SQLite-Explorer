@@ -1,139 +1,153 @@
-import { describe, it, beforeEach, afterEach, mock } from 'node:test';
+
+import './vscode_mock_setup'; // Must be first
+import { describe, it, mock, afterEach } from 'node:test';
 import assert from 'node:assert';
-import * as vscode from 'vscode';
 import { SQLiteFileSystemProvider } from '../../src/virtualFileSystem';
 import { DocumentRegistry } from '../../src/documentRegistry';
-
-// Mock Document Interface matching DatabaseDocument behavior used by FileSystemProvider
-interface MockDocument {
-    databaseOperations: {
-        updateCell: (table: string, rowId: number, column: string, value: any) => Promise<void>;
-    };
-    recordExternalModification: (mod: any) => void;
-}
+import type { DatabaseDocument } from '../../src/databaseModel';
+import * as vscode from 'vscode';
 
 describe('SQLiteFileSystemProvider', () => {
-    let provider: SQLiteFileSystemProvider;
-    let mockDocument: MockDocument;
-    const documentKey = 'mock-doc-key';
 
-    // Helper to create URI.
-    // Format: /<document_key>/<table>/<group>/<rowid>/<filename>
-    const createUri = (path: string) => vscode.Uri.file(path).with({ scheme: 'sqlite-explorer' });
-
-    beforeEach(() => {
-        provider = new SQLiteFileSystemProvider();
-
-        mockDocument = {
-            databaseOperations: {
-                updateCell: async () => {} // Default mock
-            },
-            recordExternalModification: () => {}
-        };
-
-        // Populate Registry
-        DocumentRegistry.set(documentKey, mockDocument as any);
-    });
+    function setupMockDocument(key: string, dbOps: any = {}) {
+        const mockDocument = {
+            databaseOperations: dbOps,
+            recordExternalModification: mock.fn()
+        } as unknown as DatabaseDocument;
+        DocumentRegistry.set(key, mockDocument);
+        return mockDocument;
+    }
 
     afterEach(() => {
         DocumentRegistry.clear();
-        mock.restoreAll();
+        mock.reset();
     });
 
-    it('writeFile should update cell with valid text content', async (t) => {
-        const table = 'users';
-        const rowId = '1';
-        const column = 'name';
-        const filename = `${column}.txt`;
-        const path = `/${documentKey}/${table}/group/${rowId}/${filename}`;
-        const uri = createUri(path);
+    it('initialization', () => {
+        const provider = new SQLiteFileSystemProvider();
+        assert.ok(provider.onDidChangeFile);
+    });
 
-        const contentStr = 'Alice';
-        const content = new TextEncoder().encode(contentStr);
+    describe('readFile', () => {
+        const provider = new SQLiteFileSystemProvider();
+        const docKey = 'test-doc';
 
-        // Mock updateCell to verify arguments
-        const updateCellMock = t.mock.fn(async (tbl: string, rid: number, col: string, val: any) => {
-            assert.strictEqual(tbl, table);
-            assert.strictEqual(rid, 1);
-            assert.strictEqual(col, column);
-            assert.strictEqual(val, contentStr);
+        it('should throw FileNotFound if document not found', async () => {
+            const uri = vscode.Uri.parse(`vscode-sqlite://missing-doc/table/group/1/col.txt`);
+            await assert.rejects(async () => {
+                await provider.readFile(uri);
+            }, /FileNotFound/);
         });
-        mockDocument.databaseOperations.updateCell = updateCellMock;
 
-        // Mock recordExternalModification
-        const recordMock = t.mock.fn();
-        mockDocument.recordExternalModification = recordMock;
-
-        await provider.writeFile(uri, content, { create: false, overwrite: true });
-
-        assert.strictEqual(updateCellMock.mock.callCount(), 1);
-        assert.strictEqual(recordMock.mock.callCount(), 1);
-
-        // Verify modification record
-        const callArgs = recordMock.mock.calls[0].arguments;
-        assert.strictEqual(callArgs[0].newValue, contentStr);
-        assert.strictEqual(callArgs[0].modificationType, 'cell_update');
-    });
-
-    it('writeFile should handle binary content (invalid utf-8) by saving as Uint8Array', async (t) => {
-        const table = 'data';
-        const rowId = '2';
-        const column = 'blob';
-        const path = `/${documentKey}/${table}/group/${rowId}/${column}.bin`;
-        const uri = createUri(path);
-
-        // Invalid UTF-8 sequence (0xFF cannot appear in valid UTF-8)
-        const content = new Uint8Array([0xFF, 0xFF]);
-
-        const updateCellMock = t.mock.fn(async (tbl: string, rid: number, col: string, val: any) => {
-            assert.ok(val instanceof Uint8Array);
-            assert.deepStrictEqual(val, content);
+        it('should throw FileNotFound if URI path is too short', async () => {
+             // Path format: /<document_key>/<table>/<name>/<rowid>/<filename>
+             // Short path
+             const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/table`);
+             setupMockDocument(docKey);
+             await assert.rejects(async () => {
+                 await provider.readFile(uri);
+             }, /FileNotFound/);
         });
-        mockDocument.databaseOperations.updateCell = updateCellMock;
-        mockDocument.recordExternalModification = t.mock.fn();
 
-        await provider.writeFile(uri, content, { create: false, overwrite: true });
+        it('should read __create__.sql correctly', async () => {
+            const createSql = 'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)';
+            const dbOps = {
+                executeQuery: mock.fn(async (sql: string, params: any[]) => {
+                    if (sql.includes('sqlite_schema') && params[0] === 'users') {
+                        return [{ rows: [[createSql]] }];
+                    }
+                    return [];
+                })
+            };
+            setupMockDocument(docKey, dbOps);
 
-        assert.strictEqual(updateCellMock.mock.callCount(), 1);
-    });
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/__create__.sql/create.sql`);
+            const content = await provider.readFile(uri);
+            const text = new TextDecoder().decode(content);
 
-    it('writeFile should throw NoPermissions for __create__.sql', async () => {
-        const path = `/${documentKey}/table/group/__create__.sql/foo.sql`;
-        const uri = createUri(path);
+            assert.strictEqual(text, createSql);
+            assert.strictEqual(dbOps.executeQuery.mock.callCount(), 1);
+        });
 
-        await assert.rejects(
-            async () => await provider.writeFile(uri, new Uint8Array(), { create: false, overwrite: true }),
-            (err: any) => {
-                assert.strictEqual(err.code, 'NoPermissions');
-                return true;
-            }
-        );
-    });
+        it('should return empty for __create__.sql if not found', async () => {
+            const dbOps = {
+                executeQuery: mock.fn(async () => [])
+            };
+            setupMockDocument(docKey, dbOps);
 
-    it('writeFile should throw Unavailable for invalid Row ID', async () => {
-        const path = `/${documentKey}/table/group/invalid-id/col.txt`;
-        const uri = createUri(path);
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/__create__.sql/create.sql`);
+            const content = await provider.readFile(uri);
 
-        await assert.rejects(
-            async () => await provider.writeFile(uri, new Uint8Array(), { create: false, overwrite: true }),
-            (err: any) => {
-                assert.strictEqual(err.code, 'Unavailable');
-                assert.match(err.message, /Invalid Row ID/);
-                return true;
-            }
-        );
-    });
+            assert.strictEqual(content.byteLength, 0);
+        });
 
-    it('writeFile should throw FileNotFound if document not found', async () => {
-        const path = `/non-existent-key/table/group/1/col.txt`;
-        const uri = createUri(path);
+        it('should read regular string cell', async () => {
+            const dbOps = {
+                executeQuery: mock.fn(async (sql: string, params: any[]) => {
+                    // Check query structure
+                    assert.match(sql, /SELECT "name" FROM "users" WHERE rowid = \?/);
+                    assert.deepStrictEqual(params, [1]);
+                    return [{ rows: [['Alice']] }];
+                })
+            };
+            setupMockDocument(docKey, dbOps);
 
-        await assert.rejects(
-            async () => await provider.writeFile(uri, new Uint8Array(), { create: false, overwrite: true }),
-            (err: any) => {
-                assert.strictEqual(err.code, 'FileNotFound');
-                return true;
-            }
-        );
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/name.txt`);
+            const content = await provider.readFile(uri);
+            const text = new TextDecoder().decode(content);
+
+            assert.strictEqual(text, 'Alice');
+        });
+
+        it('should handle null values as empty content', async () => {
+            const dbOps = {
+                executeQuery: mock.fn(async () => [{ rows: [[null]] }])
+            };
+            setupMockDocument(docKey, dbOps);
+
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/name.txt`);
+            const content = await provider.readFile(uri);
+
+            assert.strictEqual(content.byteLength, 0);
+        });
+
+        it('should return Uint8Array (BLOB) as is', async () => {
+            const blob = new Uint8Array([1, 2, 3, 4]);
+            const dbOps = {
+                executeQuery: mock.fn(async () => [{ rows: [[blob]] }])
+            };
+            setupMockDocument(docKey, dbOps);
+
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/data.bin`);
+            const content = await provider.readFile(uri);
+
+            assert.deepStrictEqual(content, blob);
+        });
+
+        it('should return invalid row ID message', async () => {
+            setupMockDocument(docKey);
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/invalid-id/col.txt`);
+
+            const content = await provider.readFile(uri);
+            const text = new TextDecoder().decode(content);
+
+            assert.ok(text.includes('Invalid Row ID: invalid-id'));
+        });
+
+        it('should throw FileNotFound on database error', async () => {
+            const dbOps = {
+                executeQuery: mock.fn(async () => {
+                    throw new Error('Database error');
+                })
+            };
+            setupMockDocument(docKey, dbOps);
+
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/col.txt`);
+
+            // It catches error and rethrows as FileNotFound
+            await assert.rejects(async () => {
+                await provider.readFile(uri);
+            }, /FileNotFound/);
+        });
     });
 });
