@@ -330,7 +330,7 @@ export interface DatabaseInitConfig {
  */
 export interface DatabaseInitResult {
   /** Database operations handle */
-  operations: DatabaseOperations;
+  operations?: DatabaseOperations;
   /** Whether opened in read-only mode */
   isReadOnly: boolean;
 }

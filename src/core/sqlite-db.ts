@@ -820,57 +820,9 @@ export function createWorkerEndpoint() {
       const result = await createDatabaseEngine(config);
       activeEngine = result.operations as WasmDatabaseEngine;
 
-      // Return proxy object with bound methods
-      // Note: This return value is primarily used for isReadOnly flag.
+      // Return value is primarily used for isReadOnly flag.
       // The actual database operations are accessed via the worker endpoint methods below.
       return {
-        operations: {
-          engineKind: Promise.resolve('wasm'),
-          executeQuery: (sql: string, params?: CellValue[]) =>
-            activeEngine!.executeQuery(sql, params),
-          serializeDatabase: (name: string) =>
-            activeEngine!.serializeDatabase(name),
-          applyModifications: (mods: ModificationEntry[], sig?: AbortSignal) =>
-            activeEngine!.applyModifications(mods, sig),
-          undoModification: (mod: ModificationEntry) =>
-            activeEngine!.undoModification(mod),
-          redoModification: (mod: ModificationEntry) =>
-            activeEngine!.redoModification(mod),
-          flushChanges: (sig?: AbortSignal) =>
-            activeEngine!.flushChanges(sig),
-          discardModifications: (mods: ModificationEntry[], sig?: AbortSignal) =>
-            activeEngine!.discardModifications(mods, sig),
-          updateCell: (table: string, rowId: RecordId, column: string, value: CellValue) =>
-            activeEngine!.updateCell(table, rowId, column, value),
-          insertRow: (table: string, data: Record<string, CellValue>) =>
-            activeEngine!.insertRow(table, data),
-          deleteRows: (table: string, rowIds: RecordId[]) =>
-            activeEngine!.deleteRows(table, rowIds),
-          deleteColumns: (table: string, columns: string[]) =>
-            activeEngine!.deleteColumns(table, columns),
-          createTable: (table: string, columns: ColumnDefinition[]) =>
-            activeEngine!.createTable(table, columns),
-          updateCellBatch: (table: string, updates: CellUpdate[]) =>
-            activeEngine!.updateCellBatch(table, updates),
-          addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
-            activeEngine!.addColumn(table, column, type, defaultValue),
-          fetchTableData: (table: string, options: TableQueryOptions) =>
-            activeEngine!.fetchTableData(table, options),
-          fetchTableCount: (table: string, options: TableCountOptions) =>
-            activeEngine!.fetchTableCount(table, options),
-          fetchSchema: () =>
-            activeEngine!.fetchSchema(),
-          getTableInfo: (table: string) =>
-            activeEngine!.getTableInfo(table),
-          getPragmas: () =>
-            activeEngine!.getPragmas(),
-          setPragma: (pragma: string, value: CellValue) =>
-            activeEngine!.setPragma(pragma, value),
-          ping: () =>
-            activeEngine!.ping(),
-          writeToFile: (path: string) =>
-            activeEngine!.writeToFile(path)
-        },
         isReadOnly: result.isReadOnly
       };
     },
