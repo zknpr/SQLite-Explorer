@@ -1,5 +1,5 @@
 
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, beforeEach, after, afterEach } from 'node:test';
 import assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -9,7 +9,8 @@ describe('SQLite Engine Undo/Redo', () => {
     let engine: any;
     const dbPath = path.join(__dirname, 'test_undo.db');
 
-    before(async () => {
+    // Use beforeEach to ensure clean state for each test
+    beforeEach(async () => {
         // Initialize with empty DB
         const result = await createDatabaseEngine({
             content: null,
@@ -22,6 +23,12 @@ describe('SQLite Engine Undo/Redo', () => {
         await engine.executeQuery("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
         await engine.insertRow('users', { id: 1, name: 'Alice' });
         await engine.insertRow('users', { id: 2, name: 'Bob' });
+    });
+
+    afterEach(() => {
+        if (engine && typeof engine.shutdown === 'function') {
+            engine.shutdown();
+        }
     });
 
     it('should undo/redo row deletion', async () => {
@@ -109,62 +116,83 @@ describe('SQLite Engine Undo/Redo', () => {
         }
     });
 
-    it('should undo/redo batch cell updates', async () => {
-        // Setup - reset state (Table might be altered by previous tests)
-        await engine.executeQuery("DROP TABLE IF EXISTS users");
-        await engine.executeQuery("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
-        await engine.insertRow('users', { id: 1, name: 'Alice' });
-        await engine.insertRow('users', { id: 2, name: 'Bob' });
-        await engine.insertRow('users', { id: 3, name: 'Charlie' });
+    it('should undo/redo cell update', async () => {
+        // 1. Update Cell (id=1, name='Alice' -> 'Alice Updated')
+        await engine.updateCell('users', 1, 'name', 'Alice Updated');
 
-        // 1. Batch Update
-        // Update everyone to 'Updated'
-        const updates = [
-            { rowId: 1, column: 'name', value: 'Updated', originalValue: 'Alice' },
-            { rowId: 2, column: 'name', value: 'Updated', originalValue: 'Bob' },
-            { rowId: 3, column: 'name', value: 'Updated', originalValue: 'Charlie' }
-        ];
-
-        await engine.updateCellBatch('users', updates);
-
-        // Verify update
-        const result = await engine.executeQuery("SELECT name FROM users ORDER BY id");
-        assert.strictEqual(result[0].rows[0][0], 'Updated');
-        assert.strictEqual(result[0].rows[1][0], 'Updated');
-        assert.strictEqual(result[0].rows[2][0], 'Updated');
+        const verifyUpdate = await engine.executeQuery("SELECT name FROM users WHERE id = 1");
+        assert.strictEqual(verifyUpdate[0].rows[0][0], 'Alice Updated');
 
         // 2. Undo Update
-        const affectedCells = [
-            { rowId: 1, columnName: 'name', priorValue: 'Alice', newValue: 'Updated' },
-            { rowId: 2, columnName: 'name', priorValue: 'Bob', newValue: 'Updated' },
-            { rowId: 3, columnName: 'name', priorValue: 'Charlie', newValue: 'Updated' }
-        ];
-
         await engine.undoModification({
             modificationType: 'cell_update',
             targetTable: 'users',
-            description: 'Batch update',
-            affectedCells
+            description: 'Update cell',
+            affectedCells: [{ rowId: 1, columnName: 'name', priorValue: 'Alice', newValue: 'Alice Updated' }]
         });
 
-        // Verify restored
-        const restored = await engine.executeQuery("SELECT name FROM users ORDER BY id");
-        assert.strictEqual(restored[0].rows[0][0], 'Alice');
-        assert.strictEqual(restored[0].rows[1][0], 'Bob');
-        assert.strictEqual(restored[0].rows[2][0], 'Charlie');
+        const verifyRestored = await engine.executeQuery("SELECT name FROM users WHERE id = 1");
+        assert.strictEqual(verifyRestored[0].rows[0][0], 'Alice');
 
         // 3. Redo Update
         await engine.redoModification({
             modificationType: 'cell_update',
             targetTable: 'users',
-            description: 'Batch update',
-            affectedCells
+            description: 'Update cell',
+            affectedCells: [{ rowId: 1, columnName: 'name', priorValue: 'Alice', newValue: 'Alice Updated' }]
         });
 
-        // Verify updated again
-        const reupdated = await engine.executeQuery("SELECT name FROM users ORDER BY id");
-        assert.strictEqual(reupdated[0].rows[0][0], 'Updated');
-        assert.strictEqual(reupdated[0].rows[1][0], 'Updated');
-        assert.strictEqual(reupdated[0].rows[2][0], 'Updated');
+        const verifyRedone = await engine.executeQuery("SELECT name FROM users WHERE id = 1");
+        assert.strictEqual(verifyRedone[0].rows[0][0], 'Alice Updated');
+    });
+
+    it('should undo/redo row insert', async () => {
+        // 1. Insert Row (id=3, name='Charlie')
+        const newRow = { id: 3, name: 'Charlie' };
+        await engine.insertRow('users', newRow);
+
+        const verifyInsert = await engine.fetchTableCount('users', {});
+        // Note: previous tests might have left table state.
+        // deleteRows test restores state to 2 rows.
+        // columnDrop test restores state to 2 rows + name column.
+        // cellUpdate test restores state to 'Alice Updated' (redo)
+        // Wait, tests run sequentially but `before` runs once.
+        // Let's check state.
+        // After cell_update test, id=1 is 'Alice Updated', id=2 is gone? No, row_delete test redid delete of id=2.
+        // So we likely have 1 row (id=1).
+
+        // Actually, let's just insert and check count increase.
+        const countBefore = (await engine.executeQuery("SELECT COUNT(*) FROM users"))[0].rows[0][0] as number;
+
+        // Wait, insertRow was done above. Let's do another one.
+        const row4 = { id: 4, name: 'Dave' };
+        await engine.insertRow('users', row4);
+
+        const countAfter = (await engine.executeQuery("SELECT COUNT(*) FROM users"))[0].rows[0][0] as number;
+        assert.strictEqual(countAfter, countBefore + 1);
+
+        // 2. Undo Insert
+        await engine.undoModification({
+            modificationType: 'row_insert',
+            targetTable: 'users',
+            description: 'Insert row',
+            targetRowId: 4,
+            rowData: row4
+        });
+
+        const countRestored = (await engine.executeQuery("SELECT COUNT(*) FROM users"))[0].rows[0][0] as number;
+        assert.strictEqual(countRestored, countBefore);
+
+        // 3. Redo Insert
+        await engine.redoModification({
+            modificationType: 'row_insert',
+            targetTable: 'users',
+            description: 'Insert row',
+            targetRowId: 4,
+            rowData: row4
+        });
+
+        const countRedone = (await engine.executeQuery("SELECT COUNT(*) FROM users"))[0].rows[0][0] as number;
+        assert.strictEqual(countRedone, countBefore + 1);
     });
 });

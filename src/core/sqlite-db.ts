@@ -34,7 +34,6 @@ import { applyMergePatch } from './json-utils';
 interface WasmDatabaseInstance {
   exec(sql: string, params?: unknown[]): Array<{ columns: string[]; values: unknown[][] }>;
   prepare(sql: string, params?: unknown[]): any;
-  iterateStatements(sql: string): IterableIterator<any>;
   export(): Uint8Array;
   close(): void;
 }
@@ -58,26 +57,10 @@ interface WasmEngineModule {
  */
 class WasmDatabaseEngine implements DatabaseOperations {
   private readonly instance: WasmDatabaseInstance;
-  private readonly queryTimeout: number;
-  private _hasJsonPatch: boolean | undefined;
   readonly engineKind = Promise.resolve('wasm' as const);
 
-  constructor(instance: WasmDatabaseInstance, timeoutMs: number) {
+  constructor(instance: WasmDatabaseInstance) {
     this.instance = instance;
-    this.queryTimeout = timeoutMs;
-  }
-
-  private checkJsonPatchSupport(): boolean {
-    if (this._hasJsonPatch !== undefined) {
-      return this._hasJsonPatch;
-    }
-    try {
-      this.instance.exec("SELECT json_patch('{}', '{}')");
-      this._hasJsonPatch = true;
-    } catch {
-      this._hasJsonPatch = false;
-    }
-    return this._hasJsonPatch;
   }
 
   /**
@@ -91,59 +74,20 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * @returns Array of result sets in sql.js format
    */
   async executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> {
-    const startTime = Date.now();
-    const results: QueryResultSet[] = [];
-    let currentStmt: any = null;
-
     try {
-      const iterator = this.instance.iterateStatements(sql);
-      let isFirstStatement = true;
-
-      for (const stmt of iterator) {
-        currentStmt = stmt;
-
-        // Bind parameters only to the first statement to match exec behavior
-        if (isFirstStatement && params && params.length > 0) {
-          stmt.bind(params);
-        }
-        isFirstStatement = false;
-
-        const rows: CellValue[][] = [];
-
-        while (stmt.step()) {
-          // Check timeout
-          if (Date.now() - startTime > this.queryTimeout) {
-             stmt.free(); // Free current statement to prevent leaks
-             throw new Error(`Query execution timed out after ${this.queryTimeout}ms`);
-          }
-          rows.push(stmt.get());
-        }
-
-        const columns = stmt.getColumnNames();
-        // Only include results that have columns (matching exec behavior)
-        if (columns.length > 0) {
-          results.push({
-            columns,
-            values: rows,
-            headers: columns,
-            rows
-          });
-        }
-
-        // iterateStatements handles freeing the statement when we proceed to next or finish
-        // but we clear our reference so we don't try to free it in catch block
-        currentStmt = null;
-      }
+      const rawResults = this.instance.exec(sql, params);
+      // Return in sql.js compatible format for webview compatibility
+      return rawResults.map(resultSet => ({
+        columns: resultSet.columns,
+        values: resultSet.values as CellValue[][],
+        // Also provide our new format for internal use
+        headers: resultSet.columns,
+        rows: resultSet.values as CellValue[][]
+      })) as QueryResultSet[];
     } catch (err) {
-      // Ensure current statement is freed if iteration was interrupted by error/timeout
-      if (currentStmt) {
-        try { currentStmt.free(); } catch {}
-      }
       const errorDetail = err instanceof Error ? err.message : String(err);
       throw new Error(`Query failed: ${errorDetail}`);
     }
-
-    return results;
   }
 
   /**
@@ -171,86 +115,121 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * Undo a modification.
    */
   async undoModification(mod: ModificationEntry): Promise<void> {
-    const { modificationType, targetTable, targetRowId, targetColumn, priorValue, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
+    const { modificationType, targetTable } = mod;
     if (!targetTable) return;
 
     switch (modificationType) {
-        case 'cell_update':
-            if (affectedCells) {
-                // Batch undo
-                const updates: CellUpdate[] = affectedCells.map(cell => ({
-                    rowId: cell.rowId,
-                    column: cell.columnName,
-                    value: cell.priorValue ?? null
-                }));
-                await this.updateCellBatch(targetTable, updates);
-            } else if (targetRowId !== undefined && targetColumn) {
-                // Single cell undo
-                await this.updateCell(targetTable, targetRowId, targetColumn, priorValue ?? null);
-            }
-            break;
+      case 'cell_update':
+        await this.undoCellUpdate(targetTable, mod);
+        break;
 
-        case 'row_insert':
-            // Undo insert = delete row
-            if (targetRowId !== undefined) {
-                await this.deleteRows(targetTable, [targetRowId]);
-            }
-            break;
+      case 'row_insert':
+        await this.undoRowInsert(targetTable, mod);
+        break;
 
-        case 'row_delete':
-            // Undo delete = re-insert rows
-            if (deletedRows && deletedRows.length > 0) {
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    const rowsToInsert = deletedRows.map(r => r.row);
-                    await this.insertRowBatch(targetTable, rowsToInsert);
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
-            }
-            break;
+      case 'row_delete':
+        await this.undoRowDelete(targetTable, mod);
+        break;
 
-        case 'column_add':
-            // Undo add column = drop column
-            if (targetColumn) {
-                await this.deleteColumns(targetTable, [targetColumn]);
-            }
-            break;
+      case 'column_add':
+        await this.undoColumnAdd(targetTable, mod);
+        break;
 
-        case 'column_drop':
-            // Undo drop column = add column + restore values
-            if (deletedColumns) {
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    for (const col of deletedColumns) {
-                        await this.addColumn(targetTable, col.name, col.type);
-                        // Restore values
-                     
-                        const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`;
-                        const stmt = this.instance.prepare(sql);
-                        try {
-                            for (const { rowId, value } of col.data) {
-                                stmt.run([value, Number(rowId)]);
-                            }
-                        } finally {
-                            stmt.free();
-                        }
-                    }
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
-            }
-            break;
+      case 'column_drop':
+        await this.undoColumnDrop(targetTable, mod);
+        break;
 
-        case 'table_create':
-            // Undo create table = drop table
-            await this.executeQuery(`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`);
-            break;
+      case 'table_create':
+        await this.undoTableCreate(targetTable);
+        break;
     }
+  }
+
+  private async undoCellUpdate(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { affectedCells, targetRowId, targetColumn, priorValue } = mod;
+    if (affectedCells) {
+      // Batch undo
+      await this.executeQuery('BEGIN TRANSACTION');
+      try {
+        for (const cell of affectedCells) {
+          await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.priorValue ?? null);
+        }
+        await this.executeQuery('COMMIT');
+      } catch (e) {
+        await this.executeQuery('ROLLBACK');
+        throw e;
+      }
+    } else if (targetRowId !== undefined && targetColumn) {
+      // Single cell undo
+      await this.updateCell(targetTable, targetRowId, targetColumn, priorValue ?? null);
+    }
+  }
+
+  private async undoRowInsert(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { targetRowId } = mod;
+    // Undo insert = delete row
+    if (targetRowId !== undefined) {
+      await this.deleteRows(targetTable, [targetRowId]);
+    }
+  }
+
+  private async undoRowDelete(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { deletedRows } = mod;
+    // Undo delete = re-insert rows
+    if (deletedRows && deletedRows.length > 0) {
+      await this.executeQuery('BEGIN TRANSACTION');
+      try {
+        for (const { rowId, row } of deletedRows) {
+          // row already contains rowid if needed (handled in HostBridge)
+          await this.insertRow(targetTable, row);
+        }
+        await this.executeQuery('COMMIT');
+      } catch (e) {
+        await this.executeQuery('ROLLBACK');
+        throw e;
+      }
+    }
+  }
+
+  private async undoColumnAdd(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { targetColumn } = mod;
+    // Undo add column = drop column
+    if (targetColumn) {
+      await this.deleteColumns(targetTable, [targetColumn]);
+    }
+  }
+
+  private async undoColumnDrop(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { deletedColumns } = mod;
+    // Undo drop column = add column + restore values
+    if (deletedColumns) {
+      await this.executeQuery('BEGIN TRANSACTION');
+      try {
+        for (const col of deletedColumns) {
+          await this.addColumn(targetTable, col.name, col.type);
+          // Restore values
+
+          const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`;
+          const stmt = this.instance.prepare(sql);
+          try {
+            for (const { rowId, value } of col.data) {
+              stmt.run([value, Number(rowId)]);
+            }
+          } finally {
+            stmt.free();
+          }
+        }
+        await this.executeQuery('COMMIT');
+      } catch (e) {
+        await this.executeQuery('ROLLBACK');
+        throw e;
+      }
+    }
+  }
+
+  private async undoTableCreate(targetTable: string): Promise<void> {
+    // Undo create table = drop table
+    await this.executeQuery(`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`);
   }
 
   /**
@@ -264,12 +243,16 @@ class WasmDatabaseEngine implements DatabaseOperations {
         case 'cell_update':
             if (affectedCells) {
                 // Batch redo
-                const updates: CellUpdate[] = affectedCells.map(cell => ({
-                    rowId: cell.rowId,
-                    column: cell.columnName,
-                    value: cell.newValue ?? null
-                }));
-                await this.updateCellBatch(targetTable, updates);
+                await this.executeQuery('BEGIN TRANSACTION');
+                try {
+                    for (const cell of affectedCells) {
+                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.newValue ?? null);
+                    }
+                    await this.executeQuery('COMMIT');
+                } catch (e) {
+                    await this.executeQuery('ROLLBACK');
+                    throw e;
+                }
             } else if (targetRowId !== undefined && targetColumn) {
                 await this.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
             }
@@ -353,34 +336,27 @@ class WasmDatabaseEngine implements DatabaseOperations {
     let params: CellValue[];
 
     if (patch) {
-        if (this.checkJsonPatchSupport()) {
-            // Use native json_patch
-            const patchStr = typeof patch === 'string' ? patch : JSON.stringify(patch);
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(${escapeIdentifier(column)}, ?) WHERE rowid = ?`;
-            params = [patchStr, rowIdNum];
-        } else {
-            // Fallback to JS implementation of json_patch
-            // Fetch current value
-            const currentResult = await this.executeQuery(`SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} WHERE rowid = ?`, [rowIdNum]);
-            let currentValue = currentResult[0]?.rows[0]?.[0];
+        // Fallback to JS implementation of json_patch
+        // Fetch current value
+        const currentResult = await this.executeQuery(`SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} WHERE rowid = ?`, [rowIdNum]);
+        let currentValue = currentResult[0]?.rows[0]?.[0];
 
-            // Parse current JSON
-            let currentObj = {};
-            if (typeof currentValue === 'string') {
-                try { currentObj = JSON.parse(currentValue); } catch {}
-            } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
-                 // Already an object? (unlikely from SQLite unless using some extension, usually string)
-                 currentObj = currentValue;
-            }
-
-            // Apply patch
-            const patchObj = typeof patch === 'string' ? JSON.parse(patch) : patch;
-            const newValueObj = applyMergePatch(currentObj, patchObj);
-            const newValueStr = JSON.stringify(newValueObj);
-
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
-            params = [newValueStr, rowIdNum];
+        // Parse current JSON
+        let currentObj = {};
+        if (typeof currentValue === 'string') {
+            try { currentObj = JSON.parse(currentValue); } catch {}
+        } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
+             // Already an object? (unlikely from SQLite unless using some extension, usually string)
+             currentObj = currentValue;
         }
+
+        // Apply patch
+        const patchObj = typeof patch === 'string' ? JSON.parse(patch) : patch;
+        const newValueObj = applyMergePatch(currentObj, patchObj);
+        const newValueStr = JSON.stringify(newValueObj);
+
+        sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
+        params = [newValueStr, rowIdNum];
     } else {
         sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
         params = [value, rowIdNum];
@@ -414,41 +390,6 @@ class WasmDatabaseEngine implements DatabaseOperations {
       return result[0].rows[0][0] as RecordId;
     }
     return undefined;
-  }
-
-  /**
-   * Insert multiple rows in a batch.
-   */
-  async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
-    if (rows.length === 0) return;
-
-    // Assume all rows have the same columns as the first one
-    const columns = Object.keys(rows[0]);
-    if (columns.length === 0) return;
-
-    const escapedTable = escapeIdentifier(table);
-    const colNames = columns.map(escapeIdentifier).join(', ');
-    const placeholders = columns.map(() => '?').join(', ');
-
-    // SQLite parameter limit is usually 999.
-    // We'll use a conservative limit to stay safe.
-    const MAX_PARAMS = 999;
-    const batchSize = Math.floor(MAX_PARAMS / columns.length) || 1;
-
-    for (let i = 0; i < rows.length; i += batchSize) {
-      const chunk = rows.slice(i, i + batchSize);
-      const chunkPlaceholders = chunk.map(() => `(${placeholders})`).join(', ');
-      const sql = `INSERT INTO ${escapedTable} (${colNames}) VALUES ${chunkPlaceholders}`;
-
-      const params: CellValue[] = [];
-      for (const row of chunk) {
-        for (const col of columns) {
-          params.push(row[col] ?? null);
-        }
-      }
-
-      await this.executeQuery(sql, params);
-    }
   }
 
   /**
@@ -533,69 +474,55 @@ class WasmDatabaseEngine implements DatabaseOperations {
       for (const [key, columnUpdates] of updatesByColumn.entries()) {
           const [column, op] = key.split('|');
           const escapedColumn = escapeIdentifier(column);
-          let sql: string;
+          const sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
 
-          if (op === 'json_patch' && this.checkJsonPatchSupport()) {
-              sql = `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(${escapedColumn}, ?) WHERE rowid = ?`;
-              const stmt = this.instance.prepare(sql);
-              try {
-                  for (const update of columnUpdates) {
-                      const patchStr = typeof update.value === 'string' ? update.value : JSON.stringify(update.value);
-                      stmt.run([patchStr, Number(update.rowId)]);
-                  }
-              } finally {
-                  stmt.free();
+          const stmt = this.instance.prepare(sql);
+
+          // Optimize JSON patch read by preparing the SELECT statement
+          let selectStmt: any = null;
+
+          try {
+              if (op === 'json_patch') {
+                 selectStmt = this.instance.prepare(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`);
               }
-          } else {
-              sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
-              const stmt = this.instance.prepare(sql);
 
-              // Optimize JSON patch read by preparing the SELECT statement
-              let selectStmt: any = null;
+              for (const update of columnUpdates) {
+                  const rowIdNum = Number(update.rowId);
 
-              try {
                   if (op === 'json_patch') {
-                     selectStmt = this.instance.prepare(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`);
+                     // Read using prepared statement
+                     // selectStmt.get([rowIdNum]) returns [val] or undefined
+                     // sql.js documentation says get() returns array of values
+                     let currentValue = null;
+                     if (selectStmt) {
+                        // stmt.get(params) returns the row as an array of values
+                        const row = selectStmt.get([rowIdNum]);
+                        if (row && row.length > 0) {
+                            currentValue = row[0];
+                        }
+
+                        // sqlite3_reset() is required to reuse a prepared statement.
+                        selectStmt.reset();
+                     }
+
+                     let currentObj = {};
+                     if (typeof currentValue === 'string') {
+                         try { currentObj = JSON.parse(currentValue); } catch {}
+                     }
+
+                     const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
+                     const newValueObj = applyMergePatch(currentObj, patchObj);
+                     const newValueStr = JSON.stringify(newValueObj);
+
+                     stmt.run([newValueStr, rowIdNum]);
+                  } else {
+                      // Standard update
+                      stmt.run([update.value, rowIdNum]);
                   }
-
-                  for (const update of columnUpdates) {
-                      const rowIdNum = Number(update.rowId);
-
-                      if (op === 'json_patch') {
-                         // Read using prepared statement
-                         // selectStmt.get([rowIdNum]) returns [val] or undefined
-                         // sql.js documentation says get() returns array of values
-                         let currentValue = null;
-                         if (selectStmt) {
-                            // stmt.get(params) returns the row as an array of values
-                            const row = selectStmt.get([rowIdNum]);
-                            if (row && row.length > 0) {
-                                currentValue = row[0];
-                            }
-
-                            // sqlite3_reset() is required to reuse a prepared statement.
-                            selectStmt.reset();
-                         }
-
-                         let currentObj = {};
-                         if (typeof currentValue === 'string') {
-                             try { currentObj = JSON.parse(currentValue); } catch {}
-                         }
-
-                         const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
-                         const newValueObj = applyMergePatch(currentObj, patchObj);
-                         const newValueStr = JSON.stringify(newValueObj);
-
-                         stmt.run([newValueStr, rowIdNum]);
-                      } else {
-                          // Standard update
-                          stmt.run([update.value, rowIdNum]);
-                      }
-                  }
-              } finally {
-                  stmt.free();
-                  if (selectStmt) selectStmt.free();
               }
+          } finally {
+              stmt.free();
+              if (selectStmt) selectStmt.free();
           }
       }
 
@@ -850,11 +777,11 @@ export async function createDatabaseEngine(
           if (typeof require === 'function') {
               const fs = require('fs');
               // Validate size
-              const stats = await fs.promises.stat(config.filePath);
+              const stats = fs.statSync(config.filePath);
               if (config.maxSize > 0 && stats.size > config.maxSize) {
                   throw new Error('File too large');
               }
-              buffer = await fs.promises.readFile(config.filePath);
+              buffer = fs.readFileSync(config.filePath);
           }
       } catch (e) {
           console.error('Failed to read file in worker:', e);
@@ -879,7 +806,7 @@ export async function createDatabaseEngine(
     wasmInstance = new SqlJsModule.Database();
   }
 
-  const engine = new WasmDatabaseEngine(wasmInstance, config.queryTimeout || 50000);
+  const engine = new WasmDatabaseEngine(wasmInstance);
 
   return {
     operations: engine,
@@ -1008,11 +935,6 @@ export function createWorkerEndpoint() {
     async insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined> {
       if (!activeEngine) throw new Error('No database initialized');
       return activeEngine.insertRow(table, data);
-    },
-
-    async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.insertRowBatch(table, rows);
     },
 
     async deleteRows(table: string, rowIds: RecordId[]): Promise<void> {
