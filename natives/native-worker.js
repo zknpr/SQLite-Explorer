@@ -162,6 +162,97 @@ function executeStatement(db, sql, params) {
 }
 
 /**
+ * Execute a query (SELECT or otherwise) and return results.
+ *
+ * @param {object} db - Database instance
+ * @param {string} sql - SQL statement
+ * @param {any[]} params - Parameters
+ * @returns {object} Result with columns, values, rowCount
+ */
+function executeQuery(db, sql, params) {
+  console.error("[native-worker] query:", sql.substring(0, 50));
+
+  // Detect if this is a SELECT query or a modification (UPDATE/INSERT/DELETE/etc)
+  const trimmedSql = sql.trim().toUpperCase();
+  const isSelectQuery = trimmedSql.startsWith("SELECT") ||
+                        trimmedSql.startsWith("PRAGMA") ||
+                        trimmedSql.startsWith("EXPLAIN") ||
+                        trimmedSql.startsWith("WITH");
+
+  console.error("[native-worker] isSelectQuery:", isSelectQuery);
+
+  let columns = [];
+  let values = [];
+  let rowCount = 0;
+
+  if (isSelectQuery) {
+    const stmt = db.prepare(sql);
+    let rows;
+    try {
+      if (typeof stmt.all === 'function') {
+          if (params && params.length > 0) {
+              rows = stmt.all(...params);
+          } else {
+              rows = stmt.all();
+          }
+      } else {
+          // Fallback for iterators
+          rows = [];
+          if (params && params.length > 0 && typeof stmt.bind === 'function') {
+              try { stmt.bind(...params); } catch(e) { console.error("bind failed", e); }
+          }
+          for (const row of stmt) {
+              rows.push(row);
+          }
+      }
+    } finally {
+       if (typeof stmt.finalize === 'function') stmt.finalize();
+    }
+
+    console.error("[native-worker] got rows:", rows?.length);
+
+    if (rows && rows.length > 0) {
+      columns = Object.keys(rows[0]);
+      values = rows.map(row => columns.map(col => row[col]));
+      rowCount = rows.length;
+    }
+  } else {
+    // Non-SELECT via query() - typically shouldn't happen for updateCell but good to support
+    console.error("[native-worker] executing non-SELECT via query()");
+    if (params && params.length > 0) {
+      const stmt = db.prepare(sql);
+      try {
+          if (typeof stmt.run === 'function') {
+              stmt.run(...params);
+          } else if (typeof stmt.execute === 'function') {
+              if (typeof stmt.bind === 'function') stmt.bind(...params);
+              stmt.execute();
+          } else {
+              if (typeof stmt.bind === 'function') stmt.bind(...params);
+              stmt.step(); // or iterate
+          }
+      } finally {
+          if (typeof stmt.finalize === 'function') stmt.finalize();
+      }
+    } else {
+      db.exec(sql);
+    }
+
+    // Get changes
+    try {
+       const chg = db.prepare("SELECT changes() as c").all()[0].c;
+       rowCount = chg;
+    } catch(e) { rowCount = 0; }
+  }
+
+  return {
+    columns,
+    values,
+    rowCount
+  };
+}
+
+/**
  * Handle incoming RPC request.
  *
  * @param {object} request - RPC request { id, method, args }
@@ -238,88 +329,24 @@ async function handleRequest(request) {
         // Execute SQL and return all results
         // args: [sql: string, params?: any[]]
         const [sql, params] = args;
-        console.error("[native-worker] query:", sql.substring(0, 50));
         if (!db) throw new Error("Database not open");
 
-        // Detect if this is a SELECT query or a modification (UPDATE/INSERT/DELETE/etc)
-        const trimmedSql = sql.trim().toUpperCase();
-        const isSelectQuery = trimmedSql.startsWith("SELECT") ||
-                              trimmedSql.startsWith("PRAGMA") ||
-                              trimmedSql.startsWith("EXPLAIN") ||
-                              trimmedSql.startsWith("WITH");
-
-        console.error("[native-worker] isSelectQuery:", isSelectQuery);
-
-        let columns = [];
-        let values = [];
-        let rowCount = 0;
-
-        if (isSelectQuery) {
-          const stmt = db.prepare(sql);
-          let rows;
-          try {
-            if (typeof stmt.all === 'function') {
-                if (params && params.length > 0) {
-                    rows = stmt.all(...params);
-                } else {
-                    rows = stmt.all();
-                }
-            } else {
-                // Fallback for iterators
-                rows = [];
-                if (params && params.length > 0 && typeof stmt.bind === 'function') {
-                    try { stmt.bind(...params); } catch(e) { console.error("bind failed", e); }
-                }
-                for (const row of stmt) {
-                    rows.push(row);
-                }
-            }
-          } finally {
-             if (typeof stmt.finalize === 'function') stmt.finalize();
-          }
-
-          console.error("[native-worker] got rows:", rows?.length);
-
-          if (rows && rows.length > 0) {
-            columns = Object.keys(rows[0]);
-            values = rows.map(row => columns.map(col => row[col]));
-            rowCount = rows.length;
-          }
-        } else {
-          // Non-SELECT via query() - typically shouldn't happen for updateCell but good to support
-          console.error("[native-worker] executing non-SELECT via query()");
-          if (params && params.length > 0) {
-            const stmt = db.prepare(sql);
-            try {
-                if (typeof stmt.run === 'function') {
-                    stmt.run(...params);
-                } else if (typeof stmt.execute === 'function') {
-                    if (typeof stmt.bind === 'function') stmt.bind(...params);
-                    stmt.execute();
-                } else {
-                    if (typeof stmt.bind === 'function') stmt.bind(...params);
-                    stmt.step(); // or iterate
-                }
-            } finally {
-                if (typeof stmt.finalize === 'function') stmt.finalize();
-            }
-          } else {
-            db.exec(sql);
-          }
-
-          // Get changes
-          try {
-             const chg = db.prepare("SELECT changes() as c").all()[0].c;
-             rowCount = chg;
-          } catch(e) { rowCount = 0; }
-        }
-
-        result = {
-          columns,
-          values,
-          rowCount
-        };
+        result = executeQuery(db, sql, params);
         console.error("[native-worker] query complete");
+        break;
+      }
+
+      case "queryBatch": {
+        // Execute a batch of queries and return results for each
+        // args: [queries: { sql: string, params?: any[] }[]]
+        const [queries] = args;
+        if (!db) throw new Error("Database not open");
+
+        const results = [];
+        for (const query of queries) {
+            results.push(executeQuery(db, query.sql, query.params));
+        }
+        result = { results };
         break;
       }
 

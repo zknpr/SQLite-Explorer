@@ -213,11 +213,17 @@ export interface DatabaseOperations {
   /** Insert a new row */
   insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined>;
 
+  /** Insert multiple rows in a batch */
+  insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
+
   /** Delete rows by ID */
   deleteRows(table: string, rowIds: RecordId[]): Promise<void>;
 
   /** Delete columns by name */
-  deleteColumns(table: string, columns: string[]): Promise<void>;
+  deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
+
+  /** Find indexes that depend on specific columns */
+  findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
 
   /** Create a new table */
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
@@ -323,6 +329,8 @@ export interface DatabaseInitConfig {
   wasmBinary?: Uint8Array;
   /** Open in read-only mode */
   readOnlyMode?: boolean;
+  /** Query execution timeout in milliseconds */
+  queryTimeout?: number;
 }
 
 /**
@@ -330,7 +338,7 @@ export interface DatabaseInitConfig {
  */
 export interface DatabaseInitResult {
   /** Database operations handle */
-  operations: DatabaseOperations;
+  operations?: DatabaseOperations;
   /** Whether opened in read-only mode */
   isReadOnly: boolean;
 }

@@ -202,7 +202,14 @@ async function submitDeleteColumns() {
 
     try {
         updateStatus('Deleting columns...');
-        await backendApi.deleteColumns(state.selectedTable, columnNames);
+        const result = await backendApi.deleteColumns(state.selectedTable, columnNames);
+
+        // If user cancelled the operation (e.g., declined to drop dependent indexes), don't reload
+        if (result && result.cancelled) {
+            updateStatus('Delete cancelled');
+            closeModal('deleteModal');
+            return;
+        }
 
         closeModal('deleteModal');
         state.selectedColumns.clear();

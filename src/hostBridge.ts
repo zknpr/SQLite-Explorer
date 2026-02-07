@@ -122,34 +122,7 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
-    let patch: string | undefined;
-
-    // Try to generate a JSON patch if applicable
-    if (
-      typeof value === 'string' &&
-      typeof originalValue === 'string' &&
-      (value.startsWith('{') || value.startsWith('[')) &&
-      (originalValue.startsWith('{') || originalValue.startsWith('['))
-    ) {
-      try {
-        const originalObj = JSON.parse(originalValue);
-        const newObj = JSON.parse(value);
-
-        // Only patch if valid JSON objects (not arrays, primitives, null)
-        // SQLite json_patch merge behavior is specific to objects.
-        // RFC 7396 defines how arrays are replaced entirely.
-        if (originalObj && typeof originalObj === 'object' && !Array.isArray(originalObj) &&
-            newObj && typeof newObj === 'object' && !Array.isArray(newObj)) {
-
-            const patchObj = generateMergePatch(originalObj, newObj);
-            if (patchObj !== undefined) {
-                patch = JSON.stringify(patchObj);
-            }
-        }
-      } catch {
-        // Not valid JSON or parse error, ignore and do full update
-      }
-    }
+    const patch = this.tryGeneratePatch(value, originalValue);
 
     // Use specific method instead of generic exec
     // This allows the backend to handle safe SQL construction
@@ -277,8 +250,13 @@ export class HostBridge implements ToastService {
 
   /**
    * Delete columns.
+   *
+   * If columns have dependent indexes, shows a confirmation dialog to the user.
+   * User can choose to drop the indexes and continue, or cancel the operation.
+   *
+   * @returns Object with `cancelled: true` if user cancelled, otherwise undefined
    */
-  async deleteColumns(table: string, columns: string[]) {
+  async deleteColumns(table: string, columns: string[]): Promise<{ cancelled: boolean } | void> {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
@@ -286,6 +264,33 @@ export class HostBridge implements ToastService {
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
+    }
+
+    // Check for dependent indexes before deletion
+    let dependentIndexes: string[] = [];
+    if ('findDependentIndexes' in document.databaseOperations) {
+      dependentIndexes = await document.databaseOperations.findDependentIndexes(table, columns);
+    }
+
+    // If there are dependent indexes, ask the user for confirmation
+    if (dependentIndexes.length > 0) {
+      const indexList = dependentIndexes.join(', ');
+      const message = vsc.l10n.t(
+        'The following indexes depend on the selected column(s) and will be dropped: {0}',
+        indexList
+      );
+
+      const result = await vsc.window.showWarningMessage(
+        message,
+        { modal: true },
+        { title: vsc.l10n.t('Drop Indexes & Continue'), value: true },
+        { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
+      );
+
+      if (!result?.value) {
+        // User cancelled the operation - return cancelled flag
+        return { cancelled: true };
+      }
     }
 
     // Capture column data before deletion for undo
@@ -330,7 +335,8 @@ export class HostBridge implements ToastService {
     }
 
     if ('deleteColumns' in document.databaseOperations) {
-      await document.databaseOperations.deleteColumns(table, columns);
+      // Pass dependent indexes to be dropped first if user confirmed
+      await document.databaseOperations.deleteColumns(table, columns, dependentIndexes.length > 0 ? dependentIndexes : undefined);
     } else {
       throw new Error("Backend does not support deleteColumns");
     }
@@ -390,11 +396,20 @@ export class HostBridge implements ToastService {
     if ('updateCellBatch' in document.databaseOperations) {
       await document.databaseOperations.updateCellBatch(table, updates);
     } else {
-      // Fallback: execute updates sequentially
-      for (const update of updates) {
-        await this.updateCell(table, update.rowId, update.column, update.value);
-      }
-      return;
+      // Fallback: execute updates in parallel
+      await Promise.all(updates.map(async update => {
+        let patch: string | undefined;
+        let val = update.value;
+
+        if (update.operation === 'json_patch') {
+          patch = update.value as string;
+          val = null; // Value is ignored when patch is provided
+        } else {
+          patch = this.tryGeneratePatch(update.value, update.originalValue);
+        }
+
+        await document.databaseOperations.updateCell(table, update.rowId, update.column, val, patch);
+      }));
     }
 
     // Fire batch edit event
@@ -906,6 +921,38 @@ export class HostBridge implements ToastService {
         }
         await vsc.workspace.fs.writeFile(uri, buffer);
     }
+  }
+
+  /**
+   * Attempt to generate a JSON merge patch between two cell values.
+   */
+  private tryGeneratePatch(value: CellValue, originalValue?: CellValue): string | undefined {
+    if (
+      typeof value === 'string' &&
+      typeof originalValue === 'string' &&
+      (value.startsWith('{') || value.startsWith('[')) &&
+      (originalValue.startsWith('{') || originalValue.startsWith('['))
+    ) {
+      try {
+        const originalObj = JSON.parse(originalValue);
+        const newObj = JSON.parse(value);
+
+        // Only patch if valid JSON objects (not arrays, primitives, null)
+        // SQLite json_patch merge behavior is specific to objects.
+        // RFC 7396 defines how arrays are replaced entirely.
+        if (originalObj && typeof originalObj === 'object' && !Array.isArray(originalObj) &&
+            newObj && typeof newObj === 'object' && !Array.isArray(newObj)) {
+
+            const patchObj = generateMergePatch(originalObj, newObj);
+            if (patchObj !== undefined) {
+                return JSON.stringify(patchObj);
+            }
+        }
+      } catch {
+        // Not valid JSON or parse error, ignore and do full update
+      }
+    }
+    return undefined;
   }
 
   /**

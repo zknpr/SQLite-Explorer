@@ -63,6 +63,14 @@ export function cellValueToSql(value: CellValue | undefined): string {
     return String(value);
   }
   if (typeof value === 'string') {
+    // Check for NUL characters which are unsafe in SQL scripts
+    // If found, encode as hex blob and cast to TEXT
+    if (value.includes('\0')) {
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(value);
+      const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+      return `CAST(X'${hex}' AS TEXT)`;
+    }
     // Escape single quotes by doubling them (SQL standard)
     return `'${value.replace(/'/g, "''")}'`;
   }
@@ -73,4 +81,21 @@ export function cellValueToSql(value: CellValue | undefined): string {
   }
   // Fallback for any other type
   return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+/**
+ * Escapes characters that have special meaning in SQL LIKE clauses.
+ * Prevents SQL wildcard injection where malicious input like '%' could
+ * cause expensive full table scans.
+ *
+ * @param pattern - The string to escape.
+ * @param escapeChar - The escape character to use (default: '\\').
+ * @returns The escaped string.
+ */
+export function escapeLikePattern(pattern: string, escapeChar: string = '\\'): string {
+  // Escape the escape character itself, then the wildcards % and _
+  // We need to escape the escapeChar for use in regex
+  const escapedEscapeChar = escapeChar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const regex = new RegExp(`[${escapedEscapeChar}%_]`, 'g');
+  return pattern.replace(regex, (match) => escapeChar + match);
 }

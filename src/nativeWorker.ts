@@ -63,7 +63,7 @@ const QUERY_TIMEOUT = 30000;
  * @param extensionPath - Extension installation directory
  * @returns Path to native binary or null if unsupported
  */
-function getNativeBinaryPath(extensionPath: string): string | null {
+async function getNativeBinaryPath(extensionPath: string): Promise<string | null> {
   const platform = process.platform;
   const arch = process.arch;
 
@@ -88,11 +88,12 @@ function getNativeBinaryPath(extensionPath: string): string | null {
   const binaryPath = path.join(extensionPath, 'natives', platformDir, binaryName);
 
   // Verify binary exists
-  if (fs.existsSync(binaryPath)) {
+  try {
+    await fs.promises.access(binaryPath, fs.constants.F_OK);
     return binaryPath;
+  } catch {
+    return null;
   }
-
-  return null;
 }
 
 // ============================================================================
@@ -369,8 +370,8 @@ function mapRowsByName(result: any, mapping: Record<string, string>) {
  * @param extensionPath - Extension installation directory
  * @returns True if native binary is available
  */
-export function isNativeAvailable(extensionPath: string): boolean {
-  return getNativeBinaryPath(extensionPath) !== null;
+export async function isNativeAvailable(extensionPath: string): Promise<boolean> {
+  return (await getNativeBinaryPath(extensionPath)) !== null;
 }
 
 /**
@@ -387,7 +388,7 @@ export async function createNativeDatabaseConnection(
   _reporter?: TelemetryReporter
 ): Promise<DatabaseConnectionBundle> {
   const extensionPath = extensionUri.fsPath;
-  const binaryPath = getNativeBinaryPath(extensionPath);
+  const binaryPath = await getNativeBinaryPath(extensionPath);
 
   if (!binaryPath) {
     throw new Error('Native SQLite not available on this platform');
@@ -732,13 +733,64 @@ export async function createNativeDatabaseConnection(
         },
 
         /**
-         * Delete columns by name.
+         * Find indexes that depend on specific columns.
          */
-        deleteColumns: async (table: string, columns: string[]) => {
+        findDependentIndexes: async (table: string, columns: string[]): Promise<string[]> => {
+          const dependentIndexes: string[] = [];
+
+          // Query sqlite_master for indexes on this table
+          const indexQuery = `
+            SELECT name, sql FROM sqlite_master
+            WHERE type = 'index'
+              AND tbl_name = ?
+              AND sql IS NOT NULL
+          `;
+          const indexResult = await worker.call<any>('query', [indexQuery, [table]]);
+
+          if (indexResult && indexResult.values) {
+            for (const row of indexResult.values) {
+              const indexName = row[0] as string;
+              const indexSql = row[1] as string;
+
+              // Check if this index references any of the columns
+              const referencesColumn = columns.some(col => {
+                const colLower = col.toLowerCase();
+                // Match column name in index definition (quoted or unquoted)
+                const patterns = [
+                  new RegExp(`[\\(,]\\s*${colLower}\\s*[\\),]`, 'i'),
+                  new RegExp(`[\\(,]\\s*"${colLower}"\\s*[\\),]`, 'i'),
+                  new RegExp(`[\\(,]\\s*\\[${colLower}\\]\\s*[\\),]`, 'i'),
+                  new RegExp(`[\\(,]\\s*\`${colLower}\`\\s*[\\),]`, 'i')
+                ];
+                return patterns.some(p => p.test(indexSql));
+              });
+
+              if (referencesColumn) {
+                dependentIndexes.push(indexName);
+              }
+            }
+          }
+
+          return dependentIndexes;
+        },
+
+        /**
+         * Delete columns by name.
+         * If dropDependentIndexes is provided, those indexes will be dropped first.
+         */
+        deleteColumns: async (table: string, columns: string[], dropDependentIndexes?: string[]) => {
           if (columns.length === 0) return;
 
           const escapedTable = escapeIdentifier(table);
 
+          // Drop specified dependent indexes first
+          if (dropDependentIndexes && dropDependentIndexes.length > 0) {
+            for (const indexName of dropDependentIndexes) {
+              await worker.call('run', [`DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}`]);
+            }
+          }
+
+          // Now drop the columns
           for (const col of columns) {
             const sql = `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`;
             await worker.call('run', [sql]);
@@ -897,13 +949,17 @@ export async function createNativeDatabaseConnection(
             'auto_vacuum'
           ];
 
+          const queries = pragmasToFetch.map(pragma => ({ sql: `PRAGMA ${pragma}` }));
+          const res = await worker.call<any>('queryBatch', [queries]);
+
           const result: Record<string, CellValue> = {};
 
-          for (const pragma of pragmasToFetch) {
-            const res = await worker.call<any>('query', [`PRAGMA ${pragma}`]);
-            if (res && res.values && res.values.length > 0) {
-              result[pragma] = res.values[0][0];
-            }
+          if (res && res.results && Array.isArray(res.results)) {
+            res.results.forEach((r: any, i: number) => {
+              if (r && r.values && r.values.length > 0) {
+                result[pragmasToFetch[i]] = r.values[0][0];
+              }
+            });
           }
 
           return result;

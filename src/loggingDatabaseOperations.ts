@@ -153,11 +153,21 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.deleteRows(table, rowIds);
     }
 
-    async deleteColumns(table: string, columns: string[]): Promise<void> {
+    async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {
+        if (dropDependentIndexes && dropDependentIndexes.length > 0) {
+            for (const indexName of dropDependentIndexes) {
+                this.log(`DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}`, true);
+            }
+        }
         for (const col of columns) {
             this.log(`ALTER TABLE ${escapeIdentifier(table)} DROP COLUMN ${escapeIdentifier(col)}`, true);
         }
-        return this.wrapped.deleteColumns(table, columns);
+        return this.wrapped.deleteColumns(table, columns, dropDependentIndexes);
+    }
+
+    async findDependentIndexes(table: string, columns: string[]): Promise<string[]> {
+        this.log(`Finding dependent indexes for ${escapeIdentifier(table)} columns: ${columns.join(', ')}`, false);
+        return this.wrapped.findDependentIndexes(table, columns);
     }
 
     async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {

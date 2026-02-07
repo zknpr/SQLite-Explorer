@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SQLite Explorer</title>
     <!--HEAD-->
-    <style>
+    <style nonce="<!--NONCE-->">
 <!--STYLES-->
     </style>
 </head>
@@ -28,7 +28,7 @@
                     <span class="arrow">▼</span>
                     <span>Tables</span>
                     <span class="badge" id="tablesBadge">0</span>
-                    <button type="button" class="icon-button" id="btnOpenCreateTable" title="Create Table" style="margin-left: auto;">
+                    <button type="button" class="icon-button ml-auto" id="btnOpenCreateTable" title="Create Table">
                         <span class="codicon codicon-add"></span>
                     </button>
                 </div>
@@ -57,16 +57,16 @@
                     <span class="badge" id="batchUpdateCount">0</span>
                 </div>
                 <div class="item-list hidden" id="batchUpdateList">
-                    <div style="padding: 12px;">
-                        <button type="button" class="btn-primary" id="btnApplyBatchUpdate" style="width:100%; margin-bottom:12px">Apply Changes</button>
+                    <div class="batch-update-container">
+                        <button type="button" class="btn-primary batch-update-btn" id="btnApplyBatchUpdate">Apply Changes</button>
                         <div id="batchUpdateFields"></div>
                     </div>
                 </div>
             </div>
 
             <!-- Configuration Section -->
-            <div class="section-title" id="btnOpenSettings" style="border-top: 1px solid var(--border-color); flex-shrink: 0;">
-                <span class="codicon codicon-settings" style="margin-right: 6px;"></span>
+            <div class="section-title settings-section" id="btnOpenSettings">
+                <span class="codicon codicon-settings mr-6"></span>
                 <span>Configuration</span>
             </div>
 
@@ -178,7 +178,7 @@
 
     <!-- Create Table Modal -->
     <div class="modal-overlay hidden" id="createTableModal">
-        <div class="modal-dialog" style="width: 500px;">
+        <div class="modal-dialog modal-dialog-md">
             <div class="modal-header">
                 <span class="modal-title">Create New Table</span>
                 <button type="button" class="modal-close" data-modal="createTableModal">&times;</button>
@@ -191,7 +191,7 @@
                 <div class="form-field">
                     <label>Columns</label>
                     <div id="columnDefinitions"></div>
-                    <button type="button" class="btn-secondary" id="btnAddColumnDef" style="margin-top: 8px;">+ Add Column</button>
+                    <button type="button" class="btn-secondary mt-8" id="btnAddColumnDef">+ Add Column</button>
                 </div>
             </div>
             <div class="modal-footer">
@@ -254,7 +254,7 @@
                 </div>
                 <div class="form-field">
                     <label>Columns</label>
-                    <div id="exportColumns" style="max-height: 150px; overflow-y: auto; border: 1px solid var(--border-color); padding: 8px; border-radius: 3px; background: var(--bg-primary);">
+                    <div id="exportColumns" class="export-columns-list">
                         <!-- Columns populated by JS -->
                     </div>
                 </div>
@@ -274,7 +274,7 @@
 
     <!-- Settings Modal -->
     <div class="modal-overlay hidden" id="settingsModal">
-        <div class="modal-dialog" style="width: 600px;">
+        <div class="modal-dialog modal-dialog-lg">
             <div class="modal-header">
                 <span class="modal-title">Configuration</span>
                 <button type="button" class="modal-close" data-modal="settingsModal">&times;</button>
@@ -309,7 +309,7 @@
                 <button type="button" class="cell-preview-toolbar-btn" id="wrapTextBtn" title="Toggle word wrap">
                     <span class="codicon codicon-word-wrap"></span> Wrap
                 </button>
-                <div style="flex: 1"></div>
+                <div class="flex-spacer"></div>
                 <button type="button" class="cell-preview-toolbar-btn" id="openInVsCodeBtn" title="Edit in VS Code editor">
                     <span class="codicon codicon-code"></span> Edit in VS Code
                 </button>
@@ -320,7 +320,7 @@
             <div class="cell-preview-footer">
                 <div class="cell-preview-info">
                     <span id="cellPreviewCharCount">0 characters</span>
-                    <span id="cellPreviewReadonlyBadge" style="display:none;margin-left:8px;color:var(--warning-color);">Read-only (View)</span>
+                    <span id="cellPreviewReadonlyBadge" class="readonly-badge">Read-only (View)</span>
                 </div>
                 <div class="cell-preview-actions">
                     <button type="button" class="btn-secondary" id="btnCancelCellPreview">Cancel</button>
@@ -332,23 +332,23 @@
 
     <!-- Blob Inspector Modal -->
     <div id="blob-inspector-modal" class="modal-overlay hidden">
-        <div class="modal-dialog blob-inspector" style="min-width: 600px; height: 600px;">
+        <div class="modal-dialog blob-inspector blob-inspector-dialog">
             <div class="modal-header">
                 <span class="modal-title">BLOB Inspector</span>
                 <button type="button" class="modal-close" data-modal="blob-inspector-modal">&times;</button>
             </div>
-            <div class="modal-body" style="padding: 0; display: flex; flex-direction: column; flex: 1; overflow: hidden;">
-                <div class="tabs" style="display: flex; border-bottom: 1px solid var(--border-color); background: var(--bg-tertiary);">
-                    <button class="tab-btn active" data-tab="preview" style="padding: 8px 16px; border: none; background: none; color: var(--text-primary); cursor: pointer; border-bottom: 2px solid var(--accent-color);">Preview</button>
-                    <button class="tab-btn" data-tab="hex" style="padding: 8px 16px; border: none; background: none; color: var(--text-secondary); cursor: pointer;">Hex</button>
+            <div class="modal-body blob-inspector-body">
+                <div class="tabs blob-inspector-tabs">
+                    <button class="tab-btn active" data-tab="preview">Preview</button>
+                    <button class="tab-btn" data-tab="hex">Hex</button>
                 </div>
-                <div id="blob-info" style="padding: 8px 16px; font-size: 11px; color: var(--text-secondary); border-bottom: 1px solid var(--border-color);"></div>
-                <div class="tab-content" id="tab-preview" style="flex: 1; overflow: auto; padding: 16px; display: flex; align-items: center; justify-content: center; background: var(--bg-primary);">
+                <div id="blob-info" class="blob-info-bar"></div>
+                <div class="tab-content blob-preview-pane" id="tab-preview">
                     <!-- Dynamic Content -->
-                    <span style="color: var(--text-secondary);">Select a BLOB to inspect</span>
+                    <span class="blob-preview-placeholder">Select a BLOB to inspect</span>
                 </div>
-                <div class="tab-content" id="tab-hex" style="display: none; flex: 1; overflow: auto;">
-                    <textarea readonly class="hex-dump" style="width: 100%; height: 100%; resize: none; border: none; padding: 12px; font-family: monospace; background: var(--bg-primary); color: var(--text-primary); outline: none;"></textarea>
+                <div class="tab-content blob-hex-pane" id="tab-hex">
+                    <textarea readonly class="hex-dump hex-dump-textarea"></textarea>
                 </div>
             </div>
             <div class="modal-footer">

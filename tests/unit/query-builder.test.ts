@@ -20,8 +20,17 @@ describe('Query Builder', () => {
         filters: [{ column: 'name', value: 'John' }]
       };
       const { sql, params } = buildSelectQuery('users', options);
-      assert.strictEqual(sql, 'SELECT * FROM "users" WHERE "name" LIKE ?');
+      assert.strictEqual(sql, 'SELECT * FROM "users" WHERE "name" LIKE ? ESCAPE \'\\\'');
       assert.deepStrictEqual(params, ['%John%']);
+    });
+
+    it('should escape wildcards in filters', () => {
+      const options = {
+        filters: [{ column: 'name', value: '100%' }]
+      };
+      const { sql, params } = buildSelectQuery('users', options);
+      assert.strictEqual(sql, 'SELECT * FROM "users" WHERE "name" LIKE ? ESCAPE \'\\\'');
+      assert.deepStrictEqual(params, ['%100\\%%']);
     });
 
     it('should handle pagination and sorting', () => {
@@ -33,6 +42,65 @@ describe('Query Builder', () => {
       };
       const { sql } = buildSelectQuery('logs', options);
       assert.strictEqual(sql, 'SELECT * FROM "logs" ORDER BY "created_at" DESC LIMIT 10 OFFSET 20');
+    });
+
+    it('should handle global filter with explicit columns', () => {
+      const options = {
+        columns: ['name', 'description'],
+        globalFilter: 'test'
+      };
+      const { sql, params } = buildSelectQuery('products', options);
+      assert.strictEqual(sql, 'SELECT "name", "description" FROM "products" WHERE ("name" LIKE ? ESCAPE \'\\\' OR "description" LIKE ? ESCAPE \'\\\')');
+      assert.deepStrictEqual(params, ['%test%', '%test%']);
+    });
+
+    it('should handle global filter with default columns (edge case)', () => {
+      // This documents current behavior where default ['*'] results in " * " LIKE ?
+      const options = {
+        globalFilter: 'test'
+      };
+      const { sql, params } = buildSelectQuery('products', options);
+      assert.strictEqual(sql, 'SELECT * FROM "products" WHERE ("*" LIKE ? ESCAPE \'\\\')');
+      assert.deepStrictEqual(params, ['%test%']);
+    });
+
+    it('should handle global filter with empty columns (safe behavior)', () => {
+      const options = {
+        columns: [],
+        globalFilter: 'test'
+      };
+      const { sql, params } = buildSelectQuery('products', options);
+      // Implementation should avoid generating WHERE ()
+      assert.strictEqual(sql, 'SELECT  FROM "products"');
+      assert.deepStrictEqual(params, []);
+    });
+  });
+
+  describe('buildCountQuery', () => {
+    it('should build simple count', () => {
+      const { sql, params } = buildCountQuery('my_table', {});
+      assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM "my_table"');
+      assert.deepStrictEqual(params, []);
+    });
+
+    it('should handle global filter with explicit columns', () => {
+      const options = {
+        columns: ['name', 'description'],
+        globalFilter: 'test'
+      };
+      const { sql, params } = buildCountQuery('products', options);
+      assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM "products" WHERE ("name" LIKE ? ESCAPE \'\\\' OR "description" LIKE ? ESCAPE \'\\\')');
+      assert.deepStrictEqual(params, ['%test%', '%test%']);
+    });
+
+    it('should handle global filter with empty columns (safe behavior)', () => {
+      const options = {
+        columns: [],
+        globalFilter: 'test'
+      };
+      const { sql, params } = buildCountQuery('products', options);
+      assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM "products"');
+      assert.deepStrictEqual(params, []);
     });
   });
 });

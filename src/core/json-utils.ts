@@ -7,7 +7,13 @@
  * SQLite's json_patch works this way.
  */
 
-export function generateMergePatch(original: any, modified: any): any {
+const MAX_DEPTH = 1000;
+
+export function generateMergePatch(original: any, modified: any, depth = 0): any {
+    if (depth > MAX_DEPTH) {
+        throw new Error('JSON merge patch depth limit exceeded');
+    }
+
     if (original === modified) {
         return undefined; // No change
     }
@@ -35,7 +41,7 @@ export function generateMergePatch(original: any, modified: any): any {
             hasChanges = true;
         } else if (originalVal !== modifiedVal) {
             // Modification
-            const subPatch = generateMergePatch(originalVal, modifiedVal);
+            const subPatch = generateMergePatch(originalVal, modifiedVal, depth + 1);
             if (subPatch !== undefined) {
                 patch[key] = subPatch;
                 hasChanges = true;
@@ -61,7 +67,11 @@ export function generateMergePatch(original: any, modified: any): any {
  * @param patch - The patch to apply
  * @returns The modified object (new instance or mutated)
  */
-export function applyMergePatch(target: any, patch: any): any {
+export function applyMergePatch(target: any, patch: any, depth = 0): any {
+    if (depth > MAX_DEPTH) {
+        throw new Error('JSON apply merge patch depth limit exceeded');
+    }
+
     if (patch === null) {
         // If patch is null, it typically means deletion in a parent context,
         // but at the root level, it means the result is null.
@@ -87,7 +97,7 @@ export function applyMergePatch(target: any, patch: any): any {
         if (val === null) {
             delete target[key];
         } else {
-            target[key] = applyMergePatch(target[key], val);
+            target[key] = applyMergePatch(target[key], val, depth + 1);
         }
     }
 

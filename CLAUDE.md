@@ -141,7 +141,7 @@ workerProxy.method(new Transfer(data, [data.buffer]));
 
 ### Content Security Policy (CSP)
 - **Scripts**: Strict nonce-based policy. No `'unsafe-inline'` allowed.
-- **Styles**: `'unsafe-inline'` allowed (currently required for dynamic grid layout/resizing).
+- **Styles**: Nonce-based policy for `<style>` tags. Dynamic inline styles are applied via CSSOM (`element.style.prop = ...`) which is permitted by CSP.
 - **Isolation**: Webview communicates only via RPC.
 
 ### Cross-Site Scripting (XSS) Prevention
@@ -296,9 +296,30 @@ Settings in `package.json` → `contributes.configuration`:
 |---------|---------|-------------|
 | `sqliteExplorer.maxFileSize` | 200 | Max file size in MB (0 = unlimited) |
 | `sqliteExplorer.maxRows` | 0 | Max rows to display (0 = unlimited) |
-| `sqliteExplorer.defaultPageSize` | 1000 | Default page size for pagination |
+| `sqliteExplorer.defaultPageSize` | 500 | Default page size for pagination |
 | `sqliteExplorer.instantCommit` | "never" | Auto-save strategy (always/never/remote-only) |
 | `sqliteExplorer.doubleClickBehavior` | "inline" | Double-click action (inline/modal/vscode) |
+| `sqliteExplorer.queryTimeout` | 30000 | Query execution timeout in ms (prevents runaway queries) |
+| `sqliteExplorer.maxUndoMemory` | 52428800 | Max undo history memory in bytes (default 50MB) |
+
+## Gotchas
+
+### SQL Security
+- **LIKE wildcards**: User input in LIKE queries must use `escapeLikePattern()` with `ESCAPE '\\'` clause
+- **SQL types in DDL**: Always validate with `validateSqlType()` to prevent injection via malicious type strings
+- **NUL bytes**: Strings containing `\0` must be encoded as hex blobs in exported SQL
+
+### RPC Serialization
+- **Uint8Array becomes `{}`**: Never send raw Uint8Array via postMessage - use the marker format
+- **Transfer for blobs**: Large binary data should use `Transfer` wrapper for zero-copy
+
+### Testing
+- **VS Code mocks required**: Unit tests need `tests/mocks/vscode.ts` imported first
+- **JSON patch tests**: Test behavior (merged result) not implementation (SQL function)
+
+### Build
+- **WASM not found**: Run `node scripts/build.mjs` if `assets/sqlite3.wasm` is missing
+- **Browser vs Node**: Check `import.meta.env.VSCODE_BROWSER_EXT` for environment-specific code
 
 ## Extension Identifiers
 

@@ -1,5 +1,59 @@
 # Changelog
 
+## 1.3.0
+
+### Security
+
+- **SQL Wildcard Injection Prevention**: Added `escapeLikePattern()` function to escape `%`, `_`, and `\` characters in LIKE queries. Prevents attackers from crafting inputs that cause expensive full table scans or bypass filters. All filter queries now use `ESCAPE '\\'` clause.
+- **NUL Byte Escaping**: Fixed potential SQL injection via NUL characters in exported SQL strings. Strings containing `\0` are now encoded as hex blobs with `CAST(X'...' AS TEXT)`.
+- **JSON Merge Patch Stack Overflow**: Added `MAX_DEPTH=1000` limit to prevent stack overflow from malicious or deeply nested JSON data.
+- **Unbounded Undo History Memory**: Added `maxMemory` limit (50MB default) to undo history to prevent memory exhaustion on long editing sessions.
+- **CSP Hardening**: Removed unsafe inline styles from webview HTML, extracting 20+ inline styles to CSS classes for stricter Content Security Policy compliance.
+
+### Performance
+
+- **Query Timeout Protection**: Added 30-second query timeout using `iterateStatements` API. Prevents runaway queries from freezing the extension. Timeout is checked during row iteration for interruptible execution.
+- **Async File Operations**: Converted synchronous `fs.existsSync` and `readFileSync` calls to async equivalents in native worker, preventing main thread blocking.
+- **Batch Undo Operations**: Undo/redo for batch cell updates now uses `updateCellBatch` instead of individual transactions, significantly improving performance.
+- **Batch Row Insertions**: Added `insertRowBatch` for bulk row operations, respecting SQLite's 999 parameter limit.
+- **Optimized Pragma Fetching**: Added `queryBatch` for fetching multiple pragmas in a single IPC round-trip.
+- **Native JSON Patch**: Uses SQLite's native `json_patch()` function when available, with JS fallback for older versions.
+
+### Improvements
+
+- **Type Safety**: Replaced `any[]` with proper `Transferable[]` types throughout the RPC layer, removing `@ts-ignore` comments.
+- **Memory Leak Fix**: Fixed listener leak in `cancelTokenToAbortSignal` by properly disposing the cancellation listener after abort.
+- **Table Existence Validation**: Virtual file system now validates table/view existence before attempting cell reads.
+- **Configurable Query Timeout**: Added `sqliteExplorer.queryTimeout` setting (default 30s) to control query execution timeout.
+- **Configurable Undo Memory**: Added `sqliteExplorer.maxUndoMemory` setting (default 50MB) to control undo/redo history memory limit.
+- **Full CSP Compliance**: Removed all `'unsafe-inline'` usage from both scripts and styles. Dynamic styles now use CSSOM which is CSP-compliant.
+
+### Refactoring
+
+- **Extracted Serialization Module**: Moved RPC serialization utilities to `src/core/serialization.ts` for reuse.
+- **WebviewMessageHandler**: Extracted webview message handling to dedicated class for better separation of concerns.
+- **Query Builder DRY**: Extracted `buildFilterConditions` helper to eliminate duplicated filter logic between SELECT and COUNT queries.
+- **Undo/Redo Refactor**: Extracted undo operations into private methods (`undoCellUpdate`, `undoRowInsert`, etc.) for better readability.
+- **BlobInspector Cleanup**: Removed unused `hostBridge` constructor parameter, using `backendApi` consistently.
+- **Worker Endpoint Cleanup**: Removed redundant operations proxy object from worker endpoint initialization.
+- **Type Definitions**: Added `WasmPreparedStatement` interface replacing `any` types for sql.js statements.
+
+### Testing
+
+- **New Test Suites**: Added comprehensive tests for:
+  - `ModificationTracker` serialization/deserialization
+  - `cancelTokenToAbortSignal` utility
+  - `WebviewCollection` management
+  - `getUriParts` URI parsing
+  - `WasmDatabaseEngine.updateCellBatch` batch operations
+  - `WasmDatabaseEngine.addColumn` column creation
+  - `toDatasetAttrs` HTML attribute generation
+  - `SQLiteFileSystemProvider` read/write operations
+  - `escapeLikePattern` wildcard escaping
+  - RPC `Transfer` wrapper handling
+- **VS Code Mocks**: Added comprehensive VS Code API mocks for unit testing extension code.
+- **Test Configuration**: Added `tsconfig.test.json` for proper test compilation with mock paths.
+
 ## 1.2.7
 
 ### Bug Fixes

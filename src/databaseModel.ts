@@ -58,6 +58,9 @@ export const SupportsWriteMode = IsLocalMode || IsRemoteWorkspaceMode;
 /** Maximum modifications to track */
 const MODIFICATION_LIMIT = 100;
 
+/** Default maximum memory for undo history (50MB) */
+const DEFAULT_MAX_UNDO_MEMORY = 50 * 1024 * 1024;
+
 /**
  * Get auto-commit setting from configuration.
  */
@@ -65,6 +68,14 @@ export function isAutoCommitEnabled(): boolean {
   const config = vsc.workspace.getConfiguration(ConfigurationSection);
   const setting = config.get<string>('instantCommit', 'never');
   return setting === 'always' || (setting === 'remote-only' && IsRemoteWorkspaceMode);
+}
+
+/**
+ * Get maximum undo memory from configuration.
+ */
+function getMaxUndoMemory(): number {
+  const config = vsc.workspace.getConfiguration(ConfigurationSection);
+  return config.get<number>('maxUndoMemory', DEFAULT_MAX_UNDO_MEMORY);
 }
 
 // ============================================================================
@@ -192,7 +203,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     private readonly reporter?: TelemetryReporter
   ) {
     super();
-    this.#modificationTracker = tracker ?? new ModificationTracker<DocumentModification>(MODIFICATION_LIMIT);
+    this.#modificationTracker = tracker ?? new ModificationTracker<DocumentModification>(MODIFICATION_LIMIT, getMaxUndoMemory());
     this.#hostBridge = new HostBridge(viewerProvider, this);
     this.#documentKey = generateDatabaseDocumentKey(this.uri);
     this.#documentKey.then(key => DocumentRegistry.set(key, this));

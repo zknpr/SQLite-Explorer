@@ -29,11 +29,25 @@ import { applyMergePatch } from './json-utils';
 // ============================================================================
 
 /**
+ * sql.js prepared statement interface.
+ */
+interface WasmPreparedStatement {
+  run(params?: unknown[]): void;
+  bind(params?: unknown[]): boolean;
+  get(params?: unknown[]): CellValue[] | undefined;
+  step(): boolean;
+  reset(): void;
+  free(): boolean;
+  getColumnNames(): string[];
+}
+
+/**
  * sql.js database instance interface.
  */
 interface WasmDatabaseInstance {
   exec(sql: string, params?: unknown[]): Array<{ columns: string[]; values: unknown[][] }>;
-  prepare(sql: string, params?: unknown[]): any;
+  prepare(sql: string, params?: unknown[]): WasmPreparedStatement;
+  iterateStatements(sql: string): Iterable<WasmPreparedStatement>;
   export(): Uint8Array;
   close(): void;
 }
@@ -50,6 +64,11 @@ interface WasmEngineModule {
 // ============================================================================
 
 /**
+ * Default query timeout in milliseconds (30 seconds).
+ */
+const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+
+/**
  * WebAssembly-based SQLite database engine.
  *
  * Wraps sql.js and provides a clean async API for database operations.
@@ -57,10 +76,12 @@ interface WasmEngineModule {
  */
 class WasmDatabaseEngine implements DatabaseOperations {
   private readonly instance: WasmDatabaseInstance;
+  private readonly queryTimeout: number;
   readonly engineKind = Promise.resolve('wasm' as const);
 
-  constructor(instance: WasmDatabaseInstance) {
+  constructor(instance: WasmDatabaseInstance, timeoutMs: number = DEFAULT_QUERY_TIMEOUT_MS) {
     this.instance = instance;
+    this.queryTimeout = timeoutMs;
   }
 
   /**
@@ -68,26 +89,69 @@ class WasmDatabaseEngine implements DatabaseOperations {
    *
    * Returns results in sql.js compatible format for webview compatibility.
    * The webview expects { columns, values } format from the original sql.js.
+   * Implements query timeout to prevent runaway queries.
    *
    * @param sql - SQL statement to execute
    * @param params - Optional bound parameters
    * @returns Array of result sets in sql.js format
    */
   async executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> {
+    const startTime = Date.now();
+    const results: QueryResultSet[] = [];
+    let currentStmt: WasmPreparedStatement | null = null;
+
     try {
-      const rawResults = this.instance.exec(sql, params);
-      // Return in sql.js compatible format for webview compatibility
-      return rawResults.map(resultSet => ({
-        columns: resultSet.columns,
-        values: resultSet.values as CellValue[][],
-        // Also provide our new format for internal use
-        headers: resultSet.columns,
-        rows: resultSet.values as CellValue[][]
-      })) as QueryResultSet[];
+      const iterator = this.instance.iterateStatements(sql);
+      let isFirstStatement = true;
+
+      for (const stmt of iterator) {
+        currentStmt = stmt;
+
+        // Bind parameters only to the first statement to match exec behavior
+        if (isFirstStatement && params && params.length > 0) {
+          stmt.bind(params as unknown[]);
+        }
+        isFirstStatement = false;
+
+        const rows: CellValue[][] = [];
+
+        while (stmt.step()) {
+          // Check timeout during row iteration
+          if (Date.now() - startTime > this.queryTimeout) {
+            stmt.free();
+            currentStmt = null; // Prevent double-free in catch block
+            throw new Error(`Query execution timed out after ${this.queryTimeout}ms`);
+          }
+          const row = stmt.get();
+          if (row) {
+            rows.push(row);
+          }
+        }
+
+        const columns = stmt.getColumnNames();
+        // Only include results that have columns (matching exec behavior)
+        if (columns.length > 0) {
+          results.push({
+            columns,
+            values: rows,
+            headers: columns,
+            rows
+          });
+        }
+
+        // iterateStatements handles freeing - clear reference
+        currentStmt = null;
+      }
     } catch (err) {
+      // Ensure current statement is freed if iteration was interrupted
+      if (currentStmt) {
+        try { currentStmt.free(); } catch { /* ignore free errors */ }
+      }
       const errorDetail = err instanceof Error ? err.message : String(err);
       throw new Error(`Query failed: ${errorDetail}`);
     }
+
+    return results;
   }
 
   /**
@@ -115,92 +179,121 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * Undo a modification.
    */
   async undoModification(mod: ModificationEntry): Promise<void> {
-    const { modificationType, targetTable, targetRowId, targetColumn, priorValue, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
+    const { modificationType, targetTable } = mod;
     if (!targetTable) return;
 
     switch (modificationType) {
-        case 'cell_update':
-            if (affectedCells) {
-                // Batch undo
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    for (const cell of affectedCells) {
-                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.priorValue ?? null);
-                    }
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
-            } else if (targetRowId !== undefined && targetColumn) {
-                // Single cell undo
-                await this.updateCell(targetTable, targetRowId, targetColumn, priorValue ?? null);
-            }
-            break;
+      case 'cell_update':
+        await this.undoCellUpdate(targetTable, mod);
+        break;
 
-        case 'row_insert':
-            // Undo insert = delete row
-            if (targetRowId !== undefined) {
-                await this.deleteRows(targetTable, [targetRowId]);
-            }
-            break;
+      case 'row_insert':
+        await this.undoRowInsert(targetTable, mod);
+        break;
 
-        case 'row_delete':
-            // Undo delete = re-insert rows
-            if (deletedRows && deletedRows.length > 0) {
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    for (const { rowId, row } of deletedRows) {
-                        // row already contains rowid if needed (handled in HostBridge)
-                        await this.insertRow(targetTable, row);
-                    }
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
-            }
-            break;
+      case 'row_delete':
+        await this.undoRowDelete(targetTable, mod);
+        break;
 
-        case 'column_add':
-            // Undo add column = drop column
-            if (targetColumn) {
-                await this.deleteColumns(targetTable, [targetColumn]);
-            }
-            break;
+      case 'column_add':
+        await this.undoColumnAdd(targetTable, mod);
+        break;
 
-        case 'column_drop':
-            // Undo drop column = add column + restore values
-            if (deletedColumns) {
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    for (const col of deletedColumns) {
-                        await this.addColumn(targetTable, col.name, col.type);
-                        // Restore values
-                     
-                        const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`;
-                        const stmt = this.instance.prepare(sql);
-                        try {
-                            for (const { rowId, value } of col.data) {
-                                stmt.run([value, Number(rowId)]);
-                            }
-                        } finally {
-                            stmt.free();
-                        }
-                    }
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
-            }
-            break;
+      case 'column_drop':
+        await this.undoColumnDrop(targetTable, mod);
+        break;
 
-        case 'table_create':
-            // Undo create table = drop table
-            await this.executeQuery(`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`);
-            break;
+      case 'table_create':
+        await this.undoTableCreate(targetTable);
+        break;
     }
+  }
+
+  private async undoCellUpdate(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { affectedCells, targetRowId, targetColumn, priorValue } = mod;
+    if (affectedCells) {
+      // Batch undo
+      await this.executeQuery('BEGIN TRANSACTION');
+      try {
+        for (const cell of affectedCells) {
+          await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.priorValue ?? null);
+        }
+        await this.executeQuery('COMMIT');
+      } catch (e) {
+        await this.executeQuery('ROLLBACK');
+        throw e;
+      }
+    } else if (targetRowId !== undefined && targetColumn) {
+      // Single cell undo
+      await this.updateCell(targetTable, targetRowId, targetColumn, priorValue ?? null);
+    }
+  }
+
+  private async undoRowInsert(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { targetRowId } = mod;
+    // Undo insert = delete row
+    if (targetRowId !== undefined) {
+      await this.deleteRows(targetTable, [targetRowId]);
+    }
+  }
+
+  private async undoRowDelete(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { deletedRows } = mod;
+    // Undo delete = re-insert rows
+    if (deletedRows && deletedRows.length > 0) {
+      await this.executeQuery('BEGIN TRANSACTION');
+      try {
+        for (const { rowId, row } of deletedRows) {
+          // row already contains rowid if needed (handled in HostBridge)
+          await this.insertRow(targetTable, row);
+        }
+        await this.executeQuery('COMMIT');
+      } catch (e) {
+        await this.executeQuery('ROLLBACK');
+        throw e;
+      }
+    }
+  }
+
+  private async undoColumnAdd(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { targetColumn } = mod;
+    // Undo add column = drop column
+    if (targetColumn) {
+      await this.deleteColumns(targetTable, [targetColumn]);
+    }
+  }
+
+  private async undoColumnDrop(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { deletedColumns } = mod;
+    // Undo drop column = add column + restore values
+    if (deletedColumns) {
+      await this.executeQuery('BEGIN TRANSACTION');
+      try {
+        for (const col of deletedColumns) {
+          await this.addColumn(targetTable, col.name, col.type);
+          // Restore values
+
+          const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`;
+          const stmt = this.instance.prepare(sql);
+          try {
+            for (const { rowId, value } of col.data) {
+              stmt.run([value, Number(rowId)]);
+            }
+          } finally {
+            stmt.free();
+          }
+        }
+        await this.executeQuery('COMMIT');
+      } catch (e) {
+        await this.executeQuery('ROLLBACK');
+        throw e;
+      }
+    }
+  }
+
+  private async undoTableCreate(targetTable: string): Promise<void> {
+    // Undo create table = drop table
+    await this.executeQuery(`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`);
   }
 
   /**
@@ -382,13 +475,74 @@ class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /**
-   * Delete columns by name.
+   * Find indexes that depend on specific columns.
+   *
+   * @param table - Table name
+   * @param columns - Column names to check
+   * @returns Array of index names that reference any of the columns
    */
-  async deleteColumns(table: string, columns: string[]): Promise<void> {
+  async findDependentIndexes(table: string, columns: string[]): Promise<string[]> {
+    const dependentIndexes: string[] = [];
+
+    // Query sqlite_master for indexes on this table
+    const indexQuery = `
+      SELECT name, sql FROM sqlite_master
+      WHERE type = 'index'
+        AND tbl_name = ?
+        AND sql IS NOT NULL
+    `;
+    const indexResult = await this.executeQuery(indexQuery, [table]);
+
+    if (indexResult.length > 0 && indexResult[0].rows) {
+      for (const row of indexResult[0].rows) {
+        const indexName = row[0] as string;
+        const indexSql = row[1] as string;
+
+        // Check if this index references any of the columns
+        const referencesColumn = columns.some(col => {
+          const colLower = col.toLowerCase();
+          // Match column name in index definition (quoted or unquoted)
+          const patterns = [
+            new RegExp(`[\\(,]\\s*${colLower}\\s*[\\),]`, 'i'),
+            new RegExp(`[\\(,]\\s*"${colLower}"\\s*[\\),]`, 'i'),
+            new RegExp(`[\\(,]\\s*\\[${colLower}\\]\\s*[\\),]`, 'i'),
+            new RegExp(`[\\(,]\\s*\`${colLower}\`\\s*[\\),]`, 'i')
+          ];
+          return patterns.some(p => p.test(indexSql));
+        });
+
+        if (referencesColumn) {
+          dependentIndexes.push(indexName);
+        }
+      }
+    }
+
+    return dependentIndexes;
+  }
+
+  /**
+   * Delete columns by name.
+   *
+   * If dropDependentIndexes is provided, those indexes will be dropped first.
+   * Otherwise, deletion may fail if indexes reference the columns.
+   *
+   * @param table - Table name
+   * @param columns - Column names to delete
+   * @param dropDependentIndexes - Optional list of indexes to drop first
+   */
+  async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {
     if (columns.length === 0) return;
 
     const escapedTable = escapeIdentifier(table);
 
+    // Drop specified dependent indexes first
+    if (dropDependentIndexes && dropDependentIndexes.length > 0) {
+      for (const indexName of dropDependentIndexes) {
+        await this.executeQuery(`DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}`);
+      }
+    }
+
+    // Now drop the columns
     for (const col of columns) {
       const sql = `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`;
       await this.executeQuery(sql);
@@ -450,7 +604,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
           const stmt = this.instance.prepare(sql);
 
           // Optimize JSON patch read by preparing the SELECT statement
-          let selectStmt: any = null;
+          let selectStmt: WasmPreparedStatement | null = null;
 
           try {
               if (op === 'json_patch') {
@@ -530,19 +684,28 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
   /**
    * Fetch table data using options.
+   *
+   * NOTE: This method intentionally bypasses the query timeout mechanism.
+   * Unlike raw executeQuery(), fetchTableData() always includes pagination
+   * (LIMIT/OFFSET) which naturally bounds the result size and execution time.
+   * The query builder enforces these limits, making timeout unnecessary here.
    */
   async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
     const { sql, params } = buildSelectQuery(table, options);
 
     // Use prepare/step/get to avoid overhead of exec() which builds intermediate objects
     // and to allow for potentially better memory management in the future
-    let stmt: any = null;
+    let stmt: WasmPreparedStatement | null = null;
     try {
         stmt = this.instance.prepare(sql, params);
         const rows: CellValue[][] = [];
 
         while (stmt.step()) {
-            rows.push(stmt.get());
+            // We know a row exists because step() returned true
+            const row = stmt.get();
+            if (row) {
+                rows.push(row);
+            }
         }
 
         const headers = stmt.getColumnNames();
@@ -777,7 +940,7 @@ export async function createDatabaseEngine(
     wasmInstance = new SqlJsModule.Database();
   }
 
-  const engine = new WasmDatabaseEngine(wasmInstance);
+  const engine = new WasmDatabaseEngine(wasmInstance, config.queryTimeout);
 
   return {
     operations: engine,
@@ -820,57 +983,9 @@ export function createWorkerEndpoint() {
       const result = await createDatabaseEngine(config);
       activeEngine = result.operations as WasmDatabaseEngine;
 
-      // Return proxy object with bound methods
-      // Note: This return value is primarily used for isReadOnly flag.
+      // Return value is primarily used for isReadOnly flag.
       // The actual database operations are accessed via the worker endpoint methods below.
       return {
-        operations: {
-          engineKind: Promise.resolve('wasm'),
-          executeQuery: (sql: string, params?: CellValue[]) =>
-            activeEngine!.executeQuery(sql, params),
-          serializeDatabase: (name: string) =>
-            activeEngine!.serializeDatabase(name),
-          applyModifications: (mods: ModificationEntry[], sig?: AbortSignal) =>
-            activeEngine!.applyModifications(mods, sig),
-          undoModification: (mod: ModificationEntry) =>
-            activeEngine!.undoModification(mod),
-          redoModification: (mod: ModificationEntry) =>
-            activeEngine!.redoModification(mod),
-          flushChanges: (sig?: AbortSignal) =>
-            activeEngine!.flushChanges(sig),
-          discardModifications: (mods: ModificationEntry[], sig?: AbortSignal) =>
-            activeEngine!.discardModifications(mods, sig),
-          updateCell: (table: string, rowId: RecordId, column: string, value: CellValue) =>
-            activeEngine!.updateCell(table, rowId, column, value),
-          insertRow: (table: string, data: Record<string, CellValue>) =>
-            activeEngine!.insertRow(table, data),
-          deleteRows: (table: string, rowIds: RecordId[]) =>
-            activeEngine!.deleteRows(table, rowIds),
-          deleteColumns: (table: string, columns: string[]) =>
-            activeEngine!.deleteColumns(table, columns),
-          createTable: (table: string, columns: ColumnDefinition[]) =>
-            activeEngine!.createTable(table, columns),
-          updateCellBatch: (table: string, updates: CellUpdate[]) =>
-            activeEngine!.updateCellBatch(table, updates),
-          addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
-            activeEngine!.addColumn(table, column, type, defaultValue),
-          fetchTableData: (table: string, options: TableQueryOptions) =>
-            activeEngine!.fetchTableData(table, options),
-          fetchTableCount: (table: string, options: TableCountOptions) =>
-            activeEngine!.fetchTableCount(table, options),
-          fetchSchema: () =>
-            activeEngine!.fetchSchema(),
-          getTableInfo: (table: string) =>
-            activeEngine!.getTableInfo(table),
-          getPragmas: () =>
-            activeEngine!.getPragmas(),
-          setPragma: (pragma: string, value: CellValue) =>
-            activeEngine!.setPragma(pragma, value),
-          ping: () =>
-            activeEngine!.ping(),
-          writeToFile: (path: string) =>
-            activeEngine!.writeToFile(path)
-        },
         isReadOnly: result.isReadOnly
       };
     },
@@ -913,9 +1028,14 @@ export function createWorkerEndpoint() {
       return activeEngine.deleteRows(table, rowIds);
     },
 
-    async deleteColumns(table: string, columns: string[]): Promise<void> {
+    async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {
       if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.deleteColumns(table, columns);
+      return activeEngine.deleteColumns(table, columns, dropDependentIndexes);
+    },
+
+    async findDependentIndexes(table: string, columns: string[]): Promise<string[]> {
+      if (!activeEngine) throw new Error('No database initialized');
+      return activeEngine.findDependentIndexes(table, columns);
     },
 
     async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {

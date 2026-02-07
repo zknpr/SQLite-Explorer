@@ -32,7 +32,7 @@ import { ConfigurationSection } from './config';
 
 // Native worker support (only in Node.js environment)
 let nativeSupport: {
-  isNativeAvailable: (path: string) => boolean;
+  isNativeAvailable: (path: string) => Promise<boolean>;
   createNativeDatabaseConnection: typeof import('./nativeWorker').createNativeDatabaseConnection;
 } | null = null;
 
@@ -65,6 +65,19 @@ export function getMaximumFileSizeBytes(): number {
   return sizeMB * (2 ** 20);
 }
 
+/** Default query timeout in milliseconds (30 seconds) */
+const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+
+/**
+ * Retrieve query timeout from user configuration.
+ *
+ * @returns Query timeout in milliseconds
+ */
+export function getQueryTimeout(): number {
+  const config = vsc.workspace.getConfiguration(ConfigurationSection);
+  return config.get<number>('queryTimeout', DEFAULT_QUERY_TIMEOUT_MS);
+}
+
 // ============================================================================
 // Worker Interface Types
 // ============================================================================
@@ -82,7 +95,8 @@ interface WorkerMethods {
   updateCell(table: string, rowId: string | number, column: string, value: CellValue): Promise<void>;
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   deleteRows(table: string, rowIds: (string | number)[]): Promise<void>;
-  deleteColumns(table: string, columns: string[]): Promise<void>;
+  deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
+  findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
@@ -122,7 +136,7 @@ export async function createDatabaseConnection(
   // Try native SQLite first (desktop Node.js only)
   if (!import.meta.env.VSCODE_BROWSER_EXT && nativeSupport) {
     const extensionPath = extensionUri.fsPath;
-    if (nativeSupport.isNativeAvailable(extensionPath)) {
+    if (await nativeSupport.isNativeAvailable(extensionPath)) {
       try {
         console.log('[SQLite Explorer] Using native SQLite backend');
         const nativeBundle = await nativeSupport.createNativeDatabaseConnection(extensionUri, _reporter);
@@ -197,7 +211,13 @@ async function createWasmDatabaseConnection(
   // Browser Workers use addEventListener, Node.js Workers use .on()
   const workerProxy = connectWorkerPort<WorkerMethods>(
     {
-      postMessage: (data: unknown) => workerThread.postMessage(data),
+      postMessage: (data: unknown, transfer?: Transferable[]) => {
+        if (transfer) {
+          workerThread.postMessage(data, transfer);
+        } else {
+          workerThread.postMessage(data);
+        }
+      },
       on: (event: 'message', handler: (data: unknown) => void) => {
         if (import.meta.env.VSCODE_BROWSER_EXT) {
           // Browser: Web Worker uses addEventListener with MessageEvent wrapper
@@ -209,7 +229,7 @@ async function createWasmDatabaseConnection(
         }
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile']
+    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile']
   );
 
   // Termination handler
@@ -274,12 +294,13 @@ async function createWasmDatabaseConnection(
           maxSize: getMaximumFileSizeBytes(),
           resourceMap: {},
           wasmBinary: wasmContent,
-          readOnlyMode: forceReadOnly ?? false
+          readOnlyMode: forceReadOnly ?? false,
+          queryTimeout: getQueryTimeout()
         };
 
         // Initialize database in worker
         // Use Transfer wrapper to zero-copy transfer the array buffers
-        const transferables: any[] = [];
+        const transferables: Transferable[] = [];
         if (initConfig.content && initConfig.content.buffer) {
             transferables.push(initConfig.content.buffer);
         }
@@ -292,7 +313,7 @@ async function createWasmDatabaseConnection(
 
         const result = await workerProxy.initializeDatabase(
             displayName,
-            new Transfer(initConfig, transferables) as any // Cast to satisfy type signature
+            new Transfer(initConfig, transferables) as unknown as DatabaseInitConfig
         );
 
         // Create operations facade that routes to worker
@@ -327,8 +348,10 @@ async function createWasmDatabaseConnection(
           },
           deleteRows: (table: string, rowIds: (string | number)[]) =>
             workerProxy.deleteRows(table, rowIds),
-          deleteColumns: (table: string, columns: string[]) =>
-            workerProxy.deleteColumns(table, columns),
+          deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
+            workerProxy.deleteColumns(table, columns, dropDependentIndexes),
+          findDependentIndexes: (table: string, columns: string[]) =>
+            workerProxy.findDependentIndexes(table, columns),
           createTable: (table: string, columns: ColumnDefinition[]) =>
             workerProxy.createTable(table, columns),
           updateCellBatch: (table: string, updates: CellUpdate[]) => {
