@@ -1115,3 +1115,140 @@ body {
     background-color: var(--hover-bg);
     outline-offset: -2px;
 }
+
+/* ================================================================
+   UTILITY & NEW CLASSES (Replaces Inline Styles)
+   ================================================================ */
+.header-top-center {
+    height: 100%;
+    justify-content: center;
+}
+
+.error-icon {
+    color: var(--error-color);
+}
+
+.ml-auto {
+    margin-left: auto;
+}
+
+.mr-6 {
+    margin-right: 6px;
+}
+
+.mt-8 {
+    margin-top: 8px;
+}
+
+.settings-section {
+    border-top: 1px solid var(--border-color);
+    flex-shrink: 0;
+}
+
+.batch-update-container {
+    padding: 12px;
+}
+
+.batch-update-btn {
+    width: 100%;
+    margin-bottom: 12px;
+}
+
+.modal-dialog-md {
+    width: 500px;
+}
+
+.modal-dialog-lg {
+    width: 600px;
+}
+
+.export-columns-list {
+    max-height: 150px;
+    overflow-y: auto;
+    border: 1px solid var(--border-color);
+    padding: 8px;
+    border-radius: 3px;
+    background: var(--bg-primary);
+}
+
+.flex-spacer {
+    flex: 1;
+}
+
+.readonly-badge {
+    display: none;
+    margin-left: 8px;
+    color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.blob-inspector-dialog {
+    min-width: 600px;
+    height: 600px;
+}
+
+.blob-inspector-body {
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    overflow: hidden;
+}
+
+.blob-inspector-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
+}
+
+.tab-btn {
+    padding: 8px 16px;
+    border: none;
+    background: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+}
+
+.tab-btn.active {
+    color: var(--text-primary);
+    border-bottom-color: var(--accent-color);
+}
+
+.blob-info-bar {
+    padding: 8px 16px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.blob-preview-pane {
+    flex: 1;
+    overflow: auto;
+    padding: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-primary);
+}
+
+.blob-hex-pane {
+    display: none;
+    flex: 1;
+    overflow: auto;
+}
+
+.hex-dump-textarea {
+    width: 100%;
+    height: 100%;
+    resize: none;
+    border: none;
+    padding: 12px;
+    font-family: monospace;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    outline: none;
+}
+
+.blob-preview-placeholder {
+    color: var(--text-secondary);
+}

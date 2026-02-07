@@ -39,7 +39,7 @@ export function showErrorState(message) {
     if (container) {
         container.innerHTML = `
             <div class="empty-view">
-                <span class="empty-icon codicon codicon-error" style="color: var(--error-color)"></span>
+                <span class="empty-icon codicon codicon-error error-icon"></span>
                 <span class="empty-title">Error</span>
                 <span class="empty-desc">${escapeHtml(message)}</span>
             </div>

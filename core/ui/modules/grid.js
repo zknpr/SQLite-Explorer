@@ -439,7 +439,7 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
         background: 'var(--bg-secondary)'
     });
     rowNumTh.title = 'Click to select all rows';
-    rowNumTh.innerHTML = '<div class="header-content"><div class="header-top" style="height:100%;justify-content:center">#</div></div>';
+    rowNumTh.innerHTML = '<div class="header-content"><div class="header-top header-top-center">#</div></div>';
     headerTr.appendChild(rowNumTh);
 
     for (const col of orderedColumns) {
