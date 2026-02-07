@@ -250,8 +250,13 @@ export class HostBridge implements ToastService {
 
   /**
    * Delete columns.
+   *
+   * If columns have dependent indexes, shows a confirmation dialog to the user.
+   * User can choose to drop the indexes and continue, or cancel the operation.
+   *
+   * @returns Object with `cancelled: true` if user cancelled, otherwise undefined
    */
-  async deleteColumns(table: string, columns: string[]) {
+  async deleteColumns(table: string, columns: string[]): Promise<{ cancelled: boolean } | void> {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
@@ -259,6 +264,33 @@ export class HostBridge implements ToastService {
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
+    }
+
+    // Check for dependent indexes before deletion
+    let dependentIndexes: string[] = [];
+    if ('findDependentIndexes' in document.databaseOperations) {
+      dependentIndexes = await document.databaseOperations.findDependentIndexes(table, columns);
+    }
+
+    // If there are dependent indexes, ask the user for confirmation
+    if (dependentIndexes.length > 0) {
+      const indexList = dependentIndexes.join(', ');
+      const message = vsc.l10n.t(
+        'The following indexes depend on the selected column(s) and will be dropped: {0}',
+        indexList
+      );
+
+      const result = await vsc.window.showWarningMessage(
+        message,
+        { modal: true },
+        { title: vsc.l10n.t('Drop Indexes & Continue'), value: true },
+        { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
+      );
+
+      if (!result?.value) {
+        // User cancelled the operation - return cancelled flag
+        return { cancelled: true };
+      }
     }
 
     // Capture column data before deletion for undo
@@ -303,7 +335,8 @@ export class HostBridge implements ToastService {
     }
 
     if ('deleteColumns' in document.databaseOperations) {
-      await document.databaseOperations.deleteColumns(table, columns);
+      // Pass dependent indexes to be dropped first if user confirmed
+      await document.databaseOperations.deleteColumns(table, columns, dependentIndexes.length > 0 ? dependentIndexes : undefined);
     } else {
       throw new Error("Backend does not support deleteColumns");
     }

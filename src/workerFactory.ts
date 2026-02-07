@@ -95,7 +95,8 @@ interface WorkerMethods {
   updateCell(table: string, rowId: string | number, column: string, value: CellValue): Promise<void>;
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   deleteRows(table: string, rowIds: (string | number)[]): Promise<void>;
-  deleteColumns(table: string, columns: string[]): Promise<void>;
+  deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
+  findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
@@ -228,7 +229,7 @@ async function createWasmDatabaseConnection(
         }
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile']
+    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile']
   );
 
   // Termination handler
@@ -347,8 +348,10 @@ async function createWasmDatabaseConnection(
           },
           deleteRows: (table: string, rowIds: (string | number)[]) =>
             workerProxy.deleteRows(table, rowIds),
-          deleteColumns: (table: string, columns: string[]) =>
-            workerProxy.deleteColumns(table, columns),
+          deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
+            workerProxy.deleteColumns(table, columns, dropDependentIndexes),
+          findDependentIndexes: (table: string, columns: string[]) =>
+            workerProxy.findDependentIndexes(table, columns),
           createTable: (table: string, columns: ColumnDefinition[]) =>
             workerProxy.createTable(table, columns),
           updateCellBatch: (table: string, updates: CellUpdate[]) => {

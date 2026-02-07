@@ -220,7 +220,10 @@ export interface DatabaseOperations {
   deleteRows(table: string, rowIds: RecordId[]): Promise<void>;
 
   /** Delete columns by name */
-  deleteColumns(table: string, columns: string[]): Promise<void>;
+  deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
+
+  /** Find indexes that depend on specific columns */
+  findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
 
   /** Create a new table */
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;

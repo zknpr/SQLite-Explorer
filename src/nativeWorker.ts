@@ -733,13 +733,64 @@ export async function createNativeDatabaseConnection(
         },
 
         /**
-         * Delete columns by name.
+         * Find indexes that depend on specific columns.
          */
-        deleteColumns: async (table: string, columns: string[]) => {
+        findDependentIndexes: async (table: string, columns: string[]): Promise<string[]> => {
+          const dependentIndexes: string[] = [];
+
+          // Query sqlite_master for indexes on this table
+          const indexQuery = `
+            SELECT name, sql FROM sqlite_master
+            WHERE type = 'index'
+              AND tbl_name = ?
+              AND sql IS NOT NULL
+          `;
+          const indexResult = await worker.call<any>('query', [indexQuery, [table]]);
+
+          if (indexResult && indexResult.values) {
+            for (const row of indexResult.values) {
+              const indexName = row[0] as string;
+              const indexSql = row[1] as string;
+
+              // Check if this index references any of the columns
+              const referencesColumn = columns.some(col => {
+                const colLower = col.toLowerCase();
+                // Match column name in index definition (quoted or unquoted)
+                const patterns = [
+                  new RegExp(`[\\(,]\\s*${colLower}\\s*[\\),]`, 'i'),
+                  new RegExp(`[\\(,]\\s*"${colLower}"\\s*[\\),]`, 'i'),
+                  new RegExp(`[\\(,]\\s*\\[${colLower}\\]\\s*[\\),]`, 'i'),
+                  new RegExp(`[\\(,]\\s*\`${colLower}\`\\s*[\\),]`, 'i')
+                ];
+                return patterns.some(p => p.test(indexSql));
+              });
+
+              if (referencesColumn) {
+                dependentIndexes.push(indexName);
+              }
+            }
+          }
+
+          return dependentIndexes;
+        },
+
+        /**
+         * Delete columns by name.
+         * If dropDependentIndexes is provided, those indexes will be dropped first.
+         */
+        deleteColumns: async (table: string, columns: string[], dropDependentIndexes?: string[]) => {
           if (columns.length === 0) return;
 
           const escapedTable = escapeIdentifier(table);
 
+          // Drop specified dependent indexes first
+          if (dropDependentIndexes && dropDependentIndexes.length > 0) {
+            for (const indexName of dropDependentIndexes) {
+              await worker.call('run', [`DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}`]);
+            }
+          }
+
+          // Now drop the columns
           for (const col of columns) {
             const sql = `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`;
             await worker.call('run', [sql]);

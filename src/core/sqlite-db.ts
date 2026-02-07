@@ -475,13 +475,74 @@ class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /**
-   * Delete columns by name.
+   * Find indexes that depend on specific columns.
+   *
+   * @param table - Table name
+   * @param columns - Column names to check
+   * @returns Array of index names that reference any of the columns
    */
-  async deleteColumns(table: string, columns: string[]): Promise<void> {
+  async findDependentIndexes(table: string, columns: string[]): Promise<string[]> {
+    const dependentIndexes: string[] = [];
+
+    // Query sqlite_master for indexes on this table
+    const indexQuery = `
+      SELECT name, sql FROM sqlite_master
+      WHERE type = 'index'
+        AND tbl_name = ?
+        AND sql IS NOT NULL
+    `;
+    const indexResult = await this.executeQuery(indexQuery, [table]);
+
+    if (indexResult.length > 0 && indexResult[0].rows) {
+      for (const row of indexResult[0].rows) {
+        const indexName = row[0] as string;
+        const indexSql = row[1] as string;
+
+        // Check if this index references any of the columns
+        const referencesColumn = columns.some(col => {
+          const colLower = col.toLowerCase();
+          // Match column name in index definition (quoted or unquoted)
+          const patterns = [
+            new RegExp(`[\\(,]\\s*${colLower}\\s*[\\),]`, 'i'),
+            new RegExp(`[\\(,]\\s*"${colLower}"\\s*[\\),]`, 'i'),
+            new RegExp(`[\\(,]\\s*\\[${colLower}\\]\\s*[\\),]`, 'i'),
+            new RegExp(`[\\(,]\\s*\`${colLower}\`\\s*[\\),]`, 'i')
+          ];
+          return patterns.some(p => p.test(indexSql));
+        });
+
+        if (referencesColumn) {
+          dependentIndexes.push(indexName);
+        }
+      }
+    }
+
+    return dependentIndexes;
+  }
+
+  /**
+   * Delete columns by name.
+   *
+   * If dropDependentIndexes is provided, those indexes will be dropped first.
+   * Otherwise, deletion may fail if indexes reference the columns.
+   *
+   * @param table - Table name
+   * @param columns - Column names to delete
+   * @param dropDependentIndexes - Optional list of indexes to drop first
+   */
+  async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {
     if (columns.length === 0) return;
 
     const escapedTable = escapeIdentifier(table);
 
+    // Drop specified dependent indexes first
+    if (dropDependentIndexes && dropDependentIndexes.length > 0) {
+      for (const indexName of dropDependentIndexes) {
+        await this.executeQuery(`DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}`);
+      }
+    }
+
+    // Now drop the columns
     for (const col of columns) {
       const sql = `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`;
       await this.executeQuery(sql);
@@ -967,9 +1028,14 @@ export function createWorkerEndpoint() {
       return activeEngine.deleteRows(table, rowIds);
     },
 
-    async deleteColumns(table: string, columns: string[]): Promise<void> {
+    async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {
       if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.deleteColumns(table, columns);
+      return activeEngine.deleteColumns(table, columns, dropDependentIndexes);
+    },
+
+    async findDependentIndexes(table: string, columns: string[]): Promise<string[]> {
+      if (!activeEngine) throw new Error('No database initialized');
+      return activeEngine.findDependentIndexes(table, columns);
     },
 
     async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {
