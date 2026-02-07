@@ -122,16 +122,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
         case 'cell_update':
             if (affectedCells) {
                 // Batch undo
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    for (const cell of affectedCells) {
-                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.priorValue ?? null);
-                    }
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
+                const updates = affectedCells.map(cell => ({
+                    rowId: cell.rowId,
+                    column: cell.columnName,
+                    value: cell.priorValue ?? null
+                }));
+                await this.updateCellBatch(targetTable, updates);
             } else if (targetRowId !== undefined && targetColumn) {
                 // Single cell undo
                 await this.updateCell(targetTable, targetRowId, targetColumn, priorValue ?? null);
@@ -214,16 +210,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
         case 'cell_update':
             if (affectedCells) {
                 // Batch redo
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    for (const cell of affectedCells) {
-                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.newValue ?? null);
-                    }
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
+                const updates = affectedCells.map(cell => ({
+                    rowId: cell.rowId,
+                    column: cell.columnName,
+                    value: cell.newValue ?? null
+                }));
+                await this.updateCellBatch(targetTable, updates);
             } else if (targetRowId !== undefined && targetColumn) {
                 await this.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
             }
