@@ -57,10 +57,24 @@ interface WasmEngineModule {
  */
 class WasmDatabaseEngine implements DatabaseOperations {
   private readonly instance: WasmDatabaseInstance;
+  private _hasJsonPatch: boolean | undefined;
   readonly engineKind = Promise.resolve('wasm' as const);
 
   constructor(instance: WasmDatabaseInstance) {
     this.instance = instance;
+  }
+
+  private checkJsonPatchSupport(): boolean {
+    if (this._hasJsonPatch !== undefined) {
+      return this._hasJsonPatch;
+    }
+    try {
+      this.instance.exec("SELECT json_patch('{}', '{}')");
+      this._hasJsonPatch = true;
+    } catch {
+      this._hasJsonPatch = false;
+    }
+    return this._hasJsonPatch;
   }
 
   /**
@@ -305,27 +319,34 @@ class WasmDatabaseEngine implements DatabaseOperations {
     let params: CellValue[];
 
     if (patch) {
-        // Fallback to JS implementation of json_patch
-        // Fetch current value
-        const currentResult = await this.executeQuery(`SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} WHERE rowid = ?`, [rowIdNum]);
-        let currentValue = currentResult[0]?.rows[0]?.[0];
+        if (this.checkJsonPatchSupport()) {
+            // Use native json_patch
+            const patchStr = typeof patch === 'string' ? patch : JSON.stringify(patch);
+            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(${escapeIdentifier(column)}, ?) WHERE rowid = ?`;
+            params = [patchStr, rowIdNum];
+        } else {
+            // Fallback to JS implementation of json_patch
+            // Fetch current value
+            const currentResult = await this.executeQuery(`SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} WHERE rowid = ?`, [rowIdNum]);
+            let currentValue = currentResult[0]?.rows[0]?.[0];
 
-        // Parse current JSON
-        let currentObj = {};
-        if (typeof currentValue === 'string') {
-            try { currentObj = JSON.parse(currentValue); } catch {}
-        } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
-             // Already an object? (unlikely from SQLite unless using some extension, usually string)
-             currentObj = currentValue;
+            // Parse current JSON
+            let currentObj = {};
+            if (typeof currentValue === 'string') {
+                try { currentObj = JSON.parse(currentValue); } catch {}
+            } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
+                 // Already an object? (unlikely from SQLite unless using some extension, usually string)
+                 currentObj = currentValue;
+            }
+
+            // Apply patch
+            const patchObj = typeof patch === 'string' ? JSON.parse(patch) : patch;
+            const newValueObj = applyMergePatch(currentObj, patchObj);
+            const newValueStr = JSON.stringify(newValueObj);
+
+            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
+            params = [newValueStr, rowIdNum];
         }
-
-        // Apply patch
-        const patchObj = typeof patch === 'string' ? JSON.parse(patch) : patch;
-        const newValueObj = applyMergePatch(currentObj, patchObj);
-        const newValueStr = JSON.stringify(newValueObj);
-
-        sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
-        params = [newValueStr, rowIdNum];
     } else {
         sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
         params = [value, rowIdNum];
@@ -478,55 +499,69 @@ class WasmDatabaseEngine implements DatabaseOperations {
       for (const [key, columnUpdates] of updatesByColumn.entries()) {
           const [column, op] = key.split('|');
           const escapedColumn = escapeIdentifier(column);
-          const sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+          let sql: string;
 
-          const stmt = this.instance.prepare(sql);
-
-          // Optimize JSON patch read by preparing the SELECT statement
-          let selectStmt: any = null;
-
-          try {
-              if (op === 'json_patch') {
-                 selectStmt = this.instance.prepare(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`);
-              }
-
-              for (const update of columnUpdates) {
-                  const rowIdNum = Number(update.rowId);
-
-                  if (op === 'json_patch') {
-                     // Read using prepared statement
-                     // selectStmt.get([rowIdNum]) returns [val] or undefined
-                     // sql.js documentation says get() returns array of values
-                     let currentValue = null;
-                     if (selectStmt) {
-                        // stmt.get(params) returns the row as an array of values
-                        const row = selectStmt.get([rowIdNum]);
-                        if (row && row.length > 0) {
-                            currentValue = row[0];
-                        }
-
-                        // sqlite3_reset() is required to reuse a prepared statement.
-                        selectStmt.reset();
-                     }
-
-                     let currentObj = {};
-                     if (typeof currentValue === 'string') {
-                         try { currentObj = JSON.parse(currentValue); } catch {}
-                     }
-
-                     const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
-                     const newValueObj = applyMergePatch(currentObj, patchObj);
-                     const newValueStr = JSON.stringify(newValueObj);
-
-                     stmt.run([newValueStr, rowIdNum]);
-                  } else {
-                      // Standard update
-                      stmt.run([update.value, rowIdNum]);
+          if (op === 'json_patch' && this.checkJsonPatchSupport()) {
+              sql = `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(${escapedColumn}, ?) WHERE rowid = ?`;
+              const stmt = this.instance.prepare(sql);
+              try {
+                  for (const update of columnUpdates) {
+                      const patchStr = typeof update.value === 'string' ? update.value : JSON.stringify(update.value);
+                      stmt.run([patchStr, Number(update.rowId)]);
                   }
+              } finally {
+                  stmt.free();
               }
-          } finally {
-              stmt.free();
-              if (selectStmt) selectStmt.free();
+          } else {
+              sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+              const stmt = this.instance.prepare(sql);
+
+              // Optimize JSON patch read by preparing the SELECT statement
+              let selectStmt: any = null;
+
+              try {
+                  if (op === 'json_patch') {
+                     selectStmt = this.instance.prepare(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`);
+                  }
+
+                  for (const update of columnUpdates) {
+                      const rowIdNum = Number(update.rowId);
+
+                      if (op === 'json_patch') {
+                         // Read using prepared statement
+                         // selectStmt.get([rowIdNum]) returns [val] or undefined
+                         // sql.js documentation says get() returns array of values
+                         let currentValue = null;
+                         if (selectStmt) {
+                            // stmt.get(params) returns the row as an array of values
+                            const row = selectStmt.get([rowIdNum]);
+                            if (row && row.length > 0) {
+                                currentValue = row[0];
+                            }
+
+                            // sqlite3_reset() is required to reuse a prepared statement.
+                            selectStmt.reset();
+                         }
+
+                         let currentObj = {};
+                         if (typeof currentValue === 'string') {
+                             try { currentObj = JSON.parse(currentValue); } catch {}
+                         }
+
+                         const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
+                         const newValueObj = applyMergePatch(currentObj, patchObj);
+                         const newValueStr = JSON.stringify(newValueObj);
+
+                         stmt.run([newValueStr, rowIdNum]);
+                      } else {
+                          // Standard update
+                          stmt.run([update.value, rowIdNum]);
+                      }
+                  }
+              } finally {
+                  stmt.free();
+                  if (selectStmt) selectStmt.free();
+              }
           }
       }
 
