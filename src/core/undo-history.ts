@@ -55,6 +55,59 @@ function binaryReviver(_key: string, value: unknown): unknown {
   return value;
 }
 
+/**
+ * Estimate memory size of a value in bytes.
+ *
+ * Counts primitive sizes and structural overhead.
+ * Handles circular references by tracking seen objects.
+ */
+function calculateSize(value: unknown): number {
+  const seen = new Set<any>();
+  const stack = [value];
+  let size = 0;
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+
+    if (current === null || current === undefined) {
+      continue;
+    }
+
+    if (typeof current === 'boolean') {
+      size += 4;
+    } else if (typeof current === 'number') {
+      size += 8;
+    } else if (typeof current === 'string') {
+      size += current.length * 2;
+    } else if (current instanceof Uint8Array) {
+      size += current.byteLength;
+    } else if (typeof current === 'object') {
+      if (seen.has(current)) {
+        continue;
+      }
+      seen.add(current);
+
+      // Overhead for object/array
+      size += 8;
+
+      if (Array.isArray(current)) {
+        for (const item of current) {
+          stack.push(item);
+        }
+      } else {
+        // Plain object
+        for (const key in current) {
+          if (Object.prototype.hasOwnProperty.call(current, key)) {
+            size += key.length * 2;
+            stack.push((current as any)[key]);
+          }
+        }
+      }
+    }
+  }
+  return size;
+}
+
 // ============================================================================
 // Tracker State
 // ============================================================================
@@ -88,17 +141,25 @@ interface TrackerState<T> {
  */
 export class ModificationTracker<T extends LabeledModification = LabeledModification> {
   private timeline: T[] = [];
+  private timelineSizes: number[] = [];
+
   private futureStack: T[] = [];
+  private futureStackSizes: number[] = [];
+
   private checkpointIndex: number = 0;
   private maxEntries: number;
+  private maxMemory: number;
+  private currentSize: number = 0;
 
   /**
    * Create a new modification tracker.
    *
    * @param maxEntries - Maximum number of modifications to track
+   * @param maxMemory - Maximum memory usage in bytes (default 50MB)
    */
-  constructor(maxEntries: number = 100) {
+  constructor(maxEntries: number = 100, maxMemory: number = 50 * 1024 * 1024) {
     this.maxEntries = maxEntries;
+    this.maxMemory = maxMemory;
   }
 
   /**
@@ -110,14 +171,43 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    * @param entry - Modification to record
    */
   record(entry: T): void {
-    this.timeline.push(entry);
-    this.futureStack = []; // Discard redo history
+    // Calculate size of new entry
+    const entrySize = calculateSize(entry);
 
-    // Enforce capacity limit
-    if (this.timeline.length > this.maxEntries) {
-      const overflow = this.timeline.length - this.maxEntries;
-      this.timeline.splice(0, overflow);
-      this.checkpointIndex = Math.max(0, this.checkpointIndex - overflow);
+    // Subtract size of redo history that we are about to discard
+    const redoSize = this.futureStackSizes.reduce((a, b) => a + b, 0);
+    this.currentSize -= redoSize;
+
+    // Discard redo history
+    this.futureStack = [];
+    this.futureStackSizes = [];
+
+    // Add new entry
+    this.timeline.push(entry);
+    this.timelineSizes.push(entrySize);
+    this.currentSize += entrySize;
+
+    // Enforce capacity and memory limits
+    // We remove oldest entries until we are within BOTH limits
+    while (
+      (this.timeline.length > 0) &&
+      (this.timeline.length > this.maxEntries || this.currentSize > this.maxMemory)
+    ) {
+      // Don't remove the just-added entry if it's the only one, to preserve ability to undo at least one step if possible.
+      // However, if strict memory limit is required, we might need to, but let's be practical.
+      if (this.timeline.length === 1) {
+        break;
+      }
+
+      const removedEntrySize = this.timelineSizes.shift();
+      this.timeline.shift();
+
+      if (removedEntrySize !== undefined) {
+        this.currentSize -= removedEntrySize;
+      }
+
+      // Adjust checkpoint index since we shifted the array
+      this.checkpointIndex = Math.max(0, this.checkpointIndex - 1);
     }
   }
 
@@ -128,8 +218,12 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    */
   stepBack(): T | undefined {
     const entry = this.timeline.pop();
+    const size = this.timelineSizes.pop();
+
     if (entry) {
       this.futureStack.push(entry);
+      this.futureStackSizes.push(size || 0);
+      // currentSize doesn't change as entry just moves from timeline to futureStack
     }
     return entry;
   }
@@ -141,8 +235,12 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    */
   stepForward(): T | undefined {
     const entry = this.futureStack.pop();
+    const size = this.futureStackSizes.pop();
+
     if (entry) {
       this.timeline.push(entry);
+      this.timelineSizes.push(size || 0);
+      // currentSize doesn't change as entry just moves from futureStack to timeline
     }
     return entry;
   }
@@ -180,7 +278,10 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     const uncommittedCount = this.timeline.length - this.checkpointIndex;
     if (uncommittedCount > 0) {
       const uncommitted = this.timeline.splice(this.checkpointIndex);
+      const uncommittedSizes = this.timelineSizes.splice(this.checkpointIndex);
+
       this.futureStack.push(...uncommitted.reverse());
+      this.futureStackSizes.push(...uncommittedSizes.reverse());
     }
   }
 
@@ -206,19 +307,25 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    *
    * @param data - Previously serialized state
    * @param maxEntries - Maximum capacity
+   * @param maxMemory - Maximum memory usage in bytes
    * @returns Restored tracker
    */
   static deserialize<T extends LabeledModification>(
     data: Uint8Array,
-    maxEntries: number = 100
+    maxEntries: number = 100,
+    maxMemory?: number
   ): ModificationTracker<T> {
     const jsonStr = new TextDecoder().decode(data);
     // Use binaryReviver to properly restore Uint8Array values
     const payload = JSON.parse(jsonStr, binaryReviver);
 
-    const tracker = new ModificationTracker<T>(maxEntries);
+    const tracker = new ModificationTracker<T>(maxEntries, maxMemory);
     tracker.timeline = payload.timeline || [];
     tracker.checkpointIndex = payload.checkpointIndex || 0;
+
+    // Recalculate sizes
+    tracker.timelineSizes = tracker.timeline.map(calculateSize);
+    tracker.currentSize = tracker.timelineSizes.reduce((a, b) => a + b, 0);
 
     return tracker;
   }
