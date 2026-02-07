@@ -29,11 +29,23 @@ import { applyMergePatch } from './json-utils';
 // ============================================================================
 
 /**
+ * sql.js prepared statement interface.
+ */
+interface WasmPreparedStatement {
+  run(params?: unknown[]): void;
+  get(params?: unknown[]): CellValue[] | undefined;
+  step(): boolean;
+  reset(): void;
+  free(): boolean;
+  getColumnNames(): string[];
+}
+
+/**
  * sql.js database instance interface.
  */
 interface WasmDatabaseInstance {
   exec(sql: string, params?: unknown[]): Array<{ columns: string[]; values: unknown[][] }>;
-  prepare(sql: string, params?: unknown[]): any;
+  prepare(sql: string, params?: unknown[]): WasmPreparedStatement;
   export(): Uint8Array;
   close(): void;
 }
@@ -479,7 +491,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
           const stmt = this.instance.prepare(sql);
 
           // Optimize JSON patch read by preparing the SELECT statement
-          let selectStmt: any = null;
+          let selectStmt: WasmPreparedStatement | null = null;
 
           try {
               if (op === 'json_patch') {
@@ -565,13 +577,17 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
     // Use prepare/step/get to avoid overhead of exec() which builds intermediate objects
     // and to allow for potentially better memory management in the future
-    let stmt: any = null;
+    let stmt: WasmPreparedStatement | null = null;
     try {
         stmt = this.instance.prepare(sql, params);
         const rows: CellValue[][] = [];
 
         while (stmt.step()) {
-            rows.push(stmt.get());
+            // We know a row exists because step() returned true
+            const row = stmt.get();
+            if (row) {
+                rows.push(row);
+            }
         }
 
         const headers = stmt.getColumnNames();
