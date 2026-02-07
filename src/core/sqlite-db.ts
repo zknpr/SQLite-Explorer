@@ -122,16 +122,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
         case 'cell_update':
             if (affectedCells) {
                 // Batch undo
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    for (const cell of affectedCells) {
-                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.priorValue ?? null);
-                    }
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
+                const updates: CellUpdate[] = affectedCells.map(cell => ({
+                    rowId: cell.rowId,
+                    column: cell.columnName,
+                    value: cell.priorValue ?? null
+                }));
+                await this.updateCellBatch(targetTable, updates);
             } else if (targetRowId !== undefined && targetColumn) {
                 // Single cell undo
                 await this.updateCell(targetTable, targetRowId, targetColumn, priorValue ?? null);
@@ -214,16 +210,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
         case 'cell_update':
             if (affectedCells) {
                 // Batch redo
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    for (const cell of affectedCells) {
-                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.newValue ?? null);
-                    }
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
+                const updates: CellUpdate[] = affectedCells.map(cell => ({
+                    rowId: cell.rowId,
+                    column: cell.columnName,
+                    value: cell.newValue ?? null
+                }));
+                await this.updateCellBatch(targetTable, updates);
             } else if (targetRowId !== undefined && targetColumn) {
                 await this.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
             }
@@ -297,43 +289,13 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * Update a single cell value.
    */
   async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<void> {
-    // Validate rowId is a number
-    const rowIdNum = Number(rowId);
-    if (!Number.isFinite(rowIdNum)) {
-      throw new Error(`Invalid rowid: ${rowId}`);
-    }
-
-    let sql: string;
-    let params: CellValue[];
-
-    if (patch) {
-        // Fallback to JS implementation of json_patch
-        // Fetch current value
-        const currentResult = await this.executeQuery(`SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} WHERE rowid = ?`, [rowIdNum]);
-        let currentValue = currentResult[0]?.rows[0]?.[0];
-
-        // Parse current JSON
-        let currentObj = {};
-        if (typeof currentValue === 'string') {
-            try { currentObj = JSON.parse(currentValue); } catch {}
-        } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
-             // Already an object? (unlikely from SQLite unless using some extension, usually string)
-             currentObj = currentValue;
-        }
-
-        // Apply patch
-        const patchObj = typeof patch === 'string' ? JSON.parse(patch) : patch;
-        const newValueObj = applyMergePatch(currentObj, patchObj);
-        const newValueStr = JSON.stringify(newValueObj);
-
-        sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
-        params = [newValueStr, rowIdNum];
-    } else {
-        sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
-        params = [value, rowIdNum];
-    }
-
-    await this.executeQuery(sql, params);
+    const update: CellUpdate = {
+        rowId,
+        column,
+        value: patch !== undefined ? patch : value,
+        operation: patch !== undefined ? 'json_patch' : 'set'
+    };
+    return this.updateCellBatch(table, [update]);
   }
 
   /**
@@ -460,6 +422,10 @@ class WasmDatabaseEngine implements DatabaseOperations {
               for (const update of columnUpdates) {
                   const rowIdNum = Number(update.rowId);
 
+                  if (!Number.isFinite(rowIdNum)) {
+                    throw new Error(`Invalid rowid: ${update.rowId}`);
+                  }
+
                   if (op === 'json_patch') {
                      // Read using prepared statement
                      // selectStmt.get([rowIdNum]) returns [val] or undefined
@@ -479,6 +445,9 @@ class WasmDatabaseEngine implements DatabaseOperations {
                      let currentObj = {};
                      if (typeof currentValue === 'string') {
                          try { currentObj = JSON.parse(currentValue); } catch {}
+                     } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
+                         // Already an object? (unlikely from SQLite unless using some extension, usually string)
+                         currentObj = currentValue;
                      }
 
                      const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
