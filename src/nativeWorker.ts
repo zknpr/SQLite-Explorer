@@ -897,13 +897,17 @@ export async function createNativeDatabaseConnection(
             'auto_vacuum'
           ];
 
+          const queries = pragmasToFetch.map(pragma => ({ sql: `PRAGMA ${pragma}` }));
+          const res = await worker.call<any>('queryBatch', [queries]);
+
           const result: Record<string, CellValue> = {};
 
-          for (const pragma of pragmasToFetch) {
-            const res = await worker.call<any>('query', [`PRAGMA ${pragma}`]);
-            if (res && res.values && res.values.length > 0) {
-              result[pragma] = res.values[0][0];
-            }
+          if (res && res.results && Array.isArray(res.results)) {
+            res.results.forEach((r: any, i: number) => {
+              if (r && r.values && r.values.length > 0) {
+                result[pragmasToFetch[i]] = r.values[0][0];
+              }
+            });
           }
 
           return result;
