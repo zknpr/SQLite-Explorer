@@ -197,7 +197,13 @@ async function createWasmDatabaseConnection(
   // Browser Workers use addEventListener, Node.js Workers use .on()
   const workerProxy = connectWorkerPort<WorkerMethods>(
     {
-      postMessage: (data: unknown) => workerThread.postMessage(data),
+      postMessage: (data: unknown, transfer?: Transferable[]) => {
+        if (transfer) {
+          workerThread.postMessage(data, transfer);
+        } else {
+          workerThread.postMessage(data);
+        }
+      },
       on: (event: 'message', handler: (data: unknown) => void) => {
         if (import.meta.env.VSCODE_BROWSER_EXT) {
           // Browser: Web Worker uses addEventListener with MessageEvent wrapper
@@ -279,7 +285,7 @@ async function createWasmDatabaseConnection(
 
         // Initialize database in worker
         // Use Transfer wrapper to zero-copy transfer the array buffers
-        const transferables: any[] = [];
+        const transferables: Transferable[] = [];
         if (initConfig.content && initConfig.content.buffer) {
             transferables.push(initConfig.content.buffer);
         }
@@ -292,7 +298,7 @@ async function createWasmDatabaseConnection(
 
         const result = await workerProxy.initializeDatabase(
             displayName,
-            new Transfer(initConfig, transferables) as any // Cast to satisfy type signature
+            new Transfer(initConfig, transferables) as unknown as DatabaseInitConfig
         );
 
         // Create operations facade that routes to worker
