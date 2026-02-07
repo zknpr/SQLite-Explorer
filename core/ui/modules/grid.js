@@ -350,7 +350,12 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     const headerHeight = 52;
     const rowHeight = 26;
-    const rowNumWidth = 50;
+
+    // Calculate row number column width based on the largest row number that will be displayed
+    // Base width: 50px for up to 2 digits, add ~8px per additional digit
+    const maxRowNum = state.currentPageIndex * state.rowsPerPage + state.gridData.length;
+    const digitCount = Math.max(2, String(maxRowNum).length);
+    const rowNumWidth = 36 + (digitCount * 8); // Base 36px + 8px per digit
 
     const container = document.getElementById('gridContainer');
     if (!container) return;
