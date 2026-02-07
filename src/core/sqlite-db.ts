@@ -115,92 +115,121 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * Undo a modification.
    */
   async undoModification(mod: ModificationEntry): Promise<void> {
-    const { modificationType, targetTable, targetRowId, targetColumn, priorValue, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
+    const { modificationType, targetTable } = mod;
     if (!targetTable) return;
 
     switch (modificationType) {
-        case 'cell_update':
-            if (affectedCells) {
-                // Batch undo
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    for (const cell of affectedCells) {
-                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.priorValue ?? null);
-                    }
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
-            } else if (targetRowId !== undefined && targetColumn) {
-                // Single cell undo
-                await this.updateCell(targetTable, targetRowId, targetColumn, priorValue ?? null);
-            }
-            break;
+      case 'cell_update':
+        await this.undoCellUpdate(targetTable, mod);
+        break;
 
-        case 'row_insert':
-            // Undo insert = delete row
-            if (targetRowId !== undefined) {
-                await this.deleteRows(targetTable, [targetRowId]);
-            }
-            break;
+      case 'row_insert':
+        await this.undoRowInsert(targetTable, mod);
+        break;
 
-        case 'row_delete':
-            // Undo delete = re-insert rows
-            if (deletedRows && deletedRows.length > 0) {
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    for (const { rowId, row } of deletedRows) {
-                        // row already contains rowid if needed (handled in HostBridge)
-                        await this.insertRow(targetTable, row);
-                    }
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
-            }
-            break;
+      case 'row_delete':
+        await this.undoRowDelete(targetTable, mod);
+        break;
 
-        case 'column_add':
-            // Undo add column = drop column
-            if (targetColumn) {
-                await this.deleteColumns(targetTable, [targetColumn]);
-            }
-            break;
+      case 'column_add':
+        await this.undoColumnAdd(targetTable, mod);
+        break;
 
-        case 'column_drop':
-            // Undo drop column = add column + restore values
-            if (deletedColumns) {
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    for (const col of deletedColumns) {
-                        await this.addColumn(targetTable, col.name, col.type);
-                        // Restore values
-                     
-                        const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`;
-                        const stmt = this.instance.prepare(sql);
-                        try {
-                            for (const { rowId, value } of col.data) {
-                                stmt.run([value, Number(rowId)]);
-                            }
-                        } finally {
-                            stmt.free();
-                        }
-                    }
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
-            }
-            break;
+      case 'column_drop':
+        await this.undoColumnDrop(targetTable, mod);
+        break;
 
-        case 'table_create':
-            // Undo create table = drop table
-            await this.executeQuery(`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`);
-            break;
+      case 'table_create':
+        await this.undoTableCreate(targetTable);
+        break;
     }
+  }
+
+  private async undoCellUpdate(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { affectedCells, targetRowId, targetColumn, priorValue } = mod;
+    if (affectedCells) {
+      // Batch undo
+      await this.executeQuery('BEGIN TRANSACTION');
+      try {
+        for (const cell of affectedCells) {
+          await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.priorValue ?? null);
+        }
+        await this.executeQuery('COMMIT');
+      } catch (e) {
+        await this.executeQuery('ROLLBACK');
+        throw e;
+      }
+    } else if (targetRowId !== undefined && targetColumn) {
+      // Single cell undo
+      await this.updateCell(targetTable, targetRowId, targetColumn, priorValue ?? null);
+    }
+  }
+
+  private async undoRowInsert(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { targetRowId } = mod;
+    // Undo insert = delete row
+    if (targetRowId !== undefined) {
+      await this.deleteRows(targetTable, [targetRowId]);
+    }
+  }
+
+  private async undoRowDelete(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { deletedRows } = mod;
+    // Undo delete = re-insert rows
+    if (deletedRows && deletedRows.length > 0) {
+      await this.executeQuery('BEGIN TRANSACTION');
+      try {
+        for (const { rowId, row } of deletedRows) {
+          // row already contains rowid if needed (handled in HostBridge)
+          await this.insertRow(targetTable, row);
+        }
+        await this.executeQuery('COMMIT');
+      } catch (e) {
+        await this.executeQuery('ROLLBACK');
+        throw e;
+      }
+    }
+  }
+
+  private async undoColumnAdd(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { targetColumn } = mod;
+    // Undo add column = drop column
+    if (targetColumn) {
+      await this.deleteColumns(targetTable, [targetColumn]);
+    }
+  }
+
+  private async undoColumnDrop(targetTable: string, mod: ModificationEntry): Promise<void> {
+    const { deletedColumns } = mod;
+    // Undo drop column = add column + restore values
+    if (deletedColumns) {
+      await this.executeQuery('BEGIN TRANSACTION');
+      try {
+        for (const col of deletedColumns) {
+          await this.addColumn(targetTable, col.name, col.type);
+          // Restore values
+
+          const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`;
+          const stmt = this.instance.prepare(sql);
+          try {
+            for (const { rowId, value } of col.data) {
+              stmt.run([value, Number(rowId)]);
+            }
+          } finally {
+            stmt.free();
+          }
+        }
+        await this.executeQuery('COMMIT');
+      } catch (e) {
+        await this.executeQuery('ROLLBACK');
+        throw e;
+      }
+    }
+  }
+
+  private async undoTableCreate(targetTable: string): Promise<void> {
+    // Undo create table = drop table
+    await this.executeQuery(`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`);
   }
 
   /**
