@@ -63,6 +63,14 @@ export function cellValueToSql(value: CellValue | undefined): string {
     return String(value);
   }
   if (typeof value === 'string') {
+    // Check for NUL characters which are unsafe in SQL scripts
+    // If found, encode as hex blob and cast to TEXT
+    if (value.includes('\0')) {
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(value);
+      const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+      return `CAST(X'${hex}' AS TEXT)`;
+    }
     // Escape single quotes by doubling them (SQL standard)
     return `'${value.replace(/'/g, "''")}'`;
   }
