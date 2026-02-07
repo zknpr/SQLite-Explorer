@@ -85,13 +85,13 @@ const INVOCATION_TIMEOUT_MS = 60000;
  * Wrapper to explicitly mark data for transfer (zero-copy)
  */
 export class Transfer<T> {
-  constructor(public readonly value: T, public readonly transferables: any[]) {}
+  constructor(public readonly value: T, public readonly transferables: Transferable[]) {}
 }
 
 /**
  * Dispatcher function type for sending messages.
  */
-type MessageDispatcher = (envelope: ProtocolEnvelope, transfer?: any[]) => void;
+type MessageDispatcher = (envelope: ProtocolEnvelope, transfer?: Transferable[]) => void;
 
 /**
  * Build a proxy object that forwards method calls to a remote context.
@@ -115,7 +115,7 @@ export function buildMethodProxy<T extends object>(
    * Recursively extract Transfer wrappers from a value.
    * Returns the unwrapped value and collects transferables into the provided array.
    */
-  const extractTransferables = (value: unknown, transferList: any[]): unknown => {
+  const extractTransferables = (value: unknown, transferList: Transferable[]): unknown => {
     // Handle Transfer wrapper
     if (value instanceof Transfer) {
       if (value.transferables) {
@@ -145,7 +145,7 @@ export function buildMethodProxy<T extends object>(
         const correlationId = generateCorrelationId();
 
         // Handle Transfer wrappers (including nested ones)
-        const transferList: any[] = [];
+        const transferList: Transferable[] = [];
         const cleanParameters = parameters.map(p => extractTransferables(p, transferList));
 
         // Set up expiration timer
@@ -189,7 +189,7 @@ type MethodImplementations = Record<string, (...args: any[]) => unknown>;
 /**
  * Response dispatcher type.
  */
-type ResponseDispatcher = (response: ResponseEnvelope, transfer?: any[]) => void;
+type ResponseDispatcher = (response: ResponseEnvelope, transfer?: Transferable[]) => void;
 
 /**
  * Process an incoming protocol message.
@@ -246,7 +246,7 @@ export function processProtocolMessage(
       .then(result => {
         // Handle zero-copy Transfer wrapper in return value
         let payload = result;
-        let transferables: any[] | undefined;
+        let transferables: Transferable[] | undefined;
 
         if (result instanceof Transfer) {
           payload = result.value;
@@ -300,7 +300,7 @@ export function processProtocolMessage(
  * Worker-like interface for message passing.
  */
 interface WorkerPort {
-  postMessage(data: unknown): void;
+  postMessage(data: unknown, transfer?: Transferable[]): void;
   on(event: 'message', handler: (data: unknown) => void): void;
 }
 
@@ -320,7 +320,6 @@ export function connectWorkerPort<T extends object>(
     if (transfer && transfer.length > 0 && typeof port.postMessage === 'function') {
         // Try to pass transfer list
         try {
-            // @ts-ignore - Handle mixed signatures of postMessage
             port.postMessage(envelope, transfer);
         } catch (e) {
             // Fallback if transfer fails (e.g. not supported in this env)
