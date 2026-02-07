@@ -162,7 +162,7 @@
     "build": "npm run compile",
     "package": "npm run build && npx vsce package",
     "package-all": "npm run build && npx vsce package",
-    "test": "npx tsx --test tests/unit/*.test.ts"
+    "test": "npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts"
   },
   "devDependencies": {
     "@types/node": "^25.2.0",
