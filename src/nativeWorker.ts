@@ -63,7 +63,7 @@ const QUERY_TIMEOUT = 30000;
  * @param extensionPath - Extension installation directory
  * @returns Path to native binary or null if unsupported
  */
-function getNativeBinaryPath(extensionPath: string): string | null {
+async function getNativeBinaryPath(extensionPath: string): Promise<string | null> {
   const platform = process.platform;
   const arch = process.arch;
 
@@ -88,11 +88,12 @@ function getNativeBinaryPath(extensionPath: string): string | null {
   const binaryPath = path.join(extensionPath, 'natives', platformDir, binaryName);
 
   // Verify binary exists
-  if (fs.existsSync(binaryPath)) {
+  try {
+    await fs.promises.access(binaryPath, fs.constants.F_OK);
     return binaryPath;
+  } catch {
+    return null;
   }
-
-  return null;
 }
 
 // ============================================================================
@@ -369,8 +370,8 @@ function mapRowsByName(result: any, mapping: Record<string, string>) {
  * @param extensionPath - Extension installation directory
  * @returns True if native binary is available
  */
-export function isNativeAvailable(extensionPath: string): boolean {
-  return getNativeBinaryPath(extensionPath) !== null;
+export async function isNativeAvailable(extensionPath: string): Promise<boolean> {
+  return (await getNativeBinaryPath(extensionPath)) !== null;
 }
 
 /**
@@ -387,7 +388,7 @@ export async function createNativeDatabaseConnection(
   _reporter?: TelemetryReporter
 ): Promise<DatabaseConnectionBundle> {
   const extensionPath = extensionUri.fsPath;
-  const binaryPath = getNativeBinaryPath(extensionPath);
+  const binaryPath = await getNativeBinaryPath(extensionPath);
 
   if (!binaryPath) {
     throw new Error('Native SQLite not available on this platform');

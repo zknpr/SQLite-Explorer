@@ -32,7 +32,7 @@ import { ConfigurationSection } from './config';
 
 // Native worker support (only in Node.js environment)
 let nativeSupport: {
-  isNativeAvailable: (path: string) => boolean;
+  isNativeAvailable: (path: string) => Promise<boolean>;
   createNativeDatabaseConnection: typeof import('./nativeWorker').createNativeDatabaseConnection;
 } | null = null;
 
@@ -122,7 +122,7 @@ export async function createDatabaseConnection(
   // Try native SQLite first (desktop Node.js only)
   if (!import.meta.env.VSCODE_BROWSER_EXT && nativeSupport) {
     const extensionPath = extensionUri.fsPath;
-    if (nativeSupport.isNativeAvailable(extensionPath)) {
+    if (await nativeSupport.isNativeAvailable(extensionPath)) {
       try {
         console.log('[SQLite Explorer] Using native SQLite backend');
         const nativeBundle = await nativeSupport.createNativeDatabaseConnection(extensionUri, _reporter);
