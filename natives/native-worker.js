@@ -266,13 +266,10 @@ async function handleRequest(request) {
                 }
             } else {
                 // Fallback for iterators
-                rows = [];
                 if (params && params.length > 0 && typeof stmt.bind === 'function') {
                     try { stmt.bind(...params); } catch(e) { console.error("bind failed", e); }
                 }
-                for (const row of stmt) {
-                    rows.push(row);
-                }
+                rows = [...stmt];
             }
           } finally {
              if (typeof stmt.finalize === 'function') stmt.finalize();
