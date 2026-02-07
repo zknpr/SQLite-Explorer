@@ -122,34 +122,7 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
-    let patch: string | undefined;
-
-    // Try to generate a JSON patch if applicable
-    if (
-      typeof value === 'string' &&
-      typeof originalValue === 'string' &&
-      (value.startsWith('{') || value.startsWith('[')) &&
-      (originalValue.startsWith('{') || originalValue.startsWith('['))
-    ) {
-      try {
-        const originalObj = JSON.parse(originalValue);
-        const newObj = JSON.parse(value);
-
-        // Only patch if valid JSON objects (not arrays, primitives, null)
-        // SQLite json_patch merge behavior is specific to objects.
-        // RFC 7396 defines how arrays are replaced entirely.
-        if (originalObj && typeof originalObj === 'object' && !Array.isArray(originalObj) &&
-            newObj && typeof newObj === 'object' && !Array.isArray(newObj)) {
-
-            const patchObj = generateMergePatch(originalObj, newObj);
-            if (patchObj !== undefined) {
-                patch = JSON.stringify(patchObj);
-            }
-        }
-      } catch {
-        // Not valid JSON or parse error, ignore and do full update
-      }
-    }
+    const patch = this.tryGeneratePatch(value, originalValue);
 
     // Use specific method instead of generic exec
     // This allows the backend to handle safe SQL construction
@@ -390,11 +363,20 @@ export class HostBridge implements ToastService {
     if ('updateCellBatch' in document.databaseOperations) {
       await document.databaseOperations.updateCellBatch(table, updates);
     } else {
-      // Fallback: execute updates sequentially
-      for (const update of updates) {
-        await this.updateCell(table, update.rowId, update.column, update.value);
-      }
-      return;
+      // Fallback: execute updates in parallel
+      await Promise.all(updates.map(async update => {
+        let patch: string | undefined;
+        let val = update.value;
+
+        if (update.operation === 'json_patch') {
+          patch = update.value as string;
+          val = null; // Value is ignored when patch is provided
+        } else {
+          patch = this.tryGeneratePatch(update.value, update.originalValue);
+        }
+
+        await document.databaseOperations.updateCell(table, update.rowId, update.column, val, patch);
+      }));
     }
 
     // Fire batch edit event
@@ -906,6 +888,38 @@ export class HostBridge implements ToastService {
         }
         await vsc.workspace.fs.writeFile(uri, buffer);
     }
+  }
+
+  /**
+   * Attempt to generate a JSON merge patch between two cell values.
+   */
+  private tryGeneratePatch(value: CellValue, originalValue?: CellValue): string | undefined {
+    if (
+      typeof value === 'string' &&
+      typeof originalValue === 'string' &&
+      (value.startsWith('{') || value.startsWith('[')) &&
+      (originalValue.startsWith('{') || originalValue.startsWith('['))
+    ) {
+      try {
+        const originalObj = JSON.parse(originalValue);
+        const newObj = JSON.parse(value);
+
+        // Only patch if valid JSON objects (not arrays, primitives, null)
+        // SQLite json_patch merge behavior is specific to objects.
+        // RFC 7396 defines how arrays are replaced entirely.
+        if (originalObj && typeof originalObj === 'object' && !Array.isArray(originalObj) &&
+            newObj && typeof newObj === 'object' && !Array.isArray(newObj)) {
+
+            const patchObj = generateMergePatch(originalObj, newObj);
+            if (patchObj !== undefined) {
+                return JSON.stringify(patchObj);
+            }
+        }
+      } catch {
+        // Not valid JSON or parse error, ignore and do full update
+      }
+    }
+    return undefined;
   }
 
   /**
