@@ -184,25 +184,7 @@ export function getUriParts(uri: string | vsc.Uri): {
 // Abort Signal Utilities
 // ============================================================================
 
-/**
- * Convert VS Code CancellationToken to standard AbortSignal.
- *
- * @param token - VS Code cancellation token (or null/undefined)
- * @returns AbortSignal that triggers when token is cancelled
- */
-export function cancelTokenToAbortSignal<T extends vsc.CancellationToken | null | undefined>(
-  token: T
-): T extends null ? undefined : AbortSignal {
-  if (token == null) return undefined as any;
-
-  const controller = new AbortController();
-  if (token.isCancellationRequested) {
-    controller.abort();
-  } else {
-    token.onCancellationRequested(() => controller.abort());
-  }
-  return controller.signal as any;
-}
+export { cancelTokenToAbortSignal } from './core/cancellation-utils';
 
 // ============================================================================
 // Cryptographic Utilities
@@ -337,4 +319,3 @@ export function toBoolString(value?: boolean | null): BoolString | undefined {
   if (value === false) return 'false';
   return undefined;
 }
-
