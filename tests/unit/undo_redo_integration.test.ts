@@ -108,4 +108,63 @@ describe('SQLite Engine Undo/Redo', () => {
             assert.ok(true);
         }
     });
+
+    it('should undo/redo batch cell updates', async () => {
+        // Setup - reset state (Table might be altered by previous tests)
+        await engine.executeQuery("DROP TABLE IF EXISTS users");
+        await engine.executeQuery("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+        await engine.insertRow('users', { id: 1, name: 'Alice' });
+        await engine.insertRow('users', { id: 2, name: 'Bob' });
+        await engine.insertRow('users', { id: 3, name: 'Charlie' });
+
+        // 1. Batch Update
+        // Update everyone to 'Updated'
+        const updates = [
+            { rowId: 1, column: 'name', value: 'Updated', originalValue: 'Alice' },
+            { rowId: 2, column: 'name', value: 'Updated', originalValue: 'Bob' },
+            { rowId: 3, column: 'name', value: 'Updated', originalValue: 'Charlie' }
+        ];
+
+        await engine.updateCellBatch('users', updates);
+
+        // Verify update
+        const result = await engine.executeQuery("SELECT name FROM users ORDER BY id");
+        assert.strictEqual(result[0].rows[0][0], 'Updated');
+        assert.strictEqual(result[0].rows[1][0], 'Updated');
+        assert.strictEqual(result[0].rows[2][0], 'Updated');
+
+        // 2. Undo Update
+        const affectedCells = [
+            { rowId: 1, columnName: 'name', priorValue: 'Alice', newValue: 'Updated' },
+            { rowId: 2, columnName: 'name', priorValue: 'Bob', newValue: 'Updated' },
+            { rowId: 3, columnName: 'name', priorValue: 'Charlie', newValue: 'Updated' }
+        ];
+
+        await engine.undoModification({
+            modificationType: 'cell_update',
+            targetTable: 'users',
+            description: 'Batch update',
+            affectedCells
+        });
+
+        // Verify restored
+        const restored = await engine.executeQuery("SELECT name FROM users ORDER BY id");
+        assert.strictEqual(restored[0].rows[0][0], 'Alice');
+        assert.strictEqual(restored[0].rows[1][0], 'Bob');
+        assert.strictEqual(restored[0].rows[2][0], 'Charlie');
+
+        // 3. Redo Update
+        await engine.redoModification({
+            modificationType: 'cell_update',
+            targetTable: 'users',
+            description: 'Batch update',
+            affectedCells
+        });
+
+        // Verify updated again
+        const reupdated = await engine.executeQuery("SELECT name FROM users ORDER BY id");
+        assert.strictEqual(reupdated[0].rows[0][0], 'Updated');
+        assert.strictEqual(reupdated[0].rows[1][0], 'Updated');
+        assert.strictEqual(reupdated[0].rows[2][0], 'Updated');
+    });
 });
