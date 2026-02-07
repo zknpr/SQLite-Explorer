@@ -150,10 +150,8 @@ class WasmDatabaseEngine implements DatabaseOperations {
             if (deletedRows && deletedRows.length > 0) {
                 await this.executeQuery('BEGIN TRANSACTION');
                 try {
-                    for (const { rowId, row } of deletedRows) {
-                        // row already contains rowid if needed (handled in HostBridge)
-                        await this.insertRow(targetTable, row);
-                    }
+                    const rowsToInsert = deletedRows.map(r => r.row);
+                    await this.insertRowBatch(targetTable, rowsToInsert);
                     await this.executeQuery('COMMIT');
                 } catch (e) {
                     await this.executeQuery('ROLLBACK');
@@ -361,6 +359,41 @@ class WasmDatabaseEngine implements DatabaseOperations {
       return result[0].rows[0][0] as RecordId;
     }
     return undefined;
+  }
+
+  /**
+   * Insert multiple rows in a batch.
+   */
+  async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
+    if (rows.length === 0) return;
+
+    // Assume all rows have the same columns as the first one
+    const columns = Object.keys(rows[0]);
+    if (columns.length === 0) return;
+
+    const escapedTable = escapeIdentifier(table);
+    const colNames = columns.map(escapeIdentifier).join(', ');
+    const placeholders = columns.map(() => '?').join(', ');
+
+    // SQLite parameter limit is usually 999.
+    // We'll use a conservative limit to stay safe.
+    const MAX_PARAMS = 999;
+    const batchSize = Math.floor(MAX_PARAMS / columns.length) || 1;
+
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const chunk = rows.slice(i, i + batchSize);
+      const chunkPlaceholders = chunk.map(() => `(${placeholders})`).join(', ');
+      const sql = `INSERT INTO ${escapedTable} (${colNames}) VALUES ${chunkPlaceholders}`;
+
+      const params: CellValue[] = [];
+      for (const row of chunk) {
+        for (const col of columns) {
+          params.push(row[col] ?? null);
+        }
+      }
+
+      await this.executeQuery(sql, params);
+    }
   }
 
   /**
@@ -906,6 +939,11 @@ export function createWorkerEndpoint() {
     async insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined> {
       if (!activeEngine) throw new Error('No database initialized');
       return activeEngine.insertRow(table, data);
+    },
+
+    async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
+      if (!activeEngine) throw new Error('No database initialized');
+      return activeEngine.insertRowBatch(table, rows);
     },
 
     async deleteRows(table: string, rowIds: RecordId[]): Promise<void> {
