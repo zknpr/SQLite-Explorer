@@ -34,6 +34,7 @@ import { applyMergePatch } from './json-utils';
 interface WasmDatabaseInstance {
   exec(sql: string, params?: unknown[]): Array<{ columns: string[]; values: unknown[][] }>;
   prepare(sql: string, params?: unknown[]): any;
+  iterateStatements(sql: string): IterableIterator<any>;
   export(): Uint8Array;
   close(): void;
 }
@@ -57,11 +58,13 @@ interface WasmEngineModule {
  */
 class WasmDatabaseEngine implements DatabaseOperations {
   private readonly instance: WasmDatabaseInstance;
+  private readonly queryTimeout: number;
   private _hasJsonPatch: boolean | undefined;
   readonly engineKind = Promise.resolve('wasm' as const);
 
-  constructor(instance: WasmDatabaseInstance) {
+  constructor(instance: WasmDatabaseInstance, timeoutMs: number) {
     this.instance = instance;
+    this.queryTimeout = timeoutMs;
   }
 
   private checkJsonPatchSupport(): boolean {
@@ -88,20 +91,59 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * @returns Array of result sets in sql.js format
    */
   async executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> {
+    const startTime = Date.now();
+    const results: QueryResultSet[] = [];
+    let currentStmt: any = null;
+
     try {
-      const rawResults = this.instance.exec(sql, params);
-      // Return in sql.js compatible format for webview compatibility
-      return rawResults.map(resultSet => ({
-        columns: resultSet.columns,
-        values: resultSet.values as CellValue[][],
-        // Also provide our new format for internal use
-        headers: resultSet.columns,
-        rows: resultSet.values as CellValue[][]
-      })) as QueryResultSet[];
+      const iterator = this.instance.iterateStatements(sql);
+      let isFirstStatement = true;
+
+      for (const stmt of iterator) {
+        currentStmt = stmt;
+
+        // Bind parameters only to the first statement to match exec behavior
+        if (isFirstStatement && params && params.length > 0) {
+          stmt.bind(params);
+        }
+        isFirstStatement = false;
+
+        const rows: CellValue[][] = [];
+
+        while (stmt.step()) {
+          // Check timeout
+          if (Date.now() - startTime > this.queryTimeout) {
+             stmt.free(); // Free current statement to prevent leaks
+             throw new Error(`Query execution timed out after ${this.queryTimeout}ms`);
+          }
+          rows.push(stmt.get());
+        }
+
+        const columns = stmt.getColumnNames();
+        // Only include results that have columns (matching exec behavior)
+        if (columns.length > 0) {
+          results.push({
+            columns,
+            values: rows,
+            headers: columns,
+            rows
+          });
+        }
+
+        // iterateStatements handles freeing the statement when we proceed to next or finish
+        // but we clear our reference so we don't try to free it in catch block
+        currentStmt = null;
+      }
     } catch (err) {
+      // Ensure current statement is freed if iteration was interrupted by error/timeout
+      if (currentStmt) {
+        try { currentStmt.free(); } catch {}
+      }
       const errorDetail = err instanceof Error ? err.message : String(err);
       throw new Error(`Query failed: ${errorDetail}`);
     }
+
+    return results;
   }
 
   /**
@@ -837,7 +879,7 @@ export async function createDatabaseEngine(
     wasmInstance = new SqlJsModule.Database();
   }
 
-  const engine = new WasmDatabaseEngine(wasmInstance);
+  const engine = new WasmDatabaseEngine(wasmInstance, config.queryTimeout || 50000);
 
   return {
     operations: engine,

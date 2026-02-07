@@ -326,6 +326,8 @@ export interface DatabaseInitConfig {
   wasmBinary?: Uint8Array;
   /** Open in read-only mode */
   readOnlyMode?: boolean;
+  /** Query execution timeout in milliseconds */
+  queryTimeout?: number;
 }
 
 /**
