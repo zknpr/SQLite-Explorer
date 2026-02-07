@@ -231,10 +231,11 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       // wasm-unsafe-eval is still required for sql.js WASM compilation.
       //
       // NOTE: 'unsafe-inline' for styles has been removed.
+      // The <style> tag in viewer.html uses a nonce for CSP compliance.
       // Dynamic inline styles for column widths and positioning are handled via
-      // CSSOM (element.style.prop = ...) which is allowed by CSP 'self'.
+      // CSSOM (element.style.prop = ...) which is allowed by CSP.
       [cspUtil.scriptSrc]: [webview.cspSource, cspUtil.wasmUnsafeEval, `'nonce-${nonce}'`],
-      [cspUtil.styleSrc]: [webview.cspSource],
+      [cspUtil.styleSrc]: [webview.cspSource, `'nonce-${nonce}'`],
       [cspUtil.imgSrc]: [webview.cspSource, cspUtil.data, cspUtil.blob],
       [cspUtil.fontSrc]: [webview.cspSource],
       [cspUtil.frameSrc]: [cspUtil.none],
