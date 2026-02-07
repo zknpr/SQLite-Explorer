@@ -12,6 +12,7 @@
 
 ### Performance
 
+- **Query Timeout Protection**: Added 30-second query timeout using `iterateStatements` API. Prevents runaway queries from freezing the extension. Timeout is checked during row iteration for interruptible execution.
 - **Async File Operations**: Converted synchronous `fs.existsSync` and `readFileSync` calls to async equivalents in native worker, preventing main thread blocking.
 - **Batch Undo Operations**: Undo/redo for batch cell updates now uses `updateCellBatch` instead of individual transactions, significantly improving performance.
 - **Batch Row Insertions**: Added `insertRowBatch` for bulk row operations, respecting SQLite's 999 parameter limit.
