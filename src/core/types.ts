@@ -213,6 +213,9 @@ export interface DatabaseOperations {
   /** Insert a new row */
   insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined>;
 
+  /** Insert multiple rows in a batch */
+  insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
+
   /** Delete rows by ID */
   deleteRows(table: string, rowIds: RecordId[]): Promise<void>;
 
