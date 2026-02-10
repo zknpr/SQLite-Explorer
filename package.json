@@ -191,7 +191,7 @@
   "dependencies": {
     "@scure/base": "^2.0.0",
     "@vscode/codicons": "^0.0.44",
-    "@vscode/extension-telemetry": "^1.4.0",
+    "@vscode/extension-telemetry": "^1.5.0",
     "sql.js": "^1.13.0"
   }
 }
