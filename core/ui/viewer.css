@@ -98,6 +98,34 @@ body {
     min-height: 0; /* Crucial for nested flex scrolling */
 }
 
+/* Sidebar filter input for filtering tables/views/indexes by name */
+.sidebar-filter-container {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border-color);
+    flex-shrink: 0;
+}
+
+.sidebar-filter-input {
+    width: 100%;
+    padding: 4px 8px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    color: var(--text-primary);
+    font-size: 12px;
+    box-sizing: border-box;
+}
+
+.sidebar-filter-input:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+.sidebar-filter-input::placeholder {
+    color: var(--text-secondary);
+    opacity: 0.7;
+}
+
 .sidebar-actions {
     display: flex;
     gap: 4px;

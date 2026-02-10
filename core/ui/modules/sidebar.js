@@ -14,6 +14,15 @@ export function initSidebar() {
     const sidebarPanel = document.getElementById('sidebarPanel');
     if (!sidebarPanel) return;
 
+    // Sidebar filter: update state and re-render on each keystroke
+    const sidebarFilterInput = document.getElementById('sidebarFilterInput');
+    if (sidebarFilterInput) {
+        sidebarFilterInput.addEventListener('input', () => {
+            state.sidebarFilter = sidebarFilterInput.value;
+            renderSidebar();
+        });
+    }
+
     sidebarPanel.addEventListener('click', (event) => {
         const target = event.target;
 
@@ -114,9 +123,34 @@ export function renderSidebar() {
     const viewsBadge = document.getElementById('viewsBadge');
     const indexesBadge = document.getElementById('indexesBadge');
 
-    if (tablesBadge) tablesBadge.textContent = state.schemaCache.tables.length;
-    if (viewsBadge) viewsBadge.textContent = state.schemaCache.views.length;
-    if (indexesBadge) indexesBadge.textContent = state.schemaCache.indexes.length;
+    // Apply sidebar filter (case-insensitive substring match)
+    const filter = state.sidebarFilter.toLowerCase();
+    const filteredTables = filter
+        ? state.schemaCache.tables.filter(t => t.name.toLowerCase().includes(filter))
+        : state.schemaCache.tables;
+    const filteredViews = filter
+        ? state.schemaCache.views.filter(v => v.name.toLowerCase().includes(filter))
+        : state.schemaCache.views;
+    const filteredIndexes = filter
+        ? state.schemaCache.indexes.filter(i => i.name.toLowerCase().includes(filter))
+        : state.schemaCache.indexes;
+
+    // Update badge counts: show "filtered/total" when filtering, otherwise just total
+    if (tablesBadge) {
+        tablesBadge.textContent = filter
+            ? `${filteredTables.length}/${state.schemaCache.tables.length}`
+            : state.schemaCache.tables.length;
+    }
+    if (viewsBadge) {
+        viewsBadge.textContent = filter
+            ? `${filteredViews.length}/${state.schemaCache.views.length}`
+            : state.schemaCache.views.length;
+    }
+    if (indexesBadge) {
+        indexesBadge.textContent = filter
+            ? `${filteredIndexes.length}/${state.schemaCache.indexes.length}`
+            : state.schemaCache.indexes.length;
+    }
 
     // Helper to render list
     const renderList = (listId, items, type, iconClass, emptyText) => {
@@ -160,13 +194,13 @@ export function renderSidebar() {
         list.appendChild(fragment);
     };
 
-    renderList('tablesList', state.schemaCache.tables, 'table', 'codicon-table', 'No tables');
-    renderList('viewsList', state.schemaCache.views, 'view', 'codicon-eye', 'No views');
+    renderList('tablesList', filteredTables, 'table', 'codicon-table', 'No tables');
+    renderList('viewsList', filteredViews, 'view', 'codicon-eye', 'No views');
 
     const indexesList = document.getElementById('indexesList');
     if (indexesList) {
         indexesList.replaceChildren();
-        if (state.schemaCache.indexes.length === 0) {
+        if (filteredIndexes.length === 0) {
             const li = document.createElement('li');
             li.className = 'list-item';
             li.style.opacity = '0.5';
@@ -174,7 +208,7 @@ export function renderSidebar() {
             indexesList.appendChild(li);
         } else {
             const fragment = document.createDocumentFragment();
-            state.schemaCache.indexes.forEach(i => {
+            filteredIndexes.forEach(i => {
                 const li = document.createElement('li');
                 li.className = 'list-item';
                 li.title = `${i.name} on ${i.table}`;
