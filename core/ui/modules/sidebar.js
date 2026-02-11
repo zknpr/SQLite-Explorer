@@ -194,8 +194,8 @@ export function renderSidebar() {
         list.appendChild(fragment);
     };
 
-    renderList('tablesList', filteredTables, 'table', 'codicon-table', 'No tables');
-    renderList('viewsList', filteredViews, 'view', 'codicon-eye', 'No views');
+    renderList('tablesList', filteredTables, 'table', 'codicon-table', filter ? 'No matching tables' : 'No tables');
+    renderList('viewsList', filteredViews, 'view', 'codicon-eye', filter ? 'No matching views' : 'No views');
 
     const indexesList = document.getElementById('indexesList');
     if (indexesList) {
@@ -204,7 +204,7 @@ export function renderSidebar() {
             const li = document.createElement('li');
             li.className = 'list-item';
             li.style.opacity = '0.5';
-            li.textContent = 'No indexes';
+            li.textContent = filter ? 'No matching indexes' : 'No indexes';
             indexesList.appendChild(li);
         } else {
             const fragment = document.createDocumentFragment();
