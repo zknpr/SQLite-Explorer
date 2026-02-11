@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.1
+
+### Improvements
+
+- **Sidebar Filter**: Added a filter input to the sidebar that lets you search tables, views, and indexes by name. Useful for databases with many tables. Badge counts show filtered/total when a filter is active.
+
 ## 1.3.0
 
 ### Security

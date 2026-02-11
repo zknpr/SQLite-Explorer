@@ -58,6 +58,9 @@ export const state = {
     // Schema cache
     schemaCache: { tables: [], views: [], indexes: [] },
 
+    // Sidebar filter (filters tables, views, indexes by name)
+    sidebarFilter: '',
+
     // Settings
     dateFormat: 'raw', // 'raw', 'local', 'iso', 'relative'
     cellEditBehavior: 'inline' // 'inline', 'modal', 'vscode'
