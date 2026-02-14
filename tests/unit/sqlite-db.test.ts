@@ -80,4 +80,35 @@ describe('WasmDatabaseEngine', () => {
       }
     });
   });
+
+  describe('fetchTableData', () => {
+    it('should correctly filter with globalFilter and implicit columns (*)', async () => {
+      // Create a test table for this case
+      await engine.executeQuery("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, description TEXT)");
+      await engine.insertRow('items', { id: 1, name: 'Apple', description: 'Red fruit' });
+      await engine.insertRow('items', { id: 2, name: 'Banana', description: 'Yellow fruit' });
+
+      const result = await engine.fetchTableData('items', {
+        columns: ['*'],
+        globalFilter: 'Yellow'
+      });
+
+      assert.strictEqual(result.rows.length, 1);
+      assert.strictEqual(result.rows[0][1], 'Banana');
+    });
+
+    it('should correctly count with globalFilter and implicit columns (*)', async () => {
+       const count = await engine.fetchTableCount('items', {
+         columns: ['*'],
+         globalFilter: 'fruit'
+       });
+       assert.strictEqual(count, 2);
+
+       const countYellow = await engine.fetchTableCount('items', {
+        columns: ['*'],
+        globalFilter: 'Yellow'
+      });
+      assert.strictEqual(countYellow, 1);
+    });
+  });
 });

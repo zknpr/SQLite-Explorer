@@ -550,6 +550,17 @@ class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /**
+   * Helper to resolve wildcard columns to explicit column names when using global filter.
+   */
+  private async resolveQueryColumns(table: string, columns: string[] | undefined, globalFilter: string | undefined): Promise<string[] | undefined> {
+    if (globalFilter && (!columns || (columns.length === 1 && columns[0] === '*'))) {
+      const tableInfo = await this.getTableInfo(table);
+      return tableInfo.map(c => c.identifier);
+    }
+    return columns;
+  }
+
+  /**
    * Create a new table.
    */
   async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {
@@ -691,7 +702,10 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * The query builder enforces these limits, making timeout unnecessary here.
    */
   async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
-    const { sql, params } = buildSelectQuery(table, options);
+    const queryOptions = { ...options };
+    queryOptions.columns = await this.resolveQueryColumns(table, queryOptions.columns, queryOptions.globalFilter);
+
+    const { sql, params } = buildSelectQuery(table, queryOptions);
 
     // Use prepare/step/get to avoid overhead of exec() which builds intermediate objects
     // and to allow for potentially better memory management in the future
@@ -727,7 +741,10 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * Fetch table row count using options.
    */
   async fetchTableCount(table: string, options: TableCountOptions): Promise<number> {
-    const { sql, params } = buildCountQuery(table, options);
+    const queryOptions = { ...options };
+    queryOptions.columns = await this.resolveQueryColumns(table, queryOptions.columns, queryOptions.globalFilter);
+
+    const { sql, params } = buildCountQuery(table, queryOptions);
     const result = await this.executeQuery(sql, params);
     if (result && result.length > 0 && result[0].rows.length > 0) {
       const count = result[0].rows[0][0];
