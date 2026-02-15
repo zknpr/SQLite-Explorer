@@ -321,6 +321,38 @@ export interface TableCountOptions {
 }
 
 // ============================================================================
+// Export Types
+// ============================================================================
+
+/**
+ * Parameters identifying the database and table for export.
+ */
+export interface DbParams {
+  /** Database filename */
+  filename?: string;
+  /** Table name to export */
+  table: string;
+  /** Schema/display name */
+  name?: string;
+  /** Document URI */
+  uri?: string;
+}
+
+/**
+ * Options controlling export format and behavior.
+ */
+export interface ExportOptions {
+  /** Output format */
+  format?: string;
+  /** Include column header row */
+  header?: boolean;
+  /** Include table name in SQL output */
+  includeTableName?: boolean;
+  /** Specific row IDs to export */
+  rowIds?: (string | number)[];
+}
+
+// ============================================================================
 // Worker Communication Types
 // ============================================================================
 

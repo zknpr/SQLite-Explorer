@@ -14,24 +14,16 @@ import { ConfigurationSection, ExtensionId, FullExtensionId, SidebarLeft, Sideba
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions } from './core/types';
 import { generateMergePatch } from './core/json-utils';
 import { escapeIdentifier } from './core/sql-utils';
-
-// Legacy DbParams type for backward compatibility with webview
-interface DbParams {
-  filename?: string;
-  table: string;
-  name?: string;
-  uri?: string;
-}
 
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
 
 // Column type information
 interface ColumnTypeInfo {
-  [key: string]: any;
+  [key: string]: unknown;
 }
 
 // Toast service interface for showing dialogs
@@ -562,7 +554,7 @@ export class HostBridge implements ToastService {
   /**
    * Apply edits to the database.
    */
-  async applyEdits(edits: any, signal?: any) {
+  async applyEdits(edits: ModificationEntry[], signal?: AbortSignal) {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
@@ -573,7 +565,7 @@ export class HostBridge implements ToastService {
   /**
    * Undo a database edit.
    */
-  async undo(edit: any) {
+  async undo(edit: ModificationEntry) {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
@@ -584,7 +576,7 @@ export class HostBridge implements ToastService {
   /**
    * Redo a database edit.
    */
-  async redo(edit: any) {
+  async redo(edit: ModificationEntry) {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
@@ -595,7 +587,7 @@ export class HostBridge implements ToastService {
   /**
    * Commit changes to the database.
    */
-  async commit(signal?: any) {
+  async commit(signal?: AbortSignal) {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
@@ -606,7 +598,7 @@ export class HostBridge implements ToastService {
   /**
    * Rollback changes to the database.
    */
-  async rollback(edits: any, signal?: any) {
+  async rollback(edits: ModificationEntry[], signal?: AbortSignal) {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
@@ -725,7 +717,7 @@ export class HostBridge implements ToastService {
         cellParts = [params.table, params.name || '-', '__create__.sql'];
       } else {
         // Determine file extension based on content type
-        const extname = await determineCellExtension(colTypes, value, type);
+        const extname = await determineCellExtension(value, type);
         const cellFilename = (colName || 'cell') + extname;
 
         // Use simple path structure
@@ -833,7 +825,7 @@ export class HostBridge implements ToastService {
    * @param exportOptions - Export format options
    * @param extras - Additional options
    */
-  async exportTable(dbParams: DbParams, columns: string[], dbOptions?: any, tableStore?: any, exportOptions?: any, extras?: any) {
+  async exportTable(dbParams: DbParams, columns: string[], dbOptions?: unknown, tableStore?: unknown, exportOptions?: ExportOptions, extras?: unknown) {
     // Inject the URI of the current document so the command knows which database to use
     const enrichedParams = {
       ...dbParams,
@@ -986,7 +978,7 @@ export class HostBridge implements ToastService {
  * @param type - File type result
  * @returns File extension including the dot
  */
-async function determineCellExtension(colTypes: ColumnTypeInfo, value?: CellValue, type?: CellContentType): Promise<string> {
+async function determineCellExtension(value?: CellValue, type?: CellContentType): Promise<string> {
   // Default to .txt for text, .bin for binary
   if (value instanceof Uint8Array || (value && typeof value === 'object' && 'buffer' in value)) {
     // Check if it's a known binary format
