@@ -355,14 +355,18 @@ function exportToCsv(columns: string[], rows: CellValue[][], includeHeader: bool
     return str;
   };
 
-  const lines = [];
+  const rowCount = rows.length;
+  const totalLines = rowCount + (includeHeader ? 1 : 0);
+  const lines = new Array(totalLines);
+  let idx = 0;
+
   if (includeHeader) {
-    lines.push(columns.map(escapeCsvValue).join(','));
+    lines[idx++] = columns.map(escapeCsvValue).join(',');
   }
 
-  rows.forEach(row => {
-    lines.push(row.map(escapeCsvValue).join(','));
-  });
+  for (let i = 0; i < rowCount; i++) {
+    lines[idx++] = rows[i].map(escapeCsvValue).join(',');
+  }
 
   return lines.join('\n');
 }
