@@ -7,18 +7,10 @@
 
 import * as vsc from 'vscode';
 import type { TelemetryReporter } from '@vscode/extension-telemetry';
-import type { CellValue } from './core/types';
+import type { CellValue, DbParams, ExportOptions } from './core/types';
 import type { DatabaseDocument } from './databaseModel';
 import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
-
-// Legacy DbParams type for backward compatibility with webview
-interface DbParams {
-  filename?: string;
-  table: string;
-  name?: string;
-  uri?: string;
-}
 
 /**
  * Export table data to CSV or JSON file.
@@ -36,10 +28,10 @@ export async function exportTableCommand(
   reporter: TelemetryReporter | undefined,
   dbParams: DbParams,
   columns: string[],
-  _dbOptions?: any,
-  _tableStore?: any,
-  _exportOptions?: { format?: string, header?: boolean, includeTableName?: boolean, rowIds?: (string | number)[] },
-  _extras?: any
+  _dbOptions?: unknown,
+  _tableStore?: unknown,
+  _exportOptions?: ExportOptions,
+  _extras?: unknown
 ) {
   try {
     const tableName = dbParams.table;

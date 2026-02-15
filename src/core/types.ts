@@ -366,3 +366,27 @@ export interface DialogButton {
   /** Whether clicking closes dialog */
   isCloseAction?: boolean;
 }
+
+// ============================================================================
+// Export Types
+// ============================================================================
+
+/**
+ * Parameters for database operations.
+ */
+export interface DbParams {
+  filename?: string;
+  table: string;
+  name?: string;
+  uri?: string;
+}
+
+/**
+ * Options for table export.
+ */
+export interface ExportOptions {
+  format?: string;
+  header?: boolean;
+  includeTableName?: boolean;
+  rowIds?: (string | number)[];
+}

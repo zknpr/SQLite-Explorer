@@ -14,17 +14,9 @@ import { ConfigurationSection, ExtensionId, FullExtensionId, SidebarLeft, Sideba
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, DbParams, ExportOptions } from './core/types';
 import { generateMergePatch } from './core/json-utils';
 import { escapeIdentifier } from './core/sql-utils';
-
-// Legacy DbParams type for backward compatibility with webview
-interface DbParams {
-  filename?: string;
-  table: string;
-  name?: string;
-  uri?: string;
-}
 
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
@@ -833,7 +825,7 @@ export class HostBridge implements ToastService {
    * @param exportOptions - Export format options
    * @param extras - Additional options
    */
-  async exportTable(dbParams: DbParams, columns: string[], dbOptions?: any, tableStore?: any, exportOptions?: any, extras?: any) {
+  async exportTable(dbParams: DbParams, columns: string[], dbOptions?: unknown, tableStore?: unknown, exportOptions?: ExportOptions, extras?: unknown) {
     // Inject the URI of the current document so the command knows which database to use
     const enrichedParams = {
       ...dbParams,

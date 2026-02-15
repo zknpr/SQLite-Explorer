@@ -6,13 +6,7 @@ import { ExtensionId, FullExtensionId, FileNestingPatternsAdded, FirstInstallMs,
 import { disposeAll } from './lifecycle';
 import { registerEditorProvider } from './editorController';
 import { SQLiteFileSystemProvider } from './virtualFileSystem';
-
-export type DbParams = {
-  filename: string,
-  table: string,
-  name: string,
-  uri?: string,
-}
+import type { DbParams, ExportOptions } from './core/types';
 
 export let GlobalOutputChannel: vsc.OutputChannel|null = null;
 
@@ -42,7 +36,7 @@ export async function activate(context: vsc.ExtensionContext) {
 
   // Register export table command
   context.subscriptions.push(
-    vsc.commands.registerCommand(`${ExtensionId}.exportTable`, (dbParams: DbParams, columns: string[], dbOptions?: any, tableStore?: any, exportOptions?: any, extras?: any) =>
+    vsc.commands.registerCommand(`${ExtensionId}.exportTable`, (dbParams: DbParams, columns: string[], dbOptions?: unknown, tableStore?: unknown, exportOptions?: ExportOptions, extras?: unknown) =>
       exportTableCommand(context, reporter, dbParams, columns, dbOptions, tableStore, exportOptions, extras)),
   );
 
