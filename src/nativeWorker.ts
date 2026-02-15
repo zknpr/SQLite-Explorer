@@ -29,7 +29,10 @@ import type {
   TableCountOptions,
   SchemaSnapshot,
   ColumnMetadata,
-  ColumnDefinition
+  ColumnDefinition,
+  TableMetadata,
+  ViewMetadata,
+  IndexMetadata
 } from './core/types';
 import { escapeIdentifier, cellValueToSql, validateSqlType } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -345,14 +348,25 @@ class NativeWorkerProcess {
 // Database Connection Factory
 // ============================================================================
 
+interface NativeQueryResult {
+  columns: string[];
+  values: CellValue[][];
+  rowCount?: number;
+}
+
+interface NativeQueryBatchResult {
+  results: NativeQueryResult[];
+}
+
 // Helper to safely map rows by column name
-function mapRowsByName(result: any, mapping: Record<string, string>) {
+/** @internal */
+export function mapRowsByName<T = Record<string, CellValue>>(result: NativeQueryResult | undefined | null, mapping: Record<string, string>): T[] {
   if (!result || !result.columns || !result.values) return [];
 
-  const headers = result.columns as string[];
+  const headers = result.columns;
   const headerMap = new Map(headers.map((h, i) => [h, i]));
 
-  return result.values.map((row: any[]) => {
+  return result.values.map((row) => {
     const obj: any = {};
     for (const [targetProp, sourceCol] of Object.entries(mapping)) {
       const idx = headerMap.get(sourceCol);
@@ -360,7 +374,7 @@ function mapRowsByName(result: any, mapping: Record<string, string>) {
         obj[targetProp] = row[idx];
       }
     }
-    return obj;
+    return obj as T;
   });
 }
 
@@ -449,11 +463,7 @@ export async function createNativeDatabaseConnection(
         engineKind: Promise.resolve('native'),
 
         executeQuery: async (sql: string, params?: CellValue[]): Promise<QueryResultSet[]> => {
-          const result = await worker.call<{
-            columns: string[];
-            values: CellValue[][];
-            rowCount: number;
-          }>('query', [sql, params]);
+          const result = await worker.call<NativeQueryResult>('query', [sql, params]);
 
           // Return in QueryResultSet format with multiple property names for compatibility:
           // - headers/rows: new naming convention from src/core/types.ts
@@ -715,6 +725,36 @@ export async function createNativeDatabaseConnection(
         },
 
         /**
+         * Insert multiple rows in a batch.
+         */
+        insertRowBatch: async (table: string, rows: Record<string, CellValue>[]) => {
+          if (rows.length === 0) return;
+
+          const batchItems: { sql: string; params: CellValue[] }[] = [];
+          const escapedTable = escapeIdentifier(table);
+
+          for (const row of rows) {
+            const columns = Object.keys(row);
+            let sql: string;
+            let params: CellValue[] = [];
+
+            if (columns.length === 0) {
+              sql = `INSERT INTO ${escapedTable} DEFAULT VALUES`;
+            } else {
+              const colNames = columns.map(escapeIdentifier).join(', ');
+              const placeholders = columns.map(() => '?').join(', ');
+              params = columns.map(col => row[col]);
+              sql = `INSERT INTO ${escapedTable} (${colNames}) VALUES (${placeholders})`;
+            }
+            batchItems.push({ sql, params });
+          }
+
+          if (batchItems.length > 0) {
+            await worker.call('execBatch', [batchItems]);
+          }
+        },
+
+        /**
          * Delete rows by ID.
          */
         deleteRows: async (table: string, rowIds: RecordId[]) => {
@@ -745,7 +785,7 @@ export async function createNativeDatabaseConnection(
               AND tbl_name = ?
               AND sql IS NOT NULL
           `;
-          const indexResult = await worker.call<any>('query', [indexQuery, [table]]);
+          const indexResult = await worker.call<NativeQueryResult>('query', [indexQuery, [table]]);
 
           if (indexResult && indexResult.values) {
             for (const row of indexResult.values) {
@@ -825,7 +865,7 @@ export async function createNativeDatabaseConnection(
          */
         fetchTableData: async (table: string, options: TableQueryOptions) => {
           const { sql, params } = buildSelectQuery(table, options);
-          const result = await worker.call<any>('query', [sql, params]);
+          const result = await worker.call<NativeQueryResult>('query', [sql, params]);
 
           let headers = result.columns;
           let rows = result.values;
@@ -879,9 +919,10 @@ export async function createNativeDatabaseConnection(
          */
         fetchTableCount: async (table: string, options: TableCountOptions) => {
           const { sql, params } = buildCountQuery(table, options);
-          const result = await worker.call<any>('query', [sql, params]);
+          const result = await worker.call<NativeQueryResult>('query', [sql, params]);
           if (result && result.values && result.values.length > 0) {
-            return result.values[0][0];
+            const val = result.values[0][0];
+            return typeof val === 'number' ? val : 0;
           }
           return 0;
         },
@@ -895,14 +936,14 @@ export async function createNativeDatabaseConnection(
 
           // Run queries in parallel
           const [tablesResult, viewsResult, indexesResult] = await Promise.all([
-            worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"]),
-            worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='view' ORDER BY name"]),
-            worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name"])
+            worker.call<NativeQueryResult>('query', ["SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"]),
+            worker.call<NativeQueryResult>('query', ["SELECT name FROM sqlite_schema WHERE type='view' ORDER BY name"]),
+            worker.call<NativeQueryResult>('query', ["SELECT name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name"])
           ]);
 
-          const tables = mapRowsByName(tablesResult, { identifier: 'name' });
-          const views = mapRowsByName(viewsResult, { identifier: 'name' });
-          const indexes = mapRowsByName(indexesResult, { identifier: 'name', parentTable: 'tbl_name' });
+          const tables = mapRowsByName<TableMetadata>(tablesResult, { identifier: 'name' });
+          const views = mapRowsByName<ViewMetadata>(viewsResult, { identifier: 'name' });
+          const indexes = mapRowsByName<IndexMetadata>(indexesResult, { identifier: 'name', parentTable: 'tbl_name' });
 
           return { tables, views, indexes } as SchemaSnapshot;
         },
@@ -911,10 +952,10 @@ export async function createNativeDatabaseConnection(
          * Get table metadata.
          */
         getTableInfo: async (table: string) => {
-          const result = await worker.call<any>('query', [`PRAGMA table_info(${escapeIdentifier(table)})`]);
+          const result = await worker.call<NativeQueryResult>('query', [`PRAGMA table_info(${escapeIdentifier(table)})`]);
 
           // Map columns by name to handle unpredictable column order from native worker
-          const headers = result.columns as string[];
+          const headers = result.columns;
           const idx = {
             cid: headers.indexOf('cid'),
             name: headers.indexOf('name'),
@@ -950,12 +991,12 @@ export async function createNativeDatabaseConnection(
           ];
 
           const queries = pragmasToFetch.map(pragma => ({ sql: `PRAGMA ${pragma}` }));
-          const res = await worker.call<any>('queryBatch', [queries]);
+          const res = await worker.call<NativeQueryBatchResult>('queryBatch', [queries]);
 
           const result: Record<string, CellValue> = {};
 
           if (res && res.results && Array.isArray(res.results)) {
-            res.results.forEach((r: any, i: number) => {
+            res.results.forEach((r, i) => {
               if (r && r.values && r.values.length > 0) {
                 result[pragmasToFetch[i]] = r.values[0][0];
               }
