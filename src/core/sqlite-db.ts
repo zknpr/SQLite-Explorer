@@ -23,6 +23,7 @@ import type {
 import { escapeIdentifier, cellValueToSql, validateSqlType } from './sql-utils';
 import { buildSelectQuery, buildCountQuery } from './query-builder';
 import { applyMergePatch } from './json-utils';
+import { getNodeFs } from './platform';
 
 // ============================================================================
 // Internal sql.js Types
@@ -880,9 +881,8 @@ class WasmDatabaseEngine implements DatabaseOperations {
   async writeToFile(path: string): Promise<void> {
     const data = this.instance.export();
 
-    // Dynamic require to avoid bundling fs
-    if (typeof require === 'function') {
-        const fs = require('fs');
+    const fs = getNodeFs();
+    if (fs) {
         await fs.promises.writeFile(path, data);
     } else {
         throw new Error('File system access not available');
@@ -925,8 +925,8 @@ export async function createDatabaseEngine(
       try {
           // Dynamic require to avoid bundling fs in browser builds if not polyfilled
           // In actual build, this code path only runs in Node worker
-          if (typeof require === 'function') {
-              const fs = require('fs');
+          const fs = getNodeFs();
+          if (fs) {
               // Validate size
               const stats = fs.statSync(config.filePath);
               if (config.maxSize > 0 && stats.size > config.maxSize) {
