@@ -20,6 +20,46 @@ describe('RPC Serialization', () => {
             assert.strictEqual(typeof result.base64, 'string');
         });
 
+        it('should serialize DataView to marker object', () => {
+            const buffer = new ArrayBuffer(4);
+            const view = new DataView(buffer);
+            view.setUint8(0, 10);
+            view.setUint8(1, 20);
+
+            const result = serializeValue(view) as any;
+            assert.strictEqual(result.__type, 'Uint8Array');
+
+            // Verify content
+            const decoded = base64ToUint8Array(result.base64);
+            assert.deepStrictEqual(decoded, new Uint8Array([10, 20, 0, 0]));
+        });
+
+        it('should serialize other TypedArrays (Float32Array) to marker object', () => {
+            const floatArr = new Float32Array([1.5]);
+            const result = serializeValue(floatArr) as any;
+
+            assert.strictEqual(result.__type, 'Uint8Array');
+
+            // Verify content by reinterpreting bytes
+            const decoded = base64ToUint8Array(result.base64);
+            const decodedFloat = new Float32Array(decoded.buffer);
+            assert.strictEqual(decodedFloat[0], 1.5);
+        });
+
+        it('should handle ArrayBuffer views with offset and length', () => {
+            // Create a buffer with [0, 1, 2, 3, 4, 5]
+            const buffer = new Uint8Array([0, 1, 2, 3, 4, 5]).buffer;
+
+            // Create a view on the middle part: [2, 3]
+            const view = new Uint8Array(buffer, 2, 2);
+
+            const result = serializeValue(view) as any;
+            assert.strictEqual(result.__type, 'Uint8Array');
+
+            const decoded = base64ToUint8Array(result.base64);
+            assert.deepStrictEqual(decoded, new Uint8Array([2, 3]));
+        });
+
         it('should recursively serialize objects', () => {
             const obj = {
                 a: 1,
