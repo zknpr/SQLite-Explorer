@@ -782,18 +782,22 @@ export async function createNativeDatabaseConnection(
           if (columns.length === 0) return;
 
           const escapedTable = escapeIdentifier(table);
+          const batch: { sql: string; params?: CellValue[] }[] = [];
 
           // Drop specified dependent indexes first
           if (dropDependentIndexes && dropDependentIndexes.length > 0) {
             for (const indexName of dropDependentIndexes) {
-              await worker.call('run', [`DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}`]);
+              batch.push({ sql: `DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}` });
             }
           }
 
           // Now drop the columns
           for (const col of columns) {
-            const sql = `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`;
-            await worker.call('run', [sql]);
+            batch.push({ sql: `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}` });
+          }
+
+          if (batch.length > 0) {
+            await worker.call('execBatch', [batch]);
           }
         },
 
