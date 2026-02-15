@@ -201,21 +201,23 @@ type MethodImplementations = Record<string, (...args: any[]) => unknown>;
 type ResponseDispatcher = (response: ResponseEnvelope, transfer?: Transferable[]) => void;
 
 /**
- * Process an incoming protocol message.
- *
- * For invocation requests: executes local method and sends response.
- * For response messages: resolves pending promise.
- *
- * @param envelope - Incoming protocol message
- * @param localMethods - Optional local method implementations
- * @param sendResponse - Optional function to send responses
- * @returns true if message was handled, false otherwise
- */
-/**
  * Callback for handling log messages forwarded from a worker.
  */
 type LogHandler = (level: 'log' | 'warn' | 'error', args: unknown[]) => void;
 
+/**
+ * Process an incoming protocol message.
+ *
+ * For invocation requests: executes local method and sends response.
+ * For response messages: resolves pending promise.
+ * For log messages: forwards to the provided log handler.
+ *
+ * @param envelope - Incoming protocol message
+ * @param localMethods - Optional local method implementations
+ * @param sendResponse - Optional function to send responses
+ * @param onLog - Optional callback for worker log messages
+ * @returns true if message was handled, false otherwise
+ */
 export function processProtocolMessage(
   envelope: unknown,
   localMethods?: MethodImplementations,

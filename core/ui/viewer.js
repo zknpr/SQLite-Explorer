@@ -67,14 +67,6 @@ async function initializeApp() {
         initSidebarResize();
         initDragAndDrop();
 
-        // Read configuration from environment
-        const vscodeEnv = document.getElementById('vscode-env');
-        if (vscodeEnv) {
-             if (vscodeEnv.dataset.cellEditBehavior) {
-                 state.cellEditBehavior = vscodeEnv.dataset.cellEditBehavior;
-             }
-        }
-
         updateStatus('Connecting to database...');
 
         const result = await backendApi.initialize();
@@ -157,6 +149,16 @@ async function initializeApp() {
         } else {
             updateStatus('Ready');
             showEmptyState();
+        }
+
+        // Apply VS Code extension settings last so they override any restored state.
+        // This ensures that if the user changes a setting while a tab is hidden,
+        // the new setting takes effect when the tab is re-shown.
+        const vscodeEnv = document.getElementById('vscode-env');
+        if (vscodeEnv) {
+            if (vscodeEnv.dataset.cellEditBehavior) {
+                state.cellEditBehavior = vscodeEnv.dataset.cellEditBehavior;
+            }
         }
 
         // Global shortcuts
