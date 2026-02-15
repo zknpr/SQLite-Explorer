@@ -144,8 +144,6 @@ export async function submitExport() {
         await backendApi.exportTable(
             { table: state.selectedTable },
             columns,
-            null, // dbOptions
-            null, // tableStore
             { format, ...options } // exportOptions
         );
 

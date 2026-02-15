@@ -30,16 +30,14 @@ interface DbParams {
  * @param reporter - Telemetry reporter (unused in this version)
  * @param dbParams - Database parameters containing table name
  * @param columns - Array of column names to export
+ * @param exportOptions - Export options (format, header, etc.)
  */
 export async function exportTableCommand(
   context: vsc.ExtensionContext,
   reporter: TelemetryReporter | undefined,
   dbParams: DbParams,
   columns: string[],
-  _dbOptions?: any,
-  _tableStore?: any,
-  _exportOptions?: { format?: string, header?: boolean, includeTableName?: boolean, rowIds?: (string | number)[] },
-  _extras?: any
+  exportOptions?: { format?: string, header?: boolean, includeTableName?: boolean, rowIds?: (string | number)[] }
 ) {
   try {
     const tableName = dbParams.table;
@@ -48,7 +46,7 @@ export async function exportTableCommand(
       return;
     }
 
-    let formatValue: string | undefined = _exportOptions?.format;
+    let formatValue: string | undefined = exportOptions?.format;
 
     // If format not provided in options, ask user
     if (!formatValue) {
@@ -95,8 +93,8 @@ export async function exportTableCommand(
       return;
     }
 
-    const includeHeader = _exportOptions?.header ?? true;
-    const includeTableName = _exportOptions?.includeTableName ?? true;
+    const includeHeader = exportOptions?.header ?? true;
+    const includeTableName = exportOptions?.includeTableName ?? true;
 
     // Determine extension
     let defaultExt = 'csv';
@@ -177,8 +175,8 @@ export async function exportTableCommand(
                     params.push(lastId);
 
                     // Add rowIds filter if present
-                    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-                        const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+                    if (exportOptions?.rowIds && exportOptions.rowIds.length > 0) {
+                        const validIds = exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
                         if (validIds.length > 0) {
                             sql += ` AND rowid IN (${validIds.map(() => '?').join(',')})`;
                             params.push(...validIds);
@@ -191,8 +189,8 @@ export async function exportTableCommand(
                     sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
 
                     // Add rowIds filter if present
-                    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-                        const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+                    if (exportOptions?.rowIds && exportOptions.rowIds.length > 0) {
+                        const validIds = exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
                         if (validIds.length > 0) {
                             // Filter logic for non-rowid tables would go here
                         }
@@ -285,8 +283,8 @@ export async function exportTableCommand(
     const params: any[] = [];
 
     // Filter by row IDs if provided
-    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-        const rowIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+    if (exportOptions?.rowIds && exportOptions.rowIds.length > 0) {
+        const rowIds = exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
         if (rowIds.length > 0) {
             const placeholders = rowIds.map(() => '?').join(', ');
             sql += ` WHERE rowid IN (${placeholders})`;

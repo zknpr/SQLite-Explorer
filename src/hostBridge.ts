@@ -828,18 +828,15 @@ export class HostBridge implements ToastService {
    *
    * @param dbParams - Database and table parameters
    * @param columns - Column names to export
-   * @param dbOptions - Database options
-   * @param tableStore - Table store data
    * @param exportOptions - Export format options
-   * @param extras - Additional options
    */
-  async exportTable(dbParams: DbParams, columns: string[], dbOptions?: any, tableStore?: any, exportOptions?: any, extras?: any) {
+  async exportTable(dbParams: DbParams, columns: string[], exportOptions?: any) {
     // Inject the URI of the current document so the command knows which database to use
     const enrichedParams = {
       ...dbParams,
       uri: this.document.uri.toString()
     };
-    await vsc.commands.executeCommand(`${ExtensionId}.exportTable`, enrichedParams, columns, dbOptions, tableStore, exportOptions, extras);
+    await vsc.commands.executeCommand(`${ExtensionId}.exportTable`, enrichedParams, columns, exportOptions);
   }
 
   /**

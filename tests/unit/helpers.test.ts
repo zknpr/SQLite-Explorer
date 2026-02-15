@@ -1,3 +1,4 @@
+import './vscode_mock_setup';
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { getUriParts } from '../../src/helpers';

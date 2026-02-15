@@ -280,8 +280,8 @@ export const backendApi = {
     exportDb: (filename) => sendRpcRequest('exportDb', [filename]),
     refreshFile: () => sendRpcRequest('refreshFile', []),
     fireEditEvent: (edit) => sendRpcRequest('fireEditEvent', [edit]),
-    exportTable: (dbParams, columns, dbOptions, tableStore, exportOptions, extras) =>
-        sendRpcRequest('exportTable', [dbParams, columns, dbOptions, tableStore, exportOptions, extras]),
+    exportTable: (dbParams, columns, exportOptions) =>
+        sendRpcRequest('exportTable', [dbParams, columns, exportOptions]),
 
     // Database operations
     updateCell: (table, rowId, column, value, originalValue) =>

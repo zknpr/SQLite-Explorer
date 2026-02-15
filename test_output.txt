@@ -1,0 +1,1106 @@
+TAP version 13
+# Subtest: API Coverage
+    # Subtest: should fetchTableData using prepare/step/get
+    ok 1 - should fetchTableData using prepare/step/get
+      ---
+      duration_ms: 3.441074
+      type: 'test'
+      ...
+    # Subtest: should updateCellBatch using prepare/run
+    ok 2 - should updateCellBatch using prepare/run
+      ---
+      duration_ms: 2.296475
+      type: 'test'
+      ...
+    1..2
+ok 1 - API Coverage
+  ---
+  duration_ms: 104.429845
+  type: 'suite'
+  ...
+# Subtest: Cancellation Utils
+    # Subtest: cancelTokenToAbortSignal
+        # Subtest: should return undefined if token is null
+        ok 1 - should return undefined if token is null
+          ---
+          duration_ms: 1.711894
+          type: 'test'
+          ...
+        # Subtest: should return undefined if token is undefined
+        ok 2 - should return undefined if token is undefined
+          ---
+          duration_ms: 0.283919
+          type: 'test'
+          ...
+        # Subtest: should return AbortSignal if token is provided
+        ok 3 - should return AbortSignal if token is provided
+          ---
+          duration_ms: 0.399356
+          type: 'test'
+          ...
+        # Subtest: should abort if token is already cancelled
+        ok 4 - should abort if token is already cancelled
+          ---
+          duration_ms: 0.227499
+          type: 'test'
+          ...
+        # Subtest: should abort when token is cancelled later
+        ok 5 - should abort when token is cancelled later
+          ---
+          duration_ms: 0.422183
+          type: 'test'
+          ...
+        1..5
+    ok 1 - cancelTokenToAbortSignal
+      ---
+      duration_ms: 4.506596
+      type: 'suite'
+      ...
+    1..1
+ok 2 - Cancellation Utils
+  ---
+  duration_ms: 5.236728
+  type: 'suite'
+  ...
+# Subtest: getUriParts
+    # Subtest: should parse simple file path string
+    ok 1 - should parse simple file path string
+      ---
+      duration_ms: 1.556539
+      type: 'test'
+      ...
+    # Subtest: should parse simple file path URI
+    ok 2 - should parse simple file path URI
+      ---
+      duration_ms: 0.529528
+      type: 'test'
+      ...
+    # Subtest: should parse file without extension
+    ok 3 - should parse file without extension
+      ---
+      duration_ms: 0.257912
+      type: 'test'
+      ...
+    # Subtest: should parse file in root
+    ok 4 - should parse file in root
+      ---
+      duration_ms: 0.18279
+      type: 'test'
+      ...
+    # Subtest: should parse just filename
+    ok 5 - should parse just filename
+      ---
+      duration_ms: 0.16479
+      type: 'test'
+      ...
+    # Subtest: should handle special characters and decoding
+    ok 6 - should handle special characters and decoding
+      ---
+      duration_ms: 2.011501
+      type: 'test'
+      ...
+    1..6
+ok 3 - getUriParts
+  ---
+  duration_ms: 7.797
+  type: 'suite'
+  ...
+# Subtest: toDatasetAttrs
+    # Subtest: should return empty string for empty object
+    ok 1 - should return empty string for empty object
+      ---
+      duration_ms: 1.515787
+      type: 'test'
+      ...
+    # Subtest: should format string values correctly
+    ok 2 - should format string values correctly
+      ---
+      duration_ms: 0.412501
+      type: 'test'
+      ...
+    # Subtest: should format boolean values correctly
+    ok 3 - should format boolean values correctly
+      ---
+      duration_ms: 0.444099
+      type: 'test'
+      ...
+    # Subtest: should omit undefined values
+    ok 4 - should omit undefined values
+      ---
+      duration_ms: 0.240584
+      type: 'test'
+      ...
+    # Subtest: should convert camelCase keys to dash-case
+    ok 5 - should convert camelCase keys to dash-case
+      ---
+      duration_ms: 0.382836
+      type: 'test'
+      ...
+    # Subtest: should handle mixed types
+    ok 6 - should handle mixed types
+      ---
+      duration_ms: 0.289897
+      type: 'test'
+      ...
+    # Subtest: should join multiple attributes with space
+    ok 7 - should join multiple attributes with space
+      ---
+      duration_ms: 0.265079
+      type: 'test'
+      ...
+    1..7
+ok 4 - toDatasetAttrs
+  ---
+  duration_ms: 5.228843
+  type: 'suite'
+  ...
+# Subtest: toBoolString
+    # Subtest: should return "true" for true
+    ok 1 - should return "true" for true
+      ---
+      duration_ms: 0.4599
+      type: 'test'
+      ...
+    # Subtest: should return "false" for false
+    ok 2 - should return "false" for false
+      ---
+      duration_ms: 0.277495
+      type: 'test'
+      ...
+    # Subtest: should return undefined for null or undefined
+    ok 3 - should return undefined for null or undefined
+      ---
+      duration_ms: 0.409325
+      type: 'test'
+      ...
+    1..3
+ok 5 - toBoolString
+  ---
+  duration_ms: 1.637924
+  type: 'suite'
+  ...
+# Subtest: JSON Patch Optimization
+    # Subtest: should apply json patch when updating cell with string patch
+    ok 1 - should apply json patch when updating cell with string patch
+      ---
+      duration_ms: 4.419028
+      type: 'test'
+      ...
+    # Subtest: should apply json patch when updating cell with object patch
+    ok 2 - should apply json patch when updating cell with object patch
+      ---
+      duration_ms: 1.189882
+      type: 'test'
+      ...
+    # Subtest: should apply json patch when updating batch cells
+    ok 3 - should apply json patch when updating batch cells
+      ---
+      duration_ms: 1.977707
+      type: 'test'
+      ...
+    # Subtest: should handle json patch on null/empty cell
+    ok 4 - should handle json patch on null/empty cell
+      ---
+      duration_ms: 1.979018
+      type: 'test'
+      ...
+    1..4
+ok 6 - JSON Patch Optimization
+  ---
+  duration_ms: 111.007187
+  type: 'suite'
+  ...
+# Subtest: JSON Merge Patch (RFC 7396)
+    # Subtest: generateMergePatch
+        # Subtest: should return undefined if objects are identical
+        ok 1 - should return undefined if objects are identical
+          ---
+          duration_ms: 1.329565
+          type: 'test'
+          ...
+        # Subtest: should detect added keys
+        ok 2 - should detect added keys
+          ---
+          duration_ms: 1.335405
+          type: 'test'
+          ...
+        # Subtest: should detect modified keys
+        ok 3 - should detect modified keys
+          ---
+          duration_ms: 0.253512
+          type: 'test'
+          ...
+        # Subtest: should detect deleted keys
+        ok 4 - should detect deleted keys
+          ---
+          duration_ms: 0.205771
+          type: 'test'
+          ...
+        # Subtest: should handle nested objects
+        ok 5 - should handle nested objects
+          ---
+          duration_ms: 0.333431
+          type: 'test'
+          ...
+        # Subtest: should replace arrays entirely
+        ok 6 - should replace arrays entirely
+          ---
+          duration_ms: 0.306484
+          type: 'test'
+          ...
+        # Subtest: should handle complex nesting
+        ok 7 - should handle complex nesting
+          ---
+          duration_ms: 0.454138
+          type: 'test'
+          ...
+        1..7
+    ok 1 - generateMergePatch
+      ---
+      duration_ms: 5.575257
+      type: 'suite'
+      ...
+    # Subtest: applyMergePatch
+        # Subtest: should modify property
+        ok 1 - should modify property
+          ---
+          duration_ms: 0.595574
+          type: 'test'
+          ...
+        # Subtest: should add property
+        ok 2 - should add property
+          ---
+          duration_ms: 0.329657
+          type: 'test'
+          ...
+        # Subtest: should remove property
+        ok 3 - should remove property
+          ---
+          duration_ms: 0.387579
+          type: 'test'
+          ...
+        # Subtest: should handle nested patches
+        ok 4 - should handle nested patches
+          ---
+          duration_ms: 0.216088
+          type: 'test'
+          ...
+        # Subtest: should replace arrays
+        ok 5 - should replace arrays
+          ---
+          duration_ms: 0.23848
+          type: 'test'
+          ...
+        # Subtest: should not mutate original object deeply
+        ok 6 - should not mutate original object deeply
+          ---
+          duration_ms: 0.176039
+          type: 'test'
+          ...
+        1..6
+    ok 2 - applyMergePatch
+      ---
+      duration_ms: 2.502744
+      type: 'suite'
+      ...
+    1..2
+ok 7 - JSON Merge Patch (RFC 7396)
+  ---
+  duration_ms: 9.093079
+  type: 'suite'
+  ...
+# Subtest: JSON Merge Patch Security
+    # Subtest: generateMergePatch should throw on deep recursion
+    ok 1 - generateMergePatch should throw on deep recursion
+      ---
+      duration_ms: 3.741525
+      type: 'test'
+      ...
+    # Subtest: applyMergePatch should throw on deep recursion
+    ok 2 - applyMergePatch should throw on deep recursion
+      ---
+      duration_ms: 2.328941
+      type: 'test'
+      ...
+    # Subtest: should handle cyclic references by depth limit
+    ok 3 - should handle cyclic references by depth limit
+      ---
+      duration_ms: 5.859327
+      type: 'test'
+      ...
+    1..3
+ok 8 - JSON Merge Patch Security
+  ---
+  duration_ms: 13.466271
+  type: 'suite'
+  ...
+# Subtest: Query Builder
+    # Subtest: buildSelectQuery
+        # Subtest: should build simple select *
+        ok 1 - should build simple select *
+          ---
+          duration_ms: 2.182066
+          type: 'test'
+          ...
+        # Subtest: should select specific columns
+        ok 2 - should select specific columns
+          ---
+          duration_ms: 0.434447
+          type: 'test'
+          ...
+        # Subtest: should handle filters
+        ok 3 - should handle filters
+          ---
+          duration_ms: 0.512999
+          type: 'test'
+          ...
+        # Subtest: should escape wildcards in filters
+        ok 4 - should escape wildcards in filters
+          ---
+          duration_ms: 0.528935
+          type: 'test'
+          ...
+        # Subtest: should handle pagination and sorting
+        ok 5 - should handle pagination and sorting
+          ---
+          duration_ms: 0.217543
+          type: 'test'
+          ...
+        # Subtest: should handle global filter with explicit columns
+        ok 6 - should handle global filter with explicit columns
+          ---
+          duration_ms: 0.268837
+          type: 'test'
+          ...
+        # Subtest: should handle global filter with default columns (edge case)
+        ok 7 - should handle global filter with default columns (edge case)
+          ---
+          duration_ms: 0.393307
+          type: 'test'
+          ...
+        # Subtest: should handle global filter with empty columns (safe behavior)
+        ok 8 - should handle global filter with empty columns (safe behavior)
+          ---
+          duration_ms: 0.218292
+          type: 'test'
+          ...
+        1..8
+    ok 1 - buildSelectQuery
+      ---
+      duration_ms: 6.400585
+      type: 'suite'
+      ...
+    # Subtest: buildCountQuery
+        # Subtest: should build simple count
+        ok 1 - should build simple count
+          ---
+          duration_ms: 0.410032
+          type: 'test'
+          ...
+        # Subtest: should handle global filter with explicit columns
+        ok 2 - should handle global filter with explicit columns
+          ---
+          duration_ms: 0.532903
+          type: 'test'
+          ...
+        # Subtest: should handle global filter with empty columns (safe behavior)
+        ok 3 - should handle global filter with empty columns (safe behavior)
+          ---
+          duration_ms: 0.258789
+          type: 'test'
+          ...
+        1..3
+    ok 2 - buildCountQuery
+      ---
+      duration_ms: 1.528138
+      type: 'suite'
+      ...
+    1..2
+ok 9 - Query Builder
+  ---
+  duration_ms: 9.011419
+  type: 'suite'
+  ...
+# Subtest: Revert Logic
+    # Subtest: should revert uncommitted changes
+    ok 1 - should revert uncommitted changes
+      ---
+      duration_ms: 4.153006
+      type: 'test'
+      ...
+    1..1
+ok 10 - Revert Logic
+  ---
+  duration_ms: 99.79638
+  type: 'suite'
+  ...
+# Subtest: RPC
+    # Subtest: processProtocolMessage
+        # Subtest: should ignore invalid messages
+        ok 1 - should ignore invalid messages
+          ---
+          duration_ms: 1.628627
+          type: 'test'
+          ...
+        # Subtest: should handle invocations
+        ok 2 - should handle invocations
+          ---
+          duration_ms: 0.660375
+          type: 'test'
+          ...
+        # Subtest: should handle unknown methods
+        ok 3 - should handle unknown methods
+          ---
+          duration_ms: 1.115679
+          type: 'test'
+          ...
+        # Subtest: should handle Transfer wrappers in return value
+        ok 4 - should handle Transfer wrappers in return value
+          ---
+          duration_ms: 0.845254
+          type: 'test'
+          ...
+        1..4
+    ok 1 - processProtocolMessage
+      ---
+      duration_ms: 5.524402
+      type: 'suite'
+      ...
+    # Subtest: buildMethodProxy
+        # Subtest: should extract transferables from arguments
+        ok 1 - should extract transferables from arguments
+          ---
+          duration_ms: 0.99896
+          type: 'test'
+          ...
+        1..1
+    ok 2 - buildMethodProxy
+      ---
+      duration_ms: 1.319864
+      type: 'suite'
+      ...
+    1..2
+ok 11 - RPC
+  ---
+  duration_ms: 7.80605
+  type: 'suite'
+  ...
+# Subtest: RPC Serialization
+    # Subtest: Uint8Array
+        # Subtest: should encode and decode Uint8Array correctly
+        ok 1 - should encode and decode Uint8Array correctly
+          ---
+          duration_ms: 2.048691
+          type: 'test'
+          ...
+        1..1
+    ok 1 - Uint8Array
+      ---
+      duration_ms: 3.096909
+      type: 'suite'
+      ...
+    # Subtest: serializeValue
+        # Subtest: should serialize Uint8Array to marker object
+        ok 1 - should serialize Uint8Array to marker object
+          ---
+          duration_ms: 0.643009
+          type: 'test'
+          ...
+        # Subtest: should recursively serialize objects
+        ok 2 - should recursively serialize objects
+          ---
+          duration_ms: 0.477804
+          type: 'test'
+          ...
+        # Subtest: should recursively serialize arrays
+        ok 3 - should recursively serialize arrays
+          ---
+          duration_ms: 0.274025
+          type: 'test'
+          ...
+        1..3
+    ok 2 - serializeValue
+      ---
+      duration_ms: 1.79194
+      type: 'suite'
+      ...
+    # Subtest: deserializeValue
+        # Subtest: should deserialize marker object to Uint8Array
+        ok 1 - should deserialize marker object to Uint8Array
+          ---
+          duration_ms: 0.638745
+          type: 'test'
+          ...
+        # Subtest: should deserialize legacy array format
+        ok 2 - should deserialize legacy array format
+          ---
+          duration_ms: 0.239156
+          type: 'test'
+          ...
+        # Subtest: should recursively deserialize objects
+        ok 3 - should recursively deserialize objects
+          ---
+          duration_ms: 0.579337
+          type: 'test'
+          ...
+        1..3
+    ok 3 - deserializeValue
+      ---
+      duration_ms: 1.858531
+      type: 'suite'
+      ...
+    1..3
+ok 12 - RPC Serialization
+  ---
+  duration_ms: 7.709447
+  type: 'suite'
+  ...
+# Subtest: SQL Utils
+    # Subtest: validateSqlType
+        # Subtest: should accept valid simple types
+        ok 1 - should accept valid simple types
+          ---
+          duration_ms: 1.49601
+          type: 'test'
+          ...
+        # Subtest: should accept types with length/precision
+        ok 2 - should accept types with length/precision
+          ---
+          duration_ms: 0.440858
+          type: 'test'
+          ...
+        # Subtest: should accept types with modifiers
+        ok 3 - should accept types with modifiers
+          ---
+          duration_ms: 0.274347
+          type: 'test'
+          ...
+        # Subtest: should reject types with dangerous characters
+        ok 4 - should reject types with dangerous characters
+          ---
+          duration_ms: 0.795776
+          type: 'test'
+          ...
+        # Subtest: should reject malformed types
+        ok 5 - should reject malformed types
+          ---
+          duration_ms: 0.368306
+          type: 'test'
+          ...
+        # Subtest: should reject empty or invalid inputs
+        ok 6 - should reject empty or invalid inputs
+          ---
+          duration_ms: 0.363316
+          type: 'test'
+          ...
+        1..6
+    ok 1 - validateSqlType
+      ---
+      duration_ms: 5.154883
+      type: 'suite'
+      ...
+    # Subtest: escapeIdentifier
+        # Subtest: should escape simple identifiers
+        ok 1 - should escape simple identifiers
+          ---
+          duration_ms: 0.371957
+          type: 'test'
+          ...
+        # Subtest: should escape identifiers with spaces
+        ok 2 - should escape identifiers with spaces
+          ---
+          duration_ms: 0.452136
+          type: 'test'
+          ...
+        # Subtest: should escape identifiers with double quotes
+        ok 3 - should escape identifiers with double quotes
+          ---
+          duration_ms: 0.30764
+          type: 'test'
+          ...
+        # Subtest: should escape complex identifiers
+        ok 4 - should escape complex identifiers
+          ---
+          duration_ms: 0.382295
+          type: 'test'
+          ...
+        1..4
+    ok 2 - escapeIdentifier
+      ---
+      duration_ms: 1.996165
+      type: 'suite'
+      ...
+    # Subtest: cellValueToSql
+        # Subtest: should handle null and undefined
+        ok 1 - should handle null and undefined
+          ---
+          duration_ms: 0.363124
+          type: 'test'
+          ...
+        # Subtest: should handle numbers
+        ok 2 - should handle numbers
+          ---
+          duration_ms: 0.198533
+          type: 'test'
+          ...
+        # Subtest: should handle strings
+        ok 3 - should handle strings
+          ---
+          duration_ms: 0.158516
+          type: 'test'
+          ...
+        # Subtest: should escape strings with single quotes
+        ok 4 - should escape strings with single quotes
+          ---
+          duration_ms: 0.116481
+          type: 'test'
+          ...
+        # Subtest: should handle Uint8Array (blobs)
+        ok 5 - should handle Uint8Array (blobs)
+          ---
+          duration_ms: 0.165099
+          type: 'test'
+          ...
+        # Subtest: should securely handle NUL characters in strings
+        ok 6 - should securely handle NUL characters in strings
+          ---
+          duration_ms: 0.185059
+          type: 'test'
+          ...
+        1..6
+    ok 3 - cellValueToSql
+      ---
+      duration_ms: 1.459502
+      type: 'suite'
+      ...
+    # Subtest: escapeLikePattern
+        # Subtest: should escape wildcards
+        ok 1 - should escape wildcards
+          ---
+          duration_ms: 0.473034
+          type: 'test'
+          ...
+        # Subtest: should escape the escape character
+        ok 2 - should escape the escape character
+          ---
+          duration_ms: 1.74887
+          type: 'test'
+          ...
+        # Subtest: should escape multiple wildcards
+        ok 3 - should escape multiple wildcards
+          ---
+          duration_ms: 0.156215
+          type: 'test'
+          ...
+        # Subtest: should handle strings without wildcards
+        ok 4 - should handle strings without wildcards
+          ---
+          duration_ms: 0.246647
+          type: 'test'
+          ...
+        1..4
+    ok 4 - escapeLikePattern
+      ---
+      duration_ms: 3.00111
+      type: 'suite'
+      ...
+    1..4
+ok 13 - SQL Utils
+  ---
+  duration_ms: 12.689767
+  type: 'suite'
+  ...
+# Subtest: WasmDatabaseEngine
+    # Subtest: addColumn
+        # Subtest: should add a new column with default NULL
+        ok 1 - should add a new column with default NULL
+          ---
+          duration_ms: 6.439379
+          type: 'test'
+          ...
+        # Subtest: should add a column with a specific default string value
+        ok 2 - should add a column with a specific default string value
+          ---
+          duration_ms: 1.862333
+          type: 'test'
+          ...
+        # Subtest: should add a column with a numeric default value
+        ok 3 - should add a column with a numeric default value
+          ---
+          duration_ms: 1.5003
+          type: 'test'
+          ...
+        # Subtest: should add a column with a float default value
+        ok 4 - should add a column with a float default value
+          ---
+          duration_ms: 1.48393
+          type: 'test'
+          ...
+        # Subtest: should add a column with a default value containing quotes
+        ok 5 - should add a column with a default value containing quotes
+          ---
+          duration_ms: 1.050186
+          type: 'test'
+          ...
+        # Subtest: should fail when adding a column with invalid SQL type
+        ok 6 - should fail when adding a column with invalid SQL type
+          ---
+          duration_ms: 0.694674
+          type: 'test'
+          ...
+        # Subtest: should fail when adding a column that already exists
+        ok 7 - should fail when adding a column that already exists
+          ---
+          duration_ms: 0.631999
+          type: 'test'
+          ...
+        1..7
+    ok 1 - addColumn
+      ---
+      duration_ms: 15.091556
+      type: 'suite'
+      ...
+    # Subtest: fetchTableData
+        # Subtest: should correctly filter with globalFilter and implicit columns (*)
+        ok 1 - should correctly filter with globalFilter and implicit columns (*)
+          ---
+          duration_ms: 3.705406
+          type: 'test'
+          ...
+        # Subtest: should correctly count with globalFilter and implicit columns (*)
+        ok 2 - should correctly count with globalFilter and implicit columns (*)
+          ---
+          duration_ms: 3.189792
+          type: 'test'
+          ...
+        1..2
+    ok 2 - fetchTableData
+      ---
+      duration_ms: 7.303948
+      type: 'suite'
+      ...
+    1..2
+ok 14 - WasmDatabaseEngine
+  ---
+  duration_ms: 121.568818
+  type: 'suite'
+  ...
+# Subtest: WasmDatabaseEngine
+    # Subtest: should update multiple cells in a batch
+    ok 1 - should update multiple cells in a batch
+      ---
+      duration_ms: 9.197646
+      type: 'test'
+      ...
+    # Subtest: should handle JSON patch updates
+    ok 2 - should handle JSON patch updates
+      ---
+      duration_ms: 3.385951
+      type: 'test'
+      ...
+    # Subtest: should handle mixed standard and JSON patch updates
+    ok 3 - should handle mixed standard and JSON patch updates
+      ---
+      duration_ms: 3.625802
+      type: 'test'
+      ...
+    # Subtest: should handle empty updates gracefully
+    ok 4 - should handle empty updates gracefully
+      ---
+      duration_ms: 0.501267
+      type: 'test'
+      ...
+    # Subtest: should rollback transaction on error
+    ok 5 - should rollback transaction on error
+      ---
+      duration_ms: 3.062395
+      type: 'test'
+      ...
+    1..5
+ok 15 - WasmDatabaseEngine
+  ---
+  duration_ms: 105.663446
+  type: 'suite'
+  ...
+# Subtest: ModificationTracker Serialization
+    # Subtest: should serialize and deserialize an empty tracker
+    ok 1 - should serialize and deserialize an empty tracker
+      ---
+      duration_ms: 1.622175
+      type: 'test'
+      ...
+    # Subtest: should serialize and deserialize a tracker with simple modifications
+    ok 2 - should serialize and deserialize a tracker with simple modifications
+      ---
+      duration_ms: 0.906947
+      type: 'test'
+      ...
+    # Subtest: should properly serialize and deserialize Uint8Array data
+    ok 3 - should properly serialize and deserialize Uint8Array data
+      ---
+      duration_ms: 1.813643
+      type: 'test'
+      ...
+    # Subtest: should preserve checkpoint index
+    ok 4 - should preserve checkpoint index
+      ---
+      duration_ms: 0.539153
+      type: 'test'
+      ...
+    1..4
+ok 16 - ModificationTracker Serialization
+  ---
+  duration_ms: 6.906117
+  type: 'suite'
+  ...
+# Subtest: Undo/Redo Memory Limit
+    # Subtest: should respect memory limit
+    ok 1 - should respect memory limit
+      ---
+      duration_ms: 1.565677
+      type: 'test'
+      ...
+    # Subtest: should keep at least one entry even if it exceeds limit
+    ok 2 - should keep at least one entry even if it exceeds limit
+      ---
+      duration_ms: 0.488903
+      type: 'test'
+      ...
+    # Subtest: should recalculate sizes on deserialize
+    ok 3 - should recalculate sizes on deserialize
+      ---
+      duration_ms: 0.642683
+      type: 'test'
+      ...
+    # Subtest: should correctly track memory usage with undo/redo
+    ok 4 - should correctly track memory usage with undo/redo
+      ---
+      duration_ms: 0.354256
+      type: 'test'
+      ...
+    1..4
+ok 17 - Undo/Redo Memory Limit
+  ---
+  duration_ms: 4.593866
+  type: 'suite'
+  ...
+# Subtest: SQLite Engine Undo/Redo
+    # Subtest: should undo/redo row deletion
+    ok 1 - should undo/redo row deletion
+      ---
+      duration_ms: 100.156553
+      type: 'test'
+      ...
+    # Subtest: should undo/redo column drop
+    ok 2 - should undo/redo column drop
+      ---
+      duration_ms: 146.365543
+      type: 'test'
+      ...
+    # Subtest: should undo/redo cell update
+    ok 3 - should undo/redo cell update
+      ---
+      duration_ms: 14.079338
+      type: 'test'
+      ...
+    # Subtest: should undo/redo row insert
+    ok 4 - should undo/redo row insert
+      ---
+      duration_ms: 7.985487
+      type: 'test'
+      ...
+    1..4
+ok 18 - SQLite Engine Undo/Redo
+  ---
+  duration_ms: 271.079593
+  type: 'suite'
+  ...
+# Subtest: Undo/Redo Logic
+    # Subtest: should track and restore stack
+    ok 1 - should track and restore stack
+      ---
+      duration_ms: 1.957792
+      type: 'test'
+      ...
+    1..1
+ok 19 - Undo/Redo Logic
+  ---
+  duration_ms: 4.103644
+  type: 'suite'
+  ...
+# Error reading cell: Error: Database error
+#     at Object.<anonymous> (/app/tests/unit/virtualFileSystem.test.ts:166:27)
+#     at Object.apply (node:internal/test_runner/mock/mock:765:20)
+#     at SQLiteFileSystemProvider.readFile (/app/src/virtualFileSystem.ts:65:67)
+#     at <anonymous> (/app/tests/unit/virtualFileSystem.test.ts:175:32)
+#     at waitForActual (node:assert:630:21)
+#     at Function.rejects (node:assert:767:31)
+#     at TestContext.<anonymous> (/app/tests/unit/virtualFileSystem.test.ts:174:26)
+#     at Test.runInAsyncScope (node:async_hooks:214:14)
+#     at Test.run (node:internal/test_runner/test:1047:25)
+#     at Suite.processPendingSubtests (node:internal/test_runner/test:744:18)
+# Subtest: SQLiteFileSystemProvider
+    # Subtest: initialization
+    ok 1 - initialization
+      ---
+      duration_ms: 1.827302
+      type: 'test'
+      ...
+    # Subtest: readFile
+        # Subtest: should throw FileNotFound if document not found
+        ok 1 - should throw FileNotFound if document not found
+          ---
+          duration_ms: 1.734452
+          type: 'test'
+          ...
+        # Subtest: should throw FileNotFound if URI path is too short
+        ok 2 - should throw FileNotFound if URI path is too short
+          ---
+          duration_ms: 0.783531
+          type: 'test'
+          ...
+        # Subtest: should read __create__.sql correctly
+        ok 3 - should read __create__.sql correctly
+          ---
+          duration_ms: 0.852673
+          type: 'test'
+          ...
+        # Subtest: should return empty for __create__.sql if not found
+        ok 4 - should return empty for __create__.sql if not found
+          ---
+          duration_ms: 0.848868
+          type: 'test'
+          ...
+        # Subtest: should read regular string cell
+        ok 5 - should read regular string cell
+          ---
+          duration_ms: 1.832313
+          type: 'test'
+          ...
+        # Subtest: should handle null values as empty content
+        ok 6 - should handle null values as empty content
+          ---
+          duration_ms: 0.57661
+          type: 'test'
+          ...
+        # Subtest: should return Uint8Array (BLOB) as is
+        ok 7 - should return Uint8Array (BLOB) as is
+          ---
+          duration_ms: 0.599624
+          type: 'test'
+          ...
+        # Subtest: should return invalid row ID message for non-numeric row ID
+        ok 8 - should return invalid row ID message for non-numeric row ID
+          ---
+          duration_ms: 0.637857
+          type: 'test'
+          ...
+        # Subtest: should throw FileNotFound on database error
+        ok 9 - should throw FileNotFound on database error
+          ---
+          duration_ms: 5.713396
+          type: 'test'
+          ...
+        1..9
+    ok 2 - readFile
+      ---
+      duration_ms: 16.271707
+      type: 'suite'
+      ...
+    1..2
+ok 20 - SQLiteFileSystemProvider
+  ---
+  duration_ms: 19.684106
+  type: 'suite'
+  ...
+# Subtest: WebviewMessageHandler
+    # Subtest: should handle RPC invocation
+    ok 1 - should handle RPC invocation
+      ---
+      duration_ms: 12.684841
+      type: 'test'
+      ...
+    # Subtest: should handle unknown method
+    ok 2 - should handle unknown method
+      ---
+      duration_ms: 0.689499
+      type: 'test'
+      ...
+    # Subtest: should handle legacy RPC request
+    ok 3 - should handle legacy RPC request
+      ---
+      duration_ms: 10.744758
+      type: 'test'
+      ...
+    1..3
+ok 21 - WebviewMessageHandler
+  ---
+  duration_ms: 26.164326
+  type: 'suite'
+  ...
+# Subtest: WebviewCollection
+    # Subtest: should add a panel and retrieve it by ID
+    ok 1 - should add a panel and retrieve it by ID
+      ---
+      duration_ms: 1.869283
+      type: 'test'
+      ...
+    # Subtest: should retrieve all panels for a specific URI
+    ok 2 - should retrieve all panels for a specific URI
+      ---
+      duration_ms: 0.563958
+      type: 'test'
+      ...
+    # Subtest: should return empty iterator for unknown URI
+    ok 3 - should return empty iterator for unknown URI
+      ---
+      duration_ms: 0.280983
+      type: 'test'
+      ...
+    # Subtest: should correctly check if panels exist for a URI
+    ok 4 - should correctly check if panels exist for a URI
+      ---
+      duration_ms: 0.491686
+      type: 'test'
+      ...
+    # Subtest: should remove panel when it is disposed
+    ok 5 - should remove panel when it is disposed
+      ---
+      duration_ms: 0.647183
+      type: 'test'
+      ...
+    # Subtest: should handle multiple panels for same URI and remove only the disposed one
+    ok 6 - should handle multiple panels for same URI and remove only the disposed one
+      ---
+      duration_ms: 0.605697
+      type: 'test'
+      ...
+    1..6
+ok 22 - WebviewCollection
+  ---
+  duration_ms: 6.254884
+  type: 'suite'
+  ...
+# [Worker] Initializing database: test.db
+# Subtest: Worker Endpoint Serialization
+    # Subtest: should return serializable operations object from initializeDatabase
+    ok 1 - should return serializable operations object from initializeDatabase
+      ---
+      duration_ms: 53.822054
+      type: 'test'
+      ...
+    1..1
+ok 23 - Worker Endpoint Serialization
+  ---
+  duration_ms: 55.53693
+  type: 'suite'
+  ...
+1..23
+# tests 134
+# suites 40
+# pass 134
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 61757.900506

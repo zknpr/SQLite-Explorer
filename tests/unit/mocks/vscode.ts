@@ -66,6 +66,11 @@ export const mockVscode = {
     FilePermission: {
         Readonly: 1
     },
+    env: {
+        uriScheme: 'vscode-sqlite',
+        appName: 'VS Code',
+        language: 'en'
+    },
     EventEmitter: classEventEmitter,
     Disposable: class {
         constructor(callBack: () => void) {}
