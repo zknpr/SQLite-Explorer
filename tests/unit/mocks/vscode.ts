@@ -70,5 +70,19 @@ export const mockVscode = {
     Disposable: class {
         constructor(callBack: () => void) {}
         dispose() {}
+    },
+    workspace: {
+        _config: new Map<string, any>(),
+        getConfiguration: (section?: string) => ({
+            get: <T>(key: string, defaultValue?: T) => {
+                const fullKey = section ? `${section}.${key}` : key;
+                return mockVscode.workspace._config.has(fullKey)
+                    ? mockVscode.workspace._config.get(fullKey)
+                    : defaultValue;
+            },
+            update: () => Promise.resolve(),
+            inspect: () => undefined,
+            has: () => false,
+        })
     }
 };

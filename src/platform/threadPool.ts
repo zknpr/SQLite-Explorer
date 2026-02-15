@@ -41,7 +41,7 @@ interface NodeMessagePort {
 // Runtime Detection and API Export
 // ============================================================================
 
-const isBrowserRuntime = import.meta.env.VSCODE_BROWSER_EXT;
+const isBrowserRuntime = (import.meta as any).env?.VSCODE_BROWSER_EXT;
 
 let WorkerImpl: any;
 let MessageChannelImpl: any;
