@@ -20,6 +20,13 @@ interface DbParams {
   uri?: string;
 }
 
+export interface ExportOptions {
+  format?: string;
+  header?: boolean;
+  includeTableName?: boolean;
+  rowIds?: (string | number)[];
+}
+
 /**
  * Export table data to CSV or JSON file.
  *
@@ -36,10 +43,10 @@ export async function exportTableCommand(
   reporter: TelemetryReporter | undefined,
   dbParams: DbParams,
   columns: string[],
-  _dbOptions?: any,
-  _tableStore?: any,
-  _exportOptions?: { format?: string, header?: boolean, includeTableName?: boolean, rowIds?: (string | number)[] },
-  _extras?: any
+  _dbOptions?: unknown,
+  _tableStore?: unknown,
+  _exportOptions?: ExportOptions,
+  _extras?: unknown
 ) {
   try {
     const tableName = dbParams.table;

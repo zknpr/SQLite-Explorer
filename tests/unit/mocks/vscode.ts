@@ -70,5 +70,10 @@ export const mockVscode = {
     Disposable: class {
         constructor(callBack: () => void) {}
         dispose() {}
+    },
+    env: {
+        uriScheme: 'vscode',
+        appName: 'Visual Studio Code',
+        language: 'en'
     }
 };

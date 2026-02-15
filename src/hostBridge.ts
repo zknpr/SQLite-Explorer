@@ -833,7 +833,7 @@ export class HostBridge implements ToastService {
    * @param exportOptions - Export format options
    * @param extras - Additional options
    */
-  async exportTable(dbParams: DbParams, columns: string[], dbOptions?: any, tableStore?: any, exportOptions?: any, extras?: any) {
+  async exportTable(dbParams: DbParams, columns: string[], dbOptions?: unknown, tableStore?: unknown, exportOptions?: unknown, extras?: unknown) {
     // Inject the URI of the current document so the command knows which database to use
     const enrichedParams = {
       ...dbParams,

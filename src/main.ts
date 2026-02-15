@@ -1,7 +1,7 @@
 import "./shims"
 import * as vsc from 'vscode';
 import { TelemetryReporter } from '@vscode/extension-telemetry';
-import { exportTableCommand } from './tableExporter';
+import { exportTableCommand, ExportOptions } from './tableExporter';
 import { ExtensionId, FullExtensionId, FileNestingPatternsAdded, FirstInstallMs, NestingPattern, SyncedKeys, TelemetryConnectionString, Title, UriScheme } from './config';
 import { disposeAll } from './lifecycle';
 import { registerEditorProvider } from './editorController';
@@ -42,7 +42,7 @@ export async function activate(context: vsc.ExtensionContext) {
 
   // Register export table command
   context.subscriptions.push(
-    vsc.commands.registerCommand(`${ExtensionId}.exportTable`, (dbParams: DbParams, columns: string[], dbOptions?: any, tableStore?: any, exportOptions?: any, extras?: any) =>
+    vsc.commands.registerCommand(`${ExtensionId}.exportTable`, (dbParams: DbParams, columns: string[], dbOptions?: unknown, tableStore?: unknown, exportOptions?: ExportOptions, extras?: unknown) =>
       exportTableCommand(context, reporter, dbParams, columns, dbOptions, tableStore, exportOptions, extras)),
   );
 
