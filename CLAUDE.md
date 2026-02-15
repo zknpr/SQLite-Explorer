@@ -51,7 +51,13 @@ The extension uses a three-layer communication architecture:
 | `src/core/sqlite-db.ts` | Database engine wrapper |
 | `src/core/query-builder.ts` | Safe SQL query construction |
 | `src/core/sql-utils.ts` | SQL utilities and escaping |
+| `src/core/json-utils.ts` | JSON Merge Patch (RFC 7396) generate and apply |
+| `src/core/cancellation-utils.ts` | CancellationToken to AbortSignal bridge |
+| `src/core/serialization.ts` | Serialization utilities |
 | `src/core/undo-history.ts` | ModificationTracker for undo/redo |
+| `src/documentRegistry.ts` | Global registry of open DatabaseDocument instances |
+| `src/webviewMessageHandler.ts` | Webview → Extension Host message routing |
+| `src/webview-collection.ts` | Tracks active webview panels per document |
 | `src/virtualFileSystem.ts` | Virtual FS provider for editing cells in tabs |
 | `src/loggingDatabaseOperations.ts` | Decorator for logging SQL queries |
 | `core/ui/modules/settings.js` | UI logic for database settings/pragma editor |
@@ -59,8 +65,8 @@ The extension uses a three-layer communication architecture:
 | `core/ui/viewer.html` | Standalone webview UI |
 | `core/ui/web-viewer.js` | Web demo entry point |
 | `website/app/demo/page.tsx` | Web demo React page |
-| `website/public/demo/worker.js` | Web demo SQLite worker |
-| `website/public/demo/viewer.html` | Web demo bundled viewer |
+| `website/public/sqlite-viewer/worker.js` | Web demo SQLite worker |
+| `website/public/sqlite-viewer/viewer.html` | Web demo bundled viewer |
 | `assets/sqlite3.wasm` | SQLite WebAssembly binary |
 
 ### RPC Protocol
@@ -127,15 +133,25 @@ workerProxy.method(new Transfer(data, [data.buffer]));
 ```
 
 **Uint8Array Serialization:**
-`Uint8Array` cannot be directly serialized via `postMessage` (becomes `{}`). The RPC layer uses a marker format:
+`Uint8Array` cannot be directly serialized via `postMessage` (becomes `{}`). The RPC layer uses Base64 encoding:
 ```javascript
-// Serialized format (safe for JSON)
+// Serialized format (preferred, compact)
+{ __type: 'Uint8Array', base64: 'SGVsbG8=' }
+
+// Legacy array format (supported for backward-compatible deserialization only)
 { __type: 'Uint8Array', data: [72, 101, 108, 108, 111] }
 
-// Security: Marker must have exactly 2 keys (__type, data) to prevent collision with user data
+// Security: Marker must have exactly 2 keys to prevent collision with user data
 ```
 - Webview serializes in requests, deserializes in responses (`core/ui/modules/api.js`)
 - Extension host deserializes in requests, serializes in responses (`src/editorController.ts`)
+
+**Worker Log Forwarding:**
+Workers route logs through RPC using `LogEnvelope` instead of `console.*`:
+```javascript
+{ kind: 'log', level: 'warn', args: ['message', 42] }
+```
+The host routes these to the VS Code "SQLite Explorer" output channel via `GlobalOutputChannel`.
 
 ## Security Standards
 
@@ -184,7 +200,7 @@ npm test
 - `out/worker.js` - Node.js worker
 - `out/worker-browser.js` - Browser worker
 - `core/ui/viewer.html` - Webview UI
-- `website/public/demo/viewer.html` - Web demo viewer (bundled)
+- `website/public/sqlite-viewer/viewer.html` - Web demo viewer (bundled)
 - `assets/sqlite3.wasm` - SQLite WASM binary
 
 ### Web Demo
@@ -262,7 +278,7 @@ The build uses esbuild with these targets:
 
 The webview handles inline editing:
 1. Double-click cell → Creates input overlay
-2. Enter key → `saveCellEdit()` sends UPDATE via `backendApi.exec()`
+2. Enter key → `saveCellEdit()` sends UPDATE via `backendApi.updateCell()`
 3. Escape key → `cancelCellEdit()` discards changes
 
 ### Virtual File System
@@ -279,6 +295,26 @@ Database operations are wrapped in `LoggingDatabaseOperations` which writes all 
 ### Settings & Pragmas
 
 The webview provides a UI to configure SQLite PRAGMAs (e.g., WAL mode, Foreign Keys) directly via `hostBridge.setPragma()`.
+
+### Webview State Persistence
+
+`retainContextWhenHidden` is `false` — webviews are destroyed when hidden to save memory. State survives via `vscodeApi.setState()`/`getState()`:
+- `persistState()` in `state.js` debounces (500ms) and serializes user-facing state (selected table, scroll position, filters, pins, settings)
+- `viewer.js` restores state on re-initialization, including scroll position after grid render
+- VS Code extension settings (e.g., `cellEditBehavior`) take precedence over restored state
+- Web demo (`web-api.js`) provides no-op stubs since there is no VS Code API
+
+### Platform Helpers
+
+`getNodeFs()` in `sqlite-db.ts` safely requires the Node.js `fs` module, returning `undefined` in browser environments. Used by `sqlite-db.ts` (file reading, writing) and `tableExporter.ts` (streaming export).
+
+### JSON Patch Optimization
+
+`updateCell` and `updateCellBatch` in `sqlite-db.ts` probe for SQLite's `json_patch()` at engine construction time (`hasJsonPatch` flag). When available, uses `json_patch(COALESCE(col, '{}'), ?)` in a single UPDATE (no SELECT round-trip). Falls back to JS-side `applyMergePatch()` from `json-utils.ts` when JSON1 extension is unavailable.
+
+### Batched IPC
+
+`queryBatch` in `nativeWorker.ts` sends multiple SQL queries in a single IPC round-trip. Used for schema fetching (3 queries → 1 call) and pragma reads.
 
 ### Blob Inspector
 
@@ -337,13 +373,13 @@ ConfigurationSection = 'sqliteExplorer'
 
 1. **RPC timeout**: Check that message format matches expected protocol
 2. **CSP errors**: Verify Content-Security-Policy in `editorController.ts`
-3. **Worker not loading**: Check worker path resolution in `webWorker.ts`
+3. **Worker not loading**: Check worker path resolution in `workerFactory.ts`
 4. **WASM not found**: Ensure `assets/sqlite3.wasm` exists after build
 
 ### Logging
 
 - Extension Host: `console.log()` appears in VS Code Developer Tools
-- Worker: `console.log()` appears in Extension Host output
+- Worker: Logs route via RPC `LogEnvelope` to "SQLite Explorer" output channel (View → Output → SQLite Explorer)
 - Webview: Use browser DevTools (Cmd+Shift+P → "Developer: Open Webview Developer Tools")
 
 ## Development Workflow
