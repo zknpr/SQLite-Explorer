@@ -7,18 +7,10 @@
 
 import * as vsc from 'vscode';
 import type { TelemetryReporter } from '@vscode/extension-telemetry';
-import type { CellValue } from './core/types';
+import type { CellValue, DbParams, ExportOptions } from './core/types';
 import type { DatabaseDocument } from './databaseModel';
 import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
-
-// Legacy DbParams type for backward compatibility with webview
-interface DbParams {
-  filename?: string;
-  table: string;
-  name?: string;
-  uri?: string;
-}
 
 /**
  * Export table data to CSV or JSON file.
@@ -36,10 +28,10 @@ export async function exportTableCommand(
   reporter: TelemetryReporter | undefined,
   dbParams: DbParams,
   columns: string[],
-  _dbOptions?: any,
-  _tableStore?: any,
-  _exportOptions?: { format?: string, header?: boolean, includeTableName?: boolean, rowIds?: (string | number)[] },
-  _extras?: any
+  _dbOptions?: unknown,
+  _tableStore?: unknown,
+  _exportOptions?: ExportOptions,
+  _extras?: unknown
 ) {
   try {
     const tableName = dbParams.table;
@@ -343,7 +335,7 @@ export async function exportTableCommand(
  * Convert data to CSV format.
  * Handles proper escaping of values containing commas, quotes, or newlines.
  */
-function exportToCsv(columns: string[], rows: CellValue[][], includeHeader: boolean = true): string {
+export function exportToCsv(columns: string[], rows: CellValue[][], includeHeader: boolean = true): string {
   const escapeCsvValue = (value: CellValue): string => {
     if (value === null || value === undefined) return '';
     if (value instanceof Uint8Array) return '[BLOB]';
@@ -393,7 +385,7 @@ export function exportToJson(columns: string[], rows: CellValue[][]): string {
  * Convert data to SQL INSERT statements.
  * Generates INSERT statements that can be used to recreate the data.
  */
-function exportToSql(tableName: string, columns: string[], rows: CellValue[][], includeTableName: boolean = true): string {
+export function exportToSql(tableName: string, columns: string[], rows: CellValue[][], includeTableName: boolean = true): string {
   // Use escapeIdentifier to prevent SQL injection via malicious column names
   const columnList = columns.map(c => escapeIdentifier(c)).join(', ');
   const targetTable = includeTableName ? escapeIdentifier(tableName) : 'table_name';
