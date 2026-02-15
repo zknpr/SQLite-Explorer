@@ -343,7 +343,7 @@ export async function exportTableCommand(
  * Convert data to CSV format.
  * Handles proper escaping of values containing commas, quotes, or newlines.
  */
-function exportToCsv(columns: string[], rows: CellValue[][], includeHeader: boolean = true): string {
+export function exportToCsv(columns: string[], rows: CellValue[][], includeHeader: boolean = true): string {
   const escapeCsvValue = (value: CellValue): string => {
     if (value === null || value === undefined) return '';
     if (value instanceof Uint8Array) return '[BLOB]';
@@ -371,7 +371,7 @@ function exportToCsv(columns: string[], rows: CellValue[][], includeHeader: bool
  * Convert data to JSON format.
  * Each row becomes an object with column names as keys.
  */
-function exportToJson(columns: string[], rows: CellValue[][]): string {
+export function exportToJson(columns: string[], rows: CellValue[][]): string {
   const objects = rows.map(row => {
     const obj: Record<string, any> = {};
     columns.forEach((col, idx) => {
@@ -393,7 +393,7 @@ function exportToJson(columns: string[], rows: CellValue[][]): string {
  * Convert data to SQL INSERT statements.
  * Generates INSERT statements that can be used to recreate the data.
  */
-function exportToSql(tableName: string, columns: string[], rows: CellValue[][], includeTableName: boolean = true): string {
+export function exportToSql(tableName: string, columns: string[], rows: CellValue[][], includeTableName: boolean = true): string {
   // Use escapeIdentifier to prevent SQL injection via malicious column names
   const columnList = columns.map(c => escapeIdentifier(c)).join(', ');
   const targetTable = includeTableName ? escapeIdentifier(tableName) : 'table_name';
