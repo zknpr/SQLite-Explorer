@@ -1,6 +1,8 @@
 /**
  * Application State
  */
+import { saveVsCodeState } from './api.js';
+
 export const state = {
     isDbConnected: false,
     selectedTable: null,
@@ -65,3 +67,29 @@ export const state = {
     dateFormat: 'raw', // 'raw', 'local', 'iso', 'relative'
     cellEditBehavior: 'inline' // 'inline', 'modal', 'vscode'
 };
+
+let saveTimeout;
+export function persistState() {
+    if (saveTimeout) clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(() => {
+        const stateToSave = {
+            selectedTable: state.selectedTable,
+            selectedTableType: state.selectedTableType,
+            currentPageIndex: state.currentPageIndex,
+            rowsPerPage: state.rowsPerPage,
+            sortedColumn: state.sortedColumn,
+            sortAscending: state.sortAscending,
+            filterQuery: state.filterQuery,
+            columnWidths: state.columnWidths,
+            columnFilters: state.columnFilters,
+            pinnedColumns: Array.from(state.pinnedColumns),
+            pinnedRowIds: Array.from(state.pinnedRowIds),
+            selectedColumns: Array.from(state.selectedColumns),
+            sidebarFilter: state.sidebarFilter,
+            scrollPosition: state.scrollPosition,
+            selectedRowIds: Array.from(state.selectedRowIds),
+            selectedCells: state.selectedCells
+        };
+        saveVsCodeState(stateToSave);
+    }, 500);
+}

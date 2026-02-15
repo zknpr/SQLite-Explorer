@@ -3,10 +3,11 @@
  */
 import { state } from './modules/state.js';
 import { initRpc } from './modules/rpc.js';
-import { backendApi } from './modules/api.js';
+import { backendApi, getVsCodeState } from './modules/api.js';
 import {
     initSidebar,
-    refreshSchema
+    refreshSchema,
+    renderSidebar
 } from './modules/sidebar.js';
 import {
     initExport
@@ -27,6 +28,7 @@ import {
 } from './modules/modals.js';
 import {
     loadTableData,
+    loadTableColumns,
     onSelectAllClick,
     initGridInteraction,
     initGridControls,
@@ -88,8 +90,50 @@ async function initializeApp() {
         // Load schema
         await refreshSchema();
 
-        updateStatus('Ready');
-        showEmptyState();
+        // Restore state if available
+        const savedState = getVsCodeState();
+        if (savedState && savedState.selectedTable) {
+            state.selectedTable = savedState.selectedTable;
+            state.selectedTableType = savedState.selectedTableType;
+            state.currentPageIndex = savedState.currentPageIndex;
+            state.rowsPerPage = savedState.rowsPerPage;
+            state.sortedColumn = savedState.sortedColumn;
+            state.sortAscending = savedState.sortAscending;
+            state.filterQuery = savedState.filterQuery;
+            state.columnWidths = savedState.columnWidths || {};
+            state.columnFilters = savedState.columnFilters || {};
+            state.sidebarFilter = savedState.sidebarFilter || '';
+            state.scrollPosition = savedState.scrollPosition || { top: 0, left: 0 };
+
+            if (savedState.pinnedColumns) state.pinnedColumns = new Set(savedState.pinnedColumns);
+            if (savedState.pinnedRowIds) state.pinnedRowIds = new Set(savedState.pinnedRowIds);
+            if (savedState.selectedColumns) state.selectedColumns = new Set(savedState.selectedColumns);
+            if (savedState.selectedRowIds) state.selectedRowIds = new Set(savedState.selectedRowIds);
+            if (savedState.selectedCells) state.selectedCells = savedState.selectedCells;
+
+            // Restore UI
+            const tableNameLabel = document.getElementById('tableNameLabel');
+            if (tableNameLabel) tableNameLabel.textContent = state.selectedTable;
+
+            const filterInput = document.getElementById('filterInput');
+            if (filterInput) filterInput.value = state.filterQuery;
+
+            const sidebarFilterInput = document.getElementById('sidebarFilterInput');
+            if (sidebarFilterInput) sidebarFilterInput.value = state.sidebarFilter;
+
+            const pageSizeSelect = document.getElementById('pageSizeSelect');
+            if (pageSizeSelect) pageSizeSelect.value = state.rowsPerPage;
+
+            renderSidebar();
+            await loadTableColumns();
+            // Load data using saved scroll position (second arg false means don't overwrite from DOM which is 0)
+            await loadTableData(true, false);
+
+            updateStatus(`${state.totalRecordCount} records`);
+        } else {
+            updateStatus('Ready');
+            showEmptyState();
+        }
 
         // Global shortcuts
         document.addEventListener('keydown', async (event) => {

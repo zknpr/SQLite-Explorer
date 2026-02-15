@@ -389,10 +389,9 @@ export function registerEditorProvider(
     {
       webviewOptions: {
         enableFindWidget: false,
-        // Keep webview alive when switching tabs.
-        // Serializing full UI state (scroll, selection, etc.) for restore is complex and
-        // simply retaining context provides a better user experience at the cost of memory.
-        retainContextWhenHidden: true,
+        // Webview context is not retained to save memory.
+        // State is serialized and restored via vscode.setState() / getState().
+        retainContextWhenHidden: false,
       },
       supportsMultipleEditorsPerDocument: true,
     }

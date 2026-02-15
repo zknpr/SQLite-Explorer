@@ -1,7 +1,7 @@
 /**
  * Data Grid Rendering and Logic
  */
-import { state } from './state.js';
+import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
 import { escapeHtml, escapeIdentifier, formatCellValue, formatCellValueAsText } from './utils.js';
 import { updateStatus, showLoading, showErrorState, updateToolbarButtons } from './ui.js';
@@ -192,6 +192,13 @@ export function initGridInteraction() {
             }
         }
     });
+
+    // Scroll persistence
+    container.addEventListener('scroll', () => {
+        state.scrollPosition.left = container.scrollLeft;
+        state.scrollPosition.top = container.scrollTop;
+        persistState();
+    }, { passive: true });
 }
 
 function resolveRowIdType(idStr) {
@@ -331,6 +338,9 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
         updatePagination();
         updateStatus(`${state.totalRecordCount} records`);
+
+        // Persist state after successful load
+        persistState();
 
     } catch (err) {
         console.error('Error loading data:', err);
@@ -727,6 +737,7 @@ export function onFilterChange() {
         state.filterQuery = document.getElementById('filterInput').value;
         state.currentPageIndex = 0;
         loadTableData();
+        persistState();
     }, 300);
 }
 
@@ -734,6 +745,7 @@ export function onPageSizeChange() {
     state.rowsPerPage = parseInt(document.getElementById('pageSizeSelect').value, 10);
     state.currentPageIndex = 0;
     loadTableData();
+    persistState();
 }
 
 export function onDateFormatChange() {
@@ -741,6 +753,7 @@ export function onDateFormatChange() {
     if (select) {
         state.dateFormat = select.value;
         renderDataGrid();
+        persistState();
     }
 }
 
@@ -760,6 +773,7 @@ export function onColumnSort(columnName) {
         state.sortAscending = true;
     }
     loadTableData();
+    persistState();
 }
 
 export function applyColumnFilter(columnName) {
@@ -899,6 +913,7 @@ export function toggleColumnPin(event, columnName) {
         state.pinnedColumns.add(columnName);
     }
     renderDataGrid();
+    persistState();
 }
 
 // Row Pinning
@@ -910,6 +925,7 @@ export function toggleRowPin(event, rowId) {
         state.pinnedRowIds.add(rowId);
     }
     renderDataGrid();
+    persistState();
 }
 
 // Column Resizing
@@ -975,6 +991,8 @@ function stopColumnResize() {
 
     // Full re-render to ensure pinned columns are correct
     renderDataGrid();
+
+    persistState();
 }
 
 // Row Selection

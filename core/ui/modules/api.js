@@ -5,6 +5,24 @@
 
 const vscodeApi = typeof acquireVsCodeApi !== 'undefined' ? acquireVsCodeApi() : null;
 
+/**
+ * Get the saved state from VS Code.
+ * @returns {Object|undefined} Saved state
+ */
+export function getVsCodeState() {
+    return vscodeApi ? vscodeApi.getState() : undefined;
+}
+
+/**
+ * Save state to VS Code.
+ * @param {Object} state - State to save
+ */
+export function saveVsCodeState(state) {
+    if (vscodeApi) {
+        vscodeApi.setState(state);
+    }
+}
+
 // Default RPC timeout in milliseconds (60s to accommodate large blob operations)
 const RPC_TIMEOUT_MS = 60000;
 
