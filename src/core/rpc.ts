@@ -39,9 +39,18 @@ interface ResponseEnvelope {
 }
 
 /**
+ * Log message forwarded from worker to host.
+ */
+interface LogEnvelope {
+  readonly kind: 'log';
+  readonly level: 'log' | 'warn' | 'error';
+  readonly args: unknown[];
+}
+
+/**
  * Union of all protocol message types.
  */
-type ProtocolEnvelope = InvocationEnvelope | ResponseEnvelope;
+type ProtocolEnvelope = InvocationEnvelope | ResponseEnvelope | LogEnvelope;
 
 // ============================================================================
 // State Management
@@ -202,10 +211,16 @@ type ResponseDispatcher = (response: ResponseEnvelope, transfer?: Transferable[]
  * @param sendResponse - Optional function to send responses
  * @returns true if message was handled, false otherwise
  */
+/**
+ * Callback for handling log messages forwarded from a worker.
+ */
+type LogHandler = (level: 'log' | 'warn' | 'error', args: unknown[]) => void;
+
 export function processProtocolMessage(
   envelope: unknown,
   localMethods?: MethodImplementations,
-  sendResponse?: ResponseDispatcher
+  sendResponse?: ResponseDispatcher,
+  onLog?: LogHandler
 ): boolean {
   // Validate envelope structure
   if (!envelope || typeof envelope !== 'object') return false;
@@ -270,6 +285,15 @@ export function processProtocolMessage(
     return true;
   }
 
+  // Handle log message forwarded from worker
+  if (msg.kind === 'log' && 'level' in msg && 'args' in msg) {
+    const logMsg = msg as LogEnvelope;
+    if (onLog) {
+      onLog(logMsg.level, logMsg.args);
+    }
+    return true;
+  }
+
   // Handle incoming response
   if (msg.kind === 'result') {
     const { correlationId, payload, errorText } = msg;
@@ -313,7 +337,8 @@ interface WorkerPort {
  */
 export function connectWorkerPort<T extends object>(
   port: WorkerPort,
-  methodNames: string[]
+  methodNames: string[],
+  onLog?: LogHandler
 ): T {
   const dispatcher: MessageDispatcher = (envelope, transfer) => {
     // Check if port supports transfer list (Browser/Node worker compatible)
@@ -332,7 +357,7 @@ export function connectWorkerPort<T extends object>(
   };
 
   port.on('message', (data) => {
-    processProtocolMessage(data);
+    processProtocolMessage(data, undefined, undefined, onLog);
   });
 
   return buildMethodProxy<T>(dispatcher, methodNames);

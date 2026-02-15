@@ -11,6 +11,7 @@ import type { CellValue, DbParams, ExportOptions } from './core/types';
 import type { DatabaseDocument } from './databaseModel';
 import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
+import { getNodeFs } from './core/sqlite-db';
 
 /**
  * Export table data to CSV or JSON file.
@@ -126,10 +127,10 @@ export async function exportTableCommand(
     }
 
 
-    if (isLocalFile && typeof require === 'function') {
+    const fs = isLocalFile ? getNodeFs() : undefined;
+    if (fs) {
         // Use Node.js fs streams for memory efficiency
         try {
-            const fs = require('fs');
             const stream = fs.createWriteStream(uri.fsPath, { encoding: 'utf-8' });
 
             // Write BOM for Excel if needed

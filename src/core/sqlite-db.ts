@@ -25,6 +25,25 @@ import { buildSelectQuery, buildCountQuery } from './query-builder';
 import { applyMergePatch } from './json-utils';
 
 // ============================================================================
+// Platform Helpers
+// ============================================================================
+
+/**
+ * Safely require the Node.js 'fs' module.
+ * Returns undefined in browser environments where require is not available.
+ */
+export function getNodeFs(): typeof import('fs') | undefined {
+  if (typeof require === 'function') {
+    try {
+      return require('fs');
+    } catch {
+      // fs not available (e.g., sandboxed environment)
+    }
+  }
+  return undefined;
+}
+
+// ============================================================================
 // Internal sql.js Types
 // ============================================================================
 
@@ -77,11 +96,23 @@ const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 class WasmDatabaseEngine implements DatabaseOperations {
   private readonly instance: WasmDatabaseInstance;
   private readonly queryTimeout: number;
+  /** Whether SQLite's json_patch() function is available (JSON1 extension). */
+  private readonly hasJsonPatch: boolean;
   readonly engineKind = Promise.resolve('wasm' as const);
 
   constructor(instance: WasmDatabaseInstance, timeoutMs: number = DEFAULT_QUERY_TIMEOUT_MS) {
     this.instance = instance;
     this.queryTimeout = timeoutMs;
+
+    // Probe for json_patch() availability at construction time.
+    // json_patch() is part of the JSON1 extension, which is included in most
+    // sql.js WASM builds but not guaranteed in all environments.
+    try {
+      instance.exec("SELECT json_patch('{}', '{}')");
+      this.hasJsonPatch = true;
+    } catch {
+      this.hasJsonPatch = false;
+    }
   }
 
   /**
@@ -400,27 +431,34 @@ class WasmDatabaseEngine implements DatabaseOperations {
     let params: CellValue[];
 
     if (patch) {
-        // Fallback to JS implementation of json_patch
-        // Fetch current value
-        const currentResult = await this.executeQuery(`SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} WHERE rowid = ?`, [rowIdNum]);
-        let currentValue = currentResult[0]?.rows[0]?.[0];
+        const escapedCol = escapeIdentifier(column);
+        const escapedTbl = escapeIdentifier(table);
 
-        // Parse current JSON
-        let currentObj = {};
-        if (typeof currentValue === 'string') {
-            try { currentObj = JSON.parse(currentValue); } catch {}
-        } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
-             // Already an object? (unlikely from SQLite unless using some extension, usually string)
-             currentObj = currentValue;
+        if (this.hasJsonPatch) {
+            // Use SQLite's native json_patch() — single UPDATE, no SELECT round-trip.
+            // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL per SQL semantics,
+            // but the expected behavior is to treat NULL as empty object (matching JS fallback).
+            sql = `UPDATE ${escapedTbl} SET ${escapedCol} = json_patch(COALESCE(${escapedCol}, '{}'), ?) WHERE rowid = ?`;
+            params = [typeof patch === 'string' ? patch : JSON.stringify(patch), rowIdNum];
+        } else {
+            // Fallback: read current value, apply patch in JS, write back
+            const currentResult = await this.executeQuery(`SELECT ${escapedCol} FROM ${escapedTbl} WHERE rowid = ?`, [rowIdNum]);
+            let currentValue = currentResult[0]?.rows[0]?.[0];
+
+            let currentObj = {};
+            if (typeof currentValue === 'string') {
+                try { currentObj = JSON.parse(currentValue); } catch {}
+            } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
+                currentObj = currentValue;
+            }
+
+            const patchObj = typeof patch === 'string' ? JSON.parse(patch) : patch;
+            const newValueObj = applyMergePatch(currentObj, patchObj);
+            const newValueStr = JSON.stringify(newValueObj);
+
+            sql = `UPDATE ${escapedTbl} SET ${escapedCol} = ? WHERE rowid = ?`;
+            params = [newValueStr, rowIdNum];
         }
-
-        // Apply patch
-        const patchObj = typeof patch === 'string' ? JSON.parse(patch) : patch;
-        const newValueObj = applyMergePatch(currentObj, patchObj);
-        const newValueStr = JSON.stringify(newValueObj);
-
-        sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
-        params = [newValueStr, rowIdNum];
     } else {
         sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
         params = [value, rowIdNum];
@@ -610,34 +648,45 @@ class WasmDatabaseEngine implements DatabaseOperations {
       for (const [key, columnUpdates] of updatesByColumn.entries()) {
           const [column, op] = key.split('|');
           const escapedColumn = escapeIdentifier(column);
-          const sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+
+          // For json_patch operations, choose between native SQLite json_patch()
+          // and JS fallback depending on runtime availability
+          const useNativePatch = op === 'json_patch' && this.hasJsonPatch;
+
+          // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL per SQL semantics,
+          // but the expected behavior is to treat NULL as empty object (matching JS fallback).
+          const sql = useNativePatch
+            ? `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`
+            : `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
 
           const stmt = this.instance.prepare(sql);
 
-          // Optimize JSON patch read by preparing the SELECT statement
+          // Only need SELECT for JS fallback path
           let selectStmt: WasmPreparedStatement | null = null;
 
           try {
-              if (op === 'json_patch') {
+              if (op === 'json_patch' && !this.hasJsonPatch) {
                  selectStmt = this.instance.prepare(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`);
               }
 
               for (const update of columnUpdates) {
                   const rowIdNum = Number(update.rowId);
 
-                  if (op === 'json_patch') {
-                     // Read using prepared statement
-                     // selectStmt.get([rowIdNum]) returns [val] or undefined
-                     // sql.js documentation says get() returns array of values
+                  if (useNativePatch) {
+                     // Native json_patch(): single UPDATE, no SELECT needed
+                     const patchStr = typeof update.value === 'string'
+                       ? update.value
+                       : JSON.stringify(update.value);
+                     stmt.run([patchStr, rowIdNum]);
+
+                  } else if (op === 'json_patch') {
+                     // JS fallback: read current value, apply patch, write back
                      let currentValue = null;
                      if (selectStmt) {
-                        // stmt.get(params) returns the row as an array of values
                         const row = selectStmt.get([rowIdNum]);
                         if (row && row.length > 0) {
                             currentValue = row[0];
                         }
-
-                        // sqlite3_reset() is required to reuse a prepared statement.
                         selectStmt.reset();
                      }
 
@@ -880,9 +929,8 @@ class WasmDatabaseEngine implements DatabaseOperations {
   async writeToFile(path: string): Promise<void> {
     const data = this.instance.export();
 
-    // Dynamic require to avoid bundling fs
-    if (typeof require === 'function') {
-        const fs = require('fs');
+    const fs = getNodeFs();
+    if (fs) {
         await fs.promises.writeFile(path, data);
     } else {
         throw new Error('File system access not available');
@@ -923,10 +971,10 @@ export async function createDatabaseEngine(
   // If content is missing but filePath is provided, read from disk (Node.js only)
   if (!buffer && config.filePath) {
       try {
-          // Dynamic require to avoid bundling fs in browser builds if not polyfilled
+          // Dynamic require to avoid bundling fs in browser builds
           // In actual build, this code path only runs in Node worker
-          if (typeof require === 'function') {
-              const fs = require('fs');
+          const fs = getNodeFs();
+          if (fs) {
               // Validate size
               const stats = fs.statSync(config.filePath);
               if (config.maxSize > 0 && stats.size > config.maxSize) {

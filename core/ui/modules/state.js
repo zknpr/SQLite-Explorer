@@ -1,6 +1,8 @@
 /**
  * Application State
  */
+import { saveVsCodeState } from './api.js';
+
 export const state = {
     isDbConnected: false,
     selectedTable: null,
@@ -65,3 +67,33 @@ export const state = {
     dateFormat: 'raw', // 'raw', 'local', 'iso', 'relative'
     cellEditBehavior: 'inline' // 'inline', 'modal', 'vscode'
 };
+
+/**
+ * Debounced state persistence to VS Code.
+ * Saves a snapshot of user-facing state so it survives tab switches
+ * when retainContextWhenHidden is false.
+ */
+let _persistTimer;
+export function persistState() {
+    if (_persistTimer) clearTimeout(_persistTimer);
+    _persistTimer = setTimeout(() => {
+        saveVsCodeState({
+            selectedTable: state.selectedTable,
+            selectedTableType: state.selectedTableType,
+            currentPageIndex: state.currentPageIndex,
+            rowsPerPage: state.rowsPerPage,
+            sortedColumn: state.sortedColumn,
+            sortAscending: state.sortAscending,
+            filterQuery: state.filterQuery,
+            columnWidths: state.columnWidths,
+            columnFilters: state.columnFilters,
+            pinnedColumns: Array.from(state.pinnedColumns),
+            pinnedRowIds: Array.from(state.pinnedRowIds),
+            selectedColumns: Array.from(state.selectedColumns),
+            sidebarFilter: state.sidebarFilter,
+            scrollPosition: state.scrollPosition,
+            dateFormat: state.dateFormat,
+            cellEditBehavior: state.cellEditBehavior,
+        });
+    }, 500);
+}

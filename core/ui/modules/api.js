@@ -5,6 +5,25 @@
 
 const vscodeApi = typeof acquireVsCodeApi !== 'undefined' ? acquireVsCodeApi() : null;
 
+/**
+ * Get saved state from VS Code's webview state persistence.
+ * @returns {Object|undefined} Previously saved state, or undefined if none
+ */
+export function getVsCodeState() {
+    return vscodeApi ? vscodeApi.getState() : undefined;
+}
+
+/**
+ * Save state to VS Code's webview state persistence.
+ * This survives tab switches when retainContextWhenHidden is false.
+ * @param {Object} stateObj - State to save
+ */
+export function saveVsCodeState(stateObj) {
+    if (vscodeApi) {
+        vscodeApi.setState(stateObj);
+    }
+}
+
 // Default RPC timeout in milliseconds (60s to accommodate large blob operations)
 const RPC_TIMEOUT_MS = 60000;
 

@@ -10,10 +10,26 @@ import { processProtocolMessage } from "./core/rpc";
 import { createWorkerEndpoint } from "./core/sqlite-db";
 
 // ============================================================================
+// Worker Logging
+// ============================================================================
+
+/**
+ * Send a log message to the host via RPC.
+ * Falls back to console if no parent port is available.
+ */
+function log(level: 'log' | 'warn' | 'error', ...args: unknown[]) {
+  if (parentPort) {
+    parentPort.postMessage({ kind: 'log', level, args: args.map(a => a instanceof Error ? a.message : a) });
+  } else {
+    console[level](...args);
+  }
+}
+
+// ============================================================================
 // Worker Initialization
 // ============================================================================
 
-console.log('[DatabaseWorker] Starting...');
+log('log', '[DatabaseWorker] Starting...');
 
 // Create the endpoint that handles database operations
 const databaseEndpoint = createWorkerEndpoint();
@@ -48,7 +64,7 @@ if (parentPort) {
     if (!wasHandled) {
       const msg = envelope as { kind?: string };
       if (msg?.kind !== 'result') {
-        console.warn('[DatabaseWorker] Unrecognized message:', msg?.kind);
+        log('warn', '[DatabaseWorker] Unrecognized message:', msg?.kind);
       }
     }
   });
@@ -57,10 +73,10 @@ if (parentPort) {
    * Handle port errors.
    */
   parentPort.on('error', (err: Error) => {
-    console.error('[DatabaseWorker] Port error:', err.message);
+    log('error', '[DatabaseWorker] Port error:', err.message);
   });
 
-  console.log('[DatabaseWorker] Ready for connections');
+  log('log', '[DatabaseWorker] Ready for connections');
 } else {
   console.error('[DatabaseWorker] No parent port - invalid execution context');
 }

@@ -935,19 +935,23 @@ export async function createNativeDatabaseConnection(
          * Fetch database schema.
          */
         fetchSchema: async () => {
-          // Use standard SQL queries to fetch schema information for consistency with the WASM implementation.
-          // This ensures we get tables, views, and indexes in a uniform format.
+          // Batch all 3 schema queries into a single IPC round-trip for efficiency.
+          const queries = [
+            { sql: "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name" },
+            { sql: "SELECT name FROM sqlite_schema WHERE type='view' ORDER BY name" },
+            { sql: "SELECT name, tbl_name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name" }
+          ];
 
-          // Run queries in parallel
-          const [tablesResult, viewsResult, indexesResult] = await Promise.all([
-            worker.call<NativeQueryResult>('query', ["SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"]),
-            worker.call<NativeQueryResult>('query', ["SELECT name FROM sqlite_schema WHERE type='view' ORDER BY name"]),
-            worker.call<NativeQueryResult>('query', ["SELECT name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name"])
-          ]);
+          const res = await worker.call<NativeQueryBatchResult>('queryBatch', [queries]);
 
-          const tables = mapRowsByName<TableMetadata>(tablesResult, { identifier: 'name' });
-          const views = mapRowsByName<ViewMetadata>(viewsResult, { identifier: 'name' });
-          const indexes = mapRowsByName<IndexMetadata>(indexesResult, { identifier: 'name', parentTable: 'tbl_name' });
+          // Validate the response — throw instead of silently returning empty schema
+          if (!res || !res.results || res.results.length < 3) {
+            throw new Error('Schema fetch failed: queryBatch returned incomplete results');
+          }
+
+          const tables = mapRowsByName<TableMetadata>(res.results[0], { identifier: 'name' });
+          const views = mapRowsByName<ViewMetadata>(res.results[1], { identifier: 'name' });
+          const indexes = mapRowsByName<IndexMetadata>(res.results[2], { identifier: 'name', parentTable: 'tbl_name' });
 
           return { tables, views, indexes } as SchemaSnapshot;
         },
