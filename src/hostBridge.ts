@@ -14,7 +14,7 @@ import { ConfigurationSection, ExtensionId, FullExtensionId, SidebarLeft, Sideba
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, ModificationEntry } from './core/types';
 import { generateMergePatch } from './core/json-utils';
 import { escapeIdentifier } from './core/sql-utils';
 
@@ -562,7 +562,7 @@ export class HostBridge implements ToastService {
   /**
    * Apply edits to the database.
    */
-  async applyEdits(edits: any, signal?: any) {
+  async applyEdits(edits: ModificationEntry[], signal?: AbortSignal) {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
@@ -573,7 +573,7 @@ export class HostBridge implements ToastService {
   /**
    * Undo a database edit.
    */
-  async undo(edit: any) {
+  async undo(edit: ModificationEntry) {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
@@ -584,7 +584,7 @@ export class HostBridge implements ToastService {
   /**
    * Redo a database edit.
    */
-  async redo(edit: any) {
+  async redo(edit: ModificationEntry) {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
@@ -606,7 +606,7 @@ export class HostBridge implements ToastService {
   /**
    * Rollback changes to the database.
    */
-  async rollback(edits: any, signal?: any) {
+  async rollback(edits: ModificationEntry[], signal?: AbortSignal) {
     const { document } = this;
     if (!document.databaseOperations) {
       throw new Error("Database not initialized");
