@@ -343,7 +343,7 @@ export async function exportTableCommand(
  * Convert data to CSV format.
  * Handles proper escaping of values containing commas, quotes, or newlines.
  */
-function exportToCsv(columns: string[], rows: CellValue[][], includeHeader: boolean = true): string {
+export function exportToCsv(columns: string[], rows: CellValue[][], includeHeader: boolean = true): string {
   const escapeCsvValue = (value: CellValue): string => {
     if (value === null || value === undefined) return '';
     if (value instanceof Uint8Array) return '[BLOB]';
@@ -371,8 +371,16 @@ function exportToCsv(columns: string[], rows: CellValue[][], includeHeader: bool
  * Convert data to JSON format.
  * Each row becomes an object with column names as keys.
  */
-function exportToJson(columns: string[], rows: CellValue[][]): string {
-  const objects = rows.map(row => {
+export function exportToJson(columns: string[], rows: CellValue[][]): string {
+  if (!rows || rows.length === 0) {
+    return '[]';
+  }
+
+  const parts = ['[\n'];
+  const indent = '  ';
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
     const obj: Record<string, any> = {};
     columns.forEach((col, idx) => {
       const value = row[idx];
@@ -383,17 +391,26 @@ function exportToJson(columns: string[], rows: CellValue[][]): string {
         obj[col] = value;
       }
     });
-    return obj;
-  });
 
-  return JSON.stringify(objects, null, 2);
+    const rowStr = JSON.stringify(obj);
+    parts.push('  ' + rowStr);
+
+    if (i < rows.length - 1) {
+      parts.push(',\n');
+    } else {
+      parts.push('\n');
+    }
+  }
+
+  parts.push(']');
+  return parts.join('');
 }
 
 /**
  * Convert data to SQL INSERT statements.
  * Generates INSERT statements that can be used to recreate the data.
  */
-function exportToSql(tableName: string, columns: string[], rows: CellValue[][], includeTableName: boolean = true): string {
+export function exportToSql(tableName: string, columns: string[], rows: CellValue[][], includeTableName: boolean = true): string {
   // Use escapeIdentifier to prevent SQL injection via malicious column names
   const columnList = columns.map(c => escapeIdentifier(c)).join(', ');
   const targetTable = includeTableName ? escapeIdentifier(tableName) : 'table_name';
