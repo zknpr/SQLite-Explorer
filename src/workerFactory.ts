@@ -15,6 +15,7 @@ import * as vsc from 'vscode';
 import path from 'path';
 
 import { connectWorkerPort, buildMethodProxy, Transfer } from './core/rpc';
+import { GlobalOutputChannel } from './main';
 import type {
   CellValue,
   QueryResultSet,
@@ -209,6 +210,17 @@ async function createWasmDatabaseConnection(
 
   // Create IPC proxy for worker communication
   // Browser Workers use addEventListener, Node.js Workers use .on()
+  // Route worker log messages to the VS Code output channel for visibility.
+  // Falls back to console if no output channel is available (e.g., during tests).
+  const logHandler = (level: 'log' | 'warn' | 'error', args: unknown[]) => {
+    const text = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+    if (GlobalOutputChannel) {
+      GlobalOutputChannel.appendLine(`[Worker/${level}] ${text}`);
+    } else {
+      console[level]('[Worker]', ...args);
+    }
+  };
+
   const workerProxy = connectWorkerPort<WorkerMethods>(
     {
       postMessage: (data: unknown, transfer?: Transferable[]) => {
@@ -229,7 +241,8 @@ async function createWasmDatabaseConnection(
         }
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile']
+    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile'],
+    logHandler
   );
 
   // Termination handler

@@ -1,7 +1,7 @@
 /**
  * Sidebar and Schema Logic
  */
-import { state } from './state.js';
+import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
 import { escapeHtml } from './utils.js';
 import { updateStatus } from './ui.js';
@@ -533,6 +533,7 @@ export async function selectTableItem(name, type) {
 
     await loadTableColumns();
     await loadTableData(true, false);
+    persistState();
 }
 
 export async function reloadFromDisk() {

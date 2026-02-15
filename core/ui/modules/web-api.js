@@ -9,6 +9,22 @@
 // Use parent window for RPC instead of VS Code API
 const parentWindow = window.parent;
 
+/**
+ * No-op in web demo: VS Code state persistence is not available.
+ * @returns {undefined}
+ */
+export function getVsCodeState() {
+    return undefined;
+}
+
+/**
+ * No-op in web demo: VS Code state persistence is not available.
+ * @param {Object} _stateObj - Ignored
+ */
+export function saveVsCodeState(_stateObj) {
+    // No VS Code API available in web demo
+}
+
 // Default RPC timeout in milliseconds (60s to accommodate large blob operations)
 const RPC_TIMEOUT_MS = 60000;
 
