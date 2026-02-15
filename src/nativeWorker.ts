@@ -893,12 +893,18 @@ export async function createNativeDatabaseConnection(
           // Use standard SQL queries to fetch schema information for consistency with the WASM implementation.
           // This ensures we get tables, views, and indexes in a uniform format.
 
-          // Run queries in parallel
-          const [tablesResult, viewsResult, indexesResult] = await Promise.all([
-            worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"]),
-            worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='view' ORDER BY name"]),
-            worker.call<any>('query', ["SELECT name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name"])
-          ]);
+          const queries = [
+            { sql: "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name" },
+            { sql: "SELECT name FROM sqlite_schema WHERE type='view' ORDER BY name" },
+            { sql: "SELECT name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name" }
+          ];
+
+          // Run queries in a single batch to reduce IPC overhead
+          const res = await worker.call<any>('queryBatch', [queries]);
+
+          const tablesResult = res?.results?.[0];
+          const viewsResult = res?.results?.[1];
+          const indexesResult = res?.results?.[2];
 
           const tables = mapRowsByName(tablesResult, { identifier: 'name' });
           const views = mapRowsByName(viewsResult, { identifier: 'name' });
