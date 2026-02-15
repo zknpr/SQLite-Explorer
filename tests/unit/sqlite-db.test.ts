@@ -1,7 +1,23 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
-import { createDatabaseEngine } from '../../src/core/sqlite-db';
+import { createDatabaseEngine, getNodeFs } from '../../src/core/sqlite-db';
+
+describe('getNodeFs', () => {
+  it('should return the fs module in Node.js environment', () => {
+    const fs = getNodeFs();
+    assert.ok(fs, 'getNodeFs() should return a module in Node.js');
+    assert.strictEqual(typeof fs.readFileSync, 'function', 'should have readFileSync');
+    assert.strictEqual(typeof fs.writeFileSync, 'function', 'should have writeFileSync');
+    assert.strictEqual(typeof fs.statSync, 'function', 'should have statSync');
+  });
+
+  it('should return the same module on repeated calls', () => {
+    const fs1 = getNodeFs();
+    const fs2 = getNodeFs();
+    assert.strictEqual(fs1, fs2, 'should return the same fs reference');
+  });
+});
 
 describe('WasmDatabaseEngine', () => {
   let engine: any;

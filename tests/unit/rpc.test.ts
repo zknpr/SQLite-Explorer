@@ -37,6 +37,35 @@ describe('RPC', () => {
       }, 0);
     });
 
+    it('should handle log messages with onLog callback', () => {
+      let capturedLevel: string | null = null;
+      let capturedArgs: unknown[] | null = null;
+      const onLog = (level: string, args: unknown[]) => {
+        capturedLevel = level;
+        capturedArgs = args;
+      };
+
+      const handled = processProtocolMessage(
+        { kind: 'log', level: 'warn', args: ['test warning', 42] },
+        undefined,
+        undefined,
+        onLog
+      );
+
+      assert.strictEqual(handled, true);
+      assert.strictEqual(capturedLevel, 'warn');
+      assert.deepStrictEqual(capturedArgs, ['test warning', 42]);
+    });
+
+    it('should handle log messages without onLog callback (silent drop)', () => {
+      // Log messages should still return true (handled) even without a callback
+      const handled = processProtocolMessage(
+        { kind: 'log', level: 'error', args: ['ignored error'] }
+      );
+
+      assert.strictEqual(handled, true);
+    });
+
     it('should handle unknown methods', () => {
       const methods = {};
       let response: any = null;
