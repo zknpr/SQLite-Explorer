@@ -147,6 +147,11 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.insertRow(table, data);
     }
 
+    async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
+        this.log(`Batch insert ${rows.length} rows into ${table}`, true);
+        return this.wrapped.insertRowBatch(table, rows);
+    }
+
     async deleteRows(table: string, rowIds: RecordId[]): Promise<void> {
         const sql = `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${rowIds.join(', ')})`;
         this.log(sql, true);

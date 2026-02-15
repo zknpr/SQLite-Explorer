@@ -33,6 +33,7 @@ import type {
 } from './core/types';
 import { escapeIdentifier, cellValueToSql, validateSqlType } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
+import { ModificationHandler } from './core/modification-handler';
 
 // ============================================================================
 // Utility Functions
@@ -445,6 +446,8 @@ export async function createNativeDatabaseConnection(
       }
 
       // Create operations facade
+      let modHandler: ModificationHandler;
+
       const operationsFacade: DatabaseOperations = {
         engineKind: Promise.resolve('native'),
 
@@ -476,191 +479,10 @@ export async function createNativeDatabaseConnection(
 
         applyModifications: async () => {},
 
-        /**
-         * Undo a modification by executing the inverse SQL.
-         */
-        undoModification: async (mod: ModificationEntry) => {
-          const { modificationType, targetTable, targetRowId, targetColumn, priorValue, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
-          if (!targetTable) return;
-
-          switch (modificationType) {
-            case 'cell_update':
-              if (affectedCells) {
-                // Batch undo
-                const updates = affectedCells.map(c => ({
-                    rowId: c.rowId,
-                    column: c.columnName,
-                    value: c.priorValue
-                } as CellUpdate));
-                await worker.call('execBatch', [
-                    updates.map(u => ({
-                        sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(u.column)} = ? WHERE rowid = ?`,
-                        params: [u.value, Number(u.rowId)]
-                    }))
-                ]);
-              } else if (targetRowId !== undefined && targetColumn) {
-                const rowIdNum = Number(targetRowId);
-                const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(targetColumn)} = ? WHERE rowid = ?`;
-                await worker.call('run', [sql, [priorValue, rowIdNum]]);
-              }
-              break;
-
-            case 'row_insert':
-              if (targetRowId !== undefined) {
-                await worker.call('run', [`DELETE FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`, [Number(targetRowId)]]);
-              }
-              break;
-
-            case 'row_delete':
-              if (deletedRows && deletedRows.length > 0) {
-                const batch = [];
-                for (const { rowId, row } of deletedRows) {
-                    // row already contains rowid if needed
-                    const columns = Object.keys(row);
-                    const colNames = columns.map(escapeIdentifier).join(', ');
-                    const placeholders = columns.map(() => '?').join(', ');
-                    const params = columns.map(c => row[c]);
-                    batch.push({
-                        sql: `INSERT INTO ${escapeIdentifier(targetTable)} (${colNames}) VALUES (${placeholders})`,
-                        params
-                    });
-                }
-                await worker.call('execBatch', [batch]);
-              }
-              break;
-
-            case 'column_add':
-              if (targetColumn) {
-                await worker.call('run', [`ALTER TABLE ${escapeIdentifier(targetTable)} DROP COLUMN ${escapeIdentifier(targetColumn)}`]);
-              }
-              break;
-
-            case 'column_drop':
-                if (deletedColumns) {
-                    const batch = [];
-                    // 1. Add columns back
-                    for (const col of deletedColumns) {
-                        validateSqlType(col.type); // Validate type
-                        // We can't batch DDL usually, so run immediately
-                        await worker.call('run', [`ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(col.name)} ${col.type}`]);
-                    }
-                    // 2. Restore values
-                    for (const col of deletedColumns) {
-                        for (const { rowId, value } of col.data) {
-                            batch.push({
-                                sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`,
-                                params: [value, Number(rowId)]
-                            });
-                        }
-                    }
-                    if (batch.length > 0) {
-                        await worker.call('execBatch', [batch]);
-                    }
-                }
-                break;
-
-            case 'table_create':
-                await worker.call('run', [`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`]);
-                break;
-          }
-        },
-
-        /**
-         * Redo a modification by re-executing the original change.
-         */
-        redoModification: async (mod: ModificationEntry) => {
-          const { modificationType, targetTable, targetRowId, targetColumn, newValue, affectedCells, affectedRowIds, rowData, tableDef, columnDef, deletedColumns } = mod;
-          if (!targetTable) return;
-
-          switch (modificationType) {
-            case 'cell_update':
-              if (affectedCells) {
-                const updates = affectedCells.map(c => ({
-                    rowId: c.rowId,
-                    column: c.columnName,
-                    value: c.newValue
-                } as CellUpdate));
-                await worker.call('execBatch', [
-                    updates.map(u => ({
-                        sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(u.column)} = ? WHERE rowid = ?`,
-                        params: [u.value, Number(u.rowId)]
-                    }))
-                ]);
-              } else if (targetRowId !== undefined && targetColumn) {
-                const rowIdNum = Number(targetRowId);
-                const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(targetColumn)} = ? WHERE rowid = ?`;
-                await worker.call('run', [sql, [newValue, rowIdNum]]);
-              }
-              break;
-
-            case 'row_insert':
-              if (rowData) {
-                const dataToInsert = targetRowId !== undefined ? { ...rowData, rowid: targetRowId } : rowData;
-                const columns = Object.keys(dataToInsert);
-                const colNames = columns.map(escapeIdentifier).join(', ');
-                const placeholders = columns.map(() => '?').join(', ');
-                const params = columns.map(c => dataToInsert[c]);
-                await worker.call('run', [`INSERT INTO ${escapeIdentifier(targetTable)} (${colNames}) VALUES (${placeholders})`, params]);
-              }
-              break;
-
-            case 'row_delete':
-              if (affectedRowIds && affectedRowIds.length > 0) {
-                const ids = affectedRowIds.map(id => Number(id));
-                const placeholders = ids.map(() => '?').join(', ');
-                await worker.call('run', [`DELETE FROM ${escapeIdentifier(targetTable)} WHERE rowid IN (${placeholders})`, ids]);
-              }
-              break;
-
-            case 'column_add':
-              if (targetColumn && columnDef) {
-                 validateSqlType(columnDef.type);
-                 let sql = `ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(targetColumn)} ${columnDef.type}`;
-                 if (columnDef.defaultValue !== undefined && columnDef.defaultValue !== null && columnDef.defaultValue !== '') {
-                    // Strict numeric validation for default values
-                    if (columnDef.defaultValue.toLowerCase() === 'null') {
-                        sql += ' DEFAULT NULL';
-                    } else if (/^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(columnDef.defaultValue)) {
-                        // Strict numeric pattern: optional sign, digits with optional decimal, optional exponent
-                        sql += ` DEFAULT ${columnDef.defaultValue}`;
-                    } else {
-                        sql += ` DEFAULT '${columnDef.defaultValue.replace(/'/g, "''")}'`;
-                    }
-                 }
-                 await worker.call('run', [sql]);
-              }
-              break;
-
-            case 'column_drop':
-              if (deletedColumns) {
-                  for (const col of deletedColumns) {
-                      await worker.call('run', [`ALTER TABLE ${escapeIdentifier(targetTable)} DROP COLUMN ${escapeIdentifier(col.name)}`]);
-                  }
-              }
-              break;
-
-            case 'table_create':
-              if (tableDef && tableDef.columns) {
-                  // Re-use createTable logic
-                  const colDefs = tableDef.columns.map(col => {
-                    validateSqlType(col.type);
-                    let def = `${escapeIdentifier(col.name)} ${col.type}`;
-                    if (col.primaryKey) def += ' PRIMARY KEY';
-                    if (col.notNull && !col.primaryKey) def += ' NOT NULL';
-                    return def;
-                  });
-                  await worker.call('run', [`CREATE TABLE ${escapeIdentifier(targetTable)} (${colDefs.join(', ')})`]);
-              }
-              break;
-          }
-        },
-
+        undoModification: (mod) => modHandler.undoModification(mod),
+        redoModification: (mod) => modHandler.redoModification(mod),
         flushChanges: async () => {},
-        discardModifications: async (mods: ModificationEntry[]) => {
-            for (let i = mods.length - 1; i >= 0; i--) {
-                await operationsFacade.undoModification(mods[i]);
-            }
-        },
+        discardModifications: (mods) => modHandler.discardModifications(mods),
 
         /**
          * Update a single cell value.
@@ -712,6 +534,26 @@ export async function createNativeDatabaseConnection(
             return Number(result.lastInsertRowId) as RecordId;
           }
           return undefined;
+        },
+
+        /**
+         * Insert multiple rows in a batch.
+         */
+        insertRowBatch: async (table: string, rows: Record<string, CellValue>[]) => {
+          if (rows.length === 0) return;
+
+          const batch = rows.map(row => {
+              const columns = Object.keys(row);
+              const colNames = columns.map(escapeIdentifier).join(', ');
+              const placeholders = columns.map(() => '?').join(', ');
+              const params = columns.map(c => row[c]);
+              return {
+                  sql: `INSERT INTO ${escapeIdentifier(table)} (${colNames}) VALUES (${placeholders})`,
+                  params
+              };
+          });
+
+          await worker.call('execBatch', [batch]);
         },
 
         /**
@@ -1080,6 +922,8 @@ export async function createNativeDatabaseConnection(
           await worker.call('exec', [sql]);
         }
       };
+
+      modHandler = new ModificationHandler(operationsFacade);
 
       return {
         databaseOps: operationsFacade,

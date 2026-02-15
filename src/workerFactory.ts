@@ -99,6 +99,7 @@ interface WorkerMethods {
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
+  insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
   fetchTableData(table: string, options: any): Promise<any>;
   fetchTableCount(table: string, options: any): Promise<number>;
@@ -229,7 +230,7 @@ async function createWasmDatabaseConnection(
         }
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile']
+    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'insertRowBatch', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile']
   );
 
   // Termination handler
@@ -361,6 +362,17 @@ async function createWasmDatabaseConnection(
               value: wrapForTransfer(u.value)
             }));
             return workerProxy.updateCellBatch(table, wrappedUpdates);
+          },
+          insertRowBatch: (table: string, rows: Record<string, CellValue>[]) => {
+            // Wrap any Uint8Array values for zero-copy transfer
+            const wrappedRows = rows.map(row => {
+              const wrapped: Record<string, CellValue> = {};
+              for (const key of Object.keys(row)) {
+                wrapped[key] = wrapForTransfer(row[key]);
+              }
+              return wrapped;
+            });
+            return workerProxy.insertRowBatch(table, wrappedRows);
           },
           addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
             workerProxy.addColumn(table, column, type, defaultValue),

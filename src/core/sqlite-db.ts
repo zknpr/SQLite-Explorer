@@ -23,6 +23,7 @@ import type {
 import { escapeIdentifier, cellValueToSql, validateSqlType } from './sql-utils';
 import { buildSelectQuery, buildCountQuery } from './query-builder';
 import { applyMergePatch } from './json-utils';
+import { ModificationHandler } from './modification-handler';
 
 // ============================================================================
 // Internal sql.js Types
@@ -77,11 +78,13 @@ const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 class WasmDatabaseEngine implements DatabaseOperations {
   private readonly instance: WasmDatabaseInstance;
   private readonly queryTimeout: number;
+  private readonly modificationHandler: ModificationHandler;
   readonly engineKind = Promise.resolve('wasm' as const);
 
   constructor(instance: WasmDatabaseInstance, timeoutMs: number = DEFAULT_QUERY_TIMEOUT_MS) {
     this.instance = instance;
     this.queryTimeout = timeoutMs;
+    this.modificationHandler = new ModificationHandler(this);
   }
 
   /**
@@ -179,189 +182,14 @@ class WasmDatabaseEngine implements DatabaseOperations {
    * Undo a modification.
    */
   async undoModification(mod: ModificationEntry): Promise<void> {
-    const { modificationType, targetTable } = mod;
-    if (!targetTable) return;
-
-    switch (modificationType) {
-      case 'cell_update':
-        await this.undoCellUpdate(targetTable, mod);
-        break;
-
-      case 'row_insert':
-        await this.undoRowInsert(targetTable, mod);
-        break;
-
-      case 'row_delete':
-        await this.undoRowDelete(targetTable, mod);
-        break;
-
-      case 'column_add':
-        await this.undoColumnAdd(targetTable, mod);
-        break;
-
-      case 'column_drop':
-        await this.undoColumnDrop(targetTable, mod);
-        break;
-
-      case 'table_create':
-        await this.undoTableCreate(targetTable);
-        break;
-    }
-  }
-
-  private async undoCellUpdate(targetTable: string, mod: ModificationEntry): Promise<void> {
-    const { affectedCells, targetRowId, targetColumn, priorValue } = mod;
-    if (affectedCells) {
-      // Batch undo
-      await this.executeQuery('BEGIN TRANSACTION');
-      try {
-        for (const cell of affectedCells) {
-          await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.priorValue ?? null);
-        }
-        await this.executeQuery('COMMIT');
-      } catch (e) {
-        await this.executeQuery('ROLLBACK');
-        throw e;
-      }
-    } else if (targetRowId !== undefined && targetColumn) {
-      // Single cell undo
-      await this.updateCell(targetTable, targetRowId, targetColumn, priorValue ?? null);
-    }
-  }
-
-  private async undoRowInsert(targetTable: string, mod: ModificationEntry): Promise<void> {
-    const { targetRowId } = mod;
-    // Undo insert = delete row
-    if (targetRowId !== undefined) {
-      await this.deleteRows(targetTable, [targetRowId]);
-    }
-  }
-
-  private async undoRowDelete(targetTable: string, mod: ModificationEntry): Promise<void> {
-    const { deletedRows } = mod;
-    // Undo delete = re-insert rows
-    if (deletedRows && deletedRows.length > 0) {
-      await this.executeQuery('BEGIN TRANSACTION');
-      try {
-        for (const { rowId, row } of deletedRows) {
-          // row already contains rowid if needed (handled in HostBridge)
-          await this.insertRow(targetTable, row);
-        }
-        await this.executeQuery('COMMIT');
-      } catch (e) {
-        await this.executeQuery('ROLLBACK');
-        throw e;
-      }
-    }
-  }
-
-  private async undoColumnAdd(targetTable: string, mod: ModificationEntry): Promise<void> {
-    const { targetColumn } = mod;
-    // Undo add column = drop column
-    if (targetColumn) {
-      await this.deleteColumns(targetTable, [targetColumn]);
-    }
-  }
-
-  private async undoColumnDrop(targetTable: string, mod: ModificationEntry): Promise<void> {
-    const { deletedColumns } = mod;
-    // Undo drop column = add column + restore values
-    if (deletedColumns) {
-      await this.executeQuery('BEGIN TRANSACTION');
-      try {
-        for (const col of deletedColumns) {
-          await this.addColumn(targetTable, col.name, col.type);
-          // Restore values
-
-          const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`;
-          const stmt = this.instance.prepare(sql);
-          try {
-            for (const { rowId, value } of col.data) {
-              stmt.run([value, Number(rowId)]);
-            }
-          } finally {
-            stmt.free();
-          }
-        }
-        await this.executeQuery('COMMIT');
-      } catch (e) {
-        await this.executeQuery('ROLLBACK');
-        throw e;
-      }
-    }
-  }
-
-  private async undoTableCreate(targetTable: string): Promise<void> {
-    // Undo create table = drop table
-    await this.executeQuery(`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`);
+    return this.modificationHandler.undoModification(mod);
   }
 
   /**
    * Redo a modification.
    */
   async redoModification(mod: ModificationEntry): Promise<void> {
-    const { modificationType, targetTable, targetRowId, targetColumn, newValue, affectedCells, affectedRowIds, rowData, tableDef, columnDef, deletedColumns } = mod;
-    if (!targetTable) return;
-
-    switch (modificationType) {
-        case 'cell_update':
-            if (affectedCells) {
-                // Batch redo
-                await this.executeQuery('BEGIN TRANSACTION');
-                try {
-                    for (const cell of affectedCells) {
-                        await this.updateCell(targetTable, cell.rowId, cell.columnName, cell.newValue ?? null);
-                    }
-                    await this.executeQuery('COMMIT');
-                } catch (e) {
-                    await this.executeQuery('ROLLBACK');
-                    throw e;
-                }
-            } else if (targetRowId !== undefined && targetColumn) {
-                await this.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
-            }
-            break;
-
-        case 'row_insert':
-            // Redo insert = insert again
-            if (rowData) {
-                // If we have the original rowId, enforce it to maintain history consistency
-                const dataToInsert = targetRowId !== undefined
-                    ? { ...rowData, rowid: targetRowId }
-                    : rowData;
-                await this.insertRow(targetTable, dataToInsert);
-            }
-            break;
-
-        case 'row_delete':
-            // Redo delete = delete rows
-            if (affectedRowIds) {
-                await this.deleteRows(targetTable, affectedRowIds);
-            }
-            break;
-
-        case 'column_add':
-            // Redo add column = add column
-            if (targetColumn && columnDef) {
-                await this.addColumn(targetTable, targetColumn, columnDef.type, columnDef.defaultValue);
-            }
-            break;
-
-        case 'column_drop':
-            // Redo drop column = drop column
-            if (deletedColumns) {
-                const colNames = deletedColumns.map(c => c.name);
-                await this.deleteColumns(targetTable, colNames);
-            }
-            break;
-
-        case 'table_create':
-            // Redo create table
-            if (tableDef && tableDef.columns) {
-                await this.createTable(targetTable, tableDef.columns);
-            }
-            break;
-    }
+    return this.modificationHandler.redoModification(mod);
   }
 
   /**
@@ -380,10 +208,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
     mods: ModificationEntry[],
     _signal?: AbortSignal
   ): Promise<void> {
-    // Apply undos in reverse order (LIFO)
-    for (let i = mods.length - 1; i >= 0; i--) {
-        await this.undoModification(mods[i]);
-    }
+    return this.modificationHandler.discardModifications(mods);
   }
 
   /**
@@ -454,6 +279,24 @@ class WasmDatabaseEngine implements DatabaseOperations {
       return result[0].rows[0][0] as RecordId;
     }
     return undefined;
+  }
+
+  /**
+   * Insert multiple rows in a batch.
+   */
+  async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
+    if (rows.length === 0) return;
+
+    await this.executeQuery('BEGIN TRANSACTION');
+    try {
+      for (const row of rows) {
+        await this.insertRow(table, row);
+      }
+      await this.executeQuery('COMMIT');
+    } catch (err) {
+      try { await this.executeQuery('ROLLBACK'); } catch {}
+      throw err;
+    }
   }
 
   /**
@@ -1063,6 +906,11 @@ export function createWorkerEndpoint() {
     async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
       if (!activeEngine) throw new Error('No database initialized');
       return activeEngine.updateCellBatch(table, updates);
+    },
+
+    async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
+      if (!activeEngine) throw new Error('No database initialized');
+      return activeEngine.insertRowBatch(table, rows);
     },
 
     async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {
