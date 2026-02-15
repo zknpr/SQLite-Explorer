@@ -111,4 +111,50 @@ describe('WasmDatabaseEngine', () => {
       assert.strictEqual(countYellow, 1);
     });
   });
+
+  describe('updateCellBatch', () => {
+    before(async () => {
+        await engine.executeQuery("CREATE TABLE batch_test (id INTEGER PRIMARY KEY, val TEXT, json_col TEXT)");
+        await engine.insertRow('batch_test', { id: 1, val: 'orig1', json_col: '{"a": 1}' });
+        await engine.insertRow('batch_test', { id: 2, val: 'orig2', json_col: '{"a": 2}' });
+        await engine.insertRow('batch_test', { id: 3, val: 'orig3', json_col: 'invalid' });
+    });
+
+    it('should update multiple cells with set operation', async () => {
+        await engine.updateCellBatch('batch_test', [
+            { rowId: 1, column: 'val', value: 'new1' },
+            { rowId: 2, column: 'val', value: 'new2' }
+        ]);
+
+        const res = await engine.executeQuery("SELECT val FROM batch_test ORDER BY id");
+        assert.strictEqual(res[0].rows[0][0], 'new1');
+        assert.strictEqual(res[0].rows[1][0], 'new2');
+    });
+
+    it('should update multiple cells with json_patch operation', async () => {
+        await engine.updateCellBatch('batch_test', [
+            { rowId: 1, column: 'json_col', value: '{"b": 2}', operation: 'json_patch' },
+            { rowId: 2, column: 'json_col', value: '{"b": 3}', operation: 'json_patch' }
+        ]);
+
+        const res = await engine.executeQuery("SELECT json_col FROM batch_test ORDER BY id");
+        const r1 = JSON.parse(res[0].rows[0][0] as string);
+        const r2 = JSON.parse(res[0].rows[1][0] as string);
+
+        assert.deepStrictEqual(r1, { a: 1, b: 2 });
+        assert.deepStrictEqual(r2, { a: 2, b: 3 });
+    });
+
+    it('should handle invalid JSON in target column gracefully (default to empty object)', async () => {
+        // Row 3 has 'invalid' text
+        await engine.updateCellBatch('batch_test', [
+            { rowId: 3, column: 'json_col', value: '{"b": 4}', operation: 'json_patch' }
+        ]);
+
+        const res = await engine.executeQuery("SELECT json_col FROM batch_test WHERE id = 3");
+        const r3 = JSON.parse(res[0].rows[0][0] as string);
+        // 'invalid' -> {} -> merge {"b": 4} -> {"b": 4}
+        assert.deepStrictEqual(r3, { b: 4 });
+    });
+  });
 });

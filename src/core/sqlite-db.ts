@@ -592,74 +592,102 @@ class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery('BEGIN TRANSACTION');
     try {
       const escapedTable = escapeIdentifier(table);
+
       // Group updates by column and operation type
-      // Prepare statements one by one avoids full re-parse
-
-      // Prepare per column.
-      // Group by column.
-
       const updatesByColumn = new Map<string, CellUpdate[]>();
       for (const update of updates) {
-          const key = `${update.column}|${update.operation || 'set'}`;
-          if (!updatesByColumn.has(key)) {
-              updatesByColumn.set(key, []);
-          }
-          updatesByColumn.get(key)!.push(update);
+        const key = `${update.column}|${update.operation || 'set'}`;
+        if (!updatesByColumn.has(key)) {
+          updatesByColumn.set(key, []);
+        }
+        updatesByColumn.get(key)!.push(update);
       }
 
+      // Process each group
       for (const [key, columnUpdates] of updatesByColumn.entries()) {
-          const [column, op] = key.split('|');
-          const escapedColumn = escapeIdentifier(column);
-          const sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+        const [column, op] = key.split('|');
+        const escapedColumn = escapeIdentifier(column);
 
-          const stmt = this.instance.prepare(sql);
+        if (op === 'json_patch') {
+          // Process in chunks to avoid parameter limits (SQLITE_LIMIT_VARIABLE_NUMBER)
+          // 400 * 2 = 800 parameters, well within default limits (999 or 32766)
+          const CHUNK_SIZE = 400;
+          const totalUpdates = columnUpdates.length;
+          let offset = 0;
+          const chunkParams: CellValue[] = [];
 
-          // Optimize JSON patch read by preparing the SELECT statement
-          let selectStmt: WasmPreparedStatement | null = null;
+          // 1. Process full chunks with a single prepared statement
+          if (totalUpdates >= CHUNK_SIZE) {
+            const placeholders = Array(CHUNK_SIZE).fill('(?, ?)').join(', ');
+            const sql = `
+              WITH _batch(id, patch) AS (VALUES ${placeholders})
+              UPDATE ${escapedTable}
+              SET ${escapedColumn} = json_patch(
+                CASE WHEN json_valid(${escapedColumn}) THEN ${escapedColumn} ELSE '{}' END,
+                _batch.patch
+              )
+              FROM _batch
+              WHERE ${escapedTable}.rowid = _batch.id
+            `;
 
-          try {
-              if (op === 'json_patch') {
-                 selectStmt = this.instance.prepare(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`);
+            const stmt = this.instance.prepare(sql);
+            try {
+              while (offset + CHUNK_SIZE <= totalUpdates) {
+                const chunk = columnUpdates.slice(offset, offset + CHUNK_SIZE);
+                chunkParams.length = 0;
+
+                for (const u of chunk) {
+                  chunkParams.push(Number(u.rowId));
+                  chunkParams.push(typeof u.value === 'string' ? u.value : JSON.stringify(u.value));
+                }
+
+                stmt.run(chunkParams);
+                offset += CHUNK_SIZE;
               }
-
-              for (const update of columnUpdates) {
-                  const rowIdNum = Number(update.rowId);
-
-                  if (op === 'json_patch') {
-                     // Read using prepared statement
-                     // selectStmt.get([rowIdNum]) returns [val] or undefined
-                     // sql.js documentation says get() returns array of values
-                     let currentValue = null;
-                     if (selectStmt) {
-                        // stmt.get(params) returns the row as an array of values
-                        const row = selectStmt.get([rowIdNum]);
-                        if (row && row.length > 0) {
-                            currentValue = row[0];
-                        }
-
-                        // sqlite3_reset() is required to reuse a prepared statement.
-                        selectStmt.reset();
-                     }
-
-                     let currentObj = {};
-                     if (typeof currentValue === 'string') {
-                         try { currentObj = JSON.parse(currentValue); } catch {}
-                     }
-
-                     const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
-                     const newValueObj = applyMergePatch(currentObj, patchObj);
-                     const newValueStr = JSON.stringify(newValueObj);
-
-                     stmt.run([newValueStr, rowIdNum]);
-                  } else {
-                      // Standard update
-                      stmt.run([update.value, rowIdNum]);
-                  }
-              }
-          } finally {
+            } finally {
               stmt.free();
-              if (selectStmt) selectStmt.free();
+            }
           }
+
+          // 2. Process remainder
+          if (offset < totalUpdates) {
+            const chunk = columnUpdates.slice(offset);
+            const placeholders = chunk.map(() => '(?, ?)').join(', ');
+            const sql = `
+              WITH _batch(id, patch) AS (VALUES ${placeholders})
+              UPDATE ${escapedTable}
+              SET ${escapedColumn} = json_patch(
+                CASE WHEN json_valid(${escapedColumn}) THEN ${escapedColumn} ELSE '{}' END,
+                _batch.patch
+              )
+              FROM _batch
+              WHERE ${escapedTable}.rowid = _batch.id
+            `;
+
+            const stmt = this.instance.prepare(sql);
+            try {
+              chunkParams.length = 0;
+              for (const u of chunk) {
+                chunkParams.push(Number(u.rowId));
+                chunkParams.push(typeof u.value === 'string' ? u.value : JSON.stringify(u.value));
+              }
+              stmt.run(chunkParams);
+            } finally {
+              stmt.free();
+            }
+          }
+        } else {
+          // Standard update: Use prepared statement loop (faster for simple updates)
+          const sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+          const stmt = this.instance.prepare(sql);
+          try {
+            for (const u of columnUpdates) {
+              stmt.run([u.value, Number(u.rowId)]);
+            }
+          } finally {
+            stmt.free();
+          }
+        }
       }
 
       await this.executeQuery('COMMIT');
