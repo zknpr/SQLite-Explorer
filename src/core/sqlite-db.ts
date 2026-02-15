@@ -583,6 +583,78 @@ class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /**
+   * Helper to group updates by column and operation type.
+   */
+  private groupUpdates(updates: CellUpdate[]): Map<string, CellUpdate[]> {
+    const updatesByColumn = new Map<string, CellUpdate[]>();
+    for (const update of updates) {
+      const key = `${update.column}|${update.operation || 'set'}`;
+      if (!updatesByColumn.has(key)) {
+        updatesByColumn.set(key, []);
+      }
+      updatesByColumn.get(key)!.push(update);
+    }
+    return updatesByColumn;
+  }
+
+  /**
+   * Helper to apply a JSON patch to a cell value.
+   */
+  private applyJsonPatch(selectStmt: WasmPreparedStatement, rowId: number, patchValue: CellValue): string {
+    let currentValue: CellValue = null;
+
+    // stmt.get(params) returns the row as an array of values
+    const row = selectStmt.get([rowId]);
+    if (row && row.length > 0) {
+      currentValue = row[0];
+    }
+    selectStmt.reset();
+
+    let currentObj = {};
+    if (typeof currentValue === 'string') {
+      try { currentObj = JSON.parse(currentValue); } catch { /* ignore parse error */ }
+    }
+
+    const patchObj = typeof patchValue === 'string' ? JSON.parse(patchValue as string) : patchValue;
+    const newValueObj = applyMergePatch(currentObj, patchObj);
+    return JSON.stringify(newValueObj);
+  }
+
+  /**
+   * Helper to process a batch of updates for a single column.
+   */
+  private processUpdateBatch(escapedTable: string, column: string, op: string, updates: CellUpdate[]): void {
+    const escapedColumn = escapeIdentifier(column);
+    const sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+
+    const stmt = this.instance.prepare(sql);
+
+    // Optimize JSON patch read by preparing the SELECT statement
+    let selectStmt: WasmPreparedStatement | null = null;
+
+    try {
+      if (op === 'json_patch') {
+        selectStmt = this.instance.prepare(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`);
+      }
+
+      for (const update of updates) {
+        const rowIdNum = Number(update.rowId);
+
+        if (op === 'json_patch' && selectStmt) {
+          const newValueStr = this.applyJsonPatch(selectStmt, rowIdNum, update.value);
+          stmt.run([newValueStr, rowIdNum]);
+        } else {
+          // Standard update
+          stmt.run([update.value, rowIdNum]);
+        }
+      }
+    } finally {
+      stmt.free();
+      if (selectStmt) selectStmt.free();
+    }
+  }
+
+  /**
    * Update multiple cells in a batch.
    */
   async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
@@ -592,79 +664,16 @@ class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery('BEGIN TRANSACTION');
     try {
       const escapedTable = escapeIdentifier(table);
-      // Group updates by column and operation type
-      // Prepare statements one by one avoids full re-parse
-
-      // Prepare per column.
-      // Group by column.
-
-      const updatesByColumn = new Map<string, CellUpdate[]>();
-      for (const update of updates) {
-          const key = `${update.column}|${update.operation || 'set'}`;
-          if (!updatesByColumn.has(key)) {
-              updatesByColumn.set(key, []);
-          }
-          updatesByColumn.get(key)!.push(update);
-      }
+      const updatesByColumn = this.groupUpdates(updates);
 
       for (const [key, columnUpdates] of updatesByColumn.entries()) {
-          const [column, op] = key.split('|');
-          const escapedColumn = escapeIdentifier(column);
-          const sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
-
-          const stmt = this.instance.prepare(sql);
-
-          // Optimize JSON patch read by preparing the SELECT statement
-          let selectStmt: WasmPreparedStatement | null = null;
-
-          try {
-              if (op === 'json_patch') {
-                 selectStmt = this.instance.prepare(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`);
-              }
-
-              for (const update of columnUpdates) {
-                  const rowIdNum = Number(update.rowId);
-
-                  if (op === 'json_patch') {
-                     // Read using prepared statement
-                     // selectStmt.get([rowIdNum]) returns [val] or undefined
-                     // sql.js documentation says get() returns array of values
-                     let currentValue = null;
-                     if (selectStmt) {
-                        // stmt.get(params) returns the row as an array of values
-                        const row = selectStmt.get([rowIdNum]);
-                        if (row && row.length > 0) {
-                            currentValue = row[0];
-                        }
-
-                        // sqlite3_reset() is required to reuse a prepared statement.
-                        selectStmt.reset();
-                     }
-
-                     let currentObj = {};
-                     if (typeof currentValue === 'string') {
-                         try { currentObj = JSON.parse(currentValue); } catch {}
-                     }
-
-                     const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
-                     const newValueObj = applyMergePatch(currentObj, patchObj);
-                     const newValueStr = JSON.stringify(newValueObj);
-
-                     stmt.run([newValueStr, rowIdNum]);
-                  } else {
-                      // Standard update
-                      stmt.run([update.value, rowIdNum]);
-                  }
-              }
-          } finally {
-              stmt.free();
-              if (selectStmt) selectStmt.free();
-          }
+        const [column, op] = key.split('|');
+        this.processUpdateBatch(escapedTable, column, op, columnUpdates);
       }
 
       await this.executeQuery('COMMIT');
     } catch (err) {
-      try { await this.executeQuery('ROLLBACK'); } catch {}
+      try { await this.executeQuery('ROLLBACK'); } catch { /* ignore rollback error */ }
       throw err;
     }
   }
