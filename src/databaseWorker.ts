@@ -6,14 +6,28 @@
  */
 
 import { parentPort } from "./platform/threadPool";
-import { processProtocolMessage } from "./core/rpc";
+import { processProtocolMessage, type LogEnvelope } from "./core/rpc";
 import { createWorkerEndpoint } from "./core/sqlite-db";
 
 // ============================================================================
 // Worker Initialization
 // ============================================================================
 
-console.log('[DatabaseWorker] Starting...');
+/**
+ * Send log message to the extension host.
+ */
+function log(message: string, level: 'info' | 'warn' | 'error' = 'info') {
+  if (parentPort) {
+    const envelope: LogEnvelope = {
+      kind: 'log',
+      message,
+      level
+    };
+    parentPort.postMessage(envelope);
+  }
+}
+
+log('[DatabaseWorker] Starting...');
 
 // Create the endpoint that handles database operations
 const databaseEndpoint = createWorkerEndpoint();
@@ -48,7 +62,7 @@ if (parentPort) {
     if (!wasHandled) {
       const msg = envelope as { kind?: string };
       if (msg?.kind !== 'result') {
-        console.warn('[DatabaseWorker] Unrecognized message:', msg?.kind);
+        log(`[DatabaseWorker] Unrecognized message: ${msg?.kind}`, 'warn');
       }
     }
   });
@@ -57,10 +71,10 @@ if (parentPort) {
    * Handle port errors.
    */
   parentPort.on('error', (err: Error) => {
-    console.error('[DatabaseWorker] Port error:', err.message);
+    log(`[DatabaseWorker] Port error: ${err.message}`, 'error');
   });
 
-  console.log('[DatabaseWorker] Ready for connections');
+  log('[DatabaseWorker] Ready for connections');
 } else {
   console.error('[DatabaseWorker] No parent port - invalid execution context');
 }

@@ -39,9 +39,18 @@ interface ResponseEnvelope {
 }
 
 /**
+ * Log message from the remote context.
+ */
+export interface LogEnvelope {
+  readonly kind: 'log';
+  readonly message: string;
+  readonly level: 'info' | 'warn' | 'error';
+}
+
+/**
  * Union of all protocol message types.
  */
-type ProtocolEnvelope = InvocationEnvelope | ResponseEnvelope;
+export type ProtocolEnvelope = InvocationEnvelope | ResponseEnvelope | LogEnvelope;
 
 // ============================================================================
 // State Management
@@ -309,11 +318,13 @@ interface WorkerPort {
  *
  * @param port - Worker port for message passing
  * @param methodNames - Methods to expose on proxy
+ * @param onLog - Optional callback for handling log messages from the worker
  * @returns Proxy object for calling worker methods
  */
 export function connectWorkerPort<T extends object>(
   port: WorkerPort,
-  methodNames: string[]
+  methodNames: string[],
+  onLog?: (message: string, level: 'info' | 'warn' | 'error') => void
 ): T {
   const dispatcher: MessageDispatcher = (envelope, transfer) => {
     // Check if port supports transfer list (Browser/Node worker compatible)
@@ -332,7 +343,15 @@ export function connectWorkerPort<T extends object>(
   };
 
   port.on('message', (data) => {
-    processProtocolMessage(data);
+    if (processProtocolMessage(data)) {
+      return;
+    }
+
+    // Handle log messages
+    const msg = data as Partial<LogEnvelope>;
+    if (msg && msg.kind === 'log' && typeof msg.message === 'string' && onLog) {
+      onLog(msg.message, msg.level || 'info');
+    }
   });
 
   return buildMethodProxy<T>(dispatcher, methodNames);

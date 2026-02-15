@@ -229,7 +229,17 @@ async function createWasmDatabaseConnection(
         }
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile']
+    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile'],
+    (message, level) => {
+      // Forward logs from worker to the debug console
+      if (level === 'error') {
+        console.error(message);
+      } else if (level === 'warn') {
+        console.warn(message);
+      } else {
+        console.log(message);
+      }
+    }
   );
 
   // Termination handler
