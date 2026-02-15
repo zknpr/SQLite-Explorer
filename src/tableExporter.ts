@@ -371,9 +371,9 @@ function exportToCsv(columns: string[], rows: CellValue[][], includeHeader: bool
  * Convert data to JSON format.
  * Each row becomes an object with column names as keys.
  */
-function exportToJson(columns: string[], rows: CellValue[][]): string {
+export function exportToJson(columns: string[], rows: CellValue[][]): string {
   const objects = rows.map(row => {
-    const obj: Record<string, any> = {};
+    const obj: Record<string, CellValue> = {};
     columns.forEach((col, idx) => {
       const value = row[idx];
       // Convert Uint8Array to base64 for JSON
