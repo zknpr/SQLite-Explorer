@@ -14,7 +14,7 @@ import { ConfigurationSection, ExtensionId, FullExtensionId, SidebarLeft, Sideba
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType } from './core/types';
 import { generateMergePatch } from './core/json-utils';
 import { escapeIdentifier } from './core/sql-utils';
 
@@ -713,7 +713,7 @@ export class HostBridge implements ToastService {
     value, type, webviewId, rowCount
   }: {
     value?: CellValue,
-    type?: any,
+    type?: CellContentType,
     webviewId?: string,
     rowCount?: number,
   } = {}) {
@@ -986,7 +986,7 @@ export class HostBridge implements ToastService {
  * @param type - File type result
  * @returns File extension including the dot
  */
-async function determineCellExtension(colTypes: ColumnTypeInfo, value?: CellValue, type?: any): Promise<string> {
+async function determineCellExtension(colTypes: ColumnTypeInfo, value?: CellValue, type?: CellContentType): Promise<string> {
   // Default to .txt for text, .bin for binary
   if (value instanceof Uint8Array || (value && typeof value === 'object' && 'buffer' in value)) {
     // Check if it's a known binary format

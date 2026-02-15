@@ -25,10 +25,17 @@ export const mockVscode = {
                 fragment: '',
                 fsPath: path,
                 with: () => uri,
-                toString: () => path
+                toString: () => path,
+                toJSON: () => path
             };
             return uri;
         },
+        from: (components: { scheme: string, path: string, query?: string }) => ({
+            scheme: components.scheme,
+            path: components.path,
+            query: components.query || '',
+            toString: () => `${components.scheme}://${components.path}${components.query ? '?' + components.query : ''}`
+        }),
         file: (path: string) => ({
             scheme: 'file',
             authority: '',
@@ -70,5 +77,37 @@ export const mockVscode = {
     Disposable: class {
         constructor(callBack: () => void) {}
         dispose() {}
+    },
+    commands: {
+        executeCommand: (command: string, ...args: any[]) => Promise.resolve()
+    },
+    window: {
+        showInformationMessage: () => Promise.resolve(),
+        showWarningMessage: () => Promise.resolve(),
+        showErrorMessage: () => Promise.resolve(),
+        showSaveDialog: () => Promise.resolve(),
+        showOpenDialog: () => Promise.resolve(),
+    },
+    workspace: {
+        getConfiguration: () => ({
+            get: () => {},
+            update: () => Promise.resolve()
+        }),
+        getWorkspaceFolder: () => undefined,
+        fs: {
+            readFile: () => Promise.resolve(new Uint8Array()),
+            writeFile: () => Promise.resolve()
+        }
+    },
+    ViewColumn: {
+        Two: 2
+    },
+    l10n: {
+        t: (key: string, ...args: any[]) => key
+    },
+    env: {
+        uriScheme: 'vscode',
+        appName: 'VS Code',
+        language: 'en'
     }
 };
