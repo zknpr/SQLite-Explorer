@@ -10,6 +10,19 @@
 // ============================================================================
 
 /**
+ * Content type information for cell values.
+ * Used when opening cell editors to determine file extension and handling.
+ */
+export interface CellContentType {
+  /** MIME type (e.g., 'image/png', 'application/json') */
+  mime?: string;
+  /** File extension (e.g., 'png', 'json') */
+  ext?: string;
+  /** Content type category or SQL type name */
+  type?: string;
+}
+
+/**
  * Represents any value that can be stored in a SQLite cell.
  * Includes text, integers, floats, binary data, and NULL.
  */
