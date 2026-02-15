@@ -31,7 +31,7 @@ type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength:
 
 // Column type information
 interface ColumnTypeInfo {
-  [key: string]: any;
+  [key: string]: unknown;
 }
 
 // Toast service interface for showing dialogs
@@ -725,7 +725,7 @@ export class HostBridge implements ToastService {
         cellParts = [params.table, params.name || '-', '__create__.sql'];
       } else {
         // Determine file extension based on content type
-        const extname = await determineCellExtension(colTypes, value, type);
+        const extname = await determineCellExtension(value, type);
         const cellFilename = (colName || 'cell') + extname;
 
         // Use simple path structure
@@ -981,12 +981,11 @@ export class HostBridge implements ToastService {
 /**
  * Determine the file extension for a cell based on its content type.
  *
- * @param colTypes - Column type information
  * @param value - Cell value
  * @param type - File type result
  * @returns File extension including the dot
  */
-async function determineCellExtension(colTypes: ColumnTypeInfo, value?: CellValue, type?: any): Promise<string> {
+async function determineCellExtension(value?: CellValue, type?: any): Promise<string> {
   // Default to .txt for text, .bin for binary
   if (value instanceof Uint8Array || (value && typeof value === 'object' && 'buffer' in value)) {
     // Check if it's a known binary format
