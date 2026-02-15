@@ -412,9 +412,35 @@ export async function createNativeDatabaseConnection(
 
   return {
     workerMethods: {
-      initializeDatabase: async (...args: unknown[]) => worker.call('open', args),
-      runQuery: async (...args: unknown[]) => worker.call('query', args),
-      exportDatabase: async (...args: unknown[]) => worker.call('export', args),
+      initializeDatabase: async (filename: string, config: DatabaseInitConfig): Promise<DatabaseInitResult> => {
+        const path = config.filePath || filename;
+        const readOnly = config.readOnlyMode ?? false;
+        await worker.call('open', [path, readOnly]);
+        return { isReadOnly: readOnly };
+      },
+
+      runQuery: async (sql: string, params?: CellValue[]): Promise<QueryResultSet[]> => {
+        const result = await worker.call<{
+          columns: string[];
+          values: CellValue[][];
+          rowCount: number;
+        }>('query', [sql, params]);
+
+        return [{
+          headers: result.columns,
+          rows: result.values,
+          columns: result.columns,
+          values: result.values,
+          columnNames: result.columns,
+          records: result.values
+        }];
+      },
+
+      exportDatabase: async (_name: string): Promise<Uint8Array> => {
+        const result = await worker.call<{ content: Uint8Array }>('export', []);
+        return result.content;
+      },
+
       [Symbol.dispose]: terminateWorker
     },
 
