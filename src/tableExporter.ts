@@ -13,11 +13,18 @@ import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
 
 // Legacy DbParams type for backward compatibility with webview
-interface DbParams {
+export interface DbParams {
   filename?: string;
   table: string;
   name?: string;
   uri?: string;
+}
+
+export interface ExportOptions {
+  format?: string;
+  header?: boolean;
+  includeTableName?: boolean;
+  rowIds?: (string | number)[];
 }
 
 /**
@@ -38,7 +45,7 @@ export async function exportTableCommand(
   columns: string[],
   _dbOptions?: any,
   _tableStore?: any,
-  _exportOptions?: { format?: string, header?: boolean, includeTableName?: boolean, rowIds?: (string | number)[] },
+  _exportOptions?: ExportOptions,
   _extras?: any
 ) {
   try {
@@ -48,48 +55,10 @@ export async function exportTableCommand(
       return;
     }
 
-    let formatValue: string | undefined = _exportOptions?.format;
+    const formatValue = await getExportFormat(tableName, _exportOptions);
+    if (!formatValue) return;
 
-    // If format not provided in options, ask user
-    if (!formatValue) {
-      const formatPick = await vsc.window.showQuickPick(
-        [
-          { label: 'CSV', description: 'Comma-separated values', value: 'csv' },
-          { label: 'JSON', description: 'JavaScript Object Notation', value: 'json' },
-          { label: 'SQL', description: 'SQL INSERT statements', value: 'sql' },
-          { label: 'Excel', description: 'CSV with encoding for Excel', value: 'excel' }
-        ],
-        {
-          placeHolder: 'Select export format',
-          title: `Export "${tableName}"`
-        }
-      );
-      if (!formatPick) return; // User cancelled
-      formatValue = formatPick.value;
-    }
-
-    // Find the active document to get database access
-    let document = null;
-
-    // 1. Try to find by URI if provided (most reliable)
-    if (dbParams.uri) {
-      for (const [, doc] of DocumentRegistry) {
-        if (doc.uri.toString() === dbParams.uri) {
-          document = doc;
-          break;
-        }
-      }
-    }
-
-    // 2. Fallback: pick the first one (legacy behavior)
-    // Assumes single active database editor
-    if (!document) {
-      for (const [, doc] of DocumentRegistry) {
-        document = doc;
-        break;
-      }
-    }
-
+    const document = resolveDatabaseDocument(dbParams);
     if (!document || !document.databaseOperations) {
       vsc.window.showErrorMessage('No active database connection');
       return;
@@ -98,31 +67,9 @@ export async function exportTableCommand(
     const includeHeader = _exportOptions?.header ?? true;
     const includeTableName = _exportOptions?.includeTableName ?? true;
 
-    // Determine extension
-    let defaultExt = 'csv';
-    switch (formatValue) {
-      case 'json': defaultExt = 'json'; break;
-      case 'sql': defaultExt = 'sql'; break;
-      case 'excel': defaultExt = 'csv'; break;
-      case 'csv': defaultExt = 'csv'; break;
-      default:
-        vsc.window.showErrorMessage(`Unsupported export format: ${formatValue}`);
-        return;
-    }
+    const uri = await getExportDestination(tableName, formatValue, document.uri);
+    if (!uri) return;
 
-    // Show save dialog
-    // Set default directory to the database file's directory using joinPath
-    // This prevents the dialog from defaulting to the root directory '/'
-    const uri = await vsc.window.showSaveDialog({
-      defaultUri: vsc.Uri.joinPath(document.uri, '..', `${tableName}.${defaultExt}`),
-      filters: {
-        [formatValue.toUpperCase()]: [defaultExt],
-        'All Files': ['*']
-      },
-      title: `Export "${tableName}" as ${formatValue.toUpperCase()}`
-    });
-
-    if (!uri) return; // User cancelled
     const isLocalFile = uri.scheme === 'file';
 
     // Fetch data from the table in chunks to avoid OOM
@@ -133,204 +80,13 @@ export async function exportTableCommand(
       queryColumns = columns.map(escapeIdentifier).join(', ');
     }
 
-
     if (isLocalFile && typeof require === 'function') {
-        // Use Node.js fs streams for memory efficiency
-        try {
-            const fs = require('fs');
-            const stream = fs.createWriteStream(uri.fsPath, { encoding: 'utf-8' });
-
-            // Write BOM for Excel if needed
-            if (formatValue === 'excel') {
-                stream.write('\uFEFF');
-            }
-
-            // Check if we can use rowid pagination
-            let useRowId = false;
-            try {
-                await document.databaseOperations.executeQuery(`SELECT rowid FROM ${escapeIdentifier(tableName)} LIMIT 1`);
-                useRowId = true;
-            } catch (e) {
-                // Fallback to offset pagination
-            }
-
-            const BATCH_SIZE = 5000;
-            let offset = 0;
-            let lastId = Number.MIN_SAFE_INTEGER;
-            let hasMore = true;
-            let isFirstBatch = true;
-            let rowCount = 0;
-
-            // For JSON, start the array
-            if (formatValue === 'json') {
-                stream.write('[');
-            }
-
-            while (hasMore) {
-                let sql: string;
-                const params: any[] = [];
-
-                if (useRowId) {
-                    // Keyset pagination: fast O(1)
-                    // We fetch rowid + user columns. rowid is prepended.
-                    sql = `SELECT rowid, ${queryColumns} FROM ${escapeIdentifier(tableName)} WHERE rowid > ?`;
-                    params.push(lastId);
-
-                    // Add rowIds filter if present
-                    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-                        const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
-                        if (validIds.length > 0) {
-                            sql += ` AND rowid IN (${validIds.map(() => '?').join(',')})`;
-                            params.push(...validIds);
-                        }
-                    }
-
-                    sql += ` ORDER BY rowid ASC LIMIT ${BATCH_SIZE}`;
-                } else {
-                    // Offset pagination: O(N) but compatible with WITHOUT ROWID tables
-                    sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
-
-                    // Add rowIds filter if present
-                    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-                        const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
-                        if (validIds.length > 0) {
-                            // Filter logic for non-rowid tables would go here
-                        }
-                    }
-
-                    sql += ` LIMIT ${BATCH_SIZE} OFFSET ${offset}`;
-                }
-
-                const result = await document.databaseOperations.executeQuery(sql, params);
-
-                if (!result || result.length === 0 || !result[0].rows || result[0].rows.length === 0) {
-                    hasMore = false;
-                    break;
-                }
-
-                const rows = result[0].rows as CellValue[][];
-                const headers = result[0].headers as string[];
-
-                // Update cursors
-                if (useRowId) {
-                    const lastRow = rows[rows.length - 1];
-                    // rowid is the first column because we requested `SELECT rowid, ...`
-                    lastId = Number(lastRow[0]);
-                } else {
-                    offset += rows.length;
-                }
-
-                if (rows.length < BATCH_SIZE) {
-                    hasMore = false;
-                }
-
-                rowCount += rows.length;
-
-                // Prepare data for export
-                let outputRows = rows;
-                let outputHeaders = headers;
-
-                if (useRowId) {
-                    // We fetched rowid as first column. Always strip it as it's an implementation detail.
-                    // If user requested 'rowid' in queryColumns, it will be in the remaining columns.
-                    outputRows = rows.map(r => r.slice(1));
-                    outputHeaders = headers.slice(1);
-                }
-
-                // Write chunk
-                let chunkContent = '';
-
-                switch (formatValue) {
-                    case 'excel':
-                    case 'csv':
-                        // Header only for first batch
-                        chunkContent = exportToCsv(outputHeaders, outputRows, isFirstBatch && includeHeader);
-                        if (!isFirstBatch && chunkContent) chunkContent = '\n' + chunkContent;
-                        break;
-                    case 'json':
-                        if (!isFirstBatch && outputRows.length > 0) stream.write(',');
-                        const jsonStr = exportToJson(outputHeaders, outputRows);
-                        chunkContent = jsonStr.slice(1, -1); // Remove [ and ]
-                        break;
-                    case 'sql':
-                        chunkContent = exportToSql(tableName, outputHeaders, outputRows, includeTableName);
-                        if (!isFirstBatch && chunkContent) chunkContent = '\n' + chunkContent;
-                        break;
-                }
-
-                if (chunkContent) {
-                    stream.write(chunkContent);
-                }
-
-                isFirstBatch = false;
-            }
-
-            if (formatValue === 'json') {
-                stream.write(']');
-            }
-
-            stream.end();
-            vsc.window.showInformationMessage(`Exported ${rowCount} rows to ${uri.fsPath}`);
-            return;
-
-        } catch (e) {
-            console.warn('Native stream write failed, falling back to memory', e);
-        }
+      const success = await exportToStream(document, tableName, queryColumns, uri, formatValue, _exportOptions);
+      if (success) return;
     }
 
     // Fallback to in-memory (existing logic) if not local file or rowid not supported
-    // ... (keep original logic below for fallback) ...
-
-    let sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
-    const params: any[] = [];
-
-    // Filter by row IDs if provided
-    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-        const rowIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
-        if (rowIds.length > 0) {
-            const placeholders = rowIds.map(() => '?').join(', ');
-            sql += ` WHERE rowid IN (${placeholders})`;
-            params.push(...rowIds);
-        }
-    }
-
-    const result = await document.databaseOperations.executeQuery(sql, params);
-
-    if (!result || result.length === 0 || !result[0].values) {
-      vsc.window.showInformationMessage(`Table "${tableName}" is empty or no rows match selection`);
-      return;
-    }
-
-    const columnNames = (result[0].columns || result[0].headers) as string[];
-    const rows = (result[0].values || result[0].rows) as CellValue[][];
-
-    let content: string;
-
-    switch (formatValue) {
-      case 'excel':
-        // Excel prefers CSV with BOM for UTF-8
-        content = '\uFEFF' + exportToCsv(columnNames, rows, includeHeader);
-        break;
-      case 'csv':
-        content = exportToCsv(columnNames, rows, includeHeader);
-        break;
-      case 'json':
-        content = exportToJson(columnNames, rows);
-        break;
-      case 'sql':
-        content = exportToSql(tableName, columnNames, rows, includeTableName);
-        break;
-      default:
-        vsc.window.showErrorMessage(`Unsupported export format: ${formatValue}`);
-        return;
-    }
-
-    // Write file
-    await vsc.workspace.fs.writeFile(uri, Buffer.from(content, 'utf-8'));
-
-    vsc.window.showInformationMessage(
-      `Exported ${rows.length} rows to ${uri.fsPath}`
-    );
+    await exportToMemory(document, tableName, queryColumns, uri, formatValue, _exportOptions);
 
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -405,4 +161,307 @@ function exportToSql(tableName: string, columns: string[], rows: CellValue[][], 
   });
 
   return statements.join('\n');
+}
+
+/**
+ * Determine export format from options or user selection.
+ */
+async function getExportFormat(tableName: string, options?: ExportOptions): Promise<string | undefined> {
+  if (options?.format) {
+    return options.format;
+  }
+
+  const formatPick = await vsc.window.showQuickPick(
+    [
+      { label: 'CSV', description: 'Comma-separated values', value: 'csv' },
+      { label: 'JSON', description: 'JavaScript Object Notation', value: 'json' },
+      { label: 'SQL', description: 'SQL INSERT statements', value: 'sql' },
+      { label: 'Excel', description: 'CSV with encoding for Excel', value: 'excel' }
+    ],
+    {
+      placeHolder: 'Select export format',
+      title: `Export "${tableName}"`
+    }
+  );
+
+  return formatPick?.value;
+}
+
+/**
+ * Resolve the active database document from the registry.
+ */
+function resolveDatabaseDocument(dbParams: DbParams): DatabaseDocument | undefined {
+  // 1. Try to find by URI if provided (most reliable)
+  if (dbParams.uri) {
+    for (const [, doc] of DocumentRegistry) {
+      if (doc.uri.toString() === dbParams.uri) {
+        return doc;
+      }
+    }
+  }
+
+  // 2. Fallback: pick the first one (legacy behavior)
+  for (const [, doc] of DocumentRegistry) {
+    return doc;
+  }
+
+  return undefined;
+}
+
+/**
+ * Determine export file destination via save dialog.
+ */
+async function getExportDestination(tableName: string, formatValue: string, documentUri: vsc.Uri): Promise<vsc.Uri | undefined> {
+  // Determine extension
+  let defaultExt = 'csv';
+  switch (formatValue) {
+    case 'json': defaultExt = 'json'; break;
+    case 'sql': defaultExt = 'sql'; break;
+    case 'excel': defaultExt = 'csv'; break;
+    case 'csv': defaultExt = 'csv'; break;
+    default:
+      vsc.window.showErrorMessage(`Unsupported export format: ${formatValue}`);
+      return undefined;
+  }
+
+  // Show save dialog
+  // Set default directory to the database file's directory using joinPath
+  // This prevents the dialog from defaulting to the root directory '/'
+  return vsc.window.showSaveDialog({
+    defaultUri: vsc.Uri.joinPath(documentUri, '..', `${tableName}.${defaultExt}`),
+    filters: {
+      [formatValue.toUpperCase()]: [defaultExt],
+      'All Files': ['*']
+    },
+    title: `Export "${tableName}" as ${formatValue.toUpperCase()}`
+  });
+}
+
+/**
+ * Export entirely in memory.
+ * Used as fallback or for environments without direct filesystem access (e.g. web).
+ */
+async function exportToMemory(
+  document: DatabaseDocument,
+  tableName: string,
+  queryColumns: string,
+  uri: vsc.Uri,
+  formatValue: string,
+  exportOptions?: ExportOptions
+) {
+  const includeHeader = exportOptions?.header ?? true;
+  const includeTableName = exportOptions?.includeTableName ?? true;
+
+  let sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
+  const params: any[] = [];
+
+  // Filter by row IDs if provided
+  if (exportOptions?.rowIds && exportOptions.rowIds.length > 0) {
+    const rowIds = exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+    if (rowIds.length > 0) {
+      const placeholders = rowIds.map(() => '?').join(', ');
+      sql += ` WHERE rowid IN (${placeholders})`;
+      params.push(...rowIds);
+    }
+  }
+
+  const result = await document.databaseOperations.executeQuery(sql, params);
+
+  // Check for result and ensure rows exist (handling both 'rows' and 'values' for compatibility)
+  if (!result || result.length === 0 || (!result[0].values && !result[0].rows)) {
+    vsc.window.showInformationMessage(`Table "${tableName}" is empty or no rows match selection`);
+    return;
+  }
+
+  const columnNames = (result[0].columns || result[0].headers) as string[];
+  const rows = (result[0].values || result[0].rows) as CellValue[][];
+
+  let content: string;
+
+  switch (formatValue) {
+    case 'excel':
+      // Excel prefers CSV with BOM for UTF-8
+      content = '\uFEFF' + exportToCsv(columnNames, rows, includeHeader);
+      break;
+    case 'csv':
+      content = exportToCsv(columnNames, rows, includeHeader);
+      break;
+    case 'json':
+      content = exportToJson(columnNames, rows);
+      break;
+    case 'sql':
+      content = exportToSql(tableName, columnNames, rows, includeTableName);
+      break;
+    default:
+      vsc.window.showErrorMessage(`Unsupported export format: ${formatValue}`);
+      return;
+  }
+
+  // Write file
+  await vsc.workspace.fs.writeFile(uri, Buffer.from(content, 'utf-8'));
+
+  vsc.window.showInformationMessage(
+    `Exported ${rows.length} rows to ${uri.fsPath}`
+  );
+}
+
+/**
+ * Export using Node.js filesystem streams for better memory usage.
+ * Returns true if export succeeded, false if should fallback to memory.
+ */
+async function exportToStream(
+  document: DatabaseDocument,
+  tableName: string,
+  queryColumns: string,
+  uri: vsc.Uri,
+  formatValue: string,
+  exportOptions?: ExportOptions
+): Promise<boolean> {
+  if (uri.scheme !== 'file') {
+    return false;
+  }
+
+  try {
+    const fs = require('fs');
+    const stream = fs.createWriteStream(uri.fsPath, { encoding: 'utf-8' });
+    const includeHeader = exportOptions?.header ?? true;
+    const includeTableName = exportOptions?.includeTableName ?? true;
+
+    // Write BOM for Excel if needed
+    if (formatValue === 'excel') {
+      stream.write('\uFEFF');
+    }
+
+    // Check if we can use rowid pagination
+    let useRowId = false;
+    try {
+      await document.databaseOperations.executeQuery(`SELECT rowid FROM ${escapeIdentifier(tableName)} LIMIT 1`);
+      useRowId = true;
+    } catch (e) {
+      // Fallback to offset pagination
+    }
+
+    const BATCH_SIZE = 5000;
+    let offset = 0;
+    let lastId = Number.MIN_SAFE_INTEGER;
+    let hasMore = true;
+    let isFirstBatch = true;
+    let rowCount = 0;
+
+    // For JSON, start the array
+    if (formatValue === 'json') {
+      stream.write('[');
+    }
+
+    while (hasMore) {
+      let sql: string;
+      const params: any[] = [];
+
+      if (useRowId) {
+        // Keyset pagination: fast O(1)
+        // We fetch rowid + user columns. rowid is prepended.
+        sql = `SELECT rowid, ${queryColumns} FROM ${escapeIdentifier(tableName)} WHERE rowid > ?`;
+        params.push(lastId);
+
+        // Add rowIds filter if present
+        if (exportOptions?.rowIds && exportOptions.rowIds.length > 0) {
+          const validIds = exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+          if (validIds.length > 0) {
+            sql += ` AND rowid IN (${validIds.map(() => '?').join(',')})`;
+            params.push(...validIds);
+          }
+        }
+
+        sql += ` ORDER BY rowid ASC LIMIT ${BATCH_SIZE}`;
+      } else {
+        // Offset pagination: O(N) but compatible with WITHOUT ROWID tables
+        sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
+
+        // Add rowIds filter if present
+        if (exportOptions?.rowIds && exportOptions.rowIds.length > 0) {
+          const validIds = exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+          if (validIds.length > 0) {
+            // Filter logic for non-rowid tables would go here
+          }
+        }
+
+        sql += ` LIMIT ${BATCH_SIZE} OFFSET ${offset}`;
+      }
+
+      const result = await document.databaseOperations.executeQuery(sql, params);
+
+      if (!result || result.length === 0 || !result[0].rows || result[0].rows.length === 0) {
+        hasMore = false;
+        break;
+      }
+
+      const rows = result[0].rows as CellValue[][];
+      const headers = result[0].headers as string[];
+
+      // Update cursors
+      if (useRowId) {
+        const lastRow = rows[rows.length - 1];
+        // rowid is the first column because we requested `SELECT rowid, ...`
+        lastId = Number(lastRow[0]);
+      } else {
+        offset += rows.length;
+      }
+
+      if (rows.length < BATCH_SIZE) {
+        hasMore = false;
+      }
+
+      rowCount += rows.length;
+
+      // Prepare data for export
+      let outputRows = rows;
+      let outputHeaders = headers;
+
+      if (useRowId) {
+        // We fetched rowid as first column. Always strip it as it's an implementation detail.
+        // If user requested 'rowid' in queryColumns, it will be in the remaining columns.
+        outputRows = rows.map(r => r.slice(1));
+        outputHeaders = headers.slice(1);
+      }
+
+      // Write chunk
+      let chunkContent = '';
+
+      switch (formatValue) {
+        case 'excel':
+        case 'csv':
+          // Header only for first batch
+          chunkContent = exportToCsv(outputHeaders, outputRows, isFirstBatch && includeHeader);
+          if (!isFirstBatch && chunkContent) chunkContent = '\n' + chunkContent;
+          break;
+        case 'json':
+          if (!isFirstBatch && outputRows.length > 0) stream.write(',');
+          const jsonStr = exportToJson(outputHeaders, outputRows);
+          chunkContent = jsonStr.slice(1, -1); // Remove [ and ]
+          break;
+        case 'sql':
+          chunkContent = exportToSql(tableName, outputHeaders, outputRows, includeTableName);
+          if (!isFirstBatch && chunkContent) chunkContent = '\n' + chunkContent;
+          break;
+      }
+
+      if (chunkContent) {
+        stream.write(chunkContent);
+      }
+
+      isFirstBatch = false;
+    }
+
+    if (formatValue === 'json') {
+      stream.write(']');
+    }
+
+    stream.end();
+    vsc.window.showInformationMessage(`Exported ${rowCount} rows to ${uri.fsPath}`);
+    return true;
+
+  } catch (e) {
+    console.warn('Native stream write failed, falling back to memory', e);
+    return false;
+  }
 }

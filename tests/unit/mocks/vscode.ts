@@ -38,6 +38,16 @@ export const mockVscode = {
             fsPath: path,
             with: () => ({}),
             toString: () => `file://${path}`
+        }),
+        joinPath: (uri: any, ...parts: string[]) => ({
+            scheme: uri.scheme,
+            authority: uri.authority,
+            path: uri.path + '/' + parts.join('/'),
+            query: '',
+            fragment: '',
+            fsPath: uri.fsPath + '/' + parts.join('/'),
+            with: () => ({}),
+            toString: () => uri.toString() + '/' + parts.join('/')
         })
     },
     FileSystemError: {
@@ -70,5 +80,20 @@ export const mockVscode = {
     Disposable: class {
         constructor(callBack: () => void) {}
         dispose() {}
+    },
+    window: {
+        showErrorMessage: async (msg: string) => console.log('Mock showErrorMessage:', msg),
+        showInformationMessage: async (msg: string) => console.log('Mock showInformationMessage:', msg),
+        showQuickPick: async (items: any[], options: any) => items[0], // Return first item by default
+        showSaveDialog: async (options: any) => mockVscode.Uri.file('/tmp/mock_export.csv') // Return a mock file URI
+    },
+    workspace: {
+        fs: {
+            writeFile: async (uri: any, content: Uint8Array) => console.log('Mock writeFile:', uri.toString(), content.length)
+        },
+        getWorkspaceFolder: (uri: any) => ({ uri: { fsPath: '/mock/workspace' } })
+    },
+    l10n: {
+        t: (key: string) => key
     }
 };
