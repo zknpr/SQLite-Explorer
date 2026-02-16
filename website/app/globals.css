@@ -1,8 +1,11 @@
 /**
- * Global CSS Variables and Base Styles
+ * SQLite Explorer — Design Tokens & Base Styles
  *
- * Design system following minimal/professional aesthetic (Vercel-inspired).
- * Uses CSS custom properties for theme switching support.
+ * "Editorial Developer" aesthetic:
+ * - Warm off-white base with teal accents
+ * - Instrument Serif headings, Inter body, JetBrains Mono code
+ * - Dot-grid texture on alternating sections
+ * - Subtle noise grain for depth
  */
 
 @tailwind base;
@@ -10,32 +13,33 @@
 @tailwind utilities;
 
 :root {
-  /* Light theme (default) */
-  --background: #ffffff;
-  --foreground: #171717;
-  --muted: #f5f5f5;
-  --muted-foreground: #737373;
-  --border: #e5e5e5;
-  --accent: #0070f3;
-  --accent-foreground: #ffffff;
+  --ui-bg: #fafaf8;
+  --ui-fg: #1a1a18;
+  --ui-subtle: #f0efeb;
+  --ui-subtle-fg: #6b6b63;
+  --ui-edge: #ddddd5;
+  --ui-accent: #0d9488;
+  --ui-accent-fg: #ffffff;
+  --ui-accent-soft: #0d948815;
 
-  /* Typography */
-  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  --font-mono: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  --font-sans: var(--font-inter), -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: var(--font-instrument), Georgia, 'Times New Roman', serif;
+  --font-mono: var(--font-jb-mono), 'SF Mono', 'Fira Code', monospace;
 }
 
 .dark {
-  /* Dark theme */
-  --background: #0a0a0a;
-  --foreground: #ededed;
-  --muted: #1a1a1a;
-  --muted-foreground: #a3a3a3;
-  --border: #262626;
-  --accent: #0070f3;
-  --accent-foreground: #ffffff;
+  --ui-bg: #0c0c0b;
+  --ui-fg: #e8e8e2;
+  --ui-subtle: #161614;
+  --ui-subtle-fg: #9a9a90;
+  --ui-edge: #2a2a26;
+  --ui-accent: #2dd4bf;
+  --ui-accent-fg: #0c0c0b;
+  --ui-accent-soft: #2dd4bf15;
 }
 
-/* Base styles */
+/* ─── Base ─── */
+
 * {
   box-sizing: border-box;
   padding: 0;
@@ -48,55 +52,81 @@ body {
   overflow-x: hidden;
 }
 
+html {
+  scroll-behavior: smooth;
+}
+
 body {
-  background-color: var(--background);
-  color: var(--foreground);
+  background-color: var(--ui-bg);
+  color: var(--ui-fg);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* Utility classes */
-@layer utilities {
-  .text-balance {
-    text-wrap: balance;
-  }
+/* ─── Typography ─── */
 
-  .text-gradient {
-    background: linear-gradient(to right, var(--foreground), var(--muted-foreground));
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-  }
+h1, h2, h3 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  letter-spacing: -0.01em;
 }
 
-/* Selection styling */
-::selection {
-  background-color: var(--accent);
-  color: var(--accent-foreground);
-}
-
-/* Focus styles for accessibility */
-:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-/* Smooth scrolling */
-html {
-  scroll-behavior: smooth;
-}
-
-/* Code blocks */
 code {
   font-family: var(--font-mono);
-  font-size: 0.875em;
-  background-color: var(--muted);
-  padding: 0.2em 0.4em;
+  font-size: 0.85em;
+  background-color: var(--ui-accent-soft);
+  color: var(--ui-accent);
+  padding: 0.15em 0.4em;
   border-radius: 0.25rem;
 }
 
 pre code {
   background-color: transparent;
+  color: inherit;
   padding: 0;
+}
+
+/* ─── Selection ─── */
+
+::selection {
+  background-color: var(--ui-accent);
+  color: var(--ui-accent-fg);
+}
+
+:focus-visible {
+  outline: 2px solid var(--ui-accent);
+  outline-offset: 2px;
+}
+
+/* ─── Dot Grid Background ─── */
+
+.dot-grid {
+  background-image: radial-gradient(circle, var(--ui-edge) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* ─── Noise Grain Overlay ─── */
+
+.grain::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.03;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 256px 256px;
+}
+
+.dark .grain::after {
+  opacity: 0.05;
+}
+
+/* ─── Utilities ─── */
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
 }

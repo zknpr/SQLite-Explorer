@@ -1,19 +1,14 @@
 /**
- * Demos Component
+ * Demos — Video showcase with editorial heading
  *
- * Showcases video demonstrations of key extension features.
- * Uses MP4 with GIF fallback for maximum browser compatibility.
- *
- * Design: Grid layout with autoplay videos on hover/intersection.
+ * Autoplay-on-hover video cards. Left-aligned section heading
+ * with mono label pattern. Varied spacing from other sections.
  */
 
 'use client';
 
 import { useRef, useState } from 'react';
 
-/**
- * Demo data structure for type safety.
- */
 interface Demo {
   id: string;
   title: string;
@@ -22,9 +17,6 @@ interface Demo {
   gif: string;
 }
 
-/**
- * List of feature demos with video sources.
- */
 const demos: Demo[] = [
   {
     id: 'edit-cells',
@@ -56,31 +48,18 @@ const demos: Demo[] = [
   },
 ];
 
-/**
- * DemoCard renders a single demo with video player.
- * Autoplays on hover and loops continuously.
- */
 function DemoCard({ demo }: { demo: Demo }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [useGif, setUseGif] = useState(false);
 
-  /**
-   * Handle mouse enter - start playing video
-   */
   const handleMouseEnter = () => {
     if (videoRef.current && !useGif) {
-      videoRef.current.play().catch(() => {
-        // If video fails to play, fall back to GIF
-        setUseGif(true);
-      });
+      videoRef.current.play().catch(() => setUseGif(true));
       setIsPlaying(true);
     }
   };
 
-  /**
-   * Handle mouse leave - pause and reset video
-   */
   const handleMouseLeave = () => {
     if (videoRef.current && !useGif) {
       videoRef.current.pause();
@@ -91,14 +70,12 @@ function DemoCard({ demo }: { demo: Demo }) {
 
   return (
     <div
-      className="group rounded-xl border border-[var(--border)] bg-[var(--background)] overflow-hidden hover:border-[var(--accent)]/50 transition-colors"
+      className="group rounded-2xl border border-[var(--ui-edge)]/60 bg-[var(--ui-bg)] overflow-hidden hover:shadow-lg hover:shadow-black/[0.04] dark:hover:shadow-black/20 hover:-translate-y-0.5 transition-all duration-300"
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
     >
-      {/* Video container */}
-      <div className="relative aspect-video bg-[var(--muted)] overflow-hidden">
+      <div className="relative aspect-video bg-[var(--ui-subtle)] overflow-hidden">
         {useGif ? (
-          /* GIF fallback for browsers that don't support autoplay */
           // eslint-disable-next-line @next/next/no-img-element
           <img
             src={demo.gif}
@@ -107,7 +84,6 @@ function DemoCard({ demo }: { demo: Demo }) {
             loading="lazy"
           />
         ) : (
-          /* MP4 video - preferred format */
           <video
             ref={videoRef}
             src={demo.mp4}
@@ -118,20 +94,14 @@ function DemoCard({ demo }: { demo: Demo }) {
             className="w-full h-full object-cover"
             onError={() => setUseGif(true)}
           >
-            {/* Fallback text for screen readers */}
             <track kind="descriptions" label={demo.title} />
           </video>
         )}
 
-        {/* Play indicator overlay (hidden when playing) */}
         {!isPlaying && !useGif && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/20 group-hover:bg-transparent transition-colors">
-            <div className="w-16 h-16 rounded-full bg-white/90 flex items-center justify-center group-hover:scale-110 transition-transform">
-              <svg
-                className="w-6 h-6 text-[var(--accent)] ml-1"
-                fill="currentColor"
-                viewBox="0 0 24 24"
-              >
+          <div className="absolute inset-0 flex items-center justify-center bg-black/10 group-hover:bg-transparent transition-colors duration-300">
+            <div className="w-14 h-14 rounded-full bg-white/90 dark:bg-black/60 flex items-center justify-center group-hover:scale-110 transition-transform duration-300 shadow-lg">
+              <svg className="w-5 h-5 text-[var(--ui-accent)] ml-0.5" fill="currentColor" viewBox="0 0 24 24">
                 <path d="M8 5v14l11-7z" />
               </svg>
             </div>
@@ -139,10 +109,9 @@ function DemoCard({ demo }: { demo: Demo }) {
         )}
       </div>
 
-      {/* Text content */}
-      <div className="p-5">
-        <h3 className="text-lg font-semibold mb-2">{demo.title}</h3>
-        <p className="text-sm text-[var(--muted-foreground)] leading-relaxed">
+      <div className="p-6">
+        <h3 className="text-xl mb-2">{demo.title}</h3>
+        <p className="text-sm text-[var(--ui-subtle-fg)] leading-relaxed font-sans">
           {demo.description}
         </p>
       </div>
@@ -150,24 +119,22 @@ function DemoCard({ demo }: { demo: Demo }) {
   );
 }
 
-/**
- * Demos section displaying all feature videos in a grid.
- */
 export default function Demos() {
   return (
-    <section className="py-24 px-6">
+    <section className="py-24 px-6 bg-[var(--ui-subtle)]">
       <div className="max-w-6xl mx-auto">
-        {/* Section header */}
-        <div className="text-center mb-16">
-          <h2 className="text-3xl sm:text-4xl font-bold tracking-tight mb-4">
+        <div className="mb-20">
+          <span className="font-mono text-xs tracking-widest uppercase text-[var(--ui-accent)] block mb-3">
+            Demos
+          </span>
+          <h2 className="text-4xl sm:text-5xl tracking-tight max-w-md leading-[1.15]">
             See it in action
           </h2>
-          <p className="text-lg text-[var(--muted-foreground)] max-w-2xl mx-auto">
-            Hover over each demo to see the feature in action.
+          <p className="text-lg text-[var(--ui-subtle-fg)] max-w-md mt-5 leading-relaxed font-sans">
+            Hover over each demo to preview the feature.
           </p>
         </div>
 
-        {/* Demo grid - 2 columns on larger screens */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           {demos.map((demo) => (
             <DemoCard key={demo.id} demo={demo} />
