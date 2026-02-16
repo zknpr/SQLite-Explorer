@@ -1,8 +1,8 @@
 /**
- * Demos — Video showcase with editorial heading
+ * Demos Component
  *
- * Autoplay-on-hover video cards. Left-aligned section heading
- * with mono label pattern. Varied spacing from other sections.
+ * Autoplay-on-hover video cards showcasing key features.
+ * Falls back to GIF if video playback fails.
  */
 
 'use client';
@@ -70,7 +70,7 @@ function DemoCard({ demo }: { demo: Demo }) {
 
   return (
     <div
-      className="group rounded-2xl border border-[var(--ui-edge)]/60 bg-[var(--ui-bg)] overflow-hidden hover:shadow-lg hover:shadow-black/[0.04] dark:hover:shadow-black/20 hover:-translate-y-0.5 transition-all duration-300"
+      className="group rounded-xl border border-[var(--ui-edge)] bg-[var(--ui-bg)] overflow-hidden hover:border-[var(--ui-accent)]/50 transition-colors"
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
     >
@@ -99,8 +99,8 @@ function DemoCard({ demo }: { demo: Demo }) {
         )}
 
         {!isPlaying && !useGif && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/10 group-hover:bg-transparent transition-colors duration-300">
-            <div className="w-14 h-14 rounded-full bg-white/90 dark:bg-black/60 flex items-center justify-center group-hover:scale-110 transition-transform duration-300 shadow-lg">
+          <div className="absolute inset-0 flex items-center justify-center bg-black/10 group-hover:bg-transparent transition-colors">
+            <div className="w-12 h-12 rounded-full bg-white/90 dark:bg-black/60 flex items-center justify-center group-hover:scale-110 transition-transform shadow-lg">
               <svg className="w-5 h-5 text-[var(--ui-accent)] ml-0.5" fill="currentColor" viewBox="0 0 24 24">
                 <path d="M8 5v14l11-7z" />
               </svg>
@@ -109,9 +109,9 @@ function DemoCard({ demo }: { demo: Demo }) {
         )}
       </div>
 
-      <div className="p-6">
-        <h3 className="text-xl mb-2">{demo.title}</h3>
-        <p className="text-sm text-[var(--ui-subtle-fg)] leading-relaxed font-sans">
+      <div className="p-5">
+        <h3 className="font-semibold text-lg mb-1">{demo.title}</h3>
+        <p className="text-sm text-[var(--ui-subtle-fg)] leading-relaxed">
           {demo.description}
         </p>
       </div>
@@ -121,16 +121,13 @@ function DemoCard({ demo }: { demo: Demo }) {
 
 export default function Demos() {
   return (
-    <section className="py-24 px-6 bg-[var(--ui-subtle)]">
+    <section className="py-20 px-6">
       <div className="max-w-6xl mx-auto">
-        <div className="mb-20">
-          <span className="font-mono text-xs tracking-widest uppercase text-[var(--ui-accent)] block mb-3">
-            Demos
-          </span>
-          <h2 className="text-4xl sm:text-5xl tracking-tight max-w-md leading-[1.15]">
+        <div className="text-center mb-16">
+          <h2 className="text-3xl sm:text-4xl font-bold tracking-tight mb-4">
             See it in action
           </h2>
-          <p className="text-lg text-[var(--ui-subtle-fg)] max-w-md mt-5 leading-relaxed font-sans">
+          <p className="text-lg text-[var(--ui-subtle-fg)] max-w-2xl mx-auto">
             Hover over each demo to preview the feature.
           </p>
         </div>

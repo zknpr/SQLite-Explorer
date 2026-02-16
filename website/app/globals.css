@@ -1,11 +1,8 @@
 /**
- * SQLite Explorer — Design Tokens & Base Styles
+ * Global CSS Variables and Base Styles
  *
- * "Editorial Developer" aesthetic:
- * - Warm off-white base with teal accents
- * - Instrument Serif headings, Inter body, JetBrains Mono code
- * - Dot-grid texture on alternating sections
- * - Subtle noise grain for depth
+ * Project-specific design tokens for SQLite Explorer website.
+ * Uses CSS custom properties for theme switching support.
  */
 
 @tailwind base;
@@ -13,33 +10,32 @@
 @tailwind utilities;
 
 :root {
-  --ui-bg: #fafaf8;
-  --ui-fg: #1a1a18;
-  --ui-subtle: #f0efeb;
-  --ui-subtle-fg: #6b6b63;
-  --ui-edge: #ddddd5;
-  --ui-accent: #0d9488;
+  /* Light theme (default) */
+  --ui-bg: #ffffff;
+  --ui-fg: #171717;
+  --ui-subtle: #f5f5f5;
+  --ui-subtle-fg: #737373;
+  --ui-edge: #e5e5e5;
+  --ui-accent: #0070f3;
   --ui-accent-fg: #ffffff;
-  --ui-accent-soft: #0d948815;
 
-  --font-sans: var(--font-inter), -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-display: var(--font-instrument), Georgia, 'Times New Roman', serif;
-  --font-mono: var(--font-jb-mono), 'SF Mono', 'Fira Code', monospace;
+  /* Typography */
+  --font-sans: var(--font-inter), -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
 }
 
 .dark {
-  --ui-bg: #0c0c0b;
-  --ui-fg: #e8e8e2;
-  --ui-subtle: #161614;
-  --ui-subtle-fg: #9a9a90;
-  --ui-edge: #2a2a26;
-  --ui-accent: #2dd4bf;
-  --ui-accent-fg: #0c0c0b;
-  --ui-accent-soft: #2dd4bf15;
+  /* Dark theme */
+  --ui-bg: #0a0a0a;
+  --ui-fg: #ededed;
+  --ui-subtle: #1a1a1a;
+  --ui-subtle-fg: #a3a3a3;
+  --ui-edge: #262626;
+  --ui-accent: #0070f3;
+  --ui-accent-fg: #ffffff;
 }
 
-/* ─── Base ─── */
-
+/* Base styles */
 * {
   box-sizing: border-box;
   padding: 0;
@@ -52,10 +48,6 @@ body {
   overflow-x: hidden;
 }
 
-html {
-  scroll-behavior: smooth;
-}
-
 body {
   background-color: var(--ui-bg);
   color: var(--ui-fg);
@@ -64,69 +56,47 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* ─── Typography ─── */
+/* Utility classes */
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
 
-h1, h2, h3 {
-  font-family: var(--font-display);
-  font-weight: 400;
-  letter-spacing: -0.01em;
+  .text-gradient {
+    background: linear-gradient(to right, var(--ui-fg), var(--ui-subtle-fg));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
 }
 
-code {
-  font-family: var(--font-mono);
-  font-size: 0.85em;
-  background-color: var(--ui-accent-soft);
-  color: var(--ui-accent);
-  padding: 0.15em 0.4em;
-  border-radius: 0.25rem;
-}
-
-pre code {
-  background-color: transparent;
-  color: inherit;
-  padding: 0;
-}
-
-/* ─── Selection ─── */
-
+/* Selection styling */
 ::selection {
   background-color: var(--ui-accent);
   color: var(--ui-accent-fg);
 }
 
+/* Focus styles for accessibility */
 :focus-visible {
   outline: 2px solid var(--ui-accent);
   outline-offset: 2px;
 }
 
-/* ─── Dot Grid Background ─── */
-
-.dot-grid {
-  background-image: radial-gradient(circle, var(--ui-edge) 1px, transparent 1px);
-  background-size: 24px 24px;
+/* Smooth scrolling */
+html {
+  scroll-behavior: smooth;
 }
 
-/* ─── Noise Grain Overlay ─── */
-
-.grain::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  opacity: 0.03;
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
-  background-repeat: repeat;
-  background-size: 256px 256px;
+/* Code blocks */
+code {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  background-color: var(--ui-subtle);
+  padding: 0.2em 0.4em;
+  border-radius: 0.25rem;
 }
 
-.dark .grain::after {
-  opacity: 0.05;
-}
-
-/* ─── Utilities ─── */
-
-@layer utilities {
-  .text-balance {
-    text-wrap: balance;
-  }
+pre code {
+  background-color: transparent;
+  padding: 0;
 }
