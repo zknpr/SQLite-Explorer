@@ -8,7 +8,9 @@
 
 import {
   Database,
+  Download,
   Edit3,
+  Eye,
   Globe,
   Keyboard,
   Palette,
@@ -71,6 +73,18 @@ const features: Feature[] = [
     title: 'Multiple Formats',
     description:
       'Supports .sqlite, .db, .sqlite3, .db3, .sdb, .s3db, and GeoPackage (.gpkg) files.',
+  },
+  {
+    icon: <Download className="w-6 h-6" strokeWidth={1.75} />,
+    title: 'Export Data',
+    description:
+      'Export tables to CSV, JSON, or SQL. Stream large datasets directly to disk without memory limits.',
+  },
+  {
+    icon: <Eye className="w-5 h-5" strokeWidth={2} />,
+    title: 'Blob Inspector',
+    description:
+      'Preview images, audio, video, and PDFs stored as BLOBs. Hex view for raw binary inspection.',
   },
 ];
 
