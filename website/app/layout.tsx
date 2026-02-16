@@ -1,19 +1,38 @@
 /**
- * Root Layout Component
+ * Root Layout
  *
- * Provides the HTML structure, metadata, fonts, and analytics wrapper
- * for the entire application. All pages inherit from this layout.
+ * Loads Instrument Serif (display) + Inter (body) + JetBrains Mono (code).
+ * All fonts via next/font for zero layout shift.
  */
 
 import type { Metadata, Viewport } from 'next';
+import { Inter, Instrument_Serif, JetBrains_Mono } from 'next/font/google';
 import { Analytics } from '@vercel/analytics/react';
 import { SpeedInsights } from '@vercel/speed-insights/next';
 import './globals.css';
 
+const inter = Inter({
+  subsets: ['latin'],
+  display: 'swap',
+  variable: '--font-inter',
+});
+
+const instrumentSerif = Instrument_Serif({
+  weight: '400',
+  subsets: ['latin'],
+  display: 'swap',
+  variable: '--font-instrument',
+});
+
+const jetbrainsMono = JetBrains_Mono({
+  subsets: ['latin'],
+  display: 'swap',
+  variable: '--font-jb-mono',
+});
+
 /**
- * Inline script to detect system color scheme preference.
- * Runs before React hydration to prevent flash of wrong theme.
- * Adds 'dark' class to <html> if user prefers dark mode.
+ * Theme detection — runs before paint to prevent flash.
+ * Hardcoded string literal, no user input.
  */
 const themeScript = `
   (function() {
@@ -21,7 +40,6 @@ const themeScript = `
       if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
         document.documentElement.classList.add('dark');
       }
-      // Listen for changes in system preference
       window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(e) {
         if (e.matches) {
           document.documentElement.classList.add('dark');
@@ -33,10 +51,6 @@ const themeScript = `
   })();
 `;
 
-/**
- * Site metadata for SEO and social sharing.
- * Open Graph tags ensure proper previews on Twitter, LinkedIn, etc.
- */
 export const metadata: Metadata = {
   title: "SQLite Explorer - VS Code Extension",
   description:
@@ -99,38 +113,33 @@ export const metadata: Metadata = {
   },
 };
 
-/**
- * Viewport configuration for responsive design and theme color.
- */
 export const viewport: Viewport = {
   themeColor: [
-    { media: '(prefers-color-scheme: light)', color: '#ffffff' },
-    { media: '(prefers-color-scheme: dark)', color: '#0a0a0a' },
+    { media: '(prefers-color-scheme: light)', color: '#fafaf8' },
+    { media: '(prefers-color-scheme: dark)', color: '#0c0c0b' },
   ],
   width: 'device-width',
   initialScale: 1,
 };
 
-/**
- * RootLayout wraps all pages with common HTML structure.
- * Includes Vercel Analytics for traffic monitoring and Speed Insights for Core Web Vitals.
- */
 export default function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html
+      lang="en"
+      className={`${inter.variable} ${instrumentSerif.variable} ${jetbrainsMono.variable}`}
+      suppressHydrationWarning
+    >
       <head>
-        {/* Inline script for theme detection - runs before paint to prevent flash */}
+        {/* Hardcoded theme detection script — safe, no user input involved */}
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
       </head>
       <body>
         {children}
-        {/* Vercel Analytics - automatically tracks page views and web vitals */}
         <Analytics />
-        {/* Vercel Speed Insights - Core Web Vitals monitoring */}
         <SpeedInsights />
       </body>
     </html>
