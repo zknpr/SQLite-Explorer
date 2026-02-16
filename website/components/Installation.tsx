@@ -60,7 +60,7 @@ function CodeBlock({ code, label }: { code: string; label: string }) {
 
 export default function Installation() {
   return (
-    <section id="install" className="py-32 px-6">
+    <section id="install" className="py-24 px-6">
       <div className="max-w-4xl mx-auto">
         <div className="text-center mb-16">
           <h2 className="text-3xl sm:text-4xl font-bold tracking-tight mb-4">

@@ -92,7 +92,7 @@ function FeatureCard({ feature, featured }: { feature: Feature; featured?: boole
 
 export default function Features() {
   return (
-    <section className="py-28 px-6 bg-[var(--ui-subtle)]">
+    <section className="py-24 px-6 bg-[var(--ui-subtle)]">
       <div className="max-w-6xl mx-auto">
         <div className="text-center mb-16">
           <h2 className="text-3xl sm:text-4xl font-bold tracking-tight mb-4">

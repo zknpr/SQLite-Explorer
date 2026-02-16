@@ -12,7 +12,7 @@ import { Database, ExternalLink, Play } from 'lucide-react';
 
 function MainScreenshot() {
   return (
-    <div className="relative w-full max-w-5xl mx-auto mt-14 animate-fade-in -ml-2 sm:ml-0 sm:-translate-x-2">
+    <div className="relative w-full max-w-5xl mx-auto mt-14 animate-fade-in">
       <div className="rounded-xl border border-[var(--ui-edge)] overflow-hidden shadow-2xl">
         <Image
           src="/main.png"
@@ -31,10 +31,9 @@ function MainScreenshot() {
 
 export default function Hero() {
   return (
-    <section className="relative pt-24 pb-20 px-6 overflow-hidden">
+    <section className="relative pt-24 pb-16 px-6 overflow-hidden">
       <div className="max-w-6xl mx-auto">
-        {/* Badge — left-aligned on desktop */}
-        <div className="flex justify-center sm:justify-start sm:ml-4 mb-6 animate-fade-in">
+        <div className="flex justify-center mb-6 animate-fade-in">
           <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-[var(--ui-edge)] bg-[var(--ui-subtle)] text-sm text-[var(--ui-subtle-fg)]">
             <Database className="w-4 h-4" strokeWidth={1.75} />
             <span>Open Source VS Code Extension</span>
@@ -58,7 +57,7 @@ export default function Hero() {
               href="https://marketplace.visualstudio.com/items?itemName=zknpr.sqlite-explorer"
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-2 px-7 py-3.5 rounded-lg bg-[var(--ui-accent)] text-white font-medium hover:opacity-90 transition-opacity"
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-lg bg-[var(--ui-accent)] text-white font-medium hover:opacity-90 transition-opacity"
             >
               Install Extension
               <ExternalLink className="w-4 h-4" strokeWidth={2.25} />
@@ -76,7 +75,7 @@ export default function Hero() {
               href="https://github.com/zknpr/sqlite-explorer"
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg border border-[var(--ui-edge)] bg-[var(--ui-bg)] font-medium hover:bg-[var(--ui-subtle)] transition-colors text-sm"
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-lg border border-[var(--ui-edge)] bg-[var(--ui-bg)] font-medium hover:bg-[var(--ui-subtle)] transition-colors"
             >
               <svg
                 className="w-5 h-5"
@@ -98,7 +97,6 @@ export default function Hero() {
         <MainScreenshot />
       </div>
 
-      <div className="hidden sm:block absolute top-16 right-12 w-1 h-24 bg-[var(--ui-accent)]/30 rounded-full" />
     </section>
   );
 }
