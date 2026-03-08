@@ -34,7 +34,7 @@ import type {
   ViewMetadata,
   IndexMetadata
 } from './core/types';
-import { escapeIdentifier, cellValueToSql, validateSqlType } from './core/sql-utils';
+import { escapeIdentifier, cellValueToSql, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 
 // ============================================================================
@@ -677,10 +677,7 @@ export async function createNativeDatabaseConnection(
          */
         updateCell: async (table: string, rowId: RecordId, column: string, value: CellValue, patch?: string) => {
           // Validate rowId is a number
-          const rowIdNum = Number(rowId);
-          if (!Number.isFinite(rowIdNum)) {
-            throw new Error(`Invalid rowid: ${rowId}`);
-          }
+          const rowIdNum = validateRowId(rowId);
 
           let sql: string;
           let params: CellValue[];
@@ -761,11 +758,7 @@ export async function createNativeDatabaseConnection(
           if (rowIds.length === 0) return;
 
           // Validate all row IDs
-          const validIds = rowIds.map(id => {
-            const num = Number(id);
-            if (!Number.isFinite(num)) throw new Error(`Invalid rowid: ${id}`);
-            return num;
-          });
+          const validIds = validateRowIds(rowIds);
 
           const placeholders = validIds.map(() => '?').join(', ');
           const sql = `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`;
@@ -1081,10 +1074,7 @@ export async function createNativeDatabaseConnection(
 
           for (const update of updates) {
             // Validate rowId is a number
-            const rowIdNum = Number(update.rowId);
-            if (!Number.isFinite(rowIdNum)) {
-              throw new Error(`Invalid rowid: ${update.rowId}`);
-            }
+            const rowIdNum = validateRowId(update.rowId);
 
             const escapedColumn = escapeIdentifier(update.column);
             let sql: string;

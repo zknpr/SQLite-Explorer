@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { escapeIdentifier, cellValueToSql, validateSqlType, escapeLikePattern } from '../../src/core/sql-utils';
+import { escapeIdentifier, cellValueToSql, validateSqlType, escapeLikePattern, validateRowId, validateRowIds } from '../../src/core/sql-utils';
 
 describe('SQL Utils', () => {
   describe('validateSqlType', () => {
@@ -109,6 +109,41 @@ describe('SQL Utils', () => {
 
     it('should handle strings without wildcards', () => {
       assert.strictEqual(escapeLikePattern('normal text'), 'normal text');
+    });
+  });
+
+  describe('validateRowId', () => {
+    it('should return a number for valid numeric string', () => {
+      assert.strictEqual(validateRowId('123'), 123);
+    });
+
+    it('should return a number for a valid number', () => {
+      assert.strictEqual(validateRowId(456), 456);
+    });
+
+    it('should return negative numbers correctly', () => {
+      assert.strictEqual(validateRowId('-789'), -789);
+      assert.strictEqual(validateRowId(-12), -12);
+    });
+
+    it('should throw an error for non-numeric strings', () => {
+      assert.throws(() => validateRowId('abc'), /Invalid rowid: abc/);
+      assert.throws(() => validateRowId('12a'), /Invalid rowid: 12a/);
+    });
+
+    it('should throw an error for NaN and Infinity', () => {
+      assert.throws(() => validateRowId(NaN), /Invalid rowid: NaN/);
+      assert.throws(() => validateRowId(Infinity), /Invalid rowid: Infinity/);
+    });
+  });
+
+  describe('validateRowIds', () => {
+    it('should validate an array of valid row IDs', () => {
+      assert.deepStrictEqual(validateRowIds(['1', 2, '3']), [1, 2, 3]);
+    });
+
+    it('should throw an error if any row ID is invalid', () => {
+      assert.throws(() => validateRowIds(['1', 'a', 3]), /Invalid rowid: a/);
     });
   });
 });

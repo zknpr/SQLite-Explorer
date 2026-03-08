@@ -1,7 +1,7 @@
 import './vscode_mock_setup';
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
-import { getUriParts, themeToCss } from '../../src/helpers';
+import { getUriParts, doTry, themeToCss } from '../../src/helpers';
 import * as vsc from 'vscode';
 
 describe('getUriParts', () => {
@@ -75,5 +75,33 @@ describe('themeToCss', () => {
   it('should return "light" for HighContrastLight theme', () => {
     const theme = { kind: vsc.ColorThemeKind.HighContrastLight } as vsc.ColorTheme;
     assert.strictEqual(themeToCss(theme), 'light');
+  });
+});
+
+describe('doTry', () => {
+  let originalConsoleWarn: typeof console.warn;
+  let warnMessages: unknown[][] = [];
+
+  beforeEach(() => {
+    originalConsoleWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnMessages.push(args);
+    };
+    warnMessages = [];
+  });
+
+  afterEach(() => {
+    console.warn = originalConsoleWarn;
+  });
+
+  it('should return result on success', () => {
+    assert.strictEqual(doTry(() => 42), 42);
+    assert.strictEqual(warnMessages.length, 0);
+  });
+
+  it('should return undefined and log warning on error', () => {
+    const result = doTry(() => { throw new Error('test error'); });
+    assert.strictEqual(result, undefined);
+    assert.strictEqual(warnMessages.length, 1);
   });
 });

@@ -4,7 +4,7 @@
  * Shared utilities for SQL string construction and escaping.
  */
 
-import type { CellValue } from './types';
+import type { CellValue, RecordId } from './types';
 
 /**
  * Escape a SQL identifier (table name, column name) for safe use in queries.
@@ -98,4 +98,29 @@ export function escapeLikePattern(pattern: string, escapeChar: string = '\\'): s
   const escapedEscapeChar = escapeChar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const regex = new RegExp(`[${escapedEscapeChar}%_]`, 'g');
   return pattern.replace(regex, (match) => escapeChar + match);
+}
+
+/**
+ * Validate that a row ID is a finite number and convert it to a number.
+ * Throws an error if the row ID is invalid.
+ *
+ * @param rowId - The row ID to validate
+ * @returns The validated numeric row ID
+ */
+export function validateRowId(rowId: RecordId): number {
+  const num = Number(rowId);
+  if (!Number.isFinite(num)) {
+    throw new Error(`Invalid rowid: ${rowId}`);
+  }
+  return num;
+}
+
+/**
+ * Validate an array of row IDs, ensuring all are finite numbers.
+ *
+ * @param rowIds - The array of row IDs to validate
+ * @returns An array of validated numeric row IDs
+ */
+export function validateRowIds(rowIds: RecordId[]): number[] {
+  return rowIds.map(validateRowId);
 }

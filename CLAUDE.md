@@ -59,6 +59,13 @@ The extension uses a three-layer communication architecture:
 | `src/webviewMessageHandler.ts` | Webview → Extension Host message routing |
 | `src/webview-collection.ts` | Tracks active webview panels per document |
 | `src/virtualFileSystem.ts` | Virtual FS provider for editing cells in tabs |
+| `src/connectionTypes.ts` | Database connection bundle interfaces |
+| `src/helpers.ts` | Helper utilities |
+| `src/html-utils.ts` | HTML utilities |
+| `src/lifecycle.ts` | Resource lifecycle management (Disposable utilities) |
+| `src/tableExporter.ts` | Table export to CSV/JSON/SQL |
+| `src/platform/cryptoShim.ts` | Platform crypto abstraction |
+| `src/platform/threadPool.ts` | Cross-platform worker thread APIs (Browser + Node) |
 | `src/loggingDatabaseOperations.ts` | Decorator for logging SQL queries |
 | `core/ui/modules/settings.js` | UI logic for database settings/pragma editor |
 | `core/ui/modules/web-api.js` | Web demo API module (parent window communication) |
@@ -335,6 +342,7 @@ Settings in `package.json` → `contributes.configuration`:
 | `sqliteExplorer.defaultPageSize` | 500 | Default page size for pagination |
 | `sqliteExplorer.instantCommit` | "never" | Auto-save strategy (always/never/remote-only) |
 | `sqliteExplorer.doubleClickBehavior` | "inline" | Double-click action (inline/modal/vscode) |
+| `sqliteExplorer.fileOperations` | "native" | File I/O strategy (native/wasm) |
 | `sqliteExplorer.queryTimeout` | 30000 | Query execution timeout in ms (prevents runaway queries) |
 | `sqliteExplorer.maxUndoMemory` | 52428800 | Max undo history memory in bytes (default 50MB) |
 
@@ -352,6 +360,8 @@ Settings in `package.json` → `contributes.configuration`:
 ### Testing
 - **VS Code mocks required**: Unit tests need `tests/mocks/vscode.ts` imported first
 - **JSON patch tests**: Test behavior (merged result) not implementation (SQL function)
+- **Test organization**: 30+ unit tests in `tests/unit/`, benchmarks in `tests/benchmarks/`, performance tests in `tests/performance/`
+- **Test runner**: Uses `tsx` with Node's built-in test runner (`npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts`)
 
 ### Build
 - **WASM not found**: Run `node scripts/build.mjs` if `assets/sqlite3.wasm` is missing
