@@ -61,11 +61,12 @@ async function uint8ArrayToBase64Async(bytes) {
     // For larger arrays, use chunked async encoding to prevent UI freeze
     // Process in chunks and yield to the event loop between chunks
     const CHUNK_SIZE = 32768; // 32KB per chunk
-    let binary = '';
+    const numChunks = Math.ceil(bytes.length / CHUNK_SIZE);
+    const chunks = new Array(numChunks);
 
-    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    for (let i = 0, j = 0; i < bytes.length; i += CHUNK_SIZE, j++) {
         const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
-        binary += String.fromCharCode.apply(null, chunk);
+        chunks[j] = String.fromCharCode.apply(null, chunk);
 
         // Yield to event loop every few chunks to allow UI updates
         // Using a microtask (Promise.resolve) for minimal delay while still allowing repaints
@@ -74,7 +75,7 @@ async function uint8ArrayToBase64Async(bytes) {
         }
     }
 
-    return btoa(binary);
+    return btoa(chunks.join(''));
 }
 
 /**
@@ -86,12 +87,13 @@ async function uint8ArrayToBase64Async(bytes) {
  */
 function uint8ArrayToBase64Sync(bytes) {
     const CHUNK_SIZE = 32768;
-    let binary = '';
-    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    const numChunks = Math.ceil(bytes.length / CHUNK_SIZE);
+    const chunks = new Array(numChunks);
+    for (let i = 0, j = 0; i < bytes.length; i += CHUNK_SIZE, j++) {
         const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
-        binary += String.fromCharCode.apply(null, chunk);
+        chunks[j] = String.fromCharCode.apply(null, chunk);
     }
-    return btoa(binary);
+    return btoa(chunks.join(''));
 }
 
 /**
