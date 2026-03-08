@@ -41,6 +41,10 @@ export async function exportTableCommand(
       return;
     }
 
+    const validRowIds = _exportOptions?.rowIds && _exportOptions.rowIds.length > 0
+        ? _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n))
+        : [];
+
     let formatValue: string | undefined = _exportOptions?.format;
 
     // If format not provided in options, ask user
@@ -170,12 +174,9 @@ export async function exportTableCommand(
                     params.push(lastId);
 
                     // Add rowIds filter if present
-                    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-                        const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
-                        if (validIds.length > 0) {
-                            sql += ` AND rowid IN (${validIds.map(() => '?').join(',')})`;
-                            params.push(...validIds);
-                        }
+                    if (validRowIds.length > 0) {
+                        sql += ` AND rowid IN (${validRowIds.map(() => '?').join(',')})`;
+                        params.push(...validRowIds);
                     }
 
                     sql += ` ORDER BY rowid ASC LIMIT ${BATCH_SIZE}`;
@@ -184,11 +185,8 @@ export async function exportTableCommand(
                     sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
 
                     // Add rowIds filter if present
-                    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-                        const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
-                        if (validIds.length > 0) {
-                            // Filter logic for non-rowid tables would go here
-                        }
+                    if (validRowIds.length > 0) {
+                        // Filter logic for non-rowid tables would go here
                     }
 
                     sql += ` LIMIT ${BATCH_SIZE} OFFSET ${offset}`;
@@ -278,13 +276,10 @@ export async function exportTableCommand(
     const params: any[] = [];
 
     // Filter by row IDs if provided
-    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-        const rowIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
-        if (rowIds.length > 0) {
-            const placeholders = rowIds.map(() => '?').join(', ');
-            sql += ` WHERE rowid IN (${placeholders})`;
-            params.push(...rowIds);
-        }
+    if (validRowIds.length > 0) {
+        const placeholders = validRowIds.map(() => '?').join(', ');
+        sql += ` WHERE rowid IN (${placeholders})`;
+        params.push(...validRowIds);
     }
 
     const result = await document.databaseOperations.executeQuery(sql, params);
