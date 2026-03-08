@@ -35,7 +35,6 @@ describe('isAutoCommitEnabled', () => {
             filename: workerFactoryPath,
             loaded: true,
             exports: {
-                getMaximumFileSizeBytes: () => 1024,
                 createDatabaseConnection: () => {}
             }
         };

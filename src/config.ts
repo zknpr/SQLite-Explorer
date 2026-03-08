@@ -57,7 +57,7 @@ const DEFAULT_QUERY_TIMEOUT_MS = 30000;
  */
 export function getMaximumFileSizeBytes(): number {
   const config = vsc.workspace.getConfiguration(ConfigurationSection);
-  const sizeMB = config.get<number>('maxFileSize') ?? 200;
+  const sizeMB = config.get<number>('maxFileSize', 200);
   return sizeMB * (2 ** 20);
 }
 
