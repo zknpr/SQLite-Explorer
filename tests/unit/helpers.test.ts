@@ -1,7 +1,7 @@
 import './vscode_mock_setup';
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { getUriParts } from '../../src/helpers';
+import { getUriParts, doTry } from '../../src/helpers';
 import * as vsc from 'vscode';
 
 describe('getUriParts', () => {
@@ -53,5 +53,17 @@ describe('getUriParts', () => {
     assert.strictEqual(parts.filename, 'file name.txt');
     assert.strictEqual(parts.basename, 'file name');
     assert.strictEqual(parts.extname, '.txt');
+  });
+});
+
+describe('doTry', () => {
+  it('should return function result on success', () => {
+    const result = doTry(() => 'success');
+    assert.strictEqual(result, 'success');
+  });
+
+  it('should return undefined and suppress error on failure', () => {
+    const result = doTry(() => { throw new Error('fail'); });
+    assert.strictEqual(result, undefined);
   });
 });

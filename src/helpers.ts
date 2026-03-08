@@ -254,9 +254,8 @@ export function doTry<T extends (...args: unknown[]) => unknown>(fn: T): ReturnT
   try {
     return fn() as ReturnType<T>;
   } catch (err) {
-    if (import.meta.env.DEV) {
-      console.warn(`[${Title}]`, err instanceof Error ? err.message : String(err));
-    }
+    console.warn(`[${Title}]`, err instanceof Error ? err.message : String(err));
+    return undefined;
   }
 }
 
