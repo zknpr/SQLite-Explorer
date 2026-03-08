@@ -183,13 +183,9 @@ export async function exportTableCommand(
                     // Offset pagination: O(N) but compatible with WITHOUT ROWID tables
                     sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
 
-                    // Add rowIds filter if present
-                    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-                        const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
-                        if (validIds.length > 0) {
-                            // Filter logic for non-rowid tables would go here
-                        }
-                    }
+                    // Note: Filtering by rowIds is deliberately omitted here for non-rowid
+                    // tables (like WITHOUT ROWID) because they lack a generic unique identifier
+                    // we can use for an IN clause. All rows will be exported instead.
 
                     sql += ` LIMIT ${BATCH_SIZE} OFFSET ${offset}`;
                 }
@@ -277,13 +273,21 @@ export async function exportTableCommand(
     let sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
     const params: any[] = [];
 
-    // Filter by row IDs if provided
+    // Filter by row IDs if provided and table has a rowid
+    // If the table lacks a rowid (e.g., WITHOUT ROWID), skip this filter to prevent SQL errors
     if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-        const rowIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
-        if (rowIds.length > 0) {
-            const placeholders = rowIds.map(() => '?').join(', ');
-            sql += ` WHERE rowid IN (${placeholders})`;
-            params.push(...rowIds);
+        try {
+            // First check if rowid is available for this table
+            await document.databaseOperations.executeQuery(`SELECT rowid FROM ${escapeIdentifier(tableName)} LIMIT 1`);
+
+            const rowIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+            if (rowIds.length > 0) {
+                const placeholders = rowIds.map(() => '?').join(', ');
+                sql += ` WHERE rowid IN (${placeholders})`;
+                params.push(...rowIds);
+            }
+        } catch (e) {
+            // rowid not available, skip row-level filtering and export all rows
         }
     }
 
