@@ -89,9 +89,13 @@ export const mockVscode = {
         showOpenDialog: () => Promise.resolve(),
     },
     workspace: {
-        getConfiguration: () => ({
-            get: () => {},
-            update: () => Promise.resolve()
+        _config: new Map<string, any>(),
+        getConfiguration: (section?: string) => ({
+            get: (key: string) => mockVscode.workspace._config.get(key),
+            update: (key: string, value: any) => {
+                mockVscode.workspace._config.set(key, value);
+                return Promise.resolve();
+            }
         }),
         getWorkspaceFolder: () => undefined,
         fs: {
@@ -109,5 +113,11 @@ export const mockVscode = {
         uriScheme: 'vscode',
         appName: 'VS Code',
         language: 'en'
+    },
+    extensions: {
+        getExtension: () => ({
+            extensionUri: { fsPath: '/mock/path' },
+            packageJSON: { version: '1.0.0' }
+        })
     }
 };
