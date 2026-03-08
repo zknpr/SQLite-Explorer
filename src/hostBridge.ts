@@ -675,21 +675,21 @@ export class HostBridge implements ToastService {
    * Show an information toast message.
    */
   async showInformationToast<T extends string | DialogButton>(message: string, options?: DialogConfig, ...items: T[]): Promise<T | undefined> {
-    return await vsc.window.showInformationMessage(message, options as any, ...items as any[]);
+    return showToast(vsc.window.showInformationMessage, message, options, items);
   }
 
   /**
    * Show a warning toast message.
    */
   async showWarningToast<T extends string | DialogButton>(message: string, options?: DialogConfig, ...items: T[]): Promise<T | undefined> {
-    return await vsc.window.showWarningMessage(message, options as any, ...items as any[]);
+    return showToast(vsc.window.showWarningMessage, message, options, items);
   }
 
   /**
    * Show an error toast message.
    */
   async showErrorToast<T extends string | DialogButton>(message: string, options?: DialogConfig, ...items: T[]): Promise<T | undefined> {
-    return await vsc.window.showErrorMessage(message, options as any, ...items as any[]);
+    return showToast(vsc.window.showErrorMessage, message, options, items);
   }
 
   /**
@@ -968,6 +968,42 @@ export class HostBridge implements ToastService {
     }
     return undefined;
   }
+}
+
+/**
+ * Map DialogConfig/DialogButton to VS Code MessageOptions/MessageItem and invoke the show function.
+ *
+ * DialogConfig.detailText → MessageOptions.detail
+ * DialogButton.caption    → MessageItem.title
+ * DialogButton.isCloseAction → MessageItem.isCloseAffordance
+ */
+async function showToast<T extends string | DialogButton>(
+  showFn: typeof vsc.window.showInformationMessage,
+  message: string,
+  options: DialogConfig | undefined,
+  items: T[]
+): Promise<T | undefined> {
+  // Map DialogConfig → MessageOptions
+  const msgOptions: vsc.MessageOptions = options
+    ? { modal: options.modal, detail: options.detailText }
+    : {};
+
+  // Map DialogButton items → MessageItem, pass strings through
+  const msgItems: (string | vsc.MessageItem)[] = items.map(item =>
+    typeof item === 'string'
+      ? item
+      : { title: (item as DialogButton).caption, isCloseAffordance: (item as DialogButton).isCloseAction }
+  );
+
+  const result = await (showFn as Function)(message, msgOptions, ...msgItems);
+
+  // Map MessageItem result back to the original DialogButton
+  if (result && typeof result === 'object' && 'title' in result) {
+    return items.find(
+      item => typeof item !== 'string' && (item as DialogButton).caption === result.title
+    );
+  }
+  return result as T | undefined;
 }
 
 /**

@@ -183,14 +183,6 @@ export async function exportTableCommand(
                     // Offset pagination: O(N) but compatible with WITHOUT ROWID tables
                     sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
 
-                    // Add rowIds filter if present
-                    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-                        const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
-                        if (validIds.length > 0) {
-                            // Filter logic for non-rowid tables would go here
-                        }
-                    }
-
                     sql += ` LIMIT ${BATCH_SIZE} OFFSET ${offset}`;
                 }
 

@@ -89,10 +89,16 @@ export const mockVscode = {
         showOpenDialog: () => Promise.resolve(),
     },
     workspace: {
-        getConfiguration: () => ({
-            get: () => {},
-            update: () => Promise.resolve()
-        }),
+        _config: new Map<string, unknown>(),
+        getConfiguration: function() {
+            const store = (this as any)._config as Map<string, unknown>;
+            return {
+                get: (key: string, defaultValue?: unknown) => {
+                    return store.has(key) ? store.get(key) : defaultValue;
+                },
+                update: () => Promise.resolve()
+            };
+        },
         getWorkspaceFolder: () => undefined,
         fs: {
             readFile: () => Promise.resolve(new Uint8Array()),

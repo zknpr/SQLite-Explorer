@@ -29,7 +29,7 @@ import type {
 
 import { Worker } from './platform/threadPool';
 import type { DatabaseConnectionBundle } from './connectionTypes';
-import { ConfigurationSection } from './config';
+import { ConfigurationSection, getMaximumFileSizeBytes, getQueryTimeout } from './config';
 
 // Native worker support (only in Node.js environment)
 let nativeSupport: {
@@ -45,38 +45,6 @@ if (!import.meta.env.VSCODE_BROWSER_EXT) {
   } catch {
     // Native worker not available
   }
-}
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-// ============================================================================
-// Configuration
-// ============================================================================
-
-/**
- * Retrieve maximum file size from user configuration.
- *
- * @returns Maximum size in bytes (0 = unlimited)
- */
-export function getMaximumFileSizeBytes(): number {
-  const config = vsc.workspace.getConfiguration(ConfigurationSection);
-  const sizeMB = config.get<number>('maxFileSize') ?? 200;
-  return sizeMB * (2 ** 20);
-}
-
-/** Default query timeout in milliseconds (30 seconds) */
-const DEFAULT_QUERY_TIMEOUT_MS = 30000;
-
-/**
- * Retrieve query timeout from user configuration.
- *
- * @returns Query timeout in milliseconds
- */
-export function getQueryTimeout(): number {
-  const config = vsc.workspace.getConfiguration(ConfigurationSection);
-  return config.get<number>('queryTimeout', DEFAULT_QUERY_TIMEOUT_MS);
 }
 
 // ============================================================================

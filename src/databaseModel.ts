@@ -17,7 +17,8 @@ import { HostBridge } from './hostBridge';
 import { DatabaseConnectionBundle } from './connectionTypes';
 import { DocumentRegistry } from './documentRegistry';
 
-import { createDatabaseConnection, getMaximumFileSizeBytes } from './workerFactory';
+import { createDatabaseConnection } from './workerFactory';
+import { getMaximumFileSizeBytes } from './config';
 import { GlobalOutputChannel } from './main';
 
 import { ModificationTracker } from './core/undo-history';
