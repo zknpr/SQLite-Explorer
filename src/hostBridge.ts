@@ -671,25 +671,53 @@ export class HostBridge implements ToastService {
     return this.viewerProvider.outputChannel;
   }
 
+  private mapOptions(options?: DialogConfig): import('vscode').MessageOptions {
+    return {
+      modal: options?.modal,
+      detail: options?.detailText
+    };
+  }
+
   /**
    * Show an information toast message.
    */
   async showInformationToast<T extends string | DialogButton>(message: string, options?: DialogConfig, ...items: T[]): Promise<T | undefined> {
-    return await vsc.window.showInformationMessage(message, options as any, ...items as any[]);
+    const vscOptions = this.mapOptions(options);
+    if (items.length > 0 && typeof items[0] !== 'string') {
+      const buttons = items as unknown as DialogButton[];
+      const vscItems = buttons.map(b => ({ title: b.caption, isCloseAffordance: b.isCloseAction }));
+      const result = await vsc.window.showInformationMessage(message, vscOptions, ...vscItems);
+      return result ? buttons.find(b => b.caption === result.title) as unknown as T : undefined;
+    }
+    return await vsc.window.showInformationMessage(message, vscOptions, ...(items as unknown as string[])) as unknown as T;
   }
 
   /**
    * Show a warning toast message.
    */
   async showWarningToast<T extends string | DialogButton>(message: string, options?: DialogConfig, ...items: T[]): Promise<T | undefined> {
-    return await vsc.window.showWarningMessage(message, options as any, ...items as any[]);
+    const vscOptions = this.mapOptions(options);
+    if (items.length > 0 && typeof items[0] !== 'string') {
+      const buttons = items as unknown as DialogButton[];
+      const vscItems = buttons.map(b => ({ title: b.caption, isCloseAffordance: b.isCloseAction }));
+      const result = await vsc.window.showWarningMessage(message, vscOptions, ...vscItems);
+      return result ? buttons.find(b => b.caption === result.title) as unknown as T : undefined;
+    }
+    return await vsc.window.showWarningMessage(message, vscOptions, ...(items as unknown as string[])) as unknown as T;
   }
 
   /**
    * Show an error toast message.
    */
   async showErrorToast<T extends string | DialogButton>(message: string, options?: DialogConfig, ...items: T[]): Promise<T | undefined> {
-    return await vsc.window.showErrorMessage(message, options as any, ...items as any[]);
+    const vscOptions = this.mapOptions(options);
+    if (items.length > 0 && typeof items[0] !== 'string') {
+      const buttons = items as unknown as DialogButton[];
+      const vscItems = buttons.map(b => ({ title: b.caption, isCloseAffordance: b.isCloseAction }));
+      const result = await vsc.window.showErrorMessage(message, vscOptions, ...vscItems);
+      return result ? buttons.find(b => b.caption === result.title) as unknown as T : undefined;
+    }
+    return await vsc.window.showErrorMessage(message, vscOptions, ...(items as unknown as string[])) as unknown as T;
   }
 
   /**
