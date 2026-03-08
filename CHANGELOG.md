@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.3.2
+
+### Security
+
+- **Dependency Updates**: Bumped `sql.js` from 1.13.0 to 1.14.0, `@vscode/extension-telemetry` to 1.5.1, `@types/node` to 25.3.3, and patched `qs` via npm_and_yarn group update.
+
+### Performance
+
+- **Base64 Encoding Optimization**: Replaced string concatenation with array-chunk approach for Base64 encoding, reducing GC pressure and improving throughput for large binary data serialization.
+
+### Improvements
+
+- **Type Safety**: Eliminated `as any` casts across the codebase:
+  - Added function overloads to `cancelTokenToAbortSignal` for correct return type inference.
+  - Extracted `showToast` helper in `hostBridge.ts` to properly map `DialogConfig` → `MessageOptions` and `DialogButton` → `MessageItem`.
+  - Added strict typing for `DatabaseConnectionBundle.workerMethods`.
+- **Configuration Accessors**: Extracted `getMaximumFileSizeBytes()` and `getQueryTimeout()` from `workerFactory.ts` to `config.ts`, making them independently testable without `import.meta.env` side effects.
+- **Row ID Validation**: Extracted `validateRowId()` / `validateRowIds()` utilities to `sql-utils.ts`, replacing 6 duplicated inline validation blocks across `sqlite-db.ts` and `nativeWorker.ts`.
+- **Error Logging**: `doTry()` now always logs caught errors via `console.warn` instead of silently swallowing them.
+
+### Refactoring
+
+- **Dead Code Removal**: Removed unused `onRowClick` placeholder in webview UI and unreachable `rowIds` filtering block in `tableExporter.ts`.
+- **Viewer Bundle Rebuild**: Rebuilt webview bundles to include Base64 optimization and dead code removal.
+
+### Testing
+
+- **New Test Suites**: Added comprehensive tests for:
+  - `isAutoCommitEnabled` configuration logic with environment mocking
+  - `LoggingDatabaseOperations` sanitizeValue and PII redaction
+  - `DocumentRegistry` lifecycle management
+  - `themeToCss` helper utility
+  - `validateRowId` / `validateRowIds` edge cases
+  - `getMaximumFileSizeBytes` / `getQueryTimeout` configuration accessors
+  - `doTry` error logging behavior
+- **Mock Infrastructure**: Upgraded VS Code mock to use `Map`-backed `_config` store for proper `getConfiguration().get()` default handling.
+
 ## 1.3.1
 
 ### Improvements
