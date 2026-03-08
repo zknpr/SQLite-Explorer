@@ -9,8 +9,11 @@ import type { CancellationToken } from 'vscode';
  */
 export function cancelTokenToAbortSignal<T extends CancellationToken | null | undefined>(
   token: T
-): T extends null | undefined ? undefined : AbortSignal {
-  if (token == null) return undefined as any;
+): T extends null | undefined ? undefined : AbortSignal;
+export function cancelTokenToAbortSignal(
+  token: CancellationToken | null | undefined
+): AbortSignal | undefined {
+  if (token == null) return undefined;
 
   const controller = new AbortController();
   // We access properties on 'token' assuming it adheres to the CancellationToken interface.
@@ -24,5 +27,5 @@ export function cancelTokenToAbortSignal<T extends CancellationToken | null | un
       disposable.dispose();
     });
   }
-  return controller.signal as any;
+  return controller.signal;
 }

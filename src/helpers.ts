@@ -191,8 +191,11 @@ export function getUriParts(uri: string | vsc.Uri): {
  */
 export function cancelTokenToAbortSignal<T extends vsc.CancellationToken | null | undefined>(
   token: T
-): T extends null ? undefined : AbortSignal {
-  if (token == null) return undefined as any;
+): T extends null | undefined ? undefined : AbortSignal;
+export function cancelTokenToAbortSignal(
+  token: vsc.CancellationToken | null | undefined
+): AbortSignal | undefined {
+  if (token == null) return undefined;
 
   const controller = new AbortController();
   if (token.isCancellationRequested) {
@@ -200,7 +203,7 @@ export function cancelTokenToAbortSignal<T extends vsc.CancellationToken | null 
   } else {
     token.onCancellationRequested(() => controller.abort());
   }
-  return controller.signal as any;
+  return controller.signal;
 }
 
 // ============================================================================
