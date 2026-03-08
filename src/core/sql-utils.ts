@@ -4,7 +4,35 @@
  * Shared utilities for SQL string construction and escaping.
  */
 
-import type { CellValue } from './types';
+import type { CellValue, RecordId } from './types';
+
+/**
+ * Validates that a row ID is a finite number.
+ *
+ * SECURITY: Prevents invalid or malicious row IDs from being used in queries.
+ *
+ * @param rowId - The row ID to validate
+ * @returns The validated row ID as a number
+ * @throws Error if the row ID is not a finite number
+ */
+export function validateRowId(rowId: RecordId): number {
+  const num = Number(rowId);
+  if (!Number.isFinite(num)) {
+    throw new Error(`Invalid rowid: ${rowId}`);
+  }
+  return num;
+}
+
+/**
+ * Validates an array of row IDs.
+ *
+ * @param rowIds - Array of row IDs to validate
+ * @returns Array of validated row IDs as numbers
+ * @throws Error if any row ID is invalid
+ */
+export function validateRowIds(rowIds: RecordId[]): number[] {
+  return rowIds.map(validateRowId);
+}
 
 /**
  * Escape a SQL identifier (table name, column name) for safe use in queries.
