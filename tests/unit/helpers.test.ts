@@ -1,7 +1,7 @@
 import './vscode_mock_setup';
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
-import { getUriParts } from '../../src/helpers';
+import { getUriParts, doTry } from '../../src/helpers';
 import * as vsc from 'vscode';
 
 describe('getUriParts', () => {
@@ -53,5 +53,32 @@ describe('getUriParts', () => {
     assert.strictEqual(parts.filename, 'file name.txt');
     assert.strictEqual(parts.basename, 'file name');
     assert.strictEqual(parts.extname, '.txt');
+  });
+});
+
+describe('doTry', () => {
+  let originalConsoleWarn: any;
+  let warnMessages: any[] = [];
+
+  beforeEach(() => {
+    originalConsoleWarn = console.warn;
+    console.warn = (...args) => {
+      warnMessages.push(args);
+    };
+    warnMessages = [];
+  });
+
+  afterEach(() => {
+    console.warn = originalConsoleWarn;
+  });
+
+  it('should return result on success', () => {
+    assert.strictEqual(doTry(() => 42), 42);
+    assert.strictEqual(warnMessages.length, 0);
+  });
+
+  it('should swallow error and return undefined', () => {
+    const result = doTry(() => { throw new Error('test error'); });
+    assert.strictEqual(result, undefined);
   });
 });
