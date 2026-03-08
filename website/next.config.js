@@ -3,9 +3,14 @@ const nextConfig = {
   // Enable React strict mode for better development experience
   reactStrictMode: true,
 
-  // Optimize images from external sources if needed
   images: {
     formats: ['image/avif', 'image/webp'],
+    remotePatterns: [
+      {
+        protocol: 'https',
+        hostname: '**',
+      },
+    ],
   },
 
   // Headers for security and caching
