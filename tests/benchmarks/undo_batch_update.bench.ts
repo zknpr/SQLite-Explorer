@@ -42,13 +42,29 @@ async function runBenchmark() {
 
     console.log('Starting Undo Benchmark with 50,000 cells...');
 
-    // Warm up? Maybe not needed for this simple test.
+    // Warm up
+    console.log('Warming up JIT...');
+    const warmupMod: ModificationEntry = {
+        modificationType: 'cell_update',
+        targetTable: 'test',
+        description: 'Batch update warmup',
+        affectedCells: affectedCells.slice(0, 1000)
+    };
+    for (let i = 0; i < 5; i++) {
+        await db.undoModification(warmupMod);
+    }
 
-    const start = performance.now();
-    await db.undoModification(mod);
-    const end = performance.now();
+    let totalUndoTime = 0;
+    const NUM_RUNS = 5;
 
-    console.log(`Undo took: ${(end - start).toFixed(2)}ms`);
+    for (let i = 0; i < NUM_RUNS; i++) {
+        const start = performance.now();
+        await db.undoModification(mod);
+        const end = performance.now();
+        totalUndoTime += (end - start);
+    }
+
+    console.log(`Average Undo took: ${(totalUndoTime / NUM_RUNS).toFixed(2)}ms`);
 
     // Verify
     const result = await db.executeQuery('SELECT value FROM test WHERE id = 1');
