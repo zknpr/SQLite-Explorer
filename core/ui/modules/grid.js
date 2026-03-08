@@ -159,13 +159,6 @@ export function initGridInteraction() {
             return;
         }
 
-        // 5. Row (generic click)
-        const rowEl = target.closest('.data-row');
-        if (rowEl) {
-             const rowIdx = parseInt(rowEl.dataset.rowidx, 10);
-             const rowId = resolveRowIdType(rowEl.dataset.rowid);
-             onRowClick(event, rowId, rowIdx);
-        }
     });
 
     // Double Click Handler
@@ -991,12 +984,6 @@ function stopColumnResize() {
 }
 
 // Row Selection
-export function onRowClick(event, rowId, rowIdx) {
-    // Row selection is primarily handled by `onRowNumberClick`.
-    // This handler remains as a hook for potential future row-click behaviors
-    // that differ from cell selection.
-}
-
 export function onRowNumberClick(event, rowId, rowIdx) {
     event.stopPropagation();
     // Prevent default to avoid text selection highlight
