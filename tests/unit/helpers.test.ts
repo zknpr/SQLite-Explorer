@@ -1,7 +1,7 @@
 import './vscode_mock_setup';
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { getUriParts } from '../../src/helpers';
+import { getUriParts, themeToCss } from '../../src/helpers';
 import * as vsc from 'vscode';
 
 describe('getUriParts', () => {
@@ -53,5 +53,27 @@ describe('getUriParts', () => {
     assert.strictEqual(parts.filename, 'file name.txt');
     assert.strictEqual(parts.basename, 'file name');
     assert.strictEqual(parts.extname, '.txt');
+  });
+});
+
+describe('themeToCss', () => {
+  it('should return "dark" for Dark theme', () => {
+    const theme = { kind: vsc.ColorThemeKind.Dark } as vsc.ColorTheme;
+    assert.strictEqual(themeToCss(theme), 'dark');
+  });
+
+  it('should return "dark" for HighContrast theme', () => {
+    const theme = { kind: vsc.ColorThemeKind.HighContrast } as vsc.ColorTheme;
+    assert.strictEqual(themeToCss(theme), 'dark');
+  });
+
+  it('should return "light" for Light theme', () => {
+    const theme = { kind: vsc.ColorThemeKind.Light } as vsc.ColorTheme;
+    assert.strictEqual(themeToCss(theme), 'light');
+  });
+
+  it('should return "light" for HighContrastLight theme', () => {
+    const theme = { kind: vsc.ColorThemeKind.HighContrastLight } as vsc.ColorTheme;
+    assert.strictEqual(themeToCss(theme), 'light');
   });
 });

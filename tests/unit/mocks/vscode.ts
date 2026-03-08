@@ -109,5 +109,11 @@ export const mockVscode = {
         uriScheme: 'vscode',
         appName: 'VS Code',
         language: 'en'
+    },
+    ColorThemeKind: {
+        Light: 1,
+        Dark: 2,
+        HighContrast: 3,
+        HighContrastLight: 4
     }
 };
