@@ -10,14 +10,14 @@ import type { DatabaseViewerProvider } from './editorController';
 
 import * as vsc from 'vscode';
 
-import { ConfigurationSection, FullExtensionId } from './config';
+import { ConfigurationSection, FullExtensionId, getMaximumFileSizeBytes } from './config';
 import { Disposable } from './lifecycle';
 import { cancelTokenToAbortSignal, getUriParts, generateDatabaseDocumentKey } from './helpers';
 import { HostBridge } from './hostBridge';
 import { DatabaseConnectionBundle } from './connectionTypes';
 import { DocumentRegistry } from './documentRegistry';
 
-import { createDatabaseConnection, getMaximumFileSizeBytes } from './workerFactory';
+import { createDatabaseConnection } from './workerFactory';
 import { GlobalOutputChannel } from './main';
 
 import { ModificationTracker } from './core/undo-history';
