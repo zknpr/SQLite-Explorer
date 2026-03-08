@@ -6,7 +6,7 @@
  */
 
 import type { Uri } from 'vscode';
-import type { DatabaseOperations } from './core/types';
+import type { DatabaseOperations, CellValue, QueryResultSet, DatabaseInitConfig, DatabaseInitResult } from './core/types';
 
 // ============================================================================
 // Connection Bundle Interface
@@ -25,9 +25,9 @@ export interface DatabaseConnectionBundle {
    * Includes dispose symbol for cleanup.
    */
   workerMethods: {
-    initializeDatabase: (...args: any[]) => Promise<unknown>;
-    runQuery: (...args: any[]) => Promise<unknown>;
-    exportDatabase: (...args: any[]) => Promise<unknown>;
+    initializeDatabase: (filename: string, config: DatabaseInitConfig) => Promise<DatabaseInitResult>;
+    runQuery: (sql: string, params?: CellValue[]) => Promise<QueryResultSet[]>;
+    exportDatabase: (name: string) => Promise<Uint8Array>;
     [Symbol.dispose]: () => void;
   };
 
