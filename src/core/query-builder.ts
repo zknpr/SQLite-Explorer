@@ -4,12 +4,12 @@
  * Constructs safe SQL queries for read operations.
  */
 import { escapeIdentifier, escapeLikePattern } from './sql-utils';
-import { TableQueryOptions, TableCountOptions } from './types';
+import type { CellValue, TableQueryOptions, TableCountOptions } from './types';
 
 /**
  * Build a SELECT query from options.
  */
-export function buildSelectQuery(table: string, options: TableQueryOptions): { sql: string; params: any[] } {
+export function buildSelectQuery(table: string, options: TableQueryOptions): { sql: string; params: CellValue[] } {
   const {
     columns = ['*'],
     orderBy,
@@ -29,7 +29,7 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
 
   let sql = `SELECT ${escapedColumns} FROM ${escapedTable}`;
   const whereClauses: string[] = [];
-  const params: any[] = [];
+  const params: CellValue[] = [];
 
   const { conditions, params: filterParams } = buildFilterConditions(filters, globalFilter, columns);
   whereClauses.push(...conditions);
@@ -57,13 +57,13 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
 /**
  * Build a COUNT query from options.
  */
-export function buildCountQuery(table: string, options: TableCountOptions): { sql: string; params: any[] } {
+export function buildCountQuery(table: string, options: TableCountOptions): { sql: string; params: CellValue[] } {
   const { columns = [], filters = [], globalFilter } = options;
 
   const escapedTable = escapeIdentifier(table);
   let sql = `SELECT COUNT(*) as count FROM ${escapedTable}`;
   const whereClauses: string[] = [];
-  const params: any[] = [];
+  const params: CellValue[] = [];
 
   const { conditions, params: filterParams } = buildFilterConditions(filters, globalFilter, columns);
   whereClauses.push(...conditions);
@@ -83,9 +83,9 @@ function buildFilterConditions(
   filters: { column: string; value: string }[] = [],
   globalFilter: string | undefined,
   searchColumns: string[]
-): { conditions: string[]; params: any[] } {
+): { conditions: string[]; params: CellValue[] } {
   const conditions: string[] = [];
-  const params: any[] = [];
+  const params: CellValue[] = [];
 
   // Column filters
   for (const filter of filters) {

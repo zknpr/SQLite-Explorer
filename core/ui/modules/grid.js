@@ -545,7 +545,12 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
         });
 
         const rowNumVal = state.currentPageIndex * state.rowsPerPage + rowIdx + 1;
-        rowNumTd.innerHTML = `${rowNumVal}<span class="pin-icon codicon codicon-pin ${isRowPinned ? 'pinned' : ''}" title="${isRowPinned ? 'Unpin row' : 'Pin row'}"></span>`;
+        // Use DOM methods instead of innerHTML for consistency with XSS prevention patterns
+        rowNumTd.appendChild(document.createTextNode(String(rowNumVal)));
+        const pinSpan = document.createElement('span');
+        pinSpan.className = `pin-icon codicon codicon-pin ${isRowPinned ? 'pinned' : ''}`;
+        pinSpan.title = isRowPinned ? 'Unpin row' : 'Pin row';
+        rowNumTd.appendChild(pinSpan);
         tr.appendChild(rowNumTd);
 
         for (let displayColIdx = 0; displayColIdx < orderedColumns.length; displayColIdx++) {

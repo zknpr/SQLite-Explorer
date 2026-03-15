@@ -143,9 +143,10 @@ describe('RPC', () => {
       assert.strictEqual(dispatchedEnvelope.methodName, 'sendData');
       assert.deepStrictEqual(dispatchedEnvelope.parameters, [{ buf: buffer }]);
 
-      assert.ok(dispatchedTransfer);
-      assert.strictEqual(dispatchedTransfer.length, 1);
-      assert.strictEqual(dispatchedTransfer[0], buffer);
+      const transfer = dispatchedTransfer as unknown as Transferable[];
+      assert.ok(transfer);
+      assert.strictEqual(transfer.length, 1);
+      assert.strictEqual(transfer[0], buffer);
     });
   });
 });

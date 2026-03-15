@@ -787,13 +787,14 @@ export async function createNativeDatabaseConnection(
 
               // Check if this index references any of the columns
               const referencesColumn = columns.some(col => {
-                const colLower = col.toLowerCase();
+                // Escape regex metacharacters in column name to prevent broken patterns
+                const escaped = col.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                 // Match column name in index definition (quoted or unquoted)
                 const patterns = [
-                  new RegExp(`[\\(,]\\s*${colLower}\\s*[\\),]`, 'i'),
-                  new RegExp(`[\\(,]\\s*"${colLower}"\\s*[\\),]`, 'i'),
-                  new RegExp(`[\\(,]\\s*\\[${colLower}\\]\\s*[\\),]`, 'i'),
-                  new RegExp(`[\\(,]\\s*\`${colLower}\`\\s*[\\),]`, 'i')
+                  new RegExp(`[\\(,]\\s*${escaped}\\s*[\\),]`, 'i'),
+                  new RegExp(`[\\(,]\\s*"${escaped}"\\s*[\\),]`, 'i'),
+                  new RegExp(`[\\(,]\\s*\\[${escaped}\\]\\s*[\\),]`, 'i'),
+                  new RegExp(`[\\(,]\\s*\`${escaped}\`\\s*[\\),]`, 'i')
                 ];
                 return patterns.some(p => p.test(indexSql));
               });
@@ -966,13 +967,13 @@ export async function createNativeDatabaseConnection(
             pk: headers.indexOf('pk')
           };
 
-          return (result.values || []).map((row: CellValue[]) => ({
-            ordinal: idx.cid >= 0 ? row[idx.cid] : row[0],
-            identifier: idx.name >= 0 ? row[idx.name] : row[1],
-            declaredType: idx.type >= 0 ? row[idx.type] : row[2],
-            isRequired: idx.notnull >= 0 ? row[idx.notnull] : row[3],
+          return (result.values || []).map((row: CellValue[]): ColumnMetadata => ({
+            ordinal: (idx.cid >= 0 ? row[idx.cid] : row[0]) as number,
+            identifier: (idx.name >= 0 ? row[idx.name] : row[1]) as string,
+            declaredType: (idx.type >= 0 ? row[idx.type] : row[2]) as string,
+            isRequired: (idx.notnull >= 0 ? row[idx.notnull] : row[3]) as number,
             defaultExpression: idx.dflt_value >= 0 ? row[idx.dflt_value] : row[4],
-            primaryKeyPosition: idx.pk >= 0 ? row[idx.pk] : row[5]
+            primaryKeyPosition: (idx.pk >= 0 ? row[idx.pk] : row[5]) as number
           }));
         },
 

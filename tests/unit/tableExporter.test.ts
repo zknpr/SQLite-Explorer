@@ -136,7 +136,7 @@ describe('exportTableCommand Fallback', () => {
         const docUri = mockVscode.Uri.parse('vscode-sqlite://test.db');
         const uri = mockVscode.Uri.file('/test/export.csv');
 
-        mockVscode.window.showSaveDialog = async () => uri;
+        mockVscode.window.showSaveDialog = async (): Promise<any> => uri;
 
         let fileWritten = false;
         mockVscode.workspace.fs.writeFile = async () => {

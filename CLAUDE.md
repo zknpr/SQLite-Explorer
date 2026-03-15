@@ -45,6 +45,9 @@ The extension uses a three-layer communication architecture:
 | `src/databaseModel.ts` | Document model (DatabaseDocument), undo/redo, save/revert |
 | `src/workerFactory.ts` | Worker instantiation, connection setup, file reading |
 | `src/databaseWorker.ts` | Worker entry point, exposes database operations |
+| `src/nativeWorker.ts` | Native SQLite worker (txiki-js), batched IPC via `queryBatch` |
+| `src/config.ts` | Extension constants, URI scheme, storage keys, typed config accessors |
+| `src/shims.ts` | Polyfills for Symbol.dispose, AbortSignal.throwIfAborted, Promise.withResolvers |
 | `src/hostBridge.ts` | HostBridge - functions exposed to webview (exec, export, etc.) |
 | `src/core/types.ts` | Core type definitions (CellValue, RecordId, QueryResultSet, etc.) |
 | `src/core/rpc.ts` | RPC utilities (buildMethodProxy, processProtocolMessage) |
@@ -363,6 +366,9 @@ Settings in `package.json` → `contributes.configuration`:
 - **Test organization**: 30+ unit tests in `tests/unit/`, benchmarks in `tests/benchmarks/`, performance tests in `tests/performance/`
 - **Test runner**: Uses `tsx` with Node's built-in test runner (`npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts`)
 
+### Platform Polyfills
+- **`src/shims.ts` must be imported early**: Polyfills `Symbol.dispose`, `Symbol.asyncDispose`, `AbortSignal.throwIfAborted`, `Promise.withResolvers` for older VS Code runtimes that lack these APIs
+
 ### Build
 - **WASM not found**: Run `node scripts/build.mjs` if `assets/sqlite3.wasm` is missing
 - **Browser vs Node**: Check `import.meta.env.VSCODE_BROWSER_EXT` for environment-specific code
@@ -375,6 +381,10 @@ Ns = 'zknpr'
 ExtensionId = 'sqlite-explorer'
 FullExtensionId = 'zknpr.sqlite-explorer'
 ConfigurationSection = 'sqliteExplorer'
+UriScheme = 'sqlite-explorer'        // Virtual file system URI scheme
+CopilotChatId = 'github.copilot-chat'
+// Storage keys: FirstInstallMs, SidebarLeft, SidebarRight, FileNestingPatternsAdded
+// Config accessors: getMaximumFileSizeBytes(), getQueryTimeout()
 ```
 
 ## Debugging
@@ -398,21 +408,6 @@ ConfigurationSection = 'sqliteExplorer'
 2. Run `node scripts/build.mjs` to compile
 3. Press F5 in VS Code to launch Extension Development Host
 4. Open a `.sqlite` or `.db` file to test
-
-## Testing Checklist
-
-- [ ] Open database file
-- [ ] View tables in sidebar
-- [ ] Auto-select first table on load
-- [ ] Click table rows to select
-- [ ] Double-click cells to edit
-- [ ] Verify pinned columns stay attached during horizontal scroll
-- [ ] Add new rows
-- [ ] Delete selected rows
-- [ ] Undo/redo operations
-- [ ] Save changes (Ctrl+S)
-- [ ] Export table to CSV/JSON/SQL
-- [ ] Reload database from disk
 
 ## Dependencies
 

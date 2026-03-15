@@ -484,6 +484,24 @@ class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /**
+   * Insert multiple rows in a batch within a transaction.
+   */
+  async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
+    if (rows.length === 0) return;
+
+    await this.executeQuery('BEGIN TRANSACTION');
+    try {
+      for (const row of rows) {
+        await this.insertRow(table, row);
+      }
+      await this.executeQuery('COMMIT');
+    } catch (e) {
+      await this.executeQuery('ROLLBACK');
+      throw e;
+    }
+  }
+
+  /**
    * Delete rows by ID.
    */
   async deleteRows(table: string, rowIds: RecordId[]): Promise<void> {
@@ -523,13 +541,15 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
         // Check if this index references any of the columns
         const referencesColumn = columns.some(col => {
-          const colLower = col.toLowerCase();
+          // Escape regex metacharacters in column name to prevent broken patterns
+          // for names like "data[0]", "a+b", "user.name"
+          const escaped = col.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           // Match column name in index definition (quoted or unquoted)
           const patterns = [
-            new RegExp(`[\\(,]\\s*${colLower}\\s*[\\),]`, 'i'),
-            new RegExp(`[\\(,]\\s*"${colLower}"\\s*[\\),]`, 'i'),
-            new RegExp(`[\\(,]\\s*\\[${colLower}\\]\\s*[\\),]`, 'i'),
-            new RegExp(`[\\(,]\\s*\`${colLower}\`\\s*[\\),]`, 'i')
+            new RegExp(`[\\(,]\\s*${escaped}\\s*[\\),]`, 'i'),
+            new RegExp(`[\\(,]\\s*"${escaped}"\\s*[\\),]`, 'i'),
+            new RegExp(`[\\(,]\\s*\\[${escaped}\\]\\s*[\\),]`, 'i'),
+            new RegExp(`[\\(,]\\s*\`${escaped}\`\\s*[\\),]`, 'i')
           ];
           return patterns.some(p => p.test(indexSql));
         });
@@ -955,7 +975,7 @@ export async function createDatabaseEngine(
     engineConfig.locateFile = () => config.resourceMap!['sqlite3.wasm'];
   }
 
-  const SqlJsModule = await loadEngine(engineConfig) as WasmEngineModule;
+  const SqlJsModule = await loadEngine(engineConfig) as unknown as WasmEngineModule;
 
   // Create database instance
   let wasmInstance: WasmDatabaseInstance;
@@ -1079,6 +1099,11 @@ export function createWorkerEndpoint() {
     async insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined> {
       if (!activeEngine) throw new Error('No database initialized');
       return activeEngine.insertRow(table, data);
+    },
+
+    async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
+      if (!activeEngine) throw new Error('No database initialized');
+      return activeEngine.insertRowBatch(table, rows);
     },
 
     async deleteRows(table: string, rowIds: RecordId[]): Promise<void> {

@@ -128,7 +128,8 @@ export const mockVscode = {
     env: {
         uriScheme: 'vscode',
         appName: 'VS Code',
-        language: 'en'
+        language: 'en',
+        remoteName: undefined as string | undefined
     },
     ColorThemeKind: {
         Light: 1,

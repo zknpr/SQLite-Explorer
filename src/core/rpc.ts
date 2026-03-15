@@ -79,8 +79,6 @@ interface PendingInvocation {
   readonly expirationTimer: ReturnType<typeof setTimeout>;
 }
 
-const pendingInvocations = new Map<MessageCorrelationId, PendingInvocation>();
-
 /**
  * Default timeout for remote invocations (60 seconds to accommodate large blob operations).
  */
@@ -118,6 +116,9 @@ export function buildMethodProxy<T extends object>(
   methodNames: string[],
   timeoutMs: number = INVOCATION_TIMEOUT_MS
 ): T {
+  // Each proxy gets its own isolated pending invocations map to prevent
+  // cross-connection correlation ID collisions when multiple workers are active.
+  const pendingInvocations = new Map<MessageCorrelationId, PendingInvocation>();
   const proxyObject: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
 
   /**
@@ -183,6 +184,16 @@ export function buildMethodProxy<T extends object>(
     };
   }
 
+  // Expose the pending invocations map so processProtocolMessage can resolve responses
+  // for this specific proxy instance (avoids cross-connection collisions).
+  // Non-enumerable to prevent leaking in Object.keys(), JSON.stringify(), or logging.
+  Object.defineProperty(proxyObject, '__pendingInvocations', {
+    value: pendingInvocations,
+    enumerable: false,
+    configurable: false,
+    writable: false
+  });
+
   return proxyObject as T;
 }
 
@@ -216,13 +227,15 @@ type LogHandler = (level: 'log' | 'warn' | 'error', args: unknown[]) => void;
  * @param localMethods - Optional local method implementations
  * @param sendResponse - Optional function to send responses
  * @param onLog - Optional callback for worker log messages
+ * @param pendingInvocations - Optional per-proxy pending invocations map for response routing
  * @returns true if message was handled, false otherwise
  */
 export function processProtocolMessage(
   envelope: unknown,
   localMethods?: MethodImplementations,
   sendResponse?: ResponseDispatcher,
-  onLog?: LogHandler
+  onLog?: LogHandler,
+  pendingInvocations?: Map<MessageCorrelationId, PendingInvocation>
 ): boolean {
   // Validate envelope structure
   if (!envelope || typeof envelope !== 'object') return false;
@@ -296,8 +309,8 @@ export function processProtocolMessage(
     return true;
   }
 
-  // Handle incoming response
-  if (msg.kind === 'result') {
+  // Handle incoming response — look up in the provided pending map
+  if (msg.kind === 'result' && pendingInvocations) {
     const { correlationId, payload, errorText } = msg;
     const pending = pendingInvocations.get(correlationId);
 
@@ -358,9 +371,15 @@ export function connectWorkerPort<T extends object>(
     }
   };
 
+  const proxy = buildMethodProxy<T>(dispatcher, methodNames);
+
+  // Extract the per-proxy pending invocations map so response messages are routed
+  // to the correct proxy instance (each worker gets its own isolated map).
+  const proxyPending = (proxy as any).__pendingInvocations as Map<MessageCorrelationId, PendingInvocation>;
+
   port.on('message', (data) => {
-    processProtocolMessage(data, undefined, undefined, onLog);
+    processProtocolMessage(data, undefined, undefined, onLog, proxyPending);
   });
 
-  return buildMethodProxy<T>(dispatcher, methodNames);
+  return proxy;
 }

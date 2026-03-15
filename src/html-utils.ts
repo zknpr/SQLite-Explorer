@@ -21,7 +21,7 @@ function toDashCase(str: string): string {
 export function toDatasetAttrs(obj: Record<string, string | boolean | undefined>): string {
   return Object.entries(obj)
     .filter(([, value]) => value != null)
-    .map(([key, value]) => `data-${toDashCase(key)}="${value}"`)
+    .map(([key, value]) => `data-${toDashCase(key)}="${String(value).replace(/"/g, '&quot;')}"`)
     .join(' ');
 }
 

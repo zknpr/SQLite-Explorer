@@ -14,7 +14,7 @@ describe('WasmDatabaseEngine', () => {
             maxSize: 0,
             readOnlyMode: false
         });
-        engine = result.operations;
+        engine = result.operations!;
 
         // Setup table
         await engine.executeQuery("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, data TEXT)");

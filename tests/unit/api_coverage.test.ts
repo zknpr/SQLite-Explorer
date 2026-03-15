@@ -13,7 +13,7 @@ describe('API Coverage', () => {
             maxSize: 0,
             readOnlyMode: false
         });
-        engine = result.operations;
+        engine = result.operations!;
         await engine.executeQuery("CREATE TABLE test (id INTEGER PRIMARY KEY, val TEXT)");
         await engine.insertRow('test', { id: 1, val: 'A' });
         await engine.insertRow('test', { id: 2, val: 'B' });

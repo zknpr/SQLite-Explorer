@@ -466,22 +466,11 @@ export class BlobInspector {
             pre.style.overflow = 'auto';
             this.previewContainer.appendChild(pre);
         } else if (type.type === 'pdf') {
-             // Browser might not support embedding PDF in simple iframe inside webview easily without sandbox permissions
-             // but we can try object or simple link
-             const blob = new Blob([data], { type: type.mime });
-             this.currentObjectUrl = URL.createObjectURL(blob);
+             // VS Code webview sandbox does not support inline PDF rendering.
+             // Show file info and a download button that uses the VS Code save dialog.
+             const container = document.createElement('div');
+             container.className = 'empty-view';
 
-             const iframe = document.createElement('iframe');
-             iframe.src = this.currentObjectUrl;
-             iframe.style.width = '100%';
-             iframe.style.height = '100%';
-             iframe.style.border = 'none';
-
-             // Fallback text if iframe fails
-             const fallback = document.createElement('div');
-             fallback.className = 'empty-view';
-
-             // Create elements safely instead of innerHTML
              const icon = document.createElement('span');
              icon.className = 'codicon codicon-file-pdf';
              icon.style.fontSize = '48px';
@@ -489,21 +478,19 @@ export class BlobInspector {
 
              const text = document.createElement('span');
              text.style.marginTop = '12px';
-             text.textContent = 'PDF Document';
+             text.textContent = `PDF Document (${this.formatSize(data.byteLength)})`;
 
-             const link = document.createElement('a');
-             link.href = this.currentObjectUrl;
-             link.download = 'document.pdf';
-             link.className = 'btn-primary';
-             link.style.marginTop = '12px';
-             link.style.textDecoration = 'none';
-             link.textContent = 'Download to view';
+             const dlBtn = document.createElement('button');
+             dlBtn.className = 'btn-primary';
+             dlBtn.style.marginTop = '12px';
+             dlBtn.textContent = 'Download to view';
+             dlBtn.addEventListener('click', () => this.download());
 
-             fallback.appendChild(icon);
-             fallback.appendChild(text);
-             fallback.appendChild(link);
+             container.appendChild(icon);
+             container.appendChild(text);
+             container.appendChild(dlBtn);
 
-             this.previewContainer.appendChild(iframe);
+             this.previewContainer.appendChild(container);
         } else {
             const div = document.createElement('div');
             div.className = 'empty-view';

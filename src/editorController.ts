@@ -22,7 +22,6 @@ import { WebviewMessageHandler } from './webviewMessageHandler';
 // Webview functions interface - methods the webview exposes to extension
 interface WebviewBridgeFunctions {
   updateColorScheme(scheme: 'light' | 'dark'): Promise<void>;
-  updateAutoCommit(value: boolean): Promise<void>;
   updateCellEditBehavior(value: string): Promise<void>;
   refreshContent(filename: string): Promise<void>;
 }
@@ -130,9 +129,6 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       }
     }));
 
-    // Listen for when this document gains focus to trigger pending saves
-    this._register(vsc.window.onDidChangeActiveTextEditor(_ => {
-    }));
   }
 
   /**
@@ -188,10 +184,14 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     );
     this.webviewBridges.set(webviewPanel, webviewBridge);
 
-    // Handle messages from webview
+    // Handle messages from webview.
+    // Pass the per-proxy pending invocations map so RPC responses from the webview
+    // are correctly routed to the bridge proxy for this specific panel.
+    const pendingMap = (webviewBridge as any).__pendingInvocations;
     const messageHandler = new WebviewMessageHandler(
       (msg) => webviewPanel.webview.postMessage(msg),
-      document.hostBridge as any
+      document.hostBridge as any,
+      pendingMap
     );
     webviewPanel.webview.onDidReceiveMessage((message) => messageHandler.handleMessage(message));
 

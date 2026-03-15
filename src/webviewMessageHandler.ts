@@ -31,13 +31,21 @@ function isWebviewLegacyRpcMessage(message: unknown): message is WebviewLegacyRp
 }
 
 /**
+ * SECURITY: Set of Object.prototype method names that must never be invoked via RPC.
+ * Prevents prototype pollution attacks where a crafted message could invoke
+ * inherited methods like 'constructor', '__defineGetter__', or 'toString'.
+ */
+const BLOCKED_METHODS = new Set(Object.getOwnPropertyNames(Object.prototype));
+
+/**
  * Handles messages received from the webview.
  * Decouples message processing logic from VS Code API.
  */
 export class WebviewMessageHandler {
   constructor(
     private readonly postMessage: (message: any) => PromiseLike<boolean>,
-    private readonly hostBridge: Record<string, any>
+    private readonly hostBridge: Record<string, any>,
+    private readonly pendingInvocations?: Map<string, any>
   ) {}
 
   /**
@@ -45,8 +53,9 @@ export class WebviewMessageHandler {
    * @param message - The message object received from the webview
    */
   handleMessage(message: unknown) {
-    // Handle RPC responses (for calls we make to the webview)
-    processProtocolMessage(message);
+    // Handle RPC responses (for calls we make to the webview).
+    // Pass the per-proxy pending invocations map so responses are routed correctly.
+    processProtocolMessage(message, undefined, undefined, undefined, this.pendingInvocations);
 
     if (isWebviewRpcInvokeMessage(message)) {
       this.#handleRpcInvoke(message);
@@ -68,8 +77,10 @@ export class WebviewMessageHandler {
     // Deserialize payload to restore Uint8Array instances
     const deserializedPayload = deserializeArgs(payload || []);
 
-    // Check if method exists on hostBridge
-    if (typeof hostBridge[targetMethod] === 'function') {
+    // SECURITY: Block Object.prototype methods to prevent prototype pollution attacks.
+    // Allow class prototype methods (e.g., HostBridge.initialize) but reject inherited
+    // Object methods like 'constructor', '__defineGetter__', 'toString'.
+    if (!BLOCKED_METHODS.has(targetMethod) && typeof hostBridge[targetMethod] === 'function') {
       const fn = hostBridge[targetMethod];
       Promise.resolve(fn.apply(hostBridge, deserializedPayload))
         .then(result => {
@@ -117,6 +128,8 @@ export class WebviewMessageHandler {
    */
   #handleLegacyRpcRequest(message: WebviewLegacyRpcMessage) {
     const hostBridge = this.hostBridge;
+    // SECURITY: Same prototype pollution guard as #handleRpcInvoke
+    if (BLOCKED_METHODS.has(message.method)) return;
     const fn = hostBridge[message.method];
     if (typeof fn === 'function') {
       Promise.resolve(fn.apply(hostBridge, deserializeArgs(message.args || [])))

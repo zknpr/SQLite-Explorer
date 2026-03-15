@@ -46,7 +46,21 @@ export class Uri {
 }
 
 // Mock env object for IsVSCode check
-export const env = {
+export const env: {
+    uriScheme: string;
+    appName: string;
+    appRoot: string;
+    language: string;
+    machineId: string;
+    sessionId: string;
+    isNewAppInstall: boolean;
+    isTelemetryEnabled: boolean;
+    remoteName: string | undefined;
+    shell: string;
+    uiKind: number;
+    clipboard: { readText: () => Promise<string>; writeText: (_text: string) => Promise<void> };
+    openExternal: (_uri: Uri) => Promise<boolean>;
+} = {
     uriScheme: 'vscode',
     appName: 'Visual Studio Code',
     appRoot: '/app',

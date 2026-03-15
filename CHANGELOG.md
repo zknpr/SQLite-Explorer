@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.3.3
+
+### Security
+
+- **WebviewMessageHandler Prototype Pollution Guard**: Added `hasOwnProperty` validation to both the modern and legacy RPC handlers in `WebviewMessageHandler`, preventing attackers from invoking inherited Object.prototype methods (e.g., `constructor`, `toString`) via crafted webview messages. The core RPC layer already had this guard; it is now applied consistently at all entry points.
+- **HTML Attribute Injection Prevention**: `toDatasetAttrs()` now escapes double quotes in attribute values, preventing breakout from `data-*` HTML attributes if user-derived data is passed.
+- **Regex Injection in Index Detection**: `findDependentIndexes()` (both WASM and native backends) now escapes regex metacharacters in column names before constructing match patterns. Column names like `data[0]` or `a+b` previously caused broken or incorrect regex matches, potentially missing dependent indexes during column deletion.
+
+### Bug Fixes
+
+- **Missing `insertRowBatch` in WASM Engine**: The `DatabaseOperations` interface declared `insertRowBatch`, and the native backend implemented it, but the WASM engine (`WasmDatabaseEngine`) did not — causing a runtime error for browser/VS Code Web users. Added the implementation using a transaction with individual `insertRow` calls, and plumbed it through the worker proxy, operations facade, and `LoggingDatabaseOperations` wrapper.
+- **RPC Cross-Connection Collision Risk**: The `pendingInvocations` map and correlation counter were module-level singletons shared across all `buildMethodProxy` instances. When multiple database documents were open, all workers shared the same pending response map. Moved the map into each proxy's closure and threaded it through `processProtocolMessage` and `connectWorkerPort`, so each worker connection is fully isolated. The internal map is exposed as a non-enumerable `__pendingInvocations` property to prevent leaking in serialization or logging.
+- **Leaked `cancelTokenToAbortSignal` Disposable**: The `helpers.ts` version of `cancelTokenToAbortSignal` never cleaned up the `onCancellationRequested` listener. Replaced it with a re-export of the canonical `cancellation-utils.ts` implementation, which properly calls `disposable.dispose()` after abort.
+- **Array Mutation During Iteration**: `activateProviders()` in `main.ts` used a forward `for` loop with `splice()` on the subscriptions array, causing index shifting that could skip entries. Fixed by iterating in reverse.
+- **PDF Fallback Never Rendered**: The blob inspector created a PDF fallback `div` (with download link) but never appended it to the DOM. The fallback is now appended after the iframe.
+- **Unused `updateAutoCommit` Interface Method**: `WebviewBridgeFunctions` declared `updateAutoCommit()` but it was never implemented in the webview or registered in the proxy method list. Removed the dead declaration.
+- **Pointless Catch/Throw in Document Creation**: `DatabaseDocument.create()` had a `try { ... } catch (err) { throw err; }` block that added a stack frame without value. Removed the wrapper.
+
+### Improvements
+
+- **Extension Deactivation Hook**: Added an explicit `deactivate()` export to `main.ts`. VS Code expects this for proper extension lifecycle management.
+- **Consistent XSS Prevention in Grid**: Replaced `innerHTML` with DOM creation methods (`createTextNode`, `createElement`) for row number cells in the data grid, matching the `textContent` pattern already used for data cells.
+- **Query Builder Type Safety**: Replaced all `any[]` parameter types in `query-builder.ts` with `CellValue[]`, strengthening the type boundary for SQL query construction.
+- **Empty Event Handler Removed**: Removed a no-op `onDidChangeActiveTextEditor` listener in `editorController.ts` that allocated resources without purpose.
+
 ## 1.3.2
 
 ### Security

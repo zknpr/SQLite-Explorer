@@ -9,6 +9,7 @@ async function runBenchmark() {
         maxSize: 0,
         readOnlyMode: false
     });
+    if (!db) throw new Error('Failed to create database engine');
 
     console.log('Setting up table with 50,000 rows...');
     await db.executeQuery('CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)');
@@ -45,13 +46,13 @@ async function runBenchmark() {
     // Warm up? Maybe not needed for this simple test.
 
     const start = performance.now();
-    await db.undoModification(mod);
+    await db!.undoModification(mod);
     const end = performance.now();
 
     console.log(`Undo took: ${(end - start).toFixed(2)}ms`);
 
     // Verify
-    const result = await db.executeQuery('SELECT value FROM test WHERE id = 1');
+    const result = await db!.executeQuery('SELECT value FROM test WHERE id = 1');
     if (result[0].rows[0][0] !== 'val-0') {
         console.error('Verification failed! Expected val-0');
     } else {

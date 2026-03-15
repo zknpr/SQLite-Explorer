@@ -67,6 +67,7 @@ interface WorkerMethods {
   exportDatabase(name: string): Promise<Uint8Array>;
   updateCell(table: string, rowId: string | number, column: string, value: CellValue): Promise<void>;
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
+  insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
   deleteRows(table: string, rowIds: (string | number)[]): Promise<void>;
   deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
@@ -171,7 +172,7 @@ async function createWasmDatabaseConnection(
     // Browser environment: fetch worker script and create Blob URL
     const workerScriptUri = vsc.Uri.joinPath(extensionUri, 'out', 'worker-browser.js');
     const workerContent = await vsc.workspace.fs.readFile(workerScriptUri);
-    const blob = new Blob([workerContent], { type: 'application/javascript' });
+    const blob = new Blob([workerContent as BlobPart], { type: 'application/javascript' });
     const blobUrl = URL.createObjectURL(blob);
     workerThread = new Worker(blobUrl);
   } else {
@@ -213,7 +214,7 @@ async function createWasmDatabaseConnection(
         }
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile'],
+    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'insertRowBatch', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile'],
     logHandler
   );
 
@@ -331,6 +332,8 @@ async function createWasmDatabaseConnection(
             }
             return workerProxy.insertRow(table, wrappedData);
           },
+          insertRowBatch: (table: string, rows: Record<string, CellValue>[]) =>
+            workerProxy.insertRowBatch(table, rows),
           deleteRows: (table: string, rowIds: (string | number)[]) =>
             workerProxy.deleteRows(table, rowIds),
           deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>

@@ -11,6 +11,14 @@ import { SQLiteFileSystemProvider } from './virtualFileSystem';
 export let GlobalOutputChannel: vsc.OutputChannel|null = null;
 
 /**
+ * Extension deactivation hook.
+ * VS Code calls this when the extension is deactivated.
+ */
+export function deactivate(): void {
+  // Cleanup is handled by context.subscriptions via dispose pattern
+}
+
+/**
  * Extension activation entry point.
  * Registers custom editors for SQLite files and sets up commands.
  */
@@ -65,9 +73,13 @@ const globalProviderSubs = new WeakSet<vsc.Disposable>();
  * Creates both the default view and optional view providers.
  */
 export async function activateProviders(context: vsc.ExtensionContext, reporter?: TelemetryReporter) {
-  // Clean up previous providers
+  // Clean up previous providers — collect indices in reverse to avoid shift issues during splice
   const prevSubs = context.subscriptions.filter(x => globalProviderSubs.has(x));
-  for (const sub of prevSubs) context.subscriptions.splice(context.subscriptions.indexOf(sub), 1);
+  for (let i = context.subscriptions.length - 1; i >= 0; i--) {
+    if (globalProviderSubs.has(context.subscriptions[i])) {
+      context.subscriptions.splice(i, 1);
+    }
+  }
   disposeAll(prevSubs);
 
   const subs = [];

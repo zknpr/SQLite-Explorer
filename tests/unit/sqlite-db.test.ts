@@ -137,7 +137,7 @@ describe('WasmDatabaseEngine', () => {
         readOnlyMode: false,
         queryTimeout: 100 // 100ms timeout
       });
-      const timeoutEngine = result.operations;
+      const timeoutEngine = result.operations!;
 
       await timeoutEngine.executeQuery("CREATE TABLE timeout_test (id INTEGER PRIMARY KEY, value TEXT)");
       await timeoutEngine.insertRow('timeout_test', { id: 1, value: 'test1' });
@@ -161,7 +161,7 @@ describe('WasmDatabaseEngine', () => {
         // This query will hit the while(stmt.step()) loop
         await assert.rejects(
           async () => {
-            await timeoutEngine.executeQuery("SELECT * FROM timeout_test");
+            await timeoutEngine!.executeQuery("SELECT * FROM timeout_test");
           },
           (err: any) => {
             assert.strictEqual(err.message, "Query failed: Query execution timed out after 100ms");

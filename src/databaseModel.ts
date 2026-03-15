@@ -118,27 +118,23 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     let connectionBundle: DatabaseConnectionBundle;
     let databaseOps: DatabaseOperations;
 
-    try {
-      connectionBundle = await connectionFactory(extensionUri, reporter);
-      const result = await connectionBundle.establishConnection(
-        fileUri,
-        filename,
-        forceReadOnly,
-        autoCommit
-      );
-      databaseOps = result.databaseOps;
-      forceReadOnly = result.isReadOnly;
+    connectionBundle = await connectionFactory(extensionUri, reporter);
+    const result = await connectionBundle.establishConnection(
+      fileUri,
+      filename,
+      forceReadOnly,
+      autoCommit
+    );
+    databaseOps = result.databaseOps;
+    forceReadOnly = result.isReadOnly;
 
-      // Wrap with logger if output channel is available
-      if (viewerProvider.outputChannel) {
-        databaseOps = new LoggingDatabaseOperations(
-          databaseOps,
-          filename,
-          viewerProvider.outputChannel
-        );
-      }
-    } catch (err) {
-      throw err;
+    // Wrap with logger if output channel is available
+    if (viewerProvider.outputChannel) {
+      databaseOps = new LoggingDatabaseOperations(
+        databaseOps,
+        filename,
+        viewerProvider.outputChannel
+      );
     }
 
     // Restore modification history from backup

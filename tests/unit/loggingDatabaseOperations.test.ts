@@ -6,7 +6,7 @@ import { LoggingDatabaseOperations } from '../../src/loggingDatabaseOperations';
 import type { DatabaseOperations, CellValue, QueryResultSet, ModificationEntry, CellUpdate, TableQueryOptions, TableCountOptions, SchemaSnapshot, ColumnMetadata, ColumnDefinition } from '../../src/core/types';
 
 class MockDatabaseOperations implements DatabaseOperations {
-    engineKind = 'sqlite' as const;
+    engineKind = Promise.resolve('wasm' as const);
     async executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> { return []; }
     async serializeDatabase(name: string): Promise<Uint8Array> { return new Uint8Array(); }
     async applyModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void> {}
@@ -16,13 +16,14 @@ class MockDatabaseOperations implements DatabaseOperations {
     async discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void> {}
     async updateCell(table: string, rowId: number, column: string, value: CellValue, patch?: string): Promise<void> {}
     async insertRow(table: string, data: Record<string, CellValue>): Promise<number> { return 1; }
+    async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {}
     async deleteRows(table: string, rowIds: number[]): Promise<void> {}
     async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {}
     async findDependentIndexes(table: string, columns: string[]): Promise<string[]> { return []; }
     async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {}
     async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {}
     async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {}
-    async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> { return { columns: [], rows: [], totalRows: 0 }; }
+    async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> { return { headers: [], rows: [] }; }
     async fetchTableCount(table: string, options: TableCountOptions): Promise<number> { return 0; }
     async fetchSchema(): Promise<SchemaSnapshot> { return { tables: [], views: [], indexes: [] }; }
     async getTableInfo(table: string): Promise<ColumnMetadata[]> { return []; }
@@ -41,7 +42,9 @@ class MockOutputChannel implements vsc.OutputChannel {
     }
     replace(value: string): void {}
     clear(): void { this.lines = []; }
-    show(preserveFocus?: boolean): void {}
+    show(preserveFocus?: boolean): void;
+    show(column?: any, preserveFocus?: boolean): void;
+    show(_columnOrPreserveFocus?: any, _preserveFocus?: boolean): void {}
     hide(): void {}
     dispose(): void {}
 }
