@@ -10,7 +10,7 @@ import * as vsc from 'vscode';
 import * as path from 'path';
 
 import type { DatabaseEditorProvider, DatabaseViewerProvider } from './editorController';
-import { ConfigurationSection, ExtensionId, FullExtensionId, SidebarLeft, SidebarRight, UriScheme } from './config';
+import { ConfigurationSection, ExtensionId, SidebarLeft, SidebarRight, UriScheme } from './config';
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
