@@ -387,8 +387,35 @@ export class HostBridge implements ToastService {
 
     if ('updateCellBatch' in document.databaseOperations) {
       await document.databaseOperations.updateCellBatch(table, updates);
+    } else if (typeof document.databaseOperations.executeQuery === 'function') {
+      // Intermediate fallback: execute updates in batch using a single transaction to avoid N+1 transaction overhead
+      await document.databaseOperations.executeQuery('BEGIN TRANSACTION');
+      try {
+        for (const update of updates) {
+          let patch: string | undefined;
+          let val = update.value;
+
+          if (update.operation === 'json_patch') {
+            patch = update.value as string;
+            val = null; // Value is ignored when patch is provided
+          } else {
+            patch = this.tryGeneratePatch(update.value, update.originalValue);
+          }
+
+          await document.databaseOperations.updateCell(table, update.rowId, update.column, val, patch);
+        }
+        await document.databaseOperations.executeQuery('COMMIT');
+      } catch (e) {
+        try {
+          await document.databaseOperations.executeQuery('ROLLBACK');
+        } catch (rollbackError) {
+          console.warn('Failed to rollback transaction during updateCellBatch fallback', rollbackError);
+        }
+        throw e;
+      }
     } else {
-      // Fallback: execute updates in parallel
+      // Ultimate fallback: execute updates in parallel (original behavior)
+      // Only reached if the provider is severely mocked/limited
       await Promise.all(updates.map(async update => {
         let patch: string | undefined;
         let val = update.value;
