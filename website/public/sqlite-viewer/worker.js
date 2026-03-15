@@ -57,6 +57,61 @@ async function loadSqlJs() {
 }
 
 // ============================================================================
+// SQL Validation Utilities
+// ============================================================================
+
+/**
+ * Validate a SQL type definition to ensure it is safe.
+ * Allows standard SQLite types and common variants.
+ *
+ * @param {string} type - The type string to validate (e.g. "INTEGER", "VARCHAR(255)")
+ * @throws Error if the type is potentially unsafe
+ */
+function validateSqlType(type) {
+  if (!type || typeof type !== 'string') {
+    throw new Error('Invalid SQL type: Type must be a non-empty string');
+  }
+
+  // Check for dangerous characters that could be used for injection
+  // Disallow: quotes, semicolons, dashes (comments), slashes, asterisks
+  if (/['";\-\/\*]/.test(type)) {
+     throw new Error(`Invalid SQL type: "${type}" contains potentially unsafe characters`);
+  }
+
+  // Strict validation pattern
+  // Matches:
+  // 1. Start with alphanumeric words/spaces (e.g. "INTEGER", "UNSIGNED INT")
+  // 2. Optional: Parentheses with numbers/commas (e.g. "(255)", "(10, 2)")
+  // 3. Optional: Trailing alphanumeric words/spaces (e.g. "UNSIGNED")
+  const validPattern = /^[a-zA-Z0-9_\s]+(?:\([0-9\s,]+\)[a-zA-Z0-9_\s]*)?$/;
+
+  if (!validPattern.test(type.trim())) {
+     throw new Error(`Invalid SQL type: "${type}" does not match allowed format`);
+  }
+}
+
+/**
+ * Format a default value for SQL inclusion, ensuring it is properly escaped.
+ *
+ * @param {string|number} defaultValue - The default value to format
+ * @returns {string} The safely formatted default value expression
+ */
+function formatDefaultValue(defaultValue) {
+  const strValue = String(defaultValue);
+
+  if (strValue.toLowerCase() === 'null') {
+    return 'NULL';
+  } else if (/^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(strValue)) {
+    // Strict numeric pattern: optional sign, digits with optional decimal, optional exponent
+    // This prevents hex (0x), special values, and other edge cases
+    return strValue;
+  } else {
+    // Standard string literal - escape internal single quotes and wrap in single quotes
+    return `'${strValue.replace(/'/g, "''")}'`;
+  }
+}
+
+// ============================================================================
 // Database Operations
 // ============================================================================
 
@@ -654,11 +709,15 @@ async function createTable(table, columns) {
   const safeTable = table.replace(/"/g, '""');
   const columnDefs = columns.map(col => {
     const name = col.name.replace(/"/g, '""');
-    let def = `"${name}" ${col.type || 'TEXT'}`;
+    const type = col.type || 'TEXT';
+
+    validateSqlType(type);
+
+    let def = `"${name}" ${type}`;
     if (col.pk) def += ' PRIMARY KEY';
     if (col.notnull) def += ' NOT NULL';
     if (col.defaultValue !== undefined && col.defaultValue !== null && col.defaultValue !== "") {
-      def += ` DEFAULT ${col.defaultValue}`;
+      def += ` DEFAULT ${formatDefaultValue(col.defaultValue)}`;
     }
     return def;
   }).join(', ');
@@ -698,12 +757,14 @@ async function updateCellBatch(table, updates) {
 async function addColumn(table, column, type, defaultValue) {
   if (!db) throw new Error('No database initialized');
 
+  validateSqlType(type);
+
   const safeTable = table.replace(/"/g, '""');
   const safeColumn = column.replace(/"/g, '""');
 
   let sql = `ALTER TABLE "${safeTable}" ADD COLUMN "${safeColumn}" ${type}`;
   if (defaultValue !== undefined && defaultValue !== null && defaultValue !== "") {
-    sql += ` DEFAULT ${defaultValue}`;
+    sql += ` DEFAULT ${formatDefaultValue(defaultValue)}`;
   }
 
   db.run(sql);
