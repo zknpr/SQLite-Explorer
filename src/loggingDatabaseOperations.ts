@@ -87,7 +87,7 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         // Mask credit card numbers (basic pattern: 16 digits with optional separators)
         safeMessage = safeMessage.replace(/\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b/g, '****-****-****-****');
 
-        // Mask SSN patterns (XXX-XX-XXXX)
+        // Mask SSN patterns (###-##-####)
         safeMessage = safeMessage.replace(/\b\d{3}-\d{2}-\d{4}\b/g, '***-**-****');
 
         this.outputChannel.appendLine(`${timestamp} ${type} [${this.filename}] ${safeMessage}`);
