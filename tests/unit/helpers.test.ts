@@ -103,5 +103,13 @@ describe('doTry', () => {
     const result = doTry(() => { throw new Error('test error'); });
     assert.strictEqual(result, undefined);
     assert.strictEqual(warnMessages.length, 1);
+    assert.deepStrictEqual(warnMessages[0], ['[SQLite Explorer]', 'test error']);
+  });
+
+  it('should return undefined and log warning on string error', () => {
+    const result = doTry(() => { throw 'string error'; });
+    assert.strictEqual(result, undefined);
+    assert.strictEqual(warnMessages.length, 1);
+    assert.deepStrictEqual(warnMessages[0], ['[SQLite Explorer]', 'string error']);
   });
 });
