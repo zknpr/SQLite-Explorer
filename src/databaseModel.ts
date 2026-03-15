@@ -491,7 +491,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       delete: async () => {
         try {
           await vsc.workspace.fs.delete(destination);
-        } catch { }
+        } catch (err) {
+          // Ignore errors during backup deletion (e.g. file already deleted)
+          GlobalOutputChannel?.appendLine(`[Backup deletion failed] ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
     };
   }
