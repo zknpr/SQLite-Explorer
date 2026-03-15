@@ -565,18 +565,30 @@ class WasmDatabaseEngine implements DatabaseOperations {
     if (columns.length === 0) return;
 
     const escapedTable = escapeIdentifier(table);
+    const sqlStatements: string[] = [];
 
     // Drop specified dependent indexes first
     if (dropDependentIndexes && dropDependentIndexes.length > 0) {
       for (const indexName of dropDependentIndexes) {
-        await this.executeQuery(`DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}`);
+        sqlStatements.push(`DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}`);
       }
     }
 
     // Now drop the columns
     for (const col of columns) {
-      const sql = `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`;
-      await this.executeQuery(sql);
+      sqlStatements.push(`ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`);
+    }
+
+    if (sqlStatements.length > 0) {
+      // Use transaction for performance
+      await this.executeQuery('BEGIN TRANSACTION');
+      try {
+        await this.executeQuery(sqlStatements.join('; '));
+        await this.executeQuery('COMMIT');
+      } catch (err) {
+        try { await this.executeQuery('ROLLBACK'); } catch {}
+        throw err;
+      }
     }
   }
 
