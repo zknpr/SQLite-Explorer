@@ -897,7 +897,7 @@ export async function createNativeDatabaseConnection(
             // Missing columns will be undefined/null
             if (mapping.some((idx: number | undefined) => idx !== undefined)) {
               headers = expected;
-              rows = rows.map((row: any[]) => mapping.map((idx: number | undefined) =>
+              rows = rows.map((row: CellValue[]) => mapping.map((idx: number | undefined) =>
                 idx !== undefined ? row[idx as number] : null
               ));
             }
@@ -966,7 +966,7 @@ export async function createNativeDatabaseConnection(
             pk: headers.indexOf('pk')
           };
 
-          return (result.values || []).map((row: any[]) => ({
+          return (result.values || []).map((row: CellValue[]) => ({
             ordinal: idx.cid >= 0 ? row[idx.cid] : row[0],
             identifier: idx.name >= 0 ? row[idx.name] : row[1],
             declaredType: idx.type >= 0 ? row[idx.type] : row[2],
