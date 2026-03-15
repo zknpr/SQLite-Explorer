@@ -7,7 +7,7 @@ import { updateStatus, updateToolbarButtons } from './ui.js';
 import { openModal, closeModal } from './modals.js';
 import { loadTableData, loadTableColumns } from './grid.js';
 import { refreshSchema } from './sidebar.js';
-import { validateRowId, escapeIdentifier } from './utils.js';
+// No utils imports needed — CRUD operations delegate to backendApi
 
 export function initCrud() {
     // --- Toolbar Buttons ---
