@@ -1,7 +1,24 @@
 import './vscode_mock_setup';
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert';
-import { getMaximumFileSizeBytes, getQueryTimeout } from '../../src/config';
+import {
+  getMaximumFileSizeBytes,
+  getQueryTimeout,
+  Ns,
+  ExtensionId,
+  FullExtensionId,
+  UriScheme,
+  ConfigurationSection,
+  TelemetryConnectionString,
+  NestingPattern,
+  FileNestingPatternsAdded,
+  FirstInstallMs,
+  SidebarLeft,
+  SidebarRight,
+  SyncedKeys,
+  Title,
+  CopilotChatId
+} from '../../src/config';
 import * as vsc from 'vscode';
 
 // Access the mock's config store
@@ -39,5 +56,52 @@ describe('getQueryTimeout', () => {
   it('should return configured value', () => {
     configStore.set('queryTimeout', 60000);
     assert.strictEqual(getQueryTimeout(), 60000);
+  });
+});
+
+describe('Constants', () => {
+  it('should have the correct extension identity constants', () => {
+    assert.strictEqual(Ns, 'zknpr');
+    assert.strictEqual(ExtensionId, 'sqlite-explorer');
+    assert.strictEqual(FullExtensionId, 'zknpr.sqlite-explorer');
+  });
+
+  it('should have the correct URI scheme', () => {
+    assert.strictEqual(UriScheme, 'sqlite-explorer');
+  });
+
+  it('should have the correct configuration section', () => {
+    assert.strictEqual(ConfigurationSection, 'sqliteExplorer');
+  });
+
+  it('should have the correct telemetry connection string', () => {
+    assert.strictEqual(TelemetryConnectionString, '');
+  });
+
+  it('should have the correct file nesting patterns', () => {
+    assert.strictEqual(NestingPattern, '${capture}.${extname}-*');
+    assert.strictEqual(FileNestingPatternsAdded, 'fileNestingPatternsAdded');
+  });
+
+  it('should have the correct storage keys', () => {
+    assert.strictEqual(FirstInstallMs, 'firstInstallMs');
+    assert.strictEqual(SidebarLeft, 'sidebarLeft');
+    assert.strictEqual(SidebarRight, 'sidebarRight');
+  });
+
+  it('should have the correct synced keys', () => {
+    assert.deepStrictEqual(SyncedKeys, [
+      'zknpr.sqlite-explorer',
+      'fileNestingPatternsAdded',
+      'firstInstallMs',
+    ]);
+  });
+
+  it('should have the correct display names', () => {
+    assert.strictEqual(Title, 'SQLite Explorer');
+  });
+
+  it('should have the correct copilot chat ID', () => {
+    assert.strictEqual(CopilotChatId, 'github.copilot-chat');
   });
 });
