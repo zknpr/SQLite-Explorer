@@ -34,7 +34,7 @@ import type {
   ViewMetadata,
   IndexMetadata
 } from './core/types';
-import { escapeIdentifier, cellValueToSql, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
+import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 
 // ============================================================================
