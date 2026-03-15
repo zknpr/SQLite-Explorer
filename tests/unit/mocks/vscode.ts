@@ -45,7 +45,21 @@ export const mockVscode = {
             fsPath: path,
             with: () => ({}),
             toString: () => `file://${path}`
-        })
+        }),
+        joinPath: (baseUri: any, ...pathSegments: string[]) => {
+            const separator = baseUri.fsPath.endsWith('/') ? '' : '/';
+            const joinedPath = baseUri.fsPath + separator + pathSegments.join('/');
+            return {
+                scheme: baseUri.scheme,
+                authority: baseUri.authority,
+                path: joinedPath,
+                query: baseUri.query,
+                fragment: baseUri.fragment,
+                fsPath: joinedPath,
+                with: () => ({}),
+                toString: () => `${baseUri.scheme}://${joinedPath}`
+            };
+        }
     },
     FileSystemError: {
         FileNotFound: (uri: any) => {
