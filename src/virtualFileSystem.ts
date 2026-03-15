@@ -1,6 +1,5 @@
 import * as vsc from 'vscode';
 import { DocumentRegistry } from './documentRegistry';
-import { UriScheme } from './config';
 import { Disposable } from './lifecycle';
 
 import type { DatabaseDocument } from './databaseModel';
