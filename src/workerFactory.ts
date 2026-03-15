@@ -24,7 +24,11 @@ import type {
   DatabaseInitConfig,
   DatabaseInitResult,
   CellUpdate,
-  ColumnDefinition
+  ColumnDefinition,
+  TableQueryOptions,
+  TableCountOptions,
+  SchemaSnapshot,
+  ColumnMetadata
 } from './core/types';
 
 import { Worker } from './platform/threadPool';
@@ -69,10 +73,10 @@ interface WorkerMethods {
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
-  fetchTableData(table: string, options: any): Promise<any>;
-  fetchTableCount(table: string, options: any): Promise<number>;
-  fetchSchema(): Promise<any>;
-  getTableInfo(table: string): Promise<any>;
+  fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
+  fetchTableCount(table: string, options: TableCountOptions): Promise<number>;
+  fetchSchema(): Promise<SchemaSnapshot>;
+  getTableInfo(table: string): Promise<ColumnMetadata[]>;
   getPragmas(): Promise<Record<string, CellValue>>;
   setPragma(pragma: string, value: CellValue): Promise<void>;
   ping(): Promise<boolean>;
@@ -345,9 +349,9 @@ async function createWasmDatabaseConnection(
           },
           addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
             workerProxy.addColumn(table, column, type, defaultValue),
-          fetchTableData: (table: string, options: any) =>
+          fetchTableData: (table: string, options: TableQueryOptions) =>
             workerProxy.fetchTableData(table, options),
-          fetchTableCount: (table: string, options: any) =>
+          fetchTableCount: (table: string, options: TableCountOptions) =>
             workerProxy.fetchTableCount(table, options),
           fetchSchema: () =>
             workerProxy.fetchSchema(),
