@@ -292,33 +292,39 @@ export class HostBridge implements ToastService {
         const tableInfo = await document.databaseOperations.getTableInfo(table);
         const colMap = new Map(tableInfo.map(c => [c.identifier, c.declaredType]));
 
-        // Fetch data for each column
-        for (const col of columns) {
-            const type = colMap.get(col) || 'TEXT'; // Default to TEXT if unknown
-
-            // We need rowid to restore values correctly
-            const sql = `SELECT rowid, ${escapeIdentifier(col)} FROM ${escapeIdentifier(table)}`;
+        // Fetch data for all columns in a single query to avoid N+1 query overhead
+        if (columns.length > 0) {
+            const escapedCols = columns.map(col => escapeIdentifier(col)).join(', ');
+            const sql = `SELECT rowid, ${escapedCols} FROM ${escapeIdentifier(table)}`;
             const result = await document.databaseOperations.executeQuery(sql);
 
             if (result && result.length > 0 && result[0].rows) {
                 const rows = result[0].rows;
-                const colData = rows.map(r => ({
-                    rowId: r[0] as RecordId,
-                    value: r[1]
-                }));
+                const colsData = columns.map(() => [] as { rowId: RecordId; value: CellValue }[]);
 
-                deletedColumnsData.push({
-                    name: col,
-                    type,
-                    data: colData
-                });
+                for (const r of rows) {
+                    const rowId = r[0] as RecordId;
+                    for (let i = 0; i < columns.length; i++) {
+                        colsData[i].push({ rowId, value: r[i + 1] });
+                    }
+                }
+
+                for (let i = 0; i < columns.length; i++) {
+                    deletedColumnsData.push({
+                        name: columns[i],
+                        type: colMap.get(columns[i]) || 'TEXT',
+                        data: colsData[i]
+                    });
+                }
             } else {
                 // Empty table or no results, still track the column definition
-                deletedColumnsData.push({
-                    name: col,
-                    type,
-                    data: []
-                });
+                for (const col of columns) {
+                    deletedColumnsData.push({
+                        name: col,
+                        type: colMap.get(col) || 'TEXT',
+                        data: []
+                    });
+                }
             }
         }
     } catch (e) {
