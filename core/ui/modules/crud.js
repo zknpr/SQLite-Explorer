@@ -7,7 +7,7 @@ import { updateStatus, updateToolbarButtons } from './ui.js';
 import { openModal, closeModal } from './modals.js';
 import { loadTableData, loadTableColumns } from './grid.js';
 import { refreshSchema } from './sidebar.js';
-import { escapeHtml, validateRowId, escapeIdentifier } from './utils.js';
+import { escapeHtml, validateRowId } from './utils.js';
 
 export function initCrud() {
     // --- Toolbar Buttons ---
