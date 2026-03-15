@@ -20,7 +20,7 @@ import type {
   ColumnMetadata,
   ColumnDefinition
 } from './types';
-import { escapeIdentifier, cellValueToSql, validateSqlType, validateRowId, validateRowIds } from './sql-utils';
+import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './sql-utils';
 import { buildSelectQuery, buildCountQuery } from './query-builder';
 import { applyMergePatch } from './json-utils';
 
