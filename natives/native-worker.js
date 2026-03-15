@@ -461,7 +461,6 @@ async function handleRequest(request) {
         const stmt = statements.get(stmtId);
         if (!stmt) throw new Error(`Statement ${stmtId} not found`);
         stmt.reset();
-        // if (params) stmt.bind(...params); // Simplified
         if (params && params.length > 0) {
             if (typeof stmt.bind === 'function') stmt.bind(...params);
         }
