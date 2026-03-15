@@ -565,10 +565,18 @@ class WasmDatabaseEngine implements DatabaseOperations {
       }
     }
 
-    // Now drop the columns
-    for (const col of columns) {
-      const sql = `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`;
-      await this.executeQuery(sql);
+    // Now drop the columns within a single transaction for better performance
+    // This avoids N+1 query transaction overhead for multiple columns
+    await this.executeQuery('BEGIN TRANSACTION');
+    try {
+      for (const col of columns) {
+        const sql = `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`;
+        await this.executeQuery(sql);
+      }
+      await this.executeQuery('COMMIT');
+    } catch (e) {
+      await this.executeQuery('ROLLBACK');
+      throw e;
     }
   }
 
