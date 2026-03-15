@@ -33,7 +33,7 @@ import type {
 
 import { Worker } from './platform/threadPool';
 import type { DatabaseConnectionBundle } from './connectionTypes';
-import { ConfigurationSection, getMaximumFileSizeBytes, getQueryTimeout } from './config';
+import { getMaximumFileSizeBytes, getQueryTimeout } from './config';
 
 // Native worker support (only in Node.js environment)
 let nativeSupport: {
