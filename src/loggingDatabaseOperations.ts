@@ -19,7 +19,7 @@ import type {
     ColumnMetadata,
     ColumnDefinition
 } from './core/types';
-import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
+import { escapeIdentifier } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 
 export class LoggingDatabaseOperations implements DatabaseOperations {
