@@ -55,6 +55,16 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return String(value);
     }
 
+    private async logAndDelegate<T extends keyof DatabaseOperations>(
+        message: string,
+        isWrite: boolean,
+        method: T,
+        ...args: Parameters<DatabaseOperations[T]>
+    ): Promise<ReturnType<DatabaseOperations[T]>> {
+        this.log(message, isWrite);
+        return (this.wrapped[method] as any)(...args);
+    }
+
     private log(message: string, isWrite: boolean = false) {
         const timestamp = new Date().toISOString().split('T')[1].slice(0, -1);
         const type = isWrite ? '[WRITE]' : '[read] ';
@@ -91,33 +101,27 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
     }
 
     async serializeDatabase(name: string): Promise<Uint8Array> {
-        this.log(`Exporting database: ${name}`);
-        return this.wrapped.serializeDatabase(name);
+        return this.logAndDelegate(`Exporting database: ${name}`, false, 'serializeDatabase', name);
     }
 
     async applyModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void> {
-        this.log(`Applying ${mods.length} modifications`, true);
-        return this.wrapped.applyModifications(mods, signal);
+        return this.logAndDelegate(`Applying ${mods.length} modifications`, true, 'applyModifications', mods, signal);
     }
 
     async undoModification(mod: ModificationEntry): Promise<void> {
-        this.log(`Undo: ${mod.description}`, true);
-        return this.wrapped.undoModification(mod);
+        return this.logAndDelegate(`Undo: ${mod.description}`, true, 'undoModification', mod);
     }
 
     async redoModification(mod: ModificationEntry): Promise<void> {
-        this.log(`Redo: ${mod.description}`, true);
-        return this.wrapped.redoModification(mod);
+        return this.logAndDelegate(`Redo: ${mod.description}`, true, 'redoModification', mod);
     }
 
     async flushChanges(signal?: AbortSignal): Promise<void> {
-        this.log('Flushing changes', true);
-        return this.wrapped.flushChanges(signal);
+        return this.logAndDelegate('Flushing changes', true, 'flushChanges', signal);
     }
 
     async discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void> {
-        this.log(`Discarding ${mods.length} modifications`, true);
-        return this.wrapped.discardModifications(mods, signal);
+        return this.logAndDelegate(`Discarding ${mods.length} modifications`, true, 'discardModifications', mods, signal);
     }
 
     async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<void> {
@@ -206,23 +210,19 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
     }
 
     async fetchSchema(): Promise<SchemaSnapshot> {
-        this.log(`Fetching schema`, false);
-        return this.wrapped.fetchSchema();
+        return this.logAndDelegate(`Fetching schema`, false, 'fetchSchema');
     }
 
     async getTableInfo(table: string): Promise<ColumnMetadata[]> {
-        this.log(`PRAGMA table_info(${escapeIdentifier(table)})`, false);
-        return this.wrapped.getTableInfo(table);
+        return this.logAndDelegate(`PRAGMA table_info(${escapeIdentifier(table)})`, false, 'getTableInfo', table);
     }
 
     async getPragmas(): Promise<Record<string, CellValue>> {
-        this.log('Fetching PRAGMAs', false);
-        return this.wrapped.getPragmas();
+        return this.logAndDelegate('Fetching PRAGMAs', false, 'getPragmas');
     }
 
     async setPragma(pragma: string, value: CellValue): Promise<void> {
-        this.log(`PRAGMA ${pragma} = ${this.sanitizeValue(value)}`, true);
-        return this.wrapped.setPragma(pragma, value);
+        return this.logAndDelegate(`PRAGMA ${pragma} = ${this.sanitizeValue(value)}`, true, 'setPragma', pragma, value);
     }
 
     async ping(): Promise<boolean> {
@@ -230,7 +230,6 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
     }
 
     async writeToFile(path: string): Promise<void> {
-        this.log(`Writing to file: ${path}`, true);
-        return this.wrapped.writeToFile(path);
+        return this.logAndDelegate(`Writing to file: ${path}`, true, 'writeToFile', path);
     }
 }
