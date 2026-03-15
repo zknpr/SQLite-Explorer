@@ -2,8 +2,10 @@
 import './vscode_mock_setup'; // Must be first
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { exportToJson, exportToCsv, exportToSql } from '../../src/tableExporter';
+import { exportToJson, exportToCsv, exportToSql, exportTableCommand } from '../../src/tableExporter';
 import { CellValue } from '../../src/core/types';
+import { mockVscode } from './mocks/vscode';
+import { DocumentRegistry } from '../../src/documentRegistry';
 
 describe('exportToJson', () => {
     it('should export basic types correctly', () => {
@@ -126,5 +128,85 @@ describe('exportToSql', () => {
 
         const sql = exportToSql('t', columns, rows);
         assert.strictEqual(sql, '');
+    });
+});
+
+describe('exportTableCommand Fallback', () => {
+    it('should use fallback memory export if stream write fails', async () => {
+        const docUri = mockVscode.Uri.parse('vscode-sqlite://test.db');
+        const uri = mockVscode.Uri.file('/test/export.csv');
+
+        mockVscode.window.showSaveDialog = async () => uri;
+
+        let fileWritten = false;
+        mockVscode.workspace.fs.writeFile = async () => {
+            fileWritten = true;
+        };
+
+        // Ensure stream fails without attempting to open file to prevent ENOENT.
+        // `getNodeFs()` returns `undefined` inside tests (mocked environment).
+        // Since `getNodeFs()` is used if it's a file, we can bypass fs entirely
+        // and force the `try...catch` fallback simply by letting `fs.createWriteStream` fail,
+        // or by making `fs` unavailable. However, in our test `getNodeFs()` will resolve to the real `fs`.
+        // To avoid an `ENOENT` on `fs.createWriteStream`, we mock `fs` directly or just throw error earlier.
+
+        const executeQueryCalls: string[] = [];
+        const dbOperations = {
+            executeQuery: async (sql: string) => {
+                executeQueryCalls.push(sql);
+
+                // For the fallback non-paginated query, return dummy data
+                return [{
+                    headers: ['id', 'name'],
+                    rows: [[1, 'Alice'], [2, 'Bob']],
+                    columns: ['id', 'name'],
+                    values: [[1, 'Alice'], [2, 'Bob']]
+                }];
+            }
+        };
+
+        const doc = {
+            uri: docUri,
+            databaseOperations: dbOperations
+        };
+        DocumentRegistry.set('test', doc as any);
+
+        const fs = require('fs');
+        const originalCreateWriteStream = fs.createWriteStream;
+
+        const originalConsoleWarn = console.warn;
+        let warnCalled = false;
+        try {
+            fs.createWriteStream = () => {
+                throw new Error('Simulated stream failure');
+            };
+
+            console.warn = (msg, e) => {
+                if (msg === 'Native stream write failed, falling back to memory') {
+                    warnCalled = true;
+                }
+            };
+
+            await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'test_table', uri: 'vscode-sqlite://test.db' },
+                ['id', 'name'],
+                undefined,
+                undefined,
+                { format: 'csv' }
+            );
+
+            assert.strictEqual(warnCalled, true, 'Should have logged fallback warning');
+            assert.strictEqual(fileWritten, true, 'Should have written file using fallback workspace.fs');
+
+            const expectedQuery = 'SELECT "id", "name" FROM "test_table"';
+            assert.ok(executeQueryCalls.includes(expectedQuery), `Expected query to be executed: ${expectedQuery}`);
+
+        } finally {
+            fs.createWriteStream = originalCreateWriteStream;
+            console.warn = originalConsoleWarn;
+            DocumentRegistry.delete('test');
+        }
     });
 });
