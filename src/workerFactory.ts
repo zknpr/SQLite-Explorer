@@ -14,7 +14,7 @@ import type { TelemetryReporter } from '@vscode/extension-telemetry';
 import * as vsc from 'vscode';
 import path from 'path';
 
-import { connectWorkerPort, buildMethodProxy, Transfer } from './core/rpc';
+import { connectWorkerPort, Transfer } from './core/rpc';
 import { GlobalOutputChannel } from './main';
 import type {
   CellValue,
