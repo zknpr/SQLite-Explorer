@@ -50,11 +50,6 @@ describe('HostBridge', () => {
         // The mock implementation returns a simple object with toString().
         // We verify the path property.
 
-        // HostBridge constructs path:
-        // const uriPath = [docKey, ...cellParts].map(p => encodeURIComponent(p)).join('/');
-        // cellParts = [table, name, rowId, filename]
-        // filename = colName + extname
-
         assert.ok(uri.path.endsWith('avatar.png'), `Path should end with avatar.png, got ${uri.path}`);
         assert.ok(uri.path.includes('users'));
         assert.ok(uri.path.includes('1'));
