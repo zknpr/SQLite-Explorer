@@ -49,6 +49,15 @@ describe('JSON Merge Patch (RFC 7396)', () => {
                 d: null
             });
         });
+
+        it('should throw an error when depth limit is exceeded', () => {
+            try {
+                generateMergePatch({ a: 1 }, { a: 2 }, 1001);
+                assert.fail('Should have thrown depth limit error');
+            } catch (e: any) {
+                assert.match(e.message, /JSON merge patch depth limit exceeded/);
+            }
+        });
     });
 
     describe('applyMergePatch', () => {
