@@ -67,7 +67,7 @@ export function generateMergePatch(original: any, modified: any, depth = 0): any
  * @param patch - The patch to apply
  * @returns The modified object (new instance or mutated)
  */
-export function applyMergePatch(target: any, patch: any, depth = 0): any {
+export function applyMergePatch(target: unknown, patch: unknown, depth = 0): unknown {
     if (depth > MAX_DEPTH) {
         throw new Error('JSON apply merge patch depth limit exceeded');
     }
@@ -83,25 +83,29 @@ export function applyMergePatch(target: any, patch: any, depth = 0): any {
         return patch;
     }
 
+    let resultTarget: Record<string, unknown>;
+
     if (typeof target !== 'object' || target === null || Array.isArray(target)) {
         // If target is not an object (or is null/array), it is treated as empty object for patching.
-        target = {};
+        resultTarget = {};
     } else {
         // Clone target to avoid mutation if we want immutability,
         // Clone shallowly for safety.
-        target = { ...target };
+        resultTarget = { ...(target as Record<string, unknown>) };
     }
 
-    for (const key of Object.keys(patch)) {
-        const val = patch[key];
+    const patchObj = patch as Record<string, unknown>;
+
+    for (const key of Object.keys(patchObj)) {
+        const val = patchObj[key];
         if (val === null) {
-            delete target[key];
+            delete resultTarget[key];
         } else {
-            target[key] = applyMergePatch(target[key], val, depth + 1);
+            resultTarget[key] = applyMergePatch(resultTarget[key], val, depth + 1);
         }
     }
 
-    return target;
+    return resultTarget;
 }
 
 function isObject(val: any): boolean {
