@@ -136,5 +136,10 @@ export const mockVscode = {
         Dark: 2,
         HighContrast: 3,
         HighContrastLight: 4
+    },
+    extensions: {
+        getExtension: (extensionId: string) => {
+            return undefined;
+        }
     }
 };

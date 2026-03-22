@@ -261,7 +261,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     // Build environment data for webview
     const vscodeEnv = {
       webviewId,
-      browserExt: toBoolString(!!import.meta.env.VSCODE_BROWSER_EXT),
+      browserExt: toBoolString(!!import.meta.env?.VSCODE_BROWSER_EXT),
       uriScheme, appHost, appName, extensionUrl,
       accessToken: this.accessToken,
       uiKind: uiKindToString(uiKind),
@@ -381,7 +381,7 @@ export function registerEditorProvider(
   outputChannel: vsc.OutputChannel | null,
   { verified, accessToken, readOnly }: { verified: boolean, accessToken?: string, readOnly?: boolean }
 ) {
-  const enableReadWrite = !import.meta.env.VSCODE_BROWSER_EXT && verified && SupportsWriteMode;
+  const enableReadWrite = !import.meta.env?.VSCODE_BROWSER_EXT && verified && SupportsWriteMode && !readOnly;
   const Provider = enableReadWrite ? DatabaseEditorProvider : DatabaseViewerProvider;
   return vsc.window.registerCustomEditorProvider(
     viewType,
