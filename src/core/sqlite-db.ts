@@ -491,9 +491,46 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
     await this.executeQuery('BEGIN TRANSACTION');
     try {
+      const escapedTable = escapeIdentifier(table);
+
+      // Group rows by their exact column structure to reuse prepared statements
+      const rowsByColSet = new Map<string, { cols: string[], data: CellValue[][] }>();
+
       for (const row of rows) {
-        await this.insertRow(table, row);
+        const columns = Object.keys(row).sort();
+        const colKey = columns.join(',');
+
+        if (!rowsByColSet.has(colKey)) {
+          rowsByColSet.set(colKey, { cols: columns, data: [] });
+        }
+
+        const group = rowsByColSet.get(colKey)!;
+        const rowData = group.cols.map(col => row[col]);
+        group.data.push(rowData);
       }
+
+      for (const group of rowsByColSet.values()) {
+        const { cols, data } = group;
+
+        let sql: string;
+        if (cols.length === 0) {
+          sql = `INSERT INTO ${escapedTable} DEFAULT VALUES`;
+        } else {
+          const colNames = cols.map(escapeIdentifier).join(', ');
+          const placeholders = cols.map(() => '?').join(', ');
+          sql = `INSERT INTO ${escapedTable} (${colNames}) VALUES (${placeholders})`;
+        }
+
+        const stmt = this.instance.prepare(sql);
+        try {
+          for (const rowData of data) {
+            stmt.run(cols.length === 0 ? [] : (rowData as unknown[]));
+          }
+        } finally {
+          stmt.free();
+        }
+      }
+
       await this.executeQuery('COMMIT');
     } catch (e) {
       await this.executeQuery('ROLLBACK');
