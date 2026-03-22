@@ -298,17 +298,21 @@ class WasmDatabaseEngine implements DatabaseOperations {
       try {
         for (const col of deletedColumns) {
           await this.addColumn(targetTable, col.name, col.type);
-          // Restore values
+        }
 
-          const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`;
-          const stmt = this.instance.prepare(sql);
-          try {
-            for (const { rowId, value } of col.data) {
-              stmt.run([value, Number(rowId)]);
-            }
-          } finally {
-            stmt.free();
+        const updates: CellUpdate[] = [];
+        for (const col of deletedColumns) {
+          for (const { rowId, value } of col.data) {
+            updates.push({
+              rowId,
+              column: col.name,
+              value
+            });
           }
+        }
+
+        if (updates.length > 0) {
+          await this.updateCellBatch(targetTable, updates);
         }
         await this.executeQuery('COMMIT');
       } catch (e) {
@@ -639,8 +643,10 @@ class WasmDatabaseEngine implements DatabaseOperations {
   async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
     if (updates.length === 0) return;
 
-    // Use transaction for performance and atomicity
-    await this.executeQuery('BEGIN TRANSACTION');
+    // Use SAVEPOINT instead of BEGIN TRANSACTION to allow safe nesting
+    // within other transactions (e.g., undoColumnDrop).
+    const savepointName = 'batch_update_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const escapedTable = escapeIdentifier(table);
       // Group updates by column and operation type
@@ -724,9 +730,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
           }
       }
 
-      await this.executeQuery('COMMIT');
+      await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (err) {
-      try { await this.executeQuery('ROLLBACK'); } catch {}
+      try {
+        await this.executeQuery(`ROLLBACK TO ${savepointName}`);
+        await this.executeQuery(`RELEASE ${savepointName}`);
+      } catch {}
       throw err;
     }
   }
