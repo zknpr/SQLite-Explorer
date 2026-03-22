@@ -873,10 +873,22 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
     const result: Record<string, CellValue> = {};
 
-    for (const pragma of pragmasToFetch) {
-      const res = await this.executeQuery(`PRAGMA ${pragma}`);
-      if (res[0]?.rows?.[0]) {
-        result[pragma] = res[0].rows[0][0];
+    // Batch all PRAGMA queries into a single string to avoid N+1 queries.
+    // We use explicit SELECT markers before each PRAGMA to guarantee we can safely map
+    // the results back, even if a PRAGMA returns an empty result set, multiple columns,
+    // or an unexpected column name.
+    const combinedQuery = pragmasToFetch.map(p => `SELECT 'marker_${p}' AS pragma_marker; PRAGMA ${p};`).join('\n');
+    const res = await this.executeQuery(combinedQuery);
+
+    let currentPragma = '';
+    for (const resultSet of res) {
+      if (resultSet.columns[0] === 'pragma_marker' && resultSet.rows?.[0]) {
+        // We found a marker, the next result (if any) belongs to this PRAGMA
+        currentPragma = (resultSet.rows[0][0] as string).replace('marker_', '');
+      } else if (currentPragma && resultSet.rows?.[0]) {
+        // We found the actual PRAGMA result following a marker
+        result[currentPragma] = resultSet.rows[0][0];
+        currentPragma = ''; // Reset to prevent mapping subsequent unexpected results to the same key
       }
     }
 
