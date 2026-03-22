@@ -268,17 +268,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
     const { deletedRows } = mod;
     // Undo delete = re-insert rows
     if (deletedRows && deletedRows.length > 0) {
-      await this.executeQuery('BEGIN TRANSACTION');
-      try {
-        for (const { rowId, row } of deletedRows) {
-          // row already contains rowid if needed (handled in HostBridge)
-          await this.insertRow(targetTable, row);
-        }
-        await this.executeQuery('COMMIT');
-      } catch (e) {
-        await this.executeQuery('ROLLBACK');
-        throw e;
-      }
+      await this.insertRowBatch(targetTable, deletedRows.map(dr => dr.row));
     }
   }
 
