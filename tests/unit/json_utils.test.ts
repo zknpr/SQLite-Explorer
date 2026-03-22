@@ -52,6 +52,13 @@ describe('JSON Merge Patch (RFC 7396)', () => {
     });
 
     describe('applyMergePatch', () => {
+        it('should return null if patch is null at root level', () => {
+            const target = { a: 1 };
+            const patch = null;
+            const result = applyMergePatch(target, patch);
+            assert.strictEqual(result, null);
+        });
+
         it('should modify property', () => {
             const target = { a: 1, b: 2 };
             const patch = { a: 3 };
