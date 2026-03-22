@@ -104,6 +104,6 @@ export function applyMergePatch(target: any, patch: any, depth = 0): any {
     return target;
 }
 
-function isObject(val: any): boolean {
+function isObject(val: unknown): boolean {
     return val !== null && typeof val === 'object';
 }
