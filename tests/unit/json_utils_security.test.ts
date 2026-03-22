@@ -3,8 +3,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { generateMergePatch, applyMergePatch } from '../../src/core/json-utils';
 
-function createDeepObject(depth: number, leafValue: any = 1) {
-    let obj: any = { leaf: leafValue };
+function createDeepObject(depth: number, leafValue: unknown = 1) {
+    let obj: Record<string, unknown> = { leaf: leafValue };
     for (let i = 0; i < depth; i++) {
         obj = { next: obj };
     }
@@ -35,8 +35,12 @@ describe('JSON Merge Patch Security', () => {
         try {
             generateMergePatch(original, modified);
             assert.fail('Should have thrown depth limit error');
-        } catch (e: any) {
-            assert.match(e.message, /JSON merge patch depth limit exceeded/);
+        } catch (e: unknown) {
+            if (e instanceof Error) {
+                assert.match(e.message, /JSON merge patch depth limit exceeded/);
+            } else {
+                throw e;
+            }
         }
     });
 
@@ -57,22 +61,30 @@ describe('JSON Merge Patch Security', () => {
         try {
             applyMergePatch(target, patch);
             assert.fail('Should have thrown depth limit error');
-        } catch (e: any) {
-            assert.match(e.message, /JSON apply merge patch depth limit exceeded/);
+        } catch (e: unknown) {
+            if (e instanceof Error) {
+                assert.match(e.message, /JSON apply merge patch depth limit exceeded/);
+            } else {
+                throw e;
+            }
         }
     });
 
     it('should handle cyclic references by depth limit', () => {
-         const original: any = { a: 1 };
+         const original: Record<string, unknown> = { a: 1 };
          original.self = original;
-         const modified: any = { a: 2 };
+         const modified: Record<string, unknown> = { a: 2 };
          modified.self = modified;
 
          try {
              generateMergePatch(original, modified);
              assert.fail('Should have thrown depth limit error');
-         } catch (e: any) {
-             assert.match(e.message, /JSON merge patch depth limit exceeded/);
+         } catch (e: unknown) {
+             if (e instanceof Error) {
+                 assert.match(e.message, /JSON merge patch depth limit exceeded/);
+             } else {
+                 throw e;
+             }
          }
     });
 });
