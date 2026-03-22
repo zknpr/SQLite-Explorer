@@ -112,7 +112,7 @@ export async function createDatabaseConnection(
     const extensionPath = extensionUri.fsPath;
     if (await nativeSupport.isNativeAvailable(extensionPath)) {
       try {
-        console.log('[SQLite Explorer] Using native SQLite backend');
+        if (GlobalOutputChannel) GlobalOutputChannel.appendLine('[SQLite Explorer] Using native SQLite backend');
         const nativeBundle = await nativeSupport.createNativeDatabaseConnection(extensionUri, _reporter);
 
         // Wrap the native bundle to provide fallback to WASM if file open fails
@@ -144,7 +144,7 @@ export async function createDatabaseConnection(
   }
 
   // Fall back to WASM (sql.js)
-  console.log('[SQLite Explorer] Using WebAssembly SQLite backend');
+  if (GlobalOutputChannel) GlobalOutputChannel.appendLine('[SQLite Explorer] Using WebAssembly SQLite backend');
   return createWasmDatabaseConnection(extensionUri, _reporter);
 }
 
