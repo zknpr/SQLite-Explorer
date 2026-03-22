@@ -176,7 +176,11 @@ class WasmDatabaseEngine implements DatabaseOperations {
     } catch (err) {
       // Ensure current statement is freed if iteration was interrupted
       if (currentStmt) {
-        try { currentStmt.free(); } catch { /* ignore free errors */ }
+        try {
+          currentStmt.free();
+        } catch (freeErr) {
+          console.warn('Failed to free statement on error:', freeErr);
+        }
       }
       const errorDetail = err instanceof Error ? err.message : String(err);
       throw new Error(`Query failed: ${errorDetail}`);
