@@ -16,7 +16,7 @@
 /**
  * Unique identifier for tracking message exchanges.
  */
-type MessageCorrelationId = string;
+export type MessageCorrelationId = string;
 
 /**
  * Outgoing invocation request.
@@ -73,7 +73,7 @@ function generateCorrelationId(): MessageCorrelationId {
 /**
  * Pending invocations awaiting responses.
  */
-interface PendingInvocation {
+export interface PendingInvocation {
   readonly onComplete: (value: unknown) => void;
   readonly onFault: (error: Error) => void;
   readonly expirationTimer: ReturnType<typeof setTimeout>;
@@ -101,6 +101,13 @@ export class Transfer<T> {
 type MessageDispatcher = (envelope: ProtocolEnvelope, transfer?: Transferable[]) => void;
 
 /**
+ * A proxy object that includes the pending invocations map for response routing.
+ */
+export type ProxyWithPendingInvocations<T> = T & {
+  __pendingInvocations: Map<MessageCorrelationId, PendingInvocation>;
+};
+
+/**
  * Build a proxy object that forwards method calls to a remote context.
  *
  * Each method on the proxy returns a Promise that resolves when the
@@ -115,7 +122,7 @@ export function buildMethodProxy<T extends object>(
   dispatcher: MessageDispatcher,
   methodNames: string[],
   timeoutMs: number = INVOCATION_TIMEOUT_MS
-): T {
+): ProxyWithPendingInvocations<T> {
   // Each proxy gets its own isolated pending invocations map to prevent
   // cross-connection correlation ID collisions when multiple workers are active.
   const pendingInvocations = new Map<MessageCorrelationId, PendingInvocation>();
@@ -194,7 +201,7 @@ export function buildMethodProxy<T extends object>(
     writable: false
   });
 
-  return proxyObject as T;
+  return proxyObject as ProxyWithPendingInvocations<T>;
 }
 
 // ============================================================================
@@ -375,7 +382,7 @@ export function connectWorkerPort<T extends object>(
 
   // Extract the per-proxy pending invocations map so response messages are routed
   // to the correct proxy instance (each worker gets its own isolated map).
-  const proxyPending = (proxy as any).__pendingInvocations as Map<MessageCorrelationId, PendingInvocation>;
+  const proxyPending = proxy.__pendingInvocations;
 
   port.on('message', (data) => {
     processProtocolMessage(data, undefined, undefined, onLog, proxyPending);
