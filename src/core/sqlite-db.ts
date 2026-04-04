@@ -905,7 +905,10 @@ class WasmDatabaseEngine implements DatabaseOperations {
     // Value sanitization depends on type
     let sql: string;
     if (typeof value === 'string') {
-        sql = `PRAGMA ${pragma} = '${value.replace(/'/g, "''")}'`;
+        if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
+            throw new Error(`Invalid PRAGMA value format: ${value}`);
+        }
+        sql = `PRAGMA ${pragma} = '${value}'`;
     } else if (typeof value === 'number') {
         sql = `PRAGMA ${pragma} = ${value}`;
     } else if (typeof value === 'boolean') {

@@ -128,6 +128,40 @@ describe('WasmDatabaseEngine', () => {
     });
   });
 
+  describe('setPragma', () => {
+    it('should set a valid pragma with a string value', async () => {
+      // journal_mode accepts OFF, DELETE, TRUNCATE, PERSIST, MEMORY, WAL
+      await engine.setPragma('journal_mode', 'MEMORY');
+      const pragmas = await engine.getPragmas();
+      assert.strictEqual(pragmas.journal_mode.toLowerCase(), 'memory');
+    });
+
+    it('should set a valid pragma with a numeric value', async () => {
+      // cache_size accepts numeric values
+      await engine.setPragma('cache_size', 2000);
+      const pragmas = await engine.getPragmas();
+      assert.strictEqual(pragmas.cache_size, 2000);
+    });
+
+    it('should throw an error for disallowed pragmas', async () => {
+      try {
+        await engine.setPragma('malicious_pragma', 'value');
+        assert.fail('Should have thrown an error for disallowed PRAGMA');
+      } catch (err: unknown) {
+        assert.match((err as Error).message, /Invalid or disallowed PRAGMA/);
+      }
+    });
+
+    it('should prevent SQL injection by validating string formats', async () => {
+      try {
+        await engine.setPragma('journal_mode', "OFF'; DROP TABLE users; --");
+        assert.fail('Should have thrown an error for invalid PRAGMA value format');
+      } catch (err: unknown) {
+        assert.match((err as Error).message, /Invalid PRAGMA value format/);
+      }
+    });
+  });
+
   describe('executeQuery', () => {
     it('should timeout long running queries', async () => {
       // Create a specific engine instance with a short timeout
