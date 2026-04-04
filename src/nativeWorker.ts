@@ -1083,28 +1083,38 @@ export async function createNativeDatabaseConnection(
         updateCellBatch: async (table: string, updates: CellUpdate[]) => {
           if (updates.length === 0) return;
 
-          const batchItems: { sql: string; params: CellValue[] }[] = [];
+          const batchItems: { sql: string; paramsList?: CellValue[][], params?: CellValue[] }[] = [];
           const escapedTable = escapeIdentifier(table);
 
+          const updatesByColumn = new Map<string, CellUpdate[]>();
           for (const update of updates) {
-            // Validate rowId is a number
-            const rowIdNum = validateRowId(update.rowId);
+            const key = `${update.column}|${update.operation || 'set'}`;
+            if (!updatesByColumn.has(key)) {
+                updatesByColumn.set(key, []);
+            }
+            updatesByColumn.get(key)!.push(update);
+          }
 
-            const escapedColumn = escapeIdentifier(update.column);
+          for (const [key, columnUpdates] of updatesByColumn.entries()) {
+            const column = columnUpdates[0].column;
+            const op = columnUpdates[0].operation || 'set';
+            const escapedColumn = escapeIdentifier(column);
             let sql: string;
-            let params: CellValue[];
 
-            if (update.operation === 'json_patch') {
+            if (op === 'json_patch') {
               // json_patch(col, patch)
               sql = `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(${escapedColumn}, ?) WHERE rowid = ?`;
-              params = [update.value, rowIdNum];
             } else {
               // Standard set
               sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
-              params = [update.value, rowIdNum];
             }
 
-            batchItems.push({ sql, params });
+            const paramsList = columnUpdates.map(update => {
+                const rowIdNum = validateRowId(update.rowId);
+                return [update.value, rowIdNum];
+            });
+
+            batchItems.push({ sql, paramsList });
           }
 
           if (batchItems.length > 0) {
