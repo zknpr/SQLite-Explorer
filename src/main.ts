@@ -66,22 +66,11 @@ export async function activate(context: vsc.ExtensionContext) {
   }
 }
 
-const globalProviderSubs = new WeakSet<vsc.Disposable>();
-
 /**
  * Activate the custom editor providers for SQLite files.
  * Creates both the default view and optional view providers.
  */
 export async function activateProviders(context: vsc.ExtensionContext, reporter?: TelemetryReporter) {
-  // Clean up previous providers — collect indices in reverse to avoid shift issues during splice
-  const prevSubs = context.subscriptions.filter(x => globalProviderSubs.has(x));
-  for (let i = context.subscriptions.length - 1; i >= 0; i--) {
-    if (globalProviderSubs.has(context.subscriptions[i])) {
-      context.subscriptions.splice(i, 1);
-    }
-  }
-  disposeAll(prevSubs);
-
   const subs = [];
 
   // Create output channel for SQL logging
@@ -97,7 +86,6 @@ export async function activateProviders(context: vsc.ExtensionContext, reporter?
   // Register optional provider (can be selected from "Open With" menu)
   subs.push(registerEditorProvider(`${ExtensionId}.option`, context, reporter, channel, { verified: true }));
 
-  for (const sub of subs) globalProviderSubs.add(sub);
   context.subscriptions.push(...subs);
 }
 
