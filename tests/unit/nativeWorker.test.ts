@@ -13,18 +13,18 @@ describe('isNativeAvailable', () => {
     beforeEach(() => {
         originalPlatform = process.platform;
         originalArch = process.arch;
-        vscode.env.uiKind = 2; // Desktop
+        Object.defineProperty(vscode.env, 'uiKind', { value: 2, writable: true, configurable: true }); // Desktop
     });
 
     afterEach(() => {
         Object.defineProperty(process, 'platform', { value: originalPlatform });
         Object.defineProperty(process, 'arch', { value: originalArch });
-        vscode.env.uiKind = 2; // Desktop
+        Object.defineProperty(vscode.env, 'uiKind', { value: 2, writable: true, configurable: true }); // Desktop
         mock.restoreAll();
     });
 
     it('should return false when UI kind is web', async () => {
-        vscode.env.uiKind = 1; // Web
+        Object.defineProperty(vscode.env, 'uiKind', { value: 1, writable: true, configurable: true }); // Web
 
         const result = await isNativeAvailable('/ext/path');
         assert.strictEqual(result, false);

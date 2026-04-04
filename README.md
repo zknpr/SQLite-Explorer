@@ -180,7 +180,7 @@ cd sqlite-explorer
 
 npm install          # Install dependencies
 node scripts/build.mjs   # Build extension + worker
-npm test             # Run 225 unit tests
+npm test             # Run 237 unit tests
 npm run package      # Package as .vsix
 ./install.sh         # Build + package + install to VS Code
 ```

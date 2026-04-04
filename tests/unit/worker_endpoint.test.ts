@@ -74,8 +74,8 @@ describe('Worker Endpoint', () => {
 
         // Create table and insert
         await endpoint.createTable('users', [
-            { name: 'id', type: 'INTEGER', primaryKey: true },
-            { name: 'name', type: 'TEXT' }
+            { name: 'id', type: 'INTEGER', primaryKey: true, notNull: false },
+            { name: 'name', type: 'TEXT', primaryKey: false, notNull: false }
         ]);
 
         await endpoint.insertRow('users', { id: 1, name: 'Alice' });
@@ -97,7 +97,7 @@ describe('Worker Endpoint', () => {
             wasmBinary
         });
 
-        await endpoint.createTable('test_table', [{ name: 'id', type: 'INTEGER' }]);
+        await endpoint.createTable('test_table', [{ name: 'id', type: 'INTEGER', primaryKey: false, notNull: false }]);
 
         // Initialize a new database, which should shutdown the previous one and create a clean state
         await endpoint.initializeDatabase('test2.db', {

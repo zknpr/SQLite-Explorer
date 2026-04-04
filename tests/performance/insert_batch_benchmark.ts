@@ -15,13 +15,19 @@ async function runBenchmark() {
 
     const { operations } = await createDatabaseEngine({
         content: null,
+        maxSize: 0,
         wasmBinary: wasmBinary,
     });
 
+    if (!operations) {
+        console.error("Failed to initialize database engine.");
+        process.exit(1);
+    }
+
     await operations.createTable('test_table', [
-        { name: 'id', type: 'INTEGER', primaryKey: true },
-        { name: 'name', type: 'TEXT' },
-        { name: 'value', type: 'INTEGER' }
+        { name: 'id', type: 'INTEGER', primaryKey: true, notNull: false },
+        { name: 'name', type: 'TEXT', primaryKey: false, notNull: false },
+        { name: 'value', type: 'INTEGER', primaryKey: false, notNull: false }
     ]);
 
     const numRows = 10000;

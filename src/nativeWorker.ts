@@ -377,7 +377,7 @@ export function mapRowsByName<T = Record<string, CellValue>>(result: NativeQuery
   const headerMap = new Map(headers.map((h, i) => [h, i]));
 
   return result.values.map((row) => {
-    const obj: any = {};
+    const obj: Record<string, CellValue> = {};
     for (const [targetProp, sourceCol] of Object.entries(mapping)) {
       const idx = headerMap.get(sourceCol);
       if (idx !== undefined) {
@@ -684,7 +684,9 @@ export async function createNativeDatabaseConnection(
           let params: CellValue[];
 
           if (patch) {
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(${escapeIdentifier(column)}, ?) WHERE rowid = ?`;
+            // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL,
+            // but expected behavior is to treat NULL as empty object (matching WASM path)
+            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(COALESCE(${escapeIdentifier(column)}, '{}'), ?) WHERE rowid = ?`;
             params = [patch, rowIdNum];
           } else {
             sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
@@ -1028,11 +1030,19 @@ export async function createNativeDatabaseConnection(
             throw new Error(`Invalid or disallowed PRAGMA: ${pragma}`);
           }
 
-          // Value sanitization depends on type
+          // Value sanitization depends on type.
+          // String values use a strict whitelist — only alphanumeric, underscores,
+          // and hyphens allowed (covers all valid PRAGMA string values).
           let sql: string;
           if (typeof value === 'string') {
-              sql = `PRAGMA ${pragma} = '${value.replace(/'/g, "''")}'`;
+              if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
+                throw new Error('Invalid PRAGMA string value: contains disallowed characters');
+              }
+              sql = `PRAGMA ${pragma} = '${value}'`;
           } else if (typeof value === 'number') {
+              if (!Number.isFinite(value)) {
+                throw new Error('Invalid PRAGMA numeric value: must be finite');
+              }
               sql = `PRAGMA ${pragma} = ${value}`;
           } else if (typeof value === 'boolean') {
               sql = `PRAGMA ${pragma} = ${value ? 'ON' : 'OFF'}`;

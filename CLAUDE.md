@@ -178,6 +178,7 @@ The host routes these to the VS Code "SQLite Explorer" output channel via `Globa
 - **Query Parameters**: Use prepared statements (`?` placeholders) for all values.
 - **Identifiers**: Always use `escapeIdentifier()` for table/column names.
 - **Schema Validation**: Use `validateSqlType()` for all user-provided SQL types in DDL.
+- **PRAGMA Values**: String values validated via `/^[a-zA-Z0-9_-]+$/` whitelist; numeric values checked with `Number.isFinite()`.
 
 ## Build System
 
@@ -318,6 +319,10 @@ The webview provides a UI to configure SQLite PRAGMAs (e.g., WAL mode, Foreign K
 
 `getNodeFs()` in `sqlite-db.ts` safely requires the Node.js `fs` module, returning `undefined` in browser environments. Used by `sqlite-db.ts` (file reading, writing) and `tableExporter.ts` (streaming export).
 
+### Transaction Safety
+
+`updateCellBatch` uses `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` instead of `BEGIN TRANSACTION` so it can be safely called from within outer transactions (e.g., `undoColumnDrop`). All transaction error handlers use the `safeRollback(context)` private helper which logs failures instead of throwing — preventing secondary rollback errors from masking the original error.
+
 ### JSON Patch Optimization
 
 `updateCell` and `updateCellBatch` in `sqlite-db.ts` probe for SQLite's `json_patch()` at engine construction time (`hasJsonPatch` flag). When available, uses `json_patch(COALESCE(col, '{}'), ?)` in a single UPDATE (no SELECT round-trip). Falls back to JS-side `applyMergePatch()` from `json-utils.ts` when JSON1 extension is unavailable.
@@ -361,10 +366,11 @@ Settings in `package.json` → `contributes.configuration`:
 - **Transfer for blobs**: Large binary data should use `Transfer` wrapper for zero-copy
 
 ### Testing
-- **VS Code mocks required**: Unit tests need `tests/mocks/vscode.ts` imported first
+- **VS Code mocks required**: Unit tests need `tests/unit/vscode_mock_setup.ts` imported first (path-mapped via `tsconfig.test.json`)
 - **JSON patch tests**: Test behavior (merged result) not implementation (SQL function)
-- **Test organization**: 30+ unit tests in `tests/unit/`, benchmarks in `tests/benchmarks/`, performance tests in `tests/performance/`
+- **Test organization**: 33 test files (237 tests) in `tests/unit/`, benchmarks in `tests/benchmarks/`, performance tests in `tests/performance/`
 - **Test runner**: Uses `tsx` with Node's built-in test runner (`npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts`)
+- **Readonly mock properties**: Use `Object.defineProperty(obj, prop, { value, writable: true, configurable: true })` for readonly VS Code API fields like `vscode.env.uiKind`
 
 ### Platform Polyfills
 - **`src/shims.ts` must be imported early**: Polyfills `Symbol.dispose`, `Symbol.asyncDispose`, `AbortSignal.throwIfAborted`, `Promise.withResolvers` for older VS Code runtimes that lack these APIs
@@ -398,7 +404,7 @@ CopilotChatId = 'github.copilot-chat'
 
 ### Logging
 
-- Extension Host: `console.log()` appears in VS Code Developer Tools
+- Extension Host: Use `GlobalOutputChannel?.appendLine()` (not `console.log`). Output appears in "SQLite Explorer" output channel.
 - Worker: Logs route via RPC `LogEnvelope` to "SQLite Explorer" output channel (View → Output → SQLite Explorer)
 - Webview: Use browser DevTools (Cmd+Shift+P → "Developer: Open Webview Developer Tools")
 
@@ -414,3 +420,4 @@ CopilotChatId = 'github.copilot-chat'
 - **sql.js**: WebAssembly SQLite implementation (MIT license)
 - **@vscode/codicons**: VS Code icon font
 - **esbuild**: Fast bundler for extension and worker
+- **TypeScript**: 6.0.2 (requires `"types": ["node"]` in tsconfig.json)

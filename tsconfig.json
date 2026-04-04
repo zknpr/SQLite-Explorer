@@ -9,7 +9,8 @@
 		"strict": true,
 		"rootDir": ".",
 		"noEmit": true,
-		"allowImportingTsExtensions": true
+		"allowImportingTsExtensions": true,
+		"types": ["node"]
 	},
 	"exclude": ["website", "node_modules"],
 }

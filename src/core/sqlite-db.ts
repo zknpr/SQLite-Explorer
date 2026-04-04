@@ -116,6 +116,19 @@ class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /**
+   * Attempt a ROLLBACK and log failures instead of throwing.
+   * Used in catch blocks where the original error should propagate,
+   * not a secondary rollback failure.
+   */
+  private async safeRollback(context: string): Promise<void> {
+    try {
+      await this.executeQuery('ROLLBACK');
+    } catch (rollbackErr) {
+      console.warn(`Failed to rollback (${context}):`, rollbackErr);
+    }
+  }
+
+  /**
    * Execute a SQL query and return structured results.
    *
    * Returns results in sql.js compatible format for webview compatibility.
@@ -306,7 +319,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
         }
         await this.executeQuery('COMMIT');
       } catch (e) {
-        await this.executeQuery('ROLLBACK');
+        await this.safeRollback('undoColumnDrop');
         throw e;
       }
     }
@@ -527,7 +540,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
       await this.executeQuery('COMMIT');
     } catch (e) {
-      await this.executeQuery('ROLLBACK');
+      await this.safeRollback('insertRowBatch');
       throw e;
     }
   }
@@ -626,7 +639,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
       }
       await this.executeQuery('COMMIT');
     } catch (e) {
-      await this.executeQuery('ROLLBACK');
+      await this.safeRollback('deleteColumns');
       throw e;
     }
   }
@@ -670,8 +683,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
   async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
     if (updates.length === 0) return;
 
-    // Use transaction for performance and atomicity
-    await this.executeQuery('BEGIN TRANSACTION');
+    // Use SAVEPOINT instead of BEGIN TRANSACTION so this method can be called
+    // safely from within an outer transaction (e.g., undoColumnDrop).
+    // escapeIdentifier wraps in double quotes defensively — the generated name
+    // is already [a-zA-Z0-9_] safe, but quoting prevents issues if the pattern changes.
+    const savepointName = escapeIdentifier(`sp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const escapedTable = escapeIdentifier(table);
       // Group updates by column and operation type
@@ -755,10 +772,14 @@ class WasmDatabaseEngine implements DatabaseOperations {
           }
       }
 
-      await this.executeQuery('COMMIT');
+      await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (err) {
-      try { await this.executeQuery('ROLLBACK'); } catch (rollbackErr) {
-        console.warn('Failed to rollback transaction:', rollbackErr);
+      try {
+        // ROLLBACK TO restores but keeps the savepoint; RELEASE removes it
+        await this.executeQuery(`ROLLBACK TO ${savepointName}`);
+        await this.executeQuery(`RELEASE ${savepointName}`);
+      } catch (rollbackErr) {
+        console.warn('Failed to rollback savepoint:', rollbackErr);
       }
       throw err;
     }
@@ -935,11 +956,20 @@ class WasmDatabaseEngine implements DatabaseOperations {
       throw new Error(`Invalid or disallowed PRAGMA: ${pragma}`);
     }
 
-    // Value sanitization depends on type
+    // Value sanitization depends on type.
+    // String values use a strict whitelist to prevent injection — only
+    // alphanumeric, underscores, and hyphens are allowed (covers all
+    // valid PRAGMA string values like 'wal', 'delete', 'normal', etc.)
     let sql: string;
     if (typeof value === 'string') {
-        sql = `PRAGMA ${pragma} = '${value.replace(/'/g, "''")}'`;
+        if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
+          throw new Error('Invalid PRAGMA string value: contains disallowed characters');
+        }
+        sql = `PRAGMA ${pragma} = '${value}'`;
     } else if (typeof value === 'number') {
+        if (!Number.isFinite(value)) {
+          throw new Error('Invalid PRAGMA numeric value: must be finite');
+        }
         sql = `PRAGMA ${pragma} = ${value}`;
     } else if (typeof value === 'boolean') {
         sql = `PRAGMA ${pragma} = ${value ? 'ON' : 'OFF'}`;

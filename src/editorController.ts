@@ -381,7 +381,7 @@ export function registerEditorProvider(
   outputChannel: vsc.OutputChannel | null,
   { verified, accessToken, readOnly }: { verified: boolean, accessToken?: string, readOnly?: boolean }
 ) {
-  const enableReadWrite = !import.meta.env.VSCODE_BROWSER_EXT && verified && SupportsWriteMode;
+  const enableReadWrite = !import.meta.env.VSCODE_BROWSER_EXT && verified && !readOnly && SupportsWriteMode;
   const Provider = enableReadWrite ? DatabaseEditorProvider : DatabaseViewerProvider;
   return vsc.window.registerCustomEditorProvider(
     viewType,

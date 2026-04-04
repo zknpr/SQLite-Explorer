@@ -1,5 +1,54 @@
 # Changelog
 
+## 1.3.4
+
+### Security
+
+- **PRAGMA Value Hardening**: Replaced quote-escaping with strict whitelist validation (`/^[a-zA-Z0-9_-]+$/`) for string PRAGMA values and `Number.isFinite()` for numeric values. Applied to both WASM and native backends.
+- **Native Worker Spawn Hardening**: Added explicit `shell: false` and absolute path validation to `NativeWorkerProcess` constructor, preventing command injection via shell metacharacters and relative path traversal.
+- **Virtual File System Escaping**: Replaced manual `replace(/"/g, '""')` with `escapeIdentifier()` in `SQLiteFileSystemProvider.readFile()`, aligning with the project's SQL injection prevention standard.
+- **Web Demo Worker Escaping**: Extracted `escapeIdentifier()` function in the standalone web demo worker for consistent identifier escaping.
+- **Native JSON Patch NULL Fix**: Added `COALESCE` wrapping to the native worker's `updateCell` json_patch path so NULL columns are treated as empty objects, matching the WASM backend behavior.
+- **Dependency Security**: Updated lodash 4.17.23 → 4.18.1 (prototype pollution fix via `_.unset`/`_.omit`, code injection fix in `_.template`) and picomatch 2.3.1 → 2.3.2 (CVE-2026-33671, CVE-2026-33672).
+
+### Bug Fixes
+
+- **Read-Only Editor Guard**: Fixed `registerEditorProvider` missing `!readOnly` check — passing `readOnly: true` previously still registered a read-write `DatabaseEditorProvider` if `verified` was true. Now correctly selects `DatabaseViewerProvider`.
+- **Nested Transaction Error**: `updateCellBatch` used `BEGIN TRANSACTION` which failed when called from within an outer transaction (e.g., `undoColumnDrop`). Replaced with `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` for safe nesting.
+
+### Performance
+
+- **Optimized insertRowBatch**: Rows are now grouped by column set and each group uses a single prepared statement instead of re-preparing per row. Includes a benchmark in `tests/performance/`.
+- **Batched Prepared Statements (Native)**: Native worker `updateCellBatch` now groups updates by column and sends `paramsList` for single-prepare-multi-execute, reusing statements across rows.
+- **DRY Undo/Redo Row Insertion**: Both WASM and native undo paths for `row_delete` now delegate to `insertRowBatch` instead of manual loops, benefiting from the prepared statement optimization.
+
+### Improvements
+
+- **TypeScript 6.0**: Upgraded from 5.9.3 to 6.0.2 with `"types": ["node"]` in tsconfig.json.
+- **Type Safety**: Comprehensive `any` → `unknown` refactor in `json-utils.ts` with proper `isObject` type guard. Added `ProxyWithPendingInvocations<T>` type in RPC layer, eliminating `as any` casts on webview bridge. Replaced `any[]` with `CellValue[]` in `tableExporter.ts` and `Record<string, CellValue>` in `mapRowsByName`.
+- **Structured Logging**: Extension host logging migrated from `console.log`/`console.warn` to `GlobalOutputChannel?.appendLine()` in `workerFactory.ts` and `main.ts`. Statement `free()` and ROLLBACK failures now logged instead of silently caught.
+- **DRY Transaction Error Handling**: Extracted `safeRollback(context)` private helper in `WasmDatabaseEngine`, replacing 3 identical bare ROLLBACK catch blocks.
+- **Dead Code Removal**: Removed unused `globalProviderSubs` WeakSet in `main.ts`, leftover `console.log` statements in extension activation and worker initialization, commented-out code in tests.
+
+### Dependencies
+
+- TypeScript 5.9.3 → 6.0.2
+- esbuild 0.27.3 → 0.27.4
+- @types/node 25.3.3 → 25.5.0
+- @vscode/codicons 0.0.44 → 0.0.45
+- @vercel/analytics 1.6.1 → 2.0.1 (website)
+- @vercel/speed-insights 1.3.1 → 2.0.0 (website)
+- Next.js 16.1.6 → 16.2.1 (website)
+- lodash 4.17.23 → 4.18.1
+- picomatch 2.3.1 → 2.3.2
+
+### Testing
+
+- **New Test Suites**: Added tests for `createWorkerEndpoint` (initialization, delegation, re-initialization) and `isNativeAvailable` (platform detection, binary existence, web UI kind).
+- **Edge Cases**: Added root-level null test for `applyMergePatch` and empty string test for `escapeIdentifier`.
+- **Type Strict Compliance**: All test files now satisfy `tsc --noEmit` — added missing `notNull`/`primaryKey` to `ColumnDefinition` literals, `maxSize` to `DatabaseInitConfig`, proper `Object.defineProperty` for readonly mock properties.
+- **Test Count**: 237 tests across 33 files, zero failures.
+
 ## 1.3.3
 
 ### Security
