@@ -112,7 +112,7 @@ export async function createDatabaseConnection(
     const extensionPath = extensionUri.fsPath;
     if (await nativeSupport.isNativeAvailable(extensionPath)) {
       try {
-        console.log('[SQLite Explorer] Using native SQLite backend');
+        GlobalOutputChannel?.appendLine('[SQLite Explorer] Using native SQLite backend');
         const nativeBundle = await nativeSupport.createNativeDatabaseConnection(extensionUri, _reporter);
 
         // Wrap the native bundle to provide fallback to WASM if file open fails
@@ -129,7 +129,7 @@ export async function createDatabaseConnection(
               return await nativeBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
             } catch (nativeErr) {
               // Native failed - fall back to WASM
-              console.warn('[SQLite Explorer] Native file open failed, falling back to WASM:', nativeErr);
+              GlobalOutputChannel?.appendLine(`[SQLite Explorer] Native file open failed, falling back to WASM: ${nativeErr instanceof Error ? nativeErr.message : String(nativeErr)}`);
               if (!wasmBundle) {
                 wasmBundle = await wasmBundlePromise;
               }
@@ -138,13 +138,13 @@ export async function createDatabaseConnection(
           }
         };
       } catch (err) {
-        console.warn('[SQLite Explorer] Native SQLite failed, falling back to WASM:', err);
+        GlobalOutputChannel?.appendLine(`[SQLite Explorer] Native SQLite failed, falling back to WASM: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }
 
   // Fall back to WASM (sql.js)
-  console.log('[SQLite Explorer] Using WebAssembly SQLite backend');
+  GlobalOutputChannel?.appendLine('[SQLite Explorer] Using WebAssembly SQLite backend');
   return createWasmDatabaseConnection(extensionUri, _reporter);
 }
 
