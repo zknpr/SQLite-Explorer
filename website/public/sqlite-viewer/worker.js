@@ -61,6 +61,15 @@ async function loadSqlJs() {
 // ============================================================================
 
 /**
+ * Escape a SQL identifier (table name, column name) for safe use in queries.
+ * @param {string} identifier
+ * @returns {string}
+ */
+function escapeIdentifier(identifier) {
+  return `"${identifier.replace(/"/g, '""')}"`;
+}
+
+/**
  * Validate a SQL type definition to ensure it is safe.
  * Allows standard SQLite types and common variants.
  *
@@ -526,7 +535,7 @@ async function fetchSchema() {
 async function getTableInfo(table) {
   if (!db) throw new Error('No database initialized');
 
-  const results = db.exec(`PRAGMA table_info("${table.replace(/"/g, '""')}")`);
+  const results = db.exec(`PRAGMA table_info(${escapeIdentifier(table)})`);
 
   if (results.length === 0) {
     return [];
