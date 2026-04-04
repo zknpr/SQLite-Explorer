@@ -125,8 +125,6 @@ function formatDefaultValue(defaultValue) {
  * @returns {Promise<Object>} Database handle info
  */
 async function initializeDatabase(filename, config) {
-  console.log('[Worker] Initializing database:', filename);
-
   // Close existing database
   if (db) {
     db.close();
@@ -157,8 +155,6 @@ async function initializeDatabase(filename, config) {
     // Create empty database
     db = new SQL.Database();
   }
-
-  console.log('[Worker] Database initialized successfully');
 
   return {
     operations: {},
@@ -904,5 +900,3 @@ self.onmessage = async (event) => {
 // ============================================================================
 // Worker Ready
 // ============================================================================
-
-console.log('[Worker] SQLite demo worker initialized');
