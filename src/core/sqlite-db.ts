@@ -276,7 +276,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
         }
         await this.executeQuery('COMMIT');
       } catch (e) {
-        await this.executeQuery('ROLLBACK');
+        try {
+          await this.executeQuery('ROLLBACK');
+        } catch (rollbackErr) {
+          const errMsg = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+          console.warn(`Rollback failed during undoRowDelete: ${errMsg}`);
+        }
         throw e;
       }
     }
@@ -312,7 +317,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
         }
         await this.executeQuery('COMMIT');
       } catch (e) {
-        await this.executeQuery('ROLLBACK');
+        try {
+          await this.executeQuery('ROLLBACK');
+        } catch (rollbackErr) {
+          const errMsg = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+          console.warn(`Rollback failed during undoColumnDrop: ${errMsg}`);
+        }
         throw e;
       }
     }
@@ -496,7 +506,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
       }
       await this.executeQuery('COMMIT');
     } catch (e) {
-      await this.executeQuery('ROLLBACK');
+      try {
+        await this.executeQuery('ROLLBACK');
+      } catch (rollbackErr) {
+        const errMsg = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+        console.warn(`Rollback failed during insertRowBatch: ${errMsg}`);
+      }
       throw e;
     }
   }
@@ -595,7 +610,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
       }
       await this.executeQuery('COMMIT');
     } catch (e) {
-      await this.executeQuery('ROLLBACK');
+      try {
+        await this.executeQuery('ROLLBACK');
+      } catch (rollbackErr) {
+        const errMsg = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+        console.warn(`Rollback failed during deleteColumns: ${errMsg}`);
+      }
       throw e;
     }
   }
@@ -726,7 +746,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
       await this.executeQuery('COMMIT');
     } catch (err) {
-      try { await this.executeQuery('ROLLBACK'); } catch {}
+      try {
+        await this.executeQuery('ROLLBACK');
+      } catch (rollbackErr) {
+        const errMsg = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+        console.warn(`Rollback failed during updateCellBatch: ${errMsg}`);
+      }
       throw err;
     }
   }
