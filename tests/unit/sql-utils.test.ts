@@ -58,6 +58,10 @@ describe('SQL Utils', () => {
     it('should escape complex identifiers', () => {
       assert.strictEqual(escapeIdentifier('foo"bar"baz'), '"foo""bar""baz"');
     });
+
+    it('should handle empty strings', () => {
+      assert.strictEqual(escapeIdentifier(''), '""');
+    });
   });
 
   describe('cellValueToSql', () => {
