@@ -23,7 +23,7 @@ import { GlobalOutputChannel } from './main';
 
 import { ModificationTracker } from './core/undo-history';
 import type { LabeledModification, DatabaseOperations } from './core/types';
-import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
+import { createLoggingDatabaseOperations } from './loggingDatabaseOperations';
 
 // ============================================================================
 // Types
@@ -130,7 +130,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
     // Wrap with logger if output channel is available
     if (viewerProvider.outputChannel) {
-      databaseOps = new LoggingDatabaseOperations(
+      databaseOps = createLoggingDatabaseOperations(
         databaseOps,
         filename,
         viewerProvider.outputChannel

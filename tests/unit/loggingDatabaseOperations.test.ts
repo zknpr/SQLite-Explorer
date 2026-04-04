@@ -2,7 +2,7 @@ import './vscode_mock_setup';
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import * as vsc from 'vscode';
-import { LoggingDatabaseOperations } from '../../src/loggingDatabaseOperations';
+import { createLoggingDatabaseOperations } from '../../src/loggingDatabaseOperations';
 import type { DatabaseOperations, CellValue, QueryResultSet, ModificationEntry, CellUpdate, TableQueryOptions, TableCountOptions, SchemaSnapshot, ColumnMetadata, ColumnDefinition } from '../../src/core/types';
 
 class MockDatabaseOperations implements DatabaseOperations {
@@ -52,12 +52,12 @@ class MockOutputChannel implements vsc.OutputChannel {
 describe('LoggingDatabaseOperations', () => {
     let mockDb: MockDatabaseOperations;
     let mockChannel: MockOutputChannel;
-    let logger: LoggingDatabaseOperations;
+    let logger: DatabaseOperations;
 
     beforeEach(() => {
         mockDb = new MockDatabaseOperations();
         mockChannel = new MockOutputChannel();
-        logger = new LoggingDatabaseOperations(mockDb, 'test.db', mockChannel);
+        logger = createLoggingDatabaseOperations(mockDb, 'test.db', mockChannel);
     });
 
     describe('sanitizeValue', () => {
