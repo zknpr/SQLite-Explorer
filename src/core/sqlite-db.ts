@@ -726,7 +726,9 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
       await this.executeQuery('COMMIT');
     } catch (err) {
-      try { await this.executeQuery('ROLLBACK'); } catch {}
+      try { await this.executeQuery('ROLLBACK'); } catch (rollbackErr) {
+        console.warn('Failed to rollback transaction:', rollbackErr);
+      }
       throw err;
     }
   }
