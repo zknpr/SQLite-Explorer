@@ -118,7 +118,7 @@ export default function RootLayout({
     <html lang="en" className={inter.variable} suppressHydrationWarning>
       <head>
         {/* Hardcoded theme detection script — safe, no user input involved */}
-        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+        <script>{themeScript}</script>
       </head>
       <body>
         {children}
