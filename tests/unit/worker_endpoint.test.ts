@@ -1,0 +1,115 @@
+import { describe, it, beforeEach } from 'node:test';
+import assert from 'node:assert';
+import fs from 'fs';
+
+// Mock parentPort BEFORE importing createWorkerEndpoint
+import Module from 'module';
+const originalLoad = (Module as any)._load;
+(Module as any)._load = function (request: string, parent: any, isMain: boolean) {
+    if (request === 'worker_threads') {
+        return {
+            parentPort: {
+                postMessage: () => {},
+                on: () => {}
+            }
+        };
+    }
+    return originalLoad(request, parent, isMain);
+};
+
+// Now we can import the module to test
+import { createWorkerEndpoint } from '../../src/core/sqlite-db';
+
+describe('Worker Endpoint', () => {
+    let endpoint: ReturnType<typeof createWorkerEndpoint>;
+    let wasmBinary: Buffer;
+
+    beforeEach(() => {
+        endpoint = createWorkerEndpoint();
+        wasmBinary = fs.readFileSync('./node_modules/sql.js/dist/sql-wasm.wasm');
+    });
+
+    it('should throw Error if database is not initialized', async () => {
+        const expectedError = new Error('No database initialized');
+
+        await assert.rejects(endpoint.runQuery('SELECT 1'), expectedError);
+        await assert.rejects(endpoint.exportDatabase('test'), expectedError);
+        await assert.rejects(endpoint.updateCell('table', 1, 'col', 'val'), expectedError);
+        await assert.rejects(endpoint.insertRow('table', {}), expectedError);
+        await assert.rejects(endpoint.insertRowBatch('table', []), expectedError);
+        await assert.rejects(endpoint.deleteRows('table', [1]), expectedError);
+        await assert.rejects(endpoint.deleteColumns('table', ['col']), expectedError);
+        await assert.rejects(endpoint.findDependentIndexes('table', ['col']), expectedError);
+        await assert.rejects(endpoint.createTable('table', []), expectedError);
+        await assert.rejects(endpoint.updateCellBatch('table', []), expectedError);
+        await assert.rejects(endpoint.addColumn('table', 'col', 'TEXT'), expectedError);
+        await assert.rejects(endpoint.fetchTableData('table', { offset: 0, limit: 10 }), expectedError);
+        await assert.rejects(endpoint.fetchTableCount('table', {}), expectedError);
+        await assert.rejects(endpoint.fetchSchema(), expectedError);
+        await assert.rejects(endpoint.getTableInfo('table'), expectedError);
+        await assert.rejects(endpoint.getPragmas(), expectedError);
+        await assert.rejects(endpoint.setPragma('journal_mode', 'WAL'), expectedError);
+        await assert.rejects(endpoint.writeToFile('path'), expectedError);
+
+        const pingResult = await endpoint.ping();
+        assert.strictEqual(pingResult, false);
+    });
+
+    it('should delegate operations after database is initialized', async () => {
+        const initResult = await endpoint.initializeDatabase('test.db', {
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false,
+            wasmBinary
+        });
+
+        assert.strictEqual(initResult.isReadOnly, false);
+
+        // Ping should work
+        assert.strictEqual(await endpoint.ping(), true);
+
+        // Run a query
+        const queryResult = await endpoint.runQuery('SELECT 1 + 1 AS result');
+        assert.deepStrictEqual(queryResult[0].rows, [[2]]);
+
+        // Create table and insert
+        await endpoint.createTable('users', [
+            { name: 'id', type: 'INTEGER', primaryKey: true },
+            { name: 'name', type: 'TEXT' }
+        ]);
+
+        await endpoint.insertRow('users', { id: 1, name: 'Alice' });
+
+        const tableData = await endpoint.fetchTableData('users', { offset: 0, limit: 10 });
+        assert.deepStrictEqual(tableData.rows, [[1, 'Alice']]);
+
+        // Export DB
+        const data = await endpoint.exportDatabase('test');
+        assert.ok(data instanceof Uint8Array);
+        assert.ok(data.length > 0);
+    });
+
+    it('should shutdown previous database when initializing a new one', async () => {
+        await endpoint.initializeDatabase('test1.db', {
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false,
+            wasmBinary
+        });
+
+        await endpoint.createTable('test_table', [{ name: 'id', type: 'INTEGER' }]);
+
+        // Initialize a new database, which should shutdown the previous one and create a clean state
+        await endpoint.initializeDatabase('test2.db', {
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false,
+            wasmBinary
+        });
+
+        // The new database should not have the test_table
+        const schema = await endpoint.fetchSchema();
+        const hasTestTable = schema.tables.some(t => t.identifier === 'test_table');
+        assert.strictEqual(hasTestTable, false);
+    });
+});
