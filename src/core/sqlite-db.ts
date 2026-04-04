@@ -1051,8 +1051,6 @@ export function createWorkerEndpoint() {
       filename: string,
       config: DatabaseInitConfig
     ): Promise<DatabaseInitResult> {
-      console.log('[Worker] Initializing database:', filename);
-
       // Shutdown existing engine if present
       if (activeEngine) {
         activeEngine.shutdown();
