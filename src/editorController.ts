@@ -187,7 +187,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     // Handle messages from webview.
     // Pass the per-proxy pending invocations map so RPC responses from the webview
     // are correctly routed to the bridge proxy for this specific panel.
-    const pendingMap = (webviewBridge as any).__pendingInvocations;
+    const pendingMap = webviewBridge.__pendingInvocations;
     const messageHandler = new WebviewMessageHandler(
       (msg) => webviewPanel.webview.postMessage(msg),
       document.hostBridge as any,

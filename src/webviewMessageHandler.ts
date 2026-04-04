@@ -1,4 +1,4 @@
-import { processProtocolMessage } from './core/rpc';
+import { MessageCorrelationId, PendingInvocation, processProtocolMessage } from './core/rpc';
 import { deserializeArgs, serializeValue } from './core/serialization';
 
 interface WebviewRpcInvokeMessage {
@@ -45,7 +45,7 @@ export class WebviewMessageHandler {
   constructor(
     private readonly postMessage: (message: any) => PromiseLike<boolean>,
     private readonly hostBridge: Record<string, any>,
-    private readonly pendingInvocations?: Map<string, any>
+    private readonly pendingInvocations?: Map<MessageCorrelationId, PendingInvocation>
   ) {}
 
   /**
