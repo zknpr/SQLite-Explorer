@@ -491,9 +491,46 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
     await this.executeQuery('BEGIN TRANSACTION');
     try {
+      const escapedTable = escapeIdentifier(table);
+      const groups = new Map<string, { columns: string[], data: CellValue[][] }>();
+
       for (const row of rows) {
-        await this.insertRow(table, row);
+        const columns = Object.keys(row);
+        const key = columns.join('\0');
+        if (!groups.has(key)) {
+          groups.set(key, { columns, data: [] });
+        }
+        groups.get(key)!.data.push(columns.map(col => row[col]));
       }
+
+      for (const group of groups.values()) {
+        const { columns, data } = group;
+        let sql: string;
+        if (columns.length === 0) {
+          sql = `INSERT INTO ${escapedTable} DEFAULT VALUES`;
+          const stmt = this.instance.prepare(sql);
+          try {
+            for (let i = 0; i < data.length; i++) {
+              stmt.run();
+            }
+          } finally {
+            stmt.free();
+          }
+        } else {
+          const colNames = columns.map(escapeIdentifier).join(', ');
+          const placeholders = columns.map(() => '?').join(', ');
+          sql = `INSERT INTO ${escapedTable} (${colNames}) VALUES (${placeholders})`;
+          const stmt = this.instance.prepare(sql);
+          try {
+            for (const params of data) {
+              stmt.run(params);
+            }
+          } finally {
+            stmt.free();
+          }
+        }
+      }
+
       await this.executeQuery('COMMIT');
     } catch (e) {
       await this.executeQuery('ROLLBACK');
