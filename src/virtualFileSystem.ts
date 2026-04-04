@@ -1,6 +1,7 @@
 import * as vsc from 'vscode';
 import { DocumentRegistry } from './documentRegistry';
 import { Disposable } from './lifecycle';
+import { escapeIdentifier } from './core/sql-utils';
 
 import type { DatabaseDocument } from './databaseModel';
 
@@ -77,7 +78,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             // For tables, use WHERE rowid = ?
             // Escape identifiers.
             // Reuse `fetchTableData` or `executeQuery`.
-            const query = `SELECT "${colName.replace(/"/g, '""')}" FROM "${table.replace(/"/g, '""')}" WHERE rowid = ?`;
+            const query = `SELECT ${escapeIdentifier(colName)} FROM ${escapeIdentifier(table)} WHERE rowid = ?`;
             const result = await document.databaseOperations.executeQuery(query, [rowIdNum]);
 
             const value = result?.[0]?.rows?.[0]?.[0];
