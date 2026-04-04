@@ -139,7 +139,14 @@ class NativeWorkerProcess {
   constructor(
     private readonly binaryPath: string,
     private readonly workerScript: string
-  ) {}
+  ) {
+    if (!path.isAbsolute(binaryPath)) {
+      throw new Error(`Security Error: Expected absolute path for binary, got: ${binaryPath}`);
+    }
+    if (!path.isAbsolute(workerScript)) {
+      throw new Error(`Security Error: Expected absolute path for worker script, got: ${workerScript}`);
+    }
+  }
 
   /**
    * Start the native worker process.
@@ -156,7 +163,8 @@ class NativeWorkerProcess {
       // Spawn txiki-js with the worker script
       this.process = spawn(this.binaryPath, ['run', this.workerScript], {
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env }
+        env: { ...process.env },
+        shell: false
       });
 
       // Handle stdout (message responses)
