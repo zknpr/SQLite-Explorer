@@ -31,8 +31,6 @@ export async function activate(context: vsc.ExtensionContext) {
     context.subscriptions.push(reporter);
   }
 
-  console.log('[INFO]', new Date().toISOString(), '- Extension activated!');
-
   await activateProviders(context, reporter);
 
   // Register refresh command
