@@ -424,14 +424,27 @@ async function handleRequest(request) {
 
       case "execBatch": {
         // Execute a batch of statements in a transaction
-        // args: [items: { sql: string, params?: any[] }[]]
+        // args: [items: { sql: string, params?: any[], paramsList?: any[][] }[]]
         const [items] = args;
         if (!db) throw new Error("Database not open");
 
         db.exec("BEGIN TRANSACTION");
         try {
           for (const item of items) {
-             executeStatement(db, item.sql, item.params);
+             if (item.paramsList && item.paramsList.length > 0) {
+                 const stmt = db.prepare(item.sql);
+                 try {
+                     for (const params of item.paramsList) {
+                         if (params && params.length > 0) stmt.run(...params);
+                         else stmt.run();
+                     }
+                 } finally {
+                     if (typeof stmt.free === 'function') stmt.free();
+                     else if (typeof stmt.finalize === 'function') stmt.finalize();
+                 }
+             } else {
+                 executeStatement(db, item.sql, item.params);
+             }
           }
           db.exec("COMMIT");
           result = { success: true };
