@@ -14,6 +14,8 @@ import * as fs from 'fs';
 import { spawn, ChildProcess } from 'child_process';
 import * as v8 from 'node:v8';
 
+import { uiKindToString } from './helpers';
+
 import type { TelemetryReporter } from '@vscode/extension-telemetry';
 import type { DatabaseConnectionBundle } from './connectionTypes';
 import type {
@@ -385,6 +387,9 @@ export function mapRowsByName<T = Record<string, CellValue>>(result: NativeQuery
  * @returns True if native binary is available
  */
 export async function isNativeAvailable(extensionPath: string): Promise<boolean> {
+  if (uiKindToString(vsc.env.uiKind) === 'web') {
+    return false;
+  }
   return (await getNativeBinaryPath(extensionPath)) !== null;
 }
 

@@ -129,7 +129,12 @@ export const mockVscode = {
         uriScheme: 'vscode',
         appName: 'VS Code',
         language: 'en',
-        remoteName: undefined as string | undefined
+        remoteName: undefined as string | undefined,
+        uiKind: 2 // Desktop
+    },
+    UIKind: {
+        Desktop: 2,
+        Web: 1
     },
     ColorThemeKind: {
         Light: 1,
