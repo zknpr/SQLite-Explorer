@@ -871,12 +871,20 @@ class WasmDatabaseEngine implements DatabaseOperations {
       'auto_vacuum'
     ];
 
+    const sql = pragmasToFetch.map(p => `SELECT 'marker_${p}' AS pragma_marker; PRAGMA ${p};`).join('\n');
+    const res = await this.executeQuery(sql);
+
+    let currentMarker: string | null = null;
     const result: Record<string, CellValue> = {};
 
-    for (const pragma of pragmasToFetch) {
-      const res = await this.executeQuery(`PRAGMA ${pragma}`);
-      if (res[0]?.rows?.[0]) {
-        result[pragma] = res[0].rows[0][0];
+    for (const r of res) {
+      if (r.columns?.[0] === 'pragma_marker' && r.rows?.[0]?.[0]) {
+        currentMarker = (r.rows[0][0] as string).replace('marker_', '');
+      } else if (currentMarker) {
+        if (r.rows?.[0]) {
+          result[currentMarker] = r.rows[0][0];
+        }
+        currentMarker = null;
       }
     }
 
