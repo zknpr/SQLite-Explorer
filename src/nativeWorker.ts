@@ -536,19 +536,7 @@ export async function createNativeDatabaseConnection(
 
             case 'row_delete':
               if (deletedRows && deletedRows.length > 0) {
-                const batch = [];
-                for (const { rowId, row } of deletedRows) {
-                    // row already contains rowid if needed
-                    const columns = Object.keys(row);
-                    const colNames = columns.map(escapeIdentifier).join(', ');
-                    const placeholders = columns.map(() => '?').join(', ');
-                    const params = columns.map(c => row[c]);
-                    batch.push({
-                        sql: `INSERT INTO ${escapeIdentifier(targetTable)} (${colNames}) VALUES (${placeholders})`,
-                        params
-                    });
-                }
-                await worker.call('execBatch', [batch]);
+                await operationsFacade.insertRowBatch(targetTable, deletedRows.map(dr => dr.row));
               }
               break;
 
