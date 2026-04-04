@@ -436,7 +436,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
             let currentObj = {};
             if (typeof currentValue === 'string') {
-                try { currentObj = JSON.parse(currentValue); } catch {}
+                try {
+                    currentObj = JSON.parse(currentValue);
+                } catch (e: unknown) {
+                    // Intentionally ignored: if the current value is not valid JSON,
+                    // we treat it as an empty object for the merge patch.
+                }
             } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
                 currentObj = currentValue;
             }
@@ -705,7 +710,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
                      let currentObj = {};
                      if (typeof currentValue === 'string') {
-                         try { currentObj = JSON.parse(currentValue); } catch {}
+                         try {
+                             currentObj = JSON.parse(currentValue);
+                         } catch (e: unknown) {
+                             // Intentionally ignored: if the current value is not valid JSON,
+                             // we treat it as an empty object for the merge patch.
+                         }
                      }
 
                      const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
@@ -726,7 +736,9 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
       await this.executeQuery('COMMIT');
     } catch (err) {
-      try { await this.executeQuery('ROLLBACK'); } catch {}
+      try { await this.executeQuery('ROLLBACK'); } catch (rollbackErr: unknown) {
+        console.error('Failed to rollback transaction during updateCellBatch:', rollbackErr);
+      }
       throw err;
     }
   }
