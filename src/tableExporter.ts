@@ -161,7 +161,7 @@ export async function exportTableCommand(
 
             while (hasMore) {
                 let sql: string;
-                const params: any[] = [];
+                const params: CellValue[] = [];
 
                 if (useRowId) {
                     // Keyset pagination: fast O(1)
@@ -267,7 +267,7 @@ export async function exportTableCommand(
     // ... (keep original logic below for fallback) ...
 
     let sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
-    const params: any[] = [];
+    const params: CellValue[] = [];
 
     // Filter by row IDs if provided
     if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
