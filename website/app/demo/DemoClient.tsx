@@ -179,7 +179,7 @@ export default function DemoClient() {
             success: true,
             data: { isReadOnly: false }
           }
-        }, '*' as WindowPostMessageOptions);
+        }, window.location.origin);
         return;
       }
 
@@ -198,7 +198,7 @@ export default function DemoClient() {
               doubleClickBehavior: 'inline'
             }
           }
-        }, '*' as WindowPostMessageOptions);
+        }, window.location.origin);
         return;
       }
 
@@ -226,7 +226,7 @@ export default function DemoClient() {
                 success: true,
                 data: { success: true }
               }
-            }, '*' as WindowPostMessageOptions);
+            }, window.location.origin);
           })
           .catch((error) => {
             event.source?.postMessage({
@@ -237,7 +237,7 @@ export default function DemoClient() {
                 success: false,
                 errorMessage: error.message
               }
-            }, '*' as WindowPostMessageOptions);
+            }, window.location.origin);
           });
         return;
       }
@@ -253,7 +253,7 @@ export default function DemoClient() {
               success: true,
               data: result
             }
-          }, '*' as WindowPostMessageOptions);
+          }, window.location.origin);
         })
         .catch((error) => {
           event.source?.postMessage({
@@ -264,7 +264,7 @@ export default function DemoClient() {
               success: false,
               errorMessage: error.message
             }
-          }, '*' as WindowPostMessageOptions);
+          }, window.location.origin);
         });
     }
   }, [callWorker]);
