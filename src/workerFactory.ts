@@ -42,7 +42,7 @@ let nativeSupport: {
 } | null = null;
 
 // Dynamically import native worker in Node.js environment
-if (!import.meta.env?.VSCODE_BROWSER_EXT) {
+if (!import.meta.env.VSCODE_BROWSER_EXT) {
   try {
     // Use dynamic import for native worker
     nativeSupport = require('./nativeWorker');
@@ -108,7 +108,7 @@ export async function createDatabaseConnection(
   _reporter?: TelemetryReporter
 ): Promise<DatabaseConnectionBundle> {
   // Try native SQLite first (desktop Node.js only)
-  if (!import.meta.env?.VSCODE_BROWSER_EXT && nativeSupport) {
+  if (!import.meta.env.VSCODE_BROWSER_EXT && nativeSupport) {
     const extensionPath = extensionUri.fsPath;
     if (await nativeSupport.isNativeAvailable(extensionPath)) {
       try {
@@ -168,7 +168,7 @@ async function createWasmDatabaseConnection(
   // Node.js: Use require path directly.
   let workerThread: InstanceType<typeof Worker>;
 
-  if (import.meta.env?.VSCODE_BROWSER_EXT) {
+  if (import.meta.env.VSCODE_BROWSER_EXT) {
     // Browser environment: fetch worker script and create Blob URL
     const workerScriptUri = vsc.Uri.joinPath(extensionUri, 'out', 'worker-browser.js');
     const workerContent = await vsc.workspace.fs.readFile(workerScriptUri);
@@ -204,7 +204,7 @@ async function createWasmDatabaseConnection(
         }
       },
       on: (event: 'message', handler: (data: unknown) => void) => {
-        if (import.meta.env?.VSCODE_BROWSER_EXT) {
+        if (import.meta.env.VSCODE_BROWSER_EXT) {
           // Browser: Web Worker uses addEventListener with MessageEvent wrapper
           workerThread.addEventListener(event, (e: MessageEvent) => handler(e.data));
         } else {
@@ -248,7 +248,7 @@ async function createWasmDatabaseConnection(
         // Read database and WAL files
         // Optimization: If running in Node and file is local, pass path to worker instead of reading content here
         // This avoids blocking the extension host and transferring large buffers
-        const isNode = !import.meta.env?.VSCODE_BROWSER_EXT;
+        const isNode = !import.meta.env.VSCODE_BROWSER_EXT;
         const isLocal = fileUri.scheme === 'file';
 
         let dbContent: Uint8Array | null = null;
