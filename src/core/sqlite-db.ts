@@ -305,18 +305,42 @@ class WasmDatabaseEngine implements DatabaseOperations {
       try {
         for (const col of deletedColumns) {
           await this.addColumn(targetTable, col.name, col.type);
-          // Restore values
+        }
 
-          const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`;
+        // Optimize restoration by grouping rows that have identical column sets
+        // This is done effectively by doing one UPDATE per row for all restored columns
+        // e.g. UPDATE table SET col1 = ?, col2 = ? WHERE rowid = ?
+
+        // First, transform the data into a row-centric map
+        const rowUpdates = new Map<number, Record<string, CellValue | null>>();
+        for (const col of deletedColumns) {
+          for (const cell of col.data) {
+            const rId = Number(cell.rowId);
+            let rowObj = rowUpdates.get(rId);
+            if (!rowObj) {
+              rowObj = {};
+              rowUpdates.set(rId, rowObj);
+            }
+            rowObj[col.name] = cell.value ?? null;
+          }
+        }
+
+        if (rowUpdates.size > 0) {
+          const columnsToSet = deletedColumns.map(c => escapeIdentifier(c.name));
+          const setClause = columnsToSet.map(c => `${c} = ?`).join(', ');
+          const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${setClause} WHERE rowid = ?`;
           const stmt = this.instance.prepare(sql);
           try {
-            for (const { rowId, value } of col.data) {
-              stmt.run([value, Number(rowId)]);
+            for (const [rId, rowObj] of rowUpdates.entries()) {
+              const params: any[] = deletedColumns.map(c => rowObj[c.name] ?? null);
+              params.push(rId);
+              stmt.run(params);
             }
           } finally {
             stmt.free();
           }
         }
+
         await this.executeQuery('COMMIT');
       } catch (e) {
         await this.safeRollback('undoColumnDrop');
