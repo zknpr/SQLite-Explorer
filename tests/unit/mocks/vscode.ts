@@ -143,3 +143,16 @@ export const mockVscode = {
         HighContrastLight: 4
     }
 };
+
+mockVscode.extensions = {
+    getExtension: (id: string) => {
+        return {
+            id,
+            isActive: true,
+            exports: {},
+            extensionPath: '/mock/extension/path',
+            extensionUri: mockVscode.Uri.parse('file:///mock/extension/path'),
+            packageJSON: { version: '1.0.0' }
+        };
+    }
+};
