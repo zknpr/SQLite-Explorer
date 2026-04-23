@@ -146,8 +146,15 @@ describe('SQL Utils', () => {
       assert.deepStrictEqual(validateRowIds(['1', 2, '3']), [1, 2, 3]);
     });
 
+    it('should handle an empty array', () => {
+      assert.deepStrictEqual(validateRowIds([]), []);
+    });
+
     it('should throw an error if any row ID is invalid', () => {
       assert.throws(() => validateRowIds(['1', 'a', 3]), /Invalid rowid: a/);
+      // @ts-ignore - testing runtime validation of invalid types
+      assert.throws(() => validateRowIds([1, 'abc']), /Invalid rowid: abc/);
+      assert.throws(() => validateRowIds([1, NaN]), /Invalid rowid: NaN/);
     });
   });
 });
