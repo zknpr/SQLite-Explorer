@@ -62,7 +62,7 @@ function binaryReviver(_key: string, value: unknown): unknown {
  * Handles circular references by tracking seen objects.
  */
 function calculateSize(value: unknown): number {
-  const seen = new Set<any>();
+  const seen = new Set<unknown>();
   const stack = [value];
   let size = 0;
 
@@ -99,7 +99,7 @@ function calculateSize(value: unknown): number {
         for (const key in current) {
           if (Object.prototype.hasOwnProperty.call(current, key)) {
             size += key.length * 2;
-            stack.push((current as any)[key]);
+            stack.push((current as Record<string, unknown>)[key]);
           }
         }
       }
