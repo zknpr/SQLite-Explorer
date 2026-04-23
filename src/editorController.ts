@@ -12,7 +12,8 @@ import * as vsc from 'vscode';
 import { crypto } from './platform/cryptoShim';
 import { ConfigurationSection, CopilotChatId, ExtensionId, FirstInstallMs, FullExtensionId, Ns, SidebarLeft, SidebarRight } from './config';
 import { Disposable } from './lifecycle';
-import { IsVSCode, IsVSCodium, WebviewCollection, cspUtil, doTry, toDatasetAttrs, themeToCss, uiKindToString, BoolString, toBoolString, IsCursorIDE, lang } from './helpers';
+import { IsVSCode, IsVSCodium, cspUtil, doTry, toDatasetAttrs, themeToCss, uiKindToString, BoolString, toBoolString, IsCursorIDE, lang } from './helpers';
+import { WebviewCollection } from './webview-collection';
 
 import { SupportsWriteMode, IsRemoteWorkspaceMode, DatabaseDocument, isAutoCommitEnabled } from './databaseModel';
 
