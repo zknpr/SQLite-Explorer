@@ -927,10 +927,16 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
     const result: Record<string, CellValue> = {};
 
-    for (const pragma of pragmasToFetch) {
-      const res = await this.executeQuery(`PRAGMA ${pragma}`);
-      if (res[0]?.rows?.[0]) {
-        result[pragma] = res[0].rows[0][0];
+    const batchSql = pragmasToFetch.map(p => `SELECT 'marker_${p}' AS pragma_marker; PRAGMA ${p};`).join('\n');
+    const res = await this.executeQuery(batchSql);
+
+    let currentMarker: string | null = null;
+    for (const resultSet of res) {
+      if (resultSet.columns[0] === 'pragma_marker' && resultSet.rows.length > 0) {
+        currentMarker = (resultSet.rows[0][0] as string).replace('marker_', '');
+      } else if (currentMarker && resultSet.rows.length > 0) {
+        result[currentMarker] = resultSet.rows[0][0];
+        currentMarker = null; // Reset for cases where a PRAGMA returns no rows
       }
     }
 
