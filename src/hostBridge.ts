@@ -875,14 +875,18 @@ export class HostBridge implements ToastService {
       // This allows drag-and-drop from the same directory tree in single-file mode
       const docDir = path.dirname(this.document.uri.fsPath);
 
-      // Use path.relative to safely check containment
-      // This handles platform-specific separators and normalization automatically
-      const relative = path.relative(docDir, filePath);
+      // Use path.resolve to fully resolve both paths
+      // This automatically normalizes paths, resolves any '..' or '.',
+      // and creates an absolute path, mitigating path traversal attacks.
+      const resolvedDocDir = path.resolve(docDir);
+      const resolvedFilePath = path.resolve(filePath);
 
-      // If relative path starts with '..' or is absolute (on some platforms relative might return abs if on diff drive),
-      // then it is outside the docDir.
-      // Also check if it's the docDir itself (relative === '')
-      const isInside = !relative.startsWith('..') && !path.isAbsolute(relative);
+      // Ensure the resolved target path is either the document directory itself
+      // or strictly inside it by checking if it starts with the directory path plus a separator.
+      // This prevents prefix spoofing (e.g., '/path/to/dir-fake') and directory traversal.
+      // Note: If resolvedDocDir is root (e.g., '/'), we don't need to append an extra separator.
+      const prefix = resolvedDocDir.endsWith(path.sep) ? resolvedDocDir : resolvedDocDir + path.sep;
+      const isInside = resolvedFilePath === resolvedDocDir || resolvedFilePath.startsWith(prefix);
 
       if (!isInside) {
          throw new Error(`Access denied: File "${filePath}" is not in the current workspace or document directory.`);
