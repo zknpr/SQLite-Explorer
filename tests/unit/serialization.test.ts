@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { serializeValue, deserializeValue, uint8ArrayToBase64, base64ToUint8Array } from '../../src/core/serialization';
+import { serializeValue, deserializeValue, deserializeArgs, uint8ArrayToBase64, base64ToUint8Array } from '../../src/core/serialization';
 
 describe('RPC Serialization', () => {
     describe('Uint8Array', () => {
@@ -103,6 +103,36 @@ describe('RPC Serialization', () => {
             const result = deserializeValue(obj) as any;
             assert.strictEqual(result.a, 1);
             assert.ok(result.b instanceof Uint8Array);
+        });
+    });
+
+    describe('deserializeArgs', () => {
+        it('should deserialize an empty array', () => {
+            const result = deserializeArgs([]);
+            assert.deepStrictEqual(result, []);
+        });
+
+        it('should deserialize an array with primitive values', () => {
+            const result = deserializeArgs([1, 'two', true, null]);
+            assert.deepStrictEqual(result, [1, 'two', true, null]);
+        });
+
+        it('should deserialize an array with serialized objects', () => {
+            const marker = { __type: 'Uint8Array', base64: Buffer.from([1, 2]).toString('base64') };
+            const result = deserializeArgs([marker]);
+            assert.strictEqual(result.length, 1);
+            assert.ok(result[0] instanceof Uint8Array);
+            assert.deepStrictEqual(result[0], new Uint8Array([1, 2]));
+        });
+
+        it('should deserialize a mixed array', () => {
+            const marker = { __type: 'Uint8Array', base64: Buffer.from([3, 4]).toString('base64') };
+            const result = deserializeArgs([1, marker, 'test']);
+            assert.strictEqual(result.length, 3);
+            assert.strictEqual(result[0], 1);
+            assert.ok(result[1] instanceof Uint8Array);
+            assert.deepStrictEqual(result[1], new Uint8Array([3, 4]));
+            assert.strictEqual(result[2], 'test');
         });
     });
 });
