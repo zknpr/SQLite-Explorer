@@ -165,7 +165,7 @@ class NativeWorkerProcess {
       // Spawn txiki-js with the worker script
       this.process = spawn(this.binaryPath, ['run', this.workerScript], {
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env },
+        env: {},
         shell: false
       });
 
