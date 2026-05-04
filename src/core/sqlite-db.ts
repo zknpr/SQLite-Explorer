@@ -657,9 +657,12 @@ class WasmDatabaseEngine implements DatabaseOperations {
     // This avoids N+1 query transaction overhead for multiple columns
     await this.executeQuery('BEGIN TRANSACTION');
     try {
+      const sqls: string[] = [];
       for (const col of columns) {
-        const sql = `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`;
-        await this.executeQuery(sql);
+        sqls.push(`ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`);
+      }
+      if (sqls.length > 0) {
+        await this.executeQuery(sqls.join(';\n'));
       }
       await this.executeQuery('COMMIT');
     } catch (e) {
