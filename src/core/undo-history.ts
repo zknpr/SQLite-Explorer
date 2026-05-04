@@ -19,7 +19,7 @@ import type { LabeledModification } from './types';
  * to an object like {"0": 1, "1": 2, ...} which loses the type information.
  * This replacer preserves the binary data as base64.
  */
-function binaryReplacer(_key: string, value: unknown): unknown {
+export function binaryReplacer(_key: string, value: unknown): unknown {
   if (value instanceof Uint8Array) {
     // Convert to base64 with a type marker for restoration
     // Use Buffer in Node.js environment for efficiency
@@ -35,7 +35,7 @@ function binaryReplacer(_key: string, value: unknown): unknown {
  * JSON reviver function that restores Uint8Array from serialized format.
  * Converts the special object format back to Uint8Array.
  */
-function binaryReviver(_key: string, value: unknown): unknown {
+export function binaryReviver(_key: string, value: unknown): unknown {
   if (value && typeof value === 'object' && '__type' in value) {
     const typed = value as { __type: string; data: string };
     if (typed.__type === 'Uint8Array' && typeof typed.data === 'string') {
@@ -61,7 +61,7 @@ function binaryReviver(_key: string, value: unknown): unknown {
  * Counts primitive sizes and structural overhead.
  * Handles circular references by tracking seen objects.
  */
-function calculateSize(value: unknown): number {
+export function calculateSize(value: unknown): number {
   const seen = new Set<unknown>();
   const stack = [value];
   let size = 0;
