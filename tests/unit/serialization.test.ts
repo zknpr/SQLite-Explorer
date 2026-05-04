@@ -3,6 +3,35 @@ import assert from 'node:assert';
 import { serializeValue, deserializeValue, uint8ArrayToBase64, base64ToUint8Array } from '../../src/core/serialization';
 
 describe('RPC Serialization', () => {
+    describe('base64ToUint8Array', () => {
+        it('should decode empty string', () => {
+            const decoded = base64ToUint8Array('');
+            assert.deepStrictEqual(decoded, new Uint8Array([]));
+        });
+
+        it('should decode standard base64 string', () => {
+            const decoded = base64ToUint8Array('SGVsbG8=');
+            assert.deepStrictEqual(decoded, new Uint8Array([72, 101, 108, 108, 111]));
+        });
+
+        it('should decode base64 string without padding', () => {
+            const decoded = base64ToUint8Array('SGVsbG8');
+            assert.deepStrictEqual(decoded, new Uint8Array([72, 101, 108, 108, 111]));
+        });
+    });
+
+    describe('uint8ArrayToBase64', () => {
+        it('should encode empty array', () => {
+            const encoded = uint8ArrayToBase64(new Uint8Array([]));
+            assert.strictEqual(encoded, '');
+        });
+
+        it('should encode array to standard base64 string', () => {
+            const encoded = uint8ArrayToBase64(new Uint8Array([72, 101, 108, 108, 111]));
+            assert.strictEqual(encoded, 'SGVsbG8=');
+        });
+    });
+
     describe('Uint8Array', () => {
         it('should encode and decode Uint8Array correctly', () => {
             const original = new Uint8Array([1, 2, 3, 255]);
