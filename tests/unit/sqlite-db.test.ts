@@ -1,7 +1,7 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
-import { createDatabaseEngine, getNodeFs } from '../../src/core/sqlite-db';
+import { createDatabaseEngine, getNodeFs, createWorkerEndpoint } from '../../src/core/sqlite-db';
 
 describe('getNodeFs', () => {
   it('should return the fs module in Node.js environment', () => {
@@ -172,5 +172,69 @@ describe('WasmDatabaseEngine', () => {
         Date.now = originalDateNow;
       }
     });
+  });
+});
+
+describe('createWorkerEndpoint', () => {
+  it('should create an endpoint with required methods', () => {
+    const endpoint = createWorkerEndpoint();
+    assert.strictEqual(typeof endpoint.initializeDatabase, 'function');
+    assert.strictEqual(typeof endpoint.runQuery, 'function');
+    assert.strictEqual(typeof endpoint.ping, 'function');
+  });
+
+  it('should throw when calling methods before initialization', async () => {
+    const endpoint = createWorkerEndpoint();
+    await assert.rejects(
+      async () => endpoint.runQuery('SELECT 1'),
+      /No database initialized/
+    );
+  });
+
+  it('should return false for ping when not initialized', async () => {
+    const endpoint = createWorkerEndpoint();
+    const result = await endpoint.ping();
+    assert.strictEqual(result, false);
+  });
+
+  it('should initialize and execute queries', async () => {
+    const endpoint = createWorkerEndpoint();
+    const result = await endpoint.initializeDatabase('test.db', {
+      content: null,
+      maxSize: 0,
+      readOnlyMode: false
+    });
+
+    assert.strictEqual(result.isReadOnly, false);
+
+    await endpoint.runQuery('CREATE TABLE test (id INTEGER)');
+    await endpoint.runQuery('INSERT INTO test VALUES (1)');
+    const q = await endpoint.runQuery('SELECT * FROM test');
+
+    assert.strictEqual(q[0].rows.length, 1);
+    assert.strictEqual(q[0].rows[0][0], 1);
+  });
+
+  it('should shutdown previous engine when re-initializing', async () => {
+    const endpoint = createWorkerEndpoint();
+    await endpoint.initializeDatabase('test1.db', {
+      content: null,
+      maxSize: 0,
+      readOnlyMode: false
+    });
+    await endpoint.runQuery('CREATE TABLE test (id INTEGER)');
+
+    // Re-initialize should create a new engine
+    await endpoint.initializeDatabase('test2.db', {
+      content: null,
+      maxSize: 0,
+      readOnlyMode: false
+    });
+
+    // Querying the old table should fail
+    await assert.rejects(
+      async () => endpoint.runQuery('SELECT * FROM test'),
+      /no such table: test/
+    );
   });
 });
