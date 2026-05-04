@@ -3,6 +3,26 @@ import assert from 'node:assert';
 import { processProtocolMessage, buildMethodProxy, Transfer } from '../../src/core/rpc';
 
 describe('RPC', () => {
+  describe('Transfer', () => {
+    it('should construct correctly with value and transferables', () => {
+      const buffer = new ArrayBuffer(8);
+      const value = { data: buffer };
+      const transferables = [buffer];
+      const transfer = new Transfer(value, transferables);
+
+      assert.strictEqual(transfer.value, value);
+      assert.strictEqual(transfer.transferables, transferables);
+    });
+
+    it('should handle empty transferables array', () => {
+      const value = 'simple string';
+      const transfer = new Transfer(value, []);
+
+      assert.strictEqual(transfer.value, value);
+      assert.deepStrictEqual(transfer.transferables, []);
+    });
+  });
+
   describe('processProtocolMessage', () => {
     it('should ignore invalid messages', () => {
       assert.strictEqual(processProtocolMessage(null), false);
