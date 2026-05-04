@@ -906,7 +906,8 @@ export class HostBridge implements ToastService {
   async saveFile(filename: string, data: Uint8ArrayLike): Promise<void> {
     // Use the database file's directory as the default location
     const dbDir = path.dirname(this.document.uri.fsPath);
-    const defaultPath = path.join(dbDir, filename);
+    const safeFilename = path.basename(filename);
+    const defaultPath = path.join(dbDir, safeFilename);
     
     const uri = await vsc.window.showSaveDialog({
         defaultUri: vsc.Uri.file(defaultPath),
