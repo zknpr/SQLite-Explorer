@@ -51,6 +51,18 @@ export class HostBridge implements ToastService {
   private get context() { return this.viewerProvider.context; }
 
   /**
+   * Ensures the database operations are initialized and returns them.
+   * Throws an error if they are not.
+   */
+  private ensureDatabaseInitialized() {
+    const ops = this.document.databaseOperations;
+    if (!ops) {
+      throw new Error("Database not initialized");
+    }
+    return ops;
+  }
+
+  /**
    * Initialize the connection - returns metadata about the database connection.
    * Database operations (executeQuery, serializeDatabase, etc.) are exposed as separate methods
    * on HostBridge to avoid nested proxy issues.
@@ -93,21 +105,15 @@ export class HostBridge implements ToastService {
    * @returns The database as a Uint8Array
    */
   async exportDb(filename: string) {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
-    return document.databaseOperations.serializeDatabase(filename);
+    const dbOps = this.ensureDatabaseInitialized();
+    return dbOps.serializeDatabase(filename);
   }
 
   /**
    * Update a single cell value.
    */
   async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, originalValue?: CellValue) {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
     // Check if the document is read-only
     if (this.isReadOnly) {
@@ -118,8 +124,8 @@ export class HostBridge implements ToastService {
 
     // Use specific method instead of generic exec
     // This allows the backend to handle safe SQL construction
-    if ('updateCell' in document.databaseOperations) {
-      await document.databaseOperations.updateCell(table, rowId, column, value, patch);
+    if ('updateCell' in dbOps) {
+      await dbOps.updateCell(table, rowId, column, value, patch);
     } else {
       // Fallback for older backend versions (shouldn't happen if built correctly)
       throw new Error("Backend does not support updateCell");
@@ -142,10 +148,7 @@ export class HostBridge implements ToastService {
    * Insert a new row.
    */
   async insertRow(table: string, data: Record<string, CellValue>) {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
@@ -153,8 +156,8 @@ export class HostBridge implements ToastService {
 
     let rowId: RecordId | undefined;
 
-    if ('insertRow' in document.databaseOperations) {
-      rowId = await document.databaseOperations.insertRow(table, data);
+    if ('insertRow' in dbOps) {
+      rowId = await dbOps.insertRow(table, data);
     } else {
       throw new Error("Backend does not support insertRow");
     }
@@ -176,10 +179,7 @@ export class HostBridge implements ToastService {
    * Delete rows.
    */
   async deleteRows(table: string, rowIds: RecordId[]) {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
@@ -194,7 +194,7 @@ export class HostBridge implements ToastService {
             // We select rowid to map back correctly, though we already have IDs.
             // Using * to get all columns.
             const sql = `SELECT rowid, * FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`;
-            const result = await document.databaseOperations.executeQuery(sql, validIds);
+            const result = await dbOps.executeQuery(sql, validIds);
 
             if (result && result.length > 0 && result[0].rows) {
                 const headers = result[0].headers;
@@ -223,8 +223,8 @@ export class HostBridge implements ToastService {
         console.warn('Failed to fetch rows for undo history:', e);
     }
 
-    if ('deleteRows' in document.databaseOperations) {
-      await document.databaseOperations.deleteRows(table, rowIds);
+    if ('deleteRows' in dbOps) {
+      await dbOps.deleteRows(table, rowIds);
     } else {
       throw new Error("Backend does not support deleteRows");
     }
@@ -249,10 +249,7 @@ export class HostBridge implements ToastService {
    * @returns Object with `cancelled: true` if user cancelled, otherwise undefined
    */
   async deleteColumns(table: string, columns: string[]): Promise<{ cancelled: boolean } | void> {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
@@ -260,8 +257,8 @@ export class HostBridge implements ToastService {
 
     // Check for dependent indexes before deletion
     let dependentIndexes: string[] = [];
-    if ('findDependentIndexes' in document.databaseOperations) {
-      dependentIndexes = await document.databaseOperations.findDependentIndexes(table, columns);
+    if ('findDependentIndexes' in dbOps) {
+      dependentIndexes = await dbOps.findDependentIndexes(table, columns);
     }
 
     // If there are dependent indexes, ask the user for confirmation
@@ -289,14 +286,14 @@ export class HostBridge implements ToastService {
     let deletedColumnsData: { name: string; type: string; data: { rowId: RecordId; value: CellValue }[] }[] = [];
     try {
         // Get column types first
-        const tableInfo = await document.databaseOperations.getTableInfo(table);
+        const tableInfo = await dbOps.getTableInfo(table);
         const colMap = new Map(tableInfo.map(c => [c.identifier, c.declaredType]));
 
         // Fetch data for all columns in a single query to avoid N+1 query overhead
         if (columns.length > 0) {
             const escapedCols = columns.map(col => escapeIdentifier(col)).join(', ');
             const sql = `SELECT rowid, ${escapedCols} FROM ${escapeIdentifier(table)}`;
-            const result = await document.databaseOperations.executeQuery(sql);
+            const result = await dbOps.executeQuery(sql);
 
             if (result && result.length > 0 && result[0].rows) {
                 const rows = result[0].rows;
@@ -332,9 +329,9 @@ export class HostBridge implements ToastService {
         // Proceed with deletion even if history capture fails, but warn
     }
 
-    if ('deleteColumns' in document.databaseOperations) {
+    if ('deleteColumns' in dbOps) {
       // Pass dependent indexes to be dropped first if user confirmed
-      await document.databaseOperations.deleteColumns(table, columns, dependentIndexes.length > 0 ? dependentIndexes : undefined);
+      await dbOps.deleteColumns(table, columns, dependentIndexes.length > 0 ? dependentIndexes : undefined);
     } else {
       throw new Error("Backend does not support deleteColumns");
     }
@@ -353,17 +350,14 @@ export class HostBridge implements ToastService {
    * Create a new table.
    */
   async createTable(table: string, columns: import('./core/types').ColumnDefinition[]) {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
 
-    if ('createTable' in document.databaseOperations) {
-      await document.databaseOperations.createTable(table, columns);
+    if ('createTable' in dbOps) {
+      await dbOps.createTable(table, columns);
     } else {
       throw new Error("Backend does not support createTable");
     }
@@ -382,17 +376,14 @@ export class HostBridge implements ToastService {
    * Update multiple cells in batch.
    */
   async updateCellBatch(table: string, updates: CellUpdate[], label: string) {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
 
-    if ('updateCellBatch' in document.databaseOperations) {
-      await document.databaseOperations.updateCellBatch(table, updates);
+    if ('updateCellBatch' in dbOps) {
+      await dbOps.updateCellBatch(table, updates);
     } else {
       // Fallback: execute updates in parallel
       await Promise.all(updates.map(async update => {
@@ -406,7 +397,7 @@ export class HostBridge implements ToastService {
           patch = this.tryGeneratePatch(update.value, update.originalValue);
         }
 
-        await document.databaseOperations.updateCell(table, update.rowId, update.column, val, patch);
+        await dbOps.updateCell(table, update.rowId, update.column, val, patch);
       }));
     }
 
@@ -429,17 +420,14 @@ export class HostBridge implements ToastService {
    * Add a new column to a table.
    */
   async addColumn(table: string, column: string, type: string, defaultValue?: string) {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
 
-    if ('addColumn' in document.databaseOperations) {
-      await document.databaseOperations.addColumn(table, column, type, defaultValue);
+    if ('addColumn' in dbOps) {
+      await dbOps.addColumn(table, column, type, defaultValue);
     } else {
       throw new Error("Backend does not support addColumn");
     }
@@ -459,13 +447,10 @@ export class HostBridge implements ToastService {
    * Fetch table data (SELECT).
    */
   async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
-    if ('fetchTableData' in document.databaseOperations) {
-      return await document.databaseOperations.fetchTableData(table, options);
+    if ('fetchTableData' in dbOps) {
+      return await dbOps.fetchTableData(table, options);
     } else {
       throw new Error("Backend does not support fetchTableData");
     }
@@ -475,13 +460,10 @@ export class HostBridge implements ToastService {
    * Fetch table count (SELECT COUNT(*)).
    */
   async fetchTableCount(table: string, options: TableCountOptions): Promise<number> {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
-    if ('fetchTableCount' in document.databaseOperations) {
-      return await document.databaseOperations.fetchTableCount(table, options);
+    if ('fetchTableCount' in dbOps) {
+      return await dbOps.fetchTableCount(table, options);
     } else {
       throw new Error("Backend does not support fetchTableCount");
     }
@@ -491,13 +473,10 @@ export class HostBridge implements ToastService {
    * Fetch schema (tables, views, indexes).
    */
   async fetchSchema(): Promise<SchemaSnapshot> {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
-    if ('fetchSchema' in document.databaseOperations) {
-      return await document.databaseOperations.fetchSchema();
+    if ('fetchSchema' in dbOps) {
+      return await dbOps.fetchSchema();
     } else {
       throw new Error("Backend does not support fetchSchema");
     }
@@ -507,13 +486,10 @@ export class HostBridge implements ToastService {
    * Get table columns metadata.
    */
   async getTableInfo(table: string): Promise<ColumnMetadata[]> {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
-    if ('getTableInfo' in document.databaseOperations) {
-      return await document.databaseOperations.getTableInfo(table);
+    if ('getTableInfo' in dbOps) {
+      return await dbOps.getTableInfo(table);
     } else {
       throw new Error("Backend does not support getTableInfo");
     }
@@ -523,13 +499,10 @@ export class HostBridge implements ToastService {
    * Get database PRAGMA settings.
    */
   async getPragmas(): Promise<Record<string, CellValue>> {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
-    if ('getPragmas' in document.databaseOperations) {
-      return await document.databaseOperations.getPragmas();
+    if ('getPragmas' in dbOps) {
+      return await dbOps.getPragmas();
     } else {
       throw new Error("Backend does not support getPragmas");
     }
@@ -539,17 +512,14 @@ export class HostBridge implements ToastService {
    * Set database PRAGMA value.
    */
   async setPragma(pragma: string, value: CellValue): Promise<void> {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
+    const dbOps = this.ensureDatabaseInitialized();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
 
-    if ('setPragma' in document.databaseOperations) {
-      await document.databaseOperations.setPragma(pragma, value);
+    if ('setPragma' in dbOps) {
+      await dbOps.setPragma(pragma, value);
     } else {
       throw new Error("Backend does not support setPragma");
     }
@@ -561,55 +531,40 @@ export class HostBridge implements ToastService {
    * Apply edits to the database.
    */
   async applyEdits(edits: ModificationEntry[], signal?: AbortSignal) {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
-    return document.databaseOperations.applyModifications(edits, signal);
+    const dbOps = this.ensureDatabaseInitialized();
+    return dbOps.applyModifications(edits, signal);
   }
 
   /**
    * Undo a database edit.
    */
   async undo(edit: ModificationEntry) {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
-    return document.databaseOperations.undoModification(edit);
+    const dbOps = this.ensureDatabaseInitialized();
+    return dbOps.undoModification(edit);
   }
 
   /**
    * Redo a database edit.
    */
   async redo(edit: ModificationEntry) {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
-    return document.databaseOperations.redoModification(edit);
+    const dbOps = this.ensureDatabaseInitialized();
+    return dbOps.redoModification(edit);
   }
 
   /**
    * Commit changes to the database.
    */
   async commit(signal?: AbortSignal) {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
-    return document.databaseOperations.flushChanges(signal);
+    const dbOps = this.ensureDatabaseInitialized();
+    return dbOps.flushChanges(signal);
   }
 
   /**
    * Rollback changes to the database.
    */
   async rollback(edits: ModificationEntry[], signal?: AbortSignal) {
-    const { document } = this;
-    if (!document.databaseOperations) {
-      throw new Error("Database not initialized");
-    }
-    return document.databaseOperations.discardModifications(edits, signal);
+    const dbOps = this.ensureDatabaseInitialized();
+    return dbOps.discardModifications(edits, signal);
   }
 
   /**
