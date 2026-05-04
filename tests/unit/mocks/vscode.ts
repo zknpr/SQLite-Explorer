@@ -13,6 +13,9 @@ class classEventEmitter {
 }
 
 export const mockVscode = {
+    extensions: {
+        getExtension: () => ({ extensionKind: 2 })
+    },
     Uri: {
         parse: (path: string) => {
             // Simple mock: assumes path starts with scheme or is just a path string

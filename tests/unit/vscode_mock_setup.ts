@@ -1,14 +1,21 @@
-
 import Module from 'module';
 import { mockVscode } from './mocks/vscode';
 
-// @ts-ignore
-const originalLoad = Module._load;
+(mockVscode as any).extensions = {
+    getExtension: () => ({ extensionKind: 2 })
+};
 
-// @ts-ignore
-Module._load = function (request, parent, isMain) {
+// We must also mock workerFactory globally so any import from any module will grab the mock
+// before TSX tries to transform it and eval it.
+const originalLoad = (Module as any)._load;
+(Module as any)._load = function (request: string, parent: any, isMain: boolean) {
     if (request === 'vscode') {
         return mockVscode;
+    }
+    if (request.includes('workerFactory')) {
+        return {
+            createDatabaseConnection: () => {}
+        };
     }
     return originalLoad(request, parent, isMain);
 };
