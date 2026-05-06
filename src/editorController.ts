@@ -35,9 +35,7 @@ type VSCODE_ENV = {
   appHost: string,
   uriScheme: string,
   extensionUrl: string,
-  accessToken?: string,
   uiKind?: 'desktop' | 'web',
-  machineId: string,
   firstInstall?: string,
   sidebarLeft?: string
   sidebarRight?: string
@@ -264,9 +262,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       webviewId,
       browserExt: toBoolString(!!import.meta.env.VSCODE_BROWSER_EXT),
       uriScheme, appHost, appName, extensionUrl,
-      accessToken: this.accessToken,
       uiKind: uiKindToString(uiKind),
-      machineId: vsc.env.machineId,
       firstInstall: doTry(() => new Date(this.context.globalState.get<number>(FirstInstallMs) ?? Date.now()).toISOString()),
       sidebarLeft: this.context.globalState.get<number>(SidebarLeft)?.toString(),
       sidebarRight: this.context.globalState.get<number>(SidebarRight)?.toString(),
