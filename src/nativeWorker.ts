@@ -45,6 +45,38 @@ import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 
 // Utility functions moved to src/core/sql-utils.ts
 
+/**
+ * Build a minimal env block for the txiki-js child process.
+ *
+ * Goals:
+ *   1. Drop secrets that may be present in the parent's env (AWS_*, GH_TOKEN,
+ *      shell history paths, etc.) — the txiki-js worker has no need for them.
+ *   2. Keep the variables the OS itself needs to spawn and run the binary,
+ *      otherwise the worker fails to start in production environments.
+ *
+ * Windows: SystemRoot is required for kernel/DLL resolution; TEMP/TMP for
+ * tmpfile() and any temporary export paths; PATH for any spawned subprocess
+ * the runtime might invoke. Stripping SystemRoot is a documented cause of
+ * "DLL initialization failed" on win32 child processes.
+ *
+ * POSIX: HOME for any tilde expansion the runtime does internally; TMPDIR
+ * for tmpfile()/VACUUM INTO export paths (e.g., /tmp on Linux/macOS by
+ * default — not present on minimal containers); TZ + LANG/LC_ALL for ICU
+ * collation when the worker runs SQLite collations sensitive to locale.
+ */
+function buildSpawnEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  const allowList = process.platform === 'win32'
+    ? ['SystemRoot', 'TEMP', 'TMP', 'PATH', 'PATHEXT']
+    : ['HOME', 'TMPDIR', 'TZ', 'LANG', 'LC_ALL', 'LC_CTYPE'];
+
+  for (const key of allowList) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -165,7 +197,7 @@ class NativeWorkerProcess {
       // Spawn txiki-js with the worker script
       this.process = spawn(this.binaryPath, ['run', this.workerScript], {
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: {},
+        env: buildSpawnEnv(),
         shell: false
       });
 
