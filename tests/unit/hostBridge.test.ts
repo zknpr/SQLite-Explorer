@@ -11,6 +11,29 @@ describe('HostBridge', () => {
         mock.reset();
     });
 
+    it('saveFile should prevent path traversal by stripping directory components from filename', async () => {
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///dbDir/test.db'),
+            documentKey: Promise.resolve('test-key'),
+        };
+
+        const mockProvider = { webviews: new Map(), context: {} };
+        const bridge = new HostBridge(mockProvider as any, mockDocument as any);
+
+        const showSaveDialogMock = mock.method(vscode.window, 'showSaveDialog', async () => vscode.Uri.parse('file:///dbDir/safe.txt'));
+        const writeFileMock = mock.method(vscode.workspace.fs, 'writeFile', async () => {});
+
+        await bridge.saveFile('../../../etc/passwd', new Uint8Array([1, 2, 3]));
+
+        assert.strictEqual(showSaveDialogMock.mock.callCount(), 1);
+        const args = showSaveDialogMock.mock.calls[0].arguments[0];
+        // The defaultUri path should end with the base name 'passwd', not the traversed path
+        assert.ok(args.defaultUri.path.endsWith('/dbDir/passwd'), `Expected safe path, got ${args.defaultUri.path}`);
+
+        assert.strictEqual(writeFileMock.mock.callCount(), 1);
+    });
+
+
     it('openCellEditor should open correct URI for binary file with mime type', async () => {
         const executeCommandMock = mock.method(vscode.commands, 'executeCommand', async () => {});
 
