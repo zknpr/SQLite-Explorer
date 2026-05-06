@@ -10,18 +10,62 @@ import { processProtocolMessage } from "./core/rpc";
 import { createWorkerEndpoint } from "./core/sqlite-db";
 
 // ============================================================================
-// Worker Logging
+// Worker Logic
 // ============================================================================
 
 /**
  * Send a log message to the host via RPC.
  * Falls back to console if no parent port is available.
  */
-function log(level: 'log' | 'warn' | 'error', ...args: unknown[]) {
-  if (parentPort) {
-    parentPort.postMessage({ kind: 'log', level, args: args.map(a => a instanceof Error ? a.message : a) });
+function log(port: any, level: 'log' | 'warn' | 'error', ...args: unknown[]) {
+  if (port) {
+    port.postMessage({ kind: 'log', level, args: args.map((a: any) => a instanceof Error ? a.message : a) });
   } else {
     console[level](...args);
+  }
+}
+
+/**
+ * Sets up the worker message handlers.
+ * Extracted as a function to enable unit testing without module loader side effects.
+ */
+export function setupWorkerMessageHandlers(port: any, endpoint: Record<string, (...args: unknown[]) => unknown>) {
+  log(port, 'log', '[DatabaseWorker] Starting...');
+
+  if (port) {
+    /**
+     * Handle incoming messages from the extension host.
+     * Uses the IPC protocol for request/response communication.
+     */
+    port.on('message', (envelope: unknown) => {
+      // Process RPC messages and dispatch to endpoint methods
+      const wasHandled = processProtocolMessage(
+        envelope,
+        endpoint,
+        (response, transfer) => {
+          port.postMessage(response, transfer);
+        }
+      );
+
+      // Log unhandled messages for debugging
+      if (!wasHandled) {
+        const msg = envelope as { kind?: string };
+        if (msg?.kind !== 'result') {
+          log(port, 'warn', '[DatabaseWorker] Unrecognized message:', msg?.kind);
+        }
+      }
+    });
+
+    /**
+     * Handle port errors.
+     */
+    port.on('error', (err: Error) => {
+      log(port, 'error', '[DatabaseWorker] Port error:', err.message);
+    });
+
+    log(port, 'log', '[DatabaseWorker] Ready for connections');
+  } else {
+    console.error('[DatabaseWorker] No parent port - invalid execution context');
   }
 }
 
@@ -29,54 +73,13 @@ function log(level: 'log' | 'warn' | 'error', ...args: unknown[]) {
 // Worker Initialization
 // ============================================================================
 
-log('log', '[DatabaseWorker] Starting...');
-
-// Create the endpoint that handles database operations
-const databaseEndpoint = createWorkerEndpoint();
-
-// ============================================================================
-// Message Handler
-// ============================================================================
-
-/**
- * The worker exposes these methods to the extension host:
- *
- * - initializeDatabase: Load database from binary content
- * - runQuery: Execute SQL statements
- * - exportDatabase: Serialize database to binary
- */
-if (parentPort) {
-  /**
-   * Handle incoming messages from the extension host.
-   * Uses the IPC protocol for request/response communication.
-   */
-  parentPort.on('message', (envelope: unknown) => {
-    // Process RPC messages and dispatch to endpoint methods
-    const wasHandled = processProtocolMessage(
-      envelope,
-      databaseEndpoint as Record<string, (...args: unknown[]) => unknown>,
-      (response, transfer) => {
-        parentPort!.postMessage(response, transfer);
-      }
-    );
-
-    // Log unhandled messages for debugging
-    if (!wasHandled) {
-      const msg = envelope as { kind?: string };
-      if (msg?.kind !== 'result') {
-        log('warn', '[DatabaseWorker] Unrecognized message:', msg?.kind);
-      }
-    }
-  });
-
-  /**
-   * Handle port errors.
-   */
-  parentPort.on('error', (err: Error) => {
-    log('error', '[DatabaseWorker] Port error:', err.message);
-  });
-
-  log('log', '[DatabaseWorker] Ready for connections');
-} else {
-  console.error('[DatabaseWorker] No parent port - invalid execution context');
+// Only execute the wiring if we are actually running inside a worker
+// (or if we intentionally bypass this check in the future).
+// During unit tests, `parentPort` might be null or undefined depending on the environment,
+// but we avoid executing this top-level effect by checking if we are a worker thread.
+if (typeof process !== 'undefined' && process.env.NODE_ENV !== 'test') {
+  setupWorkerMessageHandlers(parentPort, createWorkerEndpoint() as Record<string, (...args: unknown[]) => unknown>);
+} else if (typeof process === 'undefined') {
+  // Browser environment worker
+  setupWorkerMessageHandlers(parentPort, createWorkerEndpoint() as Record<string, (...args: unknown[]) => unknown>);
 }
