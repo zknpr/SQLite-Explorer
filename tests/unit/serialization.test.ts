@@ -1,9 +1,39 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { serializeValue, deserializeValue, uint8ArrayToBase64, base64ToUint8Array } from '../../src/core/serialization';
+import { serializeValue, deserializeValue, deserializeArgs, uint8ArrayToBase64, base64ToUint8Array } from '../../src/core/serialization';
 
 describe('RPC Serialization', () => {
+
+    describe('deserializeArgs', () => {
+        it('should correctly deserialize an array of arguments', () => {
+            const args = [
+                1,
+                { __type: 'Uint8Array', base64: uint8ArrayToBase64(new Uint8Array([1, 2])) },
+                "test"
+            ];
+            const result = deserializeArgs(args);
+            assert.strictEqual(result.length, 3);
+            assert.strictEqual(result[0], 1);
+            assert.ok(result[1] instanceof Uint8Array);
+            assert.deepStrictEqual(result[1], new Uint8Array([1, 2]));
+            assert.strictEqual(result[2], "test");
+        });
+
+        it('should correctly deserialize an empty array of arguments', () => {
+            const result = deserializeArgs([]);
+            assert.strictEqual(result.length, 0);
+        });
+    });
+
     describe('Uint8Array', () => {
+        it('should encode and decode empty Uint8Array correctly', () => {
+            const original = new Uint8Array([]);
+            const base64 = uint8ArrayToBase64(original);
+            assert.strictEqual(base64, '');
+            const decoded = base64ToUint8Array(base64);
+            assert.deepStrictEqual(decoded, original);
+        });
+
         it('should encode and decode Uint8Array correctly', () => {
             const original = new Uint8Array([1, 2, 3, 255]);
             const base64 = uint8ArrayToBase64(original);
@@ -80,7 +110,52 @@ describe('RPC Serialization', () => {
         });
     });
 
+
+    describe('deserializeValue edge cases', () => {
+        it('should ignore marker objects with extra keys (Base64 format)', () => {
+            const marker = { __type: 'Uint8Array', base64: Buffer.from([1, 2]).toString('base64'), extra: 123 };
+            const result = deserializeValue(marker) as any;
+            assert.ok(!(result instanceof Uint8Array), 'extra-key marker must NOT be deserialized as Uint8Array (security invariant)');
+            assert.strictEqual(result.__type, 'Uint8Array');
+            assert.strictEqual(result.extra, 123);
+        });
+
+        it('should ignore marker objects with extra keys (legacy array format)', () => {
+            const marker = { __type: 'Uint8Array', data: [1, 2], extra: 123 };
+            const result = deserializeValue(marker) as any;
+            assert.ok(!(result instanceof Uint8Array), 'extra-key legacy marker must NOT be deserialized as Uint8Array (security invariant)');
+            assert.strictEqual(result.__type, 'Uint8Array');
+            assert.strictEqual(result.extra, 123);
+        });
+
+        it('should handle primitives', () => {
+            assert.strictEqual(deserializeValue(123), 123);
+            assert.strictEqual(deserializeValue("test"), "test");
+            assert.strictEqual(deserializeValue(null), null);
+            assert.strictEqual(deserializeValue(undefined), undefined);
+        });
+    });
+
+    describe('deserializeValue more edge cases', () => {
+        it('should handle array of primitives', () => {
+             const result = deserializeValue([1, 2, 3]);
+             assert.deepStrictEqual(result, [1, 2, 3]);
+        });
+        it('should ignore marker objects with missing base64 key', () => {
+            const marker = { __type: 'Uint8Array', other: 'test' };
+            const result = deserializeValue(marker) as any;
+            assert.ok(!(result instanceof Uint8Array), 'missing-base64 marker must NOT be deserialized as Uint8Array (security invariant)');
+            assert.strictEqual(result.__type, 'Uint8Array');
+        });
+        it('should handle custom objects gracefully', () => {
+            const date = new Date();
+            const dateRes = serializeValue(date);
+            assert.strictEqual(dateRes, date);
+        });
+    });
+
     describe('deserializeValue', () => {
+
         it('should deserialize marker object to Uint8Array', () => {
             const marker = { __type: 'Uint8Array', base64: Buffer.from([1, 2]).toString('base64') };
             const result = deserializeValue(marker);
