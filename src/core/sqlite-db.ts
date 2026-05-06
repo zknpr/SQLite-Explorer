@@ -467,7 +467,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
             let currentObj = {};
             if (typeof currentValue === 'string') {
-                try { currentObj = JSON.parse(currentValue); } catch {}
+                try { currentObj = JSON.parse(currentValue); } catch (e) { console.warn('Failed to parse current JSON value for patching (updateCell)', e); }
             } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
                 currentObj = currentValue;
             }
@@ -777,7 +777,7 @@ class WasmDatabaseEngine implements DatabaseOperations {
 
                      let currentObj = {};
                      if (typeof currentValue === 'string') {
-                         try { currentObj = JSON.parse(currentValue); } catch {}
+                         try { currentObj = JSON.parse(currentValue); } catch (e) { console.warn('Failed to parse current JSON value for patching (updateCells)', e); }
                      }
 
                      const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
