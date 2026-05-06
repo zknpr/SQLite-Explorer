@@ -115,6 +115,7 @@ describe('RPC Serialization', () => {
         it('should ignore marker objects with extra keys (Base64 format)', () => {
             const marker = { __type: 'Uint8Array', base64: Buffer.from([1, 2]).toString('base64'), extra: 123 };
             const result = deserializeValue(marker) as any;
+            assert.ok(!(result instanceof Uint8Array), 'extra-key marker must NOT be deserialized as Uint8Array (security invariant)');
             assert.strictEqual(result.__type, 'Uint8Array');
             assert.strictEqual(result.extra, 123);
         });
@@ -122,6 +123,7 @@ describe('RPC Serialization', () => {
         it('should ignore marker objects with extra keys (legacy array format)', () => {
             const marker = { __type: 'Uint8Array', data: [1, 2], extra: 123 };
             const result = deserializeValue(marker) as any;
+            assert.ok(!(result instanceof Uint8Array), 'extra-key legacy marker must NOT be deserialized as Uint8Array (security invariant)');
             assert.strictEqual(result.__type, 'Uint8Array');
             assert.strictEqual(result.extra, 123);
         });
@@ -142,6 +144,7 @@ describe('RPC Serialization', () => {
         it('should ignore marker objects with missing base64 key', () => {
             const marker = { __type: 'Uint8Array', other: 'test' };
             const result = deserializeValue(marker) as any;
+            assert.ok(!(result instanceof Uint8Array), 'missing-base64 marker must NOT be deserialized as Uint8Array (security invariant)');
             assert.strictEqual(result.__type, 'Uint8Array');
         });
         it('should handle custom objects gracefully', () => {
