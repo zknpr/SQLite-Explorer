@@ -211,7 +211,7 @@ export function buildMethodProxy<T extends object>(
 /**
  * Handler map type for local method implementations.
  */
-type MethodImplementations = Record<string, (...args: any[]) => unknown>;
+type MethodImplementations = Record<string, (...args: unknown[]) => unknown>;
 
 /**
  * Response dispatcher type.
