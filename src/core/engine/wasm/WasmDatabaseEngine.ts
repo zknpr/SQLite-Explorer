@@ -301,7 +301,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           const stmt = this.instance.prepare(sql);
           try {
             for (const [rId, rowObj] of rowUpdates.entries()) {
-              const params: any[] = deletedColumns.map(c => rowObj[c.name] ?? null);
+              const params: unknown[] = deletedColumns.map(c => rowObj[c.name] ?? null);
               params.push(rId);
               stmt.run(params);
             }
