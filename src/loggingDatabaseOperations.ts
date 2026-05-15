@@ -57,14 +57,14 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
 
     // Constrain T to only callable (function) members of DatabaseOperations,
     // excluding non-function properties like `engineKind` (which is a Promise).
-    private async logAndDelegate<T extends { [K in keyof DatabaseOperations]: DatabaseOperations[K] extends (...args: any) => any ? K : never }[keyof DatabaseOperations]>(
+    private async logAndDelegate<T extends { [K in keyof DatabaseOperations]: DatabaseOperations[K] extends (...args: never[]) => unknown ? K : never }[keyof DatabaseOperations]>(
         message: string,
         isWrite: boolean,
         method: T,
-        ...args: Parameters<Extract<DatabaseOperations[T], (...args: any) => any>>
-    ): Promise<ReturnType<Extract<DatabaseOperations[T], (...args: any) => any>>> {
+        ...args: Parameters<Extract<DatabaseOperations[T], (...args: never[]) => unknown>>
+    ): Promise<ReturnType<Extract<DatabaseOperations[T], (...args: never[]) => unknown>>> {
         this.log(message, isWrite);
-        return (this.wrapped[method] as any)(...args);
+        return (this.wrapped[method] as (...args: unknown[]) => unknown)(...args) as ReturnType<Extract<DatabaseOperations[T], (...args: never[]) => unknown>>;
     }
 
     private log(message: string, isWrite: boolean = false) {
