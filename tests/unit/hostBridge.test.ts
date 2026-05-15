@@ -120,4 +120,31 @@ describe('HostBridge', () => {
         const uri = args[1];
         assert.ok(uri.path.endsWith('.txt'), `Path should end with .txt, got ${uri.path}`);
     });
+
+    it('should catch and log error if fetch rows for undo history fails in deleteRows', async () => {
+        const consoleWarnMock = mock.method(console, 'warn', () => {});
+        const error = new Error('Database disconnected');
+        const dbOps = {
+            executeQuery: mock.fn(async () => { throw error; }),
+            deleteRows: mock.fn(async () => {})
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            recordExternalModification: mock.fn(),
+        };
+        const mockProvider = { webviews: new Map(), context: {} };
+        const bridge = new HostBridge(mockProvider as any, mockDocument as any);
+        bridge.ensureDatabaseInitialized = () => dbOps as any;
+
+        await bridge.deleteRows('table1', [1]);
+
+        assert.strictEqual(consoleWarnMock.mock.callCount(), 1);
+        assert.deepStrictEqual(consoleWarnMock.mock.calls[0].arguments, [
+            'Failed to fetch rows for undo history:',
+            error
+        ]);
+
+        assert.strictEqual(dbOps.deleteRows.mock.callCount(), 1);
+    });
 });
