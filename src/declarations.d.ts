@@ -1,24 +1,26 @@
 declare module 'sql.js' {
+  export type SqlValue = number | string | Uint8Array | null;
+
   export interface Database {
-    run(sql: string, params?: any[]): void;
-    exec(sql: string, params?: any[]): QueryResults[];
-    prepare(sql: string, params?: any[]): Statement;
+    run(sql: string, params?: SqlValue[]): void;
+    exec(sql: string, params?: SqlValue[]): QueryResults[];
+    prepare(sql: string, params?: SqlValue[]): Statement;
     export(): Uint8Array;
     close(): void;
   }
 
   export interface QueryResults {
     columns: string[];
-    values: any[][];
+    values: SqlValue[][];
   }
 
   export interface Statement {
-    bind(values: any[]): boolean;
+    bind(values: SqlValue[]): boolean;
     step(): boolean;
-    get(params?: any[]): any[];
+    get(params?: SqlValue[]): SqlValue[];
     getColumnNames(): string[];
-    getAsObject(params?: any[]): any;
-    run(params?: any[]): void;
+    getAsObject(params?: SqlValue[]): Record<string, SqlValue>;
+    run(params?: SqlValue[]): void;
     free(): void;
   }
 
