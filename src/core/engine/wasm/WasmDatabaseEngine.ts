@@ -26,6 +26,7 @@ import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from
 import { buildSelectQuery, buildCountQuery } from '../../query-builder';
 import { applyMergePatch } from '../../json-utils';
 import { getNodeFs } from '../../platform/fs';
+import { crypto } from '../../../platform/cryptoShim';
 
 // ============================================================================
 // Internal sql.js Types
@@ -64,6 +65,24 @@ const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 
 export class WasmDatabaseEngine implements DatabaseOperations {
   private readonly instance: WasmDatabaseInstance;
+
+  private async withTransaction<T>(operation: () => Promise<T>): Promise<T> {
+    const savepointName = `sp_${crypto.randomUUID().replace(/-/g, '_')}`;
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      const result = await operation();
+      await this.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
+      return result;
+    } catch (err) {
+      try {
+        await this.executeQuery(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+        await this.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
+      } catch (rollbackErr) {
+        console.warn(`Failed to rollback savepoint ${savepointName}:`, rollbackErr);
+      }
+      throw err;
+    }
+  }
   private readonly queryTimeout: number;
   /** Whether SQLite's json_patch() function is available (JSON1 extension). */
   private readonly hasJsonPatch: boolean;
@@ -270,8 +289,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const { deletedColumns } = mod;
     // Undo drop column = add column + restore values
     if (deletedColumns) {
-      await this.executeQuery('BEGIN TRANSACTION');
-      try {
+      await this.withTransaction(async () => {
         for (const col of deletedColumns) {
           await this.addColumn(targetTable, col.name, col.type);
         }
@@ -310,11 +328,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           }
         }
 
-        await this.executeQuery('COMMIT');
-      } catch (e) {
-        await this.safeRollback('undoColumnDrop');
-        throw e;
-      }
+      });
     }
   }
 
@@ -403,10 +417,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     mods: ModificationEntry[],
     _signal?: AbortSignal
   ): Promise<void> {
-    // Apply undos in reverse order (LIFO)
-    for (let i = mods.length - 1; i >= 0; i--) {
-        await this.undoModification(mods[i]);
-    }
+    await this.withTransaction(async () => {
+      // Apply undos in reverse order (LIFO)
+      for (let i = mods.length - 1; i >= 0; i--) {
+          await this.undoModification(mods[i]);
+      }
+    });
   }
 
   /**
@@ -489,8 +505,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
     if (rows.length === 0) return;
 
-    await this.executeQuery('BEGIN TRANSACTION');
-    try {
+    await this.withTransaction(async () => {
       const escapedTable = escapeIdentifier(table);
       const groups = new Map<string, { columns: string[], data: CellValue[][] }>();
 
@@ -531,11 +546,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
       }
 
-      await this.executeQuery('COMMIT');
-    } catch (e) {
-      await this.safeRollback('insertRowBatch');
-      throw e;
-    }
+    });
   }
 
   /**
@@ -617,8 +628,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
     // Now drop the columns within a single transaction for better performance
     // This avoids N+1 query transaction overhead for multiple columns
-    await this.executeQuery('BEGIN TRANSACTION');
-    try {
+    await this.withTransaction(async () => {
       // Drop specified dependent indexes first inside the transaction
       if (dropDependentIndexes && dropDependentIndexes.length > 0) {
         const dropIndexStatements = dropDependentIndexes
@@ -631,11 +641,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const sql = `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`;
         await this.executeQuery(sql);
       }
-      await this.executeQuery('COMMIT');
-    } catch (e) {
-      await this.safeRollback('deleteColumns');
-      throw e;
-    }
+    });
   }
 
   /**
@@ -677,13 +683,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
     if (updates.length === 0) return;
 
-    // Use SAVEPOINT instead of BEGIN TRANSACTION so this method can be called
-    // safely from within an outer transaction (e.g., undoColumnDrop).
-    // escapeIdentifier wraps in double quotes defensively — the generated name
-    // is already [a-zA-Z0-9_] safe, but quoting prevents issues if the pattern changes.
-    const savepointName = escapeIdentifier(`sp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
-    await this.executeQuery(`SAVEPOINT ${savepointName}`);
-    try {
+    await this.withTransaction(async () => {
       const escapedTable = escapeIdentifier(table);
       // Group updates by column and operation type
       // Prepare statements one by one avoids full re-parse
@@ -766,17 +766,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           }
       }
 
-      await this.executeQuery(`RELEASE ${savepointName}`);
-    } catch (err) {
-      try {
-        // ROLLBACK TO restores but keeps the savepoint; RELEASE removes it
-        await this.executeQuery(`ROLLBACK TO ${savepointName}`);
-        await this.executeQuery(`RELEASE ${savepointName}`);
-      } catch (rollbackErr) {
-        console.warn('Failed to rollback savepoint:', rollbackErr);
-      }
-      throw err;
-    }
+    });
   }
 
   /**
