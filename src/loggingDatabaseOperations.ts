@@ -57,14 +57,21 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
 
     // Constrain T to only callable (function) members of DatabaseOperations,
     // excluding non-function properties like `engineKind` (which is a Promise).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private async logAndDelegate<T extends { [K in keyof DatabaseOperations]: DatabaseOperations[K] extends (...args: any) => any ? K : never }[keyof DatabaseOperations]>(
         message: string,
         isWrite: boolean,
         method: T,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         ...args: Parameters<Extract<DatabaseOperations[T], (...args: any) => any>>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ): Promise<ReturnType<Extract<DatabaseOperations[T], (...args: any) => any>>> {
         this.log(message, isWrite);
-        return (this.wrapped[method] as any)(...args);
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        type AnyFunc = Extract<DatabaseOperations[T], (...args: any) => any>;
+        const targetMethod = this.wrapped[method] as unknown as (...args: Parameters<AnyFunc>) => ReturnType<AnyFunc>;
+        return targetMethod(...args);
     }
 
     private log(message: string, isWrite: boolean = false) {
