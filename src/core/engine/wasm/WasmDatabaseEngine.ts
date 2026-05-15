@@ -579,7 +579,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         // Check if this index references any of the columns
         const referencesColumn = columns.some(col => {
           // Escape regex metacharacters in column name to prevent broken patterns
-          // for names like "data[0]", "a+b", "user.name"
+          // for column names with special characters like brackets, operators, or dots
           const escaped = col.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           // Match column name in index definition (quoted or unquoted)
           const patterns = [
