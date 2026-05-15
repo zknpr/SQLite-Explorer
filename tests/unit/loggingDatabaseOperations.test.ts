@@ -115,6 +115,14 @@ describe('LoggingDatabaseOperations', () => {
             assert.ok(mockChannel.lines[0].includes('params: [[Object]]'));
         });
 
+        it('should fallback to [Object] when JSON.stringify throws', async () => {
+            const thrower = {
+                toJSON() { throw new Error('Stringify error'); }
+            };
+            await logger.executeQuery('SELECT *', [thrower as any]);
+            assert.ok(mockChannel.lines[0].includes('params: [[Object]]'));
+        });
+
         it('should pass through numbers', async () => {
             await logger.executeQuery('SELECT *', [123.45]);
             assert.ok(mockChannel.lines[0].includes('params: [123.45]'));
