@@ -1,5 +1,6 @@
 import { MessageCorrelationId, PendingInvocation, processProtocolMessage } from './core/rpc';
 import { deserializeArgs, serializeValue } from './core/serialization';
+import type { HostBridge } from './hostBridge';
 
 interface WebviewRpcInvokeMessage {
   channel: 'rpc';
@@ -44,7 +45,7 @@ const BLOCKED_METHODS = new Set(Object.getOwnPropertyNames(Object.prototype));
 export class WebviewMessageHandler {
   constructor(
     private readonly postMessage: (message: any) => PromiseLike<boolean>,
-    private readonly hostBridge: Record<string, any>,
+    private readonly hostBridge: HostBridge,
     private readonly pendingInvocations?: Map<MessageCorrelationId, PendingInvocation>
   ) {}
 
@@ -80,8 +81,8 @@ export class WebviewMessageHandler {
     // SECURITY: Block Object.prototype methods to prevent prototype pollution attacks.
     // Allow class prototype methods (e.g., HostBridge.initialize) but reject inherited
     // Object methods like 'constructor', '__defineGetter__', 'toString'.
-    if (!BLOCKED_METHODS.has(targetMethod) && typeof hostBridge[targetMethod] === 'function') {
-      const fn = hostBridge[targetMethod];
+    if (!BLOCKED_METHODS.has(targetMethod) && targetMethod in hostBridge && typeof (hostBridge as any)[targetMethod] === 'function') {
+      const fn = (hostBridge as any)[targetMethod];
       Promise.resolve(fn.apply(hostBridge, deserializedPayload))
         .then(result => {
           // Serialize result to handle Uint8Array and other typed arrays
@@ -129,8 +130,8 @@ export class WebviewMessageHandler {
   #handleLegacyRpcRequest(message: WebviewLegacyRpcMessage) {
     const hostBridge = this.hostBridge;
     // SECURITY: Same prototype pollution guard as #handleRpcInvoke
-    if (BLOCKED_METHODS.has(message.method)) return;
-    const fn = hostBridge[message.method];
+    if (BLOCKED_METHODS.has(message.method) || !(message.method in hostBridge)) return;
+    const fn = (hostBridge as any)[message.method];
     if (typeof fn === 'function') {
       Promise.resolve(fn.apply(hostBridge, deserializeArgs(message.args || [])))
         .then(result => {
