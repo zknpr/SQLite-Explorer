@@ -33,7 +33,7 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.engineKind;
     }
 
-    private sanitizeValue(value: any): string {
+    private sanitizeValue(value: unknown): string {
         if (value === null) return 'null';
         if (value === undefined) return 'undefined';
         if (typeof value === 'string') {
@@ -42,8 +42,13 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
             }
             return `"${value}"`;
         }
-        if (value instanceof Uint8Array || (typeof value === 'object' && value && 'buffer' in value)) {
-            return `[BLOB ${value.byteLength} bytes]`;
+        if (value instanceof Uint8Array || (typeof value === 'object' && value !== null && 'buffer' in value)) {
+            const byteLength = value instanceof Uint8Array
+                ? value.byteLength
+                : ('byteLength' in value && typeof (value as { byteLength: unknown }).byteLength === 'number'
+                    ? (value as { byteLength: number }).byteLength
+                    : 0);
+            return `[BLOB ${byteLength} bytes]`;
         }
         if (typeof value === 'object') {
              try {
