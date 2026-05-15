@@ -676,8 +676,11 @@ export async function createNativeDatabaseConnection(
 
             case 'column_drop':
               if (deletedColumns) {
-                  for (const col of deletedColumns) {
-                      await worker.call('run', [`ALTER TABLE ${escapeIdentifier(targetTable)} DROP COLUMN ${escapeIdentifier(col.name)}`]);
+                  const batch = deletedColumns.map(col => ({
+                      sql: `ALTER TABLE ${escapeIdentifier(targetTable)} DROP COLUMN ${escapeIdentifier(col.name)}`
+                  }));
+                  if (batch.length > 0) {
+                      await worker.call('execBatch', [batch]);
                   }
               }
               break;
