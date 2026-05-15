@@ -272,9 +272,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     if (deletedColumns) {
       await this.executeQuery('BEGIN TRANSACTION');
       try {
-        for (const col of deletedColumns) {
-          await this.addColumn(targetTable, col.name, col.type);
-        }
+        await Promise.all(
+          deletedColumns.map(col => this.addColumn(targetTable, col.name, col.type))
+        );
 
         // Optimize restoration by grouping rows that have identical column sets
         // This is done effectively by doing one UPDATE per row for all restored columns
