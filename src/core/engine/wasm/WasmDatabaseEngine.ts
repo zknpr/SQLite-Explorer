@@ -920,11 +920,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     ];
 
     const result: Record<string, CellValue> = {};
+    const query = pragmasToFetch.map(pragma => `PRAGMA ${pragma};`).join('\n');
+    const res = await this.executeQuery(query);
 
-    for (const pragma of pragmasToFetch) {
-      const res = await this.executeQuery(`PRAGMA ${pragma}`);
-      if (res[0]?.rows?.[0]) {
-        result[pragma] = res[0].rows[0][0];
+    for (let i = 0; i < pragmasToFetch.length; i++) {
+      if (res[i]?.rows?.[0]) {
+        result[pragmasToFetch[i]] = res[i].rows[0][0];
       }
     }
 
