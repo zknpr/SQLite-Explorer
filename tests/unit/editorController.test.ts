@@ -1,6 +1,6 @@
 import './vscode_mock_setup';
 
-import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
+import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { mockVscode } from './mocks/vscode';
 
@@ -36,7 +36,7 @@ describe('registerEditorProvider', () => {
 
     beforeEach(() => {
         calls = [];
-        originalRegister = mockVscode.window.registerCustomEditorProvider;
+        originalRegister = (mockVscode.window as any).registerCustomEditorProvider;
         (mockVscode.window as any).registerCustomEditorProvider = (
             viewType: string,
             provider: unknown,
