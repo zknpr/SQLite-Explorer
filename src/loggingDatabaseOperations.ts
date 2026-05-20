@@ -33,7 +33,7 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.engineKind;
     }
 
-    private sanitizeValue(value: any): string {
+    private sanitizeValue(value: unknown): string {
         if (value === null) return 'null';
         if (value === undefined) return 'undefined';
         if (typeof value === 'string') {
@@ -42,8 +42,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
             }
             return `"${value}"`;
         }
-        if (value instanceof Uint8Array || (typeof value === 'object' && value && 'buffer' in value)) {
-            return `[BLOB ${value.byteLength} bytes]`;
+        if (value instanceof Uint8Array || (typeof value === 'object' && value !== null && 'buffer' in value)) {
+            return `[BLOB ${(value as { byteLength?: number }).byteLength ?? 0} bytes]`;
         }
         if (typeof value === 'object') {
              try {
@@ -57,14 +57,15 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
 
     // Constrain T to only callable (function) members of DatabaseOperations,
     // excluding non-function properties like `engineKind` (which is a Promise).
-    private async logAndDelegate<T extends { [K in keyof DatabaseOperations]: DatabaseOperations[K] extends (...args: any) => any ? K : never }[keyof DatabaseOperations]>(
+    private async logAndDelegate<T extends { [K in keyof DatabaseOperations]: DatabaseOperations[K] extends (...args: never[]) => unknown ? K : never }[keyof DatabaseOperations]>(
         message: string,
         isWrite: boolean,
         method: T,
-        ...args: Parameters<Extract<DatabaseOperations[T], (...args: any) => any>>
-    ): Promise<ReturnType<Extract<DatabaseOperations[T], (...args: any) => any>>> {
+        ...args: Parameters<Extract<DatabaseOperations[T], (...args: never[]) => unknown>>
+    ): Promise<ReturnType<Extract<DatabaseOperations[T], (...args: never[]) => unknown>>> {
         this.log(message, isWrite);
-        return (this.wrapped[method] as any)(...args);
+        const func = this.wrapped[method] as unknown as (...args: unknown[]) => unknown;
+        return func(...args) as ReturnType<Extract<DatabaseOperations[T], (...args: never[]) => unknown>>;
     }
 
     private log(message: string, isWrite: boolean = false) {
