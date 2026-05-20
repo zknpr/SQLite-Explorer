@@ -13,7 +13,7 @@ describe('WebviewMessageHandler', () => {
             return true;
         };
 
-        const handler = new WebviewMessageHandler(postMessage, hostBridge);
+        const handler = new WebviewMessageHandler(postMessage, hostBridge as unknown as import('../../src/hostBridge').HostBridge);
 
         handler.handleMessage({
             channel: 'rpc',
@@ -51,7 +51,7 @@ describe('WebviewMessageHandler', () => {
             return true;
         };
 
-        const handler = new WebviewMessageHandler(postMessage, hostBridge);
+        const handler = new WebviewMessageHandler(postMessage, hostBridge as unknown as import('../../src/hostBridge').HostBridge);
 
         handler.handleMessage({
             channel: 'rpc',
@@ -77,7 +77,7 @@ describe('WebviewMessageHandler', () => {
             return true;
         };
 
-        const handler = new WebviewMessageHandler(postMessage, hostBridge);
+        const handler = new WebviewMessageHandler(postMessage, hostBridge as unknown as import('../../src/hostBridge').HostBridge);
 
         handler.handleMessage({
             type: 'rpc-request',
