@@ -1,7 +1,7 @@
 import './vscode_mock_setup';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
-import { getUriParts, doTry, themeToCss } from '../../src/helpers';
+import { getUriParts, doTry, themeToCss, uiKindToString } from '../../src/helpers';
 import * as vsc from 'vscode';
 
 describe('getUriParts', () => {
@@ -111,5 +111,15 @@ describe('doTry', () => {
     assert.strictEqual(result, undefined);
     assert.strictEqual(warnMessages.length, 1);
     assert.deepStrictEqual(warnMessages[0], ['[SQLite Explorer]', 'string error']);
+  });
+});
+
+describe('uiKindToString', () => {
+  it('should return "web" for Web UIKind', () => {
+    assert.strictEqual(uiKindToString(vsc.UIKind.Web), 'web');
+  });
+
+  it('should return "desktop" for Desktop UIKind', () => {
+    assert.strictEqual(uiKindToString(vsc.UIKind.Desktop), 'desktop');
   });
 });
