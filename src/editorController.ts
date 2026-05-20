@@ -189,7 +189,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     const pendingMap = webviewBridge.__pendingInvocations;
     const messageHandler = new WebviewMessageHandler(
       (msg) => webviewPanel.webview.postMessage(msg),
-      document.hostBridge as any,
+      document.hostBridge,
       pendingMap
     );
     webviewPanel.webview.onDidReceiveMessage((message) => messageHandler.handleMessage(message));
