@@ -120,12 +120,12 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             // Try to decode as UTF-8
             try {
                 // We strictly try to decode as UTF-8. If the content contains invalid UTF-8 sequences,
-                // the TextDecoder with { fatal: true } will throw, and we will fall back to treating it as a BLOB.
-                // This allows saving text containing null bytes (which are valid in UTF-8/SQL TEXT)
+                // the TextDecoder with 'fatal: true' will throw, and we will fall back to treating it as a BLOB.
+                // This allows saving text containing null bytes, which are valid in UTF-8/SQL TEXT,
                 // while correctly handling actual binary data.
                 value = new TextDecoder('utf-8', { fatal: true }).decode(content);
             } catch {
-                // Keep as Uint8Array (BLOB)
+                // Keep as Uint8Array, treating as BLOB
             }
 
             await document.databaseOperations.updateCell(table, rowIdNum, column, value);
