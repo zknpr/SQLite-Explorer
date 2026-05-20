@@ -584,8 +584,9 @@ export async function createNativeDatabaseConnection(
                     // 1. Add columns back
                     for (const col of deletedColumns) {
                         validateSqlType(col.type); // Validate type
-                        // We can't batch DDL usually, so run immediately
-                        await worker.call('run', [`ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(col.name)} ${col.type}`]);
+                        batch.push({
+                            sql: `ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(col.name)} ${col.type}`
+                        });
                     }
                     // 2. Restore values
                     for (const col of deletedColumns) {
@@ -676,8 +677,12 @@ export async function createNativeDatabaseConnection(
 
             case 'column_drop':
               if (deletedColumns) {
+                  const batch = [];
                   for (const col of deletedColumns) {
-                      await worker.call('run', [`ALTER TABLE ${escapeIdentifier(targetTable)} DROP COLUMN ${escapeIdentifier(col.name)}`]);
+                      batch.push({ sql: `ALTER TABLE ${escapeIdentifier(targetTable)} DROP COLUMN ${escapeIdentifier(col.name)}` });
+                  }
+                  if (batch.length > 0) {
+                      await worker.call('execBatch', [batch]);
                   }
               }
               break;
