@@ -875,7 +875,7 @@ export class HostBridge implements ToastService {
         if (data instanceof Uint8Array) {
             buffer = data;
         } else {
-            buffer = new Uint8Array(data.buffer || (data as any), data.byteOffset, data.byteLength);
+            buffer = new Uint8Array(data.buffer || (data as unknown as ArrayBufferLike), data.byteOffset, data.byteLength);
         }
         await vsc.workspace.fs.writeFile(uri, buffer);
     }
