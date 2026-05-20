@@ -382,23 +382,36 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
+    // Ensure all updates try to generate patches for efficiency
+    const processedUpdates = updates.map(update => {
+      if (update.operation !== 'json_patch') {
+        const patch = this.tryGeneratePatch(update.value, update.originalValue);
+        if (patch) {
+          return {
+            ...update,
+            operation: 'json_patch' as const,
+            value: patch
+          };
+        }
+      }
+      return update;
+    });
+
     if ('updateCellBatch' in dbOps) {
-      await dbOps.updateCellBatch(table, updates);
+      await dbOps.updateCellBatch(table, processedUpdates);
     } else {
-      // Fallback: execute updates in parallel
-      await Promise.all(updates.map(async update => {
+      // Fallback: execute updates sequentially to avoid IPC overload and N+1 concurrency
+      for (const update of processedUpdates) {
         let patch: string | undefined;
         let val = update.value;
 
         if (update.operation === 'json_patch') {
           patch = update.value as string;
-          val = null; // Value is ignored when patch is provided
-        } else {
-          patch = this.tryGeneratePatch(update.value, update.originalValue);
+          val = null;
         }
 
         await dbOps.updateCell(table, update.rowId, update.column, val, patch);
-      }));
+      }
     }
 
     // Fire batch edit event
