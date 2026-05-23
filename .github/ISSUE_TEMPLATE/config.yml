@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & Discussions
+    url: https://github.com/zknpr/sqlite-explorer/discussions
+    about: Ask questions, share ideas, and discuss usage here.
+  - name: Documentation & Live Demo
+    url: https://sqlite-explorer.zknpr.xyz
+    about: Try the live demo and read the docs before filing an issue.
+  - name: Report a Security Vulnerability
+    url: https://github.com/zknpr/sqlite-explorer/security/advisories/new
+    about: Report security issues privately — please do not open a public issue.

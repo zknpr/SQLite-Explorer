@@ -1,0 +1,87 @@
+name: Bug Report
+description: Report a problem with SQLite Explorer
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report! Please search the
+        [existing issues](https://github.com/zknpr/sqlite-explorer/issues) first to avoid duplicates.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce the problem?
+      placeholder: |
+        1. Open a database with '...'
+        2. Click on '...'
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened? Include screenshots if helpful.
+    validations:
+      required: true
+  - type: input
+    id: extension-version
+    attributes:
+      label: Extension Version
+      description: "Found in the Extensions panel (e.g. 1.3.5)."
+    validations:
+      required: true
+  - type: input
+    id: vscode-version
+    attributes:
+      label: VS Code Version
+      description: "Help → About (e.g. 1.110.0). Note if you are using VS Code for Web."
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - VS Code for Web (browser)
+        - Remote (SSH / WSL / Container)
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: SQLite Backend
+      description: "If known — the extension falls back from native to WASM automatically."
+      options:
+        - Not sure
+        - Native (txiki-js)
+        - WASM (sql.js)
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: "Output from View → Output → 'SQLite Explorer'. Redact any sensitive data."
+      render: shell
+    validations:
+      required: false
