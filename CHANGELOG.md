@@ -1,5 +1,70 @@
 # Changelog
 
+## 1.3.5
+
+### Security
+
+- **Native Worker Environment Isolation**: Restricted the environment variables passed to the native (txiki-js) worker process, preventing inheritance of unrelated host environment state (#277).
+- **Save Dialog Path Traversal**: Sanitized the user-supplied filename in the save dialog to prevent path traversal via crafted names (#284).
+- **Webview Token Exposure**: Removed `accessToken` and `machineId` from the environment data sent to the webview — sensitive identifiers no longer cross the host→webview boundary (#281).
+- **Directory Containment Hardening**: `hostBridge` directory-containment checks are now robust against name-prefix edge cases (e.g. `/foo` no longer matches `/foobar`), tightening path validation (#263).
+- **postMessage Origin Restriction**: Replaced the wildcard (`*`) `postMessage` target origin with `window.location.origin`, preventing the webview from posting messages to arbitrary origins.
+- **Subresource Integrity**: Added an SRI hash to the unpkg codicon CSS `<link>` so the CDN-served stylesheet is integrity-checked.
+- **Dependency CVE**: Bumped the transitive `@nevware21/ts-utils` 0.13.0 → 0.14.0, picking up the fix for CVE-2026-46681 (prototype pollution in `objDeepCopy`/`objCopyProps`) (#339). Pinned the website's bundled `postcss` to the patched ≥ 8.5.10 line via an npm override (#295).
+- **Build-Tooling Dependency Security**: Bumped `qs` 6.14.2 → 6.15.2 via npm override (`parse` fix for nested bracket groups) and updated the transitive `uuid` and `@azure/msal-*` dev dependencies pulled in by `@vscode/vsce`, resolving a Dependabot security-group advisory in the packaging toolchain. These are dev/tooling dependencies and are not shipped in the extension bundle (#340).
+
+### Performance
+
+- **Batched DROP INDEX (Native)**: DROP INDEX operations are batched into a single IPC round-trip instead of one per index (#254).
+- **Batched PRAGMA Reads**: `getPragmas` batches its PRAGMA statements into a single call, reducing worker round-trips (#313).
+- **Batched ALTER TABLE (Native)**: `ADD`/`DROP COLUMN` statements in the native worker are now batched (#335).
+- **hostBridge Cell Batch Updates**: Replaced the concurrent IPC `map`+`Promise.all` fan-out in cell batch updates with a single batched call, reducing IPC pressure for large edits (#323).
+- **undoColumnDrop**: Optimized by grouping row updates instead of issuing per-row statements (#262).
+
+### Bug Fixes
+
+- **JSON Parse Error Swallowing**: Fixed empty `catch` blocks in `sqlite-db.ts` that silently swallowed JSON parse errors; failures are now surfaced (#280).
+- **postMessage TS Build**: Used `WindowPostMessageOptions` for the `postMessage` `targetOrigin` typing, fixing a TypeScript build error introduced alongside the origin-restriction change.
+
+### Improvements
+
+- **Type Safety (`any` → `unknown`/typed)**: Eliminated `any` across the RPC layer (#305); sql.js declarations now use a shared `SqlValue` type (#306); `loggingDatabaseOperations` uses safer generic constraints (#320); and `hostBridge.ts` (#327), `editorController.ts` (#330), `undo-history`'s `calculateSize` (#261), and the internal `WasmDatabaseEngine`/`WorkerPort` contracts (#338) are now strictly typed.
+- **Module Extraction**: Extracted `WasmDatabaseEngine` and a platform `fs` helper into their own modules (#291), split the dense `grid.js` UI module into cohesive sub-components (#290), moved `WebviewCollection` to its own file (#258), and extracted the database-initialization check into a shared utility (#289).
+- **Code-Scanner Hygiene**: Reworded comments to avoid false-positive code-scanning alerts (#318).
+
+### Dependencies
+
+**Extension:**
+
+- @types/node 25.5.0 → 25.9.0
+- typescript 6.0.2 → 6.0.3
+- esbuild 0.27.4 → 0.28.0
+- @vscode/vsce 3.7.1 → 3.9.1
+- @vscode/extension-telemetry 1.5.1 → 1.5.2
+- @scure/base 2.0.0 → 2.2.0
+- @nevware21/ts-utils 0.13.0 → 0.14.0 (transitive; CVE-2026-46681)
+- fast-uri (transitive bump, #296)
+- qs 6.14.2 → 6.15.2 (npm override) + transitive uuid / @azure/msal-* dev bumps (#340)
+- @types/vscode bumped to 1.116.0 then reverted/pinned to 1.110.0 to match `engines.vscode` (net unchanged)
+
+**Website:**
+
+- next 16.2.1 → 16.2.6
+- react 19.0.0 → 19.2.5
+- lucide-react 0.577.0 → 1.16.0 (major)
+- eslint 9.17.0 → 10.3.0 (major)
+- eslint-config-next 16.1.6 → 16.2.6
+- typescript 5.7.2 → 6.0.3 (major)
+- @types/node 25.5.0 → 25.7.0
+- autoprefixer 10.4.27 → 10.5.0
+- postcss 8.5.8 → 8.5.12 (+ ≥ 8.5.10 override, #295)
+
+### Testing
+
+- **New Suites**: Added `connectWorkerPort` RPC tests (#326), serialization API tests (#278), `ModificationTracker` API coverage (#282), `uiKindToString` coverage (#304), and `registerEditorProvider` tests for `editorController` (#338).
+- **Error-Path Coverage**: Added tests for the undo-history error path in `deleteRows` (#325), the stringify error fallback in the logging wrapper (#333), and `validateRowIds` edge cases — empty, NaN, Infinity, non-numeric.
+- **Test Count**: 269 tests across 36 unit test files, zero failures (up from 237 across 33 at 1.3.4).
+
 ## 1.3.4
 
 ### Security

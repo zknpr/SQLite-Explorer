@@ -7,11 +7,17 @@ import { mockVscode } from './mocks/vscode';
 // SupportsWriteMode in databaseModel.ts is evaluated at module-load time from
 // `vsc.env.remoteName` and `CurrentExtension?.extensionKind`. Set both so the
 // read-write path resolves to true regardless of which test loads databaseModel first.
-(mockVscode as any).ExtensionKind = { Workspace: 2, UI: 1 };
-mockVscode.env.remoteName = 'remote';
-(mockVscode as any).extensions = {
-    getExtension: () => ({ extensionKind: 2 })
-};
+// Use Object.defineProperty (not direct assignment) to mirror VS Code's readonly
+// API fields — direct writes can silently no-op or throw if a field is a getter.
+Object.defineProperty(mockVscode, 'ExtensionKind', {
+    value: { Workspace: 2, UI: 1 }, writable: true, configurable: true,
+});
+Object.defineProperty(mockVscode.env, 'remoteName', {
+    value: 'remote', writable: true, configurable: true,
+});
+Object.defineProperty(mockVscode, 'extensions', {
+    value: { getExtension: () => ({ extensionKind: 2 }) }, writable: true, configurable: true,
+});
 
 // workerFactory imports threadPool which crashes due to bare `import.meta.env` at
 // module load. Mock it in require cache before editorController is required.
