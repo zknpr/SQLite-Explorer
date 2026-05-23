@@ -106,6 +106,16 @@ mkdir -p "$RELEASE_DIR"
 # Build unless skipped
 if [ "$SKIP_BUILD" = false ]; then
     echo ""
+    echo -e "${YELLOW}Syncing dependencies...${NC}"
+
+    # vsce package validates the production dependency tree via
+    # `npm list --production`; stale node_modules (e.g. after pulling dependency
+    # bumps without reinstalling) makes it fail with ELSPROBLEMS. `npm ci`
+    # installs exactly from package-lock.json and does not rewrite the lockfile.
+    npm ci
+    echo -e "${GREEN}✓ Dependencies synced${NC}"
+
+    echo ""
     echo -e "${YELLOW}Building extension...${NC}"
 
     # Run the build script
