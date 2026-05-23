@@ -32,9 +32,9 @@ import { getNodeFs } from '../../platform/fs';
 // ============================================================================
 
 interface WasmPreparedStatement {
-  run(params?: unknown[]): void;
-  bind(params?: unknown[]): boolean;
-  get(params?: unknown[]): CellValue[] | undefined;
+  run(params?: CellValue[]): void;
+  bind(params?: CellValue[]): boolean;
+  get(params?: CellValue[]): CellValue[] | undefined;
   step(): boolean;
   reset(): void;
   free(): boolean;
@@ -42,8 +42,8 @@ interface WasmPreparedStatement {
 }
 
 export interface WasmDatabaseInstance {
-  exec(sql: string, params?: unknown[]): Array<{ columns: string[]; values: unknown[][] }>;
-  prepare(sql: string, params?: unknown[]): WasmPreparedStatement;
+  exec(sql: string, params?: CellValue[]): Array<{ columns: string[]; values: CellValue[][] }>;
+  prepare(sql: string, params?: CellValue[]): WasmPreparedStatement;
   iterateStatements(sql: string): Iterable<WasmPreparedStatement>;
   export(): Uint8Array;
   close(): void;
@@ -122,7 +122,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
         // Bind parameters only to the first statement to match exec behavior
         if (isFirstStatement && params && params.length > 0) {
-          stmt.bind(params as unknown[]);
+          stmt.bind(params);
         }
         isFirstStatement = false;
 
@@ -301,7 +301,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           const stmt = this.instance.prepare(sql);
           try {
             for (const [rId, rowObj] of rowUpdates.entries()) {
-              const params: any[] = deletedColumns.map(c => rowObj[c.name] ?? null);
+              const params: CellValue[] = deletedColumns.map(c => rowObj[c.name] ?? null);
               params.push(rId);
               stmt.run(params);
             }

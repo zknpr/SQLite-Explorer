@@ -11,8 +11,8 @@ describe('RPC', () => {
     });
 
     it('should handle invocations', (context) => {
-      const methods = {
-        add: (a: number, b: number) => a + b
+      const methods: Record<string, (...args: unknown[]) => unknown> = {
+        add: (...args: unknown[]) => (args[0] as number) + (args[1] as number)
       };
 
       let response: any = null;

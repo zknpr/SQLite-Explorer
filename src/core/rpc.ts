@@ -345,7 +345,7 @@ export function processProtocolMessage(
 /**
  * Worker-like interface for message passing.
  */
-interface WorkerPort {
+export interface WorkerPort {
   postMessage(data: unknown, transfer?: Transferable[]): void;
   on(event: 'message', handler: (data: unknown) => void): void;
 }
