@@ -17,7 +17,7 @@
 ## Checklist
 
 - [ ] `npm test` passes locally
-- [ ] `node scripts/build.mjs` completes without errors
+- [ ] `npm run build` completes without errors
 - [ ] I followed the project's coding standards (parameterized SQL, escaped identifiers, `textContent` rendering, strict CSP)
 - [ ] I added or updated tests for my changes
 - [ ] I updated the documentation (README / CHANGELOG / CLAUDE.md) where relevant

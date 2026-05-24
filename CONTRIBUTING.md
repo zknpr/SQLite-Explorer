@@ -31,7 +31,7 @@ git clone https://github.com/zknpr/sqlite-explorer.git
 cd sqlite-explorer
 
 npm install              # Install dependencies
-node scripts/build.mjs   # Build extension + worker
+npm run build            # Build extension + worker
 npm test                 # Run the unit test suite
 ```
 
@@ -41,7 +41,7 @@ npm test                 # Run the unit test suite
 2. Press `F5` to launch an **Extension Development Host** window.
 3. Open any `.sqlite`, `.db`, or `.sqlite3` file to exercise the extension.
 
-After changing source files, re-run `node scripts/build.mjs` and reload the host window (`Ctrl+R` / `Cmd+R`).
+After changing source files, re-run `npm run build` and reload the host window (`Ctrl+R` / `Cmd+R`).
 
 ## Project Structure
 
@@ -76,7 +76,7 @@ npm test
 - Keep each pull request focused on a single concern.
 - Before opening a PR, make sure:
   - `npm test` passes.
-  - `node scripts/build.mjs` completes without errors.
+  - `npm run build` completes without errors.
   - Docs/CHANGELOG are updated if behavior changed.
 - Fill out the pull request template and link any related issue.
 - Automated code-review bots run on every pull request — please address the feedback they surface.
