@@ -2,7 +2,7 @@
  * Drag and Drop Support for BLOBs
  */
 import { backendApi } from './api.js';
-import { updateStatus, showLoading } from './ui.js';
+import { updateStatus } from './ui.js';
 import { state } from './state.js';
 import { getRowId, getRowDataOffset } from './data-utils.js';
 import { formatCellValueAsText } from './utils.js';
