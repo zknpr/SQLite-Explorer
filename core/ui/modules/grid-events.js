@@ -33,166 +33,169 @@ export function initGridInteraction() {
     const container = document.getElementById('gridContainer');
     if (!container) return;
 
-    // --- Mousedown Delegation (Resize) ---
-    container.addEventListener('mousedown', (event) => {
-        if (event.target.classList.contains('resize-handle')) {
-            event.stopPropagation();
-            const headerCell = event.target.closest('.header-cell');
-            if (headerCell && headerCell.dataset.column) {
-                startColumnResize(event, headerCell.dataset.column);
-            }
+    container.addEventListener('mousedown', handleMousedown);
+    container.addEventListener('keydown', handleKeydown);
+    container.addEventListener('click', handleClick);
+    container.addEventListener('dblclick', handleDoubleClick);
+    container.addEventListener('mouseover', handleMouseover);
+    container.addEventListener('scroll', handleScroll, { passive: true });
+}
+
+function handleMousedown(event) {
+    if (event.target.classList.contains('resize-handle')) {
+        event.stopPropagation();
+        const headerCell = event.target.closest('.header-cell');
+        if (headerCell && headerCell.dataset.column) {
+            startColumnResize(event, headerCell.dataset.column);
         }
-    });
+    }
+}
 
-    // --- Keydown Delegation (Filters) ---
-    container.addEventListener('keydown', (event) => {
-        if (event.target.classList.contains('column-filter')) {
-            const colName = event.target.dataset.column;
-            if (colName) onColumnFilterKeydown(event, colName);
+function handleKeydown(event) {
+    if (event.target.classList.contains('column-filter')) {
+        const colName = event.target.dataset.column;
+        if (colName) onColumnFilterKeydown(event, colName);
+    }
+}
+
+function handleClick(event) {
+    const target = event.target;
+    if (target.closest('.grid-header')) {
+        handleHeaderClick(event, target);
+        return;
+    }
+    handleBodyClick(event, target);
+}
+
+function handleHeaderClick(event, target) {
+    // 1. Filter Apply Button
+    if (target.closest('.filter-apply-btn')) {
+        event.stopPropagation();
+        const headerCell = target.closest('.header-cell');
+        if (headerCell && headerCell.dataset.column) {
+            applyColumnFilter(headerCell.dataset.column);
         }
-    });
+        return;
+    }
 
-    // --- Click Delegation ---
-    container.addEventListener('click', (event) => {
-        const target = event.target;
+    // 2. Prevent sort when clicking inputs/bottom area
+    if (target.closest('.header-bottom') || target.closest('.column-filter')) {
+        event.stopPropagation();
+        return;
+    }
 
-        // --- Header Interactions ---
-        if (target.closest('.grid-header')) {
-            // 1. Filter Apply Button
-            if (target.closest('.filter-apply-btn')) {
-                event.stopPropagation();
-                const headerCell = target.closest('.header-cell');
-                if (headerCell && headerCell.dataset.column) {
-                    applyColumnFilter(headerCell.dataset.column);
-                }
-                return;
-            }
-
-            // 2. Prevent sort when clicking inputs/bottom area
-            if (target.closest('.header-bottom') || target.closest('.column-filter')) {
-                event.stopPropagation();
-                return;
-            }
-
-            // 3. Column Selection Icon
-            if (target.closest('.select-column-icon')) {
-                event.stopPropagation();
-                const headerCell = target.closest('.header-cell');
-                if (headerCell && headerCell.dataset.column) {
-                    onColumnHeaderClick(event, headerCell.dataset.column);
-                }
-                return;
-            }
-
-            // 4. Header Pin Icon
-            if (target.closest('.pin-icon')) {
-                event.stopPropagation();
-                const headerCell = target.closest('.header-cell');
-                if (headerCell && headerCell.dataset.column) {
-                    toggleColumnPin(event, headerCell.dataset.column);
-                }
-                return;
-            }
-
-            // 5. Select All (Row Number Header)
-            if (target.closest('.row-number-header')) {
-                onSelectAllClick(event);
-                return;
-            }
-
-            // 6. Sort (Header Top)
-            const headerTop = target.closest('.header-top');
-            if (headerTop) {
-                const headerCell = headerTop.closest('.header-cell');
-                if (headerCell && headerCell.dataset.column) {
-                    onColumnSort(headerCell.dataset.column);
-                }
-                return;
-            }
-            return;
+    // 3. Column Selection Icon
+    if (target.closest('.select-column-icon')) {
+        event.stopPropagation();
+        const headerCell = target.closest('.header-cell');
+        if (headerCell && headerCell.dataset.column) {
+            onColumnHeaderClick(event, headerCell.dataset.column);
         }
+        return;
+    }
 
-        // --- Body Interactions ---
-
-        // 1. Row Pin Icon
-        if (target.closest('.pin-icon')) {
-            const rowEl = target.closest('.data-row');
-            if (rowEl) {
-                const rowId = rowEl.dataset.rowid;
-                // Handle type conversion
-                const safeRowId = resolveRowIdType(rowId);
-                toggleRowPin(event, safeRowId);
-            }
-            return;
+    // 4. Header Pin Icon
+    if (target.closest('.pin-icon')) {
+        event.stopPropagation();
+        const headerCell = target.closest('.header-cell');
+        if (headerCell && headerCell.dataset.column) {
+            toggleColumnPin(event, headerCell.dataset.column);
         }
+        return;
+    }
 
-        // 2. Expand Icon
-        if (target.closest('.expand-icon')) {
-            const cellEl = target.closest('.data-cell');
-            if (cellEl) {
-                const rowIdx = parseInt(cellEl.dataset.rowidx, 10);
-                const colIdx = parseInt(cellEl.dataset.colidx, 10);
-                const rowId = resolveRowIdType(cellEl.closest('.data-row').dataset.rowid);
-                openCellPreview(rowIdx, colIdx, rowId);
-            }
-            return;
+    // 5. Select All (Row Number Header)
+    if (target.closest('.row-number-header')) {
+        onSelectAllClick(event);
+        return;
+    }
+
+    // 6. Sort (Header Top)
+    const headerTop = target.closest('.header-top');
+    if (headerTop) {
+        const headerCell = headerTop.closest('.header-cell');
+        if (headerCell && headerCell.dataset.column) {
+            onColumnSort(headerCell.dataset.column);
         }
+        return;
+    }
+}
 
-        // 3. Row Number Cell
-        if (target.closest('.row-number')) {
-            const rowEl = target.closest('.data-row');
-            if (rowEl) {
-                const rowId = resolveRowIdType(rowEl.dataset.rowid);
-                const rowIdx = parseInt(rowEl.dataset.rowidx, 10);
-                onRowNumberClick(event, rowId, rowIdx);
-            }
-            return;
+function handleBodyClick(event, target) {
+    // 1. Row Pin Icon
+    if (target.closest('.pin-icon')) {
+        const rowEl = target.closest('.data-row');
+        if (rowEl) {
+            const rowId = rowEl.dataset.rowid;
+            const safeRowId = resolveRowIdType(rowId);
+            toggleRowPin(event, safeRowId);
         }
+        return;
+    }
 
-        // 4. Data Cell
+    // 2. Expand Icon
+    if (target.closest('.expand-icon')) {
         const cellEl = target.closest('.data-cell');
         if (cellEl) {
             const rowIdx = parseInt(cellEl.dataset.rowidx, 10);
             const colIdx = parseInt(cellEl.dataset.colidx, 10);
-            const rowEl = cellEl.closest('.data-row');
+            const rowId = resolveRowIdType(cellEl.closest('.data-row').dataset.rowid);
+            openCellPreview(rowIdx, colIdx, rowId);
+        }
+        return;
+    }
+
+    // 3. Row Number Cell
+    if (target.closest('.row-number')) {
+        const rowEl = target.closest('.data-row');
+        if (rowEl) {
             const rowId = resolveRowIdType(rowEl.dataset.rowid);
-            onCellClick(event, rowIdx, colIdx, rowId);
-            return;
+            const rowIdx = parseInt(rowEl.dataset.rowidx, 10);
+            onRowNumberClick(event, rowId, rowIdx);
         }
+        return;
+    }
 
-    });
+    // 4. Data Cell
+    const cellEl = target.closest('.data-cell');
+    if (cellEl) {
+        const rowIdx = parseInt(cellEl.dataset.rowidx, 10);
+        const colIdx = parseInt(cellEl.dataset.colidx, 10);
+        const rowEl = cellEl.closest('.data-row');
+        const rowId = resolveRowIdType(rowEl.dataset.rowid);
+        onCellClick(event, rowIdx, colIdx, rowId);
+        return;
+    }
+}
 
-    // Double Click Handler
-    container.addEventListener('dblclick', (event) => {
-        const cellEl = event.target.closest('.data-cell');
-        if (cellEl && !cellEl.classList.contains('row-number')) {
-            const rowIdx = parseInt(cellEl.dataset.rowidx, 10);
-            const colIdx = parseInt(cellEl.dataset.colidx, 10);
-            const rowEl = cellEl.closest('.data-row');
-            const rowId = resolveRowIdType(rowEl.dataset.rowid);
-            onCellDoubleClick(event, rowIdx, colIdx, rowId);
+function handleDoubleClick(event) {
+    const cellEl = event.target.closest('.data-cell');
+    if (cellEl && !cellEl.classList.contains('row-number')) {
+        const rowIdx = parseInt(cellEl.dataset.rowidx, 10);
+        const colIdx = parseInt(cellEl.dataset.colidx, 10);
+        const rowEl = cellEl.closest('.data-row');
+        const rowId = resolveRowIdType(rowEl.dataset.rowid);
+        onCellDoubleClick(event, rowIdx, colIdx, rowId);
+    }
+}
+
+function handleMouseover(event) {
+    const cell = event.target.closest('.data-cell');
+    if (cell && !cell.classList.contains('checked-overflow')) {
+        const textSpan = cell.querySelector('.cell-text');
+        if (textSpan) {
+            const hasOverflow = textSpan.scrollWidth > textSpan.clientWidth;
+            cell.classList.toggle('has-overflow', hasOverflow);
+            cell.classList.add('checked-overflow');
         }
-    });
+    }
+}
 
-    // Lazy overflow detection
-    container.addEventListener('mouseover', (event) => {
-        const cell = event.target.closest('.data-cell');
-        if (cell && !cell.classList.contains('checked-overflow')) {
-            const textSpan = cell.querySelector('.cell-text');
-            if (textSpan) {
-                const hasOverflow = textSpan.scrollWidth > textSpan.clientWidth;
-                cell.classList.toggle('has-overflow', hasOverflow);
-                cell.classList.add('checked-overflow');
-            }
-        }
-    });
-
-    // Track scroll position for state persistence
-    container.addEventListener('scroll', () => {
-        state.scrollPosition.left = container.scrollLeft;
-        state.scrollPosition.top = container.scrollTop;
-        persistState();
-    }, { passive: true });
+function handleScroll(event) {
+    const container = event.currentTarget;
+    state.scrollPosition.left = container.scrollLeft;
+    state.scrollPosition.top = container.scrollTop;
+    persistState();
 }
 
 function resolveRowIdType(idStr) {
