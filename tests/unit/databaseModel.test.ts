@@ -118,3 +118,94 @@ describe('isAutoCommitEnabled', () => {
         await setupEnvironmentAndTest(undefined, 'ssh-remote', 2 /* Workspace */, false);
     });
 });
+
+
+describe('DatabaseDocument.saveAs', () => {
+    let originalConsoleWarn: typeof console.warn;
+    let warnedMessage: string | undefined;
+    let DatabaseDocument: any;
+    let originalFsStat: any;
+    let originalFsWriteFile: any;
+
+    before(() => {
+        originalConsoleWarn = console.warn;
+        const { DatabaseDocument: Model } = require('../../src/databaseModel');
+        DatabaseDocument = Model;
+
+        originalFsStat = mockVscode.workspace.fs.stat;
+        originalFsWriteFile = mockVscode.workspace.fs.writeFile;
+    });
+
+    after(() => {
+        console.warn = originalConsoleWarn;
+        mockVscode.workspace.fs.stat = originalFsStat;
+        mockVscode.workspace.fs.writeFile = originalFsWriteFile;
+    });
+
+    beforeEach(() => {
+        warnedMessage = undefined;
+        console.warn = (...args: any[]) => {
+            warnedMessage = args[0];
+        };
+    });
+
+    it('should catch writeToFile error and fall back to serializeDatabase', async () => {
+        let serializeCalled = false;
+        let ensureWritableCalled = false;
+
+        // Mock database document instance properties
+        const mockDatabaseOps = {
+            writeToFile: async (fsPath: string) => {
+                throw new Error('Simulated write failure');
+            },
+            serializeDatabase: async (filename: string) => {
+                serializeCalled = true;
+                return new Uint8Array([1, 2, 3]);
+            }
+        };
+
+        const doc = Object.create(DatabaseDocument.prototype);
+        Object.assign(doc, {
+            ensureWritable: async () => { ensureWritableCalled = true; },
+            getFileSizeLimit: () => 1024 * 1024,
+            uri: mockVscode.Uri.parse('sqlite://test.sqlite')
+        });
+
+        Object.defineProperty(doc, 'databaseOperations', {
+            get: () => mockDatabaseOps
+        });
+
+        Object.defineProperty(doc, 'fileParts', {
+            get: () => ({ filename: 'test.sqlite' })
+        });
+
+        // Mock workspace fs stat & writeFile
+        let fileStatCalled = false;
+        let writeFileCalled = false;
+        let targetUriWritten: any = null;
+        let writtenContent: any = null;
+
+        mockVscode.workspace.fs.stat = async (uri: any) => {
+            fileStatCalled = true;
+            return { size: 100 }; // Less than limit
+        };
+
+        mockVscode.workspace.fs.writeFile = async (uri: any, content: any) => {
+            writeFileCalled = true;
+            targetUriWritten = uri;
+            writtenContent = content;
+        };
+
+        const targetUri = mockVscode.Uri.file('/tmp/test.sqlite');
+        const cancellation = {} as any;
+
+        await doc.saveAs(targetUri, cancellation);
+
+        assert.strictEqual(ensureWritableCalled, true, 'ensureWritable should be called');
+        assert.strictEqual(warnedMessage, 'Direct write failed, falling back to buffer transfer', 'Should warn about write failure');
+        assert.strictEqual(fileStatCalled, true, 'fs.stat should be called as part of fallback');
+        assert.strictEqual(serializeCalled, true, 'serializeDatabase should be called as part of fallback');
+        assert.strictEqual(writeFileCalled, true, 'fs.writeFile should be called with serialized data');
+        assert.deepStrictEqual(writtenContent, new Uint8Array([1, 2, 3]), 'Should write the serialized binary content');
+    });
+});
