@@ -2,7 +2,6 @@ import { backendApi } from './api.js';
 import { state } from './state.js';
 import { getRowDataOffset } from './data-utils.js';
 import { updateStatus } from './ui.js';
-import { validateRowId } from './utils.js';
 
 export class BlobInspector {
     constructor() {
