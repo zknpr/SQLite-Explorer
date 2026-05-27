@@ -400,17 +400,26 @@ export class HostBridge implements ToastService {
     if ('updateCellBatch' in dbOps) {
       await dbOps.updateCellBatch(table, processedUpdates);
     } else {
-      // Fallback: execute updates sequentially to avoid IPC overload and N+1 concurrency
-      for (const update of processedUpdates) {
-        let patch: string | undefined;
-        let val = update.value;
+      // Fallback: execute updates sequentially to avoid IPC overload and N+1 concurrency,
+      // but wrapped in a SAVEPOINT to avoid implicit auto-commits after every DML statement.
+      const savepointName = `sp_batch_fallback_${Date.now()}`;
+      await dbOps.executeQuery(`SAVEPOINT ${savepointName}`);
+      try {
+        for (const update of processedUpdates) {
+          let patch: string | undefined;
+          let val = update.value;
 
-        if (update.operation === 'json_patch') {
-          patch = update.value as string;
-          val = null;
+          if (update.operation === 'json_patch') {
+            patch = update.value as string;
+            val = null;
+          }
+
+          await dbOps.updateCell(table, update.rowId, update.column, val, patch);
         }
-
-        await dbOps.updateCell(table, update.rowId, update.column, val, patch);
+        await dbOps.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
+      } catch (err) {
+        await dbOps.executeQuery(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+        throw err;
       }
     }
 
