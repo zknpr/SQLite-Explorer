@@ -51,8 +51,10 @@ export function serializeValue(value: unknown): unknown {
   if (value && typeof value === 'object' && Object.prototype.toString.call(value) === '[object Object]') {
     const obj = value as Record<string, unknown>;
     const result: Record<string, unknown> = {};
-    for (const key of Object.keys(obj)) {
-      result[key] = serializeValue(obj[key]);
+    for (const key in obj) {
+      if (Object.prototype.hasOwnProperty.call(obj, key)) {
+        result[key] = serializeValue(obj[key]);
+      }
     }
     return result;
   }
@@ -78,26 +80,30 @@ export function deserializeValue(value: unknown): unknown {
   // Check for our Uint8Array serialization marker
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     const obj = value as Record<string, unknown>;
-    const keys = Object.keys(obj);
 
-    // Check for Base64 format (new, preferred): { __type: 'Uint8Array', base64: '...' }
-    if (obj.__type === 'Uint8Array' && typeof obj.base64 === 'string') {
-      if (keys.length === 2 && keys.includes('__type') && keys.includes('base64')) {
-        return base64ToUint8Array(obj.base64);
+    if ('__type' in obj && obj.__type === 'Uint8Array') {
+      const keys = Object.keys(obj);
+      // Check for Base64 format (new, preferred): { __type: 'Uint8Array', base64: '...' }
+      if (typeof obj.base64 === 'string') {
+        if (keys.length === 2 && keys.includes('__type') && keys.includes('base64')) {
+          return base64ToUint8Array(obj.base64);
+        }
       }
-    }
 
-    // Check for array format (legacy): { __type: 'Uint8Array', data: [...] }
-    if (obj.__type === 'Uint8Array' && Array.isArray(obj.data)) {
-      if (keys.length === 2 && keys.includes('__type') && keys.includes('data')) {
-        return new Uint8Array(obj.data as number[]);
+      // Check for array format (legacy): { __type: 'Uint8Array', data: [...] }
+      if (Array.isArray(obj.data)) {
+        if (keys.length === 2 && keys.includes('__type') && keys.includes('data')) {
+          return new Uint8Array(obj.data as number[]);
+        }
       }
     }
 
     // Recursively deserialize object properties
     const result: Record<string, unknown> = {};
-    for (const key of Object.keys(obj)) {
-      result[key] = deserializeValue(obj[key]);
+    for (const key in obj) {
+      if (Object.prototype.hasOwnProperty.call(obj, key)) {
+        result[key] = deserializeValue(obj[key]);
+      }
     }
     return result;
   }
