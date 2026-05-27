@@ -13,6 +13,68 @@ import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
 import { getNodeFs } from './core/sqlite-db';
 
+export interface FormatHelper {
+  extension: string;
+  streamStart(stream: any): void;
+  streamWriteBatch(stream: any, headers: string[], rows: CellValue[][], isFirstBatch: boolean): void;
+  streamEnd(stream: any): void;
+  exportMemory(headers: string[], rows: CellValue[][]): string;
+}
+
+export function getFormatHelper(format: string, tableName: string, includeHeader: boolean, includeTableName: boolean): FormatHelper {
+  switch (format) {
+    case 'csv':
+      return {
+        extension: 'csv',
+        streamStart: () => {},
+        streamWriteBatch: (stream, headers, rows, isFirstBatch) => {
+          const chunk = exportToCsv(headers, rows, isFirstBatch && includeHeader);
+          if (chunk) stream.write(isFirstBatch ? chunk : '\n' + chunk);
+        },
+        streamEnd: () => {},
+        exportMemory: (headers, rows) => exportToCsv(headers, rows, includeHeader)
+      };
+    case 'excel':
+      return {
+        extension: 'csv',
+        streamStart: (stream) => stream.write('\uFEFF'),
+        streamWriteBatch: (stream, headers, rows, isFirstBatch) => {
+          const chunk = exportToCsv(headers, rows, isFirstBatch && includeHeader);
+          if (chunk) stream.write(isFirstBatch ? chunk : '\n' + chunk);
+        },
+        streamEnd: () => {},
+        exportMemory: (headers, rows) => '\uFEFF' + exportToCsv(headers, rows, includeHeader)
+      };
+    case 'json':
+      return {
+        extension: 'json',
+        streamStart: (stream) => stream.write('['),
+        streamWriteBatch: (stream, headers, rows, isFirstBatch) => {
+          if (!isFirstBatch && rows.length > 0) stream.write(',');
+          const jsonStr = exportToJson(headers, rows);
+          stream.write(jsonStr.slice(1, -1)); // Remove [ and ]
+        },
+        streamEnd: (stream) => stream.write(']'),
+        exportMemory: (headers, rows) => exportToJson(headers, rows)
+      };
+    case 'sql':
+      return {
+        extension: 'sql',
+        streamStart: () => {},
+        streamWriteBatch: (stream, headers, rows, isFirstBatch) => {
+          const chunk = exportToSql(tableName, headers, rows, includeTableName);
+          if (chunk) stream.write(isFirstBatch ? chunk : '\n' + chunk);
+        },
+        streamEnd: () => {},
+        exportMemory: (headers, rows) => exportToSql(tableName, headers, rows, includeTableName)
+      };
+    default:
+      if (!format) throw new Error(`Unsupported export format: undefined`);
+      throw new Error(`Unsupported export format: ${format}`);
+  }
+}
+
+
 /**
  * Export table data to CSV or JSON file.
  *
@@ -91,17 +153,15 @@ export async function exportTableCommand(
     const includeHeader = _exportOptions?.header ?? true;
     const includeTableName = _exportOptions?.includeTableName ?? true;
 
-    // Determine extension
-    let defaultExt = 'csv';
-    switch (formatValue) {
-      case 'json': defaultExt = 'json'; break;
-      case 'sql': defaultExt = 'sql'; break;
-      case 'excel': defaultExt = 'csv'; break;
-      case 'csv': defaultExt = 'csv'; break;
-      default:
-        vsc.window.showErrorMessage(`Unsupported export format: ${formatValue}`);
-        return;
+    // Determine extension and format helper
+    let formatHelper: FormatHelper;
+    try {
+      formatHelper = getFormatHelper(formatValue as string, tableName, includeHeader, includeTableName);
+    } catch (e) {
+      vsc.window.showErrorMessage((e as Error).message);
+      return;
     }
+    const defaultExt = formatHelper.extension;
 
     // Show save dialog
     // Set default directory to the database file's directory using joinPath
@@ -133,11 +193,6 @@ export async function exportTableCommand(
         try {
             const stream = fs.createWriteStream(uri.fsPath, { encoding: 'utf-8' });
 
-            // Write BOM for Excel if needed
-            if (formatValue === 'excel') {
-                stream.write('\uFEFF');
-            }
-
             // Check if we can use rowid pagination
             let useRowId = false;
             try {
@@ -154,10 +209,7 @@ export async function exportTableCommand(
             let isFirstBatch = true;
             let rowCount = 0;
 
-            // For JSON, start the array
-            if (formatValue === 'json') {
-                stream.write('[');
-            }
+            formatHelper.streamStart(stream);
 
             while (hasMore) {
                 let sql: string;
@@ -223,36 +275,12 @@ export async function exportTableCommand(
                 }
 
                 // Write chunk
-                let chunkContent = '';
-
-                switch (formatValue) {
-                    case 'excel':
-                    case 'csv':
-                        // Header only for first batch
-                        chunkContent = exportToCsv(outputHeaders, outputRows, isFirstBatch && includeHeader);
-                        if (!isFirstBatch && chunkContent) chunkContent = '\n' + chunkContent;
-                        break;
-                    case 'json':
-                        if (!isFirstBatch && outputRows.length > 0) stream.write(',');
-                        const jsonStr = exportToJson(outputHeaders, outputRows);
-                        chunkContent = jsonStr.slice(1, -1); // Remove [ and ]
-                        break;
-                    case 'sql':
-                        chunkContent = exportToSql(tableName, outputHeaders, outputRows, includeTableName);
-                        if (!isFirstBatch && chunkContent) chunkContent = '\n' + chunkContent;
-                        break;
-                }
-
-                if (chunkContent) {
-                    stream.write(chunkContent);
-                }
+                formatHelper.streamWriteBatch(stream, outputHeaders, outputRows, isFirstBatch);
 
                 isFirstBatch = false;
             }
 
-            if (formatValue === 'json') {
-                stream.write(']');
-            }
+            formatHelper.streamEnd(stream);
 
             stream.end();
             vsc.window.showInformationMessage(`Exported ${rowCount} rows to ${uri.fsPath}`);
@@ -289,26 +317,7 @@ export async function exportTableCommand(
     const columnNames = (result[0].columns || result[0].headers) as string[];
     const rows = (result[0].values || result[0].rows) as CellValue[][];
 
-    let content: string;
-
-    switch (formatValue) {
-      case 'excel':
-        // Excel prefers CSV with BOM for UTF-8
-        content = '\uFEFF' + exportToCsv(columnNames, rows, includeHeader);
-        break;
-      case 'csv':
-        content = exportToCsv(columnNames, rows, includeHeader);
-        break;
-      case 'json':
-        content = exportToJson(columnNames, rows);
-        break;
-      case 'sql':
-        content = exportToSql(tableName, columnNames, rows, includeTableName);
-        break;
-      default:
-        vsc.window.showErrorMessage(`Unsupported export format: ${formatValue}`);
-        return;
-    }
+    const content = formatHelper.exportMemory(columnNames, rows);
 
     // Write file
     await vsc.workspace.fs.writeFile(uri, Buffer.from(content, 'utf-8'));
