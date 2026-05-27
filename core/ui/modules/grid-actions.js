@@ -67,6 +67,93 @@ export function onColumnFilterKeydown(event, columnName) {
     }
 }
 
+// Column Selection Helpers
+function isColumnFullySelected(colIdx) {
+    const columnCellCount = state.gridData.length;
+    let selectedInColumn = 0;
+    for (const sc of state.selectedCells) {
+        if (sc.colIdx === colIdx) selectedInColumn++;
+    }
+    return columnCellCount > 0 && selectedInColumn === columnCellCount;
+}
+
+function handleColumnRangeSelection(event, colIdx) {
+    if (!(event.metaKey || event.ctrlKey)) {
+        // Clear previous if not adding to selection
+        state.selectedCells = [];
+        state.selectedColumns.clear();
+    }
+
+    const start = Math.min(state.lastSelectedColumnIndex, colIdx);
+    const end = Math.max(state.lastSelectedColumnIndex, colIdx);
+
+    const existingSet = new Set();
+    // If appending, index existing selected cells for efficiency
+    if (state.selectedCells.length > 0) {
+        for (const sc of state.selectedCells) {
+            existingSet.add(sc.rowIdx + ',' + sc.colIdx);
+        }
+    }
+
+    for (let c = start; c <= end; c++) {
+        const colName = state.tableColumns[c].name;
+        state.selectedColumns.add(colName);
+
+        for (let r = 0; r < state.gridData.length; r++) {
+            if (!existingSet.has(r + ',' + c)) {
+                const rowId = getRowId(state.gridData[r], r);
+                const value = getCellValue(state.gridData[r], c);
+                state.selectedCells.push({ rowIdx: r, colIdx: c, rowId, value });
+                existingSet.add(r + ',' + c);
+            }
+        }
+    }
+}
+
+function handleColumnMultiSelection(colIdx, columnName) {
+    if (isColumnFullySelected(colIdx)) {
+        state.selectedCells = state.selectedCells.filter(sc => sc.colIdx !== colIdx);
+        state.selectedColumns.delete(columnName);
+    } else {
+        // Add missing cells - Optimization: Use Set for fast lookup
+        const existingSet = new Set();
+        for (const sc of state.selectedCells) {
+            existingSet.add(sc.rowIdx + ',' + sc.colIdx);
+        }
+
+        for (let r = 0; r < state.gridData.length; r++) {
+            if (!existingSet.has(r + ',' + colIdx)) {
+                const rowId = getRowId(state.gridData[r], r);
+                const value = getCellValue(state.gridData[r], colIdx);
+                state.selectedCells.push({ rowIdx: r, colIdx, rowId, value });
+                existingSet.add(r + ',' + colIdx);
+            }
+        }
+        state.selectedColumns.add(columnName);
+    }
+    state.lastSelectedColumnIndex = colIdx;
+}
+
+function handleColumnSingleSelection(colIdx, columnName) {
+    // Toggle selection if this column is already fully selected and is the only column selected
+    if (isColumnFullySelected(colIdx) && state.selectedColumns.size === 1 && state.selectedColumns.has(columnName)) {
+        state.selectedCells = [];
+        state.selectedColumns.clear();
+        state.lastSelectedColumnIndex = null;
+    } else {
+        // Select only this column
+        state.selectedCells = [];
+        state.selectedColumns.clear();
+        for (let r = 0; r < state.gridData.length; r++) {
+            const rowId = getRowId(state.gridData[r], r);
+            const value = getCellValue(state.gridData[r], colIdx);
+            state.selectedCells.push({ rowIdx: r, colIdx, rowId, value });
+        }
+        state.selectedColumns.add(columnName);
+        state.lastSelectedColumnIndex = colIdx;
+    }
+}
+
 // Column Selection
 export function onColumnHeaderClick(event, columnName) {
     event.stopPropagation();
@@ -82,96 +169,15 @@ export function onColumnHeaderClick(event, columnName) {
 
     // Range Selection (Shift)
     if (event.shiftKey && state.lastSelectedColumnIndex !== null) {
-        if (!(event.metaKey || event.ctrlKey)) {
-            // Clear previous if not adding to selection
-            state.selectedCells = [];
-            state.selectedColumns.clear();
-        }
-
-        const start = Math.min(state.lastSelectedColumnIndex, colIdx);
-        const end = Math.max(state.lastSelectedColumnIndex, colIdx);
-
-        const existingSet = new Set();
-        // If appending, index existing selected cells for efficiency
-        if (state.selectedCells.length > 0) {
-            for (const sc of state.selectedCells) {
-                existingSet.add(`${sc.rowIdx},${sc.colIdx}`);
-            }
-        }
-
-        for (let c = start; c <= end; c++) {
-            const colName = state.tableColumns[c].name;
-            state.selectedColumns.add(colName);
-
-            for (let r = 0; r < state.gridData.length; r++) {
-                if (!existingSet.has(`${r},${c}`)) {
-                    const rowId = getRowId(state.gridData[r], r);
-                    const value = getCellValue(state.gridData[r], c);
-                    state.selectedCells.push({ rowIdx: r, colIdx: c, rowId, value });
-                    existingSet.add(`${r},${c}`);
-                }
-            }
-        }
+        handleColumnRangeSelection(event, colIdx);
     }
     // Multi Selection (Cmd/Ctrl)
     else if ((event.metaKey || event.ctrlKey)) {
-        // Toggle add/remove column
-
-        // Check if this specific column is fully selected
-        const columnCellCount = state.gridData.length;
-        let selectedInColumn = 0;
-        for (const sc of state.selectedCells) {
-            if (sc.colIdx === colIdx) selectedInColumn++;
-        }
-        const isColumnFullySelected = columnCellCount > 0 && selectedInColumn === columnCellCount;
-
-        if (isColumnFullySelected) {
-            state.selectedCells = state.selectedCells.filter(sc => sc.colIdx !== colIdx);
-            state.selectedColumns.delete(columnName);
-        } else {
-            // Add missing cells - Optimization: Use Set for fast lookup
-            const existingSet = new Set();
-            for (const sc of state.selectedCells) {
-                existingSet.add(`${sc.rowIdx},${sc.colIdx}`);
-            }
-
-            for (let r = 0; r < state.gridData.length; r++) {
-                if (!existingSet.has(`${r},${colIdx}`)) {
-                    const rowId = getRowId(state.gridData[r], r);
-                    const value = getCellValue(state.gridData[r], colIdx);
-                    state.selectedCells.push({ rowIdx: r, colIdx, rowId, value });
-                    existingSet.add(`${r},${colIdx}`);
-                }
-            }
-            state.selectedColumns.add(columnName);
-        }
-        state.lastSelectedColumnIndex = colIdx;
-    } else {
-        // Check if this specific column is fully selected
-        const columnCellCount = state.gridData.length;
-        let selectedInColumn = 0;
-        for (const sc of state.selectedCells) {
-            if (sc.colIdx === colIdx) selectedInColumn++;
-        }
-        const isColumnFullySelected = columnCellCount > 0 && selectedInColumn === columnCellCount;
-
-        // Toggle selection if this column is already fully selected and is the only column selected
-        if (isColumnFullySelected && state.selectedColumns.size === 1 && state.selectedColumns.has(columnName)) {
-            state.selectedCells = [];
-            state.selectedColumns.clear();
-            state.lastSelectedColumnIndex = null;
-        } else {
-            // Select only this column
-            state.selectedCells = [];
-            state.selectedColumns.clear();
-            for (let r = 0; r < state.gridData.length; r++) {
-                const rowId = getRowId(state.gridData[r], r);
-                const value = getCellValue(state.gridData[r], colIdx);
-                state.selectedCells.push({ rowIdx: r, colIdx, rowId, value });
-            }
-            state.selectedColumns.add(columnName);
-            state.lastSelectedColumnIndex = colIdx;
-        }
+        handleColumnMultiSelection(colIdx, columnName);
+    }
+    // Single Selection
+    else {
+        handleColumnSingleSelection(colIdx, columnName);
     }
 
     state.lastSelectedCell = null;
