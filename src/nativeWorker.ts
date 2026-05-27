@@ -500,7 +500,7 @@ export async function createNativeDatabaseConnection(
       } catch (err) {
         // Re-throw with more context to help debugging
         const message = err instanceof Error ? err.message : String(err);
-        throw new Error(`Failed to open database "${displayName}": ${message}. Path: ${filePath}`);
+        throw new Error(`Failed to open database "${displayName}": ${message}. Path: ${filePath}`, { cause: err });
       }
 
       // Create operations facade
