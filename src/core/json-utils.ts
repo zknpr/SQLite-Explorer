@@ -94,12 +94,14 @@ export function applyMergePatch(target: unknown, patch: unknown, depth = 0): unk
     }
 
     const patchObj = patch as Record<string, unknown>;
-    for (const key of Object.keys(patchObj)) {
-        const val = patchObj[key];
-        if (val === null) {
-            delete targetObj[key];
-        } else {
-            targetObj[key] = applyMergePatch(targetObj[key], val, depth + 1);
+    for (const key in patchObj) {
+        if (Object.prototype.hasOwnProperty.call(patchObj, key)) {
+            const val = patchObj[key];
+            if (val === null) {
+                delete targetObj[key];
+            } else {
+                targetObj[key] = applyMergePatch(targetObj[key], val, depth + 1);
+            }
         }
     }
 
