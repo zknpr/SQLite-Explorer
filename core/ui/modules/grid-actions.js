@@ -91,11 +91,14 @@ export function onColumnHeaderClick(event, columnName) {
         const start = Math.min(state.lastSelectedColumnIndex, colIdx);
         const end = Math.max(state.lastSelectedColumnIndex, colIdx);
 
-        const existingSet = new Set();
+        const existingRows = new Array();
         // If appending, index existing selected cells for efficiency
         if (state.selectedCells.length > 0) {
             for (const sc of state.selectedCells) {
-                existingSet.add(`${sc.rowIdx},${sc.colIdx}`);
+                if (sc.colIdx >= start && sc.colIdx <= end) {
+                    if (!existingRows[sc.rowIdx]) existingRows[sc.rowIdx] = new Set();
+                    existingRows[sc.rowIdx].add(sc.colIdx);
+                }
             }
         }
 
@@ -104,11 +107,11 @@ export function onColumnHeaderClick(event, columnName) {
             state.selectedColumns.add(colName);
 
             for (let r = 0; r < state.gridData.length; r++) {
-                if (!existingSet.has(`${r},${c}`)) {
+                const rowCols = existingRows[r];
+                if (!rowCols || !rowCols.has(c)) {
                     const rowId = getRowId(state.gridData[r], r);
                     const value = getCellValue(state.gridData[r], c);
                     state.selectedCells.push({ rowIdx: r, colIdx: c, rowId, value });
-                    existingSet.add(`${r},${c}`);
                 }
             }
         }
@@ -129,18 +132,19 @@ export function onColumnHeaderClick(event, columnName) {
             state.selectedCells = state.selectedCells.filter(sc => sc.colIdx !== colIdx);
             state.selectedColumns.delete(columnName);
         } else {
-            // Add missing cells - Optimization: Use Set for fast lookup
-            const existingSet = new Set();
+            // Add missing cells - Optimization: Use Set for fast lookup of rows in this column
+            const existingRows = new Set();
             for (const sc of state.selectedCells) {
-                existingSet.add(`${sc.rowIdx},${sc.colIdx}`);
+                if (sc.colIdx === colIdx) {
+                    existingRows.add(sc.rowIdx);
+                }
             }
 
             for (let r = 0; r < state.gridData.length; r++) {
-                if (!existingSet.has(`${r},${colIdx}`)) {
+                if (!existingRows.has(r)) {
                     const rowId = getRowId(state.gridData[r], r);
                     const value = getCellValue(state.gridData[r], colIdx);
                     state.selectedCells.push({ rowIdx: r, colIdx, rowId, value });
-                    existingSet.add(`${r},${colIdx}`);
                 }
             }
             state.selectedColumns.add(columnName);
@@ -373,20 +377,22 @@ export function onCellClick(event, rowIdx, colIdx, rowId) {
         const minCol = Math.min(state.lastSelectedCell.colIdx, colIdx);
         const maxCol = Math.max(state.lastSelectedCell.colIdx, colIdx);
 
-        // Optimization: Use Set for fast lookup of existing selected cells
-        const existingSet = new Set();
+        // Optimization: Map rowIdx -> Set of colIdx using a sparse array
+        const existingRows = new Array();
         for (const sc of state.selectedCells) {
-            existingSet.add(`${sc.rowIdx},${sc.colIdx}`);
+            if (sc.rowIdx >= minRow && sc.rowIdx <= maxRow && sc.colIdx >= minCol && sc.colIdx <= maxCol) {
+                if (!existingRows[sc.rowIdx]) existingRows[sc.rowIdx] = new Set();
+                existingRows[sc.rowIdx].add(sc.colIdx);
+            }
         }
 
         for (let r = minRow; r <= maxRow; r++) {
+            const rowCols = existingRows[r];
             for (let c = minCol; c <= maxCol; c++) {
-                // Check against Set instead of Array.some()
-                if (!existingSet.has(`${r},${c}`)) {
+                if (!rowCols || !rowCols.has(c)) {
                     const rId = getRowId(state.gridData[r], r);
                     const val = getCellValue(state.gridData[r], c);
                     state.selectedCells.push({ rowIdx: r, colIdx: c, rowId: rId, value: val });
-                    existingSet.add(`${r},${c}`);
                 }
             }
         }
