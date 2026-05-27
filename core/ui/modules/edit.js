@@ -3,9 +3,9 @@
  */
 import { state } from './state.js';
 import { backendApi } from './api.js';
-import { validateRowId, formatCellValue, formatCellValueAsText } from './utils.js';
+import { validateRowId, formatCellValueAsText } from './utils.js';
 import { updateStatus } from './ui.js';
-import { renderDataGrid, loadTableData, updateSelectionStates, clearSelection } from './grid.js';
+import { updateSelectionStates, clearSelection } from './grid.js';
 import { getRowDataOffset, getCellValue } from './data-utils.js';
 import { BlobInspector } from './blob-inspector.js';
 
