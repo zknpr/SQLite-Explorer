@@ -121,6 +121,11 @@ export async function createDatabaseEngine(
 export function createWorkerEndpoint() {
   let activeEngine: WasmDatabaseEngine | null = null;
 
+  function requireEngine(): WasmDatabaseEngine {
+    if (!activeEngine) throw new Error('No database initialized');
+    return activeEngine;
+  }
+
   return {
     /**
      * Initialize a database from binary content.
@@ -156,8 +161,7 @@ export function createWorkerEndpoint() {
      * @returns Query result sets
      */
     async runQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.executeQuery(sql, params);
+      return requireEngine().executeQuery(sql, params);
     },
 
     /**
@@ -167,83 +171,67 @@ export function createWorkerEndpoint() {
      * @returns Binary content
      */
     async exportDatabase(name: string): Promise<Uint8Array> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.serializeDatabase(name);
+      return requireEngine().serializeDatabase(name);
     },
 
     async updateCell(table: string, rowId: RecordId, column: string, value: CellValue): Promise<void> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.updateCell(table, rowId, column, value);
+      return requireEngine().updateCell(table, rowId, column, value);
     },
 
     async insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.insertRow(table, data);
+      return requireEngine().insertRow(table, data);
     },
 
     async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.insertRowBatch(table, rows);
+      return requireEngine().insertRowBatch(table, rows);
     },
 
     async deleteRows(table: string, rowIds: RecordId[]): Promise<void> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.deleteRows(table, rowIds);
+      return requireEngine().deleteRows(table, rowIds);
     },
 
     async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.deleteColumns(table, columns, dropDependentIndexes);
+      return requireEngine().deleteColumns(table, columns, dropDependentIndexes);
     },
 
     async findDependentIndexes(table: string, columns: string[]): Promise<string[]> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.findDependentIndexes(table, columns);
+      return requireEngine().findDependentIndexes(table, columns);
     },
 
     async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.createTable(table, columns);
+      return requireEngine().createTable(table, columns);
     },
 
     async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.updateCellBatch(table, updates);
+      return requireEngine().updateCellBatch(table, updates);
     },
 
     async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.addColumn(table, column, type, defaultValue);
+      return requireEngine().addColumn(table, column, type, defaultValue);
     },
 
     async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.fetchTableData(table, options);
+      return requireEngine().fetchTableData(table, options);
     },
 
     async fetchTableCount(table: string, options: TableCountOptions): Promise<number> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.fetchTableCount(table, options);
+      return requireEngine().fetchTableCount(table, options);
     },
 
     async fetchSchema(): Promise<SchemaSnapshot> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.fetchSchema();
+      return requireEngine().fetchSchema();
     },
 
     async getTableInfo(table: string): Promise<ColumnMetadata[]> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.getTableInfo(table);
+      return requireEngine().getTableInfo(table);
     },
 
     async getPragmas(): Promise<Record<string, CellValue>> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.getPragmas();
+      return requireEngine().getPragmas();
     },
 
     async setPragma(pragma: string, value: CellValue): Promise<void> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.setPragma(pragma, value);
+      return requireEngine().setPragma(pragma, value);
     },
 
     async ping(): Promise<boolean> {
@@ -252,8 +240,7 @@ export function createWorkerEndpoint() {
     },
 
     async writeToFile(path: string): Promise<void> {
-      if (!activeEngine) throw new Error('No database initialized');
-      return activeEngine.writeToFile(path);
+      return requireEngine().writeToFile(path);
     }
   };
 }
