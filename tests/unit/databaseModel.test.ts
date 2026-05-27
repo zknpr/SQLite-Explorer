@@ -1,5 +1,5 @@
 import './vscode_mock_setup';
-import { describe, it, before, after, beforeEach } from 'node:test';
+import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { mockVscode } from './mocks/vscode';
 
@@ -116,5 +116,164 @@ describe('isAutoCommitEnabled', () => {
         // Set configMap to return undefined for 'instantCommit' (by omitting it from configMap)
         // IsRemoteWorkspaceMode is true, but config defaults to 'never'
         await setupEnvironmentAndTest(undefined, 'ssh-remote', 2 /* Workspace */, false);
+    });
+});
+
+
+describe('DatabaseDocument undo/redo error handling', () => {
+    let mockViewerProvider: any;
+    let mockOpenContext: any;
+    let originalShowErrorMessage: any;
+    let originalL10n: any;
+
+    beforeEach(() => {
+        originalShowErrorMessage = mockVscode.window.showErrorMessage;
+        originalL10n = mockVscode.l10n.t;
+
+        mockVscode.l10n.t = (key: string, ...args: any[]) => {
+            let res = key;
+            args.forEach((arg, i) => {
+                res = res.replace(`{${i}}`, String(arg));
+            });
+            return res;
+        };
+
+        mockViewerProvider = {
+            reporter: undefined,
+            isVerified: true,
+            context: { extensionUri: mockVscode.Uri.parse('file:///ext') },
+            forceReadOnly: false
+        };
+
+        mockOpenContext = {
+            backupId: undefined
+        };
+
+        const moduleCache = require('module')._cache;
+        const workerFactoryPath = require.resolve('../../src/workerFactory');
+        moduleCache[workerFactoryPath] = {
+            id: workerFactoryPath,
+            filename: workerFactoryPath,
+            loaded: true,
+            exports: {
+                createDatabaseConnection: () => {
+                    return Promise.resolve({
+                        workerMethods: {
+                            open: () => Promise.resolve({ isReadOnly: false, bufferInfo: {} }),
+                            exec: () => Promise.resolve(),
+                        },
+                        establishConnection: () => Promise.resolve({ isReadOnly: false }),
+                        databaseOps: {
+                            undoModification: () => Promise.resolve(),
+                            redoModification: () => Promise.resolve(),
+                            close: () => Promise.resolve(),
+                            getSchema: () => Promise.resolve([]),
+                            query: () => Promise.resolve([])
+                        }
+                    });
+                }
+            }
+        };
+
+    });
+
+    afterEach(() => {
+        mockVscode.window.showErrorMessage = originalShowErrorMessage;
+        mockVscode.l10n.t = originalL10n;
+    });
+
+    it('should show error message when undoModification fails', async () => {
+        let errorMessageShown = false;
+        mockVscode.window.showErrorMessage = async (msg: string) => {
+            if (msg.includes('Test Undo Error')) {
+                errorMessageShown = true;
+            }
+        };
+
+        // We clear module cache of databaseModel so it uses the mocked workerFactory
+        delete require('module')._cache[require.resolve('../../src/databaseModel')];
+        const { DatabaseDocument } = require('../../src/databaseModel');
+
+        const uri = mockVscode.Uri.parse('file:///test.db');
+        const doc = await DatabaseDocument.create(mockViewerProvider, uri, mockOpenContext);
+
+        // Mock database operations to throw error on undo
+        const dbOps = doc.databaseOperations;
+        if(dbOps) {
+            dbOps.undoModification = () => Promise.reject(new Error("Test Undo Error"));
+        } else {
+             // force override via any
+             (doc as any).connectionState = {
+                databaseOps: {
+                    undoModification: () => Promise.reject(new Error("Test Undo Error")),
+                    redoModification: () => Promise.resolve()
+                }
+             };
+        }
+
+        let undoAction: (() => Promise<void>) | undefined;
+        doc.onDidChange((modification: any) => {
+            undoAction = modification.undo;
+        });
+
+        doc.recordModification({
+            label: 'Test Mod',
+            action: 'Test Mod Action',
+            sql: [],
+            inverseSql: []
+        });
+
+        assert.ok(undoAction, 'Undo action should be emitted');
+
+        await undoAction();
+
+        assert.strictEqual(errorMessageShown, true, 'Error message should be shown for failed undo');
+    });
+
+    it('should show error message when redoModification fails', async () => {
+        let errorMessageShown = false;
+        mockVscode.window.showErrorMessage = async (msg: string) => {
+            if (msg.includes('Test Redo Error')) {
+                errorMessageShown = true;
+            }
+        };
+
+        const { DatabaseDocument } = require('../../src/databaseModel');
+        const uri = mockVscode.Uri.parse('file:///test.db');
+        const doc = await DatabaseDocument.create(mockViewerProvider, uri, mockOpenContext);
+
+        // Mock database operations to throw error on redo
+        const dbOps = doc.databaseOperations;
+        if(dbOps) {
+             dbOps.redoModification = () => Promise.reject(new Error("Test Redo Error"));
+        } else {
+            (doc as any).connectionState = {
+                databaseOps: {
+                    undoModification: () => Promise.resolve(),
+                    redoModification: () => Promise.reject(new Error("Test Redo Error"))
+                }
+             };
+        }
+
+        let redoAction: (() => Promise<void>) | undefined;
+        let undoAction: (() => Promise<void>) | undefined;
+        doc.onDidChange((modification: any) => {
+            undoAction = modification.undo;
+            redoAction = modification.redo;
+        });
+
+        doc.recordModification({
+            label: 'Test Mod',
+            action: 'Test Mod Action',
+            sql: [],
+            inverseSql: []
+        });
+
+        assert.ok(redoAction, 'Redo action should be emitted');
+
+        await undoAction();
+        await redoAction();
+
+        assert.strictEqual(errorMessageShown, true, 'Error message should be shown for failed redo');
     });
 });
