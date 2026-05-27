@@ -3,90 +3,22 @@ import { escapeHtml, formatCellValueAsText } from './utils.js';
 import { getRowId, getCellValue } from './data-utils.js';
 import { syncSelectionDOM } from './grid-selection.js';
 
-export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
-    const headerHeight = 52;
-    const rowHeight = 26;
+function createEmptyView() {
+    const emptyView = document.createElement('div');
+    emptyView.className = 'empty-view';
+    emptyView.innerHTML = `
+        <span class="empty-icon codicon codicon-database"></span>
+        <span class="empty-title">No data</span>
+        <span class="empty-desc">This table is empty</span>
+    `;
+    return emptyView;
+}
 
-    // Calculate row number column width based on the largest row number that will be displayed
-    // Base width: 50px for up to 2 digits, add ~8px per additional digit
-    const maxRowNum = state.currentPageIndex * state.rowsPerPage + state.gridData.length;
-    const digitCount = Math.max(2, String(maxRowNum).length);
-    const rowNumWidth = 36 + (digitCount * 8); // Base 36px + 8px per digit
-
-    const container = document.getElementById('gridContainer');
-    if (!container) return;
-
-    // If explicit scroll positions not provided, capture current
-    const currentScrollLeft = container.scrollLeft;
-    const currentScrollTop = container.scrollTop;
-
-    const finalScrollLeft = savedScrollLeft !== null ? savedScrollLeft : currentScrollLeft;
-    const finalScrollTop = savedScrollTop !== null ? savedScrollTop : currentScrollTop;
-
-    const hasActiveFilters = Object.values(state.columnFilters).some(v => v && v.trim() !== '');
-
-    // Clear container
-    container.innerHTML = '';
-
-    if (state.gridData.length === 0 && !hasActiveFilters && state.tableColumns.length === 0) {
-        const emptyView = document.createElement('div');
-        emptyView.className = 'empty-view';
-        emptyView.innerHTML = `
-            <span class="empty-icon codicon codicon-database"></span>
-            <span class="empty-title">No data</span>
-            <span class="empty-desc">This table is empty</span>
-        `;
-        container.appendChild(emptyView);
-        return;
-    }
-
-    // Optimization: Pre-calculate selected cells set for O(1) lookup during render
-    const selectedCellKeys = new Set();
-    if (state.selectedCells.length > 0) {
-        for (const cell of state.selectedCells) {
-            selectedCellKeys.add(`${cell.rowIdx},${cell.colIdx}`);
-        }
-    }
-
-    const table = document.createElement('table');
-    table.className = 'data-grid';
-
+function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
     const thead = document.createElement('thead');
     thead.className = 'grid-header';
     const headerTr = document.createElement('tr');
 
-    // Calculate column widths if needed
-    if (Object.keys(state.columnWidths).length === 0 && state.gridData.length > 0) {
-        for (const col of state.tableColumns) {
-            const headerLen = col.name.length;
-            const iconPadding = col.isPrimaryKey ? 86 : 70;
-            const titleWidth = headerLen * 8 + iconPadding;
-            state.columnWidths[col.name] = Math.max(80, Math.min(250, titleWidth));
-        }
-    }
-
-    // Reorder columns: pinned first
-    const orderedColumns = [
-        ...state.tableColumns.filter(col => state.pinnedColumns.has(col.name)),
-        ...state.tableColumns.filter(col => !state.pinnedColumns.has(col.name))
-    ];
-
-    // Pinned column offsets
-    const pinnedColumnOffsets = new Map();
-    // Start 1px to the left to create a slight overlap (49px instead of 50px).
-    let cumulativeLeft = rowNumWidth - 1;
-    for (const col of orderedColumns) {
-        if (state.pinnedColumns.has(col.name)) {
-            pinnedColumnOffsets.set(col.name, cumulativeLeft);
-            cumulativeLeft += (state.columnWidths[col.name] || 120);
-        }
-    }
-
-    // Column index map
-    const columnIndexMap = new Map();
-    state.tableColumns.forEach((col, idx) => columnIndexMap.set(col.name, idx));
-
-    // Header cells
     const rowNumTh = document.createElement('th');
     rowNumTh.className = 'header-cell row-number-header';
     Object.assign(rowNumTh.style, {
@@ -148,8 +80,10 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
         headerTr.appendChild(th);
     }
     thead.appendChild(headerTr);
-    table.appendChild(thead);
+    return thead;
+}
 
+function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, rowNumWidth, headerHeight, rowHeight, selectedCellKeys, hasActiveFilters) {
     const tbody = document.createElement('tbody');
 
     // Pinned rows logic
@@ -274,7 +208,87 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     }
 
     tbody.appendChild(fragment);
+    return tbody;
+}
+
+export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
+    const headerHeight = 52;
+    const rowHeight = 26;
+
+    // Calculate row number column width based on the largest row number that will be displayed
+    // Base width: 50px for up to 2 digits, add ~8px per additional digit
+    const maxRowNum = state.currentPageIndex * state.rowsPerPage + state.gridData.length;
+    const digitCount = Math.max(2, String(maxRowNum).length);
+    const rowNumWidth = 36 + (digitCount * 8); // Base 36px + 8px per digit
+
+    const container = document.getElementById('gridContainer');
+    if (!container) return;
+
+    // If explicit scroll positions not provided, capture current
+    const currentScrollLeft = container.scrollLeft;
+    const currentScrollTop = container.scrollTop;
+
+    const finalScrollLeft = savedScrollLeft !== null ? savedScrollLeft : currentScrollLeft;
+    const finalScrollTop = savedScrollTop !== null ? savedScrollTop : currentScrollTop;
+
+    const hasActiveFilters = Object.values(state.columnFilters).some(v => v && v.trim() !== '');
+
+    // Clear container
+    container.innerHTML = '';
+
+    if (state.gridData.length === 0 && !hasActiveFilters && state.tableColumns.length === 0) {
+        container.appendChild(createEmptyView());
+        return;
+    }
+
+    // Optimization: Pre-calculate selected cells set for O(1) lookup during render
+    const selectedCellKeys = new Set();
+    if (state.selectedCells.length > 0) {
+        for (const cell of state.selectedCells) {
+            selectedCellKeys.add(`${cell.rowIdx},${cell.colIdx}`);
+        }
+    }
+
+    const table = document.createElement('table');
+    table.className = 'data-grid';
+
+    // Calculate column widths if needed
+    if (Object.keys(state.columnWidths).length === 0 && state.gridData.length > 0) {
+        for (const col of state.tableColumns) {
+            const headerLen = col.name.length;
+            const iconPadding = col.isPrimaryKey ? 86 : 70;
+            const titleWidth = headerLen * 8 + iconPadding;
+            state.columnWidths[col.name] = Math.max(80, Math.min(250, titleWidth));
+        }
+    }
+
+    // Reorder columns: pinned first
+    const orderedColumns = [
+        ...state.tableColumns.filter(col => state.pinnedColumns.has(col.name)),
+        ...state.tableColumns.filter(col => !state.pinnedColumns.has(col.name))
+    ];
+
+    // Pinned column offsets
+    const pinnedColumnOffsets = new Map();
+    // Start 1px to the left to create a slight overlap (49px instead of 50px).
+    let cumulativeLeft = rowNumWidth - 1;
+    for (const col of orderedColumns) {
+        if (state.pinnedColumns.has(col.name)) {
+            pinnedColumnOffsets.set(col.name, cumulativeLeft);
+            cumulativeLeft += (state.columnWidths[col.name] || 120);
+        }
+    }
+
+    // Column index map
+    const columnIndexMap = new Map();
+    state.tableColumns.forEach((col, idx) => columnIndexMap.set(col.name, idx));
+
+    const thead = createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets);
+    table.appendChild(thead);
+
+    const tbody = createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, rowNumWidth, headerHeight, rowHeight, selectedCellKeys, hasActiveFilters);
     table.appendChild(tbody);
+
     container.appendChild(table);
 
     container.scrollLeft = finalScrollLeft;
