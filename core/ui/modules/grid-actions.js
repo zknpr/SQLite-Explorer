@@ -102,11 +102,14 @@ export function onColumnHeaderClick(event, columnName) {
         for (let c = start; c <= end; c++) {
             const colName = state.tableColumns[c].name;
             state.selectedColumns.add(colName);
+        }
 
-            for (let r = 0; r < state.gridData.length; r++) {
+        for (let r = 0; r < state.gridData.length; r++) {
+            const rowData = state.gridData[r];
+            const rowId = getRowId(rowData, r);
+            for (let c = start; c <= end; c++) {
                 if (!existingSet.has(`${r},${c}`)) {
-                    const rowId = getRowId(state.gridData[r], r);
-                    const value = getCellValue(state.gridData[r], c);
+                    const value = getCellValue(rowData, c);
                     state.selectedCells.push({ rowIdx: r, colIdx: c, rowId, value });
                     existingSet.add(`${r},${c}`);
                 }
