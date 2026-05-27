@@ -4,6 +4,27 @@ import { getRowDataOffset } from './data-utils.js';
 import { updateStatus } from './ui.js';
 import { validateRowId } from './utils.js';
 
+
+const FILE_SIGNATURES = {
+    PNG: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+    JPEG: [0xFF, 0xD8, 0xFF],
+    GIF: [0x47, 0x49, 0x46, 0x38],
+    BMP: [0x42, 0x4D],
+    RIFF: [0x52, 0x49, 0x46, 0x46],
+    WEBP: [0x57, 0x45, 0x42, 0x50],
+    PDF: [0x25, 0x50, 0x44, 0x46, 0x2D],
+    ID3: [0x49, 0x44, 0x33],
+    MP3_SYNC1: [0xFF, 0xFB],
+    MP3_SYNC2: [0xFF, 0xF3],
+    MP3_SYNC3: [0xFF, 0xF2],
+    OGG: [0x4F, 0x67, 0x67, 0x53],
+    WAVE: [0x57, 0x41, 0x56, 0x45],
+    FLAC: [0x66, 0x4C, 0x61, 0x43],
+    FTYP: [0x66, 0x74, 0x79, 0x70],
+    WEBM: [0x1A, 0x45, 0xDF, 0xA3],
+    AVI: [0x41, 0x56, 0x49, 0x20]
+};
+
 export class BlobInspector {
     constructor() {
         this.currentObjectUrl = null;
@@ -314,24 +335,24 @@ export class BlobInspector {
 
     detectType(data) {
         // Image Signatures
-        if (this.checkSignature(data, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])) return { mime: 'image/png', type: 'image', ext: 'png' };
-        if (this.checkSignature(data, [0xFF, 0xD8, 0xFF])) return { mime: 'image/jpeg', type: 'image', ext: 'jpg' };
-        if (this.checkSignature(data, [0x47, 0x49, 0x46, 0x38])) return { mime: 'image/gif', type: 'image', ext: 'gif' };
-        if (this.checkSignature(data, [0x42, 0x4D])) return { mime: 'image/bmp', type: 'image', ext: 'bmp' };
-        if (this.checkSignature(data, [0x52, 0x49, 0x46, 0x46]) && this.checkSignature(data.subarray(8), [0x57, 0x45, 0x42, 0x50])) return { mime: 'image/webp', type: 'image', ext: 'webp' };
+        if (this.checkSignature(data, FILE_SIGNATURES.PNG)) return { mime: 'image/png', type: 'image', ext: 'png' };
+        if (this.checkSignature(data, FILE_SIGNATURES.JPEG)) return { mime: 'image/jpeg', type: 'image', ext: 'jpg' };
+        if (this.checkSignature(data, FILE_SIGNATURES.GIF)) return { mime: 'image/gif', type: 'image', ext: 'gif' };
+        if (this.checkSignature(data, FILE_SIGNATURES.BMP)) return { mime: 'image/bmp', type: 'image', ext: 'bmp' };
+        if (this.checkSignature(data, FILE_SIGNATURES.RIFF) && this.checkSignature(data.subarray(8), FILE_SIGNATURES.WEBP)) return { mime: 'image/webp', type: 'image', ext: 'webp' };
 
         // PDF
-        if (this.checkSignature(data, [0x25, 0x50, 0x44, 0x46, 0x2D])) return { mime: 'application/pdf', type: 'pdf', ext: 'pdf' };
+        if (this.checkSignature(data, FILE_SIGNATURES.PDF)) return { mime: 'application/pdf', type: 'pdf', ext: 'pdf' };
 
         // Audio formats
-        if (this.checkSignature(data, [0x49, 0x44, 0x33])) return { mime: 'audio/mpeg', type: 'audio', ext: 'mp3' };
-        if (this.checkSignature(data, [0xFF, 0xFB]) || this.checkSignature(data, [0xFF, 0xF3]) || this.checkSignature(data, [0xFF, 0xF2])) return { mime: 'audio/mpeg', type: 'audio', ext: 'mp3' };
-        if (this.checkSignature(data, [0x4F, 0x67, 0x67, 0x53])) return { mime: 'audio/ogg', type: 'audio', ext: 'ogg' };
-        if (this.checkSignature(data, [0x52, 0x49, 0x46, 0x46]) && this.checkSignature(data.subarray(8), [0x57, 0x41, 0x56, 0x45])) return { mime: 'audio/wav', type: 'audio', ext: 'wav' };
-        if (this.checkSignature(data, [0x66, 0x4C, 0x61, 0x43])) return { mime: 'audio/flac', type: 'audio', ext: 'flac' };
+        if (this.checkSignature(data, FILE_SIGNATURES.ID3)) return { mime: 'audio/mpeg', type: 'audio', ext: 'mp3' };
+        if (this.checkSignature(data, FILE_SIGNATURES.MP3_SYNC1) || this.checkSignature(data, FILE_SIGNATURES.MP3_SYNC2) || this.checkSignature(data, FILE_SIGNATURES.MP3_SYNC3)) return { mime: 'audio/mpeg', type: 'audio', ext: 'mp3' };
+        if (this.checkSignature(data, FILE_SIGNATURES.OGG)) return { mime: 'audio/ogg', type: 'audio', ext: 'ogg' };
+        if (this.checkSignature(data, FILE_SIGNATURES.RIFF) && this.checkSignature(data.subarray(8), FILE_SIGNATURES.WAVE)) return { mime: 'audio/wav', type: 'audio', ext: 'wav' };
+        if (this.checkSignature(data, FILE_SIGNATURES.FLAC)) return { mime: 'audio/flac', type: 'audio', ext: 'flac' };
 
         // Video formats - check ftyp box for MP4/MOV/M4V
-        if (this.checkSignature(data.subarray(4), [0x66, 0x74, 0x79, 0x70])) {
+        if (this.checkSignature(data.subarray(4), FILE_SIGNATURES.FTYP)) {
             // ftyp box detected - check brand
             const brand = String.fromCharCode(...data.subarray(8, 12));
             if (brand.startsWith('mp4') || brand === 'isom' || brand === 'avc1' || brand === 'M4V ') {
@@ -343,8 +364,8 @@ export class BlobInspector {
             // Generic MP4-like
             return { mime: 'video/mp4', type: 'video', ext: 'mp4' };
         }
-        if (this.checkSignature(data, [0x1A, 0x45, 0xDF, 0xA3])) return { mime: 'video/webm', type: 'video', ext: 'webm' };
-        if (this.checkSignature(data, [0x52, 0x49, 0x46, 0x46]) && this.checkSignature(data.subarray(8), [0x41, 0x56, 0x49, 0x20])) return { mime: 'video/avi', type: 'video', ext: 'avi' };
+        if (this.checkSignature(data, FILE_SIGNATURES.WEBM)) return { mime: 'video/webm', type: 'video', ext: 'webm' };
+        if (this.checkSignature(data, FILE_SIGNATURES.RIFF) && this.checkSignature(data.subarray(8), FILE_SIGNATURES.AVI)) return { mime: 'video/avi', type: 'video', ext: 'avi' };
 
         // Text check
         if (this.isText(data)) {
