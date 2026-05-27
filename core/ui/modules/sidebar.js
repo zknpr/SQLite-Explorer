@@ -238,6 +238,86 @@ export function renderSidebar() {
     }
 }
 
+function groupSelectedCellsByColumn() {
+    const columns = new Map();
+    for (const cell of state.selectedCells) {
+        if (!columns.has(cell.colIdx)) {
+            const colDef = state.tableColumns[cell.colIdx];
+            columns.set(cell.colIdx, {
+                name: colDef.name,
+                type: colDef.type,
+                values: new Set()
+            });
+        }
+        columns.get(cell.colIdx).values.add(cell.value);
+    }
+    return columns;
+}
+
+function createBatchFieldDOM(colIdx, colInfo) {
+    const uniqueValues = Array.from(colInfo.values);
+    const isMixed = uniqueValues.length > 1;
+
+    let valueDisplay = '';
+    if (isMixed) {
+        valueDisplay = '(mixed values)';
+    } else {
+        const val = uniqueValues[0];
+        if (val === null) valueDisplay = 'NULL';
+        else if (val instanceof Uint8Array) valueDisplay = '[BLOB]';
+        else valueDisplay = String(val);
+    }
+
+    const div = document.createElement('div');
+    div.className = 'form-field batch-field';
+    div.dataset.colidx = colIdx;
+    div.style.marginBottom = '8px';
+
+    const label = document.createElement('label');
+    label.style.fontSize = '11px';
+    label.style.color = 'var(--text-secondary)';
+
+    const nameText = document.createTextNode(colInfo.name + ' ');
+    label.appendChild(nameText);
+
+    const typeSpan = document.createElement('span');
+    typeSpan.style.opacity = '0.7';
+    typeSpan.textContent = colInfo.type || '';
+    label.appendChild(typeSpan);
+
+    div.appendChild(label);
+
+    const controlsDiv = document.createElement('div');
+    controlsDiv.style.display = 'flex';
+    controlsDiv.style.gap = '4px';
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'batch-input';
+    input.placeholder = valueDisplay;
+    input.dataset.colidx = colIdx;
+    input.style.flex = '1';
+    input.style.minWidth = '0';
+    controlsDiv.appendChild(input);
+
+    const nullBtn = document.createElement('button');
+    nullBtn.className = 'btn-secondary btn-batch-null';
+    nullBtn.style.padding = '2px 6px';
+    nullBtn.title = 'Set to NULL';
+    nullBtn.textContent = 'NULL';
+    controlsDiv.appendChild(nullBtn);
+
+    const patchBtn = document.createElement('button');
+    patchBtn.className = 'btn-secondary btn-batch-patch';
+    patchBtn.style.padding = '2px 6px';
+    patchBtn.title = 'JSON Patch';
+    patchBtn.textContent = '{}';
+    controlsDiv.appendChild(patchBtn);
+
+    div.appendChild(controlsDiv);
+    return div;
+}
+
 export function updateBatchSidebar() {
     const title = document.getElementById('batchUpdateSectionTitle');
     const list = document.getElementById('batchUpdateList');
@@ -261,84 +341,13 @@ export function updateBatchSidebar() {
     countBadge.textContent = cellCount;
 
     // Analyze selected cells - Group by column
-    const columns = new Map();
-
-    for (const cell of state.selectedCells) {
-        if (!columns.has(cell.colIdx)) {
-            const colDef = state.tableColumns[cell.colIdx];
-            columns.set(cell.colIdx, {
-                name: colDef.name,
-                type: colDef.type,
-                values: new Set()
-            });
-        }
-        columns.get(cell.colIdx).values.add(cell.value);
-    }
+    const columns = groupSelectedCellsByColumn();
 
     fieldsContainer.replaceChildren();
 
     for (const [colIdx, colInfo] of columns) {
-        const uniqueValues = Array.from(colInfo.values);
-        const isMixed = uniqueValues.length > 1;
-
-        let valueDisplay = '';
-        if (isMixed) {
-            valueDisplay = '(mixed values)';
-        } else {
-            const val = uniqueValues[0];
-            if (val === null) valueDisplay = 'NULL';
-            else if (val instanceof Uint8Array) valueDisplay = '[BLOB]';
-            else valueDisplay = String(val);
-        }
-
-        const div = document.createElement('div');
-        div.className = 'form-field batch-field';
-        div.dataset.colidx = colIdx;
-        div.style.marginBottom = '8px';
-
-        const label = document.createElement('label');
-        label.style.fontSize = '11px';
-        label.style.color = 'var(--text-secondary)';
-
-        const nameText = document.createTextNode(colInfo.name + ' ');
-        label.appendChild(nameText);
-
-        const typeSpan = document.createElement('span');
-        typeSpan.style.opacity = '0.7';
-        typeSpan.textContent = colInfo.type || '';
-        label.appendChild(typeSpan);
-
-        div.appendChild(label);
-
-        const controlsDiv = document.createElement('div');
-        controlsDiv.style.display = 'flex';
-        controlsDiv.style.gap = '4px';
-
-        const input = document.createElement('input');
-        input.type = 'text';
-        input.className = 'batch-input';
-        input.placeholder = valueDisplay;
-        input.dataset.colidx = colIdx;
-        input.style.flex = '1';
-        input.style.minWidth = '0';
-        controlsDiv.appendChild(input);
-
-        const nullBtn = document.createElement('button');
-        nullBtn.className = 'btn-secondary btn-batch-null';
-        nullBtn.style.padding = '2px 6px';
-        nullBtn.title = 'Set to NULL';
-        nullBtn.textContent = 'NULL';
-        controlsDiv.appendChild(nullBtn);
-
-        const patchBtn = document.createElement('button');
-        patchBtn.className = 'btn-secondary btn-batch-patch';
-        patchBtn.style.padding = '2px 6px';
-        patchBtn.title = 'JSON Patch';
-        patchBtn.textContent = '{}';
-        controlsDiv.appendChild(patchBtn);
-
-        div.appendChild(controlsDiv);
-        fieldsContainer.appendChild(div);
+        const fieldDOM = createBatchFieldDOM(colIdx, colInfo);
+        fieldsContainer.appendChild(fieldDOM);
     }
 }
 
