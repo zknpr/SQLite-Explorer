@@ -187,15 +187,15 @@ describe('exportTableCommand Fallback', () => {
                 }
             };
 
-            await exportTableCommand(
-                {} as any,
-                undefined,
-                { table: 'test_table', uri: 'vscode-sqlite://test.db' },
-                ['id', 'name'],
-                undefined,
-                undefined,
-                { format: 'csv' }
-            );
+            await exportTableCommand({
+                context: {} as any,
+                reporter: undefined,
+                dbParams: { table: 'test_table', uri: 'vscode-sqlite://test.db' },
+                columns: ['id', 'name'],
+                dbOptions: undefined,
+                tableStore: undefined,
+                exportOptions: { format: 'csv' }
+            });
 
             assert.strictEqual(warnCalled, true, 'Should have logged fallback warning');
             assert.strictEqual(fileWritten, true, 'Should have written file using fallback workspace.fs');

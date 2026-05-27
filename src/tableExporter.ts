@@ -24,16 +24,30 @@ import { getNodeFs } from './core/sqlite-db';
  * @param dbParams - Database parameters containing table name
  * @param columns - Array of column names to export
  */
+export interface ExportTableCommandOptions {
+  context: vsc.ExtensionContext;
+  reporter?: TelemetryReporter;
+  dbParams: DbParams;
+  columns: string[];
+  dbOptions?: unknown;
+  tableStore?: unknown;
+  exportOptions?: ExportOptions;
+  extras?: unknown;
+}
+
 export async function exportTableCommand(
-  context: vsc.ExtensionContext,
-  reporter: TelemetryReporter | undefined,
-  dbParams: DbParams,
-  columns: string[],
-  _dbOptions?: unknown,
-  _tableStore?: unknown,
-  _exportOptions?: ExportOptions,
-  _extras?: unknown
+  options: ExportTableCommandOptions
 ) {
+  const {
+    context,
+    reporter,
+    dbParams,
+    columns,
+    dbOptions: _dbOptions,
+    tableStore: _tableStore,
+    exportOptions: _exportOptions,
+    extras: _extras
+  } = options;
   try {
     const tableName = dbParams.table;
     if (!tableName) {
