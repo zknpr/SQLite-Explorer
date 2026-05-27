@@ -342,12 +342,9 @@ export function updateBatchSidebar() {
     }
 }
 
-export async function applyBatchUpdate() {
-    if (state.selectedCells.length === 0) return;
 
-    const inputs = document.querySelectorAll('.batch-input');
-
-    // 1. Validation and Setup Phase
+// Validation and Setup
+function validateBatchInputs(inputs, state, updateStatus) {
     const inputsByCol = new Map();
     for (const input of inputs) {
         const colIdx = parseInt(input.dataset.colidx, 10);
@@ -359,15 +356,16 @@ export async function applyBatchUpdate() {
             } catch (e) {
                 const colDef = state.tableColumns[colIdx];
                 updateStatus(`Invalid JSON for patch in ${colDef.name}`);
-                return;
+                return null; // Indicates validation failure
             }
         }
     }
+    return inputsByCol;
+}
 
+function prepareBatchUpdates(selectedCells, inputsByCol, state) {
     const updates = [];
-
-    // 2. Processing Phase
-    for (const cell of state.selectedCells) {
+    for (const cell of selectedCells) {
         const input = inputsByCol.get(cell.colIdx);
         if (!input) continue;
 
@@ -407,6 +405,30 @@ export async function applyBatchUpdate() {
             colIdx: cell.colIdx  // Local metadata
         });
     }
+    return updates;
+}
+
+function applyLocalGridUpdates(updates, state, getRowDataOffset) {
+    const hasPatch = updates.some(u => u.operation === 'json_patch');
+
+    if (!hasPatch) {
+        for (const u of updates) {
+            state.gridData[u.rowIdx][u.colIdx + getRowDataOffset()] = u.value;
+        }
+    }
+}
+
+export async function applyBatchUpdate() {
+    if (state.selectedCells.length === 0) return;
+
+    const inputs = document.querySelectorAll('.batch-input');
+
+    // 1. Validation and Setup Phase
+    const inputsByCol = validateBatchInputs(inputs, state, updateStatus);
+    if (!inputsByCol) return; // Validation failed
+
+    // 2. Processing Phase
+    const updates = prepareBatchUpdates(state.selectedCells, inputsByCol, state);
 
     if (updates.length === 0) {
         updateStatus('No values entered for batch update');
@@ -429,13 +451,7 @@ export async function applyBatchUpdate() {
         await backendApi.updateCellBatch(state.selectedTable, backendUpdates, label);
 
         // Update local grid data
-        const hasPatch = updates.some(u => u.operation === 'json_patch');
-
-        if (!hasPatch) {
-            for (const u of updates) {
-                state.gridData[u.rowIdx][u.colIdx + getRowDataOffset()] = u.value;
-            }
-        }
+        applyLocalGridUpdates(updates, state, getRowDataOffset);
 
         // Refresh grid and sidebar
         await loadTableData(false);
