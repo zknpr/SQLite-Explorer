@@ -112,4 +112,55 @@ describe('Worker Endpoint', () => {
         const hasTestTable = schema.tables.some(t => t.identifier === 'test_table');
         assert.strictEqual(hasTestTable, false);
     });
+
+    it('should delegate remaining operations after database is initialized', async () => {
+        await endpoint.initializeDatabase('test.db', {
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false,
+            wasmBinary
+        });
+
+        await endpoint.createTable('users', [
+            { name: 'id', type: 'INTEGER', primaryKey: true, notNull: false },
+            { name: 'name', type: 'TEXT', primaryKey: false, notNull: false }
+        ]);
+
+        await endpoint.insertRowBatch('users', [
+            { id: 1, name: 'Alice' },
+            { id: 2, name: 'Bob' }
+        ]);
+
+        await endpoint.updateCellBatch('users', [
+            { rowId: 1, column: 'name', value: 'Alice Smith' },
+            { rowId: 2, column: 'name', value: 'Bob Jones' }
+        ]);
+
+        await endpoint.updateCell('users', 1, 'name', 'Alice S.');
+
+        await endpoint.addColumn('users', 'age', 'INTEGER', '30');
+
+        const tableData = await endpoint.fetchTableData('users', { offset: 0, limit: 10 });
+        assert.deepStrictEqual(tableData.rows, [
+            [1, 'Alice S.', 30],
+            [2, 'Bob Jones', 30]
+        ]);
+
+        await endpoint.setPragma('journal_mode', 'WAL');
+        const pragmas = await endpoint.getPragmas();
+        assert.ok(pragmas.journal_mode !== undefined);
+
+        await endpoint.deleteColumns('users', ['age']);
+        const info = await endpoint.getTableInfo('users');
+        assert.strictEqual(info.length, 2);
+
+        const dependentIndexes = await endpoint.findDependentIndexes('users', ['name']);
+        assert.deepStrictEqual(dependentIndexes, []);
+
+        await endpoint.deleteRows('users', [1]);
+        const count = await endpoint.fetchTableCount('users', {});
+        assert.strictEqual(count, 1);
+
+        await endpoint.writeToFile('/tmp/test_dump.db');
+    });
 });
