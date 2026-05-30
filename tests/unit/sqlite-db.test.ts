@@ -19,6 +19,60 @@ describe('getNodeFs', () => {
   });
 });
 
+describe('createDatabaseEngine file reading errors', () => {
+  it('should catch and log error for non-existent file', async () => {
+    const originalConsoleError = console.error;
+    let loggedError: any;
+    console.error = (msg: string, err: any) => {
+      if (msg === 'Failed to read file in worker:') {
+        loggedError = err;
+      }
+    };
+    try {
+      await createDatabaseEngine({
+        content: null,
+        filePath: '/non/existent/path/for/test/db.sqlite',
+        maxSize: 1000,
+        readOnlyMode: false
+      });
+      assert.ok(loggedError, 'Should have caught and logged an error');
+      assert.strictEqual(loggedError.code, 'ENOENT');
+    } finally {
+      console.error = originalConsoleError;
+    }
+  });
+
+  it('should catch and log error when file exceeds maxSize', async () => {
+    const fs = require('fs');
+    const tempFile = 'test-temp.sqlite';
+    fs.writeFileSync(tempFile, 'dummy data for max size test');
+
+    const originalConsoleError = console.error;
+    let loggedError: any;
+    console.error = (msg: string, err: any) => {
+      if (msg === 'Failed to read file in worker:') {
+        loggedError = err;
+      }
+    };
+
+    try {
+      await createDatabaseEngine({
+        content: null,
+        filePath: tempFile,
+        maxSize: 1, // extremely small max size
+        readOnlyMode: false
+      });
+      assert.ok(loggedError, 'Should have caught and logged an error');
+      assert.strictEqual(loggedError.message, 'File too large');
+    } finally {
+      console.error = originalConsoleError;
+      if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+      }
+    }
+  });
+});
+
 describe('WasmDatabaseEngine', () => {
   let engine: any;
 
