@@ -6,6 +6,7 @@
  */
 
 import * as vsc from 'vscode';
+import { maskSensitiveData } from './helpers';
 import type {
     DatabaseOperations,
     CellValue,
@@ -74,24 +75,7 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
 
         // Basic PII/Secret masking in the log message itself if it contains SQL values directly
         // This is a heuristic attempt to mask email-like or key-like patterns in raw SQL
-        let safeMessage = message;
-
-        // Mask email addresses
-        safeMessage = safeMessage.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '***@***.***');
-
-        // Mask phone numbers (various formats: +1-234-567-8901, (234) 567-8901, 234.567.8901, etc.)
-        safeMessage = safeMessage.replace(/(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g, '***-***-****');
-
-        // Mask API keys / tokens (long alphanumeric strings that look like secrets, 20+ chars)
-        // Match patterns like: sk_live_xxx, api_key_xxx, or generic hex/base64 tokens
-        safeMessage = safeMessage.replace(/\b(sk_live_|sk_test_|api_key_|token_|secret_|key_)[a-zA-Z0-9]{10,}\b/gi, '$1[REDACTED]');
-        safeMessage = safeMessage.replace(/\b[a-fA-F0-9]{32,}\b/g, '[REDACTED_HEX]');
-
-        // Mask credit card numbers (basic pattern: 16 digits with optional separators)
-        safeMessage = safeMessage.replace(/\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b/g, '****-****-****-****');
-
-        // Mask SSN patterns (###-##-####)
-        safeMessage = safeMessage.replace(/\b\d{3}-\d{2}-\d{4}\b/g, '***-**-****');
+        const safeMessage = maskSensitiveData(message);
 
         this.outputChannel.appendLine(`${timestamp} ${type} [${this.filename}] ${safeMessage}`);
     }
