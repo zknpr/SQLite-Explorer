@@ -1,5 +1,5 @@
 import './vscode_mock_setup';
-import { describe, it, before, after, beforeEach } from 'node:test';
+import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { mockVscode } from './mocks/vscode';
 
@@ -116,5 +116,126 @@ describe('isAutoCommitEnabled', () => {
         // Set configMap to return undefined for 'instantCommit' (by omitting it from configMap)
         // IsRemoteWorkspaceMode is true, but config defaults to 'never'
         await setupEnvironmentAndTest(undefined, 'ssh-remote', 2 /* Workspace */, false);
+    });
+});
+
+
+describe('DatabaseDocument save', () => {
+    let mockDatabaseOperations: any;
+    let originalWarn: any;
+    let originalWorkerFactoryExports: any;
+    let workerFactoryPath: string;
+    let moduleCache: any;
+
+    beforeEach(() => {
+        originalWarn = console.warn;
+        moduleCache = require('module')._cache;
+        workerFactoryPath = require.resolve('../../src/workerFactory');
+        if (moduleCache[workerFactoryPath]) {
+            originalWorkerFactoryExports = moduleCache[workerFactoryPath].exports;
+        }
+    });
+
+    afterEach(() => {
+        console.warn = originalWarn;
+        if (moduleCache && workerFactoryPath) {
+            if (originalWorkerFactoryExports) {
+                moduleCache[workerFactoryPath].exports = originalWorkerFactoryExports;
+            } else {
+                delete moduleCache[workerFactoryPath];
+            }
+        }
+    });
+
+    it('should fallback to serializeDatabase if writeToFile throws', async () => {
+        let warningLogged = false;
+        console.warn = (msg: any, err?: any) => {
+            if (typeof msg === 'string' && msg.includes('Direct write failed')) {
+                warningLogged = true;
+            }
+        };
+
+        const mockUri = {
+            scheme: 'file',
+            fsPath: '/path/to/test.db',
+            path: '/path/to/test.db',
+            with: () => mockUri,
+            toString: () => 'file:///path/to/test.db'
+        };
+
+        mockDatabaseOperations = {
+            writeToFile: async () => {
+                throw new Error('Write failed');
+            },
+            serializeDatabase: async () => {
+                return new Uint8Array([1, 2, 3]);
+            },
+            runCheckpoint: async () => {},
+            engineKind: Promise.resolve('WASM')
+        };
+
+        let writeToFileCallCount = 0;
+        let serializeDatabaseCallCount = 0;
+        let fsWriteFileCallCount = 0;
+
+        const origWriteToFile = mockDatabaseOperations.writeToFile;
+        mockDatabaseOperations.writeToFile = async () => {
+            writeToFileCallCount++;
+            return origWriteToFile();
+        };
+
+        const origSerialize = mockDatabaseOperations.serializeDatabase;
+        mockDatabaseOperations.serializeDatabase = async () => {
+            serializeDatabaseCallCount++;
+            return origSerialize();
+        };
+
+        mockVscode.workspace.fs.writeFile = async () => {
+            fsWriteFileCallCount++;
+        };
+        mockVscode.workspace.fs.stat = async () => ({ permissions: 0 });
+
+        const mockViewerProvider = {
+            reporter: undefined,
+            isVerified: true,
+            context: {
+                extensionUri: mockUri
+            },
+            forceReadOnly: false
+        };
+
+        if (!moduleCache[workerFactoryPath]) {
+            moduleCache[workerFactoryPath] = { id: workerFactoryPath, filename: workerFactoryPath, loaded: true, exports: {} };
+        }
+
+        moduleCache[workerFactoryPath].exports = {
+            createDatabaseConnection: () => Promise.resolve({
+                establishConnection: async () => ({
+                    databaseOps: mockDatabaseOperations,
+                    isReadOnly: false
+                }),
+                workerMethods: {}
+            })
+        };
+
+        const dbModelPath = require.resolve('../../src/databaseModel');
+        delete moduleCache[dbModelPath];
+
+        const { DatabaseDocument } = require('../../src/databaseModel');
+
+        const model = await DatabaseDocument.create(
+            mockViewerProvider as any,
+            mockUri as any,
+            {} as any
+        );
+
+        model.ensureWritable = async () => {};
+
+        await model.save();
+
+        assert.strictEqual(warningLogged, true);
+        assert.strictEqual(writeToFileCallCount, 1);
+        assert.strictEqual(serializeDatabaseCallCount, 1);
+        assert.strictEqual(fsWriteFileCallCount, 1);
     });
 });
