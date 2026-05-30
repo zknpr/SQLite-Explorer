@@ -1,7 +1,8 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
-import { createDatabaseEngine, getNodeFs } from '../../src/core/sqlite-db';
+import { createDatabaseEngine, getNodeFs, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+import type { Database } from 'sql.js';
 
 describe('getNodeFs', () => {
   it('should return the fs module in Node.js environment', () => {
@@ -16,6 +17,60 @@ describe('getNodeFs', () => {
     const fs1 = getNodeFs();
     const fs2 = getNodeFs();
     assert.strictEqual(fs1, fs2, 'should return the same fs reference');
+  });
+});
+
+describe('createDatabaseEngine file reading errors', () => {
+  it('should catch and log error for non-existent file', async () => {
+    const originalConsoleError = console.error;
+    let loggedError: any;
+    console.error = (msg: string, err: any) => {
+      if (msg === 'Failed to read file in worker:') {
+        loggedError = err;
+      }
+    };
+    try {
+      await createDatabaseEngine({
+        content: null,
+        filePath: '/non/existent/path/for/test/db.sqlite',
+        maxSize: 1000,
+        readOnlyMode: false
+      });
+      assert.ok(loggedError, 'Should have caught and logged an error');
+      assert.strictEqual(loggedError.code, 'ENOENT');
+    } finally {
+      console.error = originalConsoleError;
+    }
+  });
+
+  it('should catch and log error when file exceeds maxSize', async () => {
+    const fs = require('fs');
+    const tempFile = 'test-temp.sqlite';
+    fs.writeFileSync(tempFile, 'dummy data for max size test');
+
+    const originalConsoleError = console.error;
+    let loggedError: any;
+    console.error = (msg: string, err: any) => {
+      if (msg === 'Failed to read file in worker:') {
+        loggedError = err;
+      }
+    };
+
+    try {
+      await createDatabaseEngine({
+        content: null,
+        filePath: tempFile,
+        maxSize: 1, // extremely small max size
+        readOnlyMode: false
+      });
+      assert.ok(loggedError, 'Should have caught and logged an error');
+      assert.strictEqual(loggedError.message, 'File too large');
+    } finally {
+      console.error = originalConsoleError;
+      if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+      }
+    }
   });
 });
 
@@ -34,6 +89,43 @@ describe('WasmDatabaseEngine', () => {
     // Setup initial table
     await engine.executeQuery("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
     await engine.insertRow('users', { id: 1, name: 'Alice' });
+  });
+
+  describe('safeRollback', () => {
+    it('should attempt a rollback and warn on error', async () => {
+      // override executeQuery to simulate error on ROLLBACK
+      const originalExecuteQuery = engine.executeQuery.bind(engine);
+      let rollbackCalled = false;
+
+      engine.executeQuery = async (sql: string) => {
+        if (sql === 'ROLLBACK') {
+          rollbackCalled = true;
+          throw new Error('Simulated rollback error');
+        }
+        return originalExecuteQuery(sql);
+      };
+
+      let warnCalled = false;
+      let warnArgs: any[] = [];
+      const originalWarn = console.warn;
+
+      console.warn = (...args) => {
+        warnCalled = true;
+        warnArgs = args;
+      };
+
+      try {
+        await engine.safeRollback('testContext');
+
+        assert.ok(rollbackCalled, 'ROLLBACK should have been called');
+        assert.ok(warnCalled, 'console.warn should have been called');
+        assert.match(warnArgs[0], /Failed to rollback \(testContext\)/);
+        assert.strictEqual(warnArgs[1].message, 'Simulated rollback error');
+      } finally {
+        console.warn = originalWarn;
+        engine.executeQuery = originalExecuteQuery; // Restore
+      }
+    });
   });
 
   describe('addColumn', () => {
@@ -129,6 +221,58 @@ describe('WasmDatabaseEngine', () => {
   });
 
   describe('executeQuery', () => {
+
+    it('should handle errors in executeQuery iteration and attempt to free statement', async () => {
+      let freeCalled = false;
+      let freeThrew = false;
+
+      // Mock the WASM Database instance
+      const mockDb = {
+        iterateStatements: (sql: string) => {
+          return [{
+            bind: () => {},
+            step: () => {
+              throw new Error('Simulated iteration error');
+            },
+            get: () => [],
+            getColumnNames: () => [],
+            free: () => {
+              freeCalled = true;
+              throw new Error('Simulated free error');
+            }
+          }];
+        }
+      } as unknown as Database;
+
+      const engine = new WasmDatabaseEngine(mockDb, 5000);
+
+      const consoleWarnOrig = console.warn;
+      let warnedMessage = '';
+      console.warn = (msg: string, err: any) => {
+        warnedMessage = msg;
+        if (err && err.message === 'Simulated free error') {
+          freeThrew = true;
+        }
+      };
+
+      try {
+        await assert.rejects(
+          async () => {
+            await engine.executeQuery('SELECT * FROM dummy');
+          },
+          (err: Error) => {
+            return err.message.includes('Simulated iteration error');
+          }
+        );
+
+        assert.strictEqual(freeCalled, true, 'currentStmt.free() should have been called');
+        assert.strictEqual(freeThrew, true, 'The error in free() should have been caught and warned');
+        assert.strictEqual(warnedMessage, 'Failed to free statement on error:', 'Warning message should match');
+      } finally {
+        console.warn = consoleWarnOrig;
+      }
+    });
+
     it('should timeout long running queries', async () => {
       // Create a specific engine instance with a short timeout
       const result = await createDatabaseEngine({
