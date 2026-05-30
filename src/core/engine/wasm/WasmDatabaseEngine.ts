@@ -272,8 +272,15 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     if (deletedColumns) {
       await this.executeQuery('BEGIN TRANSACTION');
       try {
-        for (const col of deletedColumns) {
-          await this.addColumn(targetTable, col.name, col.type);
+        // Optimize column creation by batching all ADD COLUMN statements into a single executeQuery call.
+        // This avoids N+1 query transaction overhead for multiple columns.
+        const addColumnStatements = deletedColumns.map(col => {
+          validateSqlType(col.type);
+          return `ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(col.name)} ${col.type};`;
+        }).join('\n');
+
+        if (addColumnStatements) {
+          await this.executeQuery(addColumnStatements);
         }
 
         // Optimize restoration by grouping rows that have identical column sets
