@@ -118,3 +118,186 @@ describe('isAutoCommitEnabled', () => {
         await setupEnvironmentAndTest(undefined, 'ssh-remote', 2 /* Workspace */, false);
     });
 });
+
+
+
+
+describe('DatabaseDocument save/saveAs fallback', () => {
+    let DatabaseDocument: any;
+
+    beforeEach(() => {
+        // Clear module cache to ensure we get a fresh instance that uses our mocked workerFactory
+        const moduleCache = require('module')._cache;
+        Object.keys(moduleCache).forEach(key => {
+            if (key.includes('src/') && !key.includes('workerFactory') && !key.includes('mocks')) {
+                delete moduleCache[key];
+            }
+        });
+
+        const workerFactoryPath = require.resolve('../../src/workerFactory');
+        moduleCache[workerFactoryPath] = {
+            id: workerFactoryPath,
+            filename: workerFactoryPath,
+            loaded: true,
+            exports: {
+                createDatabaseConnection: async () => ({
+                    establishConnection: async () => ({
+                        databaseOps: {
+                            engineKind: Promise.resolve('wasm'),
+                            writeToFile: async () => { throw new Error('Simulated write failure'); },
+                            serializeDatabase: async () => new Uint8Array([1, 2, 3]),
+                            applyModifications: async () => {}
+                        },
+                        isReadOnly: false
+                    }),
+                    workerMethods: {
+                        [Symbol.dispose]: () => {}
+                    }
+                })
+            }
+        };
+
+        const dbModel = require('../../src/databaseModel');
+        DatabaseDocument = dbModel.DatabaseDocument;
+    });
+
+    const createFileUri = (path: string) => {
+        return {
+            scheme: 'file',
+            authority: '',
+            path: path,
+            query: '',
+            fragment: '',
+            fsPath: path,
+            with: () => ({}),
+            toJSON: () => ({})
+        };
+    };
+
+    const createDocBypassingFactory = (dbOps: any) => {
+        const mockViewerProvider = {
+            reporter: {},
+            isVerified: true,
+            context: { extensionUri: createFileUri('/ext') },
+            forceReadOnly: false,
+            outputChannel: undefined
+        };
+        const fileUri = createFileUri('/test/db.sqlite');
+
+        return new (DatabaseDocument as any)(
+            mockViewerProvider,
+            fileUri,
+            null, // tracker
+            false, // autoCommitEnabled
+            { databaseOps: dbOps, isReadOnly: false },
+            { [Symbol.dispose]: () => {} }, // workerMethods
+            async () => {}, // establishConnection
+            {} // reporter
+        );
+    };
+
+    it('saveAs: falls back to buffer transfer when writeToFile fails for file URI', async () => {
+        let serialized = false;
+        const dbOps = {
+            engineKind: Promise.resolve('wasm'),
+            writeToFile: async () => { throw new Error('Simulated write failure'); },
+            serializeDatabase: async () => {
+                serialized = true;
+                return new Uint8Array([1, 2, 3]);
+            }
+        };
+
+        const doc = createDocBypassingFactory(dbOps);
+
+        const targetUri = createFileUri('/test/target.sqlite');
+
+        let statCalled = false;
+        let writeFileCalled = false;
+
+        const originalFs = mockVscode.workspace.fs;
+        mockVscode.workspace.fs = {
+            ...originalFs,
+            stat: async () => {
+                statCalled = true;
+                return { size: 100 }; // Less than getFileSizeLimit()
+            },
+            writeFile: async (uri: any, content: any) => {
+                writeFileCalled = true;
+                assert.deepStrictEqual(content, new Uint8Array([1, 2, 3]));
+            },
+            readFile: async () => new Uint8Array([])
+        } as any;
+
+        const originalConsoleWarn = console.warn;
+        let consoleWarnCalled = false;
+        console.warn = (msg: string, err: any) => {
+            if (msg && msg.includes('Direct write failed')) {
+                consoleWarnCalled = true;
+            } else {
+                originalConsoleWarn(msg, err);
+            }
+        };
+
+        try {
+            await doc.saveAs(targetUri, undefined);
+
+            assert.strictEqual(consoleWarnCalled, true, 'console.warn should be called');
+            assert.strictEqual(statCalled, true, 'fs.stat should be called');
+            assert.strictEqual(serialized, true, 'serializeDatabase should be called');
+            assert.strictEqual(writeFileCalled, true, 'fs.writeFile should be called');
+        } finally {
+            mockVscode.workspace.fs = originalFs;
+            console.warn = originalConsoleWarn;
+        }
+    });
+
+    it('save: falls back to buffer transfer when writeToFile fails for file URI', async () => {
+        let serialized = false;
+        const dbOps = {
+            engineKind: Promise.resolve('wasm'),
+            writeToFile: async () => { throw new Error('Simulated write failure'); },
+            serializeDatabase: async () => {
+                serialized = true;
+                return new Uint8Array([1, 2, 3]);
+            }
+        };
+
+        const doc = createDocBypassingFactory(dbOps);
+
+        let writeFileCalled = false;
+
+        const originalFs = mockVscode.workspace.fs;
+        mockVscode.workspace.fs = {
+            ...originalFs,
+            stat: async () => {
+                return { size: 100 };
+            },
+            writeFile: async (uri: any, content: any) => {
+                writeFileCalled = true;
+                assert.deepStrictEqual(content, new Uint8Array([1, 2, 3]));
+            },
+            readFile: async () => new Uint8Array([])
+        } as any;
+
+        const originalConsoleWarn = console.warn;
+        let consoleWarnCalled = false;
+        console.warn = (msg: string, err: any) => {
+            if (msg && msg.includes('Direct write failed')) {
+                consoleWarnCalled = true;
+            } else {
+                originalConsoleWarn(msg, err);
+            }
+        };
+
+        try {
+            await doc.save();
+
+            assert.strictEqual(consoleWarnCalled, true, 'console.warn should be called');
+            assert.strictEqual(serialized, true, 'serializeDatabase should be called');
+            assert.strictEqual(writeFileCalled, true, 'fs.writeFile should be called');
+        } finally {
+            mockVscode.workspace.fs = originalFs;
+            console.warn = originalConsoleWarn;
+        }
+    });
+});
