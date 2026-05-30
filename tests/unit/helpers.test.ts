@@ -112,6 +112,20 @@ describe('doTry', () => {
     assert.strictEqual(warnMessages.length, 1);
     assert.deepStrictEqual(warnMessages[0], ['[SQLite Explorer]', 'string error']);
   });
+
+  it('should return undefined and log warning on null error', () => {
+    const result = doTry(() => { throw null; });
+    assert.strictEqual(result, undefined);
+    assert.strictEqual(warnMessages.length, 1);
+    assert.deepStrictEqual(warnMessages[0], ['[SQLite Explorer]', 'null']);
+  });
+
+  it('should return undefined and log warning on non-error object', () => {
+    const result = doTry(() => { throw { toString: () => 'custom object error' }; });
+    assert.strictEqual(result, undefined);
+    assert.strictEqual(warnMessages.length, 1);
+    assert.deepStrictEqual(warnMessages[0], ['[SQLite Explorer]', 'custom object error']);
+  });
 });
 
 describe('uiKindToString', () => {
