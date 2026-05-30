@@ -175,5 +175,55 @@ describe('SQLiteFileSystemProvider', () => {
                 await provider.readFile(uri);
             }, /FileNotFound/);
         });
+
+        it('should test catch block explicitly', async () => {
+            // The issue requested testing the error path at src/virtualFileSystem.ts:97
+            // The previous test already covers it implicitly by ensuring the catch block is hit.
+            // We can add a spy to console.error to explicitly test that 'Error reading cell:' is logged.
+            const dbOps = {
+                executeQuery: mock.fn(async () => {
+                    throw new Error('Database error for catch block');
+                })
+            };
+            setupMockDocument(docKey, dbOps);
+
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/col.txt`);
+
+            const originalConsoleError = console.error;
+            let loggedMessage = '';
+            console.error = (msg: string, err: any) => {
+                loggedMessage = msg;
+            };
+
+            try {
+                await assert.rejects(async () => {
+                    await provider.readFile(uri);
+                }, /FileNotFound/);
+                assert.strictEqual(loggedMessage, 'Error reading cell:');
+            } finally {
+                console.error = originalConsoleError;
+            }
+        });
+    });
+
+    describe('writeFile', () => {
+        const provider = new SQLiteFileSystemProvider();
+        const docKey = 'test-doc-write';
+
+        it('should throw Unavailable on database error', async () => {
+            const dbOps = {
+                updateCell: mock.fn(async () => {
+                    throw new Error('Database write error');
+                })
+            };
+            setupMockDocument(docKey, dbOps);
+
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/col.txt`);
+            const content = new TextEncoder().encode('new data');
+
+            await assert.rejects(async () => {
+                await provider.writeFile(uri, content, { create: false, overwrite: true });
+            }, /Database write error/);
+        });
     });
 });
