@@ -36,6 +36,43 @@ describe('WasmDatabaseEngine', () => {
     await engine.insertRow('users', { id: 1, name: 'Alice' });
   });
 
+  describe('safeRollback', () => {
+    it('should attempt a rollback and warn on error', async () => {
+      // override executeQuery to simulate error on ROLLBACK
+      const originalExecuteQuery = engine.executeQuery.bind(engine);
+      let rollbackCalled = false;
+
+      engine.executeQuery = async (sql: string) => {
+        if (sql === 'ROLLBACK') {
+          rollbackCalled = true;
+          throw new Error('Simulated rollback error');
+        }
+        return originalExecuteQuery(sql);
+      };
+
+      let warnCalled = false;
+      let warnArgs: any[] = [];
+      const originalWarn = console.warn;
+
+      console.warn = (...args) => {
+        warnCalled = true;
+        warnArgs = args;
+      };
+
+      try {
+        await engine.safeRollback('testContext');
+
+        assert.ok(rollbackCalled, 'ROLLBACK should have been called');
+        assert.ok(warnCalled, 'console.warn should have been called');
+        assert.match(warnArgs[0], /Failed to rollback \(testContext\)/);
+        assert.strictEqual(warnArgs[1].message, 'Simulated rollback error');
+      } finally {
+        console.warn = originalWarn;
+        engine.executeQuery = originalExecuteQuery; // Restore
+      }
+    });
+  });
+
   describe('addColumn', () => {
     it('should add a new column with default NULL', async () => {
       await engine.addColumn('users', 'email', 'TEXT');
