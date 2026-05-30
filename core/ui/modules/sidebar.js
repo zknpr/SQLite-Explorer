@@ -118,124 +118,118 @@ export async function refreshSchema() {
     }
 }
 
+function filterSchemaItems(items, filter) {
+    if (!filter) return items;
+    return items.filter(item => item.name.toLowerCase().includes(filter));
+}
+
+function updateBadge(badgeId, filteredCount, totalCount, isFiltered) {
+    const badge = document.getElementById(badgeId);
+    if (badge) {
+        badge.textContent = isFiltered ? `${filteredCount}/${totalCount}` : totalCount;
+    }
+}
+
+function renderSidebarList(listId, items, type, iconClass, emptyText) {
+    const list = document.getElementById(listId);
+    if (!list) return;
+
+    list.replaceChildren(); // Clear list
+
+    if (items.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'list-item';
+        li.style.opacity = '0.5';
+        li.textContent = emptyText;
+        list.appendChild(li);
+        return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    items.forEach(item => {
+        const li = document.createElement('li');
+        li.className = 'list-item';
+        if (state.selectedTable === item.name && state.selectedTableType === type) {
+            li.classList.add('selected');
+        }
+        // Data attributes for delegation
+        li.dataset.name = item.name;
+        if (type) li.dataset.type = type;
+        li.title = item.name;
+
+        const icon = document.createElement('span');
+        icon.className = `item-icon codicon ${iconClass}`;
+        li.appendChild(icon);
+
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'item-name';
+        nameSpan.textContent = item.name;
+        li.appendChild(nameSpan);
+
+        fragment.appendChild(li);
+    });
+    list.appendChild(fragment);
+}
+
+function renderIndexesList(listId, indexes, emptyText) {
+    const indexesList = document.getElementById(listId);
+    if (!indexesList) return;
+
+    indexesList.replaceChildren();
+
+    if (indexes.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'list-item';
+        li.style.opacity = '0.5';
+        li.textContent = emptyText;
+        indexesList.appendChild(li);
+        return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    indexes.forEach(i => {
+        const li = document.createElement('li');
+        li.className = 'list-item';
+        li.title = `${i.name} on ${i.table}`;
+
+        const icon = document.createElement('span');
+        icon.className = 'item-icon codicon codicon-list-selection';
+        li.appendChild(icon);
+
+        const content = document.createElement('div');
+        content.className = 'item-content';
+
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'item-name';
+        nameSpan.textContent = i.name;
+        content.appendChild(nameSpan);
+
+        const detailSpan = document.createElement('span');
+        detailSpan.className = 'item-detail';
+        detailSpan.textContent = i.table;
+        content.appendChild(detailSpan);
+
+        li.appendChild(content);
+        fragment.appendChild(li);
+    });
+    indexesList.appendChild(fragment);
+}
+
 export function renderSidebar() {
-    const tablesBadge = document.getElementById('tablesBadge');
-    const viewsBadge = document.getElementById('viewsBadge');
-    const indexesBadge = document.getElementById('indexesBadge');
-
-    // Apply sidebar filter (case-insensitive substring match)
     const filter = state.sidebarFilter.toLowerCase();
-    const filteredTables = filter
-        ? state.schemaCache.tables.filter(t => t.name.toLowerCase().includes(filter))
-        : state.schemaCache.tables;
-    const filteredViews = filter
-        ? state.schemaCache.views.filter(v => v.name.toLowerCase().includes(filter))
-        : state.schemaCache.views;
-    const filteredIndexes = filter
-        ? state.schemaCache.indexes.filter(i => i.name.toLowerCase().includes(filter))
-        : state.schemaCache.indexes;
+    const isFiltered = filter.length > 0;
 
-    // Update badge counts: show "filtered/total" when filtering, otherwise just total
-    if (tablesBadge) {
-        tablesBadge.textContent = filter
-            ? `${filteredTables.length}/${state.schemaCache.tables.length}`
-            : state.schemaCache.tables.length;
-    }
-    if (viewsBadge) {
-        viewsBadge.textContent = filter
-            ? `${filteredViews.length}/${state.schemaCache.views.length}`
-            : state.schemaCache.views.length;
-    }
-    if (indexesBadge) {
-        indexesBadge.textContent = filter
-            ? `${filteredIndexes.length}/${state.schemaCache.indexes.length}`
-            : state.schemaCache.indexes.length;
-    }
+    const filteredTables = filterSchemaItems(state.schemaCache.tables, filter);
+    const filteredViews = filterSchemaItems(state.schemaCache.views, filter);
+    const filteredIndexes = filterSchemaItems(state.schemaCache.indexes, filter);
 
-    // Helper to render list
-    const renderList = (listId, items, type, iconClass, emptyText) => {
-        const list = document.getElementById(listId);
-        if (!list) return;
+    updateBadge('tablesBadge', filteredTables.length, state.schemaCache.tables.length, isFiltered);
+    updateBadge('viewsBadge', filteredViews.length, state.schemaCache.views.length, isFiltered);
+    updateBadge('indexesBadge', filteredIndexes.length, state.schemaCache.indexes.length, isFiltered);
 
-        list.replaceChildren(); // Clear list
-
-        if (items.length === 0) {
-            const li = document.createElement('li');
-            li.className = 'list-item';
-            li.style.opacity = '0.5';
-            li.textContent = emptyText;
-            list.appendChild(li);
-            return;
-        }
-
-        const fragment = document.createDocumentFragment();
-        items.forEach(item => {
-            const li = document.createElement('li');
-            li.className = 'list-item';
-            if (state.selectedTable === item.name && state.selectedTableType === type) {
-                li.classList.add('selected');
-            }
-            // Data attributes for delegation
-            li.dataset.name = item.name;
-            if (type) li.dataset.type = type;
-            li.title = item.name;
-
-            const icon = document.createElement('span');
-            icon.className = `item-icon codicon ${iconClass}`;
-            li.appendChild(icon);
-
-            const nameSpan = document.createElement('span');
-            nameSpan.className = 'item-name';
-            nameSpan.textContent = item.name;
-            li.appendChild(nameSpan);
-
-            fragment.appendChild(li);
-        });
-        list.appendChild(fragment);
-    };
-
-    renderList('tablesList', filteredTables, 'table', 'codicon-table', filter ? 'No matching tables' : 'No tables');
-    renderList('viewsList', filteredViews, 'view', 'codicon-eye', filter ? 'No matching views' : 'No views');
-
-    const indexesList = document.getElementById('indexesList');
-    if (indexesList) {
-        indexesList.replaceChildren();
-        if (filteredIndexes.length === 0) {
-            const li = document.createElement('li');
-            li.className = 'list-item';
-            li.style.opacity = '0.5';
-            li.textContent = filter ? 'No matching indexes' : 'No indexes';
-            indexesList.appendChild(li);
-        } else {
-            const fragment = document.createDocumentFragment();
-            filteredIndexes.forEach(i => {
-                const li = document.createElement('li');
-                li.className = 'list-item';
-                li.title = `${i.name} on ${i.table}`;
-
-                const icon = document.createElement('span');
-                icon.className = 'item-icon codicon codicon-list-selection';
-                li.appendChild(icon);
-
-                const content = document.createElement('div');
-                content.className = 'item-content';
-
-                const nameSpan = document.createElement('span');
-                nameSpan.className = 'item-name';
-                nameSpan.textContent = i.name;
-                content.appendChild(nameSpan);
-
-                const detailSpan = document.createElement('span');
-                detailSpan.className = 'item-detail';
-                detailSpan.textContent = i.table;
-                content.appendChild(detailSpan);
-
-                li.appendChild(content);
-                fragment.appendChild(li);
-            });
-            indexesList.appendChild(fragment);
-        }
-    }
+    renderSidebarList('tablesList', filteredTables, 'table', 'codicon-table', filter ? 'No matching tables' : 'No tables');
+    renderSidebarList('viewsList', filteredViews, 'view', 'codicon-eye', filter ? 'No matching views' : 'No views');
+    renderIndexesList('indexesList', filteredIndexes, filter ? 'No matching indexes' : 'No indexes');
 }
 
 export function updateBatchSidebar() {
