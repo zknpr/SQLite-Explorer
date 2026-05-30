@@ -181,7 +181,7 @@ export async function saveCellEdit() {
 
     } catch (err) {
         console.error('Save failed:', err);
-        // On error, keep editing so user can fix
+        // On error, the cell remains in edit mode to allow user corrections
         let errorMessage = err.message || String(err);
         // ... error message formatting ...
         updateStatus(`Save failed: ${errorMessage}`);
