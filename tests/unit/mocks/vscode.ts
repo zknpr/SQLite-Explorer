@@ -132,6 +132,9 @@ export const mockVscode = {
         remoteName: undefined as string | undefined,
         uiKind: 2 // Desktop
     },
+    extensions: {
+        getExtension: () => ({ extensionKind: 2 })
+    },
     UIKind: {
         Desktop: 2,
         Web: 1
