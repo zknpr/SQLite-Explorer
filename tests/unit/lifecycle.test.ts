@@ -34,6 +34,15 @@ describe('disposeAll', () => {
         assert.deepStrictEqual(log, [3, 2, 1]);
     });
 
+    it('should skip null or undefined items', () => {
+        const d1 = new TestDisposable();
+        const d2 = new TestDisposable();
+        // @ts-ignore - intentional testing of invalid inputs
+        disposeAll([d1, null, undefined, d2]);
+        assert.strictEqual(d1.disposed, true);
+        assert.strictEqual(d2.disposed, true);
+    });
+
     it('should collect errors and throw AggregateError', () => {
         const error1 = new Error('Error 1');
         const error2 = new Error('Error 2');
@@ -124,5 +133,26 @@ describe('Disposable', () => {
         } // service disposed here
 
         assert.strictEqual(child.disposed, true);
+    });
+
+    it('should collect errors from children and throw AggregateError on dispose', () => {
+        const service = new MyService();
+        const error1 = new Error('Child error 1');
+        const error2 = new Error('Child error 2');
+        const child1 = { dispose: () => { throw error1; } };
+        const child2 = { dispose: () => { throw error2; } };
+
+        service.register(child1 as any);
+        service.register(child2 as any);
+
+        try {
+            service.dispose();
+            assert.fail('Should have thrown AggregateError');
+        } catch (err: any) {
+            assert.ok(err instanceof AggregateError);
+            assert.strictEqual(err.errors.length, 2);
+            assert.strictEqual(err.errors[0], error2); // child2 disposed first (reverse order)
+            assert.strictEqual(err.errors[1], error1); // child1 disposed last
+        }
     });
 });
