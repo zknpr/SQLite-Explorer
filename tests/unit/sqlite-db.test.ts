@@ -1,7 +1,8 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
-import { createDatabaseEngine, getNodeFs } from '../../src/core/sqlite-db';
+import { createDatabaseEngine, getNodeFs, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+import type { Database } from 'sql.js';
 
 describe('getNodeFs', () => {
   it('should return the fs module in Node.js environment', () => {
@@ -129,6 +130,58 @@ describe('WasmDatabaseEngine', () => {
   });
 
   describe('executeQuery', () => {
+
+    it('should handle errors in executeQuery iteration and attempt to free statement', async () => {
+      let freeCalled = false;
+      let freeThrew = false;
+
+      // Mock the WASM Database instance
+      const mockDb = {
+        iterateStatements: (sql: string) => {
+          return [{
+            bind: () => {},
+            step: () => {
+              throw new Error('Simulated iteration error');
+            },
+            get: () => [],
+            getColumnNames: () => [],
+            free: () => {
+              freeCalled = true;
+              throw new Error('Simulated free error');
+            }
+          }];
+        }
+      } as unknown as Database;
+
+      const engine = new WasmDatabaseEngine(mockDb, 5000);
+
+      const consoleWarnOrig = console.warn;
+      let warnedMessage = '';
+      console.warn = (msg: string, err: any) => {
+        warnedMessage = msg;
+        if (err && err.message === 'Simulated free error') {
+          freeThrew = true;
+        }
+      };
+
+      try {
+        await assert.rejects(
+          async () => {
+            await engine.executeQuery('SELECT * FROM dummy');
+          },
+          (err: Error) => {
+            return err.message.includes('Simulated iteration error');
+          }
+        );
+
+        assert.strictEqual(freeCalled, true, 'currentStmt.free() should have been called');
+        assert.strictEqual(freeThrew, true, 'The error in free() should have been caught and warned');
+        assert.strictEqual(warnedMessage, 'Failed to free statement on error:', 'Warning message should match');
+      } finally {
+        console.warn = consoleWarnOrig;
+      }
+    });
+
     it('should timeout long running queries', async () => {
       // Create a specific engine instance with a short timeout
       const result = await createDatabaseEngine({
