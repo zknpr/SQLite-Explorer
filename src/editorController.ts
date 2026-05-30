@@ -145,20 +145,24 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
   /**
    * Create handler for webview panel disposal.
    */
-  #createPanelDisposeHandler = (webviewPanel: vsc.WebviewPanel) => () => {
-    this.webviewBridges.delete(webviewPanel);
-  };
+  #createPanelDisposeHandler(webviewPanel: vsc.WebviewPanel) {
+    return () => {
+      this.webviewBridges.delete(webviewPanel);
+    };
+  }
 
   /**
    * Create handler for webview panel view state changes.
    */
-  #createViewStateChangeHandler = (_webviewPanel: vsc.WebviewPanel, document: DatabaseDocument) => (e: vsc.WebviewPanelOnDidChangeViewStateEvent) => {
-    // If the webview panel is active and there is a pending save, save the document
-    document.hasActiveViewer = e.webviewPanel.active;
-    if (e.webviewPanel.active && document.hasPendingSave) {
-      document.triggerSave().catch(() => { });
-    }
-  };
+  #createViewStateChangeHandler(_webviewPanel: vsc.WebviewPanel, document: DatabaseDocument) {
+    return (e: vsc.WebviewPanelOnDidChangeViewStateEvent) => {
+      // If the webview panel is active and there is a pending save, save the document
+      document.hasActiveViewer = e.webviewPanel.active;
+      if (e.webviewPanel.active && document.hasPendingSave) {
+        document.triggerSave().catch(() => { });
+      }
+    };
+  }
 
   /**
    * Resolve a webview panel for the document.
