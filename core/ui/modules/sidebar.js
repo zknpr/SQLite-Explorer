@@ -3,12 +3,12 @@
  */
 import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
-import { escapeHtml } from './utils.js';
 import { updateStatus } from './ui.js';
 import { loadTableData, loadTableColumns } from './grid.js';
 import { getRowDataOffset } from './data-utils.js';
 import { openCreateTableModal } from './crud.js';
 import { openSettingsModal } from './settings.js';
+import { groupSelectedCellsByColumn, summarizeColumnValue, prepareBatchUpdates } from './batch-update-logic.js';
 
 export function initSidebar() {
     const sidebarPanel = document.getElementById('sidebarPanel');
@@ -254,36 +254,13 @@ export function updateBatchSidebar() {
 
     countBadge.textContent = cellCount;
 
-    // Analyze selected cells - Group by column
-    const columns = new Map();
-
-    for (const cell of state.selectedCells) {
-        if (!columns.has(cell.colIdx)) {
-            const colDef = state.tableColumns[cell.colIdx];
-            columns.set(cell.colIdx, {
-                name: colDef.name,
-                type: colDef.type,
-                values: new Set()
-            });
-        }
-        columns.get(cell.colIdx).values.add(cell.value);
-    }
+    // Analyze selected cells - group by column (see batch-update-logic.js)
+    const columns = groupSelectedCellsByColumn(state.selectedCells, state.tableColumns);
 
     fieldsContainer.replaceChildren();
 
     for (const [colIdx, colInfo] of columns) {
-        const uniqueValues = Array.from(colInfo.values);
-        const isMixed = uniqueValues.length > 1;
-
-        let valueDisplay = '';
-        if (isMixed) {
-            valueDisplay = '(mixed values)';
-        } else {
-            const val = uniqueValues[0];
-            if (val === null) valueDisplay = 'NULL';
-            else if (val instanceof Uint8Array) valueDisplay = '[BLOB]';
-            else valueDisplay = String(val);
-        }
+        const valueDisplay = summarizeColumnValue(colInfo.values);
 
         const div = document.createElement('div');
         div.className = 'form-field batch-field';
@@ -358,49 +335,8 @@ export async function applyBatchUpdate() {
         }
     }
 
-    const updates = [];
-
-    // 2. Processing Phase
-    for (const cell of state.selectedCells) {
-        const input = inputsByCol.get(cell.colIdx);
-        if (!input) continue;
-
-        const isNull = input.dataset.isnull === 'true';
-        const isPatch = input.dataset.ispatch === 'true';
-        const value = input.value;
-
-        // Skip if empty and not explicitly set to NULL (and not patch with content)
-        if (value === "" && !isNull) continue;
-
-        const colDef = state.tableColumns[cell.colIdx];
-
-        // Prepare value
-        let finalValue = value;
-        let operation = 'set';
-
-        if (isNull) {
-            finalValue = null;
-        } else if (isPatch) {
-            operation = 'json_patch';
-        } else {
-             // Basic type coercion
-             if (colDef.type === 'INTEGER' || colDef.type === 'REAL' || colDef.type === 'NUMERIC') {
-                 if (!isNaN(Number(value)) && value.trim() !== '') {
-                     finalValue = Number(value);
-                 }
-             }
-        }
-
-        updates.push({
-            rowId: cell.rowId,
-            column: colDef.name,
-            value: finalValue,
-            originalValue: cell.value,
-            operation,
-            rowIdx: cell.rowIdx, // Local metadata
-            colIdx: cell.colIdx  // Local metadata
-        });
-    }
+    // 2. Processing Phase — value coercion / NULL / json_patch (see batch-update-logic.js)
+    const updates = prepareBatchUpdates(state.selectedCells, inputsByCol, state.tableColumns);
 
     if (updates.length === 0) {
         updateStatus('No values entered for batch update');
