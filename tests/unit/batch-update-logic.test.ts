@@ -99,3 +99,23 @@ describe('prepareBatchUpdates', () => {
     assert.strictEqual(updates[0].colIdx, 1);
   });
 });
+
+describe('batch-update-logic hardening (edge cases)', () => {
+  it('groupSelectedCellsByColumn skips out-of-bounds column indices', () => {
+    const grouped = groupSelectedCellsByColumn([cell(0, 99, 'x'), cell(0, 1, 'a')], columns);
+    assert.strictEqual(grouped.size, 1);
+    assert.ok(grouped.has(1));
+    assert.ok(!grouped.has(99));
+  });
+  it('summarizeColumnValue returns empty string for an empty set', () => {
+    assert.strictEqual(summarizeColumnValue(new Set()), '');
+  });
+  it('prepareBatchUpdates skips cells whose column is out of bounds (e.g. after a column drop)', () => {
+    assert.strictEqual(prepareBatchUpdates([cell(0, 99, 'x')], new Map([[99, input('v')]]), columns).length, 0);
+  });
+  it('prepareBatchUpdates tolerates an input without a dataset', () => {
+    const [u] = prepareBatchUpdates([cell(0, 1, 'x')], new Map([[1, { value: 'hi' } as BatchInputLike]]), columns);
+    assert.strictEqual(u.value, 'hi');
+    assert.strictEqual(u.operation, 'set');
+  });
+});

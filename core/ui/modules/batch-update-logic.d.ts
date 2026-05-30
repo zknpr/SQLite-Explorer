@@ -17,7 +17,7 @@ export interface BatchColumnDef {
 /** Minimal shape of a batch-field <input> (real element or test stand-in). */
 export interface BatchInputLike {
   value: string;
-  dataset: { isnull?: string; ispatch?: string };
+  dataset?: { isnull?: string; ispatch?: string };
 }
 
 export interface BatchColumnInfo {

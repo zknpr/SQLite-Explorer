@@ -17,8 +17,9 @@
 export function groupSelectedCellsByColumn(selectedCells, tableColumns) {
     const columns = new Map();
     for (const cell of selectedCells) {
+        const colDef = tableColumns && tableColumns[cell.colIdx];
+        if (!colDef) continue; // skip stale/out-of-bounds selections (e.g. after a column drop)
         if (!columns.has(cell.colIdx)) {
-            const colDef = tableColumns[cell.colIdx];
             columns.set(cell.colIdx, {
                 name: colDef.name,
                 type: colDef.type,
@@ -36,7 +37,8 @@ export function groupSelectedCellsByColumn(selectedCells, tableColumns) {
  * single shared value rendered as NULL / [BLOB] / its string form.
  */
 export function summarizeColumnValue(values) {
-    const uniqueValues = Array.from(values);
+    const uniqueValues = Array.from(values || []);
+    if (uniqueValues.length === 0) return '';
     if (uniqueValues.length > 1) return '(mixed values)';
     const val = uniqueValues[0];
     if (val === null) return 'NULL';
@@ -59,14 +61,16 @@ export function prepareBatchUpdates(selectedCells, inputsByCol, tableColumns) {
         const input = inputsByCol.get(cell.colIdx);
         if (!input) continue;
 
-        const isNull = input.dataset.isnull === 'true';
-        const isPatch = input.dataset.ispatch === 'true';
+        const dataset = input.dataset || {};
+        const isNull = dataset.isnull === 'true';
+        const isPatch = dataset.ispatch === 'true';
         const value = input.value;
 
         // Skip cells left blank unless they were explicitly set to NULL.
         if (value === '' && !isNull) continue;
 
-        const colDef = tableColumns[cell.colIdx];
+        const colDef = tableColumns && tableColumns[cell.colIdx];
+        if (!colDef) continue; // skip stale/out-of-bounds selections
 
         let finalValue = value;
         let operation = 'set';
