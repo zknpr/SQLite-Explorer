@@ -378,29 +378,33 @@ async function fetchTableData(table, options = {}) {
 
   // Build WHERE clause from filters array and globalFilter
   const whereClauses = [];
+  const params = [];
 
   // Column-specific filters: [{column: 'name', value: 'foo'}, ...]
   if (filters && filters.length > 0) {
     for (const f of filters) {
       if (f.column && f.value) {
         const safeCol = f.column.replace(/"/g, '""');
-        const safeVal = f.value.replace(/'/g, "''");
-        whereClauses.push(`"${safeCol}" LIKE '%${safeVal}%'`);
+        whereClauses.push(`"${safeCol}" LIKE ?`);
+        params.push(`%${f.value}%`);
       }
     }
   }
 
   // Global filter: search across all text columns
   if (globalFilter && globalFilter.trim()) {
-    const safeGlobal = globalFilter.replace(/'/g, "''");
     // Get column names to search
     const searchCols = columns ? columns.filter(c => c !== 'rowid') : [];
     if (searchCols.length > 0) {
       const globalClauses = searchCols.map(c => {
         const safeCol = c.replace(/"/g, '""');
-        return `"${safeCol}" LIKE '%${safeGlobal}%'`;
+        return `"${safeCol}" LIKE ?`;
       });
       whereClauses.push(`(${globalClauses.join(' OR ')})`);
+      // Add the global filter parameter for each column in the OR clause
+      for (let i = 0; i < searchCols.length; i++) {
+        params.push(`%${globalFilter}%`);
+      }
     }
   }
 
@@ -416,7 +420,7 @@ async function fetchTableData(table, options = {}) {
   // Add pagination
   sql += ` LIMIT ${parseInt(limit, 10)} OFFSET ${parseInt(offset, 10)}`;
 
-  const results = db.exec(sql);
+  const results = db.exec(sql, params);
 
   if (results.length === 0) {
     return { headers: [], rows: [] };
@@ -449,28 +453,32 @@ async function fetchTableCount(table, options = {}) {
 
   // Build WHERE clause from filters array and globalFilter
   const whereClauses = [];
+  const params = [];
 
   // Column-specific filters
   if (filters && filters.length > 0) {
     for (const f of filters) {
       if (f.column && f.value) {
         const safeCol = f.column.replace(/"/g, '""');
-        const safeVal = f.value.replace(/'/g, "''");
-        whereClauses.push(`"${safeCol}" LIKE '%${safeVal}%'`);
+        whereClauses.push(`"${safeCol}" LIKE ?`);
+        params.push(`%${f.value}%`);
       }
     }
   }
 
   // Global filter
   if (globalFilter && globalFilter.trim()) {
-    const safeGlobal = globalFilter.replace(/'/g, "''");
     const searchCols = columns.filter(c => c !== 'rowid');
     if (searchCols.length > 0) {
       const globalClauses = searchCols.map(c => {
         const safeCol = c.replace(/"/g, '""');
-        return `"${safeCol}" LIKE '%${safeGlobal}%'`;
+        return `"${safeCol}" LIKE ?`;
       });
       whereClauses.push(`(${globalClauses.join(' OR ')})`);
+      // Add the global filter parameter for each column in the OR clause
+      for (let i = 0; i < searchCols.length; i++) {
+        params.push(`%${globalFilter}%`);
+      }
     }
   }
 
@@ -478,7 +486,7 @@ async function fetchTableCount(table, options = {}) {
     sql += ` WHERE ${whereClauses.join(' AND ')}`;
   }
 
-  const results = db.exec(sql);
+  const results = db.exec(sql, params);
 
   if (results.length === 0 || results[0].values.length === 0) {
     return 0;
