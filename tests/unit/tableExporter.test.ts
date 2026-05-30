@@ -194,7 +194,8 @@ describe('exportTableCommand Fallback', () => {
                 ['id', 'name'],
                 undefined,
                 undefined,
-                { format: 'csv' }
+                { format: 'csv' },
+                undefined
             );
 
             assert.strictEqual(warnCalled, true, 'Should have logged fallback warning');

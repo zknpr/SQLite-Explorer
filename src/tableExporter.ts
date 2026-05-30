@@ -31,7 +31,7 @@ export async function exportTableCommand(
   columns: string[],
   _dbOptions?: unknown,
   _tableStore?: unknown,
-  _exportOptions?: ExportOptions,
+  exportOptions?: ExportOptions,
   _extras?: unknown
 ) {
   try {
@@ -41,7 +41,7 @@ export async function exportTableCommand(
       return;
     }
 
-    let formatValue: string | undefined = _exportOptions?.format;
+    let formatValue: string | undefined = exportOptions?.format;
 
     // If format not provided in options, ask user
     if (!formatValue) {
@@ -88,8 +88,8 @@ export async function exportTableCommand(
       return;
     }
 
-    const includeHeader = _exportOptions?.header ?? true;
-    const includeTableName = _exportOptions?.includeTableName ?? true;
+    const includeHeader = exportOptions?.header ?? true;
+    const includeTableName = exportOptions?.includeTableName ?? true;
 
     // Determine extension
     let defaultExt = 'csv';
@@ -170,8 +170,8 @@ export async function exportTableCommand(
                     params.push(lastId);
 
                     // Add rowIds filter if present
-                    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-                        const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+                    if (exportOptions?.rowIds && exportOptions.rowIds.length > 0) {
+                        const validIds = exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
                         if (validIds.length > 0) {
                             sql += ` AND rowid IN (${validIds.map(() => '?').join(',')})`;
                             params.push(...validIds);
@@ -270,8 +270,8 @@ export async function exportTableCommand(
     const params: CellValue[] = [];
 
     // Filter by row IDs if provided
-    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-        const rowIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+    if (exportOptions?.rowIds && exportOptions.rowIds.length > 0) {
+        const rowIds = exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
         if (rowIds.length > 0) {
             const placeholders = rowIds.map(() => '?').join(', ');
             sql += ` WHERE rowid IN (${placeholders})`;

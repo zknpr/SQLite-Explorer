@@ -799,13 +799,13 @@ export class HostBridge implements ToastService {
    * @param exportOptions - Export format options
    * @param extras - Additional options
    */
-  async exportTable(dbParams: DbParams, columns: string[], dbOptions?: unknown, tableStore?: unknown, exportOptions?: ExportOptions, extras?: unknown) {
+  async exportTable(dbParams: DbParams, columns: string[], _dbOptions?: unknown, _tableStore?: unknown, exportOptions?: ExportOptions, _extras?: unknown) {
     // Inject the URI of the current document so the command knows which database to use
     const enrichedParams = {
       ...dbParams,
       uri: this.document.uri.toString()
     };
-    await vsc.commands.executeCommand(`${ExtensionId}.exportTable`, enrichedParams, columns, dbOptions, tableStore, exportOptions, extras);
+    await vsc.commands.executeCommand(`${ExtensionId}.exportTable`, enrichedParams, columns, undefined, undefined, exportOptions, undefined);
   }
 
   /**

@@ -42,8 +42,8 @@ export async function activate(context: vsc.ExtensionContext) {
 
   // Register export table command
   context.subscriptions.push(
-    vsc.commands.registerCommand(`${ExtensionId}.exportTable`, (dbParams: DbParams, columns: string[], dbOptions?: unknown, tableStore?: unknown, exportOptions?: ExportOptions, extras?: unknown) =>
-      exportTableCommand(context, reporter, dbParams, columns, dbOptions, tableStore, exportOptions, extras)),
+    vsc.commands.registerCommand(`${ExtensionId}.exportTable`, (dbParams: DbParams, columns: string[], _dbOptions?: unknown, _tableStore?: unknown, exportOptions?: ExportOptions, _extras?: unknown) =>
+      exportTableCommand(context, reporter, dbParams, columns, undefined, undefined, exportOptions, undefined)),
   );
 
   context.globalState.setKeysForSync(SyncedKeys);
