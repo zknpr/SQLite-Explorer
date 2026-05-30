@@ -4,7 +4,6 @@ import { TelemetryReporter } from '@vscode/extension-telemetry';
 import { exportTableCommand } from './tableExporter';
 import { ExtensionId, FullExtensionId, FileNestingPatternsAdded, FirstInstallMs, NestingPattern, SyncedKeys, TelemetryConnectionString, Title, UriScheme } from './config';
 import type { DbParams, ExportOptions } from './core/types';
-import { disposeAll } from './lifecycle';
 import { registerEditorProvider } from './editorController';
 import { SQLiteFileSystemProvider } from './virtualFileSystem';
 
