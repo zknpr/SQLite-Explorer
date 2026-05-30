@@ -228,14 +228,20 @@ describe('RPC', () => {
 
       originalWarn = console.warn;
       let warnCalled = false;
-      console.warn = () => { warnCalled = true; };
+      let warnArgs: any[] = [];
+      console.warn = (...args: any[]) => {
+        warnCalled = true;
+        warnArgs = args;
+      };
+
+      const errorToThrow = new Error('Transfer not supported');
 
       const port: WorkerPort = {
         postMessage: (msg: any, transfer: any) => {
           callCount++;
           if (transfer && transfer.length > 0) {
             hadTransfer = true;
-            throw new Error('Transfer not supported');
+            throw errorToThrow;
           } else {
             fallbackMessage = msg;
           }
@@ -255,6 +261,8 @@ describe('RPC', () => {
       assert.strictEqual(hadTransfer, true);
       assert.ok(fallbackMessage);
       assert.strictEqual(warnCalled, true);
+      assert.strictEqual(warnArgs[0], 'Transfer failed, falling back to copy');
+      assert.strictEqual(warnArgs[1], errorToThrow);
     });
 
     it('should route log messages to onLog', () => {
