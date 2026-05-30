@@ -13,7 +13,7 @@ import { Database, ExternalLink, Play } from 'lucide-react';
 function MainScreenshot() {
   return (
     <div className="relative w-full max-w-5xl mx-auto mt-14 animate-fade-in">
-      <div className="rounded-xl border border-[var(--ui-edge)] overflow-hidden shadow-2xl">
+      <div className="rounded-xl border border-(--ui-edge) overflow-hidden shadow-2xl">
         <Image
           src="/main.png"
           alt="SQLite Explorer - Database viewer and editor for VS Code"
@@ -24,7 +24,7 @@ function MainScreenshot() {
         />
       </div>
 
-      <div className="absolute -z-10 top-1/2 left-1/3 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[400px] bg-[var(--ui-accent)]/20 blur-[100px] rounded-full" />
+      <div className="absolute -z-10 top-1/2 left-1/3 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[400px] bg-(--ui-accent)/20 blur-[100px] rounded-full" />
     </div>
   );
 }
@@ -34,7 +34,7 @@ export default function Hero() {
     <section className="relative pt-24 pb-16 px-6 overflow-hidden">
       <div className="max-w-6xl mx-auto">
         <div className="flex justify-center mb-6 animate-fade-in">
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-[var(--ui-edge)] bg-[var(--ui-subtle)] text-sm text-[var(--ui-subtle-fg)]">
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-(--ui-edge) bg-(--ui-subtle) text-sm text-(--ui-subtle-fg)">
             <Database className="w-4 h-4" strokeWidth={1.75} />
             <span>Open Source VS Code Extension</span>
           </div>
@@ -44,10 +44,10 @@ export default function Hero() {
           <h1 className="text-4xl sm:text-5xl md:text-6xl font-bold tracking-tight mb-6 animate-slide-up">
             View and Edit SQLite
             <br />
-            <span className="text-[var(--ui-accent)]">Directly in VS Code</span>
+            <span className="text-(--ui-accent)">Directly in VS Code</span>
           </h1>
 
-          <p className="text-lg sm:text-xl text-[var(--ui-subtle-fg)] max-w-2xl mx-auto mb-8 animate-slide-up">
+          <p className="text-lg sm:text-xl text-(--ui-subtle-fg) max-w-2xl mx-auto mb-8 animate-slide-up">
             A powerful, WebAssembly-powered database viewer and editor. No external
             dependencies. Works everywhere — including VS Code for Web.
           </p>
@@ -57,7 +57,7 @@ export default function Hero() {
               href="https://marketplace.visualstudio.com/items?itemName=zknpr.sqlite-explorer"
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-2 px-6 py-3 rounded-lg bg-[var(--ui-accent)] text-white font-medium hover:opacity-90 transition-opacity"
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-lg bg-(--ui-accent) text-white font-medium hover:opacity-90 transition-opacity"
             >
               Install Extension
               <ExternalLink className="w-4 h-4" strokeWidth={2.25} />
@@ -65,7 +65,7 @@ export default function Hero() {
 
             <a
               href="/demo"
-              className="inline-flex items-center gap-2 px-6 py-3 rounded-lg border border-[var(--ui-accent)] text-[var(--ui-accent)] bg-[var(--ui-accent)]/10 font-medium hover:bg-[var(--ui-accent)]/20 transition-colors"
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-lg border border-(--ui-accent) text-(--ui-accent) bg-(--ui-accent)/10 font-medium hover:bg-(--ui-accent)/20 transition-colors"
             >
               <Play className="w-4 h-4" strokeWidth={2.5} />
               Try in Browser
@@ -75,7 +75,7 @@ export default function Hero() {
               href="https://github.com/zknpr/sqlite-explorer"
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-2 px-6 py-3 rounded-lg border border-[var(--ui-edge)] bg-[var(--ui-bg)] font-medium hover:bg-[var(--ui-subtle)] transition-colors"
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-lg border border-(--ui-edge) bg-(--ui-bg) font-medium hover:bg-(--ui-subtle) transition-colors"
             >
               <svg
                 className="w-5 h-5"

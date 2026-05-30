@@ -15,12 +15,12 @@ export default function Footer() {
   const currentYear = new Date().getFullYear();
 
   return (
-    <footer className="border-t border-[var(--ui-edge)] bg-[var(--ui-subtle)]">
+    <footer className="border-t border-(--ui-edge) bg-(--ui-subtle)">
       <div className="max-w-6xl mx-auto px-6 py-12">
         <div className="flex flex-col md:flex-row items-start justify-between gap-8">
           <div className="flex flex-col gap-1">
             <span className="text-lg font-semibold">SQLite Explorer</span>
-            <p className="text-sm text-[var(--ui-subtle-fg)] max-w-xs">
+            <p className="text-sm text-(--ui-subtle-fg) max-w-xs">
               A powerful SQLite viewer and editor for VS Code. Open source, zero dependencies.
             </p>
           </div>
@@ -32,7 +32,7 @@ export default function Footer() {
                 href={link.href}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-sm text-[var(--ui-subtle-fg)] hover:text-[var(--ui-accent)] transition-colors"
+                className="text-sm text-(--ui-subtle-fg) hover:text-(--ui-accent) transition-colors"
               >
                 {link.label}
               </a>
@@ -40,7 +40,7 @@ export default function Footer() {
           </nav>
         </div>
 
-        <div className="mt-8 pt-6 border-t border-[var(--ui-edge)] flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-[var(--ui-subtle-fg)]">
+        <div className="mt-8 pt-6 border-t border-(--ui-edge) flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-(--ui-subtle-fg)">
           <p>&copy; {currentYear} zknpr</p>
           <p>
             Built with{" "}
@@ -48,7 +48,7 @@ export default function Footer() {
               href="https://claude.com/product/claude-code"
               target="_blank"
               rel="noopener noreferrer"
-              className="text-[var(--ui-accent)] hover:underline"
+              className="text-(--ui-accent) hover:underline"
             >
               Claude Code
             </a>

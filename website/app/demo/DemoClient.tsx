@@ -480,20 +480,20 @@ export default function DemoClient() {
   // -------------------------------------------------------------------------
 
   return (
-    <div className="min-h-screen bg-[var(--ui-bg)] text-[var(--ui-fg)] flex flex-col">
+    <div className="min-h-screen bg-(--ui-bg) text-(--ui-fg) flex flex-col">
       {/* Header */}
-      <header className="border-b border-[var(--ui-edge)] px-6 py-4 flex items-center justify-between">
+      <header className="border-b border-(--ui-edge) px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-4">
           <a
             href="/"
-            className="flex items-center gap-2 text-[var(--ui-subtle-fg)] hover:text-[var(--ui-fg)] transition-colors"
+            className="flex items-center gap-2 text-(--ui-subtle-fg) hover:text-(--ui-fg) transition-colors"
           >
             <ArrowLeft className="w-4 h-4" />
             <span className="text-sm">Back</span>
           </a>
-          <div className="h-6 w-px bg-[var(--ui-edge)]" />
+          <div className="h-6 w-px bg-(--ui-edge)" />
           <div className="flex items-center gap-2">
-            <Database className="w-5 h-5 text-[var(--ui-accent)]" />
+            <Database className="w-5 h-5 text-(--ui-accent)" />
             <h1 className="text-lg font-semibold">SQLite Explorer Demo</h1>
           </div>
         </div>
@@ -501,24 +501,24 @@ export default function DemoClient() {
         <div className="flex items-center gap-4">
           {status === 'ready' && (
             <>
-              <span className="text-sm text-[var(--ui-subtle-fg)]">{databaseName}</span>
+              <span className="text-sm text-(--ui-subtle-fg)">{databaseName}</span>
               <button
                 onClick={handleReload}
-                className="p-2 text-[var(--ui-subtle-fg)] hover:text-[var(--ui-fg)] transition-colors"
+                className="p-2 text-(--ui-subtle-fg) hover:text-(--ui-fg) transition-colors"
                 title="Reload database"
               >
                 <RefreshCw className="w-4 h-4" />
               </button>
               <button
                 onClick={handleDownload}
-                className="p-2 text-[var(--ui-subtle-fg)] hover:text-[var(--ui-fg)] transition-colors"
+                className="p-2 text-(--ui-subtle-fg) hover:text-(--ui-fg) transition-colors"
                 title="Download database"
               >
                 <Download className="w-4 h-4" />
               </button>
               <button
                 onClick={handleClose}
-                className="px-3 py-1.5 text-sm bg-[var(--ui-subtle)] hover:opacity-80 rounded-md transition-colors"
+                className="px-3 py-1.5 text-sm bg-(--ui-subtle) hover:opacity-80 rounded-md transition-colors"
               >
                 Close
               </button>
@@ -528,7 +528,7 @@ export default function DemoClient() {
             href="https://github.com/zknpr/sqlite-explorer"
             target="_blank"
             rel="noopener noreferrer"
-            className="p-2 text-[var(--ui-subtle-fg)] hover:text-[var(--ui-fg)] transition-colors"
+            className="p-2 text-(--ui-subtle-fg) hover:text-(--ui-fg) transition-colors"
           >
             <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
               <path fillRule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clipRule="evenodd" />
@@ -547,8 +547,8 @@ export default function DemoClient() {
                 relative w-full max-w-xl p-12 border-2 border-dashed rounded-xl
                 transition-all duration-200 cursor-pointer
                 ${isDragOver
-                  ? 'border-[var(--ui-accent)] bg-[var(--ui-accent)]/10'
-                  : 'border-[var(--ui-edge)] hover:border-[var(--ui-subtle-fg)] hover:bg-[var(--ui-subtle)]/50'
+                  ? 'border-(--ui-accent) bg-(--ui-accent)/10'
+                  : 'border-(--ui-edge) hover:border-(--ui-subtle-fg) hover:bg-(--ui-subtle)/50'
                 }
               `}
               onDragOver={handleDragOver}
@@ -568,14 +568,14 @@ export default function DemoClient() {
                 }}
               />
               <div className="flex flex-col items-center text-center">
-                <div className="w-16 h-16 rounded-full bg-[var(--ui-subtle)] flex items-center justify-center mb-4">
-                  <Upload className="w-8 h-8 text-[var(--ui-subtle-fg)]" />
+                <div className="w-16 h-16 rounded-full bg-(--ui-subtle) flex items-center justify-center mb-4">
+                  <Upload className="w-8 h-8 text-(--ui-subtle-fg)" />
                 </div>
                 <h2 className="text-xl font-semibold mb-2">Drop your SQLite database</h2>
-                <p className="text-[var(--ui-subtle-fg)] mb-4">
+                <p className="text-(--ui-subtle-fg) mb-4">
                   or click to browse (.db, .sqlite, .sqlite3)
                 </p>
-                <div className="inline-flex items-center gap-2 px-4 py-2 bg-[var(--ui-accent)] text-[var(--ui-accent-fg)] hover:opacity-90 rounded-lg transition-colors">
+                <div className="inline-flex items-center gap-2 px-4 py-2 bg-(--ui-accent) text-(--ui-accent-fg) hover:opacity-90 rounded-lg transition-colors">
                   <FileUp className="w-4 h-4" />
                   <span>Choose File</span>
                 </div>
@@ -584,7 +584,7 @@ export default function DemoClient() {
 
             {/* Sample Databases */}
             <div className="mt-12 w-full max-w-xl">
-              <h3 className="text-sm font-medium text-[var(--ui-subtle-fg)] mb-4 uppercase tracking-wide">
+              <h3 className="text-sm font-medium text-(--ui-subtle-fg) mb-4 uppercase tracking-wide">
                 Or try a sample database
               </h3>
               <div className="grid gap-3">
@@ -592,21 +592,21 @@ export default function DemoClient() {
                   <button
                     key={db.name}
                     onClick={() => loadSampleDatabase(db.url, `${db.name.toLowerCase()}.db`)}
-                    className="flex items-center gap-4 p-4 bg-[var(--ui-subtle)] hover:opacity-80 border border-[var(--ui-edge)] hover:border-[var(--ui-subtle-fg)] rounded-lg transition-colors text-left"
+                    className="flex items-center gap-4 p-4 bg-(--ui-subtle) hover:opacity-80 border border-(--ui-edge) hover:border-(--ui-subtle-fg) rounded-lg transition-colors text-left"
                   >
-                    <Database className="w-8 h-8 text-[var(--ui-accent)] shrink-0" />
+                    <Database className="w-8 h-8 text-(--ui-accent) shrink-0" />
                     <div className="flex-1 min-w-0">
                       <div className="font-medium">{db.name}</div>
-                      <div className="text-sm text-[var(--ui-subtle-fg)]">{db.description}</div>
+                      <div className="text-sm text-(--ui-subtle-fg)">{db.description}</div>
                     </div>
-                    <div className="text-sm text-[var(--ui-subtle-fg)]">{db.size}</div>
+                    <div className="text-sm text-(--ui-subtle-fg)">{db.size}</div>
                   </button>
                 ))}
               </div>
             </div>
 
             {/* Info Box */}
-            <div className="mt-12 max-w-xl text-center text-sm text-[var(--ui-subtle-fg)]">
+            <div className="mt-12 max-w-xl text-center text-sm text-(--ui-subtle-fg)">
               <p>
                 Your database runs entirely in your browser using WebAssembly.
                 No data is sent to any server.
@@ -617,8 +617,8 @@ export default function DemoClient() {
 
         {status === 'loading' && (
           <div className="flex-1 flex flex-col items-center justify-center">
-            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-[var(--ui-accent)] mb-4" />
-            <p className="text-[var(--ui-subtle-fg)]">Loading database...</p>
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-(--ui-accent) mb-4" />
+            <p className="text-(--ui-subtle-fg)">Loading database...</p>
           </div>
         )}
 
@@ -628,12 +628,12 @@ export default function DemoClient() {
               <AlertCircle className="w-8 h-8 text-red-500" />
             </div>
             <h2 className="text-xl font-semibold mb-2">Failed to load database</h2>
-            <p className="text-[var(--ui-subtle-fg)] mb-6 text-center max-w-md">
+            <p className="text-(--ui-subtle-fg) mb-6 text-center max-w-md">
               {errorMessage || 'An unknown error occurred'}
             </p>
             <button
               onClick={handleClose}
-              className="px-4 py-2 bg-[var(--ui-subtle)] hover:opacity-80 rounded-lg transition-colors"
+              className="px-4 py-2 bg-(--ui-subtle) hover:opacity-80 rounded-lg transition-colors"
             >
               Try Again
             </button>

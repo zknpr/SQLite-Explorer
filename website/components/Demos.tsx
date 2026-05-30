@@ -70,11 +70,11 @@ function DemoCard({ demo }: { demo: Demo }) {
 
   return (
     <div
-      className="group rounded-xl border border-[var(--ui-edge)] bg-[var(--ui-bg)] overflow-hidden hover:border-[var(--ui-accent)]/50 transition-colors"
+      className="group rounded-xl border border-(--ui-edge) bg-(--ui-bg) overflow-hidden hover:border-(--ui-accent)/50 transition-colors"
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
     >
-      <div className="relative aspect-video bg-[var(--ui-subtle)] overflow-hidden">
+      <div className="relative aspect-video bg-(--ui-subtle) overflow-hidden">
         {useGif ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img
@@ -101,7 +101,7 @@ function DemoCard({ demo }: { demo: Demo }) {
         {!isPlaying && !useGif && (
           <div className="absolute inset-0 flex items-center justify-center bg-black/10 group-hover:bg-transparent transition-colors">
             <div className="w-12 h-12 rounded-full bg-white/90 dark:bg-black/60 flex items-center justify-center group-hover:scale-110 transition-transform shadow-lg">
-              <svg className="w-5 h-5 text-[var(--ui-accent)] ml-0.5" fill="currentColor" viewBox="0 0 24 24">
+              <svg className="w-5 h-5 text-(--ui-accent) ml-0.5" fill="currentColor" viewBox="0 0 24 24">
                 <path d="M8 5v14l11-7z" />
               </svg>
             </div>
@@ -111,7 +111,7 @@ function DemoCard({ demo }: { demo: Demo }) {
 
       <div className="p-5">
         <h3 className="font-semibold text-lg mb-1">{demo.title}</h3>
-        <p className="text-sm text-[var(--ui-subtle-fg)] leading-relaxed">
+        <p className="text-sm text-(--ui-subtle-fg) leading-relaxed">
           {demo.description}
         </p>
       </div>
@@ -127,7 +127,7 @@ export default function Demos() {
           <h2 className="text-3xl sm:text-4xl font-bold tracking-tight mb-4">
             See it in action
           </h2>
-          <p className="text-lg text-[var(--ui-subtle-fg)] max-w-2xl mx-auto">
+          <p className="text-lg text-(--ui-subtle-fg) max-w-2xl mx-auto">
             Hover over each demo to preview the feature.
           </p>
         </div>
