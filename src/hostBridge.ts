@@ -397,7 +397,7 @@ export class HostBridge implements ToastService {
       return update;
     });
 
-    if ('updateCellBatch' in dbOps) {
+    if (typeof dbOps.updateCellBatch === 'function') {
       await dbOps.updateCellBatch(table, processedUpdates);
     } else {
       // Fallback: execute updates sequentially to avoid IPC overload and N+1 concurrency,

@@ -34,7 +34,7 @@ async function runBenchmark() {
 
     try {
         const wasmBinary = fs.readFileSync(path.resolve(__dirname, '../../node_modules/sql.js/dist/sql-wasm.wasm'));
-        const engineResult = await createDatabaseEngine({ wasmBinary });
+        const engineResult = await createDatabaseEngine({ wasmBinary } as any);
         const db = engineResult.operations as WasmDatabaseEngine;
 
         const numIndexes = 50;

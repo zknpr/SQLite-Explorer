@@ -7,7 +7,7 @@ describe('WebviewMessageHandler', () => {
         const hostBridge = {
             echo: (val: unknown) => val
         };
-        let sentMessage: unknown = null;
+        let sentMessage: any = null;
         const postMessage = async (msg: unknown) => {
             sentMessage = msg;
             return true;
@@ -45,7 +45,7 @@ describe('WebviewMessageHandler', () => {
 
     it('should handle unknown method', () => {
         const hostBridge = {};
-        let sentMessage: unknown = null;
+        let sentMessage: any = null;
         const postMessage = async (msg: unknown) => {
             sentMessage = msg;
             return true;
@@ -71,7 +71,7 @@ describe('WebviewMessageHandler', () => {
         const hostBridge = {
             echo: (val: unknown) => val
         };
-        let sentMessage: unknown = null;
+        let sentMessage: any = null;
         const postMessage = async (msg: unknown) => {
             sentMessage = msg;
             return true;

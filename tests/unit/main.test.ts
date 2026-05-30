@@ -52,7 +52,7 @@ if (!mockVscode.extensions) {
 (mockVscode.workspace as any).registerFileSystemProvider = () => ({ dispose: () => {} });
 (mockVscode.window as any).createOutputChannel = () => ({ dispose: () => {} });
 (mockVscode.window as any).registerCustomEditorProvider = () => ({ dispose: () => {} });
-(mockVscode.ConfigurationTarget as any) = { Global: 1 };
+(mockVscode as any).ConfigurationTarget = { Global: 1 };
 (mockVscode.workspace as any).getConfiguration = () => {
     return {
         get: () => ({}),
@@ -170,7 +170,7 @@ describe('main.ts', () => {
         await main.activate(mockContext);
 
         assert.strictEqual(configUpdateMock.mock.calls.length, 1);
-        const callArgs = configUpdateMock.mock.calls[0].arguments;
+        const callArgs = configUpdateMock.mock.calls[0].arguments as any[];
         assert.strictEqual(callArgs[0], 'patterns');
         // The actual value in codebase may be different, we should check it
         assert.ok(callArgs[1]['*.sqlite']);

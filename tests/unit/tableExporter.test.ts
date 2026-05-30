@@ -300,7 +300,7 @@ describe('exportTableCommand Fallback', () => {
 
         let errorMessageShown = '';
         const originalShowErrorMessage = mockVscode.window.showErrorMessage;
-        mockVscode.window.showErrorMessage = async (msg: string) => {
+        (mockVscode.window as any).showErrorMessage = async (msg: string) => {
             errorMessageShown = msg;
         };
 

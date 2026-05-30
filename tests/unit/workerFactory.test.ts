@@ -87,8 +87,8 @@ describe('workerFactory error path tests', () => {
     mockVscode.workspace.fs = {
       readFile: async () => new Uint8Array(),
       stat: async () => ({ size: 0 })
-    };
-    mockVscode.Uri.joinPath = () => ({ scheme: 'file', fsPath: '/test/path/assets/sqlite3.wasm' });
+    } as any;
+    (mockVscode.Uri as any).joinPath = () => ({ scheme: 'file', fsPath: '/test/path/assets/sqlite3.wasm' });
   });
 
   afterEach(() => {

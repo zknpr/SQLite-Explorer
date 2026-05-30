@@ -48,10 +48,10 @@ async function runBenchmark() {
         const start = performance.now();
 
         // 1. Undo (Adds columns back)
-        await databaseOps.undoModification(mod);
+        await databaseOps.undoModification(mod as any);
 
         // 2. Redo (Drops columns again)
-        await databaseOps.redoModification(mod);
+        await databaseOps.redoModification(mod as any);
 
         const end = performance.now();
         console.log(`Undo + Redo took ${(end - start).toFixed(2)}ms`);
