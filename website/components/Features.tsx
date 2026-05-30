@@ -90,14 +90,14 @@ const features: Feature[] = [
 
 function FeatureCard({ feature, featured }: { feature: Feature; featured?: boolean }) {
   return (
-    <div className={`group p-6 rounded-xl border border-[var(--ui-edge)] bg-[var(--ui-bg)] hover:border-[var(--ui-accent)]/50 transition-colors ${featured ? 'sm:col-span-2 lg:col-span-2' : ''}`}>
-      <div className={`inline-flex items-center justify-center rounded-lg text-[var(--ui-accent)] mb-4 group-hover:bg-[var(--ui-accent)]/10 transition-colors ${featured ? 'w-14 h-14 bg-[var(--ui-accent)]/5' : 'w-12 h-12 bg-[var(--ui-subtle)]'}`}>
+    <div className={`group p-6 rounded-xl border border-(--ui-edge) bg-(--ui-bg) hover:border-(--ui-accent)/50 transition-colors ${featured ? 'sm:col-span-2 lg:col-span-2' : ''}`}>
+      <div className={`inline-flex items-center justify-center rounded-lg text-(--ui-accent) mb-4 group-hover:bg-(--ui-accent)/10 transition-colors ${featured ? 'w-14 h-14 bg-(--ui-accent)/5' : 'w-12 h-12 bg-(--ui-subtle)'}`}>
         {feature.icon}
       </div>
 
       <h3 className={`font-semibold mb-2 ${featured ? 'text-xl' : 'text-lg'}`}>{feature.title}</h3>
 
-      <p className="text-[var(--ui-subtle-fg)] text-sm leading-relaxed">
+      <p className="text-(--ui-subtle-fg) text-sm leading-relaxed">
         {feature.description}
       </p>
     </div>
@@ -106,13 +106,13 @@ function FeatureCard({ feature, featured }: { feature: Feature; featured?: boole
 
 export default function Features() {
   return (
-    <section className="py-24 px-6 bg-[var(--ui-subtle)]">
+    <section className="py-24 px-6 bg-(--ui-subtle)">
       <div className="max-w-6xl mx-auto">
         <div className="text-center mb-16">
           <h2 className="text-3xl sm:text-4xl font-bold tracking-tight mb-4">
             Browse, edit, and export — right from your editor
           </h2>
-          <p className="text-lg text-[var(--ui-subtle-fg)] max-w-2xl mx-auto">
+          <p className="text-lg text-(--ui-subtle-fg) max-w-2xl mx-auto">
             A complete database management experience built directly into your editor.
             No external tools required.
           </p>
