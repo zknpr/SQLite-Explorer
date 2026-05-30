@@ -157,7 +157,7 @@ function writeMessage(stream: NodeJS.WritableStream, msg: unknown): void {
  *
  * Manages the txiki-js child process and provides RPC-style communication.
  */
-class NativeWorkerProcess {
+export class NativeWorkerProcess {
   private process: ChildProcess | null = null;
   private messageId = 0;
   private pendingRequests = new Map<number, {

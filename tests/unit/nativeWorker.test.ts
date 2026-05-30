@@ -4,7 +4,7 @@ import assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { isNativeAvailable } from '../../src/nativeWorker';
+import { isNativeAvailable, NativeWorkerProcess } from '../../src/nativeWorker';
 
 describe('isNativeAvailable', () => {
     let originalPlatform: string;
@@ -99,5 +99,33 @@ describe('isNativeAvailable', () => {
 
         const expectedPath = path.join('/ext/path', 'natives', 'x86_64-windows', 'tjs.exe');
         assert.strictEqual(accessMock.mock.calls[0].arguments[0], expectedPath);
+    });
+});
+
+describe('NativeWorkerProcess', () => {
+    afterEach(() => {
+        mock.restoreAll();
+    });
+
+    it('should catch deserialization errors on invalid data', () => {
+        // Instantiate the worker directly to test internal handleData method
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+
+        let errorLogged = false;
+        mock.method(console, 'error', (msg: string, err: any) => {
+            if (msg && typeof msg === 'string' && msg.includes('Failed to deserialize message')) {
+                errorLogged = true;
+            }
+        });
+
+        const badMsg = Buffer.from('this is not valid v8 data');
+        const header = Buffer.alloc(4);
+        header.writeUInt32BE(badMsg.length, 0);
+        const payload = Buffer.concat([header, badMsg]);
+
+        // Using any to access private handleData
+        (worker as any).handleData(payload);
+
+        assert.strictEqual(errorLogged, true, 'Should log error on bad deserialization');
     });
 });
