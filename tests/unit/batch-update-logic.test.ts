@@ -118,4 +118,15 @@ describe('batch-update-logic hardening (edge cases)', () => {
     assert.strictEqual(u.value, 'hi');
     assert.strictEqual(u.operation, 'set');
   });
+  it('coerces NUMERIC columns', () => {
+    const cols: BatchColumnDef[] = [{ name: 'qty', type: 'NUMERIC' }];
+    const [u] = prepareBatchUpdates([cell(0, 0, 1)], new Map([[0, input('7')]]), cols);
+    assert.strictEqual(u.value, 7);
+  });
+  it('coerces lowercase numeric column types (e.g. "integer")', () => {
+    const cols: BatchColumnDef[] = [{ name: 'n', type: 'integer' }];
+    const [u] = prepareBatchUpdates([cell(0, 0, 1)], new Map([[0, input('42')]]), cols);
+    assert.strictEqual(u.value, 42);
+    assert.strictEqual(typeof u.value, 'number');
+  });
 });

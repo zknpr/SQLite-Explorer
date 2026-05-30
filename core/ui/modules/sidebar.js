@@ -329,7 +329,7 @@ export async function applyBatchUpdate() {
                 JSON.parse(input.value);
             } catch (e) {
                 const colDef = state.tableColumns[colIdx];
-                updateStatus(`Invalid JSON for patch in ${colDef.name}`);
+                updateStatus(`Invalid JSON for patch in ${colDef?.name ?? `column ${colIdx}`}`);
                 return;
             }
         }

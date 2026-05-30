@@ -79,9 +79,13 @@ export function prepareBatchUpdates(selectedCells, inputsByCol, tableColumns) {
             finalValue = null;
         } else if (isPatch) {
             operation = 'json_patch';
-        } else if (colDef.type === 'INTEGER' || colDef.type === 'REAL' || colDef.type === 'NUMERIC') {
+        } else {
             // Coerce numeric column types when the input parses as a number.
-            if (!isNaN(Number(value)) && value.trim() !== '') {
+            // Normalize case: SQLite stores the declared type verbatim, so a column
+            // may report e.g. 'integer' rather than 'INTEGER'.
+            const colType = (colDef.type || '').toUpperCase();
+            if ((colType === 'INTEGER' || colType === 'REAL' || colType === 'NUMERIC')
+                && !isNaN(Number(value)) && value.trim() !== '') {
                 finalValue = Number(value);
             }
         }
