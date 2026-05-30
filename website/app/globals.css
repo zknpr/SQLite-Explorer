@@ -18,8 +18,8 @@
   --color-accent: var(--ui-accent);
   --color-accent-foreground: var(--ui-accent-fg);
 
-  --font-sans: var(--font-sans), system-ui, sans-serif;
-  --font-mono: var(--font-mono), monospace;
+  --font-sans: var(--font-sans-stack);
+  --font-mono: var(--font-mono-stack);
 
   --animate-fade-in: fadeIn 0.5s ease-out;
   --animate-slide-up: slideUp 0.5s ease-out;
@@ -44,6 +44,36 @@
   }
 }
 
+:root {
+  /* Light theme (default) */
+  --ui-bg: #ffffff;
+  --ui-fg: #171717;
+  --ui-subtle: #f5f5f5;
+  --ui-subtle-fg: #737373;
+  --ui-edge: #e5e5e5;
+  --ui-accent: #0070f3;
+  --ui-accent-fg: #ffffff;
+
+  /* Typography */
+  --font-sans-stack:
+    var(--font-inter), -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, sans-serif;
+  --font-mono-stack: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  --font-sans: var(--font-sans-stack);
+  --font-mono: var(--font-mono-stack);
+}
+
+.dark {
+  /* Dark theme */
+  --ui-bg: #0a0a0a;
+  --ui-fg: #ededed;
+  --ui-subtle: #1a1a1a;
+  --ui-subtle-fg: #a3a3a3;
+  --ui-edge: #262626;
+  --ui-accent: #0070f3;
+  --ui-accent-fg: #ffffff;
+}
+
 /*
   The default border color has changed to `currentcolor` in Tailwind CSS v4,
   so we've added these compatibility styles to make sure everything still
@@ -59,46 +89,6 @@
   ::backdrop,
   ::file-selector-button {
     border-color: var(--color-gray-200, currentcolor);
-  }
-}
-
-@utility text-balance {
-  text-wrap: balance;
-}
-@utility text-gradient {
-  background: linear-gradient(to right, var(--ui-fg), var(--ui-subtle-fg));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-@layer utilities {
-  :root {
-    /* Light theme (default) */
-    --ui-bg: #ffffff;
-    --ui-fg: #171717;
-    --ui-subtle: #f5f5f5;
-    --ui-subtle-fg: #737373;
-    --ui-edge: #e5e5e5;
-    --ui-accent: #0070f3;
-    --ui-accent-fg: #ffffff;
-
-    /* Typography */
-    --font-sans:
-      var(--font-inter), -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
-      'Helvetica Neue', Arial, sans-serif;
-    --font-mono: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
-  }
-
-  .dark {
-    /* Dark theme */
-    --ui-bg: #0a0a0a;
-    --ui-fg: #ededed;
-    --ui-subtle: #1a1a1a;
-    --ui-subtle-fg: #a3a3a3;
-    --ui-edge: #262626;
-    --ui-accent: #0070f3;
-    --ui-accent-fg: #ffffff;
   }
 
   /* Base styles */
@@ -121,8 +111,16 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
+}
 
-  /* Utility classes */
+@utility text-balance {
+  text-wrap: balance;
+}
+@utility text-gradient {
+  background: linear-gradient(to right, var(--ui-fg), var(--ui-subtle-fg));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
 }
 
 /* Selection styling */

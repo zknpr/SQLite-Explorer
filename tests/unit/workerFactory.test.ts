@@ -84,11 +84,19 @@ describe('workerFactory error path tests', () => {
     workerTerminated = false;
 
     // Reset VSCode mock behaviors
-    mockVscode.workspace.fs = {
-      readFile: async () => new Uint8Array(),
-      stat: async () => ({ size: 0 })
-    } as any;
-    (mockVscode.Uri as any).joinPath = () => ({ scheme: 'file', fsPath: '/test/path/assets/sqlite3.wasm' });
+    Object.defineProperty(mockVscode.workspace, 'fs', {
+      value: {
+        readFile: async () => new Uint8Array(),
+        stat: async () => ({ size: 0 })
+      },
+      writable: true,
+      configurable: true
+    });
+    Object.defineProperty(mockVscode.Uri, 'joinPath', {
+      value: () => ({ scheme: 'file', fsPath: '/test/path/assets/sqlite3.wasm' }),
+      writable: true,
+      configurable: true
+    });
   });
 
   afterEach(() => {
