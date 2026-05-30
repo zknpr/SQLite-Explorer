@@ -209,4 +209,74 @@ describe('exportTableCommand Fallback', () => {
             DocumentRegistry.delete('test');
         }
     });
+
+    it('should catch and show error when export fails', async () => {
+        const docUri = mockVscode.Uri.parse('vscode-sqlite://test.db');
+        const uri = mockVscode.Uri.file('/test/export.csv');
+
+        let errorMessageShown = '';
+        const originalShowErrorMessage = mockVscode.window.showErrorMessage;
+        mockVscode.window.showErrorMessage = async (msg: string) => {
+            errorMessageShown = msg;
+        };
+
+        const originalShowSaveDialog = mockVscode.window.showSaveDialog;
+        mockVscode.window.showSaveDialog = async (): Promise<any> => uri;
+
+        let fileWritten = false;
+        const originalWriteFile = mockVscode.workspace.fs.writeFile;
+        mockVscode.workspace.fs.writeFile = async () => {
+            fileWritten = true;
+        };
+
+        const originalConsoleError = console.error;
+        let consoleErrorCalled = false;
+        console.error = () => { consoleErrorCalled = true; };
+
+        const dbOperations = {
+            executeQuery: async (sql: string) => {
+                throw new Error('Simulated query failure for testing');
+            }
+        };
+
+        const doc = {
+            uri: docUri,
+            databaseOperations: dbOperations
+        };
+        DocumentRegistry.set('test', doc as any);
+
+        const fs = require('fs');
+        const originalCreateWriteStream = fs.createWriteStream;
+        const originalConsoleWarn = console.warn;
+
+        try {
+            fs.createWriteStream = () => {
+                throw new Error('Simulated stream failure');
+            };
+
+            console.warn = () => {};
+
+            await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'test_table', uri: 'vscode-sqlite://test.db' },
+                ['id', 'name'],
+                undefined,
+                undefined,
+                { format: 'csv' }
+            );
+
+            assert.strictEqual(fileWritten, false, 'Should not have written file');
+            assert.strictEqual(errorMessageShown, 'Export failed: Simulated query failure for testing');
+            assert.strictEqual(consoleErrorCalled, true, 'console.error should have been called');
+        } finally {
+            fs.createWriteStream = originalCreateWriteStream;
+            mockVscode.window.showErrorMessage = originalShowErrorMessage;
+            mockVscode.window.showSaveDialog = originalShowSaveDialog;
+            mockVscode.workspace.fs.writeFile = originalWriteFile;
+            console.error = originalConsoleError;
+            console.warn = originalConsoleWarn;
+            DocumentRegistry.delete('test');
+        }
+    });
 });
