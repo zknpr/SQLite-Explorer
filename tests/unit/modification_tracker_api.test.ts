@@ -35,7 +35,7 @@ describe('Undo/Redo Logic Coverage', () => {
         tracker.stepBack(); // Undo 2
         assert.strictEqual(tracker.canStepForward, true);
 
-        tracker.record({ label: '3', description: '3', modificationType: 'row_update', targetTable: 't1' });
+        tracker.record({ label: '3', description: '3', modificationType: 'cell_update', targetTable: 't1' });
         assert.strictEqual(tracker.canStepForward, false);
         assert.strictEqual(tracker.entryCount, 2);
     });
@@ -67,7 +67,7 @@ describe('Undo/Redo Logic Coverage', () => {
         await tracker.createCheckpoint();
 
         tracker.record({ label: '2', description: '2', modificationType: 'row_delete', targetTable: 't1' });
-        tracker.record({ label: '3', description: '3', modificationType: 'row_update', targetTable: 't1' });
+        tracker.record({ label: '3', description: '3', modificationType: 'cell_update', targetTable: 't1' });
 
         assert.strictEqual(tracker.entryCount, 3);
         assert.strictEqual(tracker.hasUncommittedChanges(), true);
@@ -97,7 +97,7 @@ describe('Undo/Redo Logic Coverage', () => {
         tracker.record({ label: '1', description: '1', modificationType: 'row_insert', targetTable: 't1' });
         await tracker.createCheckpoint(); // checkpointIndex = 1
 
-        tracker.record({ label: '2', description: '2', modificationType: 'row_update', targetTable: 't1' });
+        tracker.record({ label: '2', description: '2', modificationType: 'cell_update', targetTable: 't1' });
         // timeline: ['1', '2'], checkpointIndex: 1
 
         // Add 3rd entry, should evict '1'

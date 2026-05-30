@@ -5,7 +5,7 @@ import * as path from 'path';
 
 async function runBenchmark() {
     const bundle = await createNativeDatabaseConnection(vscode.Uri.file(process.cwd()));
-    const loadResult = await bundle.loadDatabase({ buffer: new Uint8Array() });
+    const loadResult = await (bundle as any).loadDatabase({ buffer: new Uint8Array() });
     const db = loadResult.databaseOps;
 
     // create table

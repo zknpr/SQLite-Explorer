@@ -26,7 +26,7 @@ describe('HostBridge', () => {
         await bridge.saveFile('../../../etc/passwd', new Uint8Array([1, 2, 3]));
 
         assert.strictEqual(showSaveDialogMock.mock.callCount(), 1);
-        const args = showSaveDialogMock.mock.calls[0].arguments[0];
+        const args = showSaveDialogMock.mock.calls[0].arguments[0] as any;
         // The defaultUri path should end with the base name 'passwd', not the traversed path
         assert.ok(args.defaultUri.path.endsWith('/dbDir/passwd'), `Expected safe path, got ${args.defaultUri.path}`);
 
@@ -135,7 +135,7 @@ describe('HostBridge', () => {
         };
         const mockProvider = { webviews: new Map(), context: {} };
         const bridge = new HostBridge(mockProvider as any, mockDocument as any);
-        bridge.ensureDatabaseInitialized = () => dbOps as any;
+        (bridge as any).ensureDatabaseInitialized = () => dbOps as any;
 
         await bridge.deleteRows('table1', [1]);
 
@@ -162,7 +162,7 @@ describe('HostBridge', () => {
         };
         const mockProvider = { webviews: new Map(), context: {} };
         const bridge = new HostBridge(mockProvider as any, mockDocument as any);
-        bridge.ensureDatabaseInitialized = () => dbOps as any;
+        (bridge as any).ensureDatabaseInitialized = () => dbOps as any;
 
         await bridge.deleteColumns('table1', ['col1']);
 

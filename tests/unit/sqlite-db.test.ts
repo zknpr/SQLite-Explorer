@@ -244,7 +244,7 @@ describe('WasmDatabaseEngine', () => {
         }
       } as unknown as Database;
 
-      const engine = new WasmDatabaseEngine(mockDb, 5000);
+      const engine = new WasmDatabaseEngine(mockDb as any, 5000);
 
       const consoleWarnOrig = console.warn;
       let warnedMessage = '';

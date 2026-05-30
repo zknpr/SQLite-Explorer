@@ -238,7 +238,7 @@ describe('SQLiteFileSystemProvider', () => {
 
             assert.strictEqual(dbOps.updateCell.mock.callCount(), 1);
             assert.deepStrictEqual(dbOps.updateCell.mock.calls[0].arguments, ['users', 1, 'col', 'Hello World']);
-            assert.strictEqual(doc.recordExternalModification.mock.callCount(), 1);
+            assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 1);
         });
 
         it('should write binary content if not valid UTF-8', async () => {
@@ -253,7 +253,7 @@ describe('SQLiteFileSystemProvider', () => {
 
             assert.strictEqual(dbOps.updateCell.mock.callCount(), 1);
             assert.deepStrictEqual(dbOps.updateCell.mock.calls[0].arguments, ['users', 1, 'col', content]);
-            assert.strictEqual(doc.recordExternalModification.mock.callCount(), 1);
+            assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 1);
         });
     });
 
