@@ -411,7 +411,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         }
       }
     } catch (err) {
-      // Log auto-save failures to output channel for debugging
+      // Record auto-save failures in the output channel for debugging instead of showing a UI error
       const errorMessage = err instanceof Error ? err.message : String(err);
       GlobalOutputChannel?.appendLine(`[Auto-save failed] ${errorMessage}`);
       console.error('[Auto-save failed]', err);
