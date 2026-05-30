@@ -284,7 +284,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
         <meta http-equiv="Content-Security-Policy" content="${cspStr}">
         <meta name="color-scheme" content="${themeToCss(vsc.window.activeColorTheme)}">
         <meta id="vscode-env" ${toDatasetAttrs(vscodeEnv)}>
-        <link rel="stylesheet" href="${webview.asWebviewUri(codiconsUri)}" crossorigin onerror="console.log('Codicons CSS not found, using fallback')"/>
+        <link rel="stylesheet" href="${webview.asWebviewUri(codiconsUri)}" crossorigin />
       `)
       .replace(/<!--BODY-->/g, ``);
 
