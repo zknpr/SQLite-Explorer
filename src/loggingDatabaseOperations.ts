@@ -22,6 +22,10 @@ import type {
 import { escapeIdentifier } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 
+type DatabaseMethodName = {
+    [K in keyof DatabaseOperations]: DatabaseOperations[K] extends (...args: never[]) => unknown ? K : never
+}[keyof DatabaseOperations];
+
 export class LoggingDatabaseOperations implements DatabaseOperations {
     constructor(
         private readonly wrapped: DatabaseOperations,
@@ -57,7 +61,7 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
 
     // Constrain T to only callable (function) members of DatabaseOperations,
     // excluding non-function properties like `engineKind` (which is a Promise).
-    private async logAndDelegate<T extends { [K in keyof DatabaseOperations]: DatabaseOperations[K] extends (...args: never[]) => unknown ? K : never }[keyof DatabaseOperations]>(
+    private async logAndDelegate<T extends DatabaseMethodName>(
         message: string,
         isWrite: boolean,
         method: T,
