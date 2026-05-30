@@ -634,10 +634,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         await this.executeQuery(dropIndexStatements);
       }
 
-      for (const col of columns) {
-        const sql = `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}`;
-        await this.executeQuery(sql);
-      }
+      const dropColumnStatements = columns
+        .map((col) => `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)};`)
+        .join('\n');
+      await this.executeQuery(dropColumnStatements);
       await this.executeQuery('COMMIT');
     } catch (e) {
       await this.safeRollback('deleteColumns');
