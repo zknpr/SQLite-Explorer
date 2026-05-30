@@ -176,4 +176,25 @@ describe('SQLiteFileSystemProvider', () => {
             }, /FileNotFound/);
         });
     });
+
+    describe('writeFile', () => {
+        const provider = new SQLiteFileSystemProvider();
+        const docKey = 'test-doc';
+
+        it('should throw Unavailable on database error', async () => {
+            const dbOps = {
+                updateCell: mock.fn(async () => {
+                    throw new Error('Database error');
+                })
+            };
+            setupMockDocument(docKey, dbOps);
+
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/col.txt`);
+            const content = new TextEncoder().encode('new value');
+
+            await assert.rejects(async () => {
+                await provider.writeFile(uri, content, { create: false, overwrite: true });
+            }, /Database error/);
+        });
+    });
 });
