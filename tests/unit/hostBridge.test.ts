@@ -147,4 +147,32 @@ describe('HostBridge', () => {
 
         assert.strictEqual(dbOps.deleteRows.mock.callCount(), 1);
     });
+
+    it('should catch and log error if fetch column data for undo history fails in deleteColumns', async () => {
+        const consoleWarnMock = mock.method(console, 'warn', () => {});
+        const error = new Error('Database disconnected during columns fetch');
+        const dbOps = {
+            getTableInfo: mock.fn(async () => { throw error; }),
+            executeQuery: mock.fn(async () => []),
+            deleteColumns: mock.fn(async () => {})
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            recordExternalModification: mock.fn(),
+        };
+        const mockProvider = { webviews: new Map(), context: {} };
+        const bridge = new HostBridge(mockProvider as any, mockDocument as any);
+        bridge.ensureDatabaseInitialized = () => dbOps as any;
+
+        await bridge.deleteColumns('table1', ['col1']);
+
+        assert.strictEqual(consoleWarnMock.mock.callCount(), 1);
+        assert.deepStrictEqual(consoleWarnMock.mock.calls[0].arguments, [
+            'Failed to fetch column data for undo history:',
+            error
+        ]);
+
+        assert.strictEqual(dbOps.deleteColumns.mock.callCount(), 1);
+    });
 });
