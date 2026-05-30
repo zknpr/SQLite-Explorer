@@ -134,17 +134,31 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
         th.innerHTML = `
             <div class="header-content">
                 <div class="header-top">
-                    ${keyIcon}<span class="header-text">${safeColName}${sortIndicator}</span>
+                    ${keyIcon}<span class="header-text"></span>
                     <span class="select-column-icon codicon codicon-selection" title="Select entire column"></span>
                     <span class="pin-icon codicon codicon-pin ${pinClass}" title="${pinTitle}"></span>
                 </div>
                 <div class="header-bottom">
-                    <input type="text" class="column-filter" data-column="${safeColName}" value="${safeFilterValue}" placeholder="Filter...">
+                    <input type="text" class="column-filter" placeholder="Filter...">
                     <button class="filter-apply-btn" title="Apply filter (Enter)"><span class="codicon codicon-search"></span></button>
                 </div>
             </div>
             <div class="resize-handle"></div>
         `;
+
+        // Safely set text content and data attributes to prevent XSS
+        const headerTextSpan = th.querySelector('.header-text');
+        headerTextSpan.textContent = col.name;
+        if (isSorted) {
+            const sortSpan = document.createElement('span');
+            sortSpan.className = 'sort-indicator';
+            sortSpan.textContent = state.sortAscending ? '▲' : '▼';
+            headerTextSpan.appendChild(sortSpan);
+        }
+
+        const filterInput = th.querySelector('.column-filter');
+        filterInput.dataset.column = col.name;
+        filterInput.value = filterValue;
         headerTr.appendChild(th);
     }
     thead.appendChild(headerTr);
