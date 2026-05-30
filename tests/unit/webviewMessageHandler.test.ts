@@ -5,10 +5,10 @@ import { WebviewMessageHandler } from '../../src/webviewMessageHandler';
 describe('WebviewMessageHandler', () => {
     it('should handle RPC invocation', (context) => {
         const hostBridge = {
-            echo: (val: any) => val
+            echo: (val: unknown) => val
         };
-        let sentMessage: any = null;
-        const postMessage = async (msg: any) => {
+        let sentMessage: unknown = null;
+        const postMessage = async (msg: unknown) => {
             sentMessage = msg;
             return true;
         };
@@ -45,8 +45,8 @@ describe('WebviewMessageHandler', () => {
 
     it('should handle unknown method', () => {
         const hostBridge = {};
-        let sentMessage: any = null;
-        const postMessage = async (msg: any) => {
+        let sentMessage: unknown = null;
+        const postMessage = async (msg: unknown) => {
             sentMessage = msg;
             return true;
         };
@@ -69,10 +69,10 @@ describe('WebviewMessageHandler', () => {
 
     it('should handle legacy RPC request', () => {
         const hostBridge = {
-            echo: (val: any) => val
+            echo: (val: unknown) => val
         };
-        let sentMessage: any = null;
-        const postMessage = async (msg: any) => {
+        let sentMessage: unknown = null;
+        const postMessage = async (msg: unknown) => {
             sentMessage = msg;
             return true;
         };

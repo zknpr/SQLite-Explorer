@@ -44,7 +44,7 @@ const BLOCKED_METHODS = new Set(Object.getOwnPropertyNames(Object.prototype));
  */
 export class WebviewMessageHandler {
   constructor(
-    private readonly postMessage: (message: any) => PromiseLike<boolean>,
+    private readonly postMessage: (message: unknown) => PromiseLike<boolean>,
     private readonly hostBridge: HostBridge,
     private readonly pendingInvocations?: Map<MessageCorrelationId, PendingInvocation>
   ) {}
@@ -81,9 +81,9 @@ export class WebviewMessageHandler {
     // SECURITY: Block Object.prototype methods to prevent prototype pollution attacks.
     // Allow class prototype methods (e.g., HostBridge.initialize) but reject inherited
     // Object methods like 'constructor', '__defineGetter__', 'toString'.
-    if (!BLOCKED_METHODS.has(targetMethod) && targetMethod in hostBridge && typeof (hostBridge as any)[targetMethod] === 'function') {
-      const fn = (hostBridge as any)[targetMethod];
-      Promise.resolve(fn.apply(hostBridge, deserializedPayload))
+    if (!BLOCKED_METHODS.has(targetMethod) && targetMethod in hostBridge && typeof (hostBridge as Record<string, any>)[targetMethod] === 'function') {
+      const fn = (hostBridge as Record<string, any>)[targetMethod];
+      Promise.resolve(fn.apply(hostBridge as any, deserializedPayload))
         .then(result => {
           // Serialize result to handle Uint8Array and other typed arrays
           // which get converted to {} by postMessage JSON serialization
@@ -131,9 +131,9 @@ export class WebviewMessageHandler {
     const hostBridge = this.hostBridge;
     // SECURITY: Same prototype pollution guard as #handleRpcInvoke
     if (BLOCKED_METHODS.has(message.method) || !(message.method in hostBridge)) return;
-    const fn = (hostBridge as any)[message.method];
+    const fn = (hostBridge as Record<string, any>)[message.method];
     if (typeof fn === 'function') {
-      Promise.resolve(fn.apply(hostBridge, deserializeArgs(message.args || [])))
+      Promise.resolve(fn.apply(hostBridge as any, deserializeArgs(message.args || [])))
         .then(result => {
           // Serialize result to handle Uint8Array
           const serializedResult = serializeValue(result);
