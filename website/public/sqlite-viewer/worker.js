@@ -182,7 +182,22 @@ async function runQuery(sql, params = []) {
   if (!db) throw new Error('No database initialized');
 
   try {
-    const results = db.exec(sql, params);
+    let results = [];
+    if (params && params.length > 0) {
+      const stmt = db.prepare(sql);
+      stmt.bind(params);
+      const values = [];
+      while (stmt.step()) {
+        values.push(stmt.get());
+      }
+      const resultCols = stmt.getColumnNames();
+      stmt.free();
+      if (resultCols.length > 0) {
+        results = [{ columns: resultCols, values }];
+      }
+    } else {
+      results = db.exec(sql);
+    }
 
     // Convert to our result format
     return results.map(result => ({
@@ -378,29 +393,30 @@ async function fetchTableData(table, options = {}) {
 
   // Build WHERE clause from filters array and globalFilter
   const whereClauses = [];
+  const queryParams = [];
 
   // Column-specific filters: [{column: 'name', value: 'foo'}, ...]
   if (filters && filters.length > 0) {
     for (const f of filters) {
       if (f.column && f.value) {
         const safeCol = f.column.replace(/"/g, '""');
-        const safeVal = f.value.replace(/'/g, "''");
-        whereClauses.push(`"${safeCol}" LIKE '%${safeVal}%'`);
+        whereClauses.push(`"${safeCol}" LIKE ?`);
+        queryParams.push(`%${f.value}%`);
       }
     }
   }
 
   // Global filter: search across all text columns
   if (globalFilter && globalFilter.trim()) {
-    const safeGlobal = globalFilter.replace(/'/g, "''");
     // Get column names to search
     const searchCols = columns ? columns.filter(c => c !== 'rowid') : [];
     if (searchCols.length > 0) {
       const globalClauses = searchCols.map(c => {
         const safeCol = c.replace(/"/g, '""');
-        return `"${safeCol}" LIKE '%${safeGlobal}%'`;
+        return `"${safeCol}" LIKE ?`;
       });
       whereClauses.push(`(${globalClauses.join(' OR ')})`);
+      searchCols.forEach(() => queryParams.push(`%${globalFilter}%`));
     }
   }
 
@@ -416,7 +432,23 @@ async function fetchTableData(table, options = {}) {
   // Add pagination
   sql += ` LIMIT ${parseInt(limit, 10)} OFFSET ${parseInt(offset, 10)}`;
 
-  const results = db.exec(sql);
+  let results = [];
+  try {
+    const stmt = db.prepare(sql);
+    stmt.bind(queryParams);
+    const values = [];
+    while (stmt.step()) {
+      values.push(stmt.get());
+    }
+    const resultCols = stmt.getColumnNames();
+    stmt.free();
+    if (resultCols.length > 0) {
+      results = [{ columns: resultCols, values }];
+    }
+  } catch (error) {
+    console.error('[Worker] fetchTableData query error:', error);
+    throw error;
+  }
 
   if (results.length === 0) {
     return { headers: [], rows: [] };
@@ -449,14 +481,15 @@ async function fetchTableCount(table, options = {}) {
 
   // Build WHERE clause from filters array and globalFilter
   const whereClauses = [];
+  const queryParams = [];
 
   // Column-specific filters
   if (filters && filters.length > 0) {
     for (const f of filters) {
       if (f.column && f.value) {
         const safeCol = f.column.replace(/"/g, '""');
-        const safeVal = f.value.replace(/'/g, "''");
-        whereClauses.push(`"${safeCol}" LIKE '%${safeVal}%'`);
+        whereClauses.push(`"${safeCol}" LIKE ?`);
+        queryParams.push(`%${f.value}%`);
       }
     }
   }
@@ -468,9 +501,10 @@ async function fetchTableCount(table, options = {}) {
     if (searchCols.length > 0) {
       const globalClauses = searchCols.map(c => {
         const safeCol = c.replace(/"/g, '""');
-        return `"${safeCol}" LIKE '%${safeGlobal}%'`;
+        return `"${safeCol}" LIKE ?`;
       });
       whereClauses.push(`(${globalClauses.join(' OR ')})`);
+      searchCols.forEach(() => queryParams.push(`%${globalFilter}%`));
     }
   }
 
@@ -478,7 +512,23 @@ async function fetchTableCount(table, options = {}) {
     sql += ` WHERE ${whereClauses.join(' AND ')}`;
   }
 
-  const results = db.exec(sql);
+  let results = [];
+  try {
+    const stmt = db.prepare(sql);
+    stmt.bind(queryParams);
+    const values = [];
+    while (stmt.step()) {
+      values.push(stmt.get());
+    }
+    const resultCols = stmt.getColumnNames();
+    stmt.free();
+    if (resultCols.length > 0) {
+      results = [{ columns: resultCols, values }];
+    }
+  } catch (error) {
+    console.error('[Worker] fetchTableCount query error:', error);
+    throw error;
+  }
 
   if (results.length === 0 || results[0].values.length === 0) {
     return 0;
