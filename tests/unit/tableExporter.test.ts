@@ -209,4 +209,88 @@ describe('exportTableCommand Fallback', () => {
             DocumentRegistry.delete('test');
         }
     });
+
+    it('should fall back to memory export if stream write fails during chunking', async () => {
+        const docUri = mockVscode.Uri.parse('vscode-sqlite://test.db');
+        const uri = mockVscode.Uri.file('/test/export.csv');
+
+        mockVscode.window.showSaveDialog = async (): Promise<any> => uri;
+
+        let fileWritten = false;
+        mockVscode.workspace.fs.writeFile = async () => {
+            fileWritten = true;
+        };
+
+        let chunkQueryExecuted = false;
+        const executeQueryCalls: string[] = [];
+        const dbOperations = {
+            executeQuery: async (sql: string) => {
+                executeQueryCalls.push(sql);
+                if (sql.includes('LIMIT 5000')) {
+                    chunkQueryExecuted = true;
+                    return [{
+                        headers: ['id', 'name'],
+                        rows: [[1, 'Alice'], [2, 'Bob']],
+                        columns: ['id', 'name'],
+                        values: [[1, 'Alice'], [2, 'Bob']]
+                    }];
+                }
+
+                return [{
+                    headers: ['id', 'name'],
+                    rows: [[1, 'Alice'], [2, 'Bob']],
+                    columns: ['id', 'name'],
+                    values: [[1, 'Alice'], [2, 'Bob']]
+                }];
+            }
+        };
+
+        const doc = {
+            uri: docUri,
+            databaseOperations: dbOperations
+        };
+        DocumentRegistry.set('test', doc as any);
+
+        const fs = require('fs');
+        const originalCreateWriteStream = fs.createWriteStream;
+
+        const originalConsoleWarn = console.warn;
+        let warnCalled = false;
+        try {
+            fs.createWriteStream = () => {
+                return {
+                    write: () => { throw new Error('Simulated write failure during chunking'); },
+                    end: () => {}
+                };
+            };
+
+            console.warn = (msg, e) => {
+                if (msg === 'Native stream write failed, falling back to memory') {
+                    warnCalled = true;
+                }
+            };
+
+            await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'test_table', uri: 'vscode-sqlite://test.db' },
+                ['id', 'name'],
+                undefined,
+                undefined,
+                { format: 'csv' }
+            );
+
+            assert.strictEqual(warnCalled, true, 'Should have logged fallback warning');
+            assert.strictEqual(fileWritten, true, 'Should have written file using fallback workspace.fs');
+            assert.strictEqual(chunkQueryExecuted, true, 'Should have attempted the chunk query before failing');
+
+            const expectedQuery = 'SELECT "id", "name" FROM "test_table"';
+            assert.ok(executeQueryCalls.includes(expectedQuery), `Expected query to be executed: ${expectedQuery}`);
+
+        } finally {
+            fs.createWriteStream = originalCreateWriteStream;
+            console.warn = originalConsoleWarn;
+            DocumentRegistry.delete('test');
+        }
+    });
 });
