@@ -724,6 +724,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                  selectStmt = this.instance.prepare(`SELECT ${escapedColumn} FROM ${escapedTable} WHERE rowid = ?`);
               }
 
+              // Cache parsed patch objects to optimize JS fallback for batch updates
+              const parsedPatchCache = new Map<string, unknown>();
+
               for (const update of columnUpdates) {
                   const rowIdNum = validateRowId(update.rowId);
 
@@ -750,7 +753,18 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                          try { currentObj = JSON.parse(currentValue); } catch (e) { console.warn('Failed to parse current JSON value for patching (updateCells)', e); }
                      }
 
-                     const patchObj = typeof update.value === 'string' ? JSON.parse(update.value as string) : update.value;
+                     let patchObj;
+                     if (typeof update.value === 'string') {
+                         if (parsedPatchCache.has(update.value)) {
+                             patchObj = parsedPatchCache.get(update.value);
+                         } else {
+                             patchObj = JSON.parse(update.value);
+                             parsedPatchCache.set(update.value, patchObj);
+                         }
+                     } else {
+                         patchObj = update.value;
+                     }
+
                      const newValueObj = applyMergePatch(currentObj, patchObj);
                      const newValueStr = JSON.stringify(newValueObj);
 
