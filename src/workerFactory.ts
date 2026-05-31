@@ -34,6 +34,7 @@ import type {
 import { Worker } from './platform/threadPool';
 import type { DatabaseConnectionBundle } from './connectionTypes';
 import { getMaximumFileSizeBytes, getQueryTimeout } from './config';
+import { createWorkerEndpoint } from './core/sqlite-db';
 
 // Native worker support (only in Node.js environment)
 let nativeSupport: {
@@ -42,7 +43,7 @@ let nativeSupport: {
 } | null = null;
 
 // Dynamically import native worker in Node.js environment
-if (!import.meta.env.VSCODE_BROWSER_EXT) {
+if (!import.meta.env?.VSCODE_BROWSER_EXT) {
   try {
     // Use dynamic import for native worker
     nativeSupport = require('./nativeWorker');
@@ -108,7 +109,7 @@ export async function createDatabaseConnection(
   _reporter?: TelemetryReporter
 ): Promise<DatabaseConnectionBundle> {
   // Try native SQLite first (desktop Node.js only)
-  if (!import.meta.env.VSCODE_BROWSER_EXT && nativeSupport) {
+  if (!import.meta.env?.VSCODE_BROWSER_EXT && nativeSupport) {
     const extensionPath = extensionUri.fsPath;
     if (await nativeSupport.isNativeAvailable(extensionPath)) {
       try {
@@ -151,8 +152,9 @@ export async function createDatabaseConnection(
 /**
  * Create a database connection using sql.js (WebAssembly).
  *
- * The worker runs sql.js in a separate thread to prevent
- * blocking the main extension host during database operations.
+ * Browser VS Code runs sql.js in-process to avoid CSP-blocked workers.
+ * Desktop VS Code keeps sql.js in a worker thread to avoid blocking the
+ * extension host during database operations.
  *
  * @param extensionUri - Extension installation directory URI
  * @param _reporter - Optional telemetry reporter
@@ -162,27 +164,134 @@ async function createWasmDatabaseConnection(
   extensionUri: vsc.Uri,
   _reporter?: TelemetryReporter
 ): Promise<DatabaseConnectionBundle> {
-  // Spawn worker thread
-  // Browser: Web Workers can't load from vscode-vfs:// URIs directly.
-  // Use fetch to load the worker script as a Blob and create a Blob URL.
-  // Node.js: Use require path directly.
-  let workerThread: InstanceType<typeof Worker>;
-
-  if (import.meta.env.VSCODE_BROWSER_EXT) {
-    // Browser environment: fetch worker script and create Blob URL
-    const workerScriptUri = vsc.Uri.joinPath(extensionUri, 'out', 'worker-browser.js');
-    const workerContent = await vsc.workspace.fs.readFile(workerScriptUri);
-    const blob = new Blob([workerContent as BlobPart], { type: 'application/javascript' });
-    const blobUrl = URL.createObjectURL(blob);
-    workerThread = new Worker(blobUrl);
-  } else {
-    // Node.js environment: use file path directly
-    const workerScriptPath = path.resolve(__dirname, './worker.cjs');
-    workerThread = new Worker(workerScriptPath);
+  if (import.meta.env?.VSCODE_BROWSER_EXT === true) {
+    return createInProcessWasmDatabaseConnection(extensionUri);
   }
 
-  // Create IPC proxy for worker communication
-  // Browser Workers use addEventListener, Node.js Workers use .on()
+  return createWorkerBackedWasmDatabaseConnection(extensionUri);
+}
+
+/**
+ * Create a browser-safe WASM database connection.
+ *
+ * VS Code Web applies a default-src 'none' CSP to the browser extension host and
+ * does not grant worker-src, so blob-backed workers cannot start there. This
+ * bundle runs the sql.js endpoint directly in the extension host and lets thrown
+ * initialization/query errors reject the original operation.
+ */
+async function createInProcessWasmDatabaseConnection(
+  extensionUri: vsc.Uri
+): Promise<DatabaseConnectionBundle> {
+  const endpoint = createWorkerEndpoint();
+
+  return {
+    workerMethods: {
+      ...endpoint,
+      [Symbol.dispose]: () => {}
+    },
+
+    /**
+     * Establish a database connection in the browser extension host.
+     *
+     * The browser path must read binary content through VS Code's workspace
+     * filesystem because local file paths are not available in vscode.dev.
+     */
+    async establishConnection(
+      fileUri: vsc.Uri,
+      displayName: string,
+      forceReadOnly?: boolean,
+      autoCommit?: boolean
+    ) {
+      // Browser mode always reads database bytes through the VS Code filesystem.
+      // There is no file-path fast path because the web extension host cannot
+      // access local disk paths directly.
+      const [dbContent, walContent] = await loadDatabaseFiles(fileUri);
+
+      // Preload sql.js WASM bytes from the extension assets directory so
+      // WebAssembly instantiation does not depend on worker-relative URLs.
+      const wasmUri = vsc.Uri.joinPath(extensionUri, 'assets', 'sqlite3.wasm');
+      const wasmContent = await vsc.workspace.fs.readFile(wasmUri);
+
+      const initConfig: DatabaseInitConfig = {
+        content: dbContent,
+        walContent,
+        maxSize: getMaximumFileSizeBytes(),
+        resourceMap: {},
+        wasmBinary: wasmContent,
+        readOnlyMode: forceReadOnly ?? false,
+        queryTimeout: getQueryTimeout()
+      };
+
+      const result = await endpoint.initializeDatabase(displayName, initConfig);
+
+      const operationsFacade: DatabaseOperations = {
+        engineKind: Promise.resolve('wasm'),
+        executeQuery: (sql: string, params?: CellValue[]) =>
+          endpoint.runQuery(sql, params),
+        serializeDatabase: (name: string) => endpoint.exportDatabase(name),
+        applyModifications: async () => {},
+        undoModification: async () => {},
+        redoModification: async () => {},
+        flushChanges: async () => {},
+        discardModifications: async () => {},
+        updateCell: (table: string, rowId: string | number, column: string, value: CellValue) =>
+          endpoint.updateCell(table, rowId, column, value),
+        insertRow: (table: string, data: Record<string, CellValue>) =>
+          endpoint.insertRow(table, data),
+        insertRowBatch: (table: string, rows: Record<string, CellValue>[]) =>
+          endpoint.insertRowBatch(table, rows),
+        deleteRows: (table: string, rowIds: (string | number)[]) =>
+          endpoint.deleteRows(table, rowIds),
+        deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
+          endpoint.deleteColumns(table, columns, dropDependentIndexes),
+        findDependentIndexes: (table: string, columns: string[]) =>
+          endpoint.findDependentIndexes(table, columns),
+        createTable: (table: string, columns: ColumnDefinition[]) =>
+          endpoint.createTable(table, columns),
+        updateCellBatch: (table: string, updates: CellUpdate[]) =>
+          endpoint.updateCellBatch(table, updates),
+        addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
+          endpoint.addColumn(table, column, type, defaultValue),
+        fetchTableData: (table: string, options: TableQueryOptions) =>
+          endpoint.fetchTableData(table, options),
+        fetchTableCount: (table: string, options: TableCountOptions) =>
+          endpoint.fetchTableCount(table, options),
+        fetchSchema: () =>
+          endpoint.fetchSchema(),
+        getTableInfo: (table: string) =>
+          endpoint.getTableInfo(table),
+        getPragmas: () =>
+          endpoint.getPragmas(),
+        setPragma: (pragma: string, value: CellValue) =>
+          endpoint.setPragma(pragma, value),
+        ping: () =>
+          endpoint.ping(),
+        writeToFile: (path: string) =>
+          endpoint.writeToFile(path)
+      };
+
+      return {
+        databaseOps: operationsFacade,
+        isReadOnly: result.isReadOnly ?? false
+      };
+    }
+  };
+}
+
+/**
+ * Create a Node.js WASM database connection backed by worker_threads.
+ *
+ * Desktop VS Code is not constrained by the browser extension host CSP, so it
+ * keeps the existing worker/RPC path to avoid blocking the extension host.
+ */
+async function createWorkerBackedWasmDatabaseConnection(
+  extensionUri: vsc.Uri
+): Promise<DatabaseConnectionBundle> {
+  // Node.js environment: use file path directly
+  const workerScriptPath = path.resolve(__dirname, './worker.cjs');
+  const workerThread: InstanceType<typeof Worker> = new Worker(workerScriptPath);
+
+  // Create IPC proxy for Node.js worker communication
   // Route worker log messages to the VS Code output channel for visibility.
   // Falls back to console if no output channel is available (e.g., during tests).
   const logHandler = (level: 'log' | 'warn' | 'error', args: unknown[]) => {
@@ -204,14 +313,9 @@ async function createWasmDatabaseConnection(
         }
       },
       on: (event: 'message', handler: (data: unknown) => void) => {
-        if (import.meta.env.VSCODE_BROWSER_EXT) {
-          // Browser: Web Worker uses addEventListener with MessageEvent wrapper
-          workerThread.addEventListener(event, (e: MessageEvent) => handler(e.data));
-        } else {
-          // Node.js: worker_threads uses .on() with direct data
-          (workerThread as unknown as { on(event: string, handler: (data: unknown) => void): void })
-            .on(event, handler);
-        }
+        // Node.js worker_threads uses .on() with direct message payloads.
+        (workerThread as unknown as { on(event: string, handler: (data: unknown) => void): void })
+          .on(event, handler);
       }
     },
     ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'insertRowBatch', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile'],
@@ -248,7 +352,7 @@ async function createWasmDatabaseConnection(
         // Read database and WAL files
         // Optimization: If running in Node and file is local, pass path to worker instead of reading content here
         // This avoids blocking the extension host and transferring large buffers
-        const isNode = !import.meta.env.VSCODE_BROWSER_EXT;
+        const isNode = !import.meta.env?.VSCODE_BROWSER_EXT;
         const isLocal = fileUri.scheme === 'file';
 
         let dbContent: Uint8Array | null = null;
