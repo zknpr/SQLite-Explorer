@@ -13,6 +13,10 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Only run for stable version tags (vX.Y.Z). Pre-release tags such as
+    # v1.3.6-rc.1 contain a hyphen and are skipped here — they are published
+    # as GitHub pre-releases manually with the built .vsix attached.
+    if: ${{ !contains(github.ref_name, '-') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

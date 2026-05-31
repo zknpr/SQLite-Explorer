@@ -37,11 +37,51 @@ interface NodeMessagePort {
   off(event: string, handler: EventListenerOrEventListenerObject, options?: object): void;
 }
 
+/**
+ * Minimal browser worker global scope surface used by the parentPort adapter.
+ * DedicatedWorkerGlobalScope provides these DOM APIs for communication with the
+ * spawning context.
+ */
+interface BrowserParentPortScope {
+  postMessage(data: unknown, transfer?: Transferable[]): void;
+  addEventListener: EventTarget['addEventListener'];
+  removeEventListener: EventTarget['removeEventListener'];
+}
+
+/**
+ * Create a Node-style parentPort facade for browser workers.
+ *
+ * Node's parentPort.on('message', cb) delivers the message payload directly,
+ * while browser worker "message" listeners receive a MessageEvent whose data
+ * property contains the payload. The adapter preserves Node-style delivery for
+ * message events and forwards other events, such as "error", unchanged.
+ */
+export function createBrowserParentPort(scope: BrowserParentPortScope): NodeMessagePort {
+  const browserListeners = new WeakMap<EventListenerOrEventListenerObject, EventListener>();
+
+  return {
+    postMessage: (data: unknown, transfer?: Transferable[]) =>
+      transfer ? scope.postMessage(data, transfer) : scope.postMessage(data),
+    on: (event: string, handler: EventListenerOrEventListenerObject) => {
+      // Node's parentPort.on('message', cb) passes the message DATA directly; the
+      // DOM 'message' event wraps it in event.data. For other events (e.g.
+      // 'error') pass the event through so consumers can read `.message`.
+      const cb = handler as (payload: unknown) => void;
+      const wrapped: EventListener = (e: Event) =>
+        cb(event === 'message' ? (e as MessageEvent).data : e);
+      browserListeners.set(handler, wrapped);
+      scope.addEventListener(event, wrapped);
+    },
+    off: (event: string, handler: EventListenerOrEventListenerObject) => {
+      const wrapped = browserListeners.get(handler);
+      if (wrapped) scope.removeEventListener(event, wrapped);
+    },
+  };
+}
+
 // ============================================================================
 // Runtime Detection and API Export
 // ============================================================================
-
-const isBrowserRuntime = import.meta.env?.VSCODE_BROWSER_EXT;
 
 let WorkerImpl: any;
 let MessageChannelImpl: any;
@@ -49,7 +89,7 @@ let MessagePortImpl: any;
 let BroadcastChannelImpl: any;
 let parentPortImpl: any;
 
-if (isBrowserRuntime) {
+if (import.meta.env?.VSCODE_BROWSER_EXT) {
   WorkerImpl = globalThis.Worker;
   MessageChannelImpl = globalThis.MessageChannel;
   MessagePortImpl = globalThis.MessagePort;
@@ -60,30 +100,8 @@ if (isBrowserRuntime) {
   // written against. Without this adapter, `parentPort.on('message', ...)` throws
   // `TypeError: parentPort.on is not a function`, so the worker never wires up its
   // message handler and the host's RPC hangs forever (VS Code Web "stuck loading").
-  const workerScope: {
-    postMessage(data: unknown, transfer?: Transferable[]): void;
-    addEventListener: EventTarget['addEventListener'];
-    removeEventListener: EventTarget['removeEventListener'];
-  } = globalThis as unknown as typeof workerScope;
-  const browserListeners = new WeakMap<EventListenerOrEventListenerObject, EventListener>();
-  parentPortImpl = {
-    postMessage: (data: unknown, transfer?: Transferable[]) =>
-      transfer ? workerScope.postMessage(data, transfer) : workerScope.postMessage(data),
-    on: (event: string, handler: EventListenerOrEventListenerObject) => {
-      // Node's parentPort.on('message', cb) passes the message DATA directly; the
-      // DOM 'message' event wraps it in event.data. For other events (e.g.
-      // 'error') pass the event through so consumers can read `.message`.
-      const cb = handler as (payload: unknown) => void;
-      const wrapped: EventListener = (e: Event) =>
-        cb(event === 'message' ? (e as MessageEvent).data : e);
-      browserListeners.set(handler, wrapped);
-      workerScope.addEventListener(event, wrapped);
-    },
-    off: (event: string, handler: EventListenerOrEventListenerObject) => {
-      const wrapped = browserListeners.get(handler);
-      if (wrapped) workerScope.removeEventListener(event, wrapped);
-    },
-  };
+  const workerScope = globalThis as unknown as BrowserParentPortScope;
+  parentPortImpl = createBrowserParentPort(workerScope);
 } else {
   // Node.js environment
   try {

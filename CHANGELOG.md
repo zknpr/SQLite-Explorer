@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.3.6
+
+### Bug Fixes
+
+- **VS Code for Web (vscode.dev): databases stuck on the loading screen**: Fixed the browser SQLite worker never starting. The worker entry point calls Node's `parentPort.on('message', …)`, but inside a browser Web Worker the global scope only exposes `addEventListener`, not Node's `.on()` — so the worker threw `TypeError: parentPort.on is not a function` before wiring up its message handler, and every database operation silently timed out. A Node-style `parentPort` adapter is now provided for the browser runtime. This affected all database files (`.db`, `.sqlite`, `.gpkg`, …) in the web build; the desktop build and the website demo were unaffected because they use different worker paths (#418).
+- **Error Cause Preservation**: The worker now preserves the original error `cause` when re-throwing a database open failure, so the underlying reason is no longer lost (#351).
+- **Web Demo Query Parameterization**: Parameterized the filter queries in the web-demo worker, removing string-interpolated SQL in the demo data path (#401).
+
+### Performance
+
+- **Batched ALTER TABLE ADD COLUMN**: `undoColumnDrop` batches its `ADD COLUMN` statements into a single call instead of one per column (#405).
+- **Batched ALTER TABLE DROP COLUMN**: `deleteColumns` batches its `DROP COLUMN` statements into a single call (#408).
+- **Cached JSON Patches**: The `updateCells` JS fallback caches parsed JSON patches across a batch instead of re-parsing per row (#387).
+- **updateCellBatch SAVEPOINT Fallback**: The sequential `hostBridge` cell-batch fallback is wrapped in a single `SAVEPOINT` to avoid per-row transaction overhead (#364).
+- **Grid Selection Allocation**: Avoided string-key allocations in batch cell/column selection for large selections (#375).
+- **Allocation Trimming**: Dropped `Object.keys` allocations in the JSON-merge-patch key iteration (#362) and in serialization, and tidied the `Uint8Array` marker check (#356).
+
+### Improvements
+
+- **Browser Worker Bundle Format**: The browser worker bundle (`out/worker-browser.js`) is now emitted as a classic-worker (IIFE) bundle to match how it is loaded (`new Worker(blobUrl)`), removing a latent module-vs-classic mismatch. Added regression tests that fail if the bundle reverts to ESM or if the browser `parentPort` adapter is removed (#418).
+- **UI Module Extraction**: Extracted the pure batch-update logic out of `sidebar.js` into a DOM-free, unit-testable module (#416); split `renderSidebar` into helper functions; and modularized the grid render/events and viewer initialization paths.
+- **Code Organization**: Extracted file-signature byte arrays into a shared `FILE_SIGNATURES` table (#374), per-format streaming into `getFormatHelper()` (#380), `maskSensitiveData()` into helpers (#398), a `requireEngine()` helper in `createWorkerEndpoint` (#357), and a `DatabaseMethodName` type alias (#386); converted panel-handler arrow-fields to methods (#383).
+- **Type Safety**: Tightened the webview message-handler types (`any` → `unknown`) (#377).
+- **Webview Hygiene**: Dropped a CSP-blocked inline `onerror` handler from the codicons `<link>` (#353), and removed several unused imports across `edit.js` (#359), `dnd.js` (#354), `blob-inspector.js` (#355), and `main.ts` (#352).
+
+### Tests
+
+- Expanded unit coverage: activation/deactivation entrypoint (#406); `disposeAll` null-skip and child `AggregateError` (#403); WASM `establishConnection` failure + worker termination (#402); RPC transfer-fallback warning args (#394); `doTry` null/non-error branches (#391); `deleteColumns` undo-history fetch-error path (#385); delegated worker-endpoint operations after init (#370); comprehensive virtual-filesystem `writeFile` + delete/rename/stat/watch coverage (#365); and consolidated overlapping error-path coverage.
+
+### CI / Tooling
+
+- **PR Workflow**: Added a pull-request workflow that builds, typechecks, and tests on every PR, and fixed the latent type errors it surfaced (#414); addressed follow-up review feedback (#417).
+
+### Documentation
+
+- Added GitHub community health files (#343); clarified the auto-save failure comment (#358) and rephrased the save-edit comment in `edit.js` (#382).
+
+### Website
+
+- Migrated the website to Tailwind CSS v4 (#415).
+- Bumped `react`/`react-dom` to 19.2.6 (#344, #347), `@types/node` to 25.9.1 (#348), and `eslint` to 10.4.0 (#349).
+
+### Dependencies
+
+**Extension:**
+
+- @types/node 25.9.0 → 25.9.1 (#345)
+- tsx 4.21.0 → 4.22.3 (#346)
+- tmp 0.2.5 → 0.2.7 (transitive, npm_and_yarn group) (#381)
+
 ## 1.3.5
 
 ### Security
