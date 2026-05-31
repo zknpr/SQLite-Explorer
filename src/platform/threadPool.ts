@@ -14,20 +14,6 @@
 // ============================================================================
 
 /**
- * Minimal event receiver interface for message handling.
- * Matches the common subset of browser EventTarget and Node.js EventEmitter.
- */
-type MessageReceiver = Pick<EventTarget, 'addEventListener' | 'removeEventListener'>;
-
-/**
- * Browser-style message port interface.
- * Used for communication in web worker environments.
- */
-interface BrowserMessagePort extends MessageReceiver {
-  postMessage(data: unknown, transfer?: Transferable[]): void;
-}
-
-/**
  * Node.js-style message port interface.
  * Used for communication in Node.js worker_threads.
  */
