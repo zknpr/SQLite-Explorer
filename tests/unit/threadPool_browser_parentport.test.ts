@@ -90,4 +90,50 @@ describe('createBrowserParentPort', () => {
     assert.strictEqual(removedListeners[0].event, 'message');
     assert.strictEqual(removedListeners[0].listener, registeredListeners[0].listener);
   });
+
+  it('removes the correct wrapped listener when one handler is reused for two events', () => {
+    // Regression guard: the adapter must key wrapped listeners by (handler, event),
+    // not by handler alone. With a flat handler->wrapped map, registering the same
+    // handler for 'message' then 'error' would overwrite the first wrapper, so
+    // off('message', …) would remove the wrong (error) listener and leak the
+    // message one. This reuses a single handler across both events and asserts
+    // each off() removes the exact wrapper that on() installed for that event.
+    const registeredListeners: Array<{ event: string; listener: EventListener }> = [];
+    const removedListeners: Array<{ event: string; listener: EventListener }> = [];
+
+    const fakeScope = {
+      postMessage() {},
+      addEventListener(event: string, listener: EventListenerOrEventListenerObject) {
+        registeredListeners.push({ event, listener: listener as EventListener });
+      },
+      removeEventListener(event: string, listener: EventListenerOrEventListenerObject) {
+        removedListeners.push({ event, listener: listener as EventListener });
+      },
+    };
+
+    const parentPort = createBrowserParentPort(fakeScope);
+
+    // Same handler reference registered for two distinct events.
+    const sharedHandler = () => {};
+    parentPort.on('message', sharedHandler);
+    parentPort.on('error', sharedHandler);
+
+    assert.strictEqual(registeredListeners.length, 2);
+    const messageWrapped = registeredListeners[0].listener;
+    const errorWrapped = registeredListeners[1].listener;
+    // Each event must get its OWN wrapper (the bug would reuse/overwrite one).
+    assert.notStrictEqual(messageWrapped, errorWrapped);
+
+    parentPort.off('message', sharedHandler);
+    parentPort.off('error', sharedHandler);
+
+    assert.strictEqual(removedListeners.length, 2);
+    assert.deepStrictEqual(
+      removedListeners.map(r => r.event),
+      ['message', 'error']
+    );
+    // The wrapper removed for each event matches the one registered for it.
+    assert.strictEqual(removedListeners[0].listener, messageWrapped);
+    assert.strictEqual(removedListeners[1].listener, errorWrapped);
+  });
 });

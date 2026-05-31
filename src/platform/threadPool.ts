@@ -57,7 +57,12 @@ interface BrowserParentPortScope {
  * message events and forwards other events, such as "error", unchanged.
  */
 export function createBrowserParentPort(scope: BrowserParentPortScope): NodeMessagePort {
-  const browserListeners = new WeakMap<EventListenerOrEventListenerObject, EventListener>();
+  // Keyed by handler, then by event name. A single handler may be registered for
+  // more than one event (e.g. the same callback for 'message' and 'error'), so a
+  // flat handler->wrapped map would let the second registration overwrite the
+  // first — leaking the earlier DOM listener and making off() remove the wrong
+  // one. The per-event inner map keeps each (handler, event) wrapper distinct.
+  const browserListeners = new WeakMap<EventListenerOrEventListenerObject, Map<string, EventListener>>();
 
   return {
     postMessage: (data: unknown, transfer?: Transferable[]) =>
@@ -69,12 +74,22 @@ export function createBrowserParentPort(scope: BrowserParentPortScope): NodeMess
       const cb = handler as (payload: unknown) => void;
       const wrapped: EventListener = (e: Event) =>
         cb(event === 'message' ? (e as MessageEvent).data : e);
-      browserListeners.set(handler, wrapped);
+      let byEvent = browserListeners.get(handler);
+      if (!byEvent) {
+        byEvent = new Map<string, EventListener>();
+        browserListeners.set(handler, byEvent);
+      }
+      byEvent.set(event, wrapped);
       scope.addEventListener(event, wrapped);
     },
     off: (event: string, handler: EventListenerOrEventListenerObject) => {
-      const wrapped = browserListeners.get(handler);
-      if (wrapped) scope.removeEventListener(event, wrapped);
+      const byEvent = browserListeners.get(handler);
+      const wrapped = byEvent?.get(event);
+      if (wrapped) {
+        scope.removeEventListener(event, wrapped);
+        byEvent!.delete(event);
+        if (byEvent!.size === 0) browserListeners.delete(handler);
+      }
     },
   };
 }
