@@ -178,7 +178,12 @@ const compileBrowserWorker = () =>
     ...baseWorkerConfig,
     outfile: resolve(outDir, 'worker-browser.js'),
     platform: 'browser',
-    format: 'esm',
+    // IIFE (not ESM): this bundle is loaded as a CLASSIC Web Worker via
+    // `new Worker(blobUrl)` in workerFactory.ts. An ESM bundle emits a top-level
+    // `export{...}` which a classic worker cannot parse ("SyntaxError: Unexpected
+    // token 'export'"), so the worker never boots and VS Code Web hangs on load.
+    // IIFE also keeps the classic-worker environment sql.js/emscripten expects.
+    format: 'iife',
     mainFields: ['browser', 'module', 'main'],
     external: ['fs/promises', 'path'],
     define: {

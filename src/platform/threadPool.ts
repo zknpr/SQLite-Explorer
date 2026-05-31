@@ -54,7 +54,36 @@ if (isBrowserRuntime) {
   MessageChannelImpl = globalThis.MessageChannel;
   MessagePortImpl = globalThis.MessagePort;
   BroadcastChannelImpl = globalThis.BroadcastChannel;
-  parentPortImpl = globalThis;
+  // In a browser Web Worker the global scope (DedicatedWorkerGlobalScope) is the
+  // channel to the host, but it exposes addEventListener/postMessage — NOT the
+  // Node worker_threads `.on()` API that the worker entry (databaseWorker.ts) is
+  // written against. Without this adapter, `parentPort.on('message', ...)` throws
+  // `TypeError: parentPort.on is not a function`, so the worker never wires up its
+  // message handler and the host's RPC hangs forever (VS Code Web "stuck loading").
+  const workerScope: {
+    postMessage(data: unknown, transfer?: Transferable[]): void;
+    addEventListener: EventTarget['addEventListener'];
+    removeEventListener: EventTarget['removeEventListener'];
+  } = globalThis as unknown as typeof workerScope;
+  const browserListeners = new WeakMap<EventListenerOrEventListenerObject, EventListener>();
+  parentPortImpl = {
+    postMessage: (data: unknown, transfer?: Transferable[]) =>
+      transfer ? workerScope.postMessage(data, transfer) : workerScope.postMessage(data),
+    on: (event: string, handler: EventListenerOrEventListenerObject) => {
+      // Node's parentPort.on('message', cb) passes the message DATA directly; the
+      // DOM 'message' event wraps it in event.data. For other events (e.g.
+      // 'error') pass the event through so consumers can read `.message`.
+      const cb = handler as (payload: unknown) => void;
+      const wrapped: EventListener = (e: Event) =>
+        cb(event === 'message' ? (e as MessageEvent).data : e);
+      browserListeners.set(handler, wrapped);
+      workerScope.addEventListener(event, wrapped);
+    },
+    off: (event: string, handler: EventListenerOrEventListenerObject) => {
+      const wrapped = browserListeners.get(handler);
+      if (wrapped) workerScope.removeEventListener(event, wrapped);
+    },
+  };
 } else {
   // Node.js environment
   try {
