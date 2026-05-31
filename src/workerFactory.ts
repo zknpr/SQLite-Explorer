@@ -174,9 +174,13 @@ async function createWasmDatabaseConnection(
 /**
  * Create a browser-safe WASM database connection.
  *
- * VS Code Web applies a default-src 'none' CSP to the browser extension host and
- * does not grant worker-src, so blob-backed workers cannot start there. This
- * bundle runs the sql.js endpoint directly in the extension host and lets thrown
+ * VS Code Web enforces Trusted Types (require-trusted-types-for 'script') on the
+ * browser extension host with a fixed trusted-types policy allowlist, so
+ * `new Worker(blobUrl)` with a plain string URL is blocked ("This document
+ * requires 'TrustedScriptURL' assignment") and the worker never starts. (The CSP
+ * does allow worker-src 'self' blob:; the blocker is Trusted Types, not
+ * worker-src. WebAssembly instantiation is permitted.) This bundle therefore runs
+ * the sql.js endpoint directly in the extension host and lets thrown
  * initialization/query errors reject the original operation.
  */
 async function createInProcessWasmDatabaseConnection(
@@ -187,7 +191,11 @@ async function createInProcessWasmDatabaseConnection(
   return {
     workerMethods: {
       ...endpoint,
-      [Symbol.dispose]: () => {}
+      // Free the in-process sql.js WASM heap when the document is disposed.
+      // Unlike the Node worker path (which terminates the whole thread), the
+      // browser engine lives in the extension host, so closing a database must
+      // explicitly shut the engine down or its WASM memory leaks until reload.
+      [Symbol.dispose]: () => { endpoint.dispose(); }
     },
 
     /**
