@@ -14,20 +14,6 @@
 // ============================================================================
 
 /**
- * Minimal event receiver interface for message handling.
- * Matches the common subset of browser EventTarget and Node.js EventEmitter.
- */
-type MessageReceiver = Pick<EventTarget, 'addEventListener' | 'removeEventListener'>;
-
-/**
- * Browser-style message port interface.
- * Used for communication in web worker environments.
- */
-interface BrowserMessagePort extends MessageReceiver {
-  postMessage(data: unknown, transfer?: Transferable[]): void;
-}
-
-/**
  * Node.js-style message port interface.
  * Used for communication in Node.js worker_threads.
  */
@@ -37,11 +23,66 @@ interface NodeMessagePort {
   off(event: string, handler: EventListenerOrEventListenerObject, options?: object): void;
 }
 
+/**
+ * Minimal browser worker global scope surface used by the parentPort adapter.
+ * DedicatedWorkerGlobalScope provides these DOM APIs for communication with the
+ * spawning context.
+ */
+interface BrowserParentPortScope {
+  postMessage(data: unknown, transfer?: Transferable[]): void;
+  addEventListener: EventTarget['addEventListener'];
+  removeEventListener: EventTarget['removeEventListener'];
+}
+
+/**
+ * Create a Node-style parentPort facade for browser workers.
+ *
+ * Node's parentPort.on('message', cb) delivers the message payload directly,
+ * while browser worker "message" listeners receive a MessageEvent whose data
+ * property contains the payload. The adapter preserves Node-style delivery for
+ * message events and forwards other events, such as "error", unchanged.
+ */
+export function createBrowserParentPort(scope: BrowserParentPortScope): NodeMessagePort {
+  // Keyed by handler, then by event name. A single handler may be registered for
+  // more than one event (e.g. the same callback for 'message' and 'error'), so a
+  // flat handler->wrapped map would let the second registration overwrite the
+  // first — leaking the earlier DOM listener and making off() remove the wrong
+  // one. The per-event inner map keeps each (handler, event) wrapper distinct.
+  const browserListeners = new WeakMap<EventListenerOrEventListenerObject, Map<string, EventListener>>();
+
+  return {
+    postMessage: (data: unknown, transfer?: Transferable[]) =>
+      transfer ? scope.postMessage(data, transfer) : scope.postMessage(data),
+    on: (event: string, handler: EventListenerOrEventListenerObject) => {
+      // Node's parentPort.on('message', cb) passes the message DATA directly; the
+      // DOM 'message' event wraps it in event.data. For other events (e.g.
+      // 'error') pass the event through so consumers can read `.message`.
+      const cb = handler as (payload: unknown) => void;
+      const wrapped: EventListener = (e: Event) =>
+        cb(event === 'message' ? (e as MessageEvent).data : e);
+      let byEvent = browserListeners.get(handler);
+      if (!byEvent) {
+        byEvent = new Map<string, EventListener>();
+        browserListeners.set(handler, byEvent);
+      }
+      byEvent.set(event, wrapped);
+      scope.addEventListener(event, wrapped);
+    },
+    off: (event: string, handler: EventListenerOrEventListenerObject) => {
+      const byEvent = browserListeners.get(handler);
+      const wrapped = byEvent?.get(event);
+      if (wrapped) {
+        scope.removeEventListener(event, wrapped);
+        byEvent!.delete(event);
+        if (byEvent!.size === 0) browserListeners.delete(handler);
+      }
+    },
+  };
+}
+
 // ============================================================================
 // Runtime Detection and API Export
 // ============================================================================
-
-const isBrowserRuntime = import.meta.env?.VSCODE_BROWSER_EXT;
 
 let WorkerImpl: any;
 let MessageChannelImpl: any;
@@ -49,12 +90,19 @@ let MessagePortImpl: any;
 let BroadcastChannelImpl: any;
 let parentPortImpl: any;
 
-if (isBrowserRuntime) {
+if (import.meta.env?.VSCODE_BROWSER_EXT) {
   WorkerImpl = globalThis.Worker;
   MessageChannelImpl = globalThis.MessageChannel;
   MessagePortImpl = globalThis.MessagePort;
   BroadcastChannelImpl = globalThis.BroadcastChannel;
-  parentPortImpl = globalThis;
+  // In a browser Web Worker the global scope (DedicatedWorkerGlobalScope) is the
+  // channel to the host, but it exposes addEventListener/postMessage — NOT the
+  // Node worker_threads `.on()` API that the worker entry (databaseWorker.ts) is
+  // written against. Without this adapter, `parentPort.on('message', ...)` throws
+  // `TypeError: parentPort.on is not a function`, so the worker never wires up its
+  // message handler and the host's RPC hangs forever (VS Code Web "stuck loading").
+  const workerScope = globalThis as unknown as BrowserParentPortScope;
+  parentPortImpl = createBrowserParentPort(workerScope);
 } else {
   // Node.js environment
   try {

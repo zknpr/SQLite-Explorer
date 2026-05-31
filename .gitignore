@@ -32,3 +32,9 @@ Thumbs.db
 *.zip
 tmp/
 .worktrees/
+
+# Local browser/extension test harness (not part of the repo)
+.playwright-mcp/
+.vscode-test-web/
+_repro_*.html
+vscode-web-test-db.png
