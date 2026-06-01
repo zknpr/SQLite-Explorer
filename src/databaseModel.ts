@@ -324,6 +324,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * For WASM engine: we need to serialize the in-memory database and write to disk.
    */
   async save(cancellation?: vsc.CancellationToken): Promise<void> {
+    if (cancellation?.isCancellationRequested) {
+      throw new vsc.CancellationError();
+    }
     await this.ensureWritable();
 
     // Check if using native engine - changes are already on disk
@@ -340,6 +343,12 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       }
       await this.#modificationTracker.createCheckpoint();
       return;
+    }
+
+    // The WASM serialize + filesystem write can be slow for large databases or
+    // remote web filesystems; re-check cancellation before starting that work.
+    if (cancellation?.isCancellationRequested) {
+      throw new vsc.CancellationError();
     }
 
     // Export in-memory database to file (WASM engine only)

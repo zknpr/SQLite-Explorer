@@ -301,6 +301,34 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         );
     };
 
+    it('save: throws CancellationError and writes nothing when the token is already cancelled', async () => {
+        let serializeCalled = false;
+        let writeToFileCalled = false;
+        const dbOps = {
+            engineKind: Promise.resolve('wasm'),
+            writeToFile: async () => { writeToFileCalled = true; },
+            serializeDatabase: async () => {
+                serializeCalled = true;
+                return new Uint8Array([1, 2, 3]);
+            }
+        };
+
+        const doc = createDocBypassingFactory(dbOps);
+
+        // A pre-cancelled token must abort save before any serialize/write work.
+        const cancelledToken = {
+            isCancellationRequested: true,
+            onCancellationRequested: () => ({ dispose() {} })
+        } as any;
+
+        await assert.rejects(
+            () => doc.save(cancelledToken),
+            (err: any) => err instanceof Error && err.name === 'Canceled'
+        );
+        assert.strictEqual(serializeCalled, false, 'serializeDatabase must not run when cancelled');
+        assert.strictEqual(writeToFileCalled, false, 'writeToFile must not run when cancelled');
+    });
+
     it('saveAs: falls back to buffer transfer when writeToFile fails for file URI', async () => {
         let serialized = false;
         const dbOps = {
