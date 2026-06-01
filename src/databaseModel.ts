@@ -358,7 +358,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
               this.#modificationTracker.getCheckpointInvalidationRevision() ===
               fileCheckpointInvalidationRevision
             ) {
-              await this.#modificationTracker.createCheckpointAt(fileCheckpoint);
+              this.#modificationTracker.createCheckpointAt(fileCheckpoint);
             }
             return;
         } catch (e) {
@@ -395,7 +395,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       this.#modificationTracker.getCheckpointInvalidationRevision() ===
       serializedCheckpointInvalidationRevision
     ) {
-      await this.#modificationTracker.createCheckpointAt(serializedCheckpoint);
+      this.#modificationTracker.createCheckpointAt(serializedCheckpoint);
     }
   }
 

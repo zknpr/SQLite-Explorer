@@ -329,7 +329,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    * The position is translated back into the retained timeline, clamped when
    * old entries were evicted or when callers provide a future position.
    */
-  async createCheckpointAt(position: number): Promise<void> {
+  createCheckpointAt(position: number): void {
     const relativePosition = position - this.timelineOffset;
     this.checkpointIndex = Math.max(0, Math.min(this.timeline.length, relativePosition));
   }

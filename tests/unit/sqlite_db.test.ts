@@ -1,4 +1,6 @@
 
+import './vscode_mock_setup';
+
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { createDatabaseEngine } from '../../src/core/sqlite-db';

@@ -1110,8 +1110,10 @@ export async function createNativeDatabaseConnection(
             let sql: string;
 
             if (op === 'json_patch') {
-              // json_patch(col, patch)
-              sql = `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(${escapedColumn}, ?) WHERE rowid = ?`;
+              // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL per SQL
+              // semantics, but a patch on a NULL JSON cell must be applied to '{}' (matching
+              // the single-cell updateCell path and both WasmDatabaseEngine json_patch sites).
+              sql = `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`;
             } else {
               // Standard set
               sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;

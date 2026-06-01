@@ -347,7 +347,13 @@ describe('createNativeDatabaseConnection', () => {
             }[];
 
             assert.strictEqual(batch.length, 2);
+            // COALESCE so a batch patch on a NULL JSON cell applies to '{}' instead of
+            // returning NULL — must match single-cell updateCell and both WASM json_patch sites.
             assert.strictEqual(
+                batch[0].sql,
+                `UPDATE "docs" SET "payload" = json_patch(COALESCE("payload", '{}'), ?) WHERE rowid = ?`
+            );
+            assert.notStrictEqual(
                 batch[0].sql,
                 `UPDATE "docs" SET "payload" = json_patch("payload", ?) WHERE rowid = ?`
             );
