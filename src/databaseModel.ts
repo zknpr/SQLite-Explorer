@@ -44,13 +44,16 @@ const CurrentExtension = vsc.extensions.getExtension(FullExtensionId);
 /** Running on local machine (not remote) */
 const IsLocalMode = !vsc.env.remoteName;
 
+/** Running inside the browser extension host used by VS Code for Web */
+const IsBrowserExtensionHost = !!import.meta.env?.VSCODE_BROWSER_EXT;
+
 /** Running on remote with workspace extension */
 export const IsRemoteWorkspaceMode =
   !!vsc.env.remoteName &&
   CurrentExtension?.extensionKind === vsc.ExtensionKind.Workspace;
 
 /** Editor supports read-write operations */
-export const SupportsWriteMode = IsLocalMode || IsRemoteWorkspaceMode;
+export const SupportsWriteMode = IsLocalMode || IsRemoteWorkspaceMode || IsBrowserExtensionHost;
 
 // ============================================================================
 // Configuration
@@ -321,8 +324,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * For WASM engine: we need to serialize the in-memory database and write to disk.
    */
   async save(cancellation?: vsc.CancellationToken): Promise<void> {
+    if (cancellation?.isCancellationRequested) {
+      throw new vsc.CancellationError();
+    }
     await this.ensureWritable();
-    await this.#modificationTracker.createCheckpoint();
 
     // Check if using native engine - changes are already on disk
     const engineKind = await this.databaseOperations.engineKind;
@@ -336,14 +341,34 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         // Log at debug level for troubleshooting if needed
         GlobalOutputChannel?.appendLine(`[WAL checkpoint skipped] ${err instanceof Error ? err.message : String(err)}`);
       }
+      await this.#modificationTracker.createCheckpoint();
       return;
+    }
+
+    // The WASM serialize + filesystem write can be slow for large databases or
+    // remote web filesystems; re-check cancellation before starting that work.
+    if (cancellation?.isCancellationRequested) {
+      throw new vsc.CancellationError();
     }
 
     // Export in-memory database to file (WASM engine only)
     // We always do this for WASM, regardless of auto-commit setting, because WASM is in-memory.
     if (this.uri.scheme === 'file') {
         try {
+            // Capture the tracker position that matches the database snapshot
+            // exported by writeToFile(). If undo, rollback, or history eviction
+            // changes the retained timeline while the async filesystem write is
+            // pending, the saved bytes no longer match the live tracker state.
+            const fileCheckpoint = this.#modificationTracker.getCurrentPosition();
+            const fileCheckpointInvalidationRevision =
+              this.#modificationTracker.getCheckpointInvalidationRevision();
             await this.databaseOperations.writeToFile(this.uri.fsPath);
+            if (
+              this.#modificationTracker.getCheckpointInvalidationRevision() ===
+              fileCheckpointInvalidationRevision
+            ) {
+              this.#modificationTracker.createCheckpointAt(fileCheckpoint);
+            }
             return;
         } catch (e) {
             // Fallback if direct write fails
@@ -353,7 +378,34 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
     const { filename } = this.fileParts;
     const binaryContent = await this.databaseOperations.serializeDatabase(filename);
-    await vsc.workspace.fs.writeFile(this.uri, binaryContent);
+    // Capture the tracker position immediately after serialization. The bytes
+    // below represent edits up to this position only; edits recorded while the
+    // asynchronous workspace write is pending must remain dirty.
+    const serializedCheckpoint = this.#modificationTracker.getCurrentPosition();
+    const serializedCheckpointInvalidationRevision =
+      this.#modificationTracker.getCheckpointInvalidationRevision();
+    try {
+      await vsc.workspace.fs.writeFile(this.uri, binaryContent);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to save database: ${message}`);
+    }
+    // Only mark the tracker clean after bytes are persisted. If a web filesystem
+    // rejects writeFile, the edit history remains uncommitted for backup/retry.
+    // The saved checkpoint is limited to the serialized snapshot so concurrent
+    // edits are not acknowledged before their bytes reach storage.
+    //
+    // If undo/rollback/eviction changed the retained timeline while writeFile
+    // was pending, the serialized bytes no longer match the live in-memory
+    // state. In that case leave the document dirty so the next save serializes
+    // the current state instead of clamping the checkpoint onto a shorter
+    // timeline.
+    if (
+      this.#modificationTracker.getCheckpointInvalidationRevision() ===
+      serializedCheckpointInvalidationRevision
+    ) {
+      this.#modificationTracker.createCheckpointAt(serializedCheckpoint);
+    }
   }
 
   /**

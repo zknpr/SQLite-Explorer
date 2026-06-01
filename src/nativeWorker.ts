@@ -613,91 +613,64 @@ export async function createNativeDatabaseConnection(
          * Redo a modification by re-executing the original change.
          */
         redoModification: async (mod: ModificationEntry) => {
-          const { modificationType, targetTable, targetRowId, targetColumn, newValue, affectedCells, affectedRowIds, rowData, tableDef, columnDef, deletedColumns } = mod;
+          const { modificationType, targetTable, targetRowId, targetColumn, newValue, operation, affectedCells, affectedRowIds, rowData, tableDef, columnDef, deletedColumns, droppedIndexes } = mod;
           if (!targetTable) return;
+
+          // Keep this non-strict forward replay switch paired with
+          // WasmDatabaseEngine.forwardApply(..., false) so ModificationEntry
+          // fields keep one interpretation across desktop and web redo.
+          const normalizeReplayCellOperation = (replayOperation: unknown): 'set' | 'json_patch' => {
+            return replayOperation === 'json_patch' ? 'json_patch' : 'set';
+          };
 
           switch (modificationType) {
             case 'cell_update':
               if (affectedCells) {
-                const updates = affectedCells.map(c => ({
-                    rowId: c.rowId,
-                    column: c.columnName,
-                    value: c.newValue
-                } as CellUpdate));
-                await worker.call('execBatch', [
-                    updates.map(u => ({
-                        sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(u.column)} = ? WHERE rowid = ?`,
-                        params: [u.value, Number(u.rowId)]
-                    }))
-                ]);
+                await operationsFacade.updateCellBatch(targetTable, affectedCells.map(c => ({
+                  rowId: c.rowId,
+                  column: c.columnName,
+                  value: c.newValue ?? null,
+                  operation: normalizeReplayCellOperation(c.operation)
+                })));
               } else if (targetRowId !== undefined && targetColumn) {
-                const rowIdNum = Number(targetRowId);
-                const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(targetColumn)} = ? WHERE rowid = ?`;
-                await worker.call('run', [sql, [newValue, rowIdNum]]);
+                const replayOperation = normalizeReplayCellOperation(operation);
+                if (replayOperation === 'json_patch') {
+                  const patch = typeof newValue === 'string' ? newValue : JSON.stringify(newValue ?? null);
+                  await operationsFacade.updateCell(targetTable, targetRowId, targetColumn, null, patch);
+                } else {
+                  await operationsFacade.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
+                }
               }
               break;
 
             case 'row_insert':
               if (rowData) {
                 const dataToInsert = targetRowId !== undefined ? { ...rowData, rowid: targetRowId } : rowData;
-                const columns = Object.keys(dataToInsert);
-                const colNames = columns.map(escapeIdentifier).join(', ');
-                const placeholders = columns.map(() => '?').join(', ');
-                const params = columns.map(c => dataToInsert[c]);
-                await worker.call('run', [`INSERT INTO ${escapeIdentifier(targetTable)} (${colNames}) VALUES (${placeholders})`, params]);
+                await operationsFacade.insertRow(targetTable, dataToInsert);
               }
               break;
 
             case 'row_delete':
-              if (affectedRowIds && affectedRowIds.length > 0) {
-                const ids = affectedRowIds.map(id => Number(id));
-                const placeholders = ids.map(() => '?').join(', ');
-                await worker.call('run', [`DELETE FROM ${escapeIdentifier(targetTable)} WHERE rowid IN (${placeholders})`, ids]);
+              if (affectedRowIds) {
+                await operationsFacade.deleteRows(targetTable, affectedRowIds);
               }
               break;
 
             case 'column_add':
               if (targetColumn && columnDef) {
-                 validateSqlType(columnDef.type);
-                 let sql = `ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(targetColumn)} ${columnDef.type}`;
-                 if (columnDef.defaultValue !== undefined && columnDef.defaultValue !== null && columnDef.defaultValue !== '') {
-                    // Strict numeric validation for default values
-                    if (columnDef.defaultValue.toLowerCase() === 'null') {
-                        sql += ' DEFAULT NULL';
-                    } else if (/^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(columnDef.defaultValue)) {
-                        // Strict numeric pattern: optional sign, digits with optional decimal, optional exponent
-                        sql += ` DEFAULT ${columnDef.defaultValue}`;
-                    } else {
-                        sql += ` DEFAULT '${columnDef.defaultValue.replace(/'/g, "''")}'`;
-                    }
-                 }
-                 await worker.call('run', [sql]);
+                await operationsFacade.addColumn(targetTable, targetColumn, columnDef.type, columnDef.defaultValue);
               }
               break;
 
             case 'column_drop':
               if (deletedColumns) {
-                  const batch = [];
-                  for (const col of deletedColumns) {
-                      batch.push({ sql: `ALTER TABLE ${escapeIdentifier(targetTable)} DROP COLUMN ${escapeIdentifier(col.name)}` });
-                  }
-                  if (batch.length > 0) {
-                      await worker.call('execBatch', [batch]);
-                  }
+                await operationsFacade.deleteColumns(targetTable, deletedColumns.map(c => c.name), droppedIndexes ?? undefined);
               }
               break;
 
             case 'table_create':
               if (tableDef && tableDef.columns) {
-                  // Re-use createTable logic
-                  const colDefs = tableDef.columns.map(col => {
-                    validateSqlType(col.type);
-                    let def = `${escapeIdentifier(col.name)} ${col.type}`;
-                    if (col.primaryKey) def += ' PRIMARY KEY';
-                    if (col.notNull && !col.primaryKey) def += ' NOT NULL';
-                    return def;
-                  });
-                  await worker.call('run', [`CREATE TABLE ${escapeIdentifier(targetTable)} (${colDefs.join(', ')})`]);
+                await operationsFacade.createTable(targetTable, tableDef.columns);
               }
               break;
           }
@@ -1137,8 +1110,10 @@ export async function createNativeDatabaseConnection(
             let sql: string;
 
             if (op === 'json_patch') {
-              // json_patch(col, patch)
-              sql = `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(${escapedColumn}, ?) WHERE rowid = ?`;
+              // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL per SQL
+              // semantics, but a patch on a NULL JSON cell must be applied to '{}' (matching
+              // the single-cell updateCell path and both WasmDatabaseEngine json_patch sites).
+              sql = `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`;
             } else {
               // Standard set
               sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;

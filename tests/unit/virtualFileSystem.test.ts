@@ -226,6 +226,28 @@ describe('SQLiteFileSystemProvider', () => {
             }, (err: any) => err.message.includes('Database write error'));
         });
 
+        it('should reject read-only documents before updating a cell', async () => {
+            const dbOps = {
+                updateCell: mock.fn(async () => {})
+            };
+            setupMockDocument(docKey, dbOps);
+            const document = DocumentRegistry.get(docKey) as any;
+            Object.defineProperty(document, 'isReadOnlyMode', {
+                value: true,
+                configurable: true
+            });
+
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/col.txt`);
+            const content = new TextEncoder().encode('blocked write');
+
+            // Read-only database documents are immutable from the cell editor,
+            // so writeFile must stop before decoding content or mutating SQLite.
+            await assert.rejects(async () => {
+                await provider.writeFile(uri, content, { create: false, overwrite: true });
+            }, (err: any) => err.message.includes('Database is read-only'));
+            assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+        });
+
         it('should write text content correctly', async () => {
             const dbOps = {
                 updateCell: mock.fn(async () => {})

@@ -2,7 +2,12 @@ import './vscode_mock_setup';
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
+import path from 'node:path';
+import fs from 'node:fs';
+import Module from 'node:module';
+import esbuild from 'esbuild';
 import { mockVscode } from './mocks/vscode';
+import { HostBridge } from '../../src/hostBridge';
 
 // SupportsWriteMode in databaseModel.ts is evaluated at module-load time from
 // `vsc.env.remoteName` and `CurrentExtension?.extensionKind`. Set both so the
@@ -34,6 +39,47 @@ moduleCache[workerFactoryPath] = {
 
 const editorControllerModule = require('../../src/editorController');
 const { registerEditorProvider, DatabaseViewerProvider, DatabaseEditorProvider } = editorControllerModule;
+
+const editorControllerPath = path.resolve(__dirname, '../../src/editorController.ts');
+const editorControllerSource = fs.readFileSync(editorControllerPath, 'utf8');
+
+function loadBrowserEditorController(supportsWriteMode = true) {
+    const jsCode = esbuild.transformSync(editorControllerSource, {
+        loader: 'ts',
+        format: 'cjs',
+        define: {
+            'import.meta.env.VSCODE_BROWSER_EXT': 'true'
+        }
+    }).code;
+
+    const scriptModule = new Module(editorControllerPath, module as unknown as Module);
+    scriptModule.filename = editorControllerPath;
+    scriptModule.paths = (Module as unknown as { _nodeModulePaths(dirname: string): string[] })
+        ._nodeModulePaths(path.dirname(editorControllerPath));
+
+    const originalRequire = Module.prototype.require;
+    Module.prototype.require = function(request: string) {
+        if (request === 'vscode') return mockVscode;
+        if (request.endsWith('databaseModel')) {
+            return {
+                SupportsWriteMode: supportsWriteMode,
+                IsRemoteWorkspaceMode: false,
+                DatabaseDocument: class DatabaseDocument {},
+                isAutoCommitEnabled: () => false
+            };
+        }
+        return originalRequire.call(this, request);
+    };
+
+    try {
+        (scriptModule as unknown as { _compile(code: string, filename: string): void })
+            ._compile(jsCode, editorControllerPath);
+    } finally {
+        Module.prototype.require = originalRequire;
+    }
+
+    return scriptModule.exports as typeof import('../../src/editorController');
+}
 
 describe('registerEditorProvider', () => {
     type RegisterCall = { viewType: string; provider: unknown; options: unknown };
@@ -83,6 +129,26 @@ describe('registerEditorProvider', () => {
         assert.strictEqual(calls[0].viewType, 'sqlite-explorer.edit');
         // DatabaseEditorProvider extends DatabaseViewerProvider, so check the more specific type.
         assert.ok(calls[0].provider instanceof DatabaseEditorProvider);
+    });
+
+    it('registers the read-write provider in browser mode when write mode is supported', () => {
+        const {
+            registerEditorProvider: registerBrowserEditorProvider,
+            DatabaseEditorProvider: BrowserDatabaseEditorProvider
+        } = loadBrowserEditorController(true);
+
+        registerBrowserEditorProvider('sqlite-explorer.edit', ctx, undefined, null, {
+            verified: true,
+            readOnly: false
+        });
+
+        assert.strictEqual(calls.length, 1);
+        assert.ok(calls[0].provider instanceof BrowserDatabaseEditorProvider);
+
+        // HostBridge.isReadOnly now also reflects the document's connection-level
+        // read-only state, so the mock document must expose isReadOnlyMode.
+        const bridge = new HostBridge(calls[0].provider as any, { isReadOnlyMode: false } as any);
+        assert.strictEqual(bridge.isReadOnly, false);
     });
 
     it('passes retainContextWhenHidden=false in webview options', () => {

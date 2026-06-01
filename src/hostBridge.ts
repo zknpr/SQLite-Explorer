@@ -121,6 +121,7 @@ export class HostBridge implements ToastService {
     }
 
     const patch = this.tryGeneratePatch(value, originalValue);
+    const operation = patch ? 'json_patch' as const : 'set' as const;
 
     // Use specific method instead of generic exec
     // This allows the backend to handle safe SQL construction
@@ -139,7 +140,8 @@ export class HostBridge implements ToastService {
       targetTable: table,
       targetRowId: rowId,
       targetColumn: column,
-      newValue: value,
+      newValue: patch ?? value,
+      operation,
       priorValue: originalValue
     });
   }
@@ -342,7 +344,8 @@ export class HostBridge implements ToastService {
       description: `Delete columns ${columns.join(', ')} from ${table}`,
       modificationType: 'column_drop',
       targetTable: table,
-      deletedColumns: deletedColumnsData
+      deletedColumns: deletedColumnsData,
+      droppedIndexes: dependentIndexes.length > 0 ? dependentIndexes : undefined
     });
   }
 
@@ -429,11 +432,12 @@ export class HostBridge implements ToastService {
       description: `Update ${updates.length} cells in ${table}`,
       modificationType: 'cell_update',
       targetTable: table,
-      affectedCells: updates.map(u => ({
+      affectedCells: processedUpdates.map(u => ({
         rowId: u.rowId,
         columnName: u.column,
         newValue: u.value,
-        priorValue: u.originalValue
+        priorValue: u.originalValue,
+        operation: u.operation ?? 'set'
       }))
     });
   }
@@ -605,9 +609,16 @@ export class HostBridge implements ToastService {
 
   /**
    * Check if the document is read-only.
+   *
+   * Read-only when EITHER the editor provider is the read-only variant OR the
+   * specific connection opened read-only. The latter matters in VS Code for Web:
+   * a database with an active WAL opens read-only at the connection level even
+   * though the read-write DatabaseEditorProvider is registered, so the edit gate
+   * must honor the connection state too — otherwise the webview would allow edits
+   * that save()/revert() then reject, stranding the user with unsavable changes.
    */
   get isReadOnly() {
-    return this.viewerProvider.isReadOnly;
+    return this.viewerProvider.isReadOnly || this.document.isReadOnlyMode;
   }
 
   /**

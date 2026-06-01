@@ -21,7 +21,8 @@ import type {
   TableCountOptions,
   SchemaSnapshot,
   ColumnMetadata,
-  ColumnDefinition
+  ColumnDefinition,
+  ModificationEntry
 } from './types';
 import { getNodeFs } from './platform/fs';
 import {
@@ -174,8 +175,32 @@ export function createWorkerEndpoint() {
       return requireEngine().serializeDatabase(name);
     },
 
-    async updateCell(table: string, rowId: RecordId, column: string, value: CellValue): Promise<void> {
-      return requireEngine().updateCell(table, rowId, column, value);
+    // Expose undo/history operations for the browser in-process facade, which
+    // calls this endpoint directly instead of going through worker RPC.
+    async applyModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void> {
+      return requireEngine().applyModifications(mods, signal);
+    },
+
+    async undoModification(mod: ModificationEntry): Promise<void> {
+      return requireEngine().undoModification(mod);
+    },
+
+    async redoModification(mod: ModificationEntry): Promise<void> {
+      return requireEngine().redoModification(mod);
+    },
+
+    async flushChanges(signal?: AbortSignal): Promise<void> {
+      return requireEngine().flushChanges(signal);
+    },
+
+    async discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void> {
+      return requireEngine().discardModifications(mods, signal);
+    },
+
+    async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<void> {
+      // Forward the optional JSON merge patch so browser/in-process cell edits
+      // can update the current document instead of replacing it with stale data.
+      return requireEngine().updateCell(table, rowId, column, value, patch);
     },
 
     async insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined> {

@@ -136,6 +136,11 @@ export type ModificationType =
   | 'table_drop';
 
 /**
+ * How a cell value should be applied when replaying a cell update.
+ */
+export type CellUpdateOperation = 'set' | 'json_patch';
+
+/**
  * Record of a single database modification for undo/redo.
  */
 export interface ModificationEntry {
@@ -153,6 +158,8 @@ export interface ModificationEntry {
   priorValue?: CellValue;
   /** Value after modification */
   newValue?: CellValue;
+  /** Cell update operation; missing values from older backups are treated as set. */
+  operation?: CellUpdateOperation;
   /** Raw SQL executed */
   executedQuery?: string;
   /** Multiple affected rows */
@@ -163,6 +170,8 @@ export interface ModificationEntry {
     columnName: string;
     priorValue?: CellValue;
     newValue?: CellValue;
+    /** Per-cell operation; missing values from older backups are treated as set. */
+    operation?: CellUpdateOperation;
   }[];
   /** Row data for insert/delete undo/redo */
   rowData?: Record<string, CellValue>;
@@ -178,6 +187,8 @@ export interface ModificationEntry {
       type: string;
       data: { rowId: RecordId; value: CellValue }[];
   }[];
+  /** Indexes dropped before a column_drop; missing values from older backups mean none. */
+  droppedIndexes?: string[];
 }
 
 /**
@@ -280,7 +291,7 @@ export interface CellUpdate {
   column: string;
   value: CellValue;
   originalValue?: CellValue;
-  operation?: 'set' | 'json_patch';
+  operation?: CellUpdateOperation;
 }
 
 /**

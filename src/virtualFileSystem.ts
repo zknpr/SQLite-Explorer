@@ -107,6 +107,12 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             throw vsc.FileSystemError.NoPermissions('Cannot edit CREATE statement directly');
         }
 
+        if (document.isReadOnlyMode) {
+            // Read-only database documents may expose cell files for viewing, but
+            // writes must stop before decoding content or recording dirty edits.
+            throw vsc.FileSystemError.NoPermissions('Database is read-only');
+        }
+
         try {
             const rowIdNum = Number(rowId);
             if (isNaN(rowIdNum)) {

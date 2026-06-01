@@ -1,7 +1,53 @@
 import './vscode_mock_setup';
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
+import path from 'node:path';
+import fs from 'node:fs';
+import Module from 'node:module';
+import esbuild from 'esbuild';
 import { mockVscode } from './mocks/vscode';
+import { ModificationTracker } from '../../src/core/undo-history';
+import { createDatabaseEngine } from '../../src/core/sqlite-db';
+import type { DatabaseOperations, LabeledModification } from '../../src/core/types';
+
+const databaseModelPath = path.resolve(__dirname, '../../src/databaseModel.ts');
+const databaseModelSource = fs.readFileSync(databaseModelPath, 'utf8');
+
+function loadBrowserDatabaseModel() {
+    const jsCode = esbuild.transformSync(databaseModelSource, {
+        loader: 'ts',
+        format: 'cjs',
+        define: {
+            'import.meta.env.VSCODE_BROWSER_EXT': 'true'
+        }
+    }).code;
+
+    const scriptModule = new Module(databaseModelPath, module as unknown as Module);
+    scriptModule.filename = databaseModelPath;
+    scriptModule.paths = (Module as unknown as { _nodeModulePaths(dirname: string): string[] })
+        ._nodeModulePaths(path.dirname(databaseModelPath));
+
+    const originalRequire = Module.prototype.require;
+    Module.prototype.require = function(request: string) {
+        if (request === 'vscode') return mockVscode;
+        if (request.endsWith('workerFactory')) {
+            return { createDatabaseConnection: async () => ({}) };
+        }
+        if (request.endsWith('main')) {
+            return { GlobalOutputChannel: null };
+        }
+        return originalRequire.call(this, request);
+    };
+
+    try {
+        (scriptModule as unknown as { _compile(code: string, filename: string): void })
+            ._compile(jsCode, databaseModelPath);
+    } finally {
+        Module.prototype.require = originalRequire;
+    }
+
+    return scriptModule.exports as typeof import('../../src/databaseModel');
+}
 
 // Setup environment definitions that match VS Code ExtensionKind
 (mockVscode as any).ExtensionKind = { Workspace: 2, UI: 1 };
@@ -9,6 +55,51 @@ mockVscode.env.remoteName = 'remote';
 (mockVscode as any).extensions = {
     getExtension: () => ({ extensionKind: 2 })
 };
+
+describe('SupportsWriteMode', () => {
+    it('allows the browser extension host even when remoteName is set and the extension is UI-kind', () => {
+        const originalRemoteName = mockVscode.env.remoteName;
+        const originalExtensionKind = (mockVscode as any).ExtensionKind;
+        const originalExtensions = (mockVscode as any).extensions;
+
+        Object.defineProperty(mockVscode, 'ExtensionKind', {
+            value: { Workspace: 2, UI: 1 },
+            writable: true,
+            configurable: true
+        });
+        Object.defineProperty(mockVscode.env, 'remoteName', {
+            value: 'github',
+            writable: true,
+            configurable: true
+        });
+        Object.defineProperty(mockVscode, 'extensions', {
+            value: { getExtension: () => ({ extensionKind: 1 }) },
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            const { SupportsWriteMode } = loadBrowserDatabaseModel();
+            assert.strictEqual(SupportsWriteMode, true);
+        } finally {
+            Object.defineProperty(mockVscode, 'ExtensionKind', {
+                value: originalExtensionKind,
+                writable: true,
+                configurable: true
+            });
+            Object.defineProperty(mockVscode.env, 'remoteName', {
+                value: originalRemoteName,
+                writable: true,
+                configurable: true
+            });
+            Object.defineProperty(mockVscode, 'extensions', {
+                value: originalExtensions,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+});
 
 describe('isAutoCommitEnabled', () => {
     let originalGetConfiguration: any;
@@ -161,6 +252,21 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         DatabaseDocument = dbModel.DatabaseDocument;
     });
 
+    const createUri = (scheme: string, path: string) => {
+        const uri = {
+            scheme,
+            authority: '',
+            path: path,
+            query: '',
+            fragment: '',
+            fsPath: scheme === 'file' ? path : '',
+            with: (changes: { path?: string }) => createUri(scheme, changes.path ?? path),
+            toString: () => `${scheme}://${path}`,
+            toJSON: () => ({})
+        };
+        return uri;
+    };
+
     const createFileUri = (path: string) => {
         return {
             scheme: 'file',
@@ -174,7 +280,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         };
     };
 
-    const createDocBypassingFactory = (dbOps: any) => {
+    const createDocBypassingFactory = (dbOps: any, uri: any = createFileUri('/test/db.sqlite')) => {
         const mockViewerProvider = {
             reporter: {},
             isVerified: true,
@@ -182,11 +288,10 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             forceReadOnly: false,
             outputChannel: undefined
         };
-        const fileUri = createFileUri('/test/db.sqlite');
 
         return new (DatabaseDocument as any)(
             mockViewerProvider,
-            fileUri,
+            uri,
             null, // tracker
             false, // autoCommitEnabled
             { databaseOps: dbOps, isReadOnly: false },
@@ -195,6 +300,34 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             {} // reporter
         );
     };
+
+    it('save: throws CancellationError and writes nothing when the token is already cancelled', async () => {
+        let serializeCalled = false;
+        let writeToFileCalled = false;
+        const dbOps = {
+            engineKind: Promise.resolve('wasm'),
+            writeToFile: async () => { writeToFileCalled = true; },
+            serializeDatabase: async () => {
+                serializeCalled = true;
+                return new Uint8Array([1, 2, 3]);
+            }
+        };
+
+        const doc = createDocBypassingFactory(dbOps);
+
+        // A pre-cancelled token must abort save before any serialize/write work.
+        const cancelledToken = {
+            isCancellationRequested: true,
+            onCancellationRequested: () => ({ dispose() {} })
+        } as any;
+
+        await assert.rejects(
+            () => doc.save(cancelledToken),
+            (err: any) => err instanceof Error && err.name === 'Canceled'
+        );
+        assert.strictEqual(serializeCalled, false, 'serializeDatabase must not run when cancelled');
+        assert.strictEqual(writeToFileCalled, false, 'writeToFile must not run when cancelled');
+    });
 
     it('saveAs: falls back to buffer transfer when writeToFile fails for file URI', async () => {
         let serialized = false;
@@ -215,18 +348,22 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         let writeFileCalled = false;
 
         const originalFs = mockVscode.workspace.fs;
-        mockVscode.workspace.fs = {
-            ...originalFs,
-            stat: async () => {
-                statCalled = true;
-                return { size: 100 }; // Less than getFileSizeLimit()
-            },
-            writeFile: async (uri: any, content: any) => {
-                writeFileCalled = true;
-                assert.deepStrictEqual(content, new Uint8Array([1, 2, 3]));
-            },
-            readFile: async () => new Uint8Array([])
-        } as any;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                stat: async () => {
+                    statCalled = true;
+                    return { size: 100 }; // Less than getFileSizeLimit()
+                },
+                writeFile: async (uri: any, content: any) => {
+                    writeFileCalled = true;
+                    assert.deepStrictEqual(content, new Uint8Array([1, 2, 3]));
+                },
+                readFile: async () => new Uint8Array([])
+            } as any,
+            writable: true,
+            configurable: true
+        });
 
         const originalConsoleWarn = console.warn;
         let consoleWarnCalled = false;
@@ -246,7 +383,11 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             assert.strictEqual(serialized, true, 'serializeDatabase should be called');
             assert.strictEqual(writeFileCalled, true, 'fs.writeFile should be called');
         } finally {
-            mockVscode.workspace.fs = originalFs;
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
             console.warn = originalConsoleWarn;
         }
     });
@@ -267,17 +408,21 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         let writeFileCalled = false;
 
         const originalFs = mockVscode.workspace.fs;
-        mockVscode.workspace.fs = {
-            ...originalFs,
-            stat: async () => {
-                return { size: 100 };
-            },
-            writeFile: async (uri: any, content: any) => {
-                writeFileCalled = true;
-                assert.deepStrictEqual(content, new Uint8Array([1, 2, 3]));
-            },
-            readFile: async () => new Uint8Array([])
-        } as any;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                stat: async () => {
+                    return { size: 100 };
+                },
+                writeFile: async (uri: any, content: any) => {
+                    writeFileCalled = true;
+                    assert.deepStrictEqual(content, new Uint8Array([1, 2, 3]));
+                },
+                readFile: async () => new Uint8Array([])
+            } as any,
+            writable: true,
+            configurable: true
+        });
 
         const originalConsoleWarn = console.warn;
         let consoleWarnCalled = false;
@@ -296,8 +441,477 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             assert.strictEqual(serialized, true, 'serializeDatabase should be called');
             assert.strictEqual(writeFileCalled, true, 'fs.writeFile should be called');
         } finally {
-            mockVscode.workspace.fs = originalFs;
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
             console.warn = originalConsoleWarn;
+        }
+    });
+
+    it('save: serializes and writes WASM database content for non-file URI', async () => {
+        const sourceUri = createUri('vscode-vfs', '/github/user/repo/test.db');
+        let serializedName: string | undefined;
+        let writeFileCalled = false;
+
+        const dbOps = {
+            engineKind: Promise.resolve('wasm'),
+            writeToFile: async () => { throw new Error('writeToFile should not be called for non-file URIs'); },
+            serializeDatabase: async (name: string) => {
+                serializedName = name;
+                return new Uint8Array([4, 5, 6]);
+            }
+        };
+
+        const doc = createDocBypassingFactory(dbOps, sourceUri);
+
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (uri: any, content: any) => {
+                    writeFileCalled = true;
+                    assert.strictEqual(uri, sourceUri);
+                    assert.deepStrictEqual(content, new Uint8Array([4, 5, 6]));
+                },
+                readFile: async () => new Uint8Array([])
+            } as any,
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            await doc.save();
+
+            assert.strictEqual(serializedName, 'test.db');
+            assert.strictEqual(writeFileCalled, true, 'fs.writeFile should be called');
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+
+    it('save: keeps failed non-file WASM writes uncommitted for backup and retry', async () => {
+        const sourceUri = createUri('vscode-vfs', '/github/user/repo/test.db');
+        let backupContent: Uint8Array | undefined;
+
+        const dbOps = {
+            engineKind: Promise.resolve('wasm'),
+            serializeDatabase: async () => new Uint8Array([7, 8, 9])
+        };
+
+        const doc = createDocBypassingFactory(dbOps, sourceUri);
+        doc.recordModification({
+            label: 'Update Cell',
+            description: 'Update items.name',
+            modificationType: 'cell_update',
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'name',
+            newValue: 'after',
+            priorValue: 'before'
+        });
+
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (uri: any, content: any) => {
+                    if (uri.toString() === sourceUri.toString()) {
+                        throw new Error('NoPermissions: read-only filesystem');
+                    }
+                    backupContent = content;
+                },
+                readFile: async () => new Uint8Array([])
+            } as any,
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            await assert.rejects(
+                () => doc.save(),
+                /NoPermissions: read-only filesystem/
+            );
+
+            await doc.backup(createUri('vscode-userdata', '/backups/test.db'), undefined);
+
+            assert.ok(backupContent, 'backup should be written after failed save');
+            const restored = ModificationTracker.deserialize(backupContent);
+            const uncommitted = restored.getUncommittedEntries();
+            assert.strictEqual(uncommitted.length, 1);
+            assert.strictEqual(uncommitted[0].label, 'Update Cell');
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+
+    it('save: does not checkpoint edits recorded while writeFile is still pending', async () => {
+        const sourceUri = createUri('vscode-vfs', '/github/user/repo/test.db');
+        let resolveWrite: () => void = () => {};
+        let markWriteStarted: () => void = () => {};
+        const writeMayFinish = new Promise<void>(resolve => {
+            resolveWrite = resolve;
+        });
+        const writeStarted = new Promise<void>(resolve => {
+            markWriteStarted = resolve;
+        });
+
+        const firstModification = {
+            label: 'First Update',
+            description: 'Update first item',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'name',
+            priorValue: 'before',
+            newValue: 'after'
+        };
+        const concurrentModification = {
+            label: 'Concurrent Update',
+            description: 'Update concurrent item',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 2,
+            targetColumn: 'name',
+            priorValue: 'old',
+            newValue: 'new'
+        };
+        let discardedModifications: unknown[] | undefined;
+
+        const dbOps = {
+            engineKind: Promise.resolve('wasm'),
+            serializeDatabase: async () => new Uint8Array([7, 8, 9]),
+            discardModifications: async (mods: unknown[]) => {
+                discardedModifications = mods;
+            }
+        };
+
+        const doc = createDocBypassingFactory(dbOps, sourceUri);
+        doc.recordModification(firstModification);
+
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (uri: any, content: any) => {
+                    assert.strictEqual(uri, sourceUri);
+                    assert.deepStrictEqual(content, new Uint8Array([7, 8, 9]));
+                    markWriteStarted();
+                    await writeMayFinish;
+                },
+                readFile: async () => new Uint8Array([])
+            } as any,
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            const savePromise = doc.save();
+            await writeStarted;
+
+            doc.recordModification(concurrentModification);
+            resolveWrite();
+            await savePromise;
+
+            await doc.revert(undefined);
+
+            assert.deepStrictEqual(discardedModifications, [concurrentModification]);
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+
+    it('save: stays dirty when undo shrinks the timeline while writeFile is still pending', async () => {
+        const sourceUri = createUri('vscode-vfs', '/github/user/repo/test.db');
+        let resolveWrite: () => void = () => {};
+        let markWriteStarted: () => void = () => {};
+        const writeMayFinish = new Promise<void>(resolve => {
+            resolveWrite = resolve;
+        });
+        const writeStarted = new Promise<void>(resolve => {
+            markWriteStarted = resolve;
+        });
+
+        const firstModification = {
+            label: 'First Update',
+            description: 'Update first item',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'name',
+            priorValue: 'before-a',
+            newValue: 'after-a'
+        };
+        const undoneModification = {
+            label: 'Second Update',
+            description: 'Update second item',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 2,
+            targetColumn: 'name',
+            priorValue: 'before-b',
+            newValue: 'after-b'
+        };
+        let undoSecondUpdate: (() => Promise<void>) | undefined;
+        let discardedModifications: unknown[] | undefined;
+
+        const dbOps = {
+            engineKind: Promise.resolve('wasm'),
+            serializeDatabase: async () => new Uint8Array([10, 11, 12]),
+            undoModification: async (modification: unknown) => {
+                assert.strictEqual(modification, undoneModification);
+            },
+            discardModifications: async (mods: unknown[]) => {
+                discardedModifications = mods;
+            }
+        };
+
+        const doc = createDocBypassingFactory(dbOps, sourceUri);
+        doc.recordModification(firstModification);
+        doc.onDidChange((modification: any) => {
+            if (modification.label === 'Second Update') {
+                undoSecondUpdate = modification.undo;
+            }
+        });
+        doc.recordModification(undoneModification);
+        assert.ok(undoSecondUpdate, 'second update undo action should be emitted');
+
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (uri: any, content: any) => {
+                    assert.strictEqual(uri, sourceUri);
+                    assert.deepStrictEqual(content, new Uint8Array([10, 11, 12]));
+                    markWriteStarted();
+                    await writeMayFinish;
+                },
+                readFile: async () => new Uint8Array([])
+            } as any,
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            const savePromise = doc.save();
+            await writeStarted;
+
+            await undoSecondUpdate!();
+            resolveWrite();
+            await savePromise;
+
+            await doc.revert(undefined);
+
+            assert.deepStrictEqual(discardedModifications, [firstModification]);
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+
+    it('save: stays dirty when undo shrinks the timeline while file writeToFile is still pending', async () => {
+        const sourceUri = createFileUri('/test/db.sqlite');
+        let resolveWrite: () => void = () => {};
+        let markWriteStarted: () => void = () => {};
+        const writeMayFinish = new Promise<void>(resolve => {
+            resolveWrite = resolve;
+        });
+        const writeStarted = new Promise<void>(resolve => {
+            markWriteStarted = resolve;
+        });
+
+        const firstModification = {
+            label: 'First File Update',
+            description: 'Update first file item',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'name',
+            priorValue: 'before-a',
+            newValue: 'after-a'
+        };
+        const undoneModification = {
+            label: 'Second File Update',
+            description: 'Update second file item',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 2,
+            targetColumn: 'name',
+            priorValue: 'before-b',
+            newValue: 'after-b'
+        };
+        let undoSecondUpdate: (() => Promise<void>) | undefined;
+        let discardedModifications: unknown[] | undefined;
+
+        const dbOps = {
+            engineKind: Promise.resolve('wasm'),
+            writeToFile: async (filePath: string) => {
+                assert.strictEqual(filePath, '/test/db.sqlite');
+                markWriteStarted();
+                await writeMayFinish;
+            },
+            serializeDatabase: async () => {
+                throw new Error('serializeDatabase should not be called when file writeToFile succeeds');
+            },
+            undoModification: async (modification: unknown) => {
+                assert.strictEqual(modification, undoneModification);
+            },
+            discardModifications: async (mods: unknown[]) => {
+                discardedModifications = mods;
+            }
+        };
+
+        const doc = createDocBypassingFactory(dbOps, sourceUri);
+        doc.recordModification(firstModification);
+        doc.onDidChange((modification: any) => {
+            if (modification.label === 'Second File Update') {
+                undoSecondUpdate = modification.undo;
+            }
+        });
+        doc.recordModification(undoneModification);
+        assert.ok(undoSecondUpdate, 'second update undo action should be emitted');
+
+        const savePromise = doc.save();
+        await writeStarted;
+
+        await undoSecondUpdate!();
+        resolveWrite();
+        await savePromise;
+
+        await doc.revert(undefined);
+
+        assert.deepStrictEqual(discardedModifications, [firstModification]);
+    });
+});
+
+describe('DatabaseDocument hot-exit restore', () => {
+    it('replays backup modifications into the restored WASM database', async () => {
+        const result = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const engine = result.operations as DatabaseOperations & { shutdown?: () => void };
+        await engine.executeQuery("CREATE TABLE restored_items (id INTEGER PRIMARY KEY, name TEXT)");
+
+        const restoredEntries: LabeledModification[] = [
+            {
+                label: 'Insert Restored Item',
+                description: 'Insert restored item',
+                modificationType: 'row_insert',
+                targetTable: 'restored_items',
+                targetRowId: 1,
+                rowData: { id: 1, name: 'Draft' }
+            },
+            {
+                label: 'Update Restored Item',
+                description: 'Update restored item',
+                modificationType: 'cell_update',
+                targetTable: 'restored_items',
+                targetRowId: 1,
+                targetColumn: 'name',
+                priorValue: 'Draft',
+                newValue: 'Recovered'
+            }
+        ];
+        const tracker = new ModificationTracker<LabeledModification>(100);
+        for (const entry of restoredEntries) {
+            tracker.record(entry);
+        }
+
+        const backupData = tracker.serialize();
+        let applyWasCalled = false;
+        let appliedModificationCount = 0;
+        const originalApplyModifications = engine.applyModifications.bind(engine);
+        engine.applyModifications = async (mods, signal) => {
+            applyWasCalled = true;
+            appliedModificationCount = mods.length;
+            return originalApplyModifications(mods, signal);
+        };
+
+        const originalFs = mockVscode.workspace.fs;
+        const moduleCache = require('module')._cache;
+        const workerFactoryPath = require.resolve('../../src/workerFactory');
+        const originalWorkerFactoryCacheEntry = moduleCache[workerFactoryPath];
+        const databaseModelModulePath = require.resolve('../../src/databaseModel');
+
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                readFile: async () => backupData
+            } as any,
+            writable: true,
+            configurable: true
+        });
+
+        moduleCache[workerFactoryPath] = {
+            id: workerFactoryPath,
+            filename: workerFactoryPath,
+            loaded: true,
+            exports: {
+                createDatabaseConnection: async () => ({
+                    establishConnection: async () => ({
+                        databaseOps: engine,
+                        isReadOnly: false
+                    }),
+                    workerMethods: {
+                        [Symbol.dispose]: () => engine.shutdown?.()
+                    }
+                })
+            }
+        };
+        delete moduleCache[databaseModelModulePath];
+
+        try {
+            const { DatabaseDocument } = require('../../src/databaseModel');
+            await DatabaseDocument.create(
+                {
+                    reporter: undefined,
+                    isVerified: true,
+                    context: { extensionUri: mockVscode.Uri.file('/ext') },
+                    forceReadOnly: false,
+                    outputChannel: undefined
+                },
+                mockVscode.Uri.file('/test/restored.db'),
+                { backupId: 'vscode-userdata:///backup/restored.db' }
+            );
+
+            const restoredRows = await engine.executeQuery(
+                "SELECT id, name FROM restored_items ORDER BY id"
+            );
+
+            assert.strictEqual(applyWasCalled, true);
+            assert.strictEqual(appliedModificationCount, 2);
+            assert.deepStrictEqual(restoredRows[0].rows, [[1, 'Recovered']]);
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+            if (originalWorkerFactoryCacheEntry) {
+                moduleCache[workerFactoryPath] = originalWorkerFactoryCacheEntry;
+            } else {
+                delete moduleCache[workerFactoryPath];
+            }
+            delete moduleCache[databaseModelModulePath];
+            engine.shutdown?.();
         }
     });
 });

@@ -148,6 +148,53 @@ describe('HostBridge', () => {
         assert.strictEqual(dbOps.deleteRows.mock.callCount(), 1);
     });
 
+    it('treats connection-level read-only documents as read-only for web mutators', async () => {
+        const dbOps = {
+            updateCell: mock.fn(async () => {}),
+            insertRow: mock.fn(async () => 1),
+            deleteRows: mock.fn(async () => {}),
+            updateCellBatch: mock.fn(async () => {}),
+            executeQuery: mock.fn(async () => [])
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: true,
+            recordExternalModification: mock.fn()
+        };
+        const mockProvider = {
+            webviews: new Map(),
+            context: {},
+            isReadOnly: false
+        };
+        const bridge = new HostBridge(mockProvider as any, mockDocument as any);
+
+        assert.strictEqual(bridge.isReadOnly, true);
+        await assert.rejects(
+            () => bridge.updateCell('table1', 1, 'name', 'after', 'before'),
+            /Document is read-only/
+        );
+        await assert.rejects(
+            () => bridge.insertRow('table1', { name: 'new' }),
+            /Document is read-only/
+        );
+        await assert.rejects(
+            () => bridge.deleteRows('table1', [1]),
+            /Document is read-only/
+        );
+        await assert.rejects(
+            () => bridge.updateCellBatch('table1', [{ rowId: 1, column: 'name', value: 'after' }], 'Batch update'),
+            /Document is read-only/
+        );
+
+        assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+        assert.strictEqual(dbOps.insertRow.mock.callCount(), 0);
+        assert.strictEqual(dbOps.deleteRows.mock.callCount(), 0);
+        assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 0);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
     it('should catch and log error if fetch columns for undo history fails in deleteColumns', async () => {
         const consoleWarnMock = mock.method(console, 'warn', () => {});
         const error = new Error('Database disconnected during column info fetch');

@@ -73,6 +73,12 @@ export const mockVscode = {
         NoPermissions: (msg?: string) => new Error(msg || 'NoPermissions'),
         Unavailable: (msg: string) => new Error(msg || 'Unavailable')
     },
+    CancellationError: class CancellationError extends Error {
+        constructor() {
+            super('Canceled');
+            this.name = 'Canceled';
+        }
+    },
     FileChangeType: {
         Changed: 1,
         Created: 2,

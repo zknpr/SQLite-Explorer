@@ -98,6 +98,39 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /**
+   * Build a quoted SAVEPOINT name that is unique enough for nested engine work.
+   */
+  private createSavepointName(prefix: string): string {
+    return escapeIdentifier(`${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+  }
+
+  /**
+   * Roll back and release a SAVEPOINT without masking the original failure.
+   */
+  private async safeRollbackSavepoint(savepointName: string, context: string): Promise<void> {
+    try {
+      await this.executeQuery(`ROLLBACK TO ${savepointName}`);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+    } catch (rollbackErr) {
+      console.warn(`Failed to rollback savepoint (${context}):`, rollbackErr);
+    }
+  }
+
+  /**
+   * Normalize serialized cell replay operations for old and malformed history.
+   */
+  private normalizeReplayCellOperation(
+    operation: unknown,
+    strict: boolean,
+    context: string
+  ): 'set' | 'json_patch' {
+    if (operation === undefined || operation === null) return 'set';
+    if (operation === 'set' || operation === 'json_patch') return operation;
+    if (strict) throw new Error(`Cannot apply ${context}: unsupported cell operation ${String(operation)}`);
+    return 'set';
+  }
+
+  /**
    * Execute a SQL query and return structured results.
    *
    * Returns results in sql.js compatible format for webview compatibility.
@@ -183,13 +216,35 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
   /**
    * Apply a batch of modifications.
-   * Currently no-op as modifications are applied via executeQuery.
+   *
+   * Hot-exit restore opens the last saved database bytes first, then replays
+   * the serialized uncommitted edit entries into that fresh in-memory database.
+   * Each entry is applied through the same forward path used by redo so restore
+   * and redo cannot drift apart.
    */
   async applyModifications(
-    _mods: ModificationEntry[],
-    _signal?: AbortSignal
+    mods: ModificationEntry[],
+    signal?: AbortSignal
   ): Promise<void> {
-    // Modifications applied directly through executeQuery
+    signal?.throwIfAborted();
+    if (mods.length === 0) return;
+
+    const savepointName = this.createSavepointName('sp_apply_modifications');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      for (const mod of mods) {
+        // Check cancellation at the replay boundary so an aborted restore stops
+        // before the next modification starts mutating the in-memory database.
+        signal?.throwIfAborted();
+        await this.forwardApply(mod, true);
+        signal?.throwIfAborted();
+      }
+      signal?.throwIfAborted();
+      await this.executeQuery(`RELEASE ${savepointName}`);
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'applyModifications');
+      throw err;
+    }
   }
 
   /**
@@ -331,67 +386,112 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /**
-   * Redo a modification.
+   * Apply one modification in the forward direction.
+   *
+   * `strict` is enabled for hot-exit restore so malformed or unsupported
+   * entries fail loudly instead of silently dropping recovered edits. Redo uses
+   * the historical non-strict behavior so existing undo/redo semantics are not
+   * changed for entries that lack enough data to replay.
+   *
+   * Keep the non-strict redo shape paired with nativeWorker.redoModification so
+   * ModificationEntry fields keep one interpretation across web and desktop.
    */
-  async redoModification(mod: ModificationEntry): Promise<void> {
-    const { modificationType, targetTable, targetRowId, targetColumn, newValue, affectedCells, affectedRowIds, rowData, tableDef, columnDef, deletedColumns } = mod;
-    if (!targetTable) return;
+  private async forwardApply(mod: ModificationEntry, strict: boolean): Promise<void> {
+    const { modificationType, targetTable, targetRowId, targetColumn, newValue, operation, affectedCells, affectedRowIds, rowData, tableDef, columnDef, deletedColumns, droppedIndexes } = mod;
+    if (!targetTable) {
+      if (strict) throw new Error(`Cannot apply ${modificationType}: missing target table`);
+      return;
+    }
 
     switch (modificationType) {
         case 'cell_update':
             if (affectedCells) {
-                // Batch redo
+                // Batch cell updates preserve the original per-cell order and values.
                 const updates = affectedCells.map(cell => ({
                     rowId: cell.rowId,
                     column: cell.columnName,
-                    value: cell.newValue ?? null
+                    value: cell.newValue ?? null,
+                    operation: this.normalizeReplayCellOperation(cell.operation, strict, 'cell_update')
                 }));
                 await this.updateCellBatch(targetTable, updates);
             } else if (targetRowId !== undefined && targetColumn) {
-                await this.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
+                const replayOperation = this.normalizeReplayCellOperation(operation, strict, 'cell_update');
+                if (replayOperation === 'json_patch') {
+                    const patch = typeof newValue === 'string' ? newValue : JSON.stringify(newValue ?? null);
+                    await this.updateCell(targetTable, targetRowId, targetColumn, null, patch);
+                } else {
+                    await this.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
+                }
+            } else if (strict) {
+                throw new Error('Cannot apply cell_update: missing target cell or affected cells');
             }
             break;
 
         case 'row_insert':
-            // Redo insert = insert again
             if (rowData) {
-                // If we have the original rowId, enforce it to maintain history consistency
+                // If the history captured a rowid, include it so restored rows
+                // keep the same identity they had before shutdown.
                 const dataToInsert = targetRowId !== undefined
                     ? { ...rowData, rowid: targetRowId }
                     : rowData;
                 await this.insertRow(targetTable, dataToInsert);
+            } else if (strict) {
+                throw new Error('Cannot apply row_insert: missing row data');
             }
             break;
 
         case 'row_delete':
-            // Redo delete = delete rows
             if (affectedRowIds) {
                 await this.deleteRows(targetTable, affectedRowIds);
+            } else if (strict) {
+                throw new Error('Cannot apply row_delete: missing affected row ids');
             }
             break;
 
         case 'column_add':
-            // Redo add column = add column
             if (targetColumn && columnDef) {
                 await this.addColumn(targetTable, targetColumn, columnDef.type, columnDef.defaultValue);
+            } else if (strict) {
+                throw new Error('Cannot apply column_add: missing column definition');
             }
             break;
 
         case 'column_drop':
-            // Redo drop column = drop column
             if (deletedColumns) {
                 const colNames = deletedColumns.map(c => c.name);
-                await this.deleteColumns(targetTable, colNames);
+                await this.deleteColumns(targetTable, colNames, droppedIndexes ?? undefined);
+            } else if (strict) {
+                throw new Error('Cannot apply column_drop: missing deleted column data');
             }
             break;
 
         case 'table_create':
-            // Redo create table
             if (tableDef && tableDef.columns) {
                 await this.createTable(targetTable, tableDef.columns);
+            } else if (strict) {
+                throw new Error('Cannot apply table_create: missing table definition');
+            }
+            break;
+
+        case 'table_drop':
+            if (strict) {
+                throw new Error('Cannot apply table_drop: forward replay is not supported');
+            }
+            break;
+
+        default:
+            if (strict) {
+                throw new Error(`Cannot apply unsupported modification type: ${String(modificationType)}`);
             }
             break;
     }
+  }
+
+  /**
+   * Redo a modification.
+   */
+  async redoModification(mod: ModificationEntry): Promise<void> {
+    await this.forwardApply(mod, false);
   }
 
   /**
@@ -622,9 +722,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
     const escapedTable = escapeIdentifier(table);
 
-    // Now drop the columns within a single transaction for better performance
-    // This avoids N+1 query transaction overhead for multiple columns
-    await this.executeQuery('BEGIN TRANSACTION');
+    // Use a SAVEPOINT so column drops remain atomic on their own and can also
+    // participate in the outer hot-exit restore transaction.
+    const savepointName = this.createSavepointName('sp_delete_columns');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       // Drop specified dependent indexes first inside the transaction
       if (dropDependentIndexes && dropDependentIndexes.length > 0) {
@@ -638,9 +739,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         .map((col) => `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)};`)
         .join('\n');
       await this.executeQuery(dropColumnStatements);
-      await this.executeQuery('COMMIT');
+      await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (e) {
-      await this.safeRollback('deleteColumns');
+      await this.safeRollbackSavepoint(savepointName, 'deleteColumns');
       throw e;
     }
   }

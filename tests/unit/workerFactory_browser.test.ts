@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import Module from 'node:module';
 import esbuild from 'esbuild';
 import { mockVscode } from './mocks/vscode';
-import type { CellUpdate, CellValue, DatabaseInitConfig } from '../../src/core/types';
+import type { CellUpdate, CellValue, DatabaseInitConfig, ModificationEntry } from '../../src/core/types';
 
 const workerFactoryPath = path.resolve(__dirname, '../../src/workerFactory.ts');
 const workerFactorySource = fs.readFileSync(workerFactoryPath, 'utf8');
@@ -16,7 +16,12 @@ interface FakeEndpoint {
   initializeDatabase(filename: string, config: DatabaseInitConfig): Promise<{ isReadOnly: boolean }>;
   runQuery(sql: string, params?: CellValue[]): Promise<unknown[]>;
   exportDatabase(name: string): Promise<Uint8Array>;
-  updateCell(table: string, rowId: string | number, column: string, value: CellValue): Promise<void>;
+  applyModifications?(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
+  undoModification?(mod: ModificationEntry): Promise<void>;
+  redoModification?(mod: ModificationEntry): Promise<void>;
+  flushChanges?(signal?: AbortSignal): Promise<void>;
+  discardModifications?(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
+  updateCell(table: string, rowId: string | number, column: string, value: CellValue, patch?: string): Promise<void>;
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   ping(): Promise<boolean>;
@@ -114,6 +119,7 @@ describe('workerFactory browser WASM connection', () => {
   it('uses an in-process endpoint and passes raw Uint8Array values directly', async () => {
     let initConfig: DatabaseInitConfig | undefined;
     let updateCellValue: CellValue | undefined;
+    let updateCellPatch: string | undefined;
     let insertRowValue: CellValue | undefined;
     let updateBatchValue: CellValue | undefined;
 
@@ -124,8 +130,9 @@ describe('workerFactory browser WASM connection', () => {
       },
       runQuery: async () => [],
       exportDatabase: async () => new Uint8Array(),
-      updateCell: async (_table, _rowId, _column, value) => {
+      updateCell: async (_table, _rowId, _column, value, patch) => {
         updateCellValue = value;
+        updateCellPatch = patch;
       },
       insertRow: async (_table, data) => {
         insertRowValue = data.blob;
@@ -159,12 +166,144 @@ describe('workerFactory browser WASM connection', () => {
     assert.strictEqual(connection.isReadOnly, false);
 
     const blobValue = new Uint8Array([9, 8, 7]);
-    await connection.databaseOps.updateCell('items', 1, 'blob', blobValue);
+    // The browser facade calls the in-process endpoint directly, so the patch
+    // argument must survive this delegation layer alongside the raw Uint8Array.
+    await connection.databaseOps.updateCell('items', 1, 'blob', blobValue, '{"merged":true}');
     await connection.databaseOps.insertRow('items', { blob: blobValue });
     await connection.databaseOps.updateCellBatch('items', [{ rowId: 1, column: 'blob', value: blobValue }]);
 
     assert.strictEqual(updateCellValue, blobValue);
+    assert.strictEqual(updateCellPatch, '{"merged":true}');
     assert.strictEqual(insertRowValue, blobValue);
     assert.strictEqual(updateBatchValue, blobValue);
+  });
+
+  it('opens browser WAL databases read-only instead of silently writing without WAL pages', async () => {
+    const dbContent = new Uint8Array([1, 2, 3]);
+    const walContent = new Uint8Array([9, 9, 9]);
+    const wasmContent = new Uint8Array([4, 5, 6]);
+    let initConfig: DatabaseInitConfig | undefined;
+
+    Object.defineProperty(mockVscode.workspace, 'fs', {
+      value: {
+        stat: async () => ({ size: dbContent.byteLength }),
+        readFile: async (uri: { path?: string; fsPath?: string }) => {
+          const pathValue = uri.path ?? uri.fsPath ?? '';
+          if (pathValue.endsWith('-wal')) {
+            return walContent;
+          }
+          if (pathValue.endsWith('sqlite3.wasm')) {
+            return wasmContent;
+          }
+          return dbContent;
+        }
+      },
+      writable: true,
+      configurable: true
+    });
+
+    const endpoint: FakeEndpoint = {
+      initializeDatabase: async (_filename, config) => {
+        initConfig = config;
+        return { isReadOnly: config.readOnlyMode ?? false };
+      },
+      runQuery: async () => [],
+      exportDatabase: async () => new Uint8Array(),
+      updateCell: async () => {},
+      insertRow: async () => 1,
+      updateCellBatch: async () => {},
+      ping: async () => true
+    };
+
+    const workerFactory = loadBrowserWorkerFactory(endpoint);
+    const extensionUri = { scheme: 'vscode-vfs', fsPath: '/ext', path: '/ext' } as any;
+    const fileUri = {
+      scheme: 'vscode-vfs',
+      fsPath: '/workspace/test.db',
+      path: '/workspace/test.db',
+      with: ({ path: nextPath }: { path: string }) => ({
+        scheme: 'vscode-vfs',
+        fsPath: nextPath,
+        path: nextPath
+      })
+    } as any;
+
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const connection = await bundle.establishConnection(fileUri, 'test.db');
+
+    assert.strictEqual(initConfig?.walContent, walContent);
+    assert.strictEqual(initConfig?.readOnlyMode, true);
+    assert.strictEqual(connection.isReadOnly, true);
+  });
+
+  it('delegates in-process modification operations through the endpoint', async () => {
+    const calls: string[] = [];
+    const mod = {
+      label: 'Update',
+      description: 'Update item',
+      modificationType: 'cell_update' as const,
+      targetTable: 'items',
+      targetRowId: 1,
+      targetColumn: 'name',
+      priorValue: 'before',
+      newValue: 'after'
+    };
+    const abortController = new AbortController();
+
+    const endpoint: FakeEndpoint = {
+      initializeDatabase: async () => ({ isReadOnly: false }),
+      runQuery: async () => [],
+      exportDatabase: async () => new Uint8Array(),
+      applyModifications: async (mods, signal) => {
+        assert.deepStrictEqual(mods, [mod]);
+        assert.strictEqual(signal, abortController.signal);
+        calls.push('apply');
+      },
+      undoModification: async (entry) => {
+        assert.strictEqual(entry, mod);
+        calls.push('undo');
+      },
+      redoModification: async (entry) => {
+        assert.strictEqual(entry, mod);
+        calls.push('redo');
+      },
+      flushChanges: async (signal) => {
+        assert.strictEqual(signal, abortController.signal);
+        calls.push('flush');
+      },
+      discardModifications: async (mods, signal) => {
+        assert.deepStrictEqual(mods, [mod]);
+        assert.strictEqual(signal, abortController.signal);
+        calls.push('discard');
+      },
+      updateCell: async () => {},
+      insertRow: async () => 1,
+      updateCellBatch: async () => {},
+      ping: async () => true
+    };
+
+    const workerFactory = loadBrowserWorkerFactory(endpoint);
+    const extensionUri = { scheme: 'vscode-vfs', fsPath: '/ext', path: '/ext' } as any;
+    const fileUri = {
+      scheme: 'vscode-vfs',
+      fsPath: '/workspace/test.db',
+      path: '/workspace/test.db',
+      with: ({ path: nextPath }: { path: string }) => ({
+        scheme: 'vscode-vfs',
+        fsPath: nextPath,
+        path: nextPath
+      })
+    } as any;
+
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const connection = await bundle.establishConnection(fileUri, 'test.db');
+
+    await connection.databaseOps.applyModifications([mod], abortController.signal);
+    await connection.databaseOps.undoModification(mod);
+    await connection.databaseOps.redoModification(mod);
+    await connection.databaseOps.flushChanges(abortController.signal);
+    await connection.databaseOps.discardModifications([mod], abortController.signal);
+
+    assert.deepStrictEqual(calls, ['apply', 'undo', 'redo', 'flush', 'discard']);
   });
 });
