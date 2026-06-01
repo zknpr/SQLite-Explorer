@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.0
+
+### Features
+
+- **Editing databases in VS Code for Web (vscode.dev / github.dev)**. The web build was previously read-only — any edit reported "Document is read-only". Editing had been disabled since the original release because the web engine path was unreliable. The in-process WASM engine now works in the web extension host (since 1.3.9), so the read-write editor is enabled in web mode. Edits apply to the in-memory database, then persist on save: the database is serialized and written back through the VS Code filesystem (for example, committing via github.dev).
+
+### Safety
+
+- **No silent data loss on web save failure**. When the underlying filesystem rejects a write (for example, a read-only web filesystem provider), save now surfaces a clear "Failed to save database" error. The edit history is kept uncommitted so changes can be retried or recovered, rather than being marked as saved.
+
 ## 1.4.0
 
 ### Changed

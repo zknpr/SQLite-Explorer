@@ -44,13 +44,16 @@ const CurrentExtension = vsc.extensions.getExtension(FullExtensionId);
 /** Running on local machine (not remote) */
 const IsLocalMode = !vsc.env.remoteName;
 
+/** Running inside the browser extension host used by VS Code for Web */
+const IsBrowserExtensionHost = !!import.meta.env?.VSCODE_BROWSER_EXT;
+
 /** Running on remote with workspace extension */
 export const IsRemoteWorkspaceMode =
   !!vsc.env.remoteName &&
   CurrentExtension?.extensionKind === vsc.ExtensionKind.Workspace;
 
 /** Editor supports read-write operations */
-export const SupportsWriteMode = IsLocalMode || IsRemoteWorkspaceMode;
+export const SupportsWriteMode = IsLocalMode || IsRemoteWorkspaceMode || IsBrowserExtensionHost;
 
 // ============================================================================
 // Configuration
@@ -322,7 +325,6 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   async save(cancellation?: vsc.CancellationToken): Promise<void> {
     await this.ensureWritable();
-    await this.#modificationTracker.createCheckpoint();
 
     // Check if using native engine - changes are already on disk
     const engineKind = await this.databaseOperations.engineKind;
@@ -336,6 +338,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         // Log at debug level for troubleshooting if needed
         GlobalOutputChannel?.appendLine(`[WAL checkpoint skipped] ${err instanceof Error ? err.message : String(err)}`);
       }
+      await this.#modificationTracker.createCheckpoint();
       return;
     }
 
@@ -344,6 +347,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     if (this.uri.scheme === 'file') {
         try {
             await this.databaseOperations.writeToFile(this.uri.fsPath);
+            await this.#modificationTracker.createCheckpoint();
             return;
         } catch (e) {
             // Fallback if direct write fails
@@ -353,7 +357,15 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
     const { filename } = this.fileParts;
     const binaryContent = await this.databaseOperations.serializeDatabase(filename);
-    await vsc.workspace.fs.writeFile(this.uri, binaryContent);
+    try {
+      await vsc.workspace.fs.writeFile(this.uri, binaryContent);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to save database: ${message}`);
+    }
+    // Only mark the tracker clean after bytes are persisted. If a web filesystem
+    // rejects writeFile, the edit history remains uncommitted for backup/retry.
+    await this.#modificationTracker.createCheckpoint();
   }
 
   /**

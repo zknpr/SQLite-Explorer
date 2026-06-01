@@ -385,7 +385,9 @@ export function registerEditorProvider(
   // Optional chaining is required: `import.meta.env` is undefined when this module is require()'d
   // under tsx (unit tests); esbuild's `define` substitutes the value in real builds. Do not make
   // this a bare access to match workerFactory.ts — that module is never required raw in tests.
-  const enableReadWrite = !import.meta.env?.VSCODE_BROWSER_EXT && verified && !readOnly && SupportsWriteMode;
+  // SupportsWriteMode includes the browser extension host only after the
+  // in-process WASM engine is available, so the provider gate can stay shared.
+  const enableReadWrite = verified && !readOnly && SupportsWriteMode;
   const Provider = enableReadWrite ? DatabaseEditorProvider : DatabaseViewerProvider;
   return vsc.window.registerCustomEditorProvider(
     viewType,
