@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.8
+
+### Diagnostics
+
+- **VS Code for Web (vscode.dev): added open-sequence instrumentation for the remaining loading hang** ([#418]). The 1.3.7 in-process engine fix removed the worker-construction crash, but databases can still hang on the loading screen in the web build due to a second, environment-specific stall in the extension host that does not reproduce locally. This release logs each step of the web open sequence (database read, WASM read, engine init) to the **SQLite Explorer** output channel (and the Extension Host console) and surfaces step failures as error notifications, so the exact stalling call can be identified. No behavior change to the desktop build.
+
+[#418]: https://github.com/zknpr/SQLite-Explorer/issues/418
+
 ## 1.3.7
 
 ### Bug Fixes

@@ -37,4 +37,5 @@ tmp/
 .playwright-mcp/
 .vscode-test-web/
 _repro_*.html
+_endpoint_bundle.mjs
 vscode-web-test-db.png
