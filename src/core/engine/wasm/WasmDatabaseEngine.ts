@@ -24,7 +24,7 @@ import type {
 } from '../../types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from '../../sql-utils';
 import { buildSelectQuery, buildCountQuery } from '../../query-builder';
-import { applyMergePatch } from '../../json-utils';
+import { applyMergePatch, tryCreateInverseMergePatch } from '../../json-utils';
 import { getNodeFs } from '../../platform/fs';
 
 // ============================================================================
@@ -282,19 +282,41 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   private async undoCellUpdate(targetTable: string, mod: ModificationEntry): Promise<void> {
-    const { affectedCells, targetRowId, targetColumn, priorValue } = mod;
+    const { affectedCells, targetRowId, targetColumn, priorValue, newValue, operation } = mod;
     if (affectedCells) {
       // Batch undo
-      const updates = affectedCells.map(cell => ({
-        rowId: cell.rowId,
-        column: cell.columnName,
-        value: cell.priorValue ?? null
-      }));
+      const updates = affectedCells.map(cell =>
+        this.createUndoCellUpdate(cell.rowId, cell.columnName, cell.priorValue, cell.newValue, cell.operation)
+      );
       await this.updateCellBatch(targetTable, updates);
     } else if (targetRowId !== undefined && targetColumn) {
       // Single cell undo
-      await this.updateCell(targetTable, targetRowId, targetColumn, priorValue ?? null);
+      const update = this.createUndoCellUpdate(targetRowId, targetColumn, priorValue, newValue, operation);
+      if (update.operation === 'json_patch') {
+        await this.updateCell(targetTable, targetRowId, targetColumn, null, update.value as string);
+      } else {
+        await this.updateCell(targetTable, targetRowId, targetColumn, update.value);
+      }
     }
+  }
+
+  private createUndoCellUpdate(
+    rowId: RecordId,
+    column: string,
+    priorValue: CellValue | undefined,
+    newValue: CellValue | undefined,
+    operation: ModificationEntry['operation']
+  ): CellUpdate {
+    if (operation === 'json_patch') {
+      const inversePatch = tryCreateInverseMergePatch(newValue, priorValue);
+      if (inversePatch !== undefined) {
+        // The inverse merge patch touches only keys from the original forward patch.
+        return { rowId, column, value: inversePatch, operation: 'json_patch' };
+      }
+    }
+
+    // Non-patch edits and unparseable/non-object priors retain legacy value replacement undo.
+    return { rowId, column, value: priorValue ?? null, operation: 'set' };
   }
 
   private async undoRowInsert(targetTable: string, mod: ModificationEntry): Promise<void> {

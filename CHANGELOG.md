@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.1
+
+### Fixes
+
+- **Undo of a JSON cell edit no longer clobbers concurrent changes to other keys.** When a JSON cell was edited as a merge patch, undo previously restored the whole captured document, which could overwrite a concurrent change to a different key of the same cell. Undo now applies an inverse merge patch that touches only the keys the original edit changed (web and desktop): a key the edit added is removed, a key it changed is restored to its prior value. Non-JSON edits and edits whose prior value was not a JSON object keep the previous full-value undo.
+- **JSON merge patches treat arrays as atomic values** (RFC 7396), aligning the JavaScript merge-patch fallback with SQLite's native `json_patch()` semantics.
+
 ## 1.5.0
 
 ### Features

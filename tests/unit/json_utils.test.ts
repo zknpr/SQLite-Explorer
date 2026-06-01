@@ -1,7 +1,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { generateMergePatch, applyMergePatch } from '../../src/core/json-utils';
+import { generateMergePatch, applyMergePatch, invertMergePatch } from '../../src/core/json-utils';
 
 describe('JSON Merge Patch (RFC 7396)', () => {
     describe('generateMergePatch', () => {
@@ -101,6 +101,58 @@ describe('JSON Merge Patch (RFC 7396)', () => {
 
             // Result should have both
             assert.deepStrictEqual(result, { a: { x: 1, y: 2 } });
+        });
+    });
+
+    describe('invertMergePatch', () => {
+        it('should delete keys added by the forward patch', () => {
+            const prior = { a: 1 };
+            const forward = { b: 2 };
+
+            // The inverse uses null for keys that did not exist in the prior document.
+            assert.deepStrictEqual(invertMergePatch(forward, prior), { b: null });
+        });
+
+        it('should restore changed scalar values from the prior document', () => {
+            const prior = { status: 'draft', count: 1 };
+            const forward = { status: 'published' };
+
+            assert.deepStrictEqual(invertMergePatch(forward, prior), { status: 'draft' });
+        });
+
+        it('should recurse into nested object patches', () => {
+            const prior = { meta: { reviewed: false, owner: 'ada' } };
+            const forward = { meta: { reviewed: true } };
+
+            assert.deepStrictEqual(invertMergePatch(forward, prior), { meta: { reviewed: false } });
+        });
+
+        it('should restore values removed by a forward delete patch', () => {
+            const prior = { a: 1, retired: 'keep' };
+            const forward = { retired: null };
+
+            assert.deepStrictEqual(invertMergePatch(forward, prior), { retired: 'keep' });
+        });
+
+        it('should round-trip the touched keys while preserving concurrent sibling changes', () => {
+            const prior = { status: 'draft', meta: { reviewed: false, owner: 'ada' } };
+            const forward = { status: 'published', meta: { reviewed: true }, added: 'new' };
+            const inverse = invertMergePatch(forward, prior);
+            const afterForward = applyMergePatch(prior, forward);
+
+            assert.deepStrictEqual(applyMergePatch(afterForward, inverse), prior);
+
+            // A sibling key added after the forward patch is outside the inverse key structure.
+            const withConcurrentSibling = applyMergePatch(afterForward, {
+                concurrent: 'survives',
+                meta: { note: 'keep' }
+            });
+
+            assert.deepStrictEqual(applyMergePatch(withConcurrentSibling, inverse), {
+                status: 'draft',
+                meta: { reviewed: false, owner: 'ada', note: 'keep' },
+                concurrent: 'survives'
+            });
         });
     });
 });

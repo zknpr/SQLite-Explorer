@@ -38,6 +38,7 @@ import type {
 } from './core/types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
+import { tryCreateInverseMergePatch } from './core/json-utils';
 
 // ============================================================================
 // Utility Functions
@@ -89,6 +90,27 @@ const INIT_TIMEOUT = 10000;
 
 /** Timeout for individual queries (ms) */
 const QUERY_TIMEOUT = 30000;
+
+// Keep this paired with WasmDatabaseEngine.undoCellUpdate so web and native
+// undo interpret ModificationEntry cell_update fields the same way.
+function createUndoCellUpdate(
+  rowId: RecordId,
+  column: string,
+  priorValue: CellValue | undefined,
+  newValue: CellValue | undefined,
+  operation: ModificationEntry['operation']
+): CellUpdate {
+  if (operation === 'json_patch') {
+    const inversePatch = tryCreateInverseMergePatch(newValue, priorValue);
+    if (inversePatch !== undefined) {
+      // The inverse merge patch restores only keys touched by the forward patch.
+      return { rowId, column, value: inversePatch, operation: 'json_patch' };
+    }
+  }
+
+  // Non-patch edits and unparseable/non-object priors retain legacy value replacement undo.
+  return { rowId, column, value: priorValue ?? null, operation: 'set' };
+}
 
 // ============================================================================
 // Platform Detection
@@ -535,28 +557,23 @@ export async function createNativeDatabaseConnection(
          * Undo a modification by executing the inverse SQL.
          */
         undoModification: async (mod: ModificationEntry) => {
-          const { modificationType, targetTable, targetRowId, targetColumn, priorValue, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
+          const { modificationType, targetTable, targetRowId, targetColumn, priorValue, newValue, operation, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
           if (!targetTable) return;
 
           switch (modificationType) {
             case 'cell_update':
               if (affectedCells) {
                 // Batch undo
-                const updates = affectedCells.map(c => ({
-                    rowId: c.rowId,
-                    column: c.columnName,
-                    value: c.priorValue
-                } as CellUpdate));
-                await worker.call('execBatch', [
-                    updates.map(u => ({
-                        sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(u.column)} = ? WHERE rowid = ?`,
-                        params: [u.value, Number(u.rowId)]
-                    }))
-                ]);
+                await operationsFacade.updateCellBatch(targetTable, affectedCells.map(c =>
+                  createUndoCellUpdate(c.rowId, c.columnName, c.priorValue, c.newValue, c.operation)
+                ));
               } else if (targetRowId !== undefined && targetColumn) {
-                const rowIdNum = Number(targetRowId);
-                const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(targetColumn)} = ? WHERE rowid = ?`;
-                await worker.call('run', [sql, [priorValue, rowIdNum]]);
+                const update = createUndoCellUpdate(targetRowId, targetColumn, priorValue, newValue, operation);
+                if (update.operation === 'json_patch') {
+                  await operationsFacade.updateCell(targetTable, targetRowId, targetColumn, null, update.value as string);
+                } else {
+                  await operationsFacade.updateCell(targetTable, targetRowId, targetColumn, update.value);
+                }
               }
               break;
 

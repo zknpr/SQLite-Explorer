@@ -94,6 +94,102 @@ describe('WasmDatabaseEngine', () => {
          assert.deepStrictEqual(JSON.parse(rows[1][2] as string), { y: 20, z: 30 });
     });
 
+    it('should undo single JSON patch edits without clobbering concurrent sibling keys', async () => {
+        await engine.executeQuery("DELETE FROM users");
+
+        const priorValue = JSON.stringify({ status: 'draft', owner: 'ada' });
+        const forwardPatch = JSON.stringify({ status: 'published' });
+        const concurrentPatch = JSON.stringify({ reviewer: 'grace' });
+        await engine.insertRow('users', { id: 1, name: 'Patch Undo', age: 41, data: priorValue });
+
+        // The first edit is the tracked modification; the second edit happens before undo.
+        await engine.updateCell('users', 1, 'data', null, forwardPatch);
+        await engine.updateCell('users', 1, 'data', null, concurrentPatch);
+
+        await engine.undoModification({
+            modificationType: 'cell_update',
+            description: 'Undo JSON patch',
+            targetTable: 'users',
+            targetRowId: 1,
+            targetColumn: 'data',
+            priorValue,
+            newValue: forwardPatch,
+            operation: 'json_patch'
+        });
+
+        const result = await engine.executeQuery("SELECT data FROM users WHERE id = 1");
+        assert.deepStrictEqual(JSON.parse(result[0].rows[0][0] as string), {
+            status: 'draft',
+            owner: 'ada',
+            reviewer: 'grace'
+        });
+    });
+
+    it('should undo batch JSON patch edits with per-cell inverse patches', async () => {
+        await engine.executeQuery("DELETE FROM users");
+
+        const rowOnePrior = JSON.stringify({ count: 1, stable: 'one' });
+        const rowTwoPrior = JSON.stringify({ count: 10, stable: 'two' });
+        const rowOnePatch = JSON.stringify({ count: 2 });
+        const rowTwoPatch = JSON.stringify({ count: 11 });
+        await engine.insertRow('users', { id: 1, name: 'Batch One', age: 20, data: rowOnePrior });
+        await engine.insertRow('users', { id: 2, name: 'Batch Two', age: 21, data: rowTwoPrior });
+
+        // Both cells receive tracked patches, then independent sibling patches before undo.
+        await engine.updateCellBatch('users', [
+            { rowId: 1, column: 'data', value: rowOnePatch, operation: 'json_patch' },
+            { rowId: 2, column: 'data', value: rowTwoPatch, operation: 'json_patch' }
+        ]);
+        await engine.updateCellBatch('users', [
+            { rowId: 1, column: 'data', value: JSON.stringify({ concurrent: 'row-one' }), operation: 'json_patch' },
+            { rowId: 2, column: 'data', value: JSON.stringify({ concurrent: 'row-two' }), operation: 'json_patch' }
+        ]);
+
+        await engine.undoModification({
+            modificationType: 'cell_update',
+            description: 'Undo batch JSON patch',
+            targetTable: 'users',
+            affectedCells: [
+                { rowId: 1, columnName: 'data', priorValue: rowOnePrior, newValue: rowOnePatch, operation: 'json_patch' },
+                { rowId: 2, columnName: 'data', priorValue: rowTwoPrior, newValue: rowTwoPatch, operation: 'json_patch' }
+            ]
+        });
+
+        const result = await engine.executeQuery("SELECT id, data FROM users ORDER BY id");
+        assert.deepStrictEqual(JSON.parse(result[0].rows[0][1] as string), {
+            count: 1,
+            stable: 'one',
+            concurrent: 'row-one'
+        });
+        assert.deepStrictEqual(JSON.parse(result[0].rows[1][1] as string), {
+            count: 10,
+            stable: 'two',
+            concurrent: 'row-two'
+        });
+    });
+
+    it('should restore NULL when undoing a JSON patch edit whose prior value was NULL', async () => {
+        await engine.executeQuery("DELETE FROM users");
+
+        const forwardPatch = JSON.stringify({ added: 'value' });
+        await engine.insertRow('users', { id: 1, name: 'Null Prior', age: 42, data: null });
+        await engine.updateCell('users', 1, 'data', null, forwardPatch);
+
+        await engine.undoModification({
+            modificationType: 'cell_update',
+            description: 'Undo JSON patch on NULL',
+            targetTable: 'users',
+            targetRowId: 1,
+            targetColumn: 'data',
+            priorValue: null,
+            newValue: forwardPatch,
+            operation: 'json_patch'
+        });
+
+        const result = await engine.executeQuery("SELECT data FROM users WHERE id = 1");
+        assert.strictEqual(result[0].rows[0][0], null);
+    });
+
     it('should handle empty updates gracefully', async () => {
         await engine.updateCellBatch('users', []);
         assert.ok(true);

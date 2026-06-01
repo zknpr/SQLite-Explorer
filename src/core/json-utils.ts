@@ -108,6 +108,73 @@ export function applyMergePatch(target: unknown, patch: unknown, depth = 0): unk
     return targetObj;
 }
 
+/**
+ * Build a JSON Merge Patch that reverses the keys touched by a forward patch.
+ *
+ * The inverse is intentionally restricted to the forward patch key structure so
+ * undo can restore the edited keys without replacing concurrent sibling edits.
+ */
+export function invertMergePatch(forwardPatch: unknown, prior: unknown): unknown {
+    return invertMergePatchAtDepth(forwardPatch, prior, 0);
+}
+
+/**
+ * Convert recorded cell values into a serialized inverse merge patch.
+ *
+ * Undo uses this only when both recorded values are JSON strings and the prior
+ * document is an object, matching SQLite json_patch object-merge semantics.
+ */
+export function tryCreateInverseMergePatch(forwardPatchValue: unknown, priorValue: unknown): string | undefined {
+    if (typeof forwardPatchValue !== 'string' || typeof priorValue !== 'string') {
+        return undefined;
+    }
+
+    const forwardPatch = parseJsonValue(forwardPatchValue);
+    const prior = parseJsonValue(priorValue);
+    if (!forwardPatch.ok || !prior.ok || !isObject(prior.value)) {
+        return undefined;
+    }
+
+    return JSON.stringify(invertMergePatch(forwardPatch.value, prior.value));
+}
+
+function invertMergePatchAtDepth(forwardPatch: unknown, prior: unknown, depth: number): unknown {
+    if (depth > MAX_DEPTH) {
+        throw new Error('JSON invert merge patch depth limit exceeded');
+    }
+
+    if (!isObject(forwardPatch)) {
+        return prior === undefined ? null : prior;
+    }
+
+    const inverse: Record<string, unknown> = {};
+    const priorObj = isObject(prior) ? prior : {};
+
+    for (const key of Object.keys(forwardPatch)) {
+        const priorHas = Object.prototype.hasOwnProperty.call(priorObj, key);
+        const priorVal = priorHas ? priorObj[key] : undefined;
+        const forwardVal = forwardPatch[key];
+
+        if (forwardVal === null) {
+            inverse[key] = priorHas ? priorVal : null;
+        } else if (isObject(forwardVal) && isObject(priorVal)) {
+            inverse[key] = invertMergePatchAtDepth(forwardVal, priorVal, depth + 1);
+        } else {
+            inverse[key] = priorHas ? priorVal : null;
+        }
+    }
+
+    return inverse;
+}
+
+function parseJsonValue(value: string): { ok: true; value: unknown } | { ok: false } {
+    try {
+        return { ok: true, value: JSON.parse(value) };
+    } catch {
+        return { ok: false };
+    }
+}
+
 function isObject(val: unknown): val is Record<string, unknown> {
-    return val !== null && typeof val === 'object';
+    return val !== null && typeof val === 'object' && !Array.isArray(val);
 }
