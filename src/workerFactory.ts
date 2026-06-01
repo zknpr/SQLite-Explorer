@@ -227,7 +227,7 @@ async function createInProcessWasmDatabaseConnection(
         GlobalOutputChannel?.appendLine(line);
         console.log(line);
       };
-      const diagStep = async <T>(label: string, fn: () => Promise<T>): Promise<T> => {
+      const diagStep = async <T>(label: string, fn: () => PromiseLike<T>): Promise<T> => {
         const t0 = Date.now();
         diag(`▶ ${label} … start`);
         try {
@@ -254,7 +254,7 @@ async function createInProcessWasmDatabaseConnection(
       // WebAssembly instantiation does not depend on worker-relative URLs.
       const wasmUri = vsc.Uri.joinPath(extensionUri, 'assets', 'sqlite3.wasm');
       diag(`  wasmUri=${wasmUri.toString()}`);
-      const wasmContent = await diagStep('readFile(sqlite3.wasm)', () => Promise.resolve(vsc.workspace.fs.readFile(wasmUri)));
+      const wasmContent = await diagStep('readFile(sqlite3.wasm)', () => vsc.workspace.fs.readFile(wasmUri));
       diag(`  wasm bytes=${wasmContent?.byteLength ?? 'null'}`);
 
       const initConfig: DatabaseInitConfig = {
