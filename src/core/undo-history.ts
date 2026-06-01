@@ -152,6 +152,10 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   private maxEntries: number;
   private maxMemory: number;
   private currentSize: number = 0;
+  /** Monotonic counter advanced whenever the undo/redo history changes. */
+  private mutationRevision: number = 0;
+  /** Monotonic counter advanced when older checkpoint positions may no longer name the same saved state. */
+  private checkpointInvalidationRevision: number = 0;
 
   /**
    * Create a new modification tracker.
@@ -165,6 +169,26 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   }
 
   /**
+   * Record that the undo/redo history changed.
+   */
+  private advanceMutationRevision(): void {
+    this.mutationRevision++;
+  }
+
+  /**
+   * Record that a previously captured checkpoint position may no longer be safe.
+   *
+   * Undo, rollback, and eviction remove or shift retained timeline entries. A
+   * later save must not clamp an older absolute position onto the shortened
+   * timeline because that can mark bytes as clean that are no longer the live
+   * in-memory state.
+   */
+  private invalidateCapturedCheckpointPositions(): void {
+    this.advanceMutationRevision();
+    this.checkpointInvalidationRevision++;
+  }
+
+  /**
    * Record a new modification.
    *
    * Discards any future modifications (redo history) since
@@ -173,6 +197,8 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    * @param entry - Modification to record
    */
   record(entry: T): void {
+    this.advanceMutationRevision();
+
     // Calculate size of new entry
     const entrySize = calculateSize(entry);
 
@@ -211,6 +237,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
       // Adjust checkpoint index since we shifted the array
       this.checkpointIndex = Math.max(0, this.checkpointIndex - 1);
       this.timelineOffset++;
+      this.invalidateCapturedCheckpointPositions();
     }
   }
 
@@ -227,6 +254,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
       this.futureStack.push(entry);
       this.futureStackSizes.push(size || 0);
       // currentSize doesn't change as entry just moves from timeline to futureStack
+      this.invalidateCapturedCheckpointPositions();
     }
     return entry;
   }
@@ -244,6 +272,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
       this.timeline.push(entry);
       this.timelineSizes.push(size || 0);
       // currentSize doesn't change as entry just moves from futureStack to timeline
+      this.advanceMutationRevision();
     }
     return entry;
   }
@@ -272,6 +301,26 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    */
   getCurrentPosition(): number {
     return this.timelineOffset + this.timeline.length;
+  }
+
+  /**
+   * Return the current history mutation revision.
+   *
+   * The value is only meaningful for equality comparisons against a previously
+   * captured value from the same tracker instance.
+   */
+  getMutationRevision(): number {
+    return this.mutationRevision;
+  }
+
+  /**
+   * Return the current checkpoint invalidation revision.
+   *
+   * The value changes when undo, rollback, or retention eviction can make a
+   * previously captured absolute checkpoint position unsafe to commit.
+   */
+  getCheckpointInvalidationRevision(): number {
+    return this.checkpointInvalidationRevision;
   }
 
   /**
@@ -306,6 +355,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
 
       this.futureStack.push(...uncommitted.reverse());
       this.futureStackSizes.push(...uncommittedSizes.reverse());
+      this.invalidateCapturedCheckpointPositions();
     }
   }
 

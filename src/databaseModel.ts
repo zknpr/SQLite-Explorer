@@ -361,6 +361,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     // below represent edits up to this position only; edits recorded while the
     // asynchronous workspace write is pending must remain dirty.
     const serializedCheckpoint = this.#modificationTracker.getCurrentPosition();
+    const serializedCheckpointInvalidationRevision =
+      this.#modificationTracker.getCheckpointInvalidationRevision();
     try {
       await vsc.workspace.fs.writeFile(this.uri, binaryContent);
     } catch (err) {
@@ -371,7 +373,18 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     // rejects writeFile, the edit history remains uncommitted for backup/retry.
     // The saved checkpoint is limited to the serialized snapshot so concurrent
     // edits are not acknowledged before their bytes reach storage.
-    await this.#modificationTracker.createCheckpointAt(serializedCheckpoint);
+    //
+    // If undo/rollback/eviction changed the retained timeline while writeFile
+    // was pending, the serialized bytes no longer match the live in-memory
+    // state. In that case leave the document dirty so the next save serializes
+    // the current state instead of clamping the checkpoint onto a shorter
+    // timeline.
+    if (
+      this.#modificationTracker.getCheckpointInvalidationRevision() ===
+      serializedCheckpointInvalidationRevision
+    ) {
+      await this.#modificationTracker.createCheckpointAt(serializedCheckpoint);
+    }
   }
 
   /**

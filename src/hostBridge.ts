@@ -605,9 +605,16 @@ export class HostBridge implements ToastService {
 
   /**
    * Check if the document is read-only.
+   *
+   * Read-only when EITHER the editor provider is the read-only variant OR the
+   * specific connection opened read-only. The latter matters in VS Code for Web:
+   * a database with an active WAL opens read-only at the connection level even
+   * though the read-write DatabaseEditorProvider is registered, so the edit gate
+   * must honor the connection state too — otherwise the webview would allow edits
+   * that save()/revert() then reject, stranding the user with unsavable changes.
    */
   get isReadOnly() {
-    return this.viewerProvider.isReadOnly;
+    return this.viewerProvider.isReadOnly || this.document.isReadOnlyMode;
   }
 
   /**

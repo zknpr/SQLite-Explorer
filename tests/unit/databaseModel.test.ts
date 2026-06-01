@@ -563,6 +563,89 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             mockVscode.workspace.fs = originalFs;
         }
     });
+
+    it('save: stays dirty when undo shrinks the timeline while writeFile is still pending', async () => {
+        const sourceUri = createUri('vscode-vfs', '/github/user/repo/test.db');
+        let resolveWrite: () => void = () => {};
+        let markWriteStarted: () => void = () => {};
+        const writeMayFinish = new Promise<void>(resolve => {
+            resolveWrite = resolve;
+        });
+        const writeStarted = new Promise<void>(resolve => {
+            markWriteStarted = resolve;
+        });
+
+        const firstModification = {
+            label: 'First Update',
+            description: 'Update first item',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'name',
+            priorValue: 'before-a',
+            newValue: 'after-a'
+        };
+        const undoneModification = {
+            label: 'Second Update',
+            description: 'Update second item',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 2,
+            targetColumn: 'name',
+            priorValue: 'before-b',
+            newValue: 'after-b'
+        };
+        let undoSecondUpdate: (() => Promise<void>) | undefined;
+        let discardedModifications: unknown[] | undefined;
+
+        const dbOps = {
+            engineKind: Promise.resolve('wasm'),
+            serializeDatabase: async () => new Uint8Array([10, 11, 12]),
+            undoModification: async (modification: unknown) => {
+                assert.strictEqual(modification, undoneModification);
+            },
+            discardModifications: async (mods: unknown[]) => {
+                discardedModifications = mods;
+            }
+        };
+
+        const doc = createDocBypassingFactory(dbOps, sourceUri);
+        doc.recordModification(firstModification);
+        doc.onDidChange((modification: any) => {
+            if (modification.label === 'Second Update') {
+                undoSecondUpdate = modification.undo;
+            }
+        });
+        doc.recordModification(undoneModification);
+        assert.ok(undoSecondUpdate, 'second update undo action should be emitted');
+
+        const originalFs = mockVscode.workspace.fs;
+        mockVscode.workspace.fs = {
+            ...originalFs,
+            writeFile: async (uri: any, content: any) => {
+                assert.strictEqual(uri, sourceUri);
+                assert.deepStrictEqual(content, new Uint8Array([10, 11, 12]));
+                markWriteStarted();
+                await writeMayFinish;
+            },
+            readFile: async () => new Uint8Array([])
+        } as any;
+
+        try {
+            const savePromise = doc.save();
+            await writeStarted;
+
+            await undoSecondUpdate!();
+            resolveWrite();
+            await savePromise;
+
+            await doc.revert(undefined);
+
+            assert.deepStrictEqual(discardedModifications, [firstModification]);
+        } finally {
+            mockVscode.workspace.fs = originalFs;
+        }
+    });
 });
 
 

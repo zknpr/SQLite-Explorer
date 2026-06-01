@@ -145,7 +145,9 @@ describe('registerEditorProvider', () => {
         assert.strictEqual(calls.length, 1);
         assert.ok(calls[0].provider instanceof BrowserDatabaseEditorProvider);
 
-        const bridge = new HostBridge(calls[0].provider as any, {} as any);
+        // HostBridge.isReadOnly now also reflects the document's connection-level
+        // read-only state, so the mock document must expose isReadOnlyMode.
+        const bridge = new HostBridge(calls[0].provider as any, { isReadOnlyMode: false } as any);
         assert.strictEqual(bridge.isReadOnly, false);
     });
 
