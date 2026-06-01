@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.7
+
+### Bug Fixes
+
+- **VS Code for Web (vscode.dev / github.dev): databases stuck on the loading screen — actual fix** ([#418]). Every SQLite database (`.db`, `.sqlite`, `.gpkg`, …) hung forever on the loading screen in the web build. Root cause (confirmed in real vscode.dev): VS Code Web enforces Trusted Types (`require-trusted-types-for 'script'`) on the extension host with a fixed policy allowlist, so the SQLite engine's `new Worker(blobUrl)` was blocked (`Failed to construct 'Worker': This document requires 'TrustedScriptURL' assignment`) — the worker never started and every database operation timed out silently. In browser mode the sql.js engine now runs **in-process in the extension host** (no Web Worker), which Trusted Types permits; desktop VS Code continues to use a worker thread. The engine's WASM memory is released when a database is closed.
+
+  Note: the 1.3.6 web fix (a `parentPort` adapter) addressed a real but downstream bug and did **not** resolve #418, because the worker is blocked at construction before that code runs. 1.3.7 supersedes it.
+
+[#418]: https://github.com/zknpr/SQLite-Explorer/issues/418
+
 ## 1.3.6
 
 ### Bug Fixes

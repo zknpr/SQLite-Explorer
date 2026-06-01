@@ -241,6 +241,21 @@ export function createWorkerEndpoint() {
 
     async writeToFile(path: string): Promise<void> {
       return requireEngine().writeToFile(path);
+    },
+
+    /**
+     * Release the active engine and its underlying sql.js WASM heap.
+     *
+     * Safe to call when no database is active (no-op) and idempotent. The
+     * in-process browser connection wires this to its bundle's [Symbol.dispose]
+     * so closing a database frees the WASM instance instead of leaking it; the
+     * Node worker path tears down the whole worker thread instead.
+     */
+    dispose(): void {
+      if (activeEngine) {
+        activeEngine.shutdown();
+        activeEngine = null;
+      }
     }
   };
 }
