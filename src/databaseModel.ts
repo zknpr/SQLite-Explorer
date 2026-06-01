@@ -357,6 +357,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
     const { filename } = this.fileParts;
     const binaryContent = await this.databaseOperations.serializeDatabase(filename);
+    // Capture the tracker position immediately after serialization. The bytes
+    // below represent edits up to this position only; edits recorded while the
+    // asynchronous workspace write is pending must remain dirty.
+    const serializedCheckpoint = this.#modificationTracker.getCurrentPosition();
     try {
       await vsc.workspace.fs.writeFile(this.uri, binaryContent);
     } catch (err) {
@@ -365,7 +369,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     }
     // Only mark the tracker clean after bytes are persisted. If a web filesystem
     // rejects writeFile, the edit history remains uncommitted for backup/retry.
-    await this.#modificationTracker.createCheckpoint();
+    // The saved checkpoint is limited to the serialized snapshot so concurrent
+    // edits are not acknowledged before their bytes reach storage.
+    await this.#modificationTracker.createCheckpointAt(serializedCheckpoint);
   }
 
   /**

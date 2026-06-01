@@ -491,6 +491,78 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             mockVscode.workspace.fs = originalFs;
         }
     });
+
+    it('save: does not checkpoint edits recorded while writeFile is still pending', async () => {
+        const sourceUri = createUri('vscode-vfs', '/github/user/repo/test.db');
+        let resolveWrite: () => void = () => {};
+        let markWriteStarted: () => void = () => {};
+        const writeMayFinish = new Promise<void>(resolve => {
+            resolveWrite = resolve;
+        });
+        const writeStarted = new Promise<void>(resolve => {
+            markWriteStarted = resolve;
+        });
+
+        const firstModification = {
+            label: 'First Update',
+            description: 'Update first item',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'name',
+            priorValue: 'before',
+            newValue: 'after'
+        };
+        const concurrentModification = {
+            label: 'Concurrent Update',
+            description: 'Update concurrent item',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 2,
+            targetColumn: 'name',
+            priorValue: 'old',
+            newValue: 'new'
+        };
+        let discardedModifications: unknown[] | undefined;
+
+        const dbOps = {
+            engineKind: Promise.resolve('wasm'),
+            serializeDatabase: async () => new Uint8Array([7, 8, 9]),
+            discardModifications: async (mods: unknown[]) => {
+                discardedModifications = mods;
+            }
+        };
+
+        const doc = createDocBypassingFactory(dbOps, sourceUri);
+        doc.recordModification(firstModification);
+
+        const originalFs = mockVscode.workspace.fs;
+        mockVscode.workspace.fs = {
+            ...originalFs,
+            writeFile: async (uri: any, content: any) => {
+                assert.strictEqual(uri, sourceUri);
+                assert.deepStrictEqual(content, new Uint8Array([7, 8, 9]));
+                markWriteStarted();
+                await writeMayFinish;
+            },
+            readFile: async () => new Uint8Array([])
+        } as any;
+
+        try {
+            const savePromise = doc.save();
+            await writeStarted;
+
+            doc.recordModification(concurrentModification);
+            resolveWrite();
+            await savePromise;
+
+            await doc.revert(undefined);
+
+            assert.deepStrictEqual(discardedModifications, [concurrentModification]);
+        } finally {
+            mockVscode.workspace.fs = originalFs;
+        }
+    });
 });
 
 

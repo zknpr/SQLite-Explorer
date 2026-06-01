@@ -142,6 +142,8 @@ interface TrackerState<T> {
 export class ModificationTracker<T extends LabeledModification = LabeledModification> {
   private timeline: T[] = [];
   private timelineSizes: number[] = [];
+  /** Number of entries that were evicted from the front of the retained timeline. */
+  private timelineOffset: number = 0;
 
   private futureStack: T[] = [];
   private futureStackSizes: number[] = [];
@@ -208,6 +210,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
 
       // Adjust checkpoint index since we shifted the array
       this.checkpointIndex = Math.max(0, this.checkpointIndex - 1);
+      this.timelineOffset++;
     }
   }
 
@@ -259,6 +262,27 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    */
   async createCheckpoint(): Promise<void> {
     this.checkpointIndex = this.timeline.length;
+  }
+
+  /**
+   * Return the absolute timeline position after the latest retained entry.
+   *
+   * This position is stable across later front-eviction because it includes the
+   * count of entries already removed from the retained timeline.
+   */
+  getCurrentPosition(): number {
+    return this.timelineOffset + this.timeline.length;
+  }
+
+  /**
+   * Mark a previously captured absolute timeline position as the saved state.
+   *
+   * The position is translated back into the retained timeline, clamped when
+   * old entries were evicted or when callers provide a future position.
+   */
+  async createCheckpointAt(position: number): Promise<void> {
+    const relativePosition = position - this.timelineOffset;
+    this.checkpointIndex = Math.max(0, Math.min(this.timeline.length, relativePosition));
   }
 
   /**

@@ -214,6 +214,11 @@ async function createInProcessWasmDatabaseConnection(
       // There is no file-path fast path because the web extension host cannot
       // access local disk paths directly.
       const [dbContent, walContent] = await loadDatabaseFiles(fileUri);
+      const hasActiveWal = !!walContent && walContent.byteLength > 0;
+      // sql.js opens one main database image and cannot merge a separate WAL
+      // file, so browser editing is disabled when committed WAL pages may be
+      // absent from the main database bytes that save() would later overwrite.
+      const readOnlyMode = (forceReadOnly ?? false) || hasActiveWal;
 
       // Preload sql.js WASM bytes from the extension assets directory so
       // WebAssembly instantiation does not depend on worker-relative URLs.
@@ -226,7 +231,7 @@ async function createInProcessWasmDatabaseConnection(
         maxSize: getMaximumFileSizeBytes(),
         resourceMap: {},
         wasmBinary: wasmContent,
-        readOnlyMode: forceReadOnly ?? false,
+        readOnlyMode,
         queryTimeout: getQueryTimeout()
       };
 
@@ -237,11 +242,16 @@ async function createInProcessWasmDatabaseConnection(
         executeQuery: (sql: string, params?: CellValue[]) =>
           endpoint.runQuery(sql, params),
         serializeDatabase: (name: string) => endpoint.exportDatabase(name),
-        applyModifications: async () => {},
-        undoModification: async () => {},
-        redoModification: async () => {},
-        flushChanges: async () => {},
-        discardModifications: async () => {},
+        applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
+          endpoint.applyModifications(mods, signal),
+        undoModification: (mod: ModificationEntry) =>
+          endpoint.undoModification(mod),
+        redoModification: (mod: ModificationEntry) =>
+          endpoint.redoModification(mod),
+        flushChanges: (signal?: AbortSignal) =>
+          endpoint.flushChanges(signal),
+        discardModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
+          endpoint.discardModifications(mods, signal),
         updateCell: (table: string, rowId: string | number, column: string, value: CellValue) =>
           endpoint.updateCell(table, rowId, column, value),
         insertRow: (table: string, data: Record<string, CellValue>) =>
