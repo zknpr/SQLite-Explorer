@@ -210,15 +210,52 @@ async function createInProcessWasmDatabaseConnection(
       forceReadOnly?: boolean,
       autoCommit?: boolean
     ) {
+      // ---- DIAGNOSTIC INSTRUMENTATION (issue #418, web-only hang) ----
+      // The in-process browser path opens a DB through a sequence of awaits in the
+      // sandboxed web extension host, where a stall is invisible to DevTools and to
+      // network inspection. Log each step to the SQLite Explorer output channel
+      // (revealed up front) so the LAST "start" with no matching "ok" pinpoints the
+      // hanging call. Each step is wrapped so a thrown error surfaces in the UI
+      // instead of leaving the editor spinning forever.
+      GlobalOutputChannel?.show?.(true);
+      // Log to BOTH the output channel (if wired) and console — in the web
+      // extension host, console output is captured by the "Extension Host
+      // (Worker)" output channel, so we get the trace even if our own channel
+      // is not yet created when the editor opens.
+      const diag = (m: string) => {
+        const line = `[#418 web-open] ${m}`;
+        GlobalOutputChannel?.appendLine(line);
+        console.log(line);
+      };
+      const diagStep = async <T>(label: string, fn: () => Promise<T>): Promise<T> => {
+        const t0 = Date.now();
+        diag(`▶ ${label} … start`);
+        try {
+          const r = await fn();
+          diag(`  ✓ ${label} ok (${Date.now() - t0}ms)`);
+          return r;
+        } catch (err) {
+          const msg = err instanceof Error ? (err.stack || err.message) : String(err);
+          diag(`  ✗ ${label} FAILED (${Date.now() - t0}ms): ${msg}`);
+          void vsc.window.showErrorMessage(`SQLite Explorer: failed at "${label}" — ${err instanceof Error ? err.message : String(err)}`);
+          throw err;
+        }
+      };
+
+      diag(`establishConnection: ${displayName} (uri.scheme=${fileUri.scheme})`);
+
       // Browser mode always reads database bytes through the VS Code filesystem.
       // There is no file-path fast path because the web extension host cannot
       // access local disk paths directly.
-      const [dbContent, walContent] = await loadDatabaseFiles(fileUri);
+      const [dbContent, walContent] = await diagStep('loadDatabaseFiles', () => loadDatabaseFiles(fileUri));
+      diag(`  db bytes=${dbContent?.byteLength ?? 'null'} wal bytes=${walContent?.byteLength ?? 'null'}`);
 
       // Preload sql.js WASM bytes from the extension assets directory so
       // WebAssembly instantiation does not depend on worker-relative URLs.
       const wasmUri = vsc.Uri.joinPath(extensionUri, 'assets', 'sqlite3.wasm');
-      const wasmContent = await vsc.workspace.fs.readFile(wasmUri);
+      diag(`  wasmUri=${wasmUri.toString()}`);
+      const wasmContent = await diagStep('readFile(sqlite3.wasm)', () => Promise.resolve(vsc.workspace.fs.readFile(wasmUri)));
+      diag(`  wasm bytes=${wasmContent?.byteLength ?? 'null'}`);
 
       const initConfig: DatabaseInitConfig = {
         content: dbContent,
@@ -230,7 +267,8 @@ async function createInProcessWasmDatabaseConnection(
         queryTimeout: getQueryTimeout()
       };
 
-      const result = await endpoint.initializeDatabase(displayName, initConfig);
+      const result = await diagStep('initializeDatabase (sql.js engine)', () => endpoint.initializeDatabase(displayName, initConfig));
+      diag(`establishConnection complete (isReadOnly=${result.isReadOnly})`);
 
       const operationsFacade: DatabaseOperations = {
         engineKind: Promise.resolve('wasm'),
