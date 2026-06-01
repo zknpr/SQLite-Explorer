@@ -210,52 +210,15 @@ async function createInProcessWasmDatabaseConnection(
       forceReadOnly?: boolean,
       autoCommit?: boolean
     ) {
-      // ---- DIAGNOSTIC INSTRUMENTATION (issue #418, web-only hang) ----
-      // The in-process browser path opens a DB through a sequence of awaits in the
-      // sandboxed web extension host, where a stall is invisible to DevTools and to
-      // network inspection. Log each step to the SQLite Explorer output channel
-      // (revealed up front) so the LAST "start" with no matching "ok" pinpoints the
-      // hanging call. Each step is wrapped so a thrown error surfaces in the UI
-      // instead of leaving the editor spinning forever.
-      GlobalOutputChannel?.show?.(true);
-      // Log to BOTH the output channel (if wired) and console — in the web
-      // extension host, console output is captured by the "Extension Host
-      // (Worker)" output channel, so we get the trace even if our own channel
-      // is not yet created when the editor opens.
-      const diag = (m: string) => {
-        const line = `[#418 web-open] ${m}`;
-        GlobalOutputChannel?.appendLine(line);
-        console.log(line);
-      };
-      const diagStep = async <T>(label: string, fn: () => PromiseLike<T>): Promise<T> => {
-        const t0 = Date.now();
-        diag(`▶ ${label} … start`);
-        try {
-          const r = await fn();
-          diag(`  ✓ ${label} ok (${Date.now() - t0}ms)`);
-          return r;
-        } catch (err) {
-          const msg = err instanceof Error ? (err.stack || err.message) : String(err);
-          diag(`  ✗ ${label} FAILED (${Date.now() - t0}ms): ${msg}`);
-          void vsc.window.showErrorMessage(`SQLite Explorer: failed at "${label}" — ${err instanceof Error ? err.message : String(err)}`);
-          throw err;
-        }
-      };
-
-      diag(`establishConnection: ${displayName} (uri.scheme=${fileUri.scheme})`);
-
       // Browser mode always reads database bytes through the VS Code filesystem.
       // There is no file-path fast path because the web extension host cannot
       // access local disk paths directly.
-      const [dbContent, walContent] = await diagStep('loadDatabaseFiles', () => loadDatabaseFiles(fileUri, diag));
-      diag(`  db bytes=${dbContent?.byteLength ?? 'null'} wal bytes=${walContent?.byteLength ?? 'null'}`);
+      const [dbContent, walContent] = await loadDatabaseFiles(fileUri);
 
       // Preload sql.js WASM bytes from the extension assets directory so
       // WebAssembly instantiation does not depend on worker-relative URLs.
       const wasmUri = vsc.Uri.joinPath(extensionUri, 'assets', 'sqlite3.wasm');
-      diag(`  wasmUri=${wasmUri.toString()}`);
-      const wasmContent = await diagStep('readFile(sqlite3.wasm)', () => vsc.workspace.fs.readFile(wasmUri));
-      diag(`  wasm bytes=${wasmContent?.byteLength ?? 'null'}`);
+      const wasmContent = await vsc.workspace.fs.readFile(wasmUri);
 
       const initConfig: DatabaseInitConfig = {
         content: dbContent,
@@ -267,8 +230,7 @@ async function createInProcessWasmDatabaseConnection(
         queryTimeout: getQueryTimeout()
       };
 
-      const result = await diagStep('initializeDatabase (sql.js engine)', () => endpoint.initializeDatabase(displayName, initConfig));
-      diag(`establishConnection complete (isReadOnly=${result.isReadOnly})`);
+      const result = await endpoint.initializeDatabase(displayName, initConfig);
 
       const operationsFacade: DatabaseOperations = {
         engineKind: Promise.resolve('wasm'),
@@ -298,25 +260,20 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.updateCellBatch(table, updates),
         addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
           endpoint.addColumn(table, column, type, defaultValue),
-        // The read-path methods below run during the loading screen (viewer.js
-        // awaits ping -> fetchSchema -> fetchTableCount/fetchTableData on open).
-        // Wrap them in diagStep so a stall in any of THEM — not just
-        // establishConnection's awaits — is pinpointed by the last unmatched
-        // "start" in the trace. (#418 diagnostic)
         fetchTableData: (table: string, options: TableQueryOptions) =>
-          diagStep(`fetchTableData(${table})`, () => endpoint.fetchTableData(table, options)),
+          endpoint.fetchTableData(table, options),
         fetchTableCount: (table: string, options: TableCountOptions) =>
-          diagStep(`fetchTableCount(${table})`, () => endpoint.fetchTableCount(table, options)),
+          endpoint.fetchTableCount(table, options),
         fetchSchema: () =>
-          diagStep('fetchSchema', () => endpoint.fetchSchema()),
+          endpoint.fetchSchema(),
         getTableInfo: (table: string) =>
-          diagStep(`getTableInfo(${table})`, () => endpoint.getTableInfo(table)),
+          endpoint.getTableInfo(table),
         getPragmas: () =>
-          diagStep('getPragmas', () => endpoint.getPragmas()),
+          endpoint.getPragmas(),
         setPragma: (pragma: string, value: CellValue) =>
           endpoint.setPragma(pragma, value),
         ping: () =>
-          diagStep('ping', () => endpoint.ping()),
+          endpoint.ping(),
         writeToFile: (path: string) =>
           endpoint.writeToFile(path)
       };
@@ -546,16 +503,10 @@ async function createWorkerBackedWasmDatabaseConnection(
  * Load database file and optional WAL file.
  *
  * @param uri - Database file URI
- * @param diag - Optional diagnostic logger (#418). When provided, each internal
- *   filesystem await (stat, main readFile, optional -wal readFile) is logged
- *   separately so a stall in one specific call is identifiable. The -wal read is
- *   a prime suspect: reading a (usually nonexistent) `-wal` over vscode-vfs may
- *   never settle in the web extension host.
  * @returns Tuple of [database content, WAL content]
  */
 async function loadDatabaseFiles(
-  uri: vsc.Uri,
-  diag?: (message: string) => void
+  uri: vsc.Uri
 ): Promise<[Uint8Array | null, Uint8Array | null]> {
   // Untitled documents start empty
   if (uri.scheme === 'untitled') {
@@ -565,9 +516,7 @@ async function loadDatabaseFiles(
   const maxSize = getMaximumFileSizeBytes();
 
   // Check file size
-  diag?.('▶ fs.stat(db) … start');
   const fileStat = await Promise.resolve(vsc.workspace.fs.stat(uri)).catch(() => ({ size: 0 }));
-  diag?.(`  ✓ fs.stat(db) ok (size=${fileStat.size})`);
   if (maxSize !== 0 && fileStat.size > maxSize) {
     throw new Error(`File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
   }
@@ -575,20 +524,9 @@ async function loadDatabaseFiles(
   // Construct WAL file URI
   const walUri = uri.with({ path: uri.path + '-wal' });
 
-  // Read both files concurrently. Log each independently so a hang in the main
-  // DB read vs. the optional -wal read is distinguishable in the #418 trace.
+  // Read both files concurrently
   return Promise.all([
-    (async () => {
-      diag?.('▶ fs.readFile(db) … start');
-      const r = await vsc.workspace.fs.readFile(uri);
-      diag?.(`  ✓ fs.readFile(db) ok (${r?.byteLength ?? 'null'} bytes)`);
-      return r;
-    })(),
-    (async () => {
-      diag?.('▶ fs.readFile(-wal, optional) … start');
-      const r = await Promise.resolve(vsc.workspace.fs.readFile(walUri)).catch(() => null);
-      diag?.(`  ✓ fs.readFile(-wal) settled (${r ? r.byteLength + ' bytes' : 'absent'})`);
-      return r;
-    })()
+    vsc.workspace.fs.readFile(uri),
+    Promise.resolve(vsc.workspace.fs.readFile(walUri)).catch(() => null)
   ]);
 }
