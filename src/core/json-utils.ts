@@ -9,6 +9,12 @@
 
 const MAX_DEPTH = 1000;
 
+class UnfaithfulInverseMergePatchError extends Error {
+    constructor() {
+        super('JSON inverse merge patch would not faithfully restore the prior value');
+    }
+}
+
 export function generateMergePatch(original: unknown, modified: unknown, depth = 0): unknown {
     if (depth > MAX_DEPTH) {
         throw new Error('JSON merge patch depth limit exceeded');
@@ -131,11 +137,18 @@ export function tryCreateInverseMergePatch(forwardPatchValue: unknown, priorValu
 
     const forwardPatch = parseJsonValue(forwardPatchValue);
     const prior = parseJsonValue(priorValue);
-    if (!forwardPatch.ok || !prior.ok || !isObject(prior.value)) {
+    if (!forwardPatch.ok || !prior.ok || !isObject(forwardPatch.value) || !isObject(prior.value)) {
         return undefined;
     }
 
-    return JSON.stringify(invertMergePatch(forwardPatch.value, prior.value));
+    try {
+        return JSON.stringify(invertMergePatch(forwardPatch.value, prior.value));
+    } catch (err) {
+        if (err instanceof UnfaithfulInverseMergePatchError) {
+            return undefined;
+        }
+        throw err;
+    }
 }
 
 function invertMergePatchAtDepth(forwardPatch: unknown, prior: unknown, depth: number): unknown {
@@ -155,16 +168,40 @@ function invertMergePatchAtDepth(forwardPatch: unknown, prior: unknown, depth: n
         const priorVal = priorHas ? priorObj[key] : undefined;
         const forwardVal = forwardPatch[key];
 
-        if (forwardVal === null) {
-            inverse[key] = priorHas ? priorVal : null;
-        } else if (isObject(forwardVal) && isObject(priorVal)) {
-            inverse[key] = invertMergePatchAtDepth(forwardVal, priorVal, depth + 1);
+        if (isObject(forwardVal)) {
+            if (priorHas && isObject(priorVal)) {
+                inverse[key] = invertMergePatchAtDepth(forwardVal, priorVal, depth + 1);
+            } else if (priorHas && priorVal === null) {
+                throw new UnfaithfulInverseMergePatchError();
+            } else if (priorHas) {
+                // A forward object patch replaced a scalar or array prior, so the inverse must restore that whole value.
+                inverse[key] = priorVal;
+            } else {
+                // Recurse into added objects so undo deletes only the leaves touched by the forward patch.
+                inverse[key] = invertMergePatchAtDepth(forwardVal, {}, depth + 1);
+            }
+        } else if (forwardVal === null) {
+            inverse[key] = createInverseLeafValue(priorHas, priorVal);
         } else {
-            inverse[key] = priorHas ? priorVal : null;
+            inverse[key] = createInverseLeafValue(priorHas, priorVal);
         }
     }
 
     return inverse;
+}
+
+function createInverseLeafValue(priorHas: boolean, priorVal: unknown): unknown {
+    if (!priorHas) {
+        // RFC 7396 null deletes a key, which is faithful when the forward patch added that key.
+        return null;
+    }
+
+    if (priorVal === null) {
+        // RFC 7396 null would delete this existing key instead of restoring its explicit JSON null value.
+        throw new UnfaithfulInverseMergePatchError();
+    }
+
+    return priorVal;
 }
 
 function parseJsonValue(value: string): { ok: true; value: unknown } | { ok: false } {

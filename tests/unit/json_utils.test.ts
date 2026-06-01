@@ -1,7 +1,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { generateMergePatch, applyMergePatch, invertMergePatch } from '../../src/core/json-utils';
+import { generateMergePatch, applyMergePatch, invertMergePatch, tryCreateInverseMergePatch } from '../../src/core/json-utils';
 
 describe('JSON Merge Patch (RFC 7396)', () => {
     describe('generateMergePatch', () => {
@@ -153,6 +153,46 @@ describe('JSON Merge Patch (RFC 7396)', () => {
                 meta: { reviewed: false, owner: 'ada', note: 'keep' },
                 concurrent: 'survives'
             });
+        });
+    });
+
+    describe('tryCreateInverseMergePatch', () => {
+        it('should reject scalar and array forward patches so undo can value-replace the cell', () => {
+            const prior = JSON.stringify({ a: 1 });
+
+            // RFC 7396 scalar and array patches replace the whole document, so a key-limited inverse is not faithful.
+            assert.strictEqual(tryCreateInverseMergePatch('5', prior), undefined);
+            assert.strictEqual(tryCreateInverseMergePatch('[1,2]', prior), undefined);
+        });
+
+        it('should reject inverse patches that would restore an explicit null leaf', () => {
+            const prior = JSON.stringify({ a: null, b: 1 });
+            const forward = JSON.stringify({ a: 2 });
+
+            // Emitting { a: null } would delete a instead of restoring an explicit JSON null.
+            assert.strictEqual(tryCreateInverseMergePatch(forward, prior), undefined);
+        });
+
+        it('should still emit null when deleting a key added by the forward patch', () => {
+            const prior = JSON.stringify({ b: 1 });
+            const forward = JSON.stringify({ a: 2 });
+
+            assert.deepStrictEqual(
+                JSON.parse(tryCreateInverseMergePatch(forward, prior)!),
+                { a: null }
+            );
+        });
+
+        it('should recurse into nested additions so concurrent nested siblings survive undo', () => {
+            const prior = JSON.stringify({});
+            const forward = JSON.stringify({ meta: { reviewed: true } });
+            const inverse = JSON.parse(tryCreateInverseMergePatch(forward, prior)!);
+
+            assert.deepStrictEqual(inverse, { meta: { reviewed: null } });
+            assert.deepStrictEqual(
+                applyMergePatch({ meta: { reviewed: true, note: 'keep' } }, inverse),
+                { meta: { note: 'keep' } }
+            );
         });
     });
 });

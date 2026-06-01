@@ -16,6 +16,9 @@ interface RecordedNativeCall {
     args: unknown[];
 }
 
+type NativeCallResponse = { result: unknown } | { error: string };
+type NativeCallResponder = (call: RecordedNativeCall) => NativeCallResponse;
+
 function encodeNativeMessage(message: unknown): Buffer {
     // Native worker messages are length-prefixed V8 payloads, matching NativeWorkerProcess.writeMessage.
     const payload = v8.serialize(message);
@@ -24,7 +27,10 @@ function encodeNativeMessage(message: unknown): Buffer {
     return Buffer.concat([header, payload]);
 }
 
-function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[]) {
+function createRecordingNativeProcess(
+    recordedCalls: RecordedNativeCall[],
+    respondToCall: NativeCallResponder = () => ({ result: { changes: 1, lastInsertRowId: 1 } })
+) {
     const mockProcess = new EventEmitter() as any;
     mockProcess.stdout = new EventEmitter();
     mockProcess.stderr = new EventEmitter();
@@ -50,9 +56,8 @@ function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[]) {
             const call = v8.deserialize(payload) as RecordedNativeCall;
             recordedCalls.push(call);
 
-            // Every operation under test only needs a successful native response.
             queueMicrotask(() => {
-                emitMessage({ id: call.id, result: { changes: 1, lastInsertRowId: 1 } });
+                emitMessage({ id: call.id, ...respondToCall(call) });
             });
         }
     };
@@ -198,13 +203,13 @@ describe('createNativeDatabaseConnection', () => {
         mock.restoreAll();
     });
 
-    async function createRecordingConnection(): Promise<{
+    async function createRecordingConnection(respondToCall?: NativeCallResponder): Promise<{
         databaseOps: DatabaseOperations;
         calls: RecordedNativeCall[];
         dispose: () => void;
     }> {
         const calls: RecordedNativeCall[] = [];
-        mock.method(child_process, 'spawn', () => createRecordingNativeProcess(calls));
+        mock.method(child_process, 'spawn', () => createRecordingNativeProcess(calls, respondToCall));
 
         const { createNativeDatabaseConnection } = require('../../src/nativeWorker');
         const bundle = await createNativeDatabaseConnection({ fsPath: tempDir } as any);
@@ -415,6 +420,103 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
+    it('undoes scalar forward json_patch cells through value replacement', async () => {
+        const connection = await createRecordingConnection();
+
+        try {
+            const priorValue = JSON.stringify({ a: 1 });
+            connection.calls.length = 0;
+
+            await connection.databaseOps.undoModification({
+                modificationType: 'cell_update',
+                description: 'Undo scalar patch payload',
+                targetTable: 'docs',
+                targetRowId: 7,
+                targetColumn: 'payload',
+                priorValue,
+                newValue: '5',
+                operation: 'json_patch'
+            });
+
+            assert.strictEqual(connection.calls.length, 1);
+            const [sql, params] = connection.calls[0].args as [string, unknown[]];
+            assert.strictEqual(sql, `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`);
+            assert.deepStrictEqual(params, [priorValue, 7]);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('undoes prior explicit null JSON leaves through value replacement', async () => {
+        const connection = await createRecordingConnection();
+
+        try {
+            const priorValue = JSON.stringify({ a: null, b: 1 });
+            const forwardPatch = JSON.stringify({ a: 2 });
+            connection.calls.length = 0;
+
+            await connection.databaseOps.undoModification({
+                modificationType: 'cell_update',
+                description: 'Undo explicit null leaf',
+                targetTable: 'docs',
+                targetRowId: 9,
+                targetColumn: 'payload',
+                priorValue,
+                newValue: forwardPatch,
+                operation: 'json_patch'
+            });
+
+            assert.strictEqual(connection.calls.length, 1);
+            const [sql, params] = connection.calls[0].args as [string, unknown[]];
+            assert.strictEqual(sql, `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`);
+            assert.deepStrictEqual(params, [priorValue, 9]);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('undoes nested json_patch additions without deleting concurrent nested siblings', async () => {
+        const connection = await createRecordingConnection();
+
+        try {
+            const priorValue = JSON.stringify({});
+            const forwardPatch = JSON.stringify({ meta: { reviewed: true } });
+            const concurrentPatch = JSON.stringify({ meta: { note: 'keep' } });
+            connection.calls.length = 0;
+
+            await connection.databaseOps.undoModification({
+                modificationType: 'cell_update',
+                description: 'Undo nested addition',
+                targetTable: 'docs',
+                targetRowId: 10,
+                targetColumn: 'payload',
+                priorValue,
+                newValue: forwardPatch,
+                operation: 'json_patch'
+            });
+
+            assert.strictEqual(connection.calls.length, 1);
+            const [sql, params] = connection.calls[0].args as [string, unknown[]];
+            assert.strictEqual(
+                sql,
+                `UPDATE "docs" SET "payload" = json_patch(COALESCE("payload", '{}'), ?) WHERE rowid = ?`
+            );
+
+            const inversePatch = JSON.parse(params[0] as string);
+            const currentValue = applyMergePatch(
+                applyMergePatch(JSON.parse(priorValue), JSON.parse(forwardPatch)),
+                JSON.parse(concurrentPatch)
+            );
+            assert.deepStrictEqual(inversePatch, { meta: { reviewed: null } });
+            assert.deepStrictEqual(applyMergePatch(currentValue, inversePatch), {
+                meta: { note: 'keep' }
+            });
+            assert.deepStrictEqual(params, [JSON.stringify({ meta: { reviewed: null } }), 10]);
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('undoes batch json_patch cells through per-cell inverse patch operations', async () => {
         const connection = await createRecordingConnection();
 
@@ -437,28 +539,105 @@ describe('createNativeDatabaseConnection', () => {
                 ]
             });
 
-            assert.strictEqual(connection.calls.length, 1);
-            const call = connection.calls[0];
-            assert.strictEqual(call.method, 'execBatch');
-
-            const batch = call.args[0] as {
-                sql: string;
-                paramsList?: unknown[][];
-            }[];
-
-            assert.strictEqual(batch.length, 3);
+            assert.strictEqual(connection.calls.length, 4);
+            assert.ok(connection.calls.every(call => call.method === 'run'));
             assert.strictEqual(
-                batch[0].sql,
+                connection.calls[0].args[0],
                 `UPDATE "docs" SET "payload" = json_patch(COALESCE("payload", '{}'), ?) WHERE rowid = ?`
             );
-            assert.deepStrictEqual(batch[0].paramsList, [
-                [JSON.stringify({ count: 1 }), 3],
-                [JSON.stringify({ count: 10 }), 4]
-            ]);
-            assert.strictEqual(batch[1].sql, `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`);
-            assert.deepStrictEqual(batch[1].paramsList, [[null, 5]]);
-            assert.strictEqual(batch[2].sql, `UPDATE "docs" SET "title" = ? WHERE rowid = ?`);
-            assert.deepStrictEqual(batch[2].paramsList, [['Original title', 6]]);
+            assert.deepStrictEqual(connection.calls[0].args[1], [JSON.stringify({ count: 1 }), 3]);
+            assert.strictEqual(
+                connection.calls[1].args[0],
+                `UPDATE "docs" SET "payload" = json_patch(COALESCE("payload", '{}'), ?) WHERE rowid = ?`
+            );
+            assert.deepStrictEqual(connection.calls[1].args[1], [JSON.stringify({ count: 10 }), 4]);
+            assert.strictEqual(connection.calls[2].args[0], `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`);
+            assert.deepStrictEqual(connection.calls[2].args[1], [null, 5]);
+            assert.strictEqual(connection.calls[3].args[0], `UPDATE "docs" SET "title" = ? WHERE rowid = ?`);
+            assert.deepStrictEqual(connection.calls[3].args[1], ['Original title', 6]);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('falls back to value replacement when single-cell json_patch undo reports malformed JSON', async () => {
+        let failedPatch = false;
+        const connection = await createRecordingConnection((call) => {
+            const [sql] = call.args as [string];
+            if (!failedPatch && call.method === 'run' && sql.includes('json_patch')) {
+                failedPatch = true;
+                return { error: 'malformed JSON' };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            const priorValue = JSON.stringify({ status: 'draft', owner: 'ada' });
+            const forwardPatch = JSON.stringify({ status: 'published' });
+            connection.calls.length = 0;
+
+            await connection.databaseOps.undoModification({
+                modificationType: 'cell_update',
+                description: 'Undo malformed JSON text',
+                targetTable: 'docs',
+                targetRowId: 11,
+                targetColumn: 'payload',
+                priorValue,
+                newValue: forwardPatch,
+                operation: 'json_patch'
+            });
+
+            assert.strictEqual(connection.calls.length, 2);
+            assert.strictEqual(
+                connection.calls[0].args[0],
+                `UPDATE "docs" SET "payload" = json_patch(COALESCE("payload", '{}'), ?) WHERE rowid = ?`
+            );
+            assert.strictEqual(connection.calls[1].args[0], `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`);
+            assert.deepStrictEqual(connection.calls[1].args[1], [priorValue, 11]);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('falls back per cell when batch json_patch undo reports malformed JSON', async () => {
+        let failedPatch = false;
+        const connection = await createRecordingConnection((call) => {
+            const [sql, params] = call.args as [string, unknown[]];
+            if (!failedPatch && call.method === 'run' && sql.includes('json_patch') && params[1] === 12) {
+                failedPatch = true;
+                return { error: 'malformed JSON' };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            const rowOnePrior = JSON.stringify({ status: 'draft', stable: 'one' });
+            const rowTwoPrior = JSON.stringify({ status: 'draft', stable: 'two' });
+            const forwardPatch = JSON.stringify({ status: 'published' });
+            connection.calls.length = 0;
+
+            await connection.databaseOps.undoModification({
+                modificationType: 'cell_update',
+                description: 'Undo malformed batch JSON text',
+                targetTable: 'docs',
+                affectedCells: [
+                    { rowId: 12, columnName: 'payload', priorValue: rowOnePrior, newValue: forwardPatch, operation: 'json_patch' },
+                    { rowId: 13, columnName: 'payload', priorValue: rowTwoPrior, newValue: forwardPatch, operation: 'json_patch' }
+                ]
+            });
+
+            assert.strictEqual(connection.calls.length, 3);
+            assert.strictEqual(
+                connection.calls[0].args[0],
+                `UPDATE "docs" SET "payload" = json_patch(COALESCE("payload", '{}'), ?) WHERE rowid = ?`
+            );
+            assert.strictEqual(connection.calls[1].args[0], `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`);
+            assert.deepStrictEqual(connection.calls[1].args[1], [rowOnePrior, 12]);
+            assert.strictEqual(
+                connection.calls[2].args[0],
+                `UPDATE "docs" SET "payload" = json_patch(COALESCE("payload", '{}'), ?) WHERE rowid = ?`
+            );
+            assert.deepStrictEqual(connection.calls[2].args[1], [JSON.stringify({ status: 'draft' }), 13]);
         } finally {
             connection.dispose();
         }

@@ -288,15 +288,30 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const updates = affectedCells.map(cell =>
         this.createUndoCellUpdate(cell.rowId, cell.columnName, cell.priorValue, cell.newValue, cell.operation)
       );
-      await this.updateCellBatch(targetTable, updates);
+      if (updates.some(update => update.operation === 'json_patch')) {
+        for (const update of updates) {
+          await this.applyUndoCellUpdate(targetTable, update);
+        }
+      } else {
+        await this.updateCellBatch(targetTable, updates);
+      }
     } else if (targetRowId !== undefined && targetColumn) {
       // Single cell undo
       const update = this.createUndoCellUpdate(targetRowId, targetColumn, priorValue, newValue, operation);
-      if (update.operation === 'json_patch') {
-        await this.updateCell(targetTable, targetRowId, targetColumn, null, update.value as string);
-      } else {
-        await this.updateCell(targetTable, targetRowId, targetColumn, update.value);
+      await this.applyUndoCellUpdate(targetTable, update);
+    }
+  }
+
+  private async applyUndoCellUpdate(targetTable: string, update: CellUpdate): Promise<void> {
+    if (update.operation === 'json_patch') {
+      try {
+        await this.updateCell(targetTable, update.rowId, update.column, null, update.value as string);
+      } catch {
+        // The current cell can become non-JSON after the tracked edit; the recorded prior value is the safe full-cell fallback.
+        await this.updateCell(targetTable, update.rowId, update.column, update.originalValue ?? null);
       }
+    } else {
+      await this.updateCell(targetTable, update.rowId, update.column, update.value);
     }
   }
 
@@ -311,12 +326,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const inversePatch = tryCreateInverseMergePatch(newValue, priorValue);
       if (inversePatch !== undefined) {
         // The inverse merge patch touches only keys from the original forward patch.
-        return { rowId, column, value: inversePatch, operation: 'json_patch' };
+        return { rowId, column, value: inversePatch, originalValue: priorValue ?? null, operation: 'json_patch' };
       }
     }
 
     // Non-patch edits and unparseable/non-object priors retain legacy value replacement undo.
-    return { rowId, column, value: priorValue ?? null, operation: 'set' };
+    return { rowId, column, value: priorValue ?? null, originalValue: priorValue ?? null, operation: 'set' };
   }
 
   private async undoRowInsert(targetTable: string, mod: ModificationEntry): Promise<void> {

@@ -104,12 +104,12 @@ function createUndoCellUpdate(
     const inversePatch = tryCreateInverseMergePatch(newValue, priorValue);
     if (inversePatch !== undefined) {
       // The inverse merge patch restores only keys touched by the forward patch.
-      return { rowId, column, value: inversePatch, operation: 'json_patch' };
+      return { rowId, column, value: inversePatch, originalValue: priorValue ?? null, operation: 'json_patch' };
     }
   }
 
   // Non-patch edits and unparseable/non-object priors retain legacy value replacement undo.
-  return { rowId, column, value: priorValue ?? null, operation: 'set' };
+  return { rowId, column, value: priorValue ?? null, originalValue: priorValue ?? null, operation: 'set' };
 }
 
 // ============================================================================
@@ -560,20 +560,36 @@ export async function createNativeDatabaseConnection(
           const { modificationType, targetTable, targetRowId, targetColumn, priorValue, newValue, operation, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
           if (!targetTable) return;
 
+          const applyUndoCellUpdate = async (update: CellUpdate): Promise<void> => {
+            if (update.operation === 'json_patch') {
+              try {
+                await operationsFacade.updateCell(targetTable, update.rowId, update.column, null, update.value as string);
+              } catch {
+                // A json_patch undo can fail if another edit replaced the current cell with non-JSON text.
+                await operationsFacade.updateCell(targetTable, update.rowId, update.column, update.originalValue ?? null);
+              }
+            } else {
+              await operationsFacade.updateCell(targetTable, update.rowId, update.column, update.value);
+            }
+          };
+
           switch (modificationType) {
             case 'cell_update':
               if (affectedCells) {
                 // Batch undo
-                await operationsFacade.updateCellBatch(targetTable, affectedCells.map(c =>
+                const updates = affectedCells.map(c =>
                   createUndoCellUpdate(c.rowId, c.columnName, c.priorValue, c.newValue, c.operation)
-                ));
+                );
+                if (updates.some(update => update.operation === 'json_patch')) {
+                  for (const update of updates) {
+                    await applyUndoCellUpdate(update);
+                  }
+                } else {
+                  await operationsFacade.updateCellBatch(targetTable, updates);
+                }
               } else if (targetRowId !== undefined && targetColumn) {
                 const update = createUndoCellUpdate(targetRowId, targetColumn, priorValue, newValue, operation);
-                if (update.operation === 'json_patch') {
-                  await operationsFacade.updateCell(targetTable, targetRowId, targetColumn, null, update.value as string);
-                } else {
-                  await operationsFacade.updateCell(targetTable, targetRowId, targetColumn, update.value);
-                }
+                await applyUndoCellUpdate(update);
               }
               break;
 
