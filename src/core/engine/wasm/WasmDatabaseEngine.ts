@@ -389,6 +389,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * entries fail loudly instead of silently dropping recovered edits. Redo uses
    * the historical non-strict behavior so existing undo/redo semantics are not
    * changed for entries that lack enough data to replay.
+   *
+   * Keep the non-strict redo shape paired with nativeWorker.redoModification so
+   * ModificationEntry fields keep one interpretation across web and desktop.
    */
   private async forwardApply(mod: ModificationEntry, strict: boolean): Promise<void> {
     const { modificationType, targetTable, targetRowId, targetColumn, newValue, operation, affectedCells, affectedRowIds, rowData, tableDef, columnDef, deletedColumns, droppedIndexes } = mod;

@@ -3,8 +3,74 @@ import { describe, it, mock, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as v8 from 'node:v8';
+import { EventEmitter } from 'node:events';
 import * as vscode from 'vscode';
 import { isNativeAvailable, NativeWorkerProcess } from '../../src/nativeWorker';
+import type { DatabaseOperations } from '../../src/core/types';
+
+interface RecordedNativeCall {
+    id: number;
+    method: string;
+    args: unknown[];
+}
+
+function encodeNativeMessage(message: unknown): Buffer {
+    // Native worker messages are length-prefixed V8 payloads, matching NativeWorkerProcess.writeMessage.
+    const payload = v8.serialize(message);
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(payload.byteLength, 0);
+    return Buffer.concat([header, payload]);
+}
+
+function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[]) {
+    const mockProcess = new EventEmitter() as any;
+    mockProcess.stdout = new EventEmitter();
+    mockProcess.stderr = new EventEmitter();
+    mockProcess.kill = mock.fn();
+
+    let inputBuffer = Buffer.alloc(0);
+
+    const emitMessage = (message: unknown) => {
+        mockProcess.stdout.emit('data', encodeNativeMessage(message));
+    };
+
+    const readInboundMessages = () => {
+        while (inputBuffer.length >= 4) {
+            const payloadLength = inputBuffer.readUInt32BE(0);
+            const frameLength = 4 + payloadLength;
+            if (inputBuffer.length < frameLength) {
+                return;
+            }
+
+            const payload = inputBuffer.subarray(4, frameLength);
+            inputBuffer = inputBuffer.subarray(frameLength);
+
+            const call = v8.deserialize(payload) as RecordedNativeCall;
+            recordedCalls.push(call);
+
+            // Every operation under test only needs a successful native response.
+            queueMicrotask(() => {
+                emitMessage({ id: call.id, result: { changes: 1, lastInsertRowId: 1 } });
+            });
+        }
+    };
+
+    mockProcess.stdin = {
+        write: mock.fn((chunk: Buffer) => {
+            // NativeWorkerProcess writes the header and payload separately, so buffer until a full frame arrives.
+            inputBuffer = Buffer.concat([inputBuffer, Buffer.from(chunk)]);
+            readInboundMessages();
+            return true;
+        })
+    };
+
+    queueMicrotask(() => {
+        emitMessage({ ready: true });
+    });
+
+    return mockProcess;
+}
 
 describe('isNativeAvailable', () => {
     let originalPlatform: string;
@@ -131,6 +197,25 @@ describe('createNativeDatabaseConnection', () => {
         mock.restoreAll();
     });
 
+    async function createRecordingConnection(): Promise<{
+        databaseOps: DatabaseOperations;
+        calls: RecordedNativeCall[];
+        dispose: () => void;
+    }> {
+        const calls: RecordedNativeCall[] = [];
+        mock.method(child_process, 'spawn', () => createRecordingNativeProcess(calls));
+
+        const { createNativeDatabaseConnection } = require('../../src/nativeWorker');
+        const bundle = await createNativeDatabaseConnection({ fsPath: tempDir } as any);
+        const connection = await bundle.establishConnection({ fsPath: '/db/path.sqlite' } as any, 'TestDB');
+
+        return {
+            databaseOps: connection.databaseOps,
+            calls,
+            dispose: () => bundle.workerMethods[Symbol.dispose]()
+        };
+    }
+
     it('should throw an error with context when database opening fails', async () => {
         let mockProcess: any;
         const EventEmitter = require('node:events').EventEmitter;
@@ -197,6 +282,112 @@ describe('createNativeDatabaseConnection', () => {
         );
 
         bundle.workerMethods[Symbol.dispose]();
+    });
+
+    it('replays single json_patch cell redo through the patch-aware updateCell primitive', async () => {
+        const connection = await createRecordingConnection();
+
+        try {
+            const patch = JSON.stringify({ meta: { reviewed: true } });
+            connection.calls.length = 0;
+
+            await connection.databaseOps.redoModification({
+                modificationType: 'cell_update',
+                description: 'Patch payload',
+                targetTable: 'docs',
+                targetRowId: 7,
+                targetColumn: 'payload',
+                newValue: patch,
+                operation: 'json_patch'
+            });
+
+            assert.strictEqual(connection.calls.length, 1);
+            const call = connection.calls[0];
+            assert.strictEqual(call.method, 'run');
+
+            const [sql, params] = call.args as [string, unknown[]];
+            assert.strictEqual(
+                sql,
+                `UPDATE "docs" SET "payload" = json_patch(COALESCE("payload", '{}'), ?) WHERE rowid = ?`
+            );
+            assert.notStrictEqual(sql, `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`);
+            assert.deepStrictEqual(params, [patch, 7]);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('replays batch json_patch cell redo through operation-aware updateCellBatch', async () => {
+        const connection = await createRecordingConnection();
+
+        try {
+            const firstPatch = JSON.stringify({ status: 'reviewed' });
+            const secondPatch = JSON.stringify({ status: 'approved' });
+            connection.calls.length = 0;
+
+            await connection.databaseOps.redoModification({
+                modificationType: 'cell_update',
+                description: 'Batch patch payloads',
+                targetTable: 'docs',
+                affectedCells: [
+                    { rowId: 3, columnName: 'payload', newValue: firstPatch, operation: 'json_patch' },
+                    { rowId: 4, columnName: 'payload', newValue: secondPatch, operation: 'json_patch' },
+                    { rowId: 5, columnName: 'title', newValue: 'Plain title' }
+                ]
+            });
+
+            assert.strictEqual(connection.calls.length, 1);
+            const call = connection.calls[0];
+            assert.strictEqual(call.method, 'execBatch');
+
+            const batch = call.args[0] as {
+                sql: string;
+                paramsList?: unknown[][];
+                params?: unknown[];
+            }[];
+
+            assert.strictEqual(batch.length, 2);
+            assert.strictEqual(
+                batch[0].sql,
+                `UPDATE "docs" SET "payload" = json_patch("payload", ?) WHERE rowid = ?`
+            );
+            assert.deepStrictEqual(batch[0].paramsList, [[firstPatch, 3], [secondPatch, 4]]);
+            assert.strictEqual(batch[1].sql, `UPDATE "docs" SET "title" = ? WHERE rowid = ?`);
+            assert.deepStrictEqual(batch[1].paramsList, [['Plain title', 5]]);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('replays column_drop redo by dropping recorded dependent indexes first', async () => {
+        const connection = await createRecordingConnection();
+
+        try {
+            connection.calls.length = 0;
+
+            await connection.databaseOps.redoModification({
+                modificationType: 'column_drop',
+                description: 'Drop indexed payload',
+                targetTable: 'docs',
+                deletedColumns: [{ name: 'payload', type: 'TEXT', data: [] }],
+                droppedIndexes: ['idx_docs_payload']
+            });
+
+            assert.strictEqual(connection.calls.length, 1);
+            const call = connection.calls[0];
+            assert.strictEqual(call.method, 'execBatch');
+
+            const batch = call.args[0] as { sql: string }[];
+            assert.deepStrictEqual(
+                batch.map(item => item.sql),
+                [
+                    `DROP INDEX IF EXISTS "idx_docs_payload"`,
+                    `ALTER TABLE "docs" DROP COLUMN "payload"`
+                ]
+            );
+        } finally {
+            connection.dispose();
+        }
     });
 });
 
