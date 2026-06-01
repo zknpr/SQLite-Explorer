@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.9
+
+### Bug Fixes
+
+- **VS Code for Web (vscode.dev / github.dev): databases stuck on the loading screen — root cause fixed** ([#418]). The browser extension bundle (`out/extension-browser.js`) was built as an IIFE, which exports nothing on `module.exports`. The VS Code Web extension host loads the extension entry as a CommonJS module and calls `module.exports.activate(context)`; with no `activate` export it found nothing to call, so the extension never registered its custom editor and every database spun forever on the loading screen. The browser entry is now built as CommonJS (matching the desktop build), so `activate()` runs. This is the underlying reason the web build never worked — the earlier 1.3.6/1.3.7/1.3.8 changes (worker → in-process engine, instrumentation) were necessary groundwork but could not take effect while activation itself never ran.
+
+[#418]: https://github.com/zknpr/SQLite-Explorer/issues/418
+
 ## 1.3.8
 
 ### Diagnostics
