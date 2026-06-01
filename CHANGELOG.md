@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0
+
+### Changed
+
+- **Removed the temporary #418 web open-sequence diagnostic logging.** The instrumentation added in 1.3.8 to locate the VS Code for Web loading hang is no longer needed now that the root cause is fixed (1.3.9) and verified in vscode.dev. The browser connection path (`establishConnection`, `loadDatabaseFiles`) is restored to its clean form; opening a database no longer writes `[#418 web-open]` step logs to the output channel.
+
 ## 1.3.9
 
 ### Bug Fixes
