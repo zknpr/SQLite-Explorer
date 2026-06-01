@@ -121,6 +121,7 @@ export class HostBridge implements ToastService {
     }
 
     const patch = this.tryGeneratePatch(value, originalValue);
+    const operation = patch ? 'json_patch' as const : 'set' as const;
 
     // Use specific method instead of generic exec
     // This allows the backend to handle safe SQL construction
@@ -139,7 +140,8 @@ export class HostBridge implements ToastService {
       targetTable: table,
       targetRowId: rowId,
       targetColumn: column,
-      newValue: value,
+      newValue: patch ?? value,
+      operation,
       priorValue: originalValue
     });
   }
@@ -342,7 +344,8 @@ export class HostBridge implements ToastService {
       description: `Delete columns ${columns.join(', ')} from ${table}`,
       modificationType: 'column_drop',
       targetTable: table,
-      deletedColumns: deletedColumnsData
+      deletedColumns: deletedColumnsData,
+      droppedIndexes: dependentIndexes.length > 0 ? dependentIndexes : undefined
     });
   }
 
@@ -429,11 +432,12 @@ export class HostBridge implements ToastService {
       description: `Update ${updates.length} cells in ${table}`,
       modificationType: 'cell_update',
       targetTable: table,
-      affectedCells: updates.map(u => ({
+      affectedCells: processedUpdates.map(u => ({
         rowId: u.rowId,
         columnName: u.column,
         newValue: u.value,
-        priorValue: u.originalValue
+        priorValue: u.originalValue,
+        operation: u.operation ?? 'set'
       }))
     });
   }
