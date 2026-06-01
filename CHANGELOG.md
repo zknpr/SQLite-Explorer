@@ -9,6 +9,9 @@
 ### Safety
 
 - **No silent data loss on web save failure**. When the underlying filesystem rejects a write (for example, a read-only web filesystem provider), save now surfaces a clear "Failed to save database" error. The edit history is kept uncommitted so changes can be retried or recovered, rather than being marked as saved.
+- **WAL databases open read-only in web mode**. When a database has an active write-ahead log (`-wal`), the web build opens it read-only instead of risking a save that writes back a main image missing committed WAL pages. Read-only state is enforced on the cell-editor write path too, not just on save.
+- **JSON cell edits apply as merge patches**. Editing a JSON cell applies an RFC 7396 merge patch to the stored value (web and desktop), so a concurrent change to a different key is preserved instead of being overwritten by a stale full-document write.
+- **Faithful, atomic recovery of unsaved edits**. Hot-exit restore replays uncommitted edits into a freshly opened in-memory database inside a single SAVEPOINT, rolled back on any error or cancellation, so a partially replayed database is never left behind.
 
 ## 1.4.0
 
