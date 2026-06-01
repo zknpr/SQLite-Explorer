@@ -116,7 +116,14 @@ const compileBrowserMain = () =>
     ...baseConfig,
     outfile: resolve(outDir, 'extension-browser.js'),
     platform: 'browser',
-    format: 'iife',
+    // CommonJS, NOT iife: the VS Code Web extension host loads the extension
+    // entry as a CommonJS module and calls `module.exports.activate(context)`.
+    // An iife bundle exports nothing on module.exports, so `activate` is never
+    // found — the extension "activates" (the module loads) but its activate()
+    // never runs, no custom editor is registered, and databases spin forever on
+    // the loading screen in vscode.dev. This is the root cause of #418 (the web
+    // build never worked). Desktop already uses cjs; the browser entry must too.
+    format: 'cjs',
     mainFields: ['browser', 'module', 'main'],
     external: [
       ...baseConfig.external,
