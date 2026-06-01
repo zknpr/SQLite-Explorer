@@ -2,7 +2,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
-import type { DatabaseOperations, CellUpdate } from '../../src/core/types';
+import type { DatabaseOperations, CellUpdate, ModificationEntry } from '../../src/core/types';
 
 describe('WasmDatabaseEngine', () => {
     let engine: DatabaseOperations;
@@ -117,5 +117,71 @@ describe('WasmDatabaseEngine', () => {
         // Verify rollback
         const result = await engine.executeQuery("SELECT name FROM users WHERE id = 1");
         assert.strictEqual(result[0].rows[0][0], 'Frank'); // Should remain original value
+    });
+
+    it('should replay modification entries when applyModifications restores a dirty backup', async () => {
+        // A hot-exit backup stores edit history, not full database bytes. Restoring
+        // that backup must replay each pending entry into the freshly opened
+        // in-memory database so later saves contain the recovered edits.
+        await engine.executeQuery("DROP TABLE IF EXISTS restored_users");
+        await engine.executeQuery("CREATE TABLE restored_users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
+
+        const modifications: ModificationEntry[] = [
+            {
+                description: 'Insert restored row',
+                modificationType: 'row_insert',
+                targetTable: 'restored_users',
+                targetRowId: 1,
+                rowData: { id: 1, name: 'Draft', age: 30 }
+            },
+            {
+                description: 'Update restored name',
+                modificationType: 'cell_update',
+                targetTable: 'restored_users',
+                targetRowId: 1,
+                targetColumn: 'name',
+                priorValue: 'Draft',
+                newValue: 'Recovered'
+            },
+            {
+                description: 'Update restored age',
+                modificationType: 'cell_update',
+                targetTable: 'restored_users',
+                affectedCells: [
+                    { rowId: 1, columnName: 'age', priorValue: 30, newValue: 31 }
+                ]
+            }
+        ];
+
+        await engine.applyModifications(modifications);
+
+        const result = await engine.executeQuery("SELECT id, name, age FROM restored_users ORDER BY id");
+        assert.deepStrictEqual(result[0].rows, [[1, 'Recovered', 31]]);
+    });
+
+    it('should stop replaying modifications when the restore signal is already aborted', async () => {
+        // The restore caller passes an AbortSignal from VS Code cancellation.
+        // A pre-aborted signal must fail loudly before any entry is applied.
+        await engine.executeQuery("DROP TABLE IF EXISTS aborted_restore");
+        await engine.executeQuery("CREATE TABLE aborted_restore (id INTEGER PRIMARY KEY, name TEXT)");
+
+        const controller = new AbortController();
+        controller.abort();
+
+        await assert.rejects(
+            () => engine.applyModifications([
+                {
+                    description: 'Insert aborted row',
+                    modificationType: 'row_insert',
+                    targetTable: 'aborted_restore',
+                    targetRowId: 1,
+                    rowData: { id: 1, name: 'Should not exist' }
+                }
+            ], controller.signal),
+            /aborted/i
+        );
+
+        const result = await engine.executeQuery("SELECT COUNT(*) FROM aborted_restore");
+        assert.strictEqual(result[0].rows[0][0], 0);
     });
 });

@@ -346,8 +346,20 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     // We always do this for WASM, regardless of auto-commit setting, because WASM is in-memory.
     if (this.uri.scheme === 'file') {
         try {
+            // Capture the tracker position that matches the database snapshot
+            // exported by writeToFile(). If undo, rollback, or history eviction
+            // changes the retained timeline while the async filesystem write is
+            // pending, the saved bytes no longer match the live tracker state.
+            const fileCheckpoint = this.#modificationTracker.getCurrentPosition();
+            const fileCheckpointInvalidationRevision =
+              this.#modificationTracker.getCheckpointInvalidationRevision();
             await this.databaseOperations.writeToFile(this.uri.fsPath);
-            await this.#modificationTracker.createCheckpoint();
+            if (
+              this.#modificationTracker.getCheckpointInvalidationRevision() ===
+              fileCheckpointInvalidationRevision
+            ) {
+              await this.#modificationTracker.createCheckpointAt(fileCheckpoint);
+            }
             return;
         } catch (e) {
             // Fallback if direct write fails

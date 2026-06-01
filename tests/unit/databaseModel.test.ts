@@ -7,6 +7,8 @@ import Module from 'node:module';
 import esbuild from 'esbuild';
 import { mockVscode } from './mocks/vscode';
 import { ModificationTracker } from '../../src/core/undo-history';
+import { createDatabaseEngine } from '../../src/core/sqlite-db';
+import type { DatabaseOperations, LabeledModification } from '../../src/core/types';
 
 const databaseModelPath = path.resolve(__dirname, '../../src/databaseModel.ts');
 const databaseModelSource = fs.readFileSync(databaseModelPath, 'utf8');
@@ -644,6 +646,188 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             assert.deepStrictEqual(discardedModifications, [firstModification]);
         } finally {
             mockVscode.workspace.fs = originalFs;
+        }
+    });
+
+    it('save: stays dirty when undo shrinks the timeline while file writeToFile is still pending', async () => {
+        const sourceUri = createFileUri('/test/db.sqlite');
+        let resolveWrite: () => void = () => {};
+        let markWriteStarted: () => void = () => {};
+        const writeMayFinish = new Promise<void>(resolve => {
+            resolveWrite = resolve;
+        });
+        const writeStarted = new Promise<void>(resolve => {
+            markWriteStarted = resolve;
+        });
+
+        const firstModification = {
+            label: 'First File Update',
+            description: 'Update first file item',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'name',
+            priorValue: 'before-a',
+            newValue: 'after-a'
+        };
+        const undoneModification = {
+            label: 'Second File Update',
+            description: 'Update second file item',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 2,
+            targetColumn: 'name',
+            priorValue: 'before-b',
+            newValue: 'after-b'
+        };
+        let undoSecondUpdate: (() => Promise<void>) | undefined;
+        let discardedModifications: unknown[] | undefined;
+
+        const dbOps = {
+            engineKind: Promise.resolve('wasm'),
+            writeToFile: async (filePath: string) => {
+                assert.strictEqual(filePath, '/test/db.sqlite');
+                markWriteStarted();
+                await writeMayFinish;
+            },
+            serializeDatabase: async () => {
+                throw new Error('serializeDatabase should not be called when file writeToFile succeeds');
+            },
+            undoModification: async (modification: unknown) => {
+                assert.strictEqual(modification, undoneModification);
+            },
+            discardModifications: async (mods: unknown[]) => {
+                discardedModifications = mods;
+            }
+        };
+
+        const doc = createDocBypassingFactory(dbOps, sourceUri);
+        doc.recordModification(firstModification);
+        doc.onDidChange((modification: any) => {
+            if (modification.label === 'Second File Update') {
+                undoSecondUpdate = modification.undo;
+            }
+        });
+        doc.recordModification(undoneModification);
+        assert.ok(undoSecondUpdate, 'second update undo action should be emitted');
+
+        const savePromise = doc.save();
+        await writeStarted;
+
+        await undoSecondUpdate!();
+        resolveWrite();
+        await savePromise;
+
+        await doc.revert(undefined);
+
+        assert.deepStrictEqual(discardedModifications, [firstModification]);
+    });
+});
+
+describe('DatabaseDocument hot-exit restore', () => {
+    it('replays backup modifications into the restored WASM database', async () => {
+        const result = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const engine = result.operations as DatabaseOperations & { shutdown?: () => void };
+        await engine.executeQuery("CREATE TABLE restored_items (id INTEGER PRIMARY KEY, name TEXT)");
+
+        const restoredEntries: LabeledModification[] = [
+            {
+                label: 'Insert Restored Item',
+                description: 'Insert restored item',
+                modificationType: 'row_insert',
+                targetTable: 'restored_items',
+                targetRowId: 1,
+                rowData: { id: 1, name: 'Draft' }
+            },
+            {
+                label: 'Update Restored Item',
+                description: 'Update restored item',
+                modificationType: 'cell_update',
+                targetTable: 'restored_items',
+                targetRowId: 1,
+                targetColumn: 'name',
+                priorValue: 'Draft',
+                newValue: 'Recovered'
+            }
+        ];
+        const tracker = new ModificationTracker<LabeledModification>(100);
+        for (const entry of restoredEntries) {
+            tracker.record(entry);
+        }
+
+        const backupData = tracker.serialize();
+        let applyWasCalled = false;
+        let appliedModificationCount = 0;
+        const originalApplyModifications = engine.applyModifications.bind(engine);
+        engine.applyModifications = async (mods, signal) => {
+            applyWasCalled = true;
+            appliedModificationCount = mods.length;
+            return originalApplyModifications(mods, signal);
+        };
+
+        const originalFs = mockVscode.workspace.fs;
+        const moduleCache = require('module')._cache;
+        const workerFactoryPath = require.resolve('../../src/workerFactory');
+        const originalWorkerFactoryCacheEntry = moduleCache[workerFactoryPath];
+        const databaseModelModulePath = require.resolve('../../src/databaseModel');
+
+        mockVscode.workspace.fs = {
+            ...originalFs,
+            readFile: async () => backupData
+        } as any;
+
+        moduleCache[workerFactoryPath] = {
+            id: workerFactoryPath,
+            filename: workerFactoryPath,
+            loaded: true,
+            exports: {
+                createDatabaseConnection: async () => ({
+                    establishConnection: async () => ({
+                        databaseOps: engine,
+                        isReadOnly: false
+                    }),
+                    workerMethods: {
+                        [Symbol.dispose]: () => engine.shutdown?.()
+                    }
+                })
+            }
+        };
+        delete moduleCache[databaseModelModulePath];
+
+        try {
+            const { DatabaseDocument } = require('../../src/databaseModel');
+            await DatabaseDocument.create(
+                {
+                    reporter: undefined,
+                    isVerified: true,
+                    context: { extensionUri: mockVscode.Uri.file('/ext') },
+                    forceReadOnly: false,
+                    outputChannel: undefined
+                },
+                mockVscode.Uri.file('/test/restored.db'),
+                { backupId: 'vscode-userdata:///backup/restored.db' }
+            );
+
+            const restoredRows = await engine.executeQuery(
+                "SELECT id, name FROM restored_items ORDER BY id"
+            );
+
+            assert.strictEqual(applyWasCalled, true);
+            assert.strictEqual(appliedModificationCount, 2);
+            assert.deepStrictEqual(restoredRows[0].rows, [[1, 'Recovered']]);
+        } finally {
+            mockVscode.workspace.fs = originalFs;
+            if (originalWorkerFactoryCacheEntry) {
+                moduleCache[workerFactoryPath] = originalWorkerFactoryCacheEntry;
+            } else {
+                delete moduleCache[workerFactoryPath];
+            }
+            delete moduleCache[databaseModelModulePath];
+            engine.shutdown?.();
         }
     });
 });

@@ -183,13 +183,21 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
   /**
    * Apply a batch of modifications.
-   * Currently no-op as modifications are applied via executeQuery.
+   *
+   * Hot-exit restore opens the last saved database bytes first, then replays
+   * the serialized uncommitted edit entries into that fresh in-memory database.
+   * Each entry is applied through the same forward path used by redo so restore
+   * and redo cannot drift apart.
    */
   async applyModifications(
-    _mods: ModificationEntry[],
-    _signal?: AbortSignal
+    mods: ModificationEntry[],
+    signal?: AbortSignal
   ): Promise<void> {
-    // Modifications applied directly through executeQuery
+    signal?.throwIfAborted();
+    for (const mod of mods) {
+      await this.forwardApply(mod, true);
+      signal?.throwIfAborted();
+    }
   }
 
   /**
@@ -331,16 +339,24 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /**
-   * Redo a modification.
+   * Apply one modification in the forward direction.
+   *
+   * `strict` is enabled for hot-exit restore so malformed or unsupported
+   * entries fail loudly instead of silently dropping recovered edits. Redo uses
+   * the historical non-strict behavior so existing undo/redo semantics are not
+   * changed for entries that lack enough data to replay.
    */
-  async redoModification(mod: ModificationEntry): Promise<void> {
+  private async forwardApply(mod: ModificationEntry, strict: boolean): Promise<void> {
     const { modificationType, targetTable, targetRowId, targetColumn, newValue, affectedCells, affectedRowIds, rowData, tableDef, columnDef, deletedColumns } = mod;
-    if (!targetTable) return;
+    if (!targetTable) {
+      if (strict) throw new Error(`Cannot apply ${modificationType}: missing target table`);
+      return;
+    }
 
     switch (modificationType) {
         case 'cell_update':
             if (affectedCells) {
-                // Batch redo
+                // Batch cell updates preserve the original per-cell order and values.
                 const updates = affectedCells.map(cell => ({
                     rowId: cell.rowId,
                     column: cell.columnName,
@@ -349,49 +365,70 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                 await this.updateCellBatch(targetTable, updates);
             } else if (targetRowId !== undefined && targetColumn) {
                 await this.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
+            } else if (strict) {
+                throw new Error('Cannot apply cell_update: missing target cell or affected cells');
             }
             break;
 
         case 'row_insert':
-            // Redo insert = insert again
             if (rowData) {
-                // If we have the original rowId, enforce it to maintain history consistency
+                // If the history captured a rowid, include it so restored rows
+                // keep the same identity they had before shutdown.
                 const dataToInsert = targetRowId !== undefined
                     ? { ...rowData, rowid: targetRowId }
                     : rowData;
                 await this.insertRow(targetTable, dataToInsert);
+            } else if (strict) {
+                throw new Error('Cannot apply row_insert: missing row data');
             }
             break;
 
         case 'row_delete':
-            // Redo delete = delete rows
             if (affectedRowIds) {
                 await this.deleteRows(targetTable, affectedRowIds);
+            } else if (strict) {
+                throw new Error('Cannot apply row_delete: missing affected row ids');
             }
             break;
 
         case 'column_add':
-            // Redo add column = add column
             if (targetColumn && columnDef) {
                 await this.addColumn(targetTable, targetColumn, columnDef.type, columnDef.defaultValue);
+            } else if (strict) {
+                throw new Error('Cannot apply column_add: missing column definition');
             }
             break;
 
         case 'column_drop':
-            // Redo drop column = drop column
             if (deletedColumns) {
                 const colNames = deletedColumns.map(c => c.name);
                 await this.deleteColumns(targetTable, colNames);
+            } else if (strict) {
+                throw new Error('Cannot apply column_drop: missing deleted column data');
             }
             break;
 
         case 'table_create':
-            // Redo create table
             if (tableDef && tableDef.columns) {
                 await this.createTable(targetTable, tableDef.columns);
+            } else if (strict) {
+                throw new Error('Cannot apply table_create: missing table definition');
+            }
+            break;
+
+        case 'table_drop':
+            if (strict) {
+                throw new Error('Cannot apply table_drop: forward replay is not supported');
             }
             break;
     }
+  }
+
+  /**
+   * Redo a modification.
+   */
+  async redoModification(mod: ModificationEntry): Promise<void> {
+    await this.forwardApply(mod, false);
   }
 
   /**
