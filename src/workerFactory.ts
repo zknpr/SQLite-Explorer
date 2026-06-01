@@ -66,7 +66,7 @@ interface WorkerMethods {
   ): Promise<DatabaseInitResult>;
   runQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]>;
   exportDatabase(name: string): Promise<Uint8Array>;
-  updateCell(table: string, rowId: string | number, column: string, value: CellValue): Promise<void>;
+  updateCell(table: string, rowId: string | number, column: string, value: CellValue, patch?: string): Promise<void>;
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
   deleteRows(table: string, rowIds: (string | number)[]): Promise<void>;
@@ -252,8 +252,10 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.flushChanges(signal),
         discardModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
           endpoint.discardModifications(mods, signal),
-        updateCell: (table: string, rowId: string | number, column: string, value: CellValue) =>
-          endpoint.updateCell(table, rowId, column, value),
+        // Preserve JSON merge patches when the browser facade calls the
+        // in-process endpoint directly.
+        updateCell: (table: string, rowId: string | number, column: string, value: CellValue, patch?: string) =>
+          endpoint.updateCell(table, rowId, column, value, patch),
         insertRow: (table: string, data: Record<string, CellValue>) =>
           endpoint.insertRow(table, data),
         insertRowBatch: (table: string, rows: Record<string, CellValue>[]) =>
@@ -444,8 +446,10 @@ async function createWorkerBackedWasmDatabaseConnection(
           redoModification: async () => {},
           flushChanges: async () => {},
           discardModifications: async () => {},
-          updateCell: (table: string, rowId: string | number, column: string, value: CellValue) =>
-            workerProxy.updateCell(table, rowId, column, wrapForTransfer(value)),
+          // Preserve JSON merge patches through worker RPC while still
+          // transferring Uint8Array cell values without copying.
+          updateCell: (table: string, rowId: string | number, column: string, value: CellValue, patch?: string) =>
+            workerProxy.updateCell(table, rowId, column, wrapForTransfer(value), patch),
           insertRow: (table: string, data: Record<string, CellValue>) => {
             // Wrap any Uint8Array values in the data object for zero-copy transfer
             const wrappedData: Record<string, CellValue> = {};

@@ -320,18 +320,22 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         let writeFileCalled = false;
 
         const originalFs = mockVscode.workspace.fs;
-        mockVscode.workspace.fs = {
-            ...originalFs,
-            stat: async () => {
-                statCalled = true;
-                return { size: 100 }; // Less than getFileSizeLimit()
-            },
-            writeFile: async (uri: any, content: any) => {
-                writeFileCalled = true;
-                assert.deepStrictEqual(content, new Uint8Array([1, 2, 3]));
-            },
-            readFile: async () => new Uint8Array([])
-        } as any;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                stat: async () => {
+                    statCalled = true;
+                    return { size: 100 }; // Less than getFileSizeLimit()
+                },
+                writeFile: async (uri: any, content: any) => {
+                    writeFileCalled = true;
+                    assert.deepStrictEqual(content, new Uint8Array([1, 2, 3]));
+                },
+                readFile: async () => new Uint8Array([])
+            } as any,
+            writable: true,
+            configurable: true
+        });
 
         const originalConsoleWarn = console.warn;
         let consoleWarnCalled = false;
@@ -351,7 +355,11 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             assert.strictEqual(serialized, true, 'serializeDatabase should be called');
             assert.strictEqual(writeFileCalled, true, 'fs.writeFile should be called');
         } finally {
-            mockVscode.workspace.fs = originalFs;
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
             console.warn = originalConsoleWarn;
         }
     });
@@ -372,17 +380,21 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         let writeFileCalled = false;
 
         const originalFs = mockVscode.workspace.fs;
-        mockVscode.workspace.fs = {
-            ...originalFs,
-            stat: async () => {
-                return { size: 100 };
-            },
-            writeFile: async (uri: any, content: any) => {
-                writeFileCalled = true;
-                assert.deepStrictEqual(content, new Uint8Array([1, 2, 3]));
-            },
-            readFile: async () => new Uint8Array([])
-        } as any;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                stat: async () => {
+                    return { size: 100 };
+                },
+                writeFile: async (uri: any, content: any) => {
+                    writeFileCalled = true;
+                    assert.deepStrictEqual(content, new Uint8Array([1, 2, 3]));
+                },
+                readFile: async () => new Uint8Array([])
+            } as any,
+            writable: true,
+            configurable: true
+        });
 
         const originalConsoleWarn = console.warn;
         let consoleWarnCalled = false;
@@ -401,7 +413,11 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             assert.strictEqual(serialized, true, 'serializeDatabase should be called');
             assert.strictEqual(writeFileCalled, true, 'fs.writeFile should be called');
         } finally {
-            mockVscode.workspace.fs = originalFs;
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
             console.warn = originalConsoleWarn;
         }
     });
@@ -423,15 +439,19 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         const doc = createDocBypassingFactory(dbOps, sourceUri);
 
         const originalFs = mockVscode.workspace.fs;
-        mockVscode.workspace.fs = {
-            ...originalFs,
-            writeFile: async (uri: any, content: any) => {
-                writeFileCalled = true;
-                assert.strictEqual(uri, sourceUri);
-                assert.deepStrictEqual(content, new Uint8Array([4, 5, 6]));
-            },
-            readFile: async () => new Uint8Array([])
-        } as any;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (uri: any, content: any) => {
+                    writeFileCalled = true;
+                    assert.strictEqual(uri, sourceUri);
+                    assert.deepStrictEqual(content, new Uint8Array([4, 5, 6]));
+                },
+                readFile: async () => new Uint8Array([])
+            } as any,
+            writable: true,
+            configurable: true
+        });
 
         try {
             await doc.save();
@@ -439,7 +459,11 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             assert.strictEqual(serializedName, 'test.db');
             assert.strictEqual(writeFileCalled, true, 'fs.writeFile should be called');
         } finally {
-            mockVscode.workspace.fs = originalFs;
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
         }
     });
 
@@ -465,16 +489,20 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         });
 
         const originalFs = mockVscode.workspace.fs;
-        mockVscode.workspace.fs = {
-            ...originalFs,
-            writeFile: async (uri: any, content: any) => {
-                if (uri.toString() === sourceUri.toString()) {
-                    throw new Error('NoPermissions: read-only filesystem');
-                }
-                backupContent = content;
-            },
-            readFile: async () => new Uint8Array([])
-        } as any;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (uri: any, content: any) => {
+                    if (uri.toString() === sourceUri.toString()) {
+                        throw new Error('NoPermissions: read-only filesystem');
+                    }
+                    backupContent = content;
+                },
+                readFile: async () => new Uint8Array([])
+            } as any,
+            writable: true,
+            configurable: true
+        });
 
         try {
             await assert.rejects(
@@ -490,7 +518,11 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             assert.strictEqual(uncommitted.length, 1);
             assert.strictEqual(uncommitted[0].label, 'Update Cell');
         } finally {
-            mockVscode.workspace.fs = originalFs;
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
         }
     });
 
@@ -539,16 +571,20 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         doc.recordModification(firstModification);
 
         const originalFs = mockVscode.workspace.fs;
-        mockVscode.workspace.fs = {
-            ...originalFs,
-            writeFile: async (uri: any, content: any) => {
-                assert.strictEqual(uri, sourceUri);
-                assert.deepStrictEqual(content, new Uint8Array([7, 8, 9]));
-                markWriteStarted();
-                await writeMayFinish;
-            },
-            readFile: async () => new Uint8Array([])
-        } as any;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (uri: any, content: any) => {
+                    assert.strictEqual(uri, sourceUri);
+                    assert.deepStrictEqual(content, new Uint8Array([7, 8, 9]));
+                    markWriteStarted();
+                    await writeMayFinish;
+                },
+                readFile: async () => new Uint8Array([])
+            } as any,
+            writable: true,
+            configurable: true
+        });
 
         try {
             const savePromise = doc.save();
@@ -562,7 +598,11 @@ describe('DatabaseDocument save/saveAs fallback', () => {
 
             assert.deepStrictEqual(discardedModifications, [concurrentModification]);
         } finally {
-            mockVscode.workspace.fs = originalFs;
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
         }
     });
 
@@ -622,16 +662,20 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         assert.ok(undoSecondUpdate, 'second update undo action should be emitted');
 
         const originalFs = mockVscode.workspace.fs;
-        mockVscode.workspace.fs = {
-            ...originalFs,
-            writeFile: async (uri: any, content: any) => {
-                assert.strictEqual(uri, sourceUri);
-                assert.deepStrictEqual(content, new Uint8Array([10, 11, 12]));
-                markWriteStarted();
-                await writeMayFinish;
-            },
-            readFile: async () => new Uint8Array([])
-        } as any;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (uri: any, content: any) => {
+                    assert.strictEqual(uri, sourceUri);
+                    assert.deepStrictEqual(content, new Uint8Array([10, 11, 12]));
+                    markWriteStarted();
+                    await writeMayFinish;
+                },
+                readFile: async () => new Uint8Array([])
+            } as any,
+            writable: true,
+            configurable: true
+        });
 
         try {
             const savePromise = doc.save();
@@ -645,7 +689,11 @@ describe('DatabaseDocument save/saveAs fallback', () => {
 
             assert.deepStrictEqual(discardedModifications, [firstModification]);
         } finally {
-            mockVscode.workspace.fs = originalFs;
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
         }
     });
 
@@ -775,10 +823,14 @@ describe('DatabaseDocument hot-exit restore', () => {
         const originalWorkerFactoryCacheEntry = moduleCache[workerFactoryPath];
         const databaseModelModulePath = require.resolve('../../src/databaseModel');
 
-        mockVscode.workspace.fs = {
-            ...originalFs,
-            readFile: async () => backupData
-        } as any;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                readFile: async () => backupData
+            } as any,
+            writable: true,
+            configurable: true
+        });
 
         moduleCache[workerFactoryPath] = {
             id: workerFactoryPath,
@@ -820,7 +872,11 @@ describe('DatabaseDocument hot-exit restore', () => {
             assert.strictEqual(appliedModificationCount, 2);
             assert.deepStrictEqual(restoredRows[0].rows, [[1, 'Recovered']]);
         } finally {
-            mockVscode.workspace.fs = originalFs;
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
             if (originalWorkerFactoryCacheEntry) {
                 moduleCache[workerFactoryPath] = originalWorkerFactoryCacheEntry;
             } else {

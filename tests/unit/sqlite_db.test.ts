@@ -186,4 +186,61 @@ describe('WasmDatabaseEngine', () => {
         const result = await engine.executeQuery("SELECT COUNT(*) FROM aborted_restore");
         assert.strictEqual(result[0].rows[0][0], 0);
     });
+
+    it('should check cancellation before each restored modification is replayed', async () => {
+        // This signal flips to aborted after the first replay entry has finished.
+        // applyModifications must observe that state at the next loop boundary
+        // before starting another forward replay operation.
+        await engine.executeQuery("DROP TABLE IF EXISTS boundary_abort_restore");
+        await engine.executeQuery("CREATE TABLE boundary_abort_restore (id INTEGER PRIMARY KEY, name TEXT)");
+
+        const originalInsertRow = engine.insertRow.bind(engine);
+        const startedRowIds: unknown[] = [];
+        engine.insertRow = async (table, data) => {
+            startedRowIds.push(data.id);
+            return originalInsertRow(table, data);
+        };
+
+        let checkCount = 0;
+        let isAborted = false;
+        const boundarySignal = {
+            throwIfAborted() {
+                checkCount++;
+                if (isAborted) {
+                    throw new Error('Replay aborted at loop boundary');
+                }
+                if (checkCount === 2) {
+                    isAborted = true;
+                }
+            }
+        } as AbortSignal;
+
+        try {
+            await assert.rejects(
+                () => engine.applyModifications([
+                    {
+                        description: 'Insert first row before abort boundary',
+                        modificationType: 'row_insert',
+                        targetTable: 'boundary_abort_restore',
+                        targetRowId: 1,
+                        rowData: { id: 1, name: 'First' }
+                    },
+                    {
+                        description: 'Insert second row after abort boundary',
+                        modificationType: 'row_insert',
+                        targetTable: 'boundary_abort_restore',
+                        targetRowId: 2,
+                        rowData: { id: 2, name: 'Second' }
+                    }
+                ], boundarySignal),
+                /Replay aborted at loop boundary/
+            );
+
+            assert.deepStrictEqual(startedRowIds, [1]);
+            const result = await engine.executeQuery("SELECT COUNT(*) FROM boundary_abort_restore");
+            assert.strictEqual(result[0].rows[0][0], 0);
+        } finally {
+            engine.insertRow = originalInsertRow;
+        }
+    });
 });

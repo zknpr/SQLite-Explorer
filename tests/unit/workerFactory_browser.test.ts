@@ -21,7 +21,7 @@ interface FakeEndpoint {
   redoModification?(mod: ModificationEntry): Promise<void>;
   flushChanges?(signal?: AbortSignal): Promise<void>;
   discardModifications?(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
-  updateCell(table: string, rowId: string | number, column: string, value: CellValue): Promise<void>;
+  updateCell(table: string, rowId: string | number, column: string, value: CellValue, patch?: string): Promise<void>;
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   ping(): Promise<boolean>;
@@ -119,6 +119,7 @@ describe('workerFactory browser WASM connection', () => {
   it('uses an in-process endpoint and passes raw Uint8Array values directly', async () => {
     let initConfig: DatabaseInitConfig | undefined;
     let updateCellValue: CellValue | undefined;
+    let updateCellPatch: string | undefined;
     let insertRowValue: CellValue | undefined;
     let updateBatchValue: CellValue | undefined;
 
@@ -129,8 +130,9 @@ describe('workerFactory browser WASM connection', () => {
       },
       runQuery: async () => [],
       exportDatabase: async () => new Uint8Array(),
-      updateCell: async (_table, _rowId, _column, value) => {
+      updateCell: async (_table, _rowId, _column, value, patch) => {
         updateCellValue = value;
+        updateCellPatch = patch;
       },
       insertRow: async (_table, data) => {
         insertRowValue = data.blob;
@@ -164,11 +166,14 @@ describe('workerFactory browser WASM connection', () => {
     assert.strictEqual(connection.isReadOnly, false);
 
     const blobValue = new Uint8Array([9, 8, 7]);
-    await connection.databaseOps.updateCell('items', 1, 'blob', blobValue);
+    // The browser facade calls the in-process endpoint directly, so the patch
+    // argument must survive this delegation layer alongside the raw Uint8Array.
+    await connection.databaseOps.updateCell('items', 1, 'blob', blobValue, '{"merged":true}');
     await connection.databaseOps.insertRow('items', { blob: blobValue });
     await connection.databaseOps.updateCellBatch('items', [{ rowId: 1, column: 'blob', value: blobValue }]);
 
     assert.strictEqual(updateCellValue, blobValue);
+    assert.strictEqual(updateCellPatch, '{"merged":true}');
     assert.strictEqual(insertRowValue, blobValue);
     assert.strictEqual(updateBatchValue, blobValue);
   });

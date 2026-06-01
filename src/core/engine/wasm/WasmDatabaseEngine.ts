@@ -233,6 +233,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       for (const mod of mods) {
+        // Check cancellation at the replay boundary so an aborted restore stops
+        // before the next modification starts mutating the in-memory database.
+        signal?.throwIfAborted();
         await this.forwardApply(mod, true);
         signal?.throwIfAborted();
       }

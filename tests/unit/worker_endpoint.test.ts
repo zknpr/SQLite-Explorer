@@ -163,4 +163,40 @@ describe('Worker Endpoint', () => {
 
         await endpoint.writeToFile('/tmp/test_dump.db');
     });
+
+    it('should forward JSON merge patches through updateCell to the WASM engine', async () => {
+        await endpoint.initializeDatabase('test.db', {
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false,
+            wasmBinary
+        });
+
+        await endpoint.createTable('json_items', [
+            { name: 'id', type: 'INTEGER', primaryKey: true, notNull: false },
+            { name: 'data', type: 'TEXT', primaryKey: false, notNull: false }
+        ]);
+        await endpoint.insertRow('json_items', {
+            id: 1,
+            data: '{"preserved":true,"changed":"before"}'
+        });
+
+        // The fourth argument represents the stale full-cell value. When the
+        // fifth patch argument reaches WasmDatabaseEngine.updateCell, SQLite
+        // merges it into the existing document instead of writing this stale value.
+        await endpoint.updateCell(
+            'json_items',
+            1,
+            'data',
+            '{"changed":"stale-overwrite"}',
+            '{"changed":"after","added":42}'
+        );
+
+        const tableData = await endpoint.fetchTableData('json_items', { offset: 0, limit: 10 });
+        assert.deepStrictEqual(JSON.parse(tableData.rows[0][1] as string), {
+            preserved: true,
+            changed: 'after',
+            added: 42
+        });
+    });
 });

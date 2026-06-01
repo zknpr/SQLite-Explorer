@@ -197,8 +197,10 @@ export function createWorkerEndpoint() {
       return requireEngine().discardModifications(mods, signal);
     },
 
-    async updateCell(table: string, rowId: RecordId, column: string, value: CellValue): Promise<void> {
-      return requireEngine().updateCell(table, rowId, column, value);
+    async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<void> {
+      // Forward the optional JSON merge patch so browser/in-process cell edits
+      // can update the current document instead of replacing it with stale data.
+      return requireEngine().updateCell(table, rowId, column, value, patch);
     },
 
     async insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined> {
