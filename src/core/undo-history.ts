@@ -359,7 +359,9 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     if (delta <= 0) {
       return [];
     }
-    return this.futureStack.slice(this.futureStack.length - delta);
+    // Clamp defensively: a corrupted or hand-edited backup could make delta exceed
+    // futureStack.length, where a negative slice start would silently drop entries.
+    return this.futureStack.slice(Math.max(0, this.futureStack.length - delta));
   }
 
   /**
