@@ -22,6 +22,7 @@ import { getMaximumFileSizeBytes } from './config';
 import { GlobalOutputChannel } from './main';
 
 import { ModificationTracker } from './core/undo-history';
+import { reconcileRestoredDatabase } from './core/restore-reconciler';
 import type { LabeledModification, DatabaseOperations } from './core/types';
 import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
 
@@ -151,9 +152,13 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       );
 
       try {
-        // Replay uncommitted modifications
-        await databaseOps.applyModifications(
-          tracker.getUncommittedEntries(),
+        // Reconcile the opened database to the live timeline state. WASM opens
+        // checkpoint bytes and may need forward replay or saved-edit reverts;
+        // native opens the already-live on-disk database and returns unchanged.
+        await reconcileRestoredDatabase(
+          databaseOps,
+          tracker,
+          await databaseOps.engineKind,
           cancelTokenToAbortSignal(cancellation)
         );
       } catch (err) {
