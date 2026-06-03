@@ -284,64 +284,54 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private async undoCellUpdate(targetTable: string, mod: ModificationEntry): Promise<void> {
     const { affectedCells, targetRowId, targetColumn, priorValue, newValue, operation } = mod;
     if (affectedCells) {
-      const hasJsonPatchUndo = affectedCells.some(cell => cell.operation === 'json_patch');
-      if (hasJsonPatchUndo) {
-        // JSON-patch undo reads current cells before writing restored values, so
-        // the whole history entry is protected by one savepoint for atomicity.
-        const savepointName = this.createSavepointName('sp_undo_cell_update');
-        await this.executeQuery(`SAVEPOINT ${savepointName}`);
-        try {
-          for (const cell of affectedCells) {
-            await this.undoOneCell(
-              targetTable,
-              cell.rowId,
-              cell.columnName,
-              cell.priorValue,
-              cell.newValue,
-              cell.operation
-            );
-          }
-          await this.executeQuery(`RELEASE ${savepointName}`);
-        } catch (err) {
-          await this.safeRollbackSavepoint(savepointName, 'undoCellUpdate');
-          throw err;
-        }
-      } else {
-        // Pure value-replacement batches keep the existing batch update path.
-        const updates = affectedCells.map(cell => ({
+      const updates: CellUpdate[] = [];
+      for (const cell of affectedCells) {
+        updates.push({
           rowId: cell.rowId,
           column: cell.columnName,
-          value: cell.priorValue ?? null
-        }));
-        await this.updateCellBatch(targetTable, updates);
+          value: await this.computeUndoValue(
+            targetTable,
+            cell.rowId,
+            cell.columnName,
+            cell.priorValue,
+            cell.newValue,
+            cell.operation
+          )
+        });
       }
+      await this.updateCellBatch(targetTable, updates);
     } else if (targetRowId !== undefined && targetColumn) {
-      await this.undoOneCell(targetTable, targetRowId, targetColumn, priorValue, newValue, operation);
+      await this.updateCell(
+        targetTable,
+        targetRowId,
+        targetColumn,
+        await this.computeUndoValue(targetTable, targetRowId, targetColumn, priorValue, newValue, operation)
+      );
     }
   }
 
   /**
-   * Undo one cell update. JSON-patch entries use read-modify-write so only the
-   * originally edited keys are restored; all other cell updates write priorValue.
+   * Compute the value to write for one undo cell. JSON-patch entries read the
+   * current cell and surgically restore touched keys when that can be done
+   * exactly; all other cases write the recorded prior value.
    */
-  private async undoOneCell(
-    targetTable: string,
+  private async computeUndoValue(
+    table: string,
     rowId: RecordId,
     column: string,
     priorValue: CellValue | undefined,
     newValue: CellValue | undefined,
     operation: ModificationEntry['operation']
-  ): Promise<void> {
+  ): Promise<CellValue> {
     if (operation === 'json_patch') {
-      const currentValue = await this.readCellValue(targetTable, rowId, column);
+      const currentValue = await this.readCellValue(table, rowId, column);
       const plan = computeJsonPatchUndo(currentValue, newValue, priorValue);
       if (plan.kind === 'restore') {
-        await this.updateCell(targetTable, rowId, column, plan.value);
-        return;
+        return plan.value;
       }
     }
 
-    await this.updateCell(targetTable, rowId, column, priorValue ?? null);
+    return priorValue ?? null;
   }
 
   /**

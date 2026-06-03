@@ -348,6 +348,56 @@ describe('WasmDatabaseEngine', () => {
         });
     });
 
+    it('undo restores the full prior subtree when the current nested value is not an object', async () => {
+        // The tracked patch only touched meta.reviewed. If the current meta value
+        // has since become a scalar, undo cannot preserve nested current state and
+        // must restore the complete prior meta object, including untouched owner.
+        await engine.executeQuery('DELETE FROM users');
+        const prior = JSON.stringify({ meta: { reviewed: false, owner: 'ada' } });
+        const forward = JSON.stringify({ meta: { reviewed: true } });
+        await engine.insertRow('users', { id: 1, name: 'A', age: 30, data: prior });
+        await engine.updateCell('users', 1, 'data', JSON.stringify({ meta: 'archived' }));
+
+        await engine.undoModification({
+            modificationType: 'cell_update',
+            description: 'undo scalar nested current',
+            targetTable: 'users',
+            targetRowId: 1,
+            targetColumn: 'data',
+            priorValue: prior,
+            newValue: forward,
+            operation: 'json_patch'
+        });
+
+        const result = await engine.executeQuery('SELECT data FROM users WHERE id = 1');
+        assert.deepStrictEqual(JSON.parse(result[0].rows[0][0] as string), {
+            meta: { reviewed: false, owner: 'ada' }
+        });
+    });
+
+    it('undo value-replaces cells with precision-risky integer tokens without rounding siblings', async () => {
+        // The id token is outside JavaScript's safe integer range. Undo must avoid
+        // JSON.parse/stringify read-modify-write so the untouched id remains byte-exact.
+        await engine.executeQuery('DELETE FROM users');
+        const prior = '{"id":9007199254740993,"a":1}';
+        const current = '{"id":9007199254740993,"a":2}';
+        await engine.insertRow('users', { id: 1, name: 'A', age: 30, data: current });
+
+        await engine.undoModification({
+            modificationType: 'cell_update',
+            description: 'undo precision-risky JSON patch',
+            targetTable: 'users',
+            targetRowId: 1,
+            targetColumn: 'data',
+            priorValue: prior,
+            newValue: JSON.stringify({ a: 2 }),
+            operation: 'json_patch'
+        });
+
+        const result = await engine.executeQuery('SELECT data FROM users WHERE id = 1');
+        assert.strictEqual(result[0].rows[0][0], prior);
+    });
+
     it('batch undo restores each json_patch cell, keeps concurrent siblings, and is atomic (s9)', async () => {
         // Two read-modify-write undos in one history entry must restore only the count keys.
         await engine.executeQuery('DELETE FROM users');
@@ -395,5 +445,68 @@ describe('WasmDatabaseEngine', () => {
             stable: 'two',
             concurrent: 'two'
         });
+    });
+
+    it('batch json_patch undo writes the computed restored values through updateCellBatch', async () => {
+        // The batch primitive owns SAVEPOINT atomicity. Undo computes restored
+        // values first, then delegates the write set to updateCellBatch once.
+        await engine.executeQuery('DELETE FROM users');
+        const p1 = JSON.stringify({ count: 1, stable: 'one' });
+        const p2 = JSON.stringify({ count: 10, stable: 'two' });
+        await engine.insertRow('users', { id: 1, name: 'A', age: 30, data: JSON.stringify({ count: 2, stable: 'one' }) });
+        await engine.insertRow('users', { id: 2, name: 'B', age: 31, data: JSON.stringify({ count: 11, stable: 'two' }) });
+
+        const originalUpdateCell = engine.updateCell.bind(engine);
+        const originalUpdateCellBatch = engine.updateCellBatch.bind(engine);
+        const batchCalls: CellUpdate[][] = [];
+        let singleCellWrites = 0;
+
+        engine.updateCell = async (table, rowId, column, value, patch) => {
+            singleCellWrites++;
+            return originalUpdateCell(table, rowId, column, value, patch);
+        };
+        engine.updateCellBatch = async (table, updates) => {
+            batchCalls.push(updates.map(update => ({ ...update })));
+            return originalUpdateCellBatch(table, updates);
+        };
+
+        try {
+            await engine.undoModification({
+                modificationType: 'cell_update',
+                description: 'undo batch through primitive',
+                targetTable: 'users',
+                affectedCells: [
+                    {
+                        rowId: 1,
+                        columnName: 'data',
+                        priorValue: p1,
+                        newValue: JSON.stringify({ count: 2 }),
+                        operation: 'json_patch'
+                    },
+                    {
+                        rowId: 2,
+                        columnName: 'data',
+                        priorValue: p2,
+                        newValue: JSON.stringify({ count: 11 }),
+                        operation: 'json_patch'
+                    }
+                ]
+            });
+        } finally {
+            engine.updateCell = originalUpdateCell;
+            engine.updateCellBatch = originalUpdateCellBatch;
+        }
+
+        assert.strictEqual(singleCellWrites, 0);
+        assert.strictEqual(batchCalls.length, 1);
+        assert.deepStrictEqual(batchCalls[0].map(update => ({
+            rowId: update.rowId,
+            column: update.column,
+            value: JSON.parse(update.value as string),
+            operation: update.operation
+        })), [
+            { rowId: 1, column: 'data', value: { count: 1, stable: 'one' }, operation: undefined },
+            { rowId: 2, column: 'data', value: { count: 10, stable: 'two' }, operation: undefined }
+        ]);
     });
 });
