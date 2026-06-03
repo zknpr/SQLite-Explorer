@@ -40,7 +40,7 @@ priorValue: originalValue,        // the FULL prior cell value (string | null)
 
 ## 2. Why #426's inverse-patch approach was abandoned
 
-#426 built an **inverse merge patch** (`invertMergePatch` / `tryCreateInverseMergePatch`) and applied
+PR #426 built an **inverse merge patch** (`invertMergePatch` / `tryCreateInverseMergePatch`) and applied
 it with SQLite's `json_patch(COALESCE(col,'{}'), ?)`. That representation is structurally lossy
 against RFC 7396, so each review round plugged one leak and exposed another. The PR was **closed
 with two unresolved P2 correctness holes** still open from its second review round:
@@ -94,7 +94,7 @@ non-object `current` means we cannot surgically restore into it — scenario 6. 
 **Restore walk** (reference; the §4 acceptance table is the binding contract). Clone `current`; walk
 **only the forward patch's key structure**, drawing restoration values from `prior`:
 
-```
+```text
 restoreInto(currentObj, patchObj, priorObj, depth):
   if depth > MAX_DEPTH: throw
   result = { ...currentObj }
