@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.1
+
+### Fixes
+
+- **Undo of a JSON cell edit no longer clobbers concurrent changes to other keys.** When a JSON cell was edited as a merge patch, undo now restores only the keys that edit changed (reading the current value and writing the whole object back), preserving a concurrent change to a different key of the same cell. Cells whose value is not a JSON object, and JSON numbers that cannot survive a parse/serialize round-trip (large integers, overflow, high-precision decimals), fall back to an exact whole-value restore. The undo read/compute/write is serialized so a concurrent edit cannot interleave.
+- **Hot exit and Revert now reconstruct the exact undo/redo state, including re-edited undos.** Closing with unsaved changes and reopening (or File: Revert) previously lost the redo stack, could silently drop an undo of an already-saved edit on the web build, and — if you undid a saved edit and then made a new one — failed to rebuild the branched state. The redo history and the abandoned saved edits are now persisted in the hot-exit backup and reconstructed atomically on reopen. Closes #425.
+
 ## 1.5.0
 
 ### Features
