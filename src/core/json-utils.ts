@@ -215,9 +215,12 @@ function hasPrecisionRiskyNumber(raw: unknown): boolean {
     if (!tokens) return false;
     return tokens.some(tok => {
         const n = Number(tok);
-        if (!Number.isFinite(n)) return true;
-        if (/^-?\d+$/.test(tok)) return !Number.isSafeInteger(n);
-        return false;
+        // Non-finite overflow (e.g. 1e999 -> Infinity), or any token whose exact
+        // text a JSON parse/serialize round-trip does not reproduce — large
+        // integers and high-precision decimals alike — cannot be restored by RMW
+        // without changing the stored number. Value-replace writes the recorded
+        // prior string back byte-exact instead.
+        return !Number.isFinite(n) || JSON.stringify(n) !== tok;
     });
 }
 

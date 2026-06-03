@@ -240,6 +240,18 @@ describe('computeJsonPatchUndo (RMW undo decision)', () => {
         );
     });
 
+    it('value-replaces when an untouched high-precision decimal cannot round-trip', () => {
+        // The decimal carries more precision than a JS double; JSON.parse/stringify
+        // would round it, so undo must value-replace to keep it byte-exact.
+        expectReplace(
+            computeJsonPatchUndo(
+                '{"precise":0.1234567890123456789012345,"a":2}',
+                j({ a: 2 }),
+                '{"precise":0.1234567890123456789012345,"a":1}'
+            )
+        );
+    });
+
     it('still performs a surgical restore when object cells have no precision-risky integers', () => {
         expectRestore(
             computeJsonPatchUndo(

@@ -422,6 +422,29 @@ describe('WasmDatabaseEngine', () => {
         assert.strictEqual(result[0].rows[0][0], prior);
     });
 
+    it('undo value-replaces cells with high-precision decimals without rounding siblings', async () => {
+        // The decimal carries more precision than a JS double. Undo must avoid the
+        // JSON.parse/stringify restore so the untouched value stays byte-exact.
+        await engine.executeQuery('DELETE FROM users');
+        const prior = '{"precise":0.1234567890123456789012345,"a":1}';
+        const current = '{"precise":0.1234567890123456789012345,"a":2}';
+        await engine.insertRow('users', { id: 1, name: 'A', age: 30, data: current });
+
+        await engine.undoModification({
+            modificationType: 'cell_update',
+            description: 'undo high-precision decimal',
+            targetTable: 'users',
+            targetRowId: 1,
+            targetColumn: 'data',
+            priorValue: prior,
+            newValue: JSON.stringify({ a: 2 }),
+            operation: 'json_patch'
+        });
+
+        const result = await engine.executeQuery('SELECT data FROM users WHERE id = 1');
+        assert.strictEqual(result[0].rows[0][0], prior);
+    });
+
     it('batch undo restores each json_patch cell, keeps concurrent siblings, and is atomic (s9)', async () => {
         // Two read-modify-write undos in one history entry must restore only the count keys.
         await engine.executeQuery('DELETE FROM users');
