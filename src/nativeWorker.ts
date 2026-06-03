@@ -38,6 +38,7 @@ import type {
 } from './core/types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
+import { computeJsonPatchUndo } from './core/json-utils';
 
 // ============================================================================
 // Utility Functions
@@ -535,30 +536,85 @@ export async function createNativeDatabaseConnection(
          * Undo a modification by executing the inverse SQL.
          */
         undoModification: async (mod: ModificationEntry) => {
-          const { modificationType, targetTable, targetRowId, targetColumn, priorValue, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
+          const { modificationType, targetTable, targetRowId, targetColumn, priorValue, newValue, operation, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
           if (!targetTable) return;
 
           switch (modificationType) {
-            case 'cell_update':
+            case 'cell_update': {
+              // Keep this undo interpretation paired with
+              // WasmDatabaseEngine.undoCellUpdate so ModificationEntry
+              // fields keep one interpretation across desktop and web undo.
+              const resolveUndoValue = async (
+                rowId: RecordId,
+                column: string,
+                cellPrior: CellValue | undefined,
+                cellNew: CellValue | undefined,
+                cellOperation: ModificationEntry['operation']
+              ): Promise<CellValue> => {
+                if (cellOperation === 'json_patch') {
+                  const rowIdNum = validateRowId(rowId);
+                  const read = await operationsFacade.executeQuery(
+                    `SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`,
+                    [rowIdNum]
+                  );
+                  const currentValue = (read[0]?.rows[0]?.[0] ?? null) as CellValue;
+                  const plan = computeJsonPatchUndo(currentValue, cellNew, cellPrior);
+                  if (plan.kind === 'restore') {
+                    return plan.value;
+                  }
+                }
+                return cellPrior ?? null;
+              };
+
               if (affectedCells) {
-                // Batch undo
-                const updates = affectedCells.map(c => ({
-                    rowId: c.rowId,
-                    column: c.columnName,
-                    value: c.priorValue
-                } as CellUpdate));
-                await worker.call('execBatch', [
-                    updates.map(u => ({
-                        sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(u.column)} = ? WHERE rowid = ?`,
-                        params: [u.value, Number(u.rowId)]
-                    }))
-                ]);
+                const hasJsonPatchUndo = affectedCells.some(cell => cell.operation === 'json_patch');
+                if (hasJsonPatchUndo) {
+                  // Read and compute all values first, then send one execBatch
+                  // so native SQLite applies the write set atomically.
+                  const batchItems: { sql: string; params: CellValue[] }[] = [];
+                  for (const cell of affectedCells) {
+                    const rowIdNum = validateRowId(cell.rowId);
+                    const value = await resolveUndoValue(
+                      cell.rowId,
+                      cell.columnName,
+                      cell.priorValue,
+                      cell.newValue,
+                      cell.operation
+                    );
+                    batchItems.push({
+                      sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(cell.columnName)} = ? WHERE rowid = ?`,
+                      params: [value, rowIdNum]
+                    });
+                  }
+                  if (batchItems.length > 0) {
+                    await worker.call('execBatch', [batchItems]);
+                  }
+                } else {
+                  // Pure value-replacement batches keep the existing SQL shape.
+                  const updates = affectedCells.map(c => ({
+                      rowId: c.rowId,
+                      column: c.columnName,
+                      value: c.priorValue
+                  } as CellUpdate));
+                  await worker.call('execBatch', [
+                      updates.map(u => ({
+                          sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(u.column)} = ? WHERE rowid = ?`,
+                          params: [u.value, Number(u.rowId)]
+                      }))
+                  ]);
+                }
               } else if (targetRowId !== undefined && targetColumn) {
                 const rowIdNum = Number(targetRowId);
                 const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(targetColumn)} = ? WHERE rowid = ?`;
-                await worker.call('run', [sql, [priorValue, rowIdNum]]);
+                if (operation === 'json_patch') {
+                  const value = await resolveUndoValue(targetRowId, targetColumn, priorValue, newValue, operation);
+                  await worker.call('run', [sql, [value, validateRowId(targetRowId)]]);
+                } else {
+                  await worker.call('run', [sql, [priorValue, rowIdNum]]);
+                }
               }
               break;
+            }
 
             case 'row_insert':
               if (targetRowId !== undefined) {
