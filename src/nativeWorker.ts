@@ -39,6 +39,7 @@ import type {
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 import { computeJsonPatchUndo } from './core/json-utils';
+import { serializeOperations } from './core/operation-serializer';
 
 // ============================================================================
 // Utility Functions
@@ -1215,55 +1216,7 @@ export async function createNativeDatabaseConnection(
         }
       };
 
-      // Serialize host-facing operations so multi-message sequences such as
-      // json_patch undo read/compute/write cannot interleave with another edit.
-      let operationLock: Promise<void> = Promise.resolve();
-      const withOperationLock = async <T>(operation: () => Promise<T>): Promise<T> => {
-        const previous = operationLock;
-        let release!: () => void;
-        operationLock = new Promise<void>(resolve => {
-          release = resolve;
-        });
-
-        await previous;
-        try {
-          return await operation();
-        } finally {
-          release();
-        }
-      };
-
-      const operationsFacade: DatabaseOperations = {
-        engineKind: rawOperations.engineKind,
-        executeQuery: (sql, params) => withOperationLock(() => rawOperations.executeQuery(sql, params)),
-        serializeDatabase: name => withOperationLock(() => rawOperations.serializeDatabase(name)),
-        applyModifications: (mods, signal) => withOperationLock(() => rawOperations.applyModifications(mods, signal)),
-        undoModification: mod => withOperationLock(() => rawOperations.undoModification(mod)),
-        redoModification: mod => withOperationLock(() => rawOperations.redoModification(mod)),
-        flushChanges: signal => withOperationLock(() => rawOperations.flushChanges(signal)),
-        discardModifications: (mods, signal) => withOperationLock(() => rawOperations.discardModifications(mods, signal)),
-        updateCell: (table, rowId, column, value, patch) =>
-          withOperationLock(() => rawOperations.updateCell(table, rowId, column, value, patch)),
-        insertRow: (table, data) => withOperationLock(() => rawOperations.insertRow(table, data)),
-        insertRowBatch: (table, rows) => withOperationLock(() => rawOperations.insertRowBatch(table, rows)),
-        deleteRows: (table, rowIds) => withOperationLock(() => rawOperations.deleteRows(table, rowIds)),
-        deleteColumns: (table, columns, dropDependentIndexes) =>
-          withOperationLock(() => rawOperations.deleteColumns(table, columns, dropDependentIndexes)),
-        findDependentIndexes: (table, columns) =>
-          withOperationLock(() => rawOperations.findDependentIndexes(table, columns)),
-        createTable: (table, columns) => withOperationLock(() => rawOperations.createTable(table, columns)),
-        updateCellBatch: (table, updates) => withOperationLock(() => rawOperations.updateCellBatch(table, updates)),
-        addColumn: (table, column, type, defaultValue) =>
-          withOperationLock(() => rawOperations.addColumn(table, column, type, defaultValue)),
-        fetchTableData: (table, options) => withOperationLock(() => rawOperations.fetchTableData(table, options)),
-        fetchTableCount: (table, options) => withOperationLock(() => rawOperations.fetchTableCount(table, options)),
-        fetchSchema: () => withOperationLock(() => rawOperations.fetchSchema()),
-        getTableInfo: table => withOperationLock(() => rawOperations.getTableInfo(table)),
-        getPragmas: () => withOperationLock(() => rawOperations.getPragmas()),
-        setPragma: (pragma, value) => withOperationLock(() => rawOperations.setPragma(pragma, value)),
-        ping: () => withOperationLock(() => rawOperations.ping()),
-        writeToFile: path => withOperationLock(() => rawOperations.writeToFile(path))
-      };
+      const operationsFacade = serializeOperations(rawOperations);
 
       return {
         databaseOps: operationsFacade,
