@@ -504,8 +504,10 @@ export async function createNativeDatabaseConnection(
         throw new Error(`Failed to open database "${displayName}": ${message}. Path: ${filePath}`, { cause: err });
       }
 
-      // Create operations facade
-      const operationsFacade: DatabaseOperations = {
+      // Public mutating operations are wrapped below with a per-connection
+      // promise-chain lock. The raw implementation is used for internal
+      // facade-to-facade calls so composite operations do not deadlock.
+      const rawOperations: DatabaseOperations = {
         engineKind: Promise.resolve('native'),
 
         executeQuery: async (sql: string, params?: CellValue[]): Promise<QueryResultSet[]> => {
@@ -544,20 +546,13 @@ export async function createNativeDatabaseConnection(
               // Keep this undo interpretation paired with
               // WasmDatabaseEngine.undoCellUpdate so ModificationEntry
               // fields keep one interpretation across desktop and web undo.
-              const resolveUndoValue = async (
-                rowId: RecordId,
-                column: string,
+              const computeUndoValue = (
+                currentValue: CellValue,
                 cellPrior: CellValue | undefined,
                 cellNew: CellValue | undefined,
                 cellOperation: ModificationEntry['operation']
-              ): Promise<CellValue> => {
+              ): CellValue => {
                 if (cellOperation === 'json_patch') {
-                  const rowIdNum = validateRowId(rowId);
-                  const read = await operationsFacade.executeQuery(
-                    `SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`,
-                    [rowIdNum]
-                  );
-                  const currentValue = (read[0]?.rows[0]?.[0] ?? null) as CellValue;
                   const plan = computeJsonPatchUndo(currentValue, cellNew, cellPrior);
                   if (plan.kind === 'restore') {
                     return plan.value;
@@ -567,51 +562,61 @@ export async function createNativeDatabaseConnection(
               };
 
               if (affectedCells) {
-                const hasJsonPatchUndo = affectedCells.some(cell => cell.operation === 'json_patch');
-                if (hasJsonPatchUndo) {
-                  // Read and compute all values first, then send one execBatch
-                  // so native SQLite applies the write set atomically.
-                  const batchItems: { sql: string; params: CellValue[] }[] = [];
-                  for (const cell of affectedCells) {
-                    const rowIdNum = validateRowId(cell.rowId);
-                    const value = await resolveUndoValue(
-                      cell.rowId,
-                      cell.columnName,
+                const undoValues: CellValue[] = affectedCells.map(cell => cell.priorValue ?? null);
+                const jsonPatchIndexes: number[] = [];
+                const queries: { sql: string; params: CellValue[] }[] = [];
+
+                for (let index = 0; index < affectedCells.length; index++) {
+                  const cell = affectedCells[index];
+                  if (cell.operation !== 'json_patch') continue;
+                  const rowIdNum = validateRowId(cell.rowId);
+                  jsonPatchIndexes.push(index);
+                  queries.push({
+                    sql: `SELECT ${escapeIdentifier(cell.columnName)} FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`,
+                    params: [rowIdNum]
+                  });
+                }
+
+                if (queries.length > 0) {
+                  const read = await worker.call<NativeQueryBatchResult>('queryBatch', [queries]);
+                  if (!read || !read.results || read.results.length < queries.length) {
+                    throw new Error('json_patch undo failed: queryBatch returned incomplete results');
+                  }
+
+                  for (let queryIndex = 0; queryIndex < queries.length; queryIndex++) {
+                    const cellIndex = jsonPatchIndexes[queryIndex];
+                    const cell = affectedCells[cellIndex];
+                    const currentValue = (read.results[queryIndex]?.values?.[0]?.[0] ?? null) as CellValue;
+                    undoValues[cellIndex] = computeUndoValue(
+                      currentValue,
                       cell.priorValue,
                       cell.newValue,
                       cell.operation
                     );
-                    batchItems.push({
-                      sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(cell.columnName)} = ? WHERE rowid = ?`,
-                      params: [value, rowIdNum]
-                    });
                   }
-                  if (batchItems.length > 0) {
-                    await worker.call('execBatch', [batchItems]);
-                  }
-                } else {
-                  // Pure value-replacement batches keep the existing SQL shape.
-                  const updates = affectedCells.map(c => ({
-                      rowId: c.rowId,
-                      column: c.columnName,
-                      value: c.priorValue
-                  } as CellUpdate));
-                  await worker.call('execBatch', [
-                      updates.map(u => ({
-                          sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(u.column)} = ? WHERE rowid = ?`,
-                          params: [u.value, Number(u.rowId)]
-                      }))
-                  ]);
+                }
+
+                const batchItems = affectedCells.map((cell, index) => ({
+                  sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(cell.columnName)} = ? WHERE rowid = ?`,
+                  params: [undoValues[index], validateRowId(cell.rowId)]
+                }));
+
+                if (batchItems.length > 0) {
+                  await worker.call('execBatch', [batchItems]);
                 }
               } else if (targetRowId !== undefined && targetColumn) {
-                const rowIdNum = Number(targetRowId);
+                const rowIdNum = validateRowId(targetRowId);
                 const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(targetColumn)} = ? WHERE rowid = ?`;
+                let value = priorValue ?? null;
                 if (operation === 'json_patch') {
-                  const value = await resolveUndoValue(targetRowId, targetColumn, priorValue, newValue, operation);
-                  await worker.call('run', [sql, [value, validateRowId(targetRowId)]]);
-                } else {
-                  await worker.call('run', [sql, [priorValue, rowIdNum]]);
+                  const read = await rawOperations.executeQuery(
+                    `SELECT ${escapeIdentifier(targetColumn)} FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`,
+                    [rowIdNum]
+                  );
+                  const currentValue = (read[0]?.rows[0]?.[0] ?? null) as CellValue;
+                  value = computeUndoValue(currentValue, priorValue, newValue, operation);
                 }
+                await worker.call('run', [sql, [value, rowIdNum]]);
               }
               break;
             }
@@ -624,7 +629,7 @@ export async function createNativeDatabaseConnection(
 
             case 'row_delete':
               if (deletedRows && deletedRows.length > 0) {
-                await operationsFacade.insertRowBatch(targetTable, deletedRows.map(dr => dr.row));
+                await rawOperations.insertRowBatch(targetTable, deletedRows.map(dr => dr.row));
               }
               break;
 
@@ -682,7 +687,7 @@ export async function createNativeDatabaseConnection(
           switch (modificationType) {
             case 'cell_update':
               if (affectedCells) {
-                await operationsFacade.updateCellBatch(targetTable, affectedCells.map(c => ({
+                await rawOperations.updateCellBatch(targetTable, affectedCells.map(c => ({
                   rowId: c.rowId,
                   column: c.columnName,
                   value: c.newValue ?? null,
@@ -692,9 +697,9 @@ export async function createNativeDatabaseConnection(
                 const replayOperation = normalizeReplayCellOperation(operation);
                 if (replayOperation === 'json_patch') {
                   const patch = typeof newValue === 'string' ? newValue : JSON.stringify(newValue ?? null);
-                  await operationsFacade.updateCell(targetTable, targetRowId, targetColumn, null, patch);
+                  await rawOperations.updateCell(targetTable, targetRowId, targetColumn, null, patch);
                 } else {
-                  await operationsFacade.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
+                  await rawOperations.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
                 }
               }
               break;
@@ -702,31 +707,31 @@ export async function createNativeDatabaseConnection(
             case 'row_insert':
               if (rowData) {
                 const dataToInsert = targetRowId !== undefined ? { ...rowData, rowid: targetRowId } : rowData;
-                await operationsFacade.insertRow(targetTable, dataToInsert);
+                await rawOperations.insertRow(targetTable, dataToInsert);
               }
               break;
 
             case 'row_delete':
               if (affectedRowIds) {
-                await operationsFacade.deleteRows(targetTable, affectedRowIds);
+                await rawOperations.deleteRows(targetTable, affectedRowIds);
               }
               break;
 
             case 'column_add':
               if (targetColumn && columnDef) {
-                await operationsFacade.addColumn(targetTable, targetColumn, columnDef.type, columnDef.defaultValue);
+                await rawOperations.addColumn(targetTable, targetColumn, columnDef.type, columnDef.defaultValue);
               }
               break;
 
             case 'column_drop':
               if (deletedColumns) {
-                await operationsFacade.deleteColumns(targetTable, deletedColumns.map(c => c.name), droppedIndexes ?? undefined);
+                await rawOperations.deleteColumns(targetTable, deletedColumns.map(c => c.name), droppedIndexes ?? undefined);
               }
               break;
 
             case 'table_create':
               if (tableDef && tableDef.columns) {
-                await operationsFacade.createTable(targetTable, tableDef.columns);
+                await rawOperations.createTable(targetTable, tableDef.columns);
               }
               break;
           }
@@ -735,7 +740,7 @@ export async function createNativeDatabaseConnection(
         flushChanges: async () => {},
         discardModifications: async (mods: ModificationEntry[]) => {
             for (let i = mods.length - 1; i >= 0; i--) {
-                await operationsFacade.undoModification(mods[i]);
+                await rawOperations.undoModification(mods[i]);
             }
         },
 
@@ -1208,6 +1213,56 @@ export async function createNativeDatabaseConnection(
 
           await worker.call('exec', [sql]);
         }
+      };
+
+      // Serialize host-facing operations so multi-message sequences such as
+      // json_patch undo read/compute/write cannot interleave with another edit.
+      let operationLock: Promise<void> = Promise.resolve();
+      const withOperationLock = async <T>(operation: () => Promise<T>): Promise<T> => {
+        const previous = operationLock;
+        let release!: () => void;
+        operationLock = new Promise<void>(resolve => {
+          release = resolve;
+        });
+
+        await previous;
+        try {
+          return await operation();
+        } finally {
+          release();
+        }
+      };
+
+      const operationsFacade: DatabaseOperations = {
+        engineKind: rawOperations.engineKind,
+        executeQuery: (sql, params) => withOperationLock(() => rawOperations.executeQuery(sql, params)),
+        serializeDatabase: name => withOperationLock(() => rawOperations.serializeDatabase(name)),
+        applyModifications: (mods, signal) => withOperationLock(() => rawOperations.applyModifications(mods, signal)),
+        undoModification: mod => withOperationLock(() => rawOperations.undoModification(mod)),
+        redoModification: mod => withOperationLock(() => rawOperations.redoModification(mod)),
+        flushChanges: signal => withOperationLock(() => rawOperations.flushChanges(signal)),
+        discardModifications: (mods, signal) => withOperationLock(() => rawOperations.discardModifications(mods, signal)),
+        updateCell: (table, rowId, column, value, patch) =>
+          withOperationLock(() => rawOperations.updateCell(table, rowId, column, value, patch)),
+        insertRow: (table, data) => withOperationLock(() => rawOperations.insertRow(table, data)),
+        insertRowBatch: (table, rows) => withOperationLock(() => rawOperations.insertRowBatch(table, rows)),
+        deleteRows: (table, rowIds) => withOperationLock(() => rawOperations.deleteRows(table, rowIds)),
+        deleteColumns: (table, columns, dropDependentIndexes) =>
+          withOperationLock(() => rawOperations.deleteColumns(table, columns, dropDependentIndexes)),
+        findDependentIndexes: (table, columns) =>
+          withOperationLock(() => rawOperations.findDependentIndexes(table, columns)),
+        createTable: (table, columns) => withOperationLock(() => rawOperations.createTable(table, columns)),
+        updateCellBatch: (table, updates) => withOperationLock(() => rawOperations.updateCellBatch(table, updates)),
+        addColumn: (table, column, type, defaultValue) =>
+          withOperationLock(() => rawOperations.addColumn(table, column, type, defaultValue)),
+        fetchTableData: (table, options) => withOperationLock(() => rawOperations.fetchTableData(table, options)),
+        fetchTableCount: (table, options) => withOperationLock(() => rawOperations.fetchTableCount(table, options)),
+        fetchSchema: () => withOperationLock(() => rawOperations.fetchSchema()),
+        getTableInfo: table => withOperationLock(() => rawOperations.getTableInfo(table)),
+        getPragmas: () => withOperationLock(() => rawOperations.getPragmas()),
+        setPragma: (pragma, value) => withOperationLock(() => rawOperations.setPragma(pragma, value)),
+        ping: () => withOperationLock(() => rawOperations.ping()),
+        writeToFile: path => withOperationLock(() => rawOperations.writeToFile(path))
       };
 
       return {
