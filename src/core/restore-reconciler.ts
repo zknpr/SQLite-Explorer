@@ -13,7 +13,7 @@ import type { ModificationTracker } from './undo-history';
  * @param databaseOps - Database operation facade for the restored database
  * @param tracker - Deserialized hot-exit modification tracker
  * @param engineKind - Active database engine type
- * @param signal - Optional cancellation signal used by forward replay
+ * @param signal - Optional cancellation signal checked between revert/replay steps
  */
 export async function reconcileRestoredDatabase(
   databaseOps: DatabaseOperations,
@@ -31,16 +31,24 @@ export async function reconcileRestoredDatabase(
     return;
   }
 
-  await runInSavepoint(databaseOps, 'sp_restore', async () => {
-    // Revert saved entries first to move checkpoint bytes back to the
-    // common-prefix state, then replay live entries from that boundary.
-    for (const entry of revertSeq) {
-      await databaseOps.undoModification(entry);
-    }
-    if (forward.length > 0) {
-      await databaseOps.applyModifications(forward, signal);
-    }
-  });
+  // Revert saved-then-undone entries first to move the restored bytes back to
+  // the common-prefix state, then replay the live entries from that boundary.
+  //
+  // Each engine operation is individually atomic (it opens its own
+  // transaction). We deliberately do NOT wrap the sequence in an outer
+  // SAVEPOINT: row/column undos (`undoRowDelete` -> `insertRowBatch`,
+  // `undoColumnDrop`) issue their own `BEGIN TRANSACTION`, which SQLite rejects
+  // while an outer transaction is open — wrapping them would break restoring
+  // deleted rows/columns entirely. A mid-sequence failure instead propagates to
+  // the caller (`DatabaseDocument.create`), which opens the document read-only
+  // and re-restores from the unchanged backup on the next open.
+  for (const entry of revertSeq) {
+    signal?.throwIfAborted();
+    await databaseOps.undoModification(entry);
+  }
+  if (forward.length > 0) {
+    await databaseOps.applyModifications(forward, signal);
+  }
 }
 
 /**
@@ -48,8 +56,8 @@ export async function reconcileRestoredDatabase(
  *
  * Forward entries are undone from the live timeline, then saved-undone entries
  * are re-applied in original application order. The tracker is rolled back only
- * after database mutations commit so a failed revert does not desynchronize the
- * in-memory history from the live database.
+ * after the database mutations succeed so a failed revert does not desynchronize
+ * the in-memory history from the live database.
  *
  * @param databaseOps - Database operation facade for the open database
  * @param tracker - Modification tracker for the open document
@@ -68,45 +76,24 @@ export async function revertDatabaseToSaved(
     return;
   }
 
-  await runInSavepoint(databaseOps, 'sp_revert', async () => {
-    // Discard live edits first, then re-apply saved entries that the user had
-    // undone so the final database bytes match the checkpoint exactly.
-    if (forward.length > 0) {
-      await databaseOps.discardModifications(forward, signal);
-    }
-    if (redo.length > 0) {
-      await databaseOps.applyModifications(redo, signal);
-    }
-  });
+  // Discard live edits first, then re-apply the saved entries the user had
+  // undone so the final database matches the checkpoint.
+  //
+  // Re-apply via `redoModification`, NOT `applyModifications`: the native engine
+  // implements replay in `redoModification` and treats `applyModifications` as a
+  // no-op (`src/nativeWorker.ts`), so using `applyModifications` here would
+  // silently leave a native database at the undone state while the tracker is
+  // marked clean. As in restore, the sequence is per-operation atomic rather
+  // than wrapped in a SAVEPOINT (row/column undos open their own transaction).
+  if (forward.length > 0) {
+    await databaseOps.discardModifications(forward, signal);
+  }
+  for (const entry of redo) {
+    signal?.throwIfAborted();
+    await databaseOps.redoModification(entry);
+  }
 
+  // Roll the tracker back to the checkpoint only after the database mutations
+  // succeed, so a failed revert does not desynchronize history from the data.
   tracker.rollbackToCheckpoint();
-}
-
-/**
- * Run database mutations inside a SAVEPOINT and roll back all mutations from
- * this helper if any operation in the sequence fails.
- */
-async function runInSavepoint(
-  databaseOps: DatabaseOperations,
-  prefix: string,
-  body: () => Promise<void>
-): Promise<void> {
-  if (typeof databaseOps.executeQuery !== 'function') {
-    // Some unit-test doubles only implement the mutation primitive under test.
-    // Real DatabaseOperations implementations expose executeQuery and therefore
-    // take the atomic SAVEPOINT path below.
-    await body();
-    return;
-  }
-
-  const name = `${prefix}_${Date.now()}`;
-  await databaseOps.executeQuery(`SAVEPOINT ${name}`);
-  try {
-    await body();
-    await databaseOps.executeQuery(`RELEASE ${name}`);
-  } catch (err) {
-    await databaseOps.executeQuery(`ROLLBACK TO ${name}`).catch(() => {});
-    await databaseOps.executeQuery(`RELEASE ${name}`).catch(() => {});
-    throw err;
-  }
 }

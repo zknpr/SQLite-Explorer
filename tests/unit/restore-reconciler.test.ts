@@ -277,7 +277,7 @@ describe('reconcileRestoredDatabase', () => {
     assert.strictEqual(tracker.hasUncommittedChanges(), false);
   });
 
-  it('BC-restore atomicity: rolls back prior reverts when a later revert entry fails', async () => {
+  it('BC-restore failure: a failing revert propagates and earlier reverts are not batch-rolled-back', async () => {
     const ops = await freshEngine();
     await ops.insertRow('t', { id: 1, data: 'v0' });
     await ops.updateCell('t', 1, 'data', 'v1');
@@ -290,12 +290,59 @@ describe('reconcileRestoredDatabase', () => {
     tracker.stepBack();
     tracker.stepBack();
 
+    // The reconcile runs per-operation-atomic engine calls with NO outer
+    // SAVEPOINT (an outer transaction would conflict with the BEGIN-based
+    // row/column undos and break restoring deleted rows/columns). So a failing
+    // entry propagates the error to the caller (DatabaseDocument.create opens
+    // the document read-only) but does NOT roll back reverts that already
+    // committed: 'e2' reverts first (v2 -> v1), then 'bad' fails on missing_column.
     await assert.rejects(
       reconcileRestoredDatabase(ops, roundTripTracker(tracker), 'wasm'),
       /missing_column|no such column/i
     );
 
+    // Earlier revert stayed committed (would be 'v2' if an outer SAVEPOINT had
+    // rolled the sequence back). This guards against re-introducing that wrap.
     const r = await ops.executeQuery('SELECT data FROM t WHERE id = 1');
-    assert.strictEqual(r[0].rows[0][0], 'v2');
+    assert.strictEqual(r[0].rows[0][0], 'v1');
+  });
+
+  it('BC-revert native: re-applies saved-undone edits via redoModification, not the native no-op applyModifications', async () => {
+    // The native engine implements replay in redoModification and treats
+    // applyModifications as a no-op (src/nativeWorker.ts). Mimic that contract:
+    // applyModifications records nothing, redoModification records. If
+    // revertDatabaseToSaved ever re-applies the redo via applyModifications, a
+    // native database would silently stay at the undone state — so assert it
+    // uses redoModification.
+    const redone: string[] = [];
+    const applied: string[] = [];
+    const discarded: string[] = [];
+    const mockOps = {
+      applyModifications: async (mods: LabeledModification[]) => {
+        applied.push(...mods.map((m) => m.label));
+      },
+      redoModification: async (mod: LabeledModification) => {
+        redone.push(mod.label);
+      },
+      discardModifications: async (mods: LabeledModification[]) => {
+        discarded.push(...mods.map((m) => m.label));
+      },
+      undoModification: async () => {}
+    } as unknown as DatabaseOperations;
+
+    // Branch: save [e1,e2], undo e2, then record e3 so e2 lands in revertOnRestore.
+    const tracker = new ModificationTracker<LabeledModification>();
+    tracker.record(cellEdit('e1', 'a', 'b'));
+    tracker.record(cellEdit('e2', 'b', 'c'));
+    await tracker.createCheckpoint();
+    tracker.stepBack();
+    tracker.record(cellEdit('e3', 'b', 'd'));
+
+    await restoreReconciler.revertDatabaseToSaved(mockOps, tracker);
+
+    assert.deepStrictEqual(discarded, ['e3']); // forward edit undone
+    assert.deepStrictEqual(redone, ['e2']); // saved-undone edit re-applied via redo path
+    assert.deepStrictEqual(applied, []); // never routed through the native no-op
+    assert.strictEqual(tracker.hasUncommittedChanges(), false);
   });
 });
