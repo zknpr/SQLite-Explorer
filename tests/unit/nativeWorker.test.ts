@@ -15,6 +15,19 @@ interface RecordedNativeCall {
     args: unknown[];
 }
 
+type RecordedNativeResponse = { result?: unknown; error?: string };
+type RecordedNativeResponder = (call: RecordedNativeCall) => RecordedNativeResponse | Promise<RecordedNativeResponse>;
+
+function createDeferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+}
+
 function encodeNativeMessage(message: unknown): Buffer {
     // Native worker messages are length-prefixed V8 payloads, matching NativeWorkerProcess.writeMessage.
     const payload = v8.serialize(message);
@@ -23,7 +36,7 @@ function encodeNativeMessage(message: unknown): Buffer {
     return Buffer.concat([header, payload]);
 }
 
-function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[]) {
+function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[], respondToCall?: RecordedNativeResponder) {
     const mockProcess = new EventEmitter() as any;
     mockProcess.stdout = new EventEmitter();
     mockProcess.stderr = new EventEmitter();
@@ -49,9 +62,16 @@ function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[]) {
             const call = v8.deserialize(payload) as RecordedNativeCall;
             recordedCalls.push(call);
 
-            // Every operation under test only needs a successful native response.
-            queueMicrotask(() => {
-                emitMessage({ id: call.id, result: { changes: 1, lastInsertRowId: 1 } });
+            // Tests can provide per-method native responses, including deferred
+            // promises for deterministic interleaving checks; otherwise writes
+            // receive a generic success response.
+            queueMicrotask(async () => {
+                try {
+                    const response = await (respondToCall?.(call) ?? { result: { changes: 1, lastInsertRowId: 1 } });
+                    emitMessage({ id: call.id, ...response });
+                } catch (err) {
+                    emitMessage({ id: call.id, error: err instanceof Error ? err.message : String(err) });
+                }
             });
         }
     };
@@ -197,13 +217,13 @@ describe('createNativeDatabaseConnection', () => {
         mock.restoreAll();
     });
 
-    async function createRecordingConnection(): Promise<{
+    async function createRecordingConnection(respondToCall?: RecordedNativeResponder): Promise<{
         databaseOps: DatabaseOperations;
         calls: RecordedNativeCall[];
         dispose: () => void;
     }> {
         const calls: RecordedNativeCall[] = [];
-        mock.method(child_process, 'spawn', () => createRecordingNativeProcess(calls));
+        mock.method(child_process, 'spawn', () => createRecordingNativeProcess(calls, respondToCall));
 
         const { createNativeDatabaseConnection } = require('../../src/nativeWorker');
         const bundle = await createNativeDatabaseConnection({ fsPath: tempDir } as any);
@@ -282,6 +302,238 @@ describe('createNativeDatabaseConnection', () => {
         );
 
         bundle.workerMethods[Symbol.dispose]();
+    });
+
+    it('undoes a single json_patch cell by reading current then writing the restored object', async () => {
+        // The SELECT response is the current document after the forward edit plus a concurrent key.
+        const current = { status: 'published', owner: 'ada', reviewer: 'grace' };
+        const connection = await createRecordingConnection((call) => {
+            if (call.method === 'query') {
+                return { result: { columns: ['payload'], values: [[JSON.stringify(current)]] } };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            await connection.databaseOps.undoModification({
+                modificationType: 'cell_update',
+                description: 'undo payload',
+                targetTable: 'docs',
+                targetRowId: 7,
+                targetColumn: 'payload',
+                priorValue: JSON.stringify({ status: 'draft', owner: 'ada' }),
+                newValue: JSON.stringify({ status: 'published' }),
+                operation: 'json_patch'
+            });
+
+            const queryCall = connection.calls.find(call => call.method === 'query');
+            const runCall = connection.calls.find(call => call.method === 'run');
+            assert.ok(queryCall, 'expected a SELECT read');
+            assert.ok(runCall, 'expected a SET write');
+
+            const [readSql, readParams] = queryCall.args as [string, unknown[]];
+            assert.strictEqual(readSql, `SELECT "payload" FROM "docs" WHERE rowid = ?`);
+            assert.deepStrictEqual(readParams, [7]);
+
+            const [sql, params] = runCall.args as [string, unknown[]];
+            assert.strictEqual(sql, `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`);
+            assert.deepStrictEqual(JSON.parse(params[0] as string), {
+                status: 'draft',
+                owner: 'ada',
+                reviewer: 'grace'
+            });
+            assert.strictEqual(params[1], 7);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('value-replaces a single json_patch undo when the current cell is non-object', async () => {
+        // A non-object current value makes surgical restore unsafe, but the undo still performs the read.
+        const connection = await createRecordingConnection((call) => {
+            if (call.method === 'query') {
+                return { result: { columns: ['payload'], values: [['plain text']] } };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            const prior = JSON.stringify({ status: 'draft' });
+            connection.calls.length = 0;
+            await connection.databaseOps.undoModification({
+                modificationType: 'cell_update',
+                description: 'undo payload',
+                targetTable: 'docs',
+                targetRowId: 7,
+                targetColumn: 'payload',
+                priorValue: prior,
+                newValue: JSON.stringify({ status: 'published' }),
+                operation: 'json_patch'
+            });
+
+            const queryCall = connection.calls.find(call => call.method === 'query');
+            const runCall = connection.calls.find(call => call.method === 'run');
+            assert.ok(queryCall, 'expected a SELECT read');
+            assert.ok(runCall, 'expected a SET write');
+            const [sql, params] = runCall.args as [string, unknown[]];
+            assert.strictEqual(sql, `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`);
+            assert.deepStrictEqual(params, [prior, 7]);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('undoes a batch of json_patch cells with one queryBatch read and one execBatch write', async () => {
+        // The read side is batched into one worker round-trip, and the write
+        // side remains one execBatch so restored values are applied atomically.
+        const currents: Record<number, unknown> = {
+            3: { count: 2, stable: 'one', concurrent: 'a' },
+            4: { count: 11, stable: 'two', concurrent: 'b' }
+        };
+        const connection = await createRecordingConnection((call) => {
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [Array<{ sql: string; params: unknown[] }>];
+                return {
+                    result: {
+                        results: queries.map(query => ({
+                            columns: ['payload'],
+                            values: [[JSON.stringify(currents[Number(query.params[0])])]]
+                        }))
+                    }
+                };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            await connection.databaseOps.undoModification({
+                modificationType: 'cell_update',
+                description: 'undo batch payloads',
+                targetTable: 'docs',
+                affectedCells: [
+                    {
+                        rowId: 3,
+                        columnName: 'payload',
+                        priorValue: JSON.stringify({ count: 1, stable: 'one' }),
+                        newValue: JSON.stringify({ count: 2 }),
+                        operation: 'json_patch'
+                    },
+                    {
+                        rowId: 4,
+                        columnName: 'payload',
+                        priorValue: JSON.stringify({ count: 10, stable: 'two' }),
+                        newValue: JSON.stringify({ count: 11 }),
+                        operation: 'json_patch'
+                    }
+                ]
+            });
+
+            const queryCalls = connection.calls.filter(call => call.method === 'query');
+            const queryBatchCalls = connection.calls.filter(call => call.method === 'queryBatch');
+            const batchCall = connection.calls.find(call => call.method === 'execBatch');
+            assert.strictEqual(queryCalls.length, 0);
+            assert.strictEqual(queryBatchCalls.length, 1);
+            assert.ok(batchCall, 'batch json_patch undo must write through one execBatch');
+
+            const [queries] = queryBatchCalls[0].args as [Array<{ sql: string; params: unknown[] }>];
+            assert.deepStrictEqual(queries, [
+                { sql: `SELECT "payload" FROM "docs" WHERE rowid = ?`, params: [3] },
+                { sql: `SELECT "payload" FROM "docs" WHERE rowid = ?`, params: [4] }
+            ]);
+
+            const items = (batchCall.args as [Array<{ sql: string; params: unknown[] }>])[0];
+            assert.strictEqual(items.length, 2);
+            assert.ok(items.every(item => item.sql === `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`));
+            assert.deepStrictEqual(JSON.parse(items[0].params[0] as string), {
+                count: 1,
+                stable: 'one',
+                concurrent: 'a'
+            });
+            assert.deepStrictEqual(JSON.parse(items[1].params[0] as string), {
+                count: 10,
+                stable: 'two',
+                concurrent: 'b'
+            });
+            assert.strictEqual(items[0].params[1], 3);
+            assert.strictEqual(items[1].params[1], 4);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('serializes overlapping undoModification and updateCell worker messages', async () => {
+        // The undo read is intentionally held open. A public updateCell call
+        // started during that read must wait until undo has also written, so the
+        // undo read/write sequence remains contiguous at the worker boundary.
+        const queryStarted = createDeferred<void>();
+        const queryResponse = createDeferred<RecordedNativeResponse>();
+        const connection = await createRecordingConnection((call) => {
+            if (call.method === 'query') {
+                queryStarted.resolve();
+                return queryResponse.promise;
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        let undoPromise: Promise<void> | undefined;
+        let updatePromise: Promise<void> | undefined;
+        try {
+            connection.calls.length = 0;
+            undoPromise = connection.databaseOps.undoModification({
+                modificationType: 'cell_update',
+                description: 'undo payload',
+                targetTable: 'docs',
+                targetRowId: 7,
+                targetColumn: 'payload',
+                priorValue: JSON.stringify({ status: 'draft', owner: 'ada' }),
+                newValue: JSON.stringify({ status: 'published' }),
+                operation: 'json_patch'
+            });
+
+            await queryStarted.promise;
+            updatePromise = connection.databaseOps.updateCell('docs', 7, 'payload', '{"status":"manual"}');
+            await new Promise(resolve => setImmediate(resolve));
+            await new Promise(resolve => setImmediate(resolve));
+
+            try {
+                assert.deepStrictEqual(
+                    connection.calls.map(call => call.method),
+                    ['query'],
+                    'concurrent updateCell must not write while undo is between read and write'
+                );
+            } finally {
+                queryResponse.resolve({
+                    result: {
+                        columns: ['payload'],
+                        values: [[JSON.stringify({ status: 'published', owner: 'ada', reviewer: 'grace' })]]
+                    }
+                });
+                await Promise.allSettled([undoPromise, updatePromise]);
+            }
+
+            assert.deepStrictEqual(connection.calls.map(call => call.method), ['query', 'run', 'run']);
+            const undoRun = connection.calls[1];
+            const updateRun = connection.calls[2];
+            assert.deepStrictEqual(JSON.parse((undoRun.args as [string, unknown[]])[1][0] as string), {
+                status: 'draft',
+                owner: 'ada',
+                reviewer: 'grace'
+            });
+            assert.deepStrictEqual((updateRun.args as [string, unknown[]])[1], ['{"status":"manual"}', 7]);
+        } finally {
+            queryResponse.resolve({
+                result: {
+                    columns: ['payload'],
+                    values: [[JSON.stringify({ status: 'published', owner: 'ada' })]]
+                }
+            });
+            if (undoPromise || updatePromise) {
+                await Promise.allSettled([undoPromise, updatePromise].filter(Boolean) as Promise<void>[]);
+            }
+            connection.dispose();
+        }
     });
 
     it('replays single json_patch cell redo through the patch-aware updateCell primitive', async () => {

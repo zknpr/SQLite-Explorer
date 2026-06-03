@@ -15,6 +15,7 @@ import * as vsc from 'vscode';
 import path from 'path';
 
 import { connectWorkerPort, Transfer } from './core/rpc';
+import { serializeOperations } from './core/operation-serializer';
 import { GlobalOutputChannel } from './main';
 import type {
   CellValue,
@@ -291,7 +292,7 @@ async function createInProcessWasmDatabaseConnection(
       };
 
       return {
-        databaseOps: operationsFacade,
+        databaseOps: serializeOperations(operationsFacade),
         isReadOnly: result.isReadOnly ?? false
       };
     }
