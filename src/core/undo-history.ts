@@ -344,6 +344,25 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   }
 
   /**
+   * Get saved checkpoint entries that were undone after the last save.
+   *
+   * A hot-exit restore opens WASM bytes at the checkpoint state. When the live
+   * timeline is behind that checkpoint, the restored database must undo the
+   * saved entries that are now stored on the redo stack. The returned entries
+   * are ordered exactly as they must be reverted to replay the user's undo
+   * sequence against checkpoint bytes.
+   *
+   * @returns Saved-then-undone entries in database revert order
+   */
+  getEntriesUndoneSinceCheckpoint(): T[] {
+    const delta = this.checkpointIndex - this.timeline.length;
+    if (delta <= 0) {
+      return [];
+    }
+    return this.futureStack.slice(this.futureStack.length - delta);
+  }
+
+  /**
    * Rollback to the last checkpoint.
    * Moves uncommitted modifications to redo stack.
    */
@@ -368,7 +387,8 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   serialize(): Uint8Array {
     const payload = {
       timeline: this.timeline,
-      checkpointIndex: this.checkpointIndex
+      checkpointIndex: this.checkpointIndex,
+      futureStack: this.futureStack
     };
     // Use binaryReplacer to properly serialize Uint8Array values
     const jsonStr = JSON.stringify(payload, binaryReplacer);
@@ -396,10 +416,15 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     const tracker = new ModificationTracker<T>(maxEntries, maxMemory);
     tracker.timeline = payload.timeline || [];
     tracker.checkpointIndex = payload.checkpointIndex || 0;
+    tracker.futureStack = payload.futureStack || [];
 
-    // Recalculate sizes
+    // Recalculate sizes for both active timeline entries and redo entries so
+    // restored trackers enforce the same memory accounting as live trackers.
     tracker.timelineSizes = tracker.timeline.map(calculateSize);
-    tracker.currentSize = tracker.timelineSizes.reduce((a, b) => a + b, 0);
+    tracker.futureStackSizes = tracker.futureStack.map(calculateSize);
+    tracker.currentSize =
+      tracker.timelineSizes.reduce((a, b) => a + b, 0) +
+      tracker.futureStackSizes.reduce((a, b) => a + b, 0);
 
     return tracker;
   }
