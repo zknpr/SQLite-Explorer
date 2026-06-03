@@ -398,6 +398,30 @@ describe('WasmDatabaseEngine', () => {
         assert.strictEqual(result[0].rows[0][0], prior);
     });
 
+    it('undo value-replaces cells with overflowing exponent tokens without nulling siblings', async () => {
+        // The huge token parses to Infinity in JavaScript. Undo must avoid
+        // JSON.parse/stringify read-modify-write so the untouched token does
+        // not become null and the stored prior string remains byte-exact.
+        await engine.executeQuery('DELETE FROM users');
+        const prior = '{"huge":1e999,"a":1}';
+        const current = '{"huge":1e999,"a":2}';
+        await engine.insertRow('users', { id: 1, name: 'A', age: 30, data: current });
+
+        await engine.undoModification({
+            modificationType: 'cell_update',
+            description: 'undo overflowing JSON patch number',
+            targetTable: 'users',
+            targetRowId: 1,
+            targetColumn: 'data',
+            priorValue: prior,
+            newValue: JSON.stringify({ a: 2 }),
+            operation: 'json_patch'
+        });
+
+        const result = await engine.executeQuery('SELECT data FROM users WHERE id = 1');
+        assert.strictEqual(result[0].rows[0][0], prior);
+    });
+
     it('batch undo restores each json_patch cell, keeps concurrent siblings, and is atomic (s9)', async () => {
         // Two read-modify-write undos in one history entry must restore only the count keys.
         await engine.executeQuery('DELETE FROM users');

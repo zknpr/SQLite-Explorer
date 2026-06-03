@@ -140,10 +140,10 @@ export function computeJsonPatchUndo(
     forwardPatchRaw: unknown,
     priorRaw: unknown
 ): JsonUndoPlan {
-    // Large integer tokens cannot round-trip through JSON.parse/JSON.stringify
+    // Some JSON number tokens cannot round-trip through JSON.parse/JSON.stringify
     // safely. In that case undo falls back to the recorded prior string so
     // untouched sibling numbers remain byte-exact.
-    if (hasPrecisionRiskyInteger(currentRaw) || hasPrecisionRiskyInteger(priorRaw)) {
+    if (hasPrecisionRiskyNumber(currentRaw) || hasPrecisionRiskyNumber(priorRaw)) {
         return { kind: 'replace' };
     }
 
@@ -207,13 +207,18 @@ function restoreInto(
     return result;
 }
 
-function hasPrecisionRiskyInteger(raw: unknown): boolean {
+function hasPrecisionRiskyNumber(raw: unknown): boolean {
     if (typeof raw !== 'string') return false;
-    // Neutralize string literals so only structural JSON number tokens are
-    // inspected for integer runs that JavaScript cannot represent exactly.
+    // Neutralize string literals so only structural JSON number tokens are inspected.
     const structural = raw.replace(/"(?:\\.|[^"\\])*"/g, '""');
-    const digitRuns = structural.match(/\d{16,}/g);
-    return !!digitRuns && digitRuns.some(run => !Number.isSafeInteger(Number(run)));
+    const tokens = structural.match(/-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g);
+    if (!tokens) return false;
+    return tokens.some(tok => {
+        const n = Number(tok);
+        if (!Number.isFinite(n)) return true;
+        if (/^-?\d+$/.test(tok)) return !Number.isSafeInteger(n);
+        return false;
+    });
 }
 
 function isObject(val: unknown): val is Record<string, unknown> {

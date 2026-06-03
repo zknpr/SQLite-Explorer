@@ -230,6 +230,16 @@ describe('computeJsonPatchUndo (RMW undo decision)', () => {
         );
     });
 
+    it('value-replaces when untouched exponent tokens overflow JSON number parsing', () => {
+        expectReplace(
+            computeJsonPatchUndo(
+                '{"huge":1e999,"a":2}',
+                j({ a: 2 }),
+                '{"huge":1e999,"a":1}'
+            )
+        );
+    });
+
     it('still performs a surgical restore when object cells have no precision-risky integers', () => {
         expectRestore(
             computeJsonPatchUndo(
