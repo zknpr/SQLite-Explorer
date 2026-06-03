@@ -147,6 +147,19 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
 
   private futureStack: T[] = [];
   private futureStackSizes: number[] = [];
+  /**
+   * Saved entries that were undone and then removed from redo history by a new
+   * branch edit. They are stored in database revert order so hot-exit restore
+   * can move checkpoint bytes back to the common-prefix state before replaying
+   * live forward edits.
+   */
+  private revertOnRestore: T[] = [];
+  /**
+   * Memory sizes for entries stored in revertOnRestore. These entries remain
+   * counted in currentSize because they are still required for restore/revert
+   * correctness even after they leave futureStack.
+   */
+  private revertOnRestoreSizes: number[] = [];
 
   private checkpointIndex: number = 0;
   private maxEntries: number;
@@ -201,6 +214,21 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
 
     // Calculate size of new entry
     const entrySize = calculateSize(entry);
+
+    const savedUndoneCount = this.checkpointIndex - this.timeline.length;
+    if (savedUndoneCount > 0) {
+      const start = Math.max(0, this.futureStack.length - savedUndoneCount);
+      this.revertOnRestore.push(...this.futureStack.slice(start));
+      this.revertOnRestoreSizes.push(...this.futureStackSizes.slice(start));
+
+      // Captured entries remain necessary for restore, so leave their memory in
+      // currentSize and trim futureStack down to only redo entries that the new
+      // branch truly discards.
+      this.futureStack = this.futureStack.slice(0, start);
+      this.futureStackSizes = this.futureStackSizes.slice(0, start);
+      this.checkpointIndex = this.timeline.length;
+      this.invalidateCapturedCheckpointPositions();
+    }
 
     // Subtract size of redo history that we are about to discard
     const redoSize = this.futureStackSizes.reduce((a, b) => a + b, 0);
@@ -283,7 +311,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    * @returns True if timeline differs from checkpoint
    */
   hasUncommittedChanges(): boolean {
-    return this.timeline.length !== this.checkpointIndex;
+    return this.timeline.length !== this.checkpointIndex || this.revertOnRestore.length > 0;
   }
 
   /**
@@ -291,6 +319,9 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    */
   async createCheckpoint(): Promise<void> {
     this.checkpointIndex = this.timeline.length;
+    this.currentSize -= this.revertOnRestoreSizes.reduce((a, b) => a + b, 0);
+    this.revertOnRestore = [];
+    this.revertOnRestoreSizes = [];
   }
 
   /**
@@ -332,6 +363,9 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   createCheckpointAt(position: number): void {
     const relativePosition = position - this.timelineOffset;
     this.checkpointIndex = Math.max(0, Math.min(this.timeline.length, relativePosition));
+    this.currentSize -= this.revertOnRestoreSizes.reduce((a, b) => a + b, 0);
+    this.revertOnRestore = [];
+    this.revertOnRestoreSizes = [];
   }
 
   /**
@@ -365,10 +399,38 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   }
 
   /**
+   * Get all saved checkpoint entries that restore/revert must undo first.
+   *
+   * The returned sequence is ordered newest-first for database undo. It combines
+   * entries already captured from abandoned branches with entries that are still
+   * available on the redo stack in the base undo-saved case.
+   *
+   * @returns Saved entries in database revert order
+   */
+  getCheckpointRevertSequence(): T[] {
+    return [...this.revertOnRestore, ...this.getEntriesUndoneSinceCheckpoint()];
+  }
+
+  /**
    * Rollback to the last checkpoint.
    * Moves uncommitted modifications to redo stack.
    */
   rollbackToCheckpoint(): void {
+    const savedUndoneCount = Math.max(0, this.checkpointIndex - this.timeline.length);
+    const savedUndoneStart = Math.max(0, this.futureStack.length - savedUndoneCount);
+    const savedUndone = this.futureStack.slice(savedUndoneStart);
+    const savedUndoneSizes = this.futureStackSizes.slice(savedUndoneStart);
+    let changed = false;
+
+    if (savedUndone.length > 0) {
+      // Entries below the checkpoint that are currently undone already exist on
+      // futureStack. Rolling back to saved consumes them because they become part
+      // of the active saved timeline again.
+      this.futureStack = this.futureStack.slice(0, savedUndoneStart);
+      this.futureStackSizes = this.futureStackSizes.slice(0, savedUndoneStart);
+      changed = true;
+    }
+
     const uncommittedCount = this.timeline.length - this.checkpointIndex;
     if (uncommittedCount > 0) {
       const uncommitted = this.timeline.splice(this.checkpointIndex);
@@ -376,6 +438,25 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
 
       this.futureStack.push(...uncommitted.reverse());
       this.futureStackSizes.push(...uncommittedSizes.reverse());
+      changed = true;
+    }
+
+    const restoreSequence = [...this.revertOnRestore, ...savedUndone];
+    if (restoreSequence.length > 0) {
+      // Saved-undone entries are stored newest-first for undo. Rolling back to
+      // the saved checkpoint needs them in original application order.
+      const restoreSizes = [...this.revertOnRestoreSizes, ...savedUndoneSizes];
+      const restored = restoreSequence.reverse();
+      const restoredSizes = restoreSizes.reverse();
+      this.timeline.push(...restored);
+      this.timelineSizes.push(...restoredSizes);
+      this.checkpointIndex = this.timeline.length;
+      this.revertOnRestore = [];
+      this.revertOnRestoreSizes = [];
+      changed = true;
+    }
+
+    if (changed) {
       this.invalidateCapturedCheckpointPositions();
     }
   }
@@ -390,7 +471,8 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     const payload = {
       timeline: this.timeline,
       checkpointIndex: this.checkpointIndex,
-      futureStack: this.futureStack
+      futureStack: this.futureStack,
+      revertOnRestore: this.revertOnRestore
     };
     // Use binaryReplacer to properly serialize Uint8Array values
     const jsonStr = JSON.stringify(payload, binaryReplacer);
@@ -419,14 +501,18 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     tracker.timeline = payload.timeline || [];
     tracker.checkpointIndex = payload.checkpointIndex || 0;
     tracker.futureStack = payload.futureStack || [];
+    tracker.revertOnRestore = payload.revertOnRestore || [];
 
-    // Recalculate sizes for both active timeline entries and redo entries so
-    // restored trackers enforce the same memory accounting as live trackers.
+    // Recalculate sizes for active timeline entries, redo entries, and captured
+    // branch-revert entries so restored trackers enforce the same memory
+    // accounting as live trackers.
     tracker.timelineSizes = tracker.timeline.map(calculateSize);
     tracker.futureStackSizes = tracker.futureStack.map(calculateSize);
+    tracker.revertOnRestoreSizes = tracker.revertOnRestore.map(calculateSize);
     tracker.currentSize =
       tracker.timelineSizes.reduce((a, b) => a + b, 0) +
-      tracker.futureStackSizes.reduce((a, b) => a + b, 0);
+      tracker.futureStackSizes.reduce((a, b) => a + b, 0) +
+      tracker.revertOnRestoreSizes.reduce((a, b) => a + b, 0);
 
     return tracker;
   }

@@ -46,4 +46,72 @@ describe('ModificationTracker hot-exit persistence', () => {
     t.stepBack();
     assert.deepStrictEqual(t.getEntriesUndoneSinceCheckpoint().map(e => e.label), ['e2', 'e1']);
   });
+
+  it('BC1: record after undoing a saved edit captures it and moves the checkpoint', async () => {
+    const t = new ModificationTracker<LabeledModification>();
+    t.record(entry('e1'));
+    t.record(entry('e2'));
+    await t.createCheckpoint();
+    t.stepBack();
+    t.record(entry('e3'));
+
+    assert.strictEqual(t.entryCount, 2);
+    assert.deepStrictEqual(t.getCheckpointRevertSequence().map(e => e.label), ['e2']);
+    assert.strictEqual(t.hasUncommittedChanges(), true);
+  });
+
+  it('BC2: multi-branch accumulates saved-undone in revert order', async () => {
+    const t = new ModificationTracker<LabeledModification>();
+    t.record(entry('e1'));
+    t.record(entry('e2'));
+    t.record(entry('e3'));
+    await t.createCheckpoint();
+    t.stepBack();
+    t.stepBack();
+    t.record(entry('e4'));
+
+    assert.deepStrictEqual(t.getCheckpointRevertSequence().map(e => e.label), ['e3', 'e2']);
+  });
+
+  it('BC3: a save clears revertOnRestore (clean baseline)', async () => {
+    const t = new ModificationTracker<LabeledModification>();
+    t.record(entry('e1'));
+    t.record(entry('e2'));
+    await t.createCheckpoint();
+    t.stepBack();
+    t.record(entry('e3'));
+    await t.createCheckpoint();
+
+    assert.deepStrictEqual(t.getCheckpointRevertSequence(), []);
+    assert.strictEqual(t.hasUncommittedChanges(), false);
+  });
+
+  it('BC4: serialize/deserialize round-trips revertOnRestore', async () => {
+    const t = new ModificationTracker<LabeledModification>();
+    t.record(entry('e1'));
+    t.record(entry('e2'));
+    await t.createCheckpoint();
+    t.stepBack();
+    t.record(entry('e3'));
+
+    const restored = ModificationTracker.deserialize<LabeledModification>(t.serialize());
+
+    assert.deepStrictEqual(restored.getCheckpointRevertSequence().map(e => e.label), ['e2']);
+    assert.strictEqual(restored.hasUncommittedChanges(), true);
+  });
+
+  it('BC5: rollbackToCheckpoint re-applies branched saved edits to reach the saved state', async () => {
+    const t = new ModificationTracker<LabeledModification>();
+    t.record(entry('e1'));
+    t.record(entry('e2'));
+    await t.createCheckpoint();
+    t.stepBack();
+    t.record(entry('e3'));
+
+    t.rollbackToCheckpoint();
+
+    assert.deepStrictEqual(t['timeline'].map((e: LabeledModification) => e.label), ['e1', 'e2']);
+    assert.deepStrictEqual(t.getCheckpointRevertSequence(), []);
+    assert.strictEqual(t.hasUncommittedChanges(), false);
+  });
 });
