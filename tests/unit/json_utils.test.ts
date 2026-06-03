@@ -176,6 +176,71 @@ describe('computeJsonPatchUndo (RMW undo decision)', () => {
         expectReplace(computeJsonPatchUndo(j({ added: true }), j({ added: true }), '5'));
     });
 
+    it('restores literal __proto__ keys as data without mutating prototypes', () => {
+        const priorRaw = '{"a":1,"__proto__":{"x":9}}';
+        const forwardRaw = '{"__proto__":{"x":10}}';
+        const currentRaw = '{"a":1,"b":2}';
+
+        const beforePrototype = ({} as Record<string, unknown>).x;
+        const plan = computeJsonPatchUndo(currentRaw, forwardRaw, priorRaw);
+
+        assert.strictEqual(plan.kind, 'restore');
+        const restoredRaw = (plan as { kind: 'restore'; value: string }).value;
+        assert.strictEqual(restoredRaw, '{"a":1,"b":2,"__proto__":{"x":9}}');
+        const restored = JSON.parse(restoredRaw);
+        assert.deepStrictEqual(restored.__proto__, { x: 9 });
+        assert.strictEqual(({} as Record<string, unknown>).x, beforePrototype);
+    });
+
+    it('preserves literal __proto__ and constructor keys already present on the current cell', () => {
+        const priorRaw = '{"a":1,"constructor":{"safe":1,"owner":"ada"}}';
+        const forwardRaw = '{"b":2,"constructor":{"safe":2}}';
+        const currentRaw = '{"a":1,"b":2,"__proto__":{"x":9},"constructor":{"safe":2,"owner":"ada","keep":3}}';
+
+        const plan = computeJsonPatchUndo(currentRaw, forwardRaw, priorRaw);
+
+        assert.strictEqual(plan.kind, 'restore');
+        const restoredRaw = (plan as { kind: 'restore'; value: string }).value;
+        assert.strictEqual(restoredRaw.includes('"__proto__":{"x":9}'), true);
+        expectRestore(
+            plan,
+            JSON.parse('{"a":1,"__proto__":{"x":9},"constructor":{"safe":1,"owner":"ada","keep":3}}')
+        );
+        assert.strictEqual(({} as Record<string, unknown>).x, undefined);
+    });
+
+    it('restores the full prior subtree when the current nested value is no longer an object', () => {
+        expectRestore(
+            computeJsonPatchUndo(
+                j({ meta: 'archived' }),
+                j({ meta: { reviewed: true } }),
+                j({ meta: { reviewed: false, owner: 'ada' } })
+            ),
+            { meta: { reviewed: false, owner: 'ada' } }
+        );
+    });
+
+    it('value-replaces when untouched integer tokens cannot survive JSON parse/stringify exactly', () => {
+        expectReplace(
+            computeJsonPatchUndo(
+                '{"id":9007199254740993,"a":2}',
+                j({ a: 2 }),
+                '{"id":9007199254740993,"a":1}'
+            )
+        );
+    });
+
+    it('still performs a surgical restore when object cells have no precision-risky integers', () => {
+        expectRestore(
+            computeJsonPatchUndo(
+                j({ id: 42, a: 2, untouched: 'keep' }),
+                j({ a: 2 }),
+                j({ id: 42, a: 1 })
+            ),
+            { id: 42, a: 1, untouched: 'keep' }
+        );
+    });
+
     it('invariant: round-trips an object edit (no concurrent change) back to prior', () => {
         const prior = { status: 'draft', meta: { reviewed: false, owner: 'ada' } };
         const forward = generateMergePatch(prior, { status: 'published', meta: { reviewed: true, owner: 'ada' } });

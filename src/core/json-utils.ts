@@ -140,6 +140,13 @@ export function computeJsonPatchUndo(
     forwardPatchRaw: unknown,
     priorRaw: unknown
 ): JsonUndoPlan {
+    // Large integer tokens cannot round-trip through JSON.parse/JSON.stringify
+    // safely. In that case undo falls back to the recorded prior string so
+    // untouched sibling numbers remain byte-exact.
+    if (hasPrecisionRiskyInteger(currentRaw) || hasPrecisionRiskyInteger(priorRaw)) {
+        return { kind: 'replace' };
+    }
+
     const current = parseJsonObject(currentRaw);
     const forwardPatch = parseJsonObject(forwardPatchRaw);
     const prior = parseJsonObject(priorRaw);
@@ -162,7 +169,9 @@ function restoreInto(
     if (depth > MAX_DEPTH) {
         throw new Error('JSON undo restore depth limit exceeded');
     }
-    const result: Record<string, unknown> = { ...currentObj };
+    // Null-prototype clones treat keys such as "__proto__" and "constructor"
+    // as ordinary JSON data instead of inherited accessors/properties.
+    const result: Record<string, unknown> = Object.assign(Object.create(null), currentObj);
     for (const key of Object.keys(patchObj)) {
         const pv = patchObj[key];
         const priorHas = Object.prototype.hasOwnProperty.call(priorObj, key);
@@ -170,13 +179,19 @@ function restoreInto(
 
         if (isObject(pv)) {
             if (priorHas && isObject(priorVal)) {
-                const base = isObject(result[key]) ? (result[key] as Record<string, unknown>) : {};
-                result[key] = restoreInto(base, pv, priorVal, depth + 1);
+                if (Object.prototype.hasOwnProperty.call(result, key) && isObject(result[key])) {
+                    const base = result[key] as Record<string, unknown>;
+                    result[key] = restoreInto(base, pv, priorVal, depth + 1);
+                } else {
+                    result[key] = priorVal;
+                }
             } else if (priorHas) {
                 result[key] = priorVal;
             } else {
-                const base = isObject(result[key]) ? (result[key] as Record<string, unknown>) : {};
-                const child = restoreInto(base, pv, {}, depth + 1);
+                const base = (Object.prototype.hasOwnProperty.call(result, key) && isObject(result[key]))
+                    ? (result[key] as Record<string, unknown>)
+                    : Object.create(null);
+                const child = restoreInto(base, pv, Object.create(null), depth + 1);
                 if (Object.keys(child).length === 0) {
                     delete result[key];
                 } else {
@@ -190,6 +205,15 @@ function restoreInto(
         }
     }
     return result;
+}
+
+function hasPrecisionRiskyInteger(raw: unknown): boolean {
+    if (typeof raw !== 'string') return false;
+    // Neutralize string literals so only structural JSON number tokens are
+    // inspected for integer runs that JavaScript cannot represent exactly.
+    const structural = raw.replace(/"(?:\\.|[^"\\])*"/g, '""');
+    const digitRuns = structural.match(/\d{16,}/g);
+    return !!digitRuns && digitRuns.some(run => !Number.isSafeInteger(Number(run)));
 }
 
 function isObject(val: unknown): val is Record<string, unknown> {
