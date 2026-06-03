@@ -22,7 +22,7 @@ import { getMaximumFileSizeBytes } from './config';
 import { GlobalOutputChannel } from './main';
 
 import { ModificationTracker } from './core/undo-history';
-import { reconcileRestoredDatabase } from './core/restore-reconciler';
+import { reconcileRestoredDatabase, revertDatabaseToSaved } from './core/restore-reconciler';
 import type { LabeledModification, DatabaseOperations } from './core/types';
 import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
 
@@ -444,10 +444,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   async revert(cancellation: vsc.CancellationToken): Promise<void> {
     await this.ensureWritable();
-    const uncommitted = this.#modificationTracker.getUncommittedEntries();
-    this.#modificationTracker.rollbackToCheckpoint();
-    await this.databaseOperations.discardModifications(
-      uncommitted,
+    await revertDatabaseToSaved(
+      this.databaseOperations,
+      this.#modificationTracker,
       cancelTokenToAbortSignal(cancellation)
     );
     this.#contentChangeEmitter.fire({});
