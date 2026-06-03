@@ -114,4 +114,31 @@ describe('ModificationTracker hot-exit persistence', () => {
     assert.deepStrictEqual(t.getCheckpointRevertSequence(), []);
     assert.strictEqual(t.hasUncommittedChanges(), false);
   });
+
+  it('BC6: a branch does not invalidate an in-flight save started after the undo; the save clears revertOnRestore', async () => {
+    const t = new ModificationTracker<LabeledModification>();
+    t.record(entry('e1'));
+    t.record(entry('e2'));
+    await t.createCheckpoint(); // saved = [e1, e2]
+    t.stepBack(); // undo e2 -> the async save below writes the [e1] state
+
+    // Capture what an in-flight async save of the undone [e1] state would hold.
+    const savePosition = t.getCurrentPosition();
+    const saveRevision = t.getCheckpointInvalidationRevision();
+
+    t.record(entry('e3')); // branch while that save is still writing
+
+    // The branch must NOT bump the invalidation revision: the save's bytes ([e1])
+    // still match the captured common-prefix position, so save() will commit its
+    // checkpoint. (Re-adding invalidateCapturedCheckpointPositions() here breaks this.)
+    assert.strictEqual(t.getCheckpointInvalidationRevision(), saveRevision);
+
+    // Save completes and commits -> clears revertOnRestore so the tracker's saved
+    // state matches the [e1] bytes on disk, not the stale [e1, e2].
+    t.createCheckpointAt(savePosition);
+
+    assert.deepStrictEqual(t.getCheckpointRevertSequence(), []); // e2 no longer saved-undone
+    assert.deepStrictEqual(t.getUncommittedEntries().map((e) => e.label), ['e3']);
+    assert.strictEqual(t.hasUncommittedChanges(), true); // e3 still uncommitted
+  });
 });

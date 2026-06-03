@@ -227,7 +227,16 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
       this.futureStack = this.futureStack.slice(0, start);
       this.futureStackSizes = this.futureStackSizes.slice(0, start);
       this.checkpointIndex = this.timeline.length;
-      this.invalidateCapturedCheckpointPositions();
+
+      // Intentionally do NOT invalidate captured save positions here. Any
+      // in-flight save that predates this undo+branch was already invalidated by
+      // stepBack() (line ~285); a save that started *after* the undo is writing
+      // exactly this common-prefix state, so it must be allowed to commit its
+      // checkpoint — createCheckpointAt() then clears revertOnRestore to match
+      // the bytes now on disk. Invalidating here would make save() skip that
+      // checkpoint and leave revertOnRestore describing the pre-save state,
+      // desyncing File>Revert and hot-exit restore from the saved file
+      // (Codex P2, #434).
     }
 
     // Subtract size of redo history that we are about to discard
