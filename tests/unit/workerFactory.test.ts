@@ -9,29 +9,18 @@ const moduleCache = require('module')._cache;
 let connectionFailed = false;
 let workerTerminated = false;
 
-// Hack for import.meta.env
-// The workerFactory does not compile because it depends on `import.meta.env.VSCODE_BROWSER_EXT`.
-// When TSX requires it, it's not defined.
-const path = require('path');
-const fs = require('fs');
-const esbuild = require('esbuild');
 const Module = require('module');
 
-const workerFactoryPath = path.resolve(__dirname, '../../src/workerFactory.ts');
-const srcCode = fs.readFileSync(workerFactoryPath, 'utf8');
-
-const jsCode = esbuild.transformSync(srcCode, {
-  loader: 'ts',
-  format: 'cjs',
-  define: {
-    'import.meta.env.VSCODE_BROWSER_EXT': 'false'
-  }
-}).code;
-
-// Evaluate script
-const scriptModule = new Module(workerFactoryPath, module as any);
-scriptModule.filename = workerFactoryPath;
-scriptModule.paths = (Module as any)._nodeModulePaths(path.dirname(workerFactoryPath));
+// Hack for import.meta.env
+// TSX does not polyfill import.meta.env out of the box when evaluating imported modules.
+// We intercept compilation of workerFactory to inject the polyfill at the top of the file.
+const originalCompile = Module.prototype._compile;
+Module.prototype._compile = function(content: string, filename: string) {
+    if (filename.endsWith('workerFactory.ts')) {
+        content = `const import_meta_env = { VSCODE_BROWSER_EXT: false };\n` + content.replace(/import\.meta\.env/g, 'import_meta_env');
+    }
+    return originalCompile.call(this, content, filename);
+};
 
 // We need to intercept required modules in the compiled code
 const originalRequire = Module.prototype.require;
@@ -73,9 +62,10 @@ Module.prototype.require = function(id: string) {
     return originalRequire.call(this, id);
 };
 
-(scriptModule as any)._compile(jsCode, workerFactoryPath);
+// Import after interceptors are set up
+const workerFactory = require('../../src/workerFactory');
+Module.prototype._compile = originalCompile;
 
-const workerFactory = scriptModule.exports;
 import { mockVscode } from './mocks/vscode';
 
 describe('workerFactory error path tests', () => {
