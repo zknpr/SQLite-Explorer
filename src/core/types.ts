@@ -214,7 +214,7 @@ export interface DatabaseOperations {
   executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]>;
 
   /** Export database to binary */
-  serializeDatabase(name: string): Promise<Uint8Array>;
+  serializeDatabase(): Promise<Uint8Array>;
 
   /** Apply pending modifications */
   applyModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;

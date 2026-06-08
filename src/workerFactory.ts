@@ -66,7 +66,7 @@ interface WorkerMethods {
     config: DatabaseInitConfig
   ): Promise<DatabaseInitResult>;
   runQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]>;
-  exportDatabase(name: string): Promise<Uint8Array>;
+  exportDatabase(): Promise<Uint8Array>;
   updateCell(table: string, rowId: string | number, column: string, value: CellValue, patch?: string): Promise<void>;
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
@@ -242,7 +242,7 @@ async function createInProcessWasmDatabaseConnection(
         engineKind: Promise.resolve('wasm'),
         executeQuery: (sql: string, params?: CellValue[]) =>
           endpoint.runQuery(sql, params),
-        serializeDatabase: (name: string) => endpoint.exportDatabase(name),
+        serializeDatabase: () => endpoint.exportDatabase(),
         applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
           endpoint.applyModifications(mods, signal),
         undoModification: (mod: ModificationEntry) =>
@@ -441,7 +441,7 @@ async function createWorkerBackedWasmDatabaseConnection(
           engineKind: Promise.resolve('wasm'),
           executeQuery: (sql: string, params?: CellValue[]) =>
             workerProxy.runQuery(sql, params),
-          serializeDatabase: (name: string) => workerProxy.exportDatabase(name),
+          serializeDatabase: () => workerProxy.exportDatabase(),
           applyModifications: async () => {},
           undoModification: async () => {},
           redoModification: async () => {},

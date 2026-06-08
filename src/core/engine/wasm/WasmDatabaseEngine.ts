@@ -210,7 +210,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * @param _name - Identifier (unused, for interface compatibility)
    * @returns Database binary content
    */
-  async serializeDatabase(_name: string): Promise<Uint8Array> {
+  async serializeDatabase(): Promise<Uint8Array> {
     return this.instance.export();
   }
 

@@ -382,7 +382,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     }
 
     const { filename } = this.fileParts;
-    const binaryContent = await this.databaseOperations.serializeDatabase(filename);
+    const binaryContent = await this.databaseOperations.serializeDatabase();
     // Capture the tracker position immediately after serialization. The bytes
     // below represent edits up to this position only; edits recorded while the
     // asynchronous workspace write is pending must remain dirty.
@@ -435,7 +435,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     }
 
     const { filename } = this.fileParts;
-    const binaryContent = await this.databaseOperations.serializeDatabase(filename);
+    const binaryContent = await this.databaseOperations.serializeDatabase();
     await vsc.workspace.fs.writeFile(targetUri, binaryContent);
   }
 

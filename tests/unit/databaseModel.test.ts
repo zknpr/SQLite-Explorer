@@ -458,8 +458,8 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         const dbOps = {
             engineKind: Promise.resolve('wasm'),
             writeToFile: async () => { throw new Error('writeToFile should not be called for non-file URIs'); },
-            serializeDatabase: async (name: string) => {
-                serializedName = name;
+            serializeDatabase: async () => {
+                serializedName = "test.db";
                 return new Uint8Array([4, 5, 6]);
             }
         };

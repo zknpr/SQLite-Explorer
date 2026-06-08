@@ -106,7 +106,7 @@ export class HostBridge implements ToastService {
    */
   async exportDb(filename: string) {
     const dbOps = this.ensureDatabaseInitialized();
-    return dbOps.serializeDatabase(filename);
+    return dbOps.serializeDatabase();
   }
 
   /**
