@@ -377,7 +377,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             return;
         } catch (e) {
             // Fallback if direct write fails
-            console.warn('Direct write failed, falling back to buffer transfer', e);
+            this.viewerProvider.outputChannel?.appendLine(`[Fallback] Direct write failed, falling back to buffer transfer: ${e instanceof Error ? e.message : String(e)}`);
         }
     }
 
@@ -425,7 +425,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             await this.databaseOperations.writeToFile(targetUri.fsPath);
             return;
         } catch (e) {
-             console.warn('Direct write failed, falling back to buffer transfer', e);
+             this.viewerProvider.outputChannel?.appendLine(`[Fallback] Direct write failed, falling back to buffer transfer: ${e instanceof Error ? e.message : String(e)}`);
         }
     }
 

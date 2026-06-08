@@ -365,15 +365,14 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             configurable: true
         });
 
-        const originalConsoleWarn = console.warn;
         let consoleWarnCalled = false;
-        console.warn = (msg: string, err: any) => {
-            if (msg && msg.includes('Direct write failed')) {
-                consoleWarnCalled = true;
-            } else {
-                originalConsoleWarn(msg, err);
+        doc.viewerProvider.outputChannel = {
+            appendLine: (msg: string) => {
+                if (msg && msg.includes('Direct write failed')) {
+                    consoleWarnCalled = true;
+                }
             }
-        };
+        } as any;
 
         try {
             await doc.saveAs(targetUri, undefined);
@@ -388,7 +387,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
                 writable: true,
                 configurable: true
             });
-            console.warn = originalConsoleWarn;
+
         }
     });
 
@@ -424,15 +423,14 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             configurable: true
         });
 
-        const originalConsoleWarn = console.warn;
         let consoleWarnCalled = false;
-        console.warn = (msg: string, err: any) => {
-            if (msg && msg.includes('Direct write failed')) {
-                consoleWarnCalled = true;
-            } else {
-                originalConsoleWarn(msg, err);
+        doc.viewerProvider.outputChannel = {
+            appendLine: (msg: string) => {
+                if (msg && msg.includes('Direct write failed')) {
+                    consoleWarnCalled = true;
+                }
             }
-        };
+        } as any;
 
         try {
             await doc.save();
@@ -446,7 +444,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
                 writable: true,
                 configurable: true
             });
-            console.warn = originalConsoleWarn;
+
         }
     });
 
