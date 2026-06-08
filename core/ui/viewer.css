@@ -887,9 +887,13 @@ body {
 }
 
 .btn-primary {
-    background: var(--accent-color);
+    /* VS Code button theme tokens: text/background contrast is defined by the
+       active theme rather than hardcoded, so "Apply Changes" etc. stay legible
+       on custom themes. Fallbacks mirror the Dark+ defaults and keep the
+       standalone web demo (no --vscode-* vars) rendering unchanged. */
+    background: var(--vscode-button-background, #0e639c);
     border: none;
-    color: white;
+    color: var(--vscode-button-foreground, #ffffff);
     padding: 6px 14px;
     border-radius: 3px;
     cursor: pointer;
@@ -897,13 +901,15 @@ body {
 }
 
 .btn-primary:hover {
-    opacity: 0.9;
+    /* Themed hover background replaces the previous opacity dim, which faded
+       the button-foreground text and hurt contrast on some themes. */
+    background: var(--vscode-button-hoverBackground, #1177bb);
 }
 
 .btn-secondary {
-    background: var(--bg-tertiary);
+    background: var(--vscode-button-secondaryBackground, #3c3c3c);
     border: 1px solid var(--border-color);
-    color: var(--text-primary);
+    color: var(--vscode-button-secondaryForeground, #cccccc);
     padding: 6px 14px;
     border-radius: 3px;
     cursor: pointer;
@@ -911,13 +917,16 @@ body {
 }
 
 .btn-secondary:hover {
-    background: var(--hover-bg);
+    background: var(--vscode-button-secondaryHoverBackground, #2a2d2e);
 }
 
 .btn-danger {
+    /* No dedicated danger-button token exists; keep the error-colored
+       background and use button-foreground (white in the standard themes) for
+       readable text instead of a hardcoded white. */
     background: var(--error-color);
     border: none;
-    color: white;
+    color: var(--vscode-button-foreground, #ffffff);
     padding: 6px 14px;
     border-radius: 3px;
     cursor: pointer;
@@ -1073,7 +1082,7 @@ body {
 .cell-preview-toolbar-btn.active {
     background: var(--accent-color);
     border-color: var(--accent-color);
-    color: white;
+    color: var(--vscode-button-foreground, #ffffff);
 }
 
 .cell-preview-footer {
