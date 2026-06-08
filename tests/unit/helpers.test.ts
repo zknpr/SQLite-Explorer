@@ -99,6 +99,13 @@ describe('doTry', () => {
     assert.strictEqual(warnMessages.length, 0);
   });
 
+  it('should return result on success even if it is falsy', () => {
+    assert.strictEqual(doTry(() => 0), 0);
+    assert.strictEqual(doTry(() => ''), '');
+    assert.strictEqual(doTry(() => false), false);
+    assert.strictEqual(warnMessages.length, 0);
+  });
+
   it('should return undefined and log warning on error', () => {
     const result = doTry(() => { throw new Error('test error'); });
     assert.strictEqual(result, undefined);
