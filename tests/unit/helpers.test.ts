@@ -149,3 +149,20 @@ describe('uiKindToString', () => {
     assert.strictEqual(uiKindToString(vsc.UIKind.Desktop), 'desktop');
   });
 });
+
+describe('maskSensitiveData', () => {
+  const { maskSensitiveData } = require('../../src/helpers');
+
+  it('should mask different formats of credit card numbers', () => {
+    assert.strictEqual(maskSensitiveData("My CC is 1234-5678-9012-3456"), "My CC is ****-****-****-****");
+    assert.strictEqual(maskSensitiveData("My CC is 1234567890123456"), "My CC is ****-****-****-****");
+    assert.strictEqual(maskSensitiveData("My CC is 1234 5678 9012 3456"), "My CC is ****-****-****-****");
+    assert.strictEqual(maskSensitiveData("Amex: 378282246310005"), "Amex: ****-****-****-****");
+  });
+
+  it('should mask different formats of SSN', () => {
+    assert.strictEqual(maskSensitiveData("My SSN is 123-45-6789"), "My SSN is ***-**-****");
+    assert.strictEqual(maskSensitiveData("My SSN is 123 45 6789"), "My SSN is ***-**-****");
+    assert.strictEqual(maskSensitiveData("My SSN is 123456789"), "My SSN is ***-**-****");
+  });
+});
