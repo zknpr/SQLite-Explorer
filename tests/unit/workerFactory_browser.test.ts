@@ -15,7 +15,7 @@ const workerFactorySource = fs.readFileSync(workerFactoryPath, 'utf8');
 interface FakeEndpoint {
   initializeDatabase(filename: string, config: DatabaseInitConfig): Promise<{ isReadOnly: boolean }>;
   runQuery(sql: string, params?: CellValue[]): Promise<unknown[]>;
-  exportDatabase(name: string): Promise<Uint8Array>;
+  exportDatabase(): Promise<Uint8Array>;
   applyModifications?(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
   undoModification?(mod: ModificationEntry): Promise<void>;
   redoModification?(mod: ModificationEntry): Promise<void>;

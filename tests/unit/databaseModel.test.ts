@@ -450,14 +450,18 @@ describe('DatabaseDocument save/saveAs fallback', () => {
 
     it('save: serializes and writes WASM database content for non-file URI', async () => {
         const sourceUri = createUri('vscode-vfs', '/github/user/repo/test.db');
-        let serializedName: string | undefined;
+        let serializeCallCount = 0;
+        let serializeArgCount = -1;
         let writeFileCalled = false;
 
         const dbOps = {
             engineKind: Promise.resolve('wasm'),
             writeToFile: async () => { throw new Error('writeToFile should not be called for non-file URIs'); },
-            serializeDatabase: async () => {
-                serializedName = "test.db";
+            // Capture call count + arity so the test fails if save() regresses to passing a
+            // filename argument (the previous version asserted a value it set itself — tautological).
+            serializeDatabase: async (...args: unknown[]) => {
+                serializeCallCount++;
+                serializeArgCount = args.length;
                 return new Uint8Array([4, 5, 6]);
             }
         };
@@ -482,7 +486,8 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         try {
             await doc.save();
 
-            assert.strictEqual(serializedName, 'test.db');
+            assert.strictEqual(serializeCallCount, 1, 'serializeDatabase should be called exactly once');
+            assert.strictEqual(serializeArgCount, 0, 'serializeDatabase should be called with no arguments');
             assert.strictEqual(writeFileCalled, true, 'fs.writeFile should be called');
         } finally {
             Object.defineProperty(mockVscode.workspace, 'fs', {

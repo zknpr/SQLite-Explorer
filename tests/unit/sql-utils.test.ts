@@ -144,15 +144,21 @@ describe('SQL Utils', () => {
       assert.strictEqual(validateRowId(-9007199254740991n), -9007199254740991);
     });
 
-    it('should evaluate empty or whitespace strings as 0', () => {
-      assert.strictEqual(validateRowId(''), 0);
-      assert.strictEqual(validateRowId('  '), 0);
+    it('should reject empty or whitespace-only strings', () => {
+      // Number('') and Number('   ') coerce to 0; a rowid must never silently become "row 0".
+      assert.throws(() => validateRowId(''), /Invalid rowid:/);
+      assert.throws(() => validateRowId('  '), /Invalid rowid:/);
     });
 
-    it('should handle float and scientific notation strings', () => {
-      assert.strictEqual(validateRowId('123.45'), 123.45);
-      assert.strictEqual(validateRowId('1e3'), 1000);
-      assert.strictEqual(validateRowId('-1e3'), -1000);
+    it('should reject fractional and scientific-notation strings', () => {
+      assert.throws(() => validateRowId('123.45'), /Invalid rowid: 123\.45/);
+      assert.throws(() => validateRowId('1e3'), /Invalid rowid: 1e3/);
+      assert.throws(() => validateRowId('-1e3'), /Invalid rowid: -1e3/);
+    });
+
+    it('should reject fractional numbers and unsafe-magnitude integers', () => {
+      assert.throws(() => validateRowId(123.45), /Invalid rowid: 123\.45/);
+      assert.throws(() => validateRowId(Number.MAX_SAFE_INTEGER + 1), /Invalid rowid:/);
     });
 
     it('should throw an error for non-numeric strings', () => {
