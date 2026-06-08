@@ -688,7 +688,8 @@ async function deleteColumns(table, columns) {
 
   // Get current table info
   const tableInfo = await getTableInfo(table);
-  const remainingColumns = tableInfo.filter(c => !columns.includes(c.name));
+  const columnsSet = new Set(columns);
+  const remainingColumns = tableInfo.filter(c => !columnsSet.has(c.name));
 
   if (remainingColumns.length === 0) {
     throw new Error('Cannot delete all columns');
