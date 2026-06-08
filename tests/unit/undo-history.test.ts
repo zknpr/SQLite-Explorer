@@ -142,3 +142,51 @@ describe('ModificationTracker hot-exit persistence', () => {
     assert.strictEqual(t.hasUncommittedChanges(), true); // e3 still uncommitted
   });
 });
+
+describe('invalidateCapturedCheckpointPositions', () => {
+  it('increments checkpointInvalidationRevision on timeline eviction', () => {
+    const tracker = new ModificationTracker<LabeledModification>(1);
+    tracker.record(entry('e1'));
+    const initialRevision = tracker.getCheckpointInvalidationRevision();
+    tracker.record(entry('e2'));
+    assert.strictEqual(tracker.getCheckpointInvalidationRevision(), initialRevision + 1);
+  });
+
+  it('increments checkpointInvalidationRevision on stepBack (undo)', () => {
+    const tracker = new ModificationTracker<LabeledModification>();
+    tracker.record(entry('e1'));
+    const preUndoRevision = tracker.getCheckpointInvalidationRevision();
+    tracker.stepBack();
+    assert.strictEqual(tracker.getCheckpointInvalidationRevision(), preUndoRevision + 1);
+  });
+
+  it('increments checkpointInvalidationRevision on rollbackToCheckpoint with undone entries', async () => {
+    const tracker = new ModificationTracker<LabeledModification>();
+    tracker.record(entry('e1'));
+    tracker.record(entry('e2'));
+    await tracker.createCheckpoint();
+    tracker.stepBack();
+    const preRollbackRevision = tracker.getCheckpointInvalidationRevision();
+    tracker.rollbackToCheckpoint();
+    assert.strictEqual(tracker.getCheckpointInvalidationRevision(), preRollbackRevision + 1);
+  });
+
+  it('increments checkpointInvalidationRevision on rollbackToCheckpoint with uncommitted entries', async () => {
+    const tracker = new ModificationTracker<LabeledModification>();
+    tracker.record(entry('e1'));
+    await tracker.createCheckpoint();
+    tracker.record(entry('e2'));
+    const preRollbackRevision = tracker.getCheckpointInvalidationRevision();
+    tracker.rollbackToCheckpoint();
+    assert.strictEqual(tracker.getCheckpointInvalidationRevision(), preRollbackRevision + 1);
+  });
+
+  it('does NOT increment checkpointInvalidationRevision when rollbackToCheckpoint causes no change', async () => {
+    const tracker = new ModificationTracker<LabeledModification>();
+    tracker.record(entry('e1'));
+    await tracker.createCheckpoint();
+    const preRollbackRevision = tracker.getCheckpointInvalidationRevision();
+    tracker.rollbackToCheckpoint();
+    assert.strictEqual(tracker.getCheckpointInvalidationRevision(), preRollbackRevision);
+  });
+});
