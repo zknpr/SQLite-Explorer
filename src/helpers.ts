@@ -214,8 +214,8 @@ const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
 const PHONE_REGEX = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
 const API_KEY_REGEX = /\b(sk_live_|sk_test_|api_key_|token_|secret_|key_)[a-zA-Z0-9]{10,}\b/gi;
 const HEX_REGEX = /\b[a-fA-F0-9]{32,}\b/g;
-const CC_REGEX = /\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b/g;
-const SSN_REGEX = /\b\d{3}-\d{2}-\d{4}\b/g;
+const CC_REGEX = /\b(?:\d[ -]*?){13,16}\b/g;
+const SSN_REGEX = /\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/g;
 
 /**
  * Masks sensitive data like emails, phone numbers, API keys, hex strings,
@@ -227,10 +227,10 @@ const SSN_REGEX = /\b\d{3}-\d{2}-\d{4}\b/g;
 export function maskSensitiveData(message: string): string {
   let safeMessage = message;
   safeMessage = safeMessage.replace(EMAIL_REGEX, '***@***.***');
+  safeMessage = safeMessage.replace(CC_REGEX, '****-****-****-****');
   safeMessage = safeMessage.replace(PHONE_REGEX, '***-***-****');
   safeMessage = safeMessage.replace(API_KEY_REGEX, '$1[REDACTED]');
   safeMessage = safeMessage.replace(HEX_REGEX, '[REDACTED_HEX]');
-  safeMessage = safeMessage.replace(CC_REGEX, '****-****-****-****');
   safeMessage = safeMessage.replace(SSN_REGEX, '***-**-****');
   return safeMessage;
 }
