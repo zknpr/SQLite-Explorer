@@ -258,6 +258,7 @@ export function updateBatchSidebar() {
     const columns = groupSelectedCellsByColumn(state.selectedCells, state.tableColumns);
 
     fieldsContainer.replaceChildren();
+    const fragment = document.createDocumentFragment();
 
     for (const [colIdx, colInfo] of columns) {
         const valueDisplay = summarizeColumnValue(colInfo.values);
@@ -309,8 +310,9 @@ export function updateBatchSidebar() {
         controlsDiv.appendChild(patchBtn);
 
         div.appendChild(controlsDiv);
-        fieldsContainer.appendChild(div);
+        fragment.appendChild(div);
     }
+    fieldsContainer.appendChild(fragment);
 }
 
 export async function applyBatchUpdate() {
