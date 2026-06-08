@@ -294,6 +294,39 @@ describe('exportTableCommand Fallback', () => {
         }
     });
 
+    it('should catch unsupported format error', async () => {
+        const docUri = mockVscode.Uri.parse('vscode-sqlite://test.db');
+
+        let errorMessageShown = '';
+        const originalShowErrorMessage = mockVscode.window.showErrorMessage;
+        (mockVscode.window as any).showErrorMessage = async (msg: string) => {
+            errorMessageShown = msg;
+        };
+
+        const doc = {
+            uri: docUri,
+            databaseOperations: {}
+        };
+        DocumentRegistry.set('test', doc as any);
+
+        try {
+            await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'test_table', uri: 'vscode-sqlite://test.db' },
+                ['id', 'name'],
+                undefined,
+                undefined,
+                { format: 'invalid_format' }
+            );
+
+            assert.strictEqual(errorMessageShown, 'Unsupported export format: invalid_format');
+        } finally {
+            mockVscode.window.showErrorMessage = originalShowErrorMessage;
+            DocumentRegistry.delete('test');
+        }
+    });
+
     it('should catch and show error when export fails', async () => {
         const docUri = mockVscode.Uri.parse('vscode-sqlite://test.db');
         const uri = mockVscode.Uri.file('/test/export.csv');
