@@ -76,6 +76,11 @@ describe('themeToCss', () => {
     const theme = { kind: vsc.ColorThemeKind.HighContrastLight } as vsc.ColorTheme;
     assert.strictEqual(themeToCss(theme), 'light');
   });
+
+  it('should return undefined for an unknown theme kind', () => {
+    const theme = { kind: 999 } as unknown as vsc.ColorTheme;
+    assert.strictEqual(themeToCss(theme), undefined);
+  });
 });
 
 describe('doTry', () => {
