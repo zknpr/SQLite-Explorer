@@ -101,15 +101,41 @@ export function escapeLikePattern(pattern: string, escapeChar: string = '\\'): s
 }
 
 /**
- * Validate that a row ID is a finite number and convert it to a number.
+ * Validate that a row ID is a safe integer and convert it to a number.
  * Throws an error if the row ID is invalid.
  *
+ * A SQLite rowid is always an integer. We deliberately reject inputs that
+ * `Number()` would silently coerce into a plausible-but-wrong value:
+ *   - non string/number/bigint types — Number(null)/Number(false)/Number([])
+ *     are all 0, Number(true) is 1, Number([5]) is 5
+ *   - blank/whitespace strings ('' / '   ' -> 0), which would target "row 0"
+ *   - fractional ('123.45') and scientific-notation ('1e3') strings
+ *   - NaN / Infinity, fractional numbers, and magnitudes beyond ±(2^53-1)
+ *     that a JS number cannot represent without precision loss
+ *
  * @param rowId - The row ID to validate
- * @returns The validated numeric row ID
+ * @returns The validated integer row ID
  */
 export function validateRowId(rowId: RecordId): number {
+  // Only strings, numbers, and bigints are valid rowid inputs. RecordId is typed
+  // string | number, but this runs against untyped runtime values (RPC payloads,
+  // persisted history state), where null/boolean/array would otherwise sail
+  // through Number() as 0/1/element. Capturing typeof in a local keeps TS from
+  // narrowing rowId to `never` and flagging the (intentional) runtime guard.
+  const inputType = typeof rowId;
+  if (inputType !== 'string' && inputType !== 'number' && inputType !== 'bigint') {
+    throw new Error(`Invalid rowid: ${rowId}`);
+  }
+  // For string inputs, require a canonical integer form (optional sign + digits).
+  // This rejects '', '   ', '123.45' and '1e3' up front — none are valid rowids,
+  // even though Number() would happily turn them into 0 / 123.45 / 1000.
+  if (typeof rowId === 'string' && !/^[+-]?\d+$/.test(rowId.trim())) {
+    throw new Error(`Invalid rowid: ${rowId}`);
+  }
   const num = Number(rowId);
-  if (!Number.isFinite(num)) {
+  // Require a safe integer: rejects NaN, Infinity, fractional numbers, and
+  // values outside ±(2^53-1) that cannot be represented exactly as a JS number.
+  if (!Number.isSafeInteger(num)) {
     throw new Error(`Invalid rowid: ${rowId}`);
   }
   return num;
