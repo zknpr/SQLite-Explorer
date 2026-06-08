@@ -84,11 +84,18 @@ export function createBrowserParentPort(scope: BrowserParentPortScope): NodeMess
 // Runtime Detection and API Export
 // ============================================================================
 
-let WorkerImpl: any;
-let MessageChannelImpl: any;
-let MessagePortImpl: any;
-let BroadcastChannelImpl: any;
-let parentPortImpl: any;
+import type {
+  Worker as NodeWorker,
+  MessageChannel as NodeMessageChannel,
+  MessagePort as NodeMessagePortType,
+  BroadcastChannel as NodeBroadcastChannel
+} from 'worker_threads';
+
+let WorkerImpl: typeof globalThis.Worker | typeof NodeWorker;
+let MessageChannelImpl: typeof globalThis.MessageChannel | typeof NodeMessageChannel;
+let MessagePortImpl: typeof globalThis.MessagePort | typeof NodeMessagePortType;
+let BroadcastChannelImpl: typeof globalThis.BroadcastChannel | typeof NodeBroadcastChannel;
+let parentPortImpl: NodeMessagePort | NodeMessagePortType | null;
 
 if (import.meta.env?.VSCODE_BROWSER_EXT) {
   WorkerImpl = globalThis.Worker;
