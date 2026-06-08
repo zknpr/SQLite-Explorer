@@ -161,6 +161,25 @@ describe('SQL Utils', () => {
       assert.throws(() => validateRowId(Number.MAX_SAFE_INTEGER + 1), /Invalid rowid:/);
     });
 
+    it('should reject non-string/non-numeric types that Number() would coerce', () => {
+      // Number(null)/Number(false)/Number([]) are all 0, Number(true) is 1, Number([5]) is 5 —
+      // none are valid rowids. RecordId is string|number, but this guards untyped runtime values.
+      // @ts-ignore - exercising the runtime type guard for values outside RecordId
+      assert.throws(() => validateRowId(null), /Invalid rowid:/);
+      // @ts-ignore
+      assert.throws(() => validateRowId(undefined), /Invalid rowid:/);
+      // @ts-ignore
+      assert.throws(() => validateRowId(true), /Invalid rowid:/);
+      // @ts-ignore
+      assert.throws(() => validateRowId(false), /Invalid rowid:/);
+      // @ts-ignore
+      assert.throws(() => validateRowId([]), /Invalid rowid:/);
+      // @ts-ignore
+      assert.throws(() => validateRowId([5]), /Invalid rowid:/);
+      // @ts-ignore
+      assert.throws(() => validateRowId({}), /Invalid rowid:/);
+    });
+
     it('should throw an error for non-numeric strings', () => {
       assert.throws(() => validateRowId('abc'), /Invalid rowid: abc/);
       assert.throws(() => validateRowId('12a'), /Invalid rowid: 12a/);
