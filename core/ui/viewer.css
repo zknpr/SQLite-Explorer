@@ -887,9 +887,13 @@ body {
 }
 
 .btn-primary {
-    background: var(--accent-color);
+    /* VS Code button theme tokens: text/background contrast is defined by the
+       active theme rather than hardcoded, so "Apply Changes" etc. stay legible
+       on custom themes. Fallbacks mirror the Dark+ defaults and keep the
+       standalone web demo (no --vscode-* vars) rendering unchanged. */
+    background: var(--vscode-button-background, #0e639c);
     border: none;
-    color: white;
+    color: var(--vscode-button-foreground, #ffffff);
     padding: 6px 14px;
     border-radius: 3px;
     cursor: pointer;
@@ -897,13 +901,15 @@ body {
 }
 
 .btn-primary:hover {
-    opacity: 0.9;
+    /* Themed hover background replaces the previous opacity dim, which faded
+       the button-foreground text and hurt contrast on some themes. */
+    background: var(--vscode-button-hoverBackground, #1177bb);
 }
 
 .btn-secondary {
-    background: var(--bg-tertiary);
+    background: var(--vscode-button-secondaryBackground, #3c3c3c);
     border: 1px solid var(--border-color);
-    color: var(--text-primary);
+    color: var(--vscode-button-secondaryForeground, #cccccc);
     padding: 6px 14px;
     border-radius: 3px;
     cursor: pointer;
@@ -911,13 +917,17 @@ body {
 }
 
 .btn-secondary:hover {
-    background: var(--hover-bg);
+    background: var(--vscode-button-secondaryHoverBackground, #2a2d2e);
 }
 
 .btn-danger {
+    /* No dedicated danger-button token exists. The background is the theme's
+       error color (always a saturated red), so a fixed white label stays
+       readable. button-foreground is NOT used here: a theme may set it dark to
+       pair with a light button background, which would be illegible on red. */
     background: var(--error-color);
     border: none;
-    color: white;
+    color: #ffffff;
     padding: 6px 14px;
     border-radius: 3px;
     cursor: pointer;
@@ -1071,9 +1081,12 @@ body {
 }
 
 .cell-preview-toolbar-btn.active {
-    background: var(--accent-color);
-    border-color: var(--accent-color);
-    color: white;
+    /* Matched VS Code button token pair: button-foreground is only defined to
+       contrast button-background, so the active background uses that token (not
+       focusBorder/--accent-color) to guarantee legible text on any theme. */
+    background: var(--vscode-button-background, #0e639c);
+    border-color: var(--vscode-button-background, #0e639c);
+    color: var(--vscode-button-foreground, #ffffff);
 }
 
 .cell-preview-footer {
