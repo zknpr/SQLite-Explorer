@@ -130,6 +130,31 @@ describe('SQL Utils', () => {
       assert.strictEqual(validateRowId(-12), -12);
     });
 
+    it('should handle boundary integer values', () => {
+      assert.strictEqual(validateRowId(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER);
+      assert.strictEqual(validateRowId(Number.MIN_SAFE_INTEGER), Number.MIN_SAFE_INTEGER);
+      assert.strictEqual(validateRowId(Number.MAX_SAFE_INTEGER.toString()), Number.MAX_SAFE_INTEGER);
+      assert.strictEqual(validateRowId(Number.MIN_SAFE_INTEGER.toString()), Number.MIN_SAFE_INTEGER);
+    });
+
+    it('should handle bigint values correctly', () => {
+      // @ts-ignore - testing BigInt fallback since JS allows it even if types don't
+      assert.strictEqual(validateRowId(9007199254740991n), 9007199254740991);
+      // @ts-ignore
+      assert.strictEqual(validateRowId(-9007199254740991n), -9007199254740991);
+    });
+
+    it('should evaluate empty or whitespace strings as 0', () => {
+      assert.strictEqual(validateRowId(''), 0);
+      assert.strictEqual(validateRowId('  '), 0);
+    });
+
+    it('should handle float and scientific notation strings', () => {
+      assert.strictEqual(validateRowId('123.45'), 123.45);
+      assert.strictEqual(validateRowId('1e3'), 1000);
+      assert.strictEqual(validateRowId('-1e3'), -1000);
+    });
+
     it('should throw an error for non-numeric strings', () => {
       assert.throws(() => validateRowId('abc'), /Invalid rowid: abc/);
       assert.throws(() => validateRowId('12a'), /Invalid rowid: 12a/);
