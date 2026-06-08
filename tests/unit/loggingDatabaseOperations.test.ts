@@ -8,7 +8,7 @@ import type { DatabaseOperations, CellValue, QueryResultSet, ModificationEntry, 
 class MockDatabaseOperations implements DatabaseOperations {
     engineKind = Promise.resolve('wasm' as const);
     async executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> { return []; }
-    async serializeDatabase(name: string): Promise<Uint8Array> { return new Uint8Array(); }
+    async serializeDatabase(): Promise<Uint8Array> { return new Uint8Array(); }
     async applyModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void> {}
     async undoModification(mod: ModificationEntry): Promise<void> {}
     async redoModification(mod: ModificationEntry): Promise<void> {}

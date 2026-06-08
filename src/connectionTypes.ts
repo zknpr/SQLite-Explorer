@@ -27,7 +27,7 @@ export interface DatabaseConnectionBundle {
   workerMethods: {
     initializeDatabase: (filename: string, config: DatabaseInitConfig) => Promise<DatabaseInitResult>;
     runQuery: (sql: string, params?: CellValue[]) => Promise<QueryResultSet[]>;
-    exportDatabase: (name: string) => Promise<Uint8Array>;
+    exportDatabase: () => Promise<Uint8Array>;
     [Symbol.dispose]: () => void;
   };
 

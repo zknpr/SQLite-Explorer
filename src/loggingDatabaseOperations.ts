@@ -91,8 +91,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.executeQuery(sql, params);
     }
 
-    async serializeDatabase(name: string): Promise<Uint8Array> {
-        return this.logAndDelegate(`Exporting database: ${name}`, false, 'serializeDatabase', name);
+    async serializeDatabase(): Promise<Uint8Array> {
+        return this.logAndDelegate(`Exporting database`, false, 'serializeDatabase');
     }
 
     async applyModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void> {

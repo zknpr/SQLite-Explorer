@@ -528,7 +528,7 @@ export async function createNativeDatabaseConnection(
           }];
         },
 
-        serializeDatabase: async (_name: string): Promise<Uint8Array> => {
+        serializeDatabase: async (): Promise<Uint8Array> => {
           const result = await worker.call<{ content: Uint8Array }>('export', []);
           return result.content;
         },

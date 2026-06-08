@@ -171,8 +171,8 @@ export function createWorkerEndpoint() {
      * @param name - Database name
      * @returns Binary content
      */
-    async exportDatabase(name: string): Promise<Uint8Array> {
-      return requireEngine().serializeDatabase(name);
+    async exportDatabase(): Promise<Uint8Array> {
+      return requireEngine().serializeDatabase();
     },
 
     // Expose undo/history operations for the browser in-process facade, which
