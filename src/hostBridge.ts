@@ -408,16 +408,28 @@ export class HostBridge implements ToastService {
       const savepointName = `sp_batch_fallback_${Date.now()}`;
       await dbOps.executeQuery(`SAVEPOINT ${savepointName}`);
       try {
-        for (const update of processedUpdates) {
-          let patch: string | undefined;
-          let val = update.value;
+        // Process in chunks to balance IPC overhead and N+1 sequential bottlenecks
+        const CHUNK_SIZE = 50;
+        for (let i = 0; i < processedUpdates.length; i += CHUNK_SIZE) {
+          const chunk = processedUpdates.slice(i, i + CHUNK_SIZE);
+          const promises = chunk.map(update => {
+            let patch: string | undefined;
+            let val = update.value;
 
-          if (update.operation === 'json_patch') {
-            patch = update.value as string;
-            val = null;
+            if (update.operation === 'json_patch') {
+              patch = update.value as string;
+              val = null;
+            }
+
+            return dbOps.updateCell(table, update.rowId, update.column, val, patch);
+          });
+
+          // Wait for all in chunk to settle to avoid rolling back while concurrent queries are running
+          const results = await Promise.allSettled(promises);
+          const rejected = results.find(r => r.status === 'rejected');
+          if (rejected) {
+            throw (rejected as PromiseRejectedResult).reason;
           }
-
-          await dbOps.updateCell(table, update.rowId, update.column, val, patch);
         }
         await dbOps.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
       } catch (err) {
