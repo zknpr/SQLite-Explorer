@@ -82,7 +82,6 @@ export function getFormatHelper(format: string, tableName: string, includeHeader
  * to a file chosen by the user via a save dialog.
  *
  * @param context - VS Code extension context
- * @param reporter - Telemetry reporter (unused in this version)
  * @param dbParams - Database parameters containing table name
  * @param columns - Array of column names to export
  */
