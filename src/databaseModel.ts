@@ -269,7 +269,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       undo: async () => {
         const undoneEntry = tracker.stepBack();
         if (!undoneEntry) {
-            console.warn('[Undo] No entry found in tracker');
+            GlobalOutputChannel?.appendLine('[Undo] No entry found in tracker');
             return;
         }
         try {
@@ -284,7 +284,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       redo: async () => {
         const redoneEntry = tracker.stepForward();
         if (!redoneEntry) {
-            console.warn('[Redo] No entry found in tracker');
+            GlobalOutputChannel?.appendLine('[Redo] No entry found in tracker');
             return;
         }
         try {
