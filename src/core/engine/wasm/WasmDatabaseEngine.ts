@@ -284,9 +284,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private async undoCellUpdate(targetTable: string, mod: ModificationEntry): Promise<void> {
     const { affectedCells, targetRowId, targetColumn, priorValue, newValue, operation } = mod;
     if (affectedCells) {
-      const updates: CellUpdate[] = [];
-      for (const cell of affectedCells) {
-        updates.push({
+      const updates: CellUpdate[] = await Promise.all(
+        affectedCells.map(async (cell) => ({
           rowId: cell.rowId,
           column: cell.columnName,
           value: await this.computeUndoValue(
@@ -297,8 +296,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             cell.newValue,
             cell.operation
           )
-        });
-      }
+        }))
+      );
       await this.updateCellBatch(targetTable, updates);
     } else if (targetRowId !== undefined && targetColumn) {
       await this.updateCell(
