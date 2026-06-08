@@ -33,7 +33,7 @@ describe('Worker Endpoint', () => {
         const expectedError = new Error('No database initialized');
 
         await assert.rejects(endpoint.runQuery('SELECT 1'), expectedError);
-        await assert.rejects(endpoint.exportDatabase('test'), expectedError);
+        await assert.rejects(endpoint.exportDatabase(), expectedError);
         await assert.rejects(endpoint.updateCell('table', 1, 'col', 'val'), expectedError);
         await assert.rejects(endpoint.insertRow('table', {}), expectedError);
         await assert.rejects(endpoint.insertRowBatch('table', []), expectedError);
@@ -84,7 +84,7 @@ describe('Worker Endpoint', () => {
         assert.deepStrictEqual(tableData.rows, [[1, 'Alice']]);
 
         // Export DB
-        const data = await endpoint.exportDatabase('test');
+        const data = await endpoint.exportDatabase();
         assert.ok(data instanceof Uint8Array);
         assert.ok(data.length > 0);
     });
