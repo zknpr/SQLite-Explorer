@@ -26,6 +26,8 @@ import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from
 import { buildSelectQuery, buildCountQuery } from '../../query-builder';
 import { applyMergePatch, computeJsonPatchUndo } from '../../json-utils';
 import { getNodeFs } from '../../platform/fs';
+import { crypto } from '../../../platform/cryptoShim';
+
 
 // ============================================================================
 // Internal sql.js Types
@@ -101,7 +103,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * Build a quoted SAVEPOINT name that is unique enough for nested engine work.
    */
   private createSavepointName(prefix: string): string {
-    return escapeIdentifier(`${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    return escapeIdentifier(`${prefix}_${Date.now()}_${crypto.randomUUID().replace(/-/g, '').substring(0, 8)}`);
   }
 
   /**
@@ -837,7 +839,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     // safely from within an outer transaction (e.g., undoColumnDrop).
     // escapeIdentifier wraps in double quotes defensively — the generated name
     // is already [a-zA-Z0-9_] safe, but quoting prevents issues if the pattern changes.
-    const savepointName = escapeIdentifier(`sp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+    const savepointName = this.createSavepointName('sp');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const escapedTable = escapeIdentifier(table);
