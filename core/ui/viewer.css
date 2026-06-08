@@ -921,12 +921,13 @@ body {
 }
 
 .btn-danger {
-    /* No dedicated danger-button token exists; keep the error-colored
-       background and use button-foreground (white in the standard themes) for
-       readable text instead of a hardcoded white. */
+    /* No dedicated danger-button token exists. The background is the theme's
+       error color (always a saturated red), so a fixed white label stays
+       readable. button-foreground is NOT used here: a theme may set it dark to
+       pair with a light button background, which would be illegible on red. */
     background: var(--error-color);
     border: none;
-    color: var(--vscode-button-foreground, #ffffff);
+    color: #ffffff;
     padding: 6px 14px;
     border-radius: 3px;
     cursor: pointer;
@@ -1080,8 +1081,11 @@ body {
 }
 
 .cell-preview-toolbar-btn.active {
-    background: var(--accent-color);
-    border-color: var(--accent-color);
+    /* Matched VS Code button token pair: button-foreground is only defined to
+       contrast button-background, so the active background uses that token (not
+       focusBorder/--accent-color) to guarantee legible text on any theme. */
+    background: var(--vscode-button-background, #0e639c);
+    border-color: var(--vscode-button-background, #0e639c);
     color: var(--vscode-button-foreground, #ffffff);
 }
 

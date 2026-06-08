@@ -4,7 +4,7 @@
 
 ### Fixes
 
-- **Button text now follows the active VS Code theme instead of a hardcoded white.** Action buttons (Apply Changes, Add Row, Create Table, Export, Save, …) drew their label in hardcoded white, which could fall below a readable contrast on custom themes whose button/accent colors are light. The primary, secondary, and danger buttons — and the active cell-preview toolbar toggle — now use the built-in VS Code button theme tokens (`--vscode-button-background` / `-foreground` / `-hoverBackground` and the `secondary*` variants), so text/background contrast is defined by the active theme. Fallback values matching the previous appearance are retained for the standalone web demo, which renders outside VS Code. Closes #436.
+- **Button text now follows the active VS Code theme instead of hardcoded white.** Action buttons (Apply Changes, Add Row, Create Table, Export, Save, …) used hardcoded white for their label, which could be hard to read on custom themes whose button/accent colors are light. Primary and secondary buttons now use the built-in VS Code button theme tokens (`--vscode-button-background` / `-foreground` / `-hoverBackground` and the `secondary*` variants), and the active cell-preview toolbar toggle uses the matching button background/foreground pair, so contrast is defined by the active theme. The destructive (danger) button keeps a fixed white label on its error-red background, where white stays readable across themes. Fallback values matching the previous appearance are retained for the standalone web demo, which renders outside VS Code. Closes #436.
 
 ## 1.5.1
 
