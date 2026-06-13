@@ -277,7 +277,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             this.#contentChangeEmitter.fire({});
             this.#autoSaveIfNeeded();
         } catch (e) {
-            console.error('[Undo] Failed:', e);
+            GlobalOutputChannel?.appendLine(`[Undo] Failed: ${e instanceof Error ? e.message : String(e)}`);
             vsc.window.showErrorMessage(vsc.l10n.t('Undo failed: {0}', e instanceof Error ? e.message : String(e)));
         }
       },
@@ -292,7 +292,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             this.#contentChangeEmitter.fire({});
             this.#autoSaveIfNeeded();
         } catch (e) {
-             console.error('[Redo] Failed:', e);
+             GlobalOutputChannel?.appendLine(`[Redo] Failed: ${e instanceof Error ? e.message : String(e)}`);
              vsc.window.showErrorMessage(vsc.l10n.t('Redo failed: {0}', e instanceof Error ? e.message : String(e)));
         }
       }
@@ -470,7 +470,6 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       // Record auto-save failures in the output channel for debugging instead of showing a UI error
       const errorMessage = err instanceof Error ? err.message : String(err);
       GlobalOutputChannel?.appendLine(`[Auto-save failed] ${errorMessage}`);
-      console.error('[Auto-save failed]', err);
     }
   }
 
