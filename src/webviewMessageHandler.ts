@@ -82,8 +82,8 @@ export class WebviewMessageHandler {
     // SECURITY: Block Object.prototype methods to prevent prototype pollution attacks.
     // Allow class prototype methods (e.g., HostBridge.initialize) but reject inherited
     // Object methods like 'constructor', '__defineGetter__', 'toString'.
-    if (!BLOCKED_METHODS.has(targetMethod) && targetMethod in hostBridge && typeof (hostBridge as Record<string, unknown>)[targetMethod] === 'function') {
-      const fn = (hostBridge as Record<string, unknown>)[targetMethod] as Function;
+    if (!BLOCKED_METHODS.has(targetMethod) && targetMethod in hostBridge && typeof (hostBridge as unknown as Record<string, unknown>)[targetMethod] === 'function') {
+      const fn = (hostBridge as unknown as Record<string, unknown>)[targetMethod] as Function;
       Promise.resolve(fn.apply(hostBridge, deserializedPayload))
         .then(result => {
           // Serialize result to handle Uint8Array and other typed arrays
@@ -132,7 +132,7 @@ export class WebviewMessageHandler {
     const hostBridge = this.hostBridge;
     // SECURITY: Same prototype pollution guard as #handleRpcInvoke
     if (BLOCKED_METHODS.has(message.method) || !(message.method in hostBridge)) return;
-    const fn = (hostBridge as Record<string, unknown>)[message.method] as Function;
+    const fn = (hostBridge as unknown as Record<string, unknown>)[message.method] as Function;
     if (typeof fn === 'function') {
       Promise.resolve(fn.apply(hostBridge, deserializeArgs(message.args || [])))
         .then(result => {
