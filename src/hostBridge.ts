@@ -403,21 +403,31 @@ export class HostBridge implements ToastService {
     if (typeof dbOps.updateCellBatch === 'function') {
       await dbOps.updateCellBatch(table, processedUpdates);
     } else {
-      // Fallback: execute updates sequentially to avoid IPC overload and N+1 concurrency,
+      // Fallback: execute updates in chunks to avoid IPC overload and N+1 concurrency,
       // but wrapped in a SAVEPOINT to avoid implicit auto-commits after every DML statement.
       const savepointName = `sp_batch_fallback_${Date.now()}`;
       await dbOps.executeQuery(`SAVEPOINT ${savepointName}`);
       try {
-        for (const update of processedUpdates) {
-          let patch: string | undefined;
-          let val = update.value;
+        const CHUNK_SIZE = 50;
+        for (let i = 0; i < processedUpdates.length; i += CHUNK_SIZE) {
+          const chunk = processedUpdates.slice(i, i + CHUNK_SIZE);
+          const promises = chunk.map(update => {
+            let patch: string | undefined;
+            let val = update.value;
 
-          if (update.operation === 'json_patch') {
-            patch = update.value as string;
-            val = null;
+            if (update.operation === 'json_patch') {
+              patch = update.value as string;
+              val = null;
+            }
+
+            return dbOps.updateCell(table, update.rowId, update.column, val, patch);
+          });
+
+          const results = await Promise.allSettled(promises);
+          const failures = results.filter(r => r.status === 'rejected');
+          if (failures.length > 0) {
+            throw (failures[0] as PromiseRejectedResult).reason;
           }
-
-          await dbOps.updateCell(table, update.rowId, update.column, val, patch);
         }
         await dbOps.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
       } catch (err) {
