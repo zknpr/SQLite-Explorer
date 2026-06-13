@@ -750,9 +750,29 @@ async function updateCellBatch(table, updates) {
 
   db.run('BEGIN TRANSACTION');
   try {
+    const safeTable = table.replace(/"/g, '""');
+
+    // Group updates by column to minimize statement preparation overhead
+    const byColumn = {};
     for (const update of updates) {
-      await updateCell(table, update.rowId, update.column, update.value);
+      const col = update.column;
+      if (!byColumn[col]) byColumn[col] = [];
+      byColumn[col].push(update);
     }
+
+    for (const column of Object.keys(byColumn)) {
+      const safeColumn = column.replace(/"/g, '""');
+      const stmt = db.prepare(`UPDATE "${safeTable}" SET "${safeColumn}" = ? WHERE rowid = ?`);
+
+      try {
+        for (const update of byColumn[column]) {
+          stmt.run([update.value, update.rowId]);
+        }
+      } finally {
+        stmt.free();
+      }
+    }
+
     db.run('COMMIT');
   } catch (e) {
     db.run('ROLLBACK');
