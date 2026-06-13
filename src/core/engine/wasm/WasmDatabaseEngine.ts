@@ -93,8 +93,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private async safeRollback(context: string): Promise<void> {
     try {
       await this.executeQuery('ROLLBACK');
-    } catch (rollbackErr) {
-      console.warn(`Failed to rollback (${context}):`, rollbackErr);
+    } catch (rollbackErr: unknown) {
+      const errorDetail = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+      console.warn(`Failed to rollback (${context}):`, errorDetail);
     }
   }
 
@@ -112,8 +113,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     try {
       await this.executeQuery(`ROLLBACK TO ${savepointName}`);
       await this.executeQuery(`RELEASE ${savepointName}`);
-    } catch (rollbackErr) {
-      console.warn(`Failed to rollback savepoint (${context}):`, rollbackErr);
+    } catch (rollbackErr: unknown) {
+      const errorDetail = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+      console.warn(`Failed to rollback savepoint (${context}):`, errorDetail);
     }
   }
 
@@ -189,13 +191,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         // iterateStatements handles freeing - clear reference
         currentStmt = null;
       }
-    } catch (err) {
+    } catch (err: unknown) {
       // Ensure current statement is freed if iteration was interrupted
       if (currentStmt) {
         try {
           currentStmt.free();
-        } catch (freeErr) {
-          console.warn('Failed to free statement on error:', freeErr);
+        } catch (freeErr: unknown) {
+          const freeErrorDetail = freeErr instanceof Error ? freeErr.message : String(freeErr);
+          console.warn('Failed to free statement on error:', freeErrorDetail);
         }
       }
       const errorDetail = err instanceof Error ? err.message : String(err);
@@ -242,7 +245,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
       signal?.throwIfAborted();
       await this.executeQuery(`RELEASE ${savepointName}`);
-    } catch (err) {
+    } catch (err: unknown) {
       await this.safeRollbackSavepoint(savepointName, 'applyModifications');
       throw err;
     }
@@ -421,7 +424,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
 
         await this.executeQuery('COMMIT');
-      } catch (e) {
+      } catch (e: unknown) {
         await this.safeRollback('undoColumnDrop');
         throw e;
       }
@@ -591,7 +594,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
             let currentObj = {};
             if (typeof currentValue === 'string') {
-                try { currentObj = JSON.parse(currentValue); } catch (e) { console.warn('Failed to parse current JSON value for patching (updateCell)', e); }
+                try { currentObj = JSON.parse(currentValue); } catch (e: unknown) { const errorDetail = e instanceof Error ? e.message : String(e); console.warn('Failed to parse current JSON value for patching (updateCell)', errorDetail); }
             } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
                 currentObj = currentValue;
             }
@@ -687,7 +690,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
 
       await this.executeQuery('COMMIT');
-    } catch (e) {
+    } catch (e: unknown) {
       await this.safeRollback('insertRowBatch');
       throw e;
     }
@@ -788,7 +791,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         .join('\n');
       await this.executeQuery(dropColumnStatements);
       await this.executeQuery(`RELEASE ${savepointName}`);
-    } catch (e) {
+    } catch (e: unknown) {
       await this.safeRollbackSavepoint(savepointName, 'deleteColumns');
       throw e;
     }
@@ -906,7 +909,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
                      let currentObj = {};
                      if (typeof currentValue === 'string') {
-                         try { currentObj = JSON.parse(currentValue); } catch (e) { console.warn('Failed to parse current JSON value for patching (updateCells)', e); }
+                         try { currentObj = JSON.parse(currentValue); } catch (e: unknown) { const errorDetail = e instanceof Error ? e.message : String(e); console.warn('Failed to parse current JSON value for patching (updateCells)', errorDetail); }
                      }
 
                      let patchObj;
@@ -937,13 +940,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
 
       await this.executeQuery(`RELEASE ${savepointName}`);
-    } catch (err) {
+    } catch (err: unknown) {
       try {
         // ROLLBACK TO restores but keeps the savepoint; RELEASE removes it
         await this.executeQuery(`ROLLBACK TO ${savepointName}`);
         await this.executeQuery(`RELEASE ${savepointName}`);
-      } catch (rollbackErr) {
-        console.warn('Failed to rollback savepoint:', rollbackErr);
+      } catch (rollbackErr: unknown) {
+        const errorDetail = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+        console.warn('Failed to rollback savepoint:', errorDetail);
       }
       throw err;
     }
@@ -1009,7 +1013,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             columns: headers,
             values: rows
         };
-    } catch (err) {
+    } catch (err: unknown) {
         const errorDetail = err instanceof Error ? err.message : String(err);
         throw new Error(`Fetch failed: ${errorDetail}`);
     } finally {
