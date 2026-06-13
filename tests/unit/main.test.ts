@@ -36,15 +36,7 @@ require('module')._cache[path.resolve(baseDir, 'src/virtualFileSystem.ts')] = {
     exports: { SQLiteFileSystemProvider: class {} }
 };
 
-// Fix getExtension error by mocking vsc.extensions in vscode_mock_setup directly
 import { mockVscode } from './mocks/vscode';
-if (!mockVscode.extensions) {
-    (mockVscode as any).extensions = {
-        getExtension: () => ({ packageJSON: { version: '1.0.0' }, extensionKind: 2 })
-    };
-} else {
-    (mockVscode.extensions as any).getExtension = () => ({ packageJSON: { version: '1.0.0' }, extensionKind: 2 });
-}
 
 // Ensure mockVscode properties are completely overridable functions
 (mockVscode.commands as any).registerCommand = () => ({ dispose: () => {} });
