@@ -15,9 +15,9 @@ import { getNodeFs } from './core/sqlite-db';
 
 export interface FormatHelper {
   extension: string;
-  streamStart(stream: any): void;
-  streamWriteBatch(stream: any, headers: string[], rows: CellValue[][], isFirstBatch: boolean): void;
-  streamEnd(stream: any): void;
+  streamStart(stream: NodeJS.WritableStream): void;
+  streamWriteBatch(stream: NodeJS.WritableStream, headers: string[], rows: CellValue[][], isFirstBatch: boolean): void;
+  streamEnd(stream: NodeJS.WritableStream): void;
   exportMemory(headers: string[], rows: CellValue[][]): string;
 }
 
