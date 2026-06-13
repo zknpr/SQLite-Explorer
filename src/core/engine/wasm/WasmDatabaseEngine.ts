@@ -589,9 +589,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             const currentResult = await this.executeQuery(`SELECT ${escapedCol} FROM ${escapedTbl} WHERE rowid = ?`, [rowIdNum]);
             let currentValue = currentResult[0]?.rows[0]?.[0];
 
-            let currentObj = {};
+            let currentObj: unknown = {};
             if (typeof currentValue === 'string') {
-                try { currentObj = JSON.parse(currentValue); } catch (e) { console.warn('Failed to parse current JSON value for patching (updateCell)', e); }
+                try {
+                    currentObj = JSON.parse(currentValue);
+                } catch {
+                    // Fallback to empty object for patching if parsing fails
+                    currentObj = {};
+                }
             } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
                 currentObj = currentValue;
             }
@@ -904,9 +909,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                         selectStmt.reset();
                      }
 
-                     let currentObj = {};
+                     let currentObj: unknown = {};
                      if (typeof currentValue === 'string') {
-                         try { currentObj = JSON.parse(currentValue); } catch (e) { console.warn('Failed to parse current JSON value for patching (updateCells)', e); }
+                         try {
+                             currentObj = JSON.parse(currentValue);
+                         } catch {
+                             // Fallback to empty object for patching if parsing fails
+                             currentObj = {};
+                         }
                      }
 
                      let patchObj;
