@@ -328,7 +328,8 @@ async function createWorkerBackedWasmDatabaseConnection(
     {
       postMessage: (data: unknown, transfer?: Transferable[]) => {
         if (transfer) {
-          workerThread.postMessage(data, transfer);
+          // worker_threads.Worker postMessage needs TransferListItem[], but we can pass it via any if necessary or let it be inferred if we cast it. Transferable in DOM is ArrayBuffer | MessagePort | ImageBitmap, which intersects with node's TransferListItem (ArrayBuffer | MessagePort | FileHandle | X509Certificate | Blob) at ArrayBuffer and MessagePort.
+          workerThread.postMessage(data, transfer as any);
         } else {
           workerThread.postMessage(data);
         }

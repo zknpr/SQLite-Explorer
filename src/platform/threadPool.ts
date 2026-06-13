@@ -20,7 +20,7 @@ import type * as wt from 'worker_threads';
  * Used for communication in Node.js worker_threads.
  */
 interface NodeMessagePort {
-  postMessage(data: unknown, transfer?: unknown[]): void;
+  postMessage(data: unknown, transfer?: any[]): void;
   on(event: string, handler: EventListenerOrEventListenerObject, options?: object): void;
   off(event: string, handler: EventListenerOrEventListenerObject, options?: object): void;
 }
