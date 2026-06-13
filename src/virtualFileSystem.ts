@@ -1,4 +1,5 @@
 import * as vsc from 'vscode';
+import { GlobalOutputChannel } from './main';
 import { DocumentRegistry } from './documentRegistry';
 import { Disposable } from './lifecycle';
 import { escapeIdentifier } from './core/sql-utils';
@@ -95,7 +96,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             return new TextEncoder().encode(String(value));
 
         } catch (err) {
-            console.error('Error reading cell:', err);
+            GlobalOutputChannel?.appendLine(`Error reading cell: ${err instanceof Error ? err.message : String(err)}`);
             throw vsc.FileSystemError.FileNotFound(uri);
         }
     }
@@ -150,7 +151,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
 
         } catch (err) {
-            console.error('Error writing cell:', err);
+            GlobalOutputChannel?.appendLine(`Error writing cell: ${err instanceof Error ? err.message : String(err)}`);
             throw vsc.FileSystemError.Unavailable(err instanceof Error ? err.message : String(err));
         }
     }
