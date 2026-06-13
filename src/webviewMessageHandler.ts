@@ -21,13 +21,14 @@ interface WebviewLegacyRpcMessage {
 
 function isWebviewRpcInvokeMessage(message: unknown): message is WebviewRpcInvokeMessage {
   if (!message || typeof message !== 'object') return false;
-  const msg = message as Record<string, any>;
-  return msg.channel === 'rpc' && msg.content?.kind === 'invoke';
+  const msg = message as Record<string, unknown>;
+  const content = msg.content as Record<string, unknown> | undefined;
+  return msg.channel === 'rpc' && content?.kind === 'invoke';
 }
 
 function isWebviewLegacyRpcMessage(message: unknown): message is WebviewLegacyRpcMessage {
   if (!message || typeof message !== 'object') return false;
-  const msg = message as Record<string, any>;
+  const msg = message as Record<string, unknown>;
   return msg.type === 'rpc-request';
 }
 
@@ -81,9 +82,9 @@ export class WebviewMessageHandler {
     // SECURITY: Block Object.prototype methods to prevent prototype pollution attacks.
     // Allow class prototype methods (e.g., HostBridge.initialize) but reject inherited
     // Object methods like 'constructor', '__defineGetter__', 'toString'.
-    if (!BLOCKED_METHODS.has(targetMethod) && targetMethod in hostBridge && typeof (hostBridge as Record<string, any>)[targetMethod] === 'function') {
-      const fn = (hostBridge as Record<string, any>)[targetMethod];
-      Promise.resolve(fn.apply(hostBridge as any, deserializedPayload))
+    if (!BLOCKED_METHODS.has(targetMethod) && targetMethod in hostBridge && typeof (hostBridge as Record<string, unknown>)[targetMethod] === 'function') {
+      const fn = (hostBridge as Record<string, unknown>)[targetMethod] as Function;
+      Promise.resolve(fn.apply(hostBridge, deserializedPayload))
         .then(result => {
           // Serialize result to handle Uint8Array and other typed arrays
           // which get converted to {} by postMessage JSON serialization
@@ -131,9 +132,9 @@ export class WebviewMessageHandler {
     const hostBridge = this.hostBridge;
     // SECURITY: Same prototype pollution guard as #handleRpcInvoke
     if (BLOCKED_METHODS.has(message.method) || !(message.method in hostBridge)) return;
-    const fn = (hostBridge as Record<string, any>)[message.method];
+    const fn = (hostBridge as Record<string, unknown>)[message.method] as Function;
     if (typeof fn === 'function') {
-      Promise.resolve(fn.apply(hostBridge as any, deserializeArgs(message.args || [])))
+      Promise.resolve(fn.apply(hostBridge, deserializeArgs(message.args || [])))
         .then(result => {
           // Serialize result to handle Uint8Array
           const serializedResult = serializeValue(result);
