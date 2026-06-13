@@ -25,7 +25,7 @@ import type {
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from '../../sql-utils';
 import { crypto } from '../../../platform/cryptoShim';
 import { buildSelectQuery, buildCountQuery } from '../../query-builder';
-import { applyMergePatch, computeJsonPatchUndo } from '../../json-utils';
+import { applyMergePatch, computeJsonPatchUndo, parseJsonValueForPatching } from '../../json-utils';
 import { getNodeFs } from '../../platform/fs';
 
 // ============================================================================
@@ -589,12 +589,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             const currentResult = await this.executeQuery(`SELECT ${escapedCol} FROM ${escapedTbl} WHERE rowid = ?`, [rowIdNum]);
             let currentValue = currentResult[0]?.rows[0]?.[0];
 
-            let currentObj = {};
-            if (typeof currentValue === 'string') {
-                try { currentObj = JSON.parse(currentValue); } catch (e) { console.warn('Failed to parse current JSON value for patching (updateCell)', e); }
-            } else if (typeof currentValue === 'object' && currentValue !== null && !(currentValue instanceof Uint8Array)) {
-                currentObj = currentValue;
-            }
+            const currentObj = parseJsonValueForPatching(currentValue, 'updateCell');
 
             const patchObj = typeof patch === 'string' ? JSON.parse(patch) : patch;
             const newValueObj = applyMergePatch(currentObj, patchObj);
@@ -904,10 +899,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                         selectStmt.reset();
                      }
 
-                     let currentObj = {};
-                     if (typeof currentValue === 'string') {
-                         try { currentObj = JSON.parse(currentValue); } catch (e) { console.warn('Failed to parse current JSON value for patching (updateCells)', e); }
-                     }
+                     const currentObj = parseJsonValueForPatching(currentValue, 'updateCells');
 
                      let patchObj;
                      if (typeof update.value === 'string') {
