@@ -938,13 +938,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (err) {
-      try {
-        // ROLLBACK TO restores but keeps the savepoint; RELEASE removes it
-        await this.executeQuery(`ROLLBACK TO ${savepointName}`);
-        await this.executeQuery(`RELEASE ${savepointName}`);
-      } catch (rollbackErr) {
-        console.warn('Failed to rollback savepoint:', rollbackErr);
-      }
+      await this.safeRollbackSavepoint(savepointName, 'updateCellBatch');
       throw err;
     }
   }
