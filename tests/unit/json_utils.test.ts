@@ -102,6 +102,37 @@ describe('JSON Merge Patch (RFC 7396)', () => {
             // Result should have both
             assert.deepStrictEqual(result, { a: { x: 1, y: 2 } });
         });
+
+        it('should throw error if depth limit is exceeded', () => {
+            const patch = { a: { b: { c: 1 } } };
+            assert.throws(() => applyMergePatch({}, patch, 1001), /JSON apply merge patch depth limit exceeded/);
+        });
+
+        it('should replace target if patch is primitive or array', () => {
+            assert.strictEqual(applyMergePatch({ a: 1 }, 'test'), 'test');
+            assert.deepStrictEqual(applyMergePatch({ a: 1 }, [1, 2]), [1, 2]);
+        });
+
+        it('should treat target as empty object if it is primitive, null, or array', () => {
+            assert.deepStrictEqual(applyMergePatch(null, { a: 1 }), { a: 1 });
+            assert.deepStrictEqual(applyMergePatch('str', { a: 1 }), { a: 1 });
+            assert.deepStrictEqual(applyMergePatch([1, 2], { a: 1 }), { a: 1 });
+        });
+
+        it('should handle deletion of non-existent property', () => {
+            assert.deepStrictEqual(applyMergePatch({ a: 1 }, { b: null }), { a: 1 });
+        });
+
+        it('should correctly apply nested patch when target property is not an object', () => {
+            assert.deepStrictEqual(applyMergePatch({ a: 1 }, { a: { b: 2 } }), { a: { b: 2 } });
+        });
+
+        it('should only process patch own properties', () => {
+            const proto = { inherited: 1 };
+            const patch = Object.create(proto);
+            patch.own = 2;
+            assert.deepStrictEqual(applyMergePatch({ a: 1 }, patch), { a: 1, own: 2 });
+        });
     });
 });
 
