@@ -2,9 +2,16 @@ import './vscode_mock_setup';
 import { describe, it, mock, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import path from 'path';
+import Module from 'module';
 
-// Fix import.meta.env by adding it globally since we know workerFactory is trying to access it
-(globalThis as any).import = { meta: { env: { VSCODE_BROWSER_EXT: false } } };
+// Fix import.meta.env by intercepting compilation since TSX doesn't polyfill it natively
+const originalCompile = (Module as any).prototype._compile;
+(Module as any).prototype._compile = function (content: string, filename: string) {
+    if (content.includes('import.meta.env')) {
+        content = `const import_meta_env = { VSCODE_BROWSER_EXT: false };\n` + content.replace(/import\.meta\.env/g, 'import_meta_env');
+    }
+    return originalCompile.call(this, content, filename);
+};
 
 // Intercept TSX compilation using module cache
 const baseDir = path.resolve(__dirname, '..', '..');
@@ -61,7 +68,6 @@ if (!mockVscode.extensions) {
 };
 
 // Mock telemetry via _load
-import Module from 'module';
 const originalLoad = (Module as any)._load;
 (Module as any)._load = function (request: string, parent: any, isMain: boolean) {
     if (request === '@vscode/extension-telemetry') {
@@ -80,6 +86,8 @@ import * as config from '../../src/config';
 
 // Let's import main via require!
 const main = require('../../src/main');
+(Module as any).prototype._compile = originalCompile;
+
 const vsc = require('vscode');
 
 describe('main.ts', () => {
