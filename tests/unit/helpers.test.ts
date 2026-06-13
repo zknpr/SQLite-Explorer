@@ -118,6 +118,22 @@ describe('doTry', () => {
     assert.deepStrictEqual(warnMessages[0], ['[SQLite Explorer]', 'test error']);
   });
 
+  it('should return undefined and log warning with context if onError is a string', () => {
+    const result = doTry(() => { throw new Error('test error'); }, 'Context message');
+    assert.strictEqual(result, undefined);
+    assert.strictEqual(warnMessages.length, 1);
+    assert.deepStrictEqual(warnMessages[0], ['[SQLite Explorer]', 'Context message: test error']);
+  });
+
+  it('should return undefined and use custom handler if onError is a function', () => {
+    let handledError: unknown;
+    const result = doTry(() => { throw new Error('test error'); }, (err) => { handledError = err; });
+    assert.strictEqual(result, undefined);
+    assert.strictEqual(warnMessages.length, 0);
+    assert.ok(handledError instanceof Error);
+    assert.strictEqual(handledError.message, 'test error');
+  });
+
   it('should return undefined and log warning on string error', () => {
     const result = doTry(() => { throw 'string error'; });
     assert.strictEqual(result, undefined);
