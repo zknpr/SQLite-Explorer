@@ -11,8 +11,7 @@ let workerTerminated = false;
 
 const Module = require('module');
 
-// Hack for import.meta.env
-// TSX does not polyfill import.meta.env out of the box when evaluating imported modules.
+// Provide a polyfill for import.meta.env to prevent crashes during TSX evaluation.
 // We intercept compilation of workerFactory to inject the polyfill at the top of the file.
 const originalCompile = Module.prototype._compile;
 Module.prototype._compile = function(content: string, filename: string) {
