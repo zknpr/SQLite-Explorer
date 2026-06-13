@@ -10,10 +10,8 @@ test('mapRowsByName - returns empty array for null/undefined input', () => {
 });
 
 test('mapRowsByName - returns empty array for missing columns or values', () => {
-    // @ts-ignore
-    assert.deepStrictEqual(mapRowsByName({ columns: [] }, {}), []);
-    // @ts-ignore
-    assert.deepStrictEqual(mapRowsByName({ values: [] }, {}), []);
+    assert.deepStrictEqual(mapRowsByName({ columns: [] } as any, {}), []);
+    assert.deepStrictEqual(mapRowsByName({ values: [] } as any, {}), []);
 });
 
 test('mapRowsByName - maps rows correctly', () => {
