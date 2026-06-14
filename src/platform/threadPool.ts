@@ -9,6 +9,8 @@
  * all VS Code runtime environments without conditional imports.
  */
 
+import type * as wt from 'worker_threads';
+
 // ============================================================================
 // Type Definitions for Cross-Platform Message Passing
 // ============================================================================
@@ -18,7 +20,7 @@
  * Used for communication in Node.js worker_threads.
  */
 interface NodeMessagePort {
-  postMessage(data: unknown, transfer?: unknown[]): void;
+  postMessage(data: unknown, transfer?: any[]): void;
   on(event: string, handler: EventListenerOrEventListenerObject, options?: object): void;
   off(event: string, handler: EventListenerOrEventListenerObject, options?: object): void;
 }
@@ -84,11 +86,11 @@ export function createBrowserParentPort(scope: BrowserParentPortScope): NodeMess
 // Runtime Detection and API Export
 // ============================================================================
 
-let WorkerImpl: any;
-let MessageChannelImpl: any;
-let MessagePortImpl: any;
-let BroadcastChannelImpl: any;
-let parentPortImpl: any;
+let WorkerImpl: typeof globalThis.Worker | typeof wt.Worker;
+let MessageChannelImpl: typeof globalThis.MessageChannel | typeof wt.MessageChannel;
+let MessagePortImpl: typeof globalThis.MessagePort | typeof wt.MessagePort;
+let BroadcastChannelImpl: typeof globalThis.BroadcastChannel | typeof wt.BroadcastChannel;
+let parentPortImpl: typeof wt.parentPort | NodeMessagePort | null;
 
 if (import.meta.env?.VSCODE_BROWSER_EXT) {
   WorkerImpl = globalThis.Worker;

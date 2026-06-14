@@ -19,7 +19,7 @@ import { createWorkerEndpoint } from "./core/sqlite-db";
  */
 function log(level: 'log' | 'warn' | 'error', ...args: unknown[]) {
   if (parentPort) {
-    parentPort.postMessage({ kind: 'log', level, args: args.map(a => a instanceof Error ? a.message : a) });
+    parentPort.postMessage({ kind: 'log', level, args: args.map(a => a instanceof Error ? a.message : a) }, []);
   } else {
     console[level](...args);
   }
@@ -55,8 +55,12 @@ if (parentPort) {
     const wasHandled = processProtocolMessage(
       envelope,
       databaseEndpoint as Record<string, (...args: unknown[]) => unknown>,
-      (response, transfer) => {
-        parentPort!.postMessage(response, transfer);
+      (response, transfer?: Transferable[]) => {
+        if (transfer) {
+          parentPort!.postMessage(response, transfer as any[]);
+        } else {
+          parentPort!.postMessage(response, []);
+        }
       }
     );
 
