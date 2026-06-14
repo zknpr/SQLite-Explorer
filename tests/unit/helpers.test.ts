@@ -54,6 +54,46 @@ describe('getUriParts', () => {
     assert.strictEqual(parts.basename, 'file name');
     assert.strictEqual(parts.extname, '.txt');
   });
+
+  it('should parse empty string', () => {
+    const parts = getUriParts('');
+    assert.strictEqual(parts.dirname, '');
+    assert.strictEqual(parts.filename, '');
+    assert.strictEqual(parts.basename, '');
+    assert.strictEqual(parts.extname, '');
+  });
+
+  it('should parse file with multiple extensions', () => {
+    const parts = getUriParts('archive.tar.gz');
+    assert.strictEqual(parts.dirname, '');
+    assert.strictEqual(parts.filename, 'archive.tar.gz');
+    assert.strictEqual(parts.basename, 'archive.tar');
+    assert.strictEqual(parts.extname, '.gz');
+  });
+
+  it('should parse dotfile', () => {
+    const parts = getUriParts('.gitignore');
+    assert.strictEqual(parts.dirname, '');
+    assert.strictEqual(parts.filename, '.gitignore');
+    assert.strictEqual(parts.basename, '');
+    assert.strictEqual(parts.extname, '.gitignore');
+  });
+
+  it('should parse directory path without file', () => {
+    const parts = getUriParts('dirname/');
+    assert.strictEqual(parts.dirname, 'dirname/');
+    assert.strictEqual(parts.filename, '');
+    assert.strictEqual(parts.basename, '');
+    assert.strictEqual(parts.extname, '');
+  });
+
+  it('should parse path with dots in directory name', () => {
+    const parts = getUriParts('dir.with.dots/file.txt');
+    assert.strictEqual(parts.dirname, 'dir.with.dots/');
+    assert.strictEqual(parts.filename, 'file.txt');
+    assert.strictEqual(parts.basename, 'file');
+    assert.strictEqual(parts.extname, '.txt');
+  });
 });
 
 describe('themeToCss', () => {
