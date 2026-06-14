@@ -1,7 +1,7 @@
 import './vscode_mock_setup';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
-import { getUriParts, doTry, themeToCss, uiKindToString } from '../../src/helpers';
+import { getUriParts, doTry, themeToCss, uiKindToString, generateDatabaseDocumentKey } from '../../src/helpers';
 import * as vsc from 'vscode';
 
 describe('getUriParts', () => {
@@ -220,5 +220,34 @@ describe('maskSensitiveData', () => {
     assert.strictEqual(maskSensitiveData("My SSN is 123-45-6789"), "My SSN is ***-**-****");
     assert.strictEqual(maskSensitiveData("My SSN is 123 45 6789"), "My SSN is ***-**-****");
     assert.strictEqual(maskSensitiveData("My SSN is 123456789"), "My SSN is ***-**-****");
+  });
+});
+
+describe('generateDatabaseDocumentKey', () => {
+  it('should generate a unique key for a document URI', async () => {
+    const uri = vsc.Uri.file('/path/to/database.sqlite');
+    const key = await generateDatabaseDocumentKey(uri);
+    assert.match(key, /^database\.sqlite <[a-zA-Z0-9_-]+>$/);
+  });
+
+  it('should generate the same key for the same URI', async () => {
+    const uri = vsc.Uri.file('/path/to/database.sqlite');
+    const key1 = await generateDatabaseDocumentKey(uri);
+    const key2 = await generateDatabaseDocumentKey(uri);
+    assert.strictEqual(key1, key2);
+  });
+
+  it('should generate different keys for different URIs with the same filename', async () => {
+    const uri1 = vsc.Uri.file('/path/to/database.sqlite');
+    const uri2 = vsc.Uri.file('/another/path/database.sqlite');
+    const key1 = await generateDatabaseDocumentKey(uri1);
+    const key2 = await generateDatabaseDocumentKey(uri2);
+    assert.notStrictEqual(key1, key2);
+  });
+
+  it('should handle URIs without an extension', async () => {
+    const uri = vsc.Uri.file('/path/to/database');
+    const key = await generateDatabaseDocumentKey(uri);
+    assert.match(key, /^database <[a-zA-Z0-9_-]+>$/);
   });
 });
