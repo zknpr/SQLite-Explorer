@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.5.3
+
+### Fixes
+
+- **Row-id validation no longer silently accepts non-integers.** `validateRowId` previously used `Number()` + `Number.isFinite`, which coerced `''` and `'   '` to `0` (a missing rowid became "row 0") and accepted `'123.45'` / `'1e3'` as rowids. It now rejects blank, non-integer, and exponential inputs, so a malformed rowid fails loudly instead of operating on the wrong row. (#456)
+- **Broader sensitive-data masking.** The credit-card and SSN regexes in `maskSensitiveData` were too strict (e.g. required 16 digits split into dash/space groups of four), so 15-digit Amex numbers and unbroken digit runs could slip through unredacted when logged or displayed. The patterns now cover 13–16-digit cards and more SSN formats, and credit cards are matched before phone numbers so a partial match can't leak the remaining digits. (#453)
+
+### Security
+
+- **Cryptographically secure SAVEPOINT names.** The WASM engine generated nested-transaction savepoint names with `Math.random()`; they are now derived from `crypto.randomUUID()` (via the crypto shim) through a single `createSavepointName` helper, removing the predictability that could collide or be guessed across nested savepoint release/rollback. (#449)
+
+### Performance
+
+- **~100× faster multi-column deletes.** `deleteColumns` used `Array.includes()` inside a filter (O(n²)); switching the lookup to a `Set` cut filtering on a 10k-element case from ~350 ms to ~3 ms. (#443)
+- **Concurrent undo-value computation.** `WasmDatabaseEngine.undoCellUpdate` awaited `computeUndoValue` sequentially per cell; running the independent calls with `Promise.all` took a 1,000-cell undo (e.g. paste / multi-select) from ~1,155 ms to ~9 ms. (#439)
+- **Batched sidebar DOM writes.** The batch-edit sidebar now accumulates its rows in a `DocumentFragment` and appends once, avoiding per-row layout thrashing when many columns are selected. (#440)
+
+### Maintenance
+
+- **Diagnostic logging consolidated to the SQLite Explorer output channel.** Replaced `console.error` / `console.warn` with the extension output channel across the cell virtual filesystem, the document model's undo/redo, auto-save, and save-fallback paths, and the "missing undo/redo entry" warnings — so failures surface in the Output panel instead of the (usually hidden) extension-host console. (#464, #483, #455, #447)
+- **Type-safety pass.** Dropped `any` for `unknown`/explicit types in the webview message handler, the cross-platform worker-thread plumbing, and the table exporter's stream sink (a minimal `ExportWritable` interface). (#475, #471, #489)
+- **Refactors.** Reuse `safeRollbackSavepoint` in `updateCellBatch`; extract a shared JSON-parse-for-patching helper in the WASM engine; drop the unused `name` parameter from `serializeDatabase` / `exportDatabase`; add an optional error-context argument to `doTry`; remove dead benchmark code. (#465, #470, #452, #474, #466)
+- **Expanded unit-test coverage.** Added tests for `validateRowId` / `validateRowIds` boundaries, `getUriParts`, `applyMergePatch` (depth limit + own-properties / prototype-pollution guard), `getFormatHelper`, `generateDatabaseDocumentKey`, `doTry` falsy-success returns, `themeToCss` unknown-kind, `invalidateCapturedCheckpointPositions`, and the unsupported-export-format path; plus test-infra cleanups (centralized `getExtension` mock, simplified `import.meta.env` mock, removed `@ts-ignore`s). (#438, #441, #442, #445, #446, #451, #467, #469, #476, #478, #480, #481, #482, #489)
+
+### Dependencies
+
+- Extension dev-dependencies: `esbuild` 0.28.0 → 0.28.1, `@vscode/vsce` 3.9.1 → 3.9.2, `tsx` 4.22.3 → 4.22.4, `@types/node` → 25.9.3.
+- Website: `next` and `eslint-config-next` 16.2.6 → 16.2.7, `react-dom` 19.2.6 → 19.2.7, `lucide-react` 1.16.0 → 1.17.0, plus `postcss`, `eslint`, `@types/react`, and `@types/node` bumps.
+
 ## 1.5.2
 
 ### Fixes
