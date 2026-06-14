@@ -209,5 +209,16 @@ describe('SQL Utils', () => {
       assert.throws(() => validateRowIds([Infinity, 2]), /Invalid rowid: Infinity/);
       assert.throws(() => validateRowIds(['1', 'abc']), /Invalid rowid: abc/);
     });
+
+    it('should throw TypeError when given non-array malformed inputs', () => {
+      // @ts-ignore
+      assert.throws(() => validateRowIds(null), TypeError);
+      // @ts-ignore
+      assert.throws(() => validateRowIds(undefined), TypeError);
+      // @ts-ignore
+      assert.throws(() => validateRowIds({}), TypeError);
+      // @ts-ignore
+      assert.throws(() => validateRowIds(123), TypeError);
+    });
   });
 });
