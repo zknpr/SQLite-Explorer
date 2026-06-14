@@ -2,7 +2,7 @@
 import './vscode_mock_setup'; // Must be first
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { exportToJson, exportToCsv, exportToSql, exportTableCommand } from '../../src/tableExporter';
+import { exportToJson, exportToCsv, exportToSql, exportTableCommand, getFormatHelper } from '../../src/tableExporter';
 import { CellValue } from '../../src/core/types';
 import { mockVscode } from './mocks/vscode';
 import { DocumentRegistry } from '../../src/documentRegistry';
@@ -395,5 +395,116 @@ describe('exportTableCommand Fallback', () => {
             console.warn = originalConsoleWarn;
             DocumentRegistry.delete('test');
         }
+    });
+});
+
+describe('getFormatHelper', () => {
+    it('should return correct helper for csv format', () => {
+        const helper = getFormatHelper('csv', 'test_table', true, true);
+        assert.strictEqual(helper.extension, 'csv');
+
+        let called = false;
+        helper.streamStart({ write: () => called = true });
+        assert.strictEqual(called, false, 'streamStart should be a no-op');
+
+        called = false;
+        helper.streamEnd({ write: () => called = true });
+        assert.strictEqual(called, false, 'streamEnd should be a no-op');
+
+        let written = '';
+        helper.streamWriteBatch({ write: (data: string) => written += data }, ['col1'], [[1]], true);
+        assert.ok(written.includes('col1'), 'First batch should include header');
+        assert.ok(written.includes('1'), 'First batch should include data');
+
+        written = '';
+        helper.streamWriteBatch({ write: (data: string) => written += data }, ['col1'], [[2]], false);
+        assert.strictEqual(written.startsWith('\n'), true, 'Subsequent batches should start with newline');
+        assert.ok(!written.includes('col1'), 'Subsequent batches should not include header');
+
+        const memExport = helper.exportMemory(['col1'], [[1]]);
+        assert.ok(memExport.includes('col1'));
+        assert.ok(memExport.includes('1'));
+    });
+
+    it('should return correct helper for excel format', () => {
+        const helper = getFormatHelper('excel', 'test_table', true, true);
+        assert.strictEqual(helper.extension, 'csv');
+
+        let written = '';
+        helper.streamStart({ write: (data: string) => written = data });
+        assert.strictEqual(written, '\uFEFF', 'streamStart should write BOM');
+
+        let called = false;
+        helper.streamEnd({ write: () => called = true });
+        assert.strictEqual(called, false, 'streamEnd should be a no-op');
+
+        const memExport = helper.exportMemory(['col1'], [[1]]);
+        assert.ok(memExport.startsWith('\uFEFF'), 'exportMemory should start with BOM');
+        assert.ok(memExport.includes('col1'));
+        assert.ok(memExport.includes('1'));
+    });
+
+    it('should return correct helper for json format', () => {
+        const helper = getFormatHelper('json', 'test_table', true, true);
+        assert.strictEqual(helper.extension, 'json');
+
+        let written = '';
+        helper.streamStart({ write: (data: string) => written = data });
+        assert.strictEqual(written, '[', 'streamStart should write array start');
+
+        written = '';
+        helper.streamEnd({ write: (data: string) => written = data });
+        assert.strictEqual(written, ']', 'streamEnd should write array end');
+
+        written = '';
+        helper.streamWriteBatch({ write: (data: string) => written += data }, ['col1'], [[1]], true);
+        assert.ok(written.includes('"col1": 1'), 'First batch should write formatted object');
+        assert.ok(!written.startsWith('['), 'First batch should not start with [');
+        assert.ok(!written.endsWith(']'), 'First batch should not end with ]');
+
+        written = '';
+        helper.streamWriteBatch({ write: (data: string) => written += data }, ['col1'], [[2]], false);
+        assert.strictEqual(written.startsWith(','), true, 'Subsequent batches should prepend comma');
+        assert.ok(written.includes('"col1": 2'), 'Subsequent batches should write formatted object');
+
+        const memExport = helper.exportMemory(['col1'], [[1]]);
+        assert.strictEqual(memExport, '[\n  {\n    "col1": 1\n  }\n]', 'exportMemory should write full JSON array');
+    });
+
+    it('should return correct helper for sql format', () => {
+        const helper = getFormatHelper('sql', 'test_table', true, true);
+        assert.strictEqual(helper.extension, 'sql');
+
+        let called = false;
+        helper.streamStart({ write: () => called = true });
+        assert.strictEqual(called, false, 'streamStart should be a no-op');
+
+        called = false;
+        helper.streamEnd({ write: () => called = true });
+        assert.strictEqual(called, false, 'streamEnd should be a no-op');
+
+        let written = '';
+        helper.streamWriteBatch({ write: (data: string) => written += data }, ['col1'], [[1]], true);
+        assert.ok(written.includes('INSERT INTO "test_table"'), 'First batch should contain INSERT statement');
+
+        written = '';
+        helper.streamWriteBatch({ write: (data: string) => written += data }, ['col1'], [[2]], false);
+        assert.strictEqual(written.startsWith('\n'), true, 'Subsequent batches should start with newline');
+        assert.ok(written.includes('INSERT INTO "test_table"'), 'Subsequent batches should contain INSERT statement');
+
+        const memExport = helper.exportMemory(['col1'], [[1]]);
+        assert.ok(memExport.includes('INSERT INTO "test_table"'), 'exportMemory should contain INSERT statement');
+    });
+
+    it('should throw error for unknown format', () => {
+        assert.throws(() => {
+            getFormatHelper('unknown_format', 'test_table', true, true);
+        }, /Unsupported export format: unknown_format/);
+    });
+
+    it('should throw error for undefined format', () => {
+        assert.throws(() => {
+            getFormatHelper('', 'test_table', true, true);
+        }, /Unsupported export format: undefined/);
     });
 });
