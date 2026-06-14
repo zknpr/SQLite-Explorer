@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.3
+
+### Maintenance
+
+- **Error logging routed to the output channel.** Failures on the cell virtual-filesystem read/write paths and in the document model's undo/redo/auto-save handlers now log through the **SQLite Explorer** output channel instead of `console.error`, so they appear in the Output panel rather than only the (usually hidden) extension-host console.
+- **Type-safety and internal cleanup.** Dropped `any` in favor of `unknown`/explicit types in the webview message handler, the cross-platform worker-thread plumbing, and the table exporter's stream sink; and consolidated duplicated logic — a shared JSON-parse-for-patching helper in the WASM engine, reuse of `safeRollbackSavepoint` in `updateCellBatch`, and an optional error-context argument for `doTry`. No user-facing behavior change.
+- **Expanded test coverage.** Added unit tests for `validateRowIds`, `getUriParts` edge cases, `applyMergePatch` (depth limit and the own-properties / prototype-pollution guard), `getFormatHelper`, and `generateDatabaseDocumentKey`, plus test-suite cleanups (454 tests passing).
+
+### Dependencies
+
+- Bumped dev dependencies: `esbuild` 0.28.0 → 0.28.1 and `@vscode/vsce` 3.9.1 → 3.9.2; in the website workspace, `eslint`, `postcss`, `@types/node` (→ 25.9.3), and `@types/react`.
+
 ## 1.5.2
 
 ### Fixes
