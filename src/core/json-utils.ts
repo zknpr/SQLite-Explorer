@@ -108,6 +108,19 @@ export function applyMergePatch(target: unknown, patch: unknown, depth = 0): unk
     return targetObj;
 }
 
+export function parseJsonValueForPatching(val: unknown, context: string): Record<string, unknown> {
+    if (typeof val === 'string') {
+        try {
+            return JSON.parse(val);
+        } catch (e) {
+            console.warn(`Failed to parse current JSON value for patching (${context})`, e);
+        }
+    } else if (typeof val === 'object' && val !== null && !(val instanceof Uint8Array)) {
+        return val as Record<string, unknown>;
+    }
+    return {};
+}
+
 export type JsonUndoPlan =
     | { kind: 'restore'; value: string }
     | { kind: 'replace' };
