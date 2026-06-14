@@ -182,7 +182,7 @@
     "@types/node": "^25.9.2",
     "@types/vscode": "=1.110.0",
     "@vscode/vsce": "^3.9.2",
-    "esbuild": "^0.28.0",
+    "esbuild": "^0.28.1",
     "esbuild-plugin-polyfill-node": "^0.3.0",
     "ts-node": "^10.9.2",
     "tsx": "^4.22.4",
