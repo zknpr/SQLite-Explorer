@@ -41,7 +41,6 @@ async function runBenchmark() {
         });
     } catch (e: any) {
         // We expect an error because the file is not a valid SQLite database
-        // console.log('Expected error (invalid db):', e.message);
     }
 
     clearInterval(interval);
