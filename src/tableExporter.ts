@@ -13,11 +13,21 @@ import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
 import { getNodeFs } from './core/sqlite-db';
 
+/**
+ * Minimal writable sink consumed by the streaming exporters. Satisfied by Node's
+ * `fs.WriteStream` and by lightweight in-memory test doubles alike: the exporters
+ * only ever call `write()` with a string chunk, so requiring the full
+ * `NodeJS.WritableStream` surface would be unnecessary and would reject valid stubs.
+ */
+export interface ExportWritable {
+  write(chunk: string): void;
+}
+
 export interface FormatHelper {
   extension: string;
-  streamStart(stream: any): void;
-  streamWriteBatch(stream: any, headers: string[], rows: CellValue[][], isFirstBatch: boolean): void;
-  streamEnd(stream: any): void;
+  streamStart(stream: ExportWritable): void;
+  streamWriteBatch(stream: ExportWritable, headers: string[], rows: CellValue[][], isFirstBatch: boolean): void;
+  streamEnd(stream: ExportWritable): void;
   exportMemory(headers: string[], rows: CellValue[][]): string;
 }
 
