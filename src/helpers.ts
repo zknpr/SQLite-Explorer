@@ -159,11 +159,16 @@ export async function generateDatabaseDocumentKey(uri: vsc.Uri): Promise<string>
  * @param fn - Function to execute
  * @returns Function result or undefined on error
  */
-export function doTry<T extends (...args: unknown[]) => unknown>(fn: T): ReturnType<T> | undefined {
+export function doTry<T extends (...args: unknown[]) => unknown>(fn: T, onError?: string | ((err: unknown) => void)): ReturnType<T> | undefined {
   try {
     return fn() as ReturnType<T>;
   } catch (err) {
-    console.warn(`[${Title}]`, err instanceof Error ? err.message : String(err));
+    if (typeof onError === 'function') {
+      onError(err);
+    } else {
+      const context = onError ? `${onError}: ` : '';
+      console.warn(`[${Title}]`, `${context}${err instanceof Error ? err.message : String(err)}`);
+    }
     return undefined;
   }
 }

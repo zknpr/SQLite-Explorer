@@ -267,7 +267,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       browserExt: toBoolString(!!import.meta.env?.VSCODE_BROWSER_EXT),
       uriScheme, appHost, appName, extensionUrl,
       uiKind: uiKindToString(uiKind),
-      firstInstall: doTry(() => new Date(this.context.globalState.get<number>(FirstInstallMs) ?? Date.now()).toISOString()),
+      firstInstall: doTry(() => new Date(this.context.globalState.get<number>(FirstInstallMs) ?? Date.now()).toISOString(), 'Failed to parse first install date'),
       sidebarLeft: this.context.globalState.get<number>(SidebarLeft)?.toString(),
       sidebarRight: this.context.globalState.get<number>(SidebarRight)?.toString(),
       panelVisible: toBoolString(webviewPanel.visible),
