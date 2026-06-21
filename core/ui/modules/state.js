@@ -19,7 +19,6 @@ export const state = {
     sortedColumn: null,
     sortAscending: true,
     filterQuery: '',
-    filterTimer: null,
     selectedRowIds: new Set(),
     gridData: [],
 

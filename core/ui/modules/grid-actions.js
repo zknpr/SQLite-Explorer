@@ -15,7 +15,13 @@ import { navigateMatches, resetMatchNav } from './match-nav.js';
  * just advance to the next match.
  */
 export async function applyGlobalFilter(direction = 1) {
-    const value = document.getElementById('filterInput').value;
+    // The toolbar filter input bypasses the #gridContainer guards, so block here
+    // while a reload is in flight to avoid a concurrent refetch / acting on the
+    // stale grid (the column filter is already covered by handleKeydown/handleClick).
+    if (state.isGridReloading) return;
+    const input = document.getElementById('filterInput');
+    if (!input) return;
+    const value = input.value;
     if (value !== state.filterQuery) {
         state.filterQuery = value;
         state.currentPageIndex = 0;
@@ -28,7 +34,10 @@ export async function applyGlobalFilter(direction = 1) {
 
 export function onFilterEnter(event) {
     // Enter jumps to the next match, Shift+Enter to the previous one.
-    if (event.key === 'Enter') applyGlobalFilter(event.shiftKey ? -1 : 1);
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        applyGlobalFilter(event.shiftKey ? -1 : 1);
+    }
 }
 
 export function onPageSizeChange() {
@@ -43,6 +52,9 @@ export function onDateFormatChange() {
     const select = document.getElementById('dateFormatSelect');
     if (select) {
         state.dateFormat = select.value;
+        // Cached matches were computed against the previous formatted text, so they
+        // (and the highlighted active cell) are stale once the format changes.
+        resetMatchNav();
         renderDataGrid();
         persistState();
     }
@@ -82,6 +94,7 @@ export function onColumnSort(columnName) {
  * cycle through matches; when unchanged we just advance to the next match.
  */
 export async function applyColumnFilter(columnName, direction = 1) {
+    if (state.isGridReloading) return; // don't stack a refetch/navigate on an in-flight reload
     const input = document.querySelector(`.column-filter[data-column="${columnName}"]`);
     if (!input) return;
 
@@ -104,7 +117,10 @@ export async function applyColumnFilter(columnName, direction = 1) {
 
 export function onColumnFilterKeydown(event, columnName) {
     // Enter jumps to the next match, Shift+Enter to the previous one.
-    if (event.key === 'Enter') applyColumnFilter(columnName, event.shiftKey ? -1 : 1);
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        applyColumnFilter(columnName, event.shiftKey ? -1 : 1);
+    }
 }
 
 // Column Selection

@@ -29,7 +29,9 @@ function computeMatches(scope, term) {
         const row = state.gridData[rowIdx];
         for (const { col, colIdx } of columnsToScan) {
             const value = getCellValue(row, colIdx);
-            const text = formatCellValueAsText(value, col.type, state.dateFormat, col.name);
+            // String() guards against formatters that may return a non-string
+            // (number/null/undefined), which would otherwise throw on .toLowerCase().
+            const text = String(formatCellValueAsText(value, col.type, state.dateFormat, col.name));
             if (text.toLowerCase().includes(term)) {
                 matches.push({ rowIdx, colIdx });
             }
@@ -75,6 +77,9 @@ function updateMatchCounterUI() {
  * rescan of every row.
  */
 export function navigateMatches(scope, direction = 1) {
+    // Normalize to ±1 so a stray non-numeric arg (e.g. a DOM event) can never
+    // produce a NaN index in the modulo arithmetic below.
+    direction = direction < 0 ? -1 : 1;
     const term = activeTerm(scope);
     const cacheValid = state.matchNav.scope === scope
         && state.matchNav.term === term

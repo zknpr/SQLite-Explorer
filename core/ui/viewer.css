@@ -703,6 +703,14 @@ body {
     z-index: 3;
 }
 
+/* A pinned cell must keep its sticky stacking (z-index 5) even when it is the
+   active match — this rule is later + more specific than .data-cell.pinned, so
+   without it the active-match z-index (3) would drop the pinned cell below its
+   neighbors. */
+.data-cell.pinned.active-match-cell {
+    z-index: 5;
+}
+
 /* Header cell styling when entire column is selected */
 .header-cell.column-selected {
     /* Layer active background over secondary background to ensure opacity for sticky header */
