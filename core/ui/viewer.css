@@ -1117,6 +1117,13 @@ body {
     white-space: nowrap;
 }
 
+/* Light background for substrings matching the active filter/search term */
+.cell-highlight {
+    background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 182, 42, 0.4));
+    color: inherit;
+    border-radius: 2px;
+}
+
 /* Expand icon - hidden by default, shown on hover when cell has overflow */
 .data-cell .expand-icon {
     display: none;

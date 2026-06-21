@@ -16,6 +16,46 @@ export function escapeHtml(str) {
 }
 
 /**
+ * Escape a string for safe use inside a RegExp pattern.
+ */
+function escapeRegExp(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Append text to a parent element, wrapping any case-insensitive matches of
+ * the given terms in <mark class="cell-highlight"> spans. Uses DOM text nodes
+ * (never innerHTML) so untrusted cell content can never be interpreted as markup.
+ */
+export function appendHighlightedText(parentEl, text, terms) {
+    const activeTerms = (terms || []).filter(t => t && t.trim());
+    if (activeTerms.length === 0) {
+        parentEl.appendChild(document.createTextNode(text));
+        return;
+    }
+
+    const pattern = activeTerms.map(t => escapeRegExp(t.trim())).join('|');
+    const regex = new RegExp(`(${pattern})`, 'gi');
+
+    let lastIndex = 0;
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+            parentEl.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+        }
+        const mark = document.createElement('mark');
+        mark.className = 'cell-highlight';
+        mark.textContent = match[0];
+        parentEl.appendChild(mark);
+        lastIndex = match.index + match[0].length;
+        if (match[0].length === 0) regex.lastIndex++; // guard against zero-length matches
+    }
+    if (lastIndex < text.length) {
+        parentEl.appendChild(document.createTextNode(text.slice(lastIndex)));
+    }
+}
+
+/**
  * Validate and sanitize a rowid for use in SQL queries.
  */
 export function validateRowId(rowId) {

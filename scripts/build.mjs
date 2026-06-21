@@ -286,10 +286,13 @@ const bundleWebview = async () => {
     }
   }
 
-  // Bundle: replace placeholders with actual content
+  // Bundle: replace placeholders with actual content.
+  // Use function replacers so literal "$&"/"$1"-style sequences inside the
+  // bundled JS/CSS (e.g. regex replacement strings) aren't reinterpreted as
+  // String.replace() substitution patterns.
   const bundled = template
-    .replace('<!--STYLES-->', finalCss)
-    .replace('<!--SCRIPTS-->', finalJs);
+    .replace('<!--STYLES-->', () => finalCss)
+    .replace('<!--SCRIPTS-->', () => finalJs);
 
   // Write the bundled HTML
   fs.writeFileSync(outputPath, bundled, 'utf-8');
@@ -379,9 +382,9 @@ const bundleWebDemoViewer = async () => {
   const codiconLink = '<link rel="stylesheet" href="https://unpkg.com/@vscode/codicons@0.0.44/dist/codicon.css" integrity="sha384-sVpT0iPTciRIsuV1JVtIodkJ0guQ/8vFWf8PaazFqcSmJfWptKd00bCziqfui3Ir" crossorigin="anonymous">';
 
   const bundled = template
-    .replace('<!--HEAD-->', codiconLink)
-    .replace('<!--STYLES-->', finalCss)
-    .replace('<!--SCRIPTS-->', finalJs)
+    .replace('<!--HEAD-->', () => codiconLink)
+    .replace('<!--STYLES-->', () => finalCss)
+    .replace('<!--SCRIPTS-->', () => finalJs)
     .replace('nonce="<!--NONCE-->"', ''); // Remove nonce for static web demo
 
   // Write the bundled HTML

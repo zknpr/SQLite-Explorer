@@ -1,5 +1,5 @@
 import { state } from './state.js';
-import { escapeHtml, formatCellValueAsText } from './utils.js';
+import { escapeHtml, formatCellValueAsText, appendHighlightedText } from './utils.js';
 import { getRowId, getCellValue } from './data-utils.js';
 import { syncSelectionDOM } from './grid-selection.js';
 
@@ -175,9 +175,9 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
 
             const textSpan = document.createElement('span');
             textSpan.className = 'cell-text';
-            // Use textContent for security (prevents XSS).
-            // formatCellValueAsText returns unescaped text suitable for textContent.
-            textSpan.textContent = displayValue;
+            // Use DOM text nodes (never innerHTML) for security (prevents XSS).
+            // formatCellValueAsText returns unescaped text suitable for textContent/text nodes.
+            appendHighlightedText(textSpan, displayValue, [state.filterQuery, state.columnFilters[col.name]]);
             td.appendChild(textSpan);
 
             if (hasContent) {
