@@ -42,22 +42,28 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     if (!state.selectedTable) return;
 
     const container = document.getElementById('gridContainer');
-    // Whether a data grid is currently rendered (vs. a spinner/error/empty state).
-    // Cached once instead of re-querying the DOM at each decision point below.
+    // Whether a data grid is currently rendered (vs. a spinner/error/empty state),
+    // AND whether it belongs to the table we're loading. The renderedTable check is
+    // what separates a same-table refetch (filter/sort/page — keep the grid, no
+    // flicker) from a table switch, where the previous table's grid is still in the
+    // DOM and must not be left on screen. Cached once instead of re-querying below.
     const hasRenderedGrid = !!(container && container.querySelector('.data-grid'));
+    const isSameTableGrid = hasRenderedGrid && state.renderedTable === state.selectedTable;
 
-    // Only capture scroll position if the grid is currently visible (not loading/error state)
-    // This prevents overwriting the saved position with 0 when reloading data while a spinner is shown.
-    if (saveScrollPosition && hasRenderedGrid) {
+    // Only capture scroll position if the current table's grid is visible (not a
+    // loading/error state, and not a different table's grid mid-switch). This
+    // prevents overwriting the saved position with 0 while a spinner is shown.
+    if (saveScrollPosition && isSameTableGrid) {
         state.scrollPosition.left = container.scrollLeft;
         state.scrollPosition.top = container.scrollTop;
     }
 
     if (showSpinner) {
         state.isLoadingData = true;
-        // Keep the existing grid visible during refetch (prevents flicker); only
-        // show the spinner on a true first load when nothing is rendered yet.
-        if (!hasRenderedGrid) {
+        // Keep the existing grid visible during a same-table refetch (prevents
+        // flicker); show the spinner on a true first load or a table switch, where
+        // nothing valid for this table is on screen yet.
+        if (!isSameTableGrid) {
             showLoading();
         }
     }
@@ -113,13 +119,15 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
         state.gridData = dataResult.rows || [];
 
-        // If not showing spinner (background refresh), capture the current scroll position
-        // right before rendering. This ensures we use the latest scroll position,
-        // which covers cases where the user scrolled during fetch or if an edit operation
-        // updated the view (and restored scroll) while the fetch was pending.
+        // When preserving scroll, re-capture the latest position right before
+        // rendering. Covers the user scrolling during the fetch — including a
+        // flicker-free refetch where the spinner was suppressed and the grid stayed
+        // interactive — and edit operations that restored scroll while the fetch was
+        // pending. Gated on saveScrollPosition (not !showSpinner) so callers that
+        // intentionally reset scroll (page change, table switch) aren't clobbered.
         // Re-check the DOM here (not the cached flag): this runs after the await,
         // so the rendered state may differ from when the function started.
-        if (!showSpinner && container && container.querySelector('.data-grid')) {
+        if (saveScrollPosition && container && container.querySelector('.data-grid')) {
             state.scrollPosition.left = container.scrollLeft;
             state.scrollPosition.top = container.scrollTop;
         }
@@ -131,6 +139,9 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             // updateCellDom in edit.js handles the visual update of the modified cell.
         } else {
             renderDataGrid(state.scrollPosition.top, state.scrollPosition.left);
+            // The on-screen grid now reflects this table; remember it so the next
+            // load can distinguish a same-table refetch from a table switch.
+            state.renderedTable = state.selectedTable;
         }
 
         if (container) {

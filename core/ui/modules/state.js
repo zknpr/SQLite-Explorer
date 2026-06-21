@@ -7,6 +7,10 @@ export const state = {
     isDbConnected: false,
     selectedTable: null,
     selectedTableType: 'table',
+    // Name of the table whose grid is currently rendered on screen. Lets
+    // loadTableData tell a same-table refetch (keep the grid, no flicker) apart
+    // from a table switch (show the spinner instead of the previous table's rows).
+    renderedTable: null,
     currentPageIndex: 0,
     rowsPerPage: 500,
     totalRecordCount: 0,
