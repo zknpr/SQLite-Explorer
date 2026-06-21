@@ -42,17 +42,22 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     if (!state.selectedTable) return;
 
     const container = document.getElementById('gridContainer');
+    // Whether a data grid is currently rendered (vs. a spinner/error/empty state).
+    // Cached once instead of re-querying the DOM at each decision point below.
+    const hasRenderedGrid = !!(container && container.querySelector('.data-grid'));
 
     // Only capture scroll position if the grid is currently visible (not loading/error state)
     // This prevents overwriting the saved position with 0 when reloading data while a spinner is shown.
-    if (saveScrollPosition && container && container.querySelector('.data-grid')) {
+    if (saveScrollPosition && hasRenderedGrid) {
         state.scrollPosition.left = container.scrollLeft;
         state.scrollPosition.top = container.scrollTop;
     }
 
     if (showSpinner) {
         state.isLoadingData = true;
-        if (!container || !container.querySelector('.data-grid')) {
+        // Keep the existing grid visible during refetch (prevents flicker); only
+        // show the spinner on a true first load when nothing is rendered yet.
+        if (!hasRenderedGrid) {
             showLoading();
         }
     }
@@ -69,10 +74,13 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             }
         }
 
+        // Column names are needed both for the global-filter count and the data query.
+        const columnNames = state.tableColumns.map(c => c.name);
+
         const countOptions = {
             filters,
             globalFilter: state.filterQuery,
-            columns: state.tableColumns.map(c => c.name) // Needed for global filter
+            columns: columnNames // Needed for global filter
         };
 
         // Get total count
@@ -85,7 +93,6 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
         // Get data
         const isTable = state.selectedTableType === 'table';
-        const columnNames = state.tableColumns.map(c => c.name);
 
         // For tables, we need to explicitly request the 'rowid' column to handle row identification.
         // The frontend expects rowid at index 0 for tables (see `getRowId` and `getRowDataOffset`).
@@ -110,6 +117,8 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // right before rendering. This ensures we use the latest scroll position,
         // which covers cases where the user scrolled during fetch or if an edit operation
         // updated the view (and restored scroll) while the fetch was pending.
+        // Re-check the DOM here (not the cached flag): this runs after the await,
+        // so the rendered state may differ from when the function started.
         if (!showSpinner && container && container.querySelector('.data-grid')) {
             state.scrollPosition.left = container.scrollLeft;
             state.scrollPosition.top = container.scrollTop;
