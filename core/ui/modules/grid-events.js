@@ -1,7 +1,8 @@
 import { state, persistState } from './state.js';
 import {
     goToPage,
-    onFilterChange,
+    applyGlobalFilter,
+    onFilterEnter,
     onPageSizeChange,
     onDateFormatChange,
     startColumnResize,
@@ -19,7 +20,10 @@ import {
 import { openCellPreview } from './edit.js';
 
 export function initGridControls() {
-    document.getElementById('filterInput')?.addEventListener('keyup', onFilterChange);
+    document.getElementById('filterInput')?.addEventListener('keydown', onFilterEnter);
+    // Wrap so the click MouseEvent isn't passed as `direction` (which would make
+    // navigateMatches compute NaN); the Search button always advances forward.
+    document.getElementById('btnApplyFilter')?.addEventListener('click', () => applyGlobalFilter(1));
     document.getElementById('pageSizeSelect')?.addEventListener('change', onPageSizeChange);
     document.getElementById('dateFormatSelect')?.addEventListener('change', onDateFormatChange);
 

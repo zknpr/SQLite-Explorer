@@ -6,20 +6,56 @@ import { updateToolbarButtons } from './ui.js';
 import { updateBatchSidebar } from './sidebar.js';
 import { getRowId, getCellValue } from './data-utils.js';
 import { openCellPreview, startCellEdit, openCellInVsCode } from './edit.js';
+import { navigateMatches, resetMatchNav } from './match-nav.js';
 
-export function onFilterChange() {
-    clearTimeout(state.filterTimer);
-    state.filterTimer = setTimeout(() => {
-        state.filterQuery = document.getElementById('filterInput').value;
+/**
+ * Apply the global filter and jump to a match. The filter is only run when the
+ * user submits (Enter / Search button) — there is no filter-as-you-type. If the
+ * term is unchanged the grid already reflects it, so we skip the refetch and
+ * just advance to the next match.
+ */
+export async function applyGlobalFilter(direction = 1) {
+    // The toolbar filter input bypasses the #gridContainer guards, so block here
+    // while a reload is in flight to avoid a concurrent refetch / acting on the
+    // stale grid (the column filter is already covered by handleKeydown/handleClick).
+    if (state.isGridReloading) return;
+    const input = document.getElementById('filterInput');
+    if (!input) return;
+    const value = input.value;
+    if (value !== state.filterQuery) {
+        const previous = state.filterQuery;
+        state.filterQuery = value;
         state.currentPageIndex = 0;
-        loadTableData();
+        resetMatchNav();
+        const ok = await loadTableData();
+        if (ok !== true) {
+            // Only a fully-applied load (true) should persist/navigate. false = a
+            // genuine failure: revert so the same query can be retried. undefined =
+            // superseded by a newer load (pagination/page-size/table switch); leave
+            // the term (that load is using it) and don't navigate against the stale
+            // grid while it's still in flight.
+            if (ok === false) state.filterQuery = previous;
+            return;
+        }
         persistState();
-    }, 300);
+    }
+    navigateMatches('global', direction);
+}
+
+export function onFilterEnter(event) {
+    // Enter jumps to the next match, Shift+Enter to the previous one. Ignore the
+    // Enter that confirms an IME composition candidate (isComposing) so we don't
+    // submit the filter / preventDefault before the composed text is committed.
+    if (event.key === 'Enter' && !event.isComposing) {
+        event.preventDefault();
+        applyGlobalFilter(event.shiftKey ? -1 : 1);
+    }
 }
 
 export function onPageSizeChange() {
     state.rowsPerPage = parseInt(document.getElementById('pageSizeSelect').value, 10);
     state.currentPageIndex = 0;
+    resetMatchNav();
     loadTableData();
     persistState();
 }
@@ -28,6 +64,9 @@ export function onDateFormatChange() {
     const select = document.getElementById('dateFormatSelect');
     if (select) {
         state.dateFormat = select.value;
+        // Cached matches were computed against the previous formatted text, so they
+        // (and the highlighted active cell) are stale once the format changes.
+        resetMatchNav();
         renderDataGrid();
         persistState();
     }
@@ -37,6 +76,7 @@ export function goToPage(pageIndex) {
     if (pageIndex >= 0 && pageIndex < state.totalPageCount) {
         state.currentPageIndex = pageIndex;
         state.scrollPosition = { top: 0, left: 0 };
+        resetMatchNav();
         loadTableData(true, false);
     }
 }
@@ -54,22 +94,56 @@ export function onColumnSort(columnName) {
         state.sortedColumn = null;
         state.sortAscending = true;
     }
+    resetMatchNav();
     loadTableData();
     persistState();
 }
 
-export function applyColumnFilter(columnName) {
+/**
+ * Apply a column filter and jump to a match. Like the global filter, this only
+ * runs on submit (Enter / Search button). When the term changed we refetch and
+ * restore focus to the (rebuilt) input so the user can keep pressing Enter to
+ * cycle through matches; when unchanged we just advance to the next match.
+ */
+export async function applyColumnFilter(columnName, direction = 1) {
+    if (state.isGridReloading) return; // don't stack a refetch/navigate on an in-flight reload
     const input = document.querySelector(`.column-filter[data-column="${columnName}"]`);
-    if (input) {
+    if (!input) return;
+
+    const changed = input.value !== (state.columnFilters[columnName] || '');
+    if (changed) {
+        const previous = state.columnFilters[columnName];
         state.columnFilters[columnName] = input.value;
         state.currentPageIndex = 0;
-        loadTableData();
+        resetMatchNav();
+        const ok = await loadTableData();
+        if (ok !== true) {
+            // Only a fully-applied load (true) proceeds. false = genuine failure:
+            // restore the prior value so the query can be retried. undefined =
+            // superseded by a newer load; leave the value and don't navigate.
+            if (ok === false) {
+                if (previous === undefined) delete state.columnFilters[columnName];
+                else state.columnFilters[columnName] = previous;
+            }
+            return;
+        }
+        // loadTableData() rebuilds the header, so the input we focused is gone.
+        // Re-focus the freshly rendered one and place the caret at the end.
+        const newInput = document.querySelector(`.column-filter[data-column="${columnName}"]`);
+        if (newInput) {
+            newInput.focus();
+            newInput.setSelectionRange(newInput.value.length, newInput.value.length);
+        }
     }
+    navigateMatches(columnName, direction);
 }
 
 export function onColumnFilterKeydown(event, columnName) {
-    if (event.key === 'Enter') {
-        applyColumnFilter(columnName);
+    // Enter jumps to the next match, Shift+Enter to the previous one. Ignore the
+    // IME composition-confirm Enter (isComposing) so CJK input isn't broken.
+    if (event.key === 'Enter' && !event.isComposing) {
+        event.preventDefault();
+        applyColumnFilter(columnName, event.shiftKey ? -1 : 1);
     }
 }
 

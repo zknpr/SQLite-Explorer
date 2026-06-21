@@ -19,7 +19,6 @@ export const state = {
     sortedColumn: null,
     sortAscending: true,
     filterQuery: '',
-    filterTimer: null,
     selectedRowIds: new Set(),
     gridData: [],
 
@@ -75,7 +74,15 @@ export const state = {
 
     // Settings
     dateFormat: 'raw', // 'raw', 'local', 'iso', 'relative'
-    cellEditBehavior: 'inline' // 'inline', 'modal', 'vscode'
+    cellEditBehavior: 'inline', // 'inline', 'modal', 'vscode'
+
+    // Filter match navigation (Enter-to-jump on global/column filters)
+    matchNav: {
+        scope: null,       // 'global' or a column name
+        term: null,        // the lowercased term the cached matches were computed for
+        matches: [],       // [{ rowIdx, colIdx }] in row/column order
+        currentIndex: -1
+    }
 };
 
 /**

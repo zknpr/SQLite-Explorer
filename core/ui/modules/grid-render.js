@@ -62,6 +62,9 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
         const keyIcon = col.isPrimaryKey ? '<span class="key-icon codicon codicon-key" title="Primary Key"></span>' : '';
         const pinClass = isPinned ? 'pinned' : '';
         const pinTitle = isPinned ? 'Unpin column' : 'Pin column';
+        const matchCounterText = state.matchNav.scope === col.name && state.matchNav.matches.length > 0
+            ? `${state.matchNav.currentIndex + 1}/${state.matchNav.matches.length}`
+            : '';
 
         th.innerHTML = `
             <div class="header-content">
@@ -71,8 +74,11 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
                     <span class="pin-icon codicon codicon-pin ${pinClass}" title="${pinTitle}"></span>
                 </div>
                 <div class="header-bottom">
-                    <input type="text" class="column-filter" data-column="${safeColName}" value="${safeFilterValue}" placeholder="Filter...">
-                    <button class="filter-apply-btn" title="Apply filter (Enter)"><span class="codicon codicon-search"></span></button>
+                    <div class="column-filter-wrap">
+                        <input type="text" class="column-filter" data-column="${safeColName}" value="${safeFilterValue}" placeholder="Filter...">
+                        <span class="column-filter-counter" data-column="${safeColName}">${matchCounterText}</span>
+                    </div>
+                    <button class="filter-apply-btn" title="Apply filter — Enter: next match, Shift+Enter: previous"><span class="codicon codicon-search"></span></button>
                 </div>
             </div>
             <div class="resize-handle"></div>
@@ -85,6 +91,10 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
 
 function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, rowNumWidth, headerHeight, rowHeight, selectedCellKeys, hasActiveFilters) {
     const tbody = document.createElement('tbody');
+
+    const activeMatch = state.matchNav.currentIndex >= 0
+        ? state.matchNav.matches[state.matchNav.currentIndex]
+        : null;
 
     // Pinned rows logic
     const pinnedRowsList = [];
@@ -159,10 +169,11 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
             const isColPinned = state.pinnedColumns.has(col.name);
             const hasContent = !isNull && !(value instanceof Uint8Array);
             const colWidth = state.columnWidths[col.name] || 120;
+            const isActiveMatch = !!activeMatch && activeMatch.rowIdx === rowIdx && activeMatch.colIdx === originalColIdx;
 
             const td = document.createElement('td');
             td.id = `cell-${rowIdx}-${originalColIdx}`;
-            td.className = `data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''}`;
+            td.className = `data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''} ${isActiveMatch ? 'active-match-cell' : ''}`;
             td.dataset.rowidx = rowIdx;
             td.dataset.colidx = originalColIdx;
 
@@ -208,7 +219,7 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
             padding: '20px',
             color: 'var(--text-secondary)'
         });
-        td.textContent = 'No rows match the current filter. Modify or clear filters above.';
+        td.textContent = 'No rows match the current filter.';
         tr.appendChild(td);
         fragment.appendChild(tr);
     }

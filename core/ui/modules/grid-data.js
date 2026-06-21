@@ -180,6 +180,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
         updatePagination();
         updateStatus(`${state.totalRecordCount} records`);
+        return true; // signals callers (e.g. filter submit) that the load applied
 
     } catch (err) {
         console.error('Error loading data:', err);
@@ -187,7 +188,9 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         if (!isSuperseded()) {
             updateStatus(`Error: ${err.message}`);
             showErrorState(err.message);
+            return false; // the current load genuinely failed (lets callers retry)
         }
+        // Superseded failure: a newer load owns the outcome — return undefined.
     } finally {
         // isLoadingData keeps its original lifecycle. It is also set by BLOB uploads
         // (dnd.js), so a superseded or no-spinner load must NOT clear it — only the
