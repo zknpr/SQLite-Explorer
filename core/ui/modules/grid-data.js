@@ -55,6 +55,13 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     // (which would SELECT the old columns against the new table and error out).
     const requestedTable = state.selectedTable;
     const requestedTableType = state.selectedTableType;
+    // This load is superseded if a newer load has started (token bumped) OR the
+    // user has navigated to a different table. The selection check matters because
+    // a table switch changes state.selectedTable synchronously but only starts its
+    // own load (bumping the token) after awaiting loadTableColumns(); during that
+    // gap the old load still owns the token, so a token-only check would let it
+    // render the old table's rows under the new selection and clear the flag.
+    const isSuperseded = () => loadToken !== activeLoadToken || requestedTable !== state.selectedTable;
 
     const container = document.getElementById('gridContainer');
     // Whether a data grid is currently rendered (vs. a spinner/error/empty state),
@@ -106,7 +113,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
         // Get total count
         const totalRecordCount = await backendApi.fetchTableCount(requestedTable, countOptions);
-        if (loadToken !== activeLoadToken) return; // a newer load superseded this one
+        if (isSuperseded()) return; // a newer load started, or the user switched tables
         state.totalRecordCount = totalRecordCount;
         state.totalPageCount = Math.max(1, Math.ceil(state.totalRecordCount / state.rowsPerPage));
 
@@ -133,7 +140,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         };
 
         const dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
-        if (loadToken !== activeLoadToken) return; // superseded while the data fetch was pending
+        if (isSuperseded()) return; // superseded (newer load or table switch) during the fetch
 
         state.gridData = dataResult.rows || [];
 
@@ -173,14 +180,18 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     } catch (err) {
         console.error('Error loading data:', err);
         // Don't let a superseded load's error replace the current table's view.
-        if (loadToken === activeLoadToken) {
+        if (!isSuperseded()) {
             updateStatus(`Error: ${err.message}`);
             showErrorState(err.message);
         }
     } finally {
-        // Only the most recent load owns the loading flag; an earlier, superseded
-        // load must not clear it while the newer request is still in flight.
-        if (showSpinner && loadToken === activeLoadToken) {
+        // The current load owns the loading flag: clear it once this load settles,
+        // regardless of whether THIS load showed a spinner. A no-spinner background
+        // refresh can supersede a spinner-backed load, and must still release the
+        // interactivity guard the spinner load set — otherwise isLoadingData (and
+        // the grid-event handlers keyed on it) would stay stuck on. A superseded
+        // load leaves the flag for the newer in-flight request to clear.
+        if (!isSuperseded()) {
             state.isLoadingData = false;
         }
     }

@@ -202,6 +202,13 @@ function handleMouseover(event) {
 }
 
 function handleScroll(event) {
+    // Ignore scroll while a load is in flight. The flicker fix keeps the grid
+    // mounted and scrollable during a refetch; without this, scrolling the old
+    // page during a page change (which reset scrollPosition to {0,0}) would
+    // overwrite the reset and reopen the new page at a stale offset. Same-table
+    // filter/sort refetches still preserve scroll via the post-await re-capture
+    // in loadTableData, which reads the live DOM position directly.
+    if (state.isLoadingData) return;
     const container = event.currentTarget;
     state.scrollPosition.left = container.scrollLeft;
     state.scrollPosition.top = container.scrollTop;
