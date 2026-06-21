@@ -23,10 +23,17 @@ export async function applyGlobalFilter(direction = 1) {
     if (!input) return;
     const value = input.value;
     if (value !== state.filterQuery) {
+        const previous = state.filterQuery;
         state.filterQuery = value;
         state.currentPageIndex = 0;
         resetMatchNav();
-        await loadTableData();
+        const ok = await loadTableData();
+        if (ok === false) {
+            // The fetch failed; don't treat the term as applied, so the user can
+            // retry the same query with Enter/Search without editing the text first.
+            state.filterQuery = previous;
+            return;
+        }
         persistState();
     }
     navigateMatches('global', direction);
@@ -102,10 +109,18 @@ export async function applyColumnFilter(columnName, direction = 1) {
 
     const changed = input.value !== (state.columnFilters[columnName] || '');
     if (changed) {
+        const previous = state.columnFilters[columnName];
         state.columnFilters[columnName] = input.value;
         state.currentPageIndex = 0;
         resetMatchNav();
-        await loadTableData();
+        const ok = await loadTableData();
+        if (ok === false) {
+            // The fetch failed; restore the prior value so the same query can be
+            // retried with Enter/Search rather than appearing already-applied.
+            if (previous === undefined) delete state.columnFilters[columnName];
+            else state.columnFilters[columnName] = previous;
+            return;
+        }
         // loadTableData() rebuilds the header, so the input we focused is gone.
         // Re-focus the freshly rendered one and place the caret at the end.
         const newInput = document.querySelector(`.column-filter[data-column="${columnName}"]`);
