@@ -186,7 +186,10 @@ function setupGlobalShortcuts() {
 
         // Cmd+A / Ctrl+A
         if ((event.metaKey || event.ctrlKey) && event.key === 'a') {
-            if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
+            // Bail during a grid reload: selecting "all" would capture row ids from
+            // the stale, about-to-be-replaced result set. This shortcut bypasses the
+            // #gridContainer handlers, so it needs its own guard.
+            if (state.isGridReloading || state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
 
             if (state.selectedTable) {
                 event.preventDefault();
@@ -196,7 +199,10 @@ function setupGlobalShortcuts() {
 
         // Delete / Backspace
         if ((event.metaKey || event.ctrlKey) && (event.key === 'Delete' || event.key === 'Backspace')) {
-            if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
+            // Bail during a grid reload: deleting now would act on row/column/cell
+            // selections from the stale result set about to be replaced. Bypasses the
+            // #gridContainer handlers, so it needs its own guard.
+            if (state.isGridReloading || state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
 
             if (state.selectedTable && state.selectedTableType === 'table') {
                 event.preventDefault();

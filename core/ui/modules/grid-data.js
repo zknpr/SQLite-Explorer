@@ -82,6 +82,10 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
     if (showSpinner) {
         state.isLoadingData = true;
+        // Dedicated guard the grid handlers + global delete/select-all shortcuts
+        // key on. Separate from isLoadingData (also set by BLOB uploads in dnd.js)
+        // so the two can't clear each other; released by the latest load below.
+        state.isGridReloading = true;
         // Keep the existing grid visible during a same-table refetch (prevents
         // flicker); show the spinner on a true first load or a table switch, where
         // nothing valid for this table is on screen yet.
@@ -185,14 +189,17 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             showErrorState(err.message);
         }
     } finally {
-        // The current load owns the loading flag: clear it once this load settles,
-        // regardless of whether THIS load showed a spinner. A no-spinner background
-        // refresh can supersede a spinner-backed load, and must still release the
-        // interactivity guard the spinner load set — otherwise isLoadingData (and
-        // the grid-event handlers keyed on it) would stay stuck on. A superseded
-        // load leaves the flag for the newer in-flight request to clear.
-        if (!isSuperseded()) {
+        // isLoadingData keeps its original lifecycle. It is also set by BLOB uploads
+        // (dnd.js), so a superseded or no-spinner load must NOT clear it — only the
+        // spinner load that set it does, mirroring the pre-change behavior.
+        if (showSpinner) {
             state.isLoadingData = false;
+        }
+        // isGridReloading is owned solely here: the latest (non-superseded) load
+        // releases the grid-interaction guard once it settles, regardless of
+        // showSpinner. A superseded load leaves it set for the newer request to clear.
+        if (!isSuperseded()) {
+            state.isGridReloading = false;
         }
     }
 }

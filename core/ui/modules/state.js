@@ -28,6 +28,12 @@ export const state = {
     activeCellInput: null,
     isSavingCell: false,
     isLoadingData: false,
+    // Dedicated guard for "a grid data reload is in flight", owned solely by
+    // loadTableData. Kept separate from isLoadingData (which BLOB uploads also set)
+    // so the grid-interaction guards can't be cleared by an unrelated upload. The
+    // grid event handlers and the global delete/select-all shortcuts key on this to
+    // avoid acting on rows that are about to be replaced.
+    isGridReloading: false,
     lastDoubleClickTime: 0,
     isTransitioningEdit: false,
     transitionLockTimeout: null,
