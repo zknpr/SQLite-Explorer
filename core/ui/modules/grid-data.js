@@ -38,8 +38,23 @@ export async function loadTableColumns() {
     }
 }
 
+// Monotonic token identifying the most recent loadTableData() call. Concurrent
+// loads (e.g. a slow fetch followed by a filter/sort/page change or a table
+// switch, triggered via toolbar controls the grid guard doesn't cover) compare
+// this after each await and bail if a newer load has started — so a superseded
+// request never writes state, renders stale rows, shows a stale error, or clears
+// the loading flag out from under the in-flight one.
+let activeLoadToken = 0;
+
 export async function loadTableData(showSpinner = true, saveScrollPosition = true) {
     if (!state.selectedTable) return;
+
+    const loadToken = ++activeLoadToken;
+    // Snapshot the target table/type for the whole request so an in-flight load
+    // can't pair this table's columns with a table the user switched to mid-fetch
+    // (which would SELECT the old columns against the new table and error out).
+    const requestedTable = state.selectedTable;
+    const requestedTableType = state.selectedTableType;
 
     const container = document.getElementById('gridContainer');
     // Whether a data grid is currently rendered (vs. a spinner/error/empty state),
@@ -90,7 +105,9 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         };
 
         // Get total count
-        state.totalRecordCount = await backendApi.fetchTableCount(state.selectedTable, countOptions);
+        const totalRecordCount = await backendApi.fetchTableCount(requestedTable, countOptions);
+        if (loadToken !== activeLoadToken) return; // a newer load superseded this one
+        state.totalRecordCount = totalRecordCount;
         state.totalPageCount = Math.max(1, Math.ceil(state.totalRecordCount / state.rowsPerPage));
 
         if (state.currentPageIndex >= state.totalPageCount) {
@@ -98,7 +115,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         }
 
         // Get data
-        const isTable = state.selectedTableType === 'table';
+        const isTable = requestedTableType === 'table';
 
         // For tables, we need to explicitly request the 'rowid' column to handle row identification.
         // The frontend expects rowid at index 0 for tables (see `getRowId` and `getRowDataOffset`).
@@ -115,7 +132,8 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             globalFilter: state.filterQuery
         };
 
-        const dataResult = await backendApi.fetchTableData(state.selectedTable, queryOptions);
+        const dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
+        if (loadToken !== activeLoadToken) return; // superseded while the data fetch was pending
 
         state.gridData = dataResult.rows || [];
 
@@ -141,7 +159,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             renderDataGrid(state.scrollPosition.top, state.scrollPosition.left);
             // The on-screen grid now reflects this table; remember it so the next
             // load can distinguish a same-table refetch from a table switch.
-            state.renderedTable = state.selectedTable;
+            state.renderedTable = requestedTable;
         }
 
         if (container) {
@@ -154,10 +172,15 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
     } catch (err) {
         console.error('Error loading data:', err);
-        updateStatus(`Error: ${err.message}`);
-        showErrorState(err.message);
+        // Don't let a superseded load's error replace the current table's view.
+        if (loadToken === activeLoadToken) {
+            updateStatus(`Error: ${err.message}`);
+            showErrorState(err.message);
+        }
     } finally {
-        if (showSpinner) {
+        // Only the most recent load owns the loading flag; an earlier, superseded
+        // load must not clear it while the newer request is still in flight.
+        if (showSpinner && loadToken === activeLoadToken) {
             state.isLoadingData = false;
         }
     }
