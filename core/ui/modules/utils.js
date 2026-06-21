@@ -26,15 +26,21 @@ function escapeRegExp(str) {
  * Build a reusable case-insensitive RegExp that matches any of the given filter
  * terms, or null when there are no active terms. Compile this once per column
  * and reuse the matcher across every cell rather than rebuilding it per cell.
+ *
+ * Terms are de-duplicated and sorted longest-first: regex alternation matches
+ * the first listed alternative that fits, so without this a shorter term that is
+ * a prefix of a longer one (e.g. "cat" vs "category") would shadow the longer
+ * match and only highlight the prefix.
  */
 export function buildHighlightMatcher(terms) {
-    const escaped = [];
+    const seen = new Set();
     for (const t of terms) {
         const trimmed = t && t.trim();
-        if (trimmed) escaped.push(escapeRegExp(trimmed));
+        if (trimmed) seen.add(trimmed);
     }
-    if (escaped.length === 0) return null;
-    return new RegExp(`(${escaped.join('|')})`, 'gi');
+    if (seen.size === 0) return null;
+    const ordered = [...seen].sort((a, b) => b.length - a.length);
+    return new RegExp(`(${ordered.map(escapeRegExp).join('|')})`, 'gi');
 }
 
 /**
