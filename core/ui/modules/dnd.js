@@ -35,6 +35,18 @@ let lastHighlightedCell = null;
 
 function onDragOver(e) {
     e.preventDefault();
+
+    // Don't offer a drop target while a grid reload is in flight: the cells under
+    // the cursor are stale and about to be replaced. Leave dropEffect unset so the
+    // cursor shows "no-drop", and clear any lingering highlight.
+    if (state.isGridReloading) {
+        if (lastHighlightedCell) {
+            lastHighlightedCell.classList.remove('drag-over');
+            lastHighlightedCell = null;
+        }
+        return;
+    }
+
     e.dataTransfer.dropEffect = 'copy';
 
     const cell = e.target.closest('.data-cell');
@@ -63,6 +75,11 @@ async function onDrop(e) {
         lastHighlightedCell.classList.remove('drag-over');
         lastHighlightedCell = null;
     }
+
+    // Ignore drops while a grid reload is in flight: the targeted cell belongs to
+    // the stale result set about to be replaced, so the upload would land on the
+    // wrong row/column once the new data renders.
+    if (state.isGridReloading) return;
 
     const cell = e.target.closest('.data-cell');
     if (!cell || cell.classList.contains('row-number')) {
