@@ -408,11 +408,12 @@ body {
     min-width: 0;
 }
 
-/* Sort indicator - displayed inline next to column name */
+/* Sort indicator - sits next to the column name as its own flex item so it is
+   never clipped by the name's text-overflow ellipsis on narrow columns */
 .sort-indicator {
     font-size: 10px;
-    margin-left: 4px;
     color: var(--text-secondary);
+    flex-shrink: 0;
 }
 
 /* Primary key indicator - displayed before column name */

@@ -42,10 +42,16 @@ export function goToPage(pageIndex) {
 }
 
 export function onColumnSort(columnName) {
-    if (state.sortedColumn === columnName) {
-        state.sortAscending = !state.sortAscending;
-    } else {
+    // Cycle through three states on repeated clicks of the same column:
+    // none (original order) -> ascending -> descending -> none ...
+    if (state.sortedColumn !== columnName) {
         state.sortedColumn = columnName;
+        state.sortAscending = true;
+    } else if (state.sortAscending) {
+        state.sortAscending = false;
+    } else {
+        // Back to the original, unsorted order.
+        state.sortedColumn = null;
         state.sortAscending = true;
     }
     loadTableData();
