@@ -33,8 +33,10 @@ export async function applyGlobalFilter(direction = 1) {
 }
 
 export function onFilterEnter(event) {
-    // Enter jumps to the next match, Shift+Enter to the previous one.
-    if (event.key === 'Enter') {
+    // Enter jumps to the next match, Shift+Enter to the previous one. Ignore the
+    // Enter that confirms an IME composition candidate (isComposing) so we don't
+    // submit the filter / preventDefault before the composed text is committed.
+    if (event.key === 'Enter' && !event.isComposing) {
         event.preventDefault();
         applyGlobalFilter(event.shiftKey ? -1 : 1);
     }
@@ -116,8 +118,9 @@ export async function applyColumnFilter(columnName, direction = 1) {
 }
 
 export function onColumnFilterKeydown(event, columnName) {
-    // Enter jumps to the next match, Shift+Enter to the previous one.
-    if (event.key === 'Enter') {
+    // Enter jumps to the next match, Shift+Enter to the previous one. Ignore the
+    // IME composition-confirm Enter (isComposing) so CJK input isn't broken.
+    if (event.key === 'Enter' && !event.isComposing) {
         event.preventDefault();
         applyColumnFilter(columnName, event.shiftKey ? -1 : 1);
     }
