@@ -23,23 +23,37 @@ function escapeRegExp(str) {
 }
 
 /**
- * Append text to a parent element, wrapping any case-insensitive matches of
- * the given terms in <mark class="cell-highlight"> spans. Uses DOM text nodes
- * (never innerHTML) so untrusted cell content can never be interpreted as markup.
+ * Build a reusable case-insensitive RegExp that matches any of the given filter
+ * terms, or null when there are no active terms. Compile this once per column
+ * and reuse the matcher across every cell rather than rebuilding it per cell.
  */
-export function appendHighlightedText(parentEl, text, terms) {
-    const activeTerms = (terms || []).filter(t => t && t.trim());
-    if (activeTerms.length === 0) {
+export function buildHighlightMatcher(terms) {
+    const escaped = [];
+    for (const t of terms) {
+        const trimmed = t && t.trim();
+        if (trimmed) escaped.push(escapeRegExp(trimmed));
+    }
+    if (escaped.length === 0) return null;
+    return new RegExp(`(${escaped.join('|')})`, 'gi');
+}
+
+/**
+ * Append text to a parent element, wrapping matches of a precompiled `matcher`
+ * (from buildHighlightMatcher) in <mark class="cell-highlight"> spans. Uses DOM
+ * text nodes (never innerHTML) so untrusted cell content can never be interpreted
+ * as markup. When `matcher` is null, the text is appended verbatim (fast path).
+ */
+export function appendHighlightedText(parentEl, text, matcher) {
+    if (!matcher) {
         parentEl.appendChild(document.createTextNode(text));
         return;
     }
 
-    const pattern = activeTerms.map(t => escapeRegExp(t.trim())).join('|');
-    const regex = new RegExp(`(${pattern})`, 'gi');
-
+    // The matcher is shared across cells; reset its state before scanning.
+    matcher.lastIndex = 0;
     let lastIndex = 0;
     let match;
-    while ((match = regex.exec(text)) !== null) {
+    while ((match = matcher.exec(text)) !== null) {
         if (match.index > lastIndex) {
             parentEl.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
         }
@@ -48,7 +62,7 @@ export function appendHighlightedText(parentEl, text, terms) {
         mark.textContent = match[0];
         parentEl.appendChild(mark);
         lastIndex = match.index + match[0].length;
-        if (match[0].length === 0) regex.lastIndex++; // guard against zero-length matches
+        if (match[0].length === 0) matcher.lastIndex++; // guard against zero-length matches
     }
     if (lastIndex < text.length) {
         parentEl.appendChild(document.createTextNode(text.slice(lastIndex)));
