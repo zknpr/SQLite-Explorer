@@ -66,7 +66,7 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
         th.innerHTML = `
             <div class="header-content">
                 <div class="header-top">
-                    ${keyIcon}<span class="header-text">${safeColName}${sortIndicator}</span>
+                    ${keyIcon}<span class="header-text">${safeColName}</span>${sortIndicator}
                     <span class="select-column-icon codicon codicon-selection" title="Select entire column"></span>
                     <span class="pin-icon codicon codicon-pin ${pinClass}" title="${pinTitle}"></span>
                 </div>
