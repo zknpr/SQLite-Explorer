@@ -186,7 +186,9 @@ async function initializeApp() {
 
             // Cmd+A / Ctrl+A
             if ((event.metaKey || event.ctrlKey) && event.key === 'a') {
-                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT') return;
+                // Bail during a grid reload: "select all" would capture row ids from
+                // the stale, about-to-be-replaced result set (mirrors core viewer.js).
+                if (state.isGridReloading || state.editingCellInfo || document.activeElement.tagName === 'INPUT') return;
 
                 if (state.selectedTable) {
                     event.preventDefault();
@@ -196,7 +198,9 @@ async function initializeApp() {
 
             // Delete / Backspace
             if ((event.metaKey || event.ctrlKey) && (event.key === 'Delete' || event.key === 'Backspace')) {
-                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
+                // Bail during a grid reload: deleting now would act on selections
+                // from the stale result set about to be replaced (mirrors viewer.js).
+                if (state.isGridReloading || state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
 
                 if (state.selectedTable && state.selectedTableType === 'table') {
                     event.preventDefault();
