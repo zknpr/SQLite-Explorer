@@ -52,6 +52,9 @@ function handleMousedown(event) {
 }
 
 function handleKeydown(event) {
+    // Ignore filter Enter while a load is in flight: acting now would queue a
+    // concurrent reload and operate against the stale, soon-to-be-replaced grid.
+    if (state.isGridReloading) return;
     if (event.target.classList.contains('column-filter')) {
         const colName = event.target.dataset.column;
         if (colName) onColumnFilterKeydown(event, colName);
@@ -59,6 +62,11 @@ function handleKeydown(event) {
 }
 
 function handleClick(event) {
+    // Block grid selection/sort/filter/pin clicks while a load is in flight. The
+    // flicker fix keeps the previous grid visible during a same-table refetch, so
+    // without this guard a click on the stale row numbers or cells could select
+    // (and then delete) rows from the old result set before the new data arrives.
+    if (state.isGridReloading) return;
     const target = event.target;
     if (target.closest('.grid-header')) {
         handleHeaderClick(event, target);
@@ -169,6 +177,8 @@ function handleBodyClick(event, target) {
 }
 
 function handleDoubleClick(event) {
+    // Don't open a cell editor on stale cells while a refetch is in flight.
+    if (state.isGridReloading) return;
     const cellEl = event.target.closest('.data-cell');
     if (cellEl && !cellEl.classList.contains('row-number')) {
         const rowIdx = parseInt(cellEl.dataset.rowidx, 10);
@@ -192,6 +202,13 @@ function handleMouseover(event) {
 }
 
 function handleScroll(event) {
+    // Ignore scroll while a load is in flight. The flicker fix keeps the grid
+    // mounted and scrollable during a refetch; without this, scrolling the old
+    // page during a page change (which reset scrollPosition to {0,0}) would
+    // overwrite the reset and reopen the new page at a stale offset. Same-table
+    // filter/sort refetches still preserve scroll via the post-await re-capture
+    // in loadTableData, which reads the live DOM position directly.
+    if (state.isGridReloading) return;
     const container = event.currentTarget;
     state.scrollPosition.left = container.scrollLeft;
     state.scrollPosition.top = container.scrollTop;

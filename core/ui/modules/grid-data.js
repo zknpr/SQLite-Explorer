@@ -38,22 +38,62 @@ export async function loadTableColumns() {
     }
 }
 
+// Monotonic token identifying the most recent loadTableData() call. Concurrent
+// loads (e.g. a slow fetch followed by a filter/sort/page change or a table
+// switch, triggered via toolbar controls the grid guard doesn't cover) compare
+// this after each await and bail if a newer load has started — so a superseded
+// request never writes state, renders stale rows, shows a stale error, or clears
+// the loading flag out from under the in-flight one.
+let activeLoadToken = 0;
+
 export async function loadTableData(showSpinner = true, saveScrollPosition = true) {
     if (!state.selectedTable) return;
 
-    const container = document.getElementById('gridContainer');
+    const loadToken = ++activeLoadToken;
+    // Snapshot the target table/type for the whole request so an in-flight load
+    // can't pair this table's columns with a table the user switched to mid-fetch
+    // (which would SELECT the old columns against the new table and error out).
+    const requestedTable = state.selectedTable;
+    const requestedTableType = state.selectedTableType;
+    // This load is superseded if a newer load has started (token bumped) OR the
+    // user has navigated to a different table. The selection check matters because
+    // a table switch changes state.selectedTable synchronously but only starts its
+    // own load (bumping the token) after awaiting loadTableColumns(); during that
+    // gap the old load still owns the token, so a token-only check would let it
+    // render the old table's rows under the new selection and clear the flag.
+    const isSuperseded = () => loadToken !== activeLoadToken || requestedTable !== state.selectedTable;
 
-    // Only capture scroll position if the grid is currently visible (not loading/error state)
-    // This prevents overwriting the saved position with 0 when reloading data while a spinner is shown.
-    if (saveScrollPosition && container && container.querySelector('.data-grid')) {
+    const container = document.getElementById('gridContainer');
+    // Whether a data grid is currently rendered (vs. a spinner/error/empty state),
+    // AND whether it belongs to the table we're loading. The renderedTable check is
+    // what separates a same-table refetch (filter/sort/page — keep the grid, no
+    // flicker) from a table switch, where the previous table's grid is still in the
+    // DOM and must not be left on screen. Cached once instead of re-querying below.
+    const hasRenderedGrid = !!(container && container.querySelector('.data-grid'));
+    const isSameTableGrid = hasRenderedGrid && state.renderedTable === state.selectedTable;
+
+    // Only capture scroll position if the current table's grid is visible (not a
+    // loading/error state, and not a different table's grid mid-switch). This
+    // prevents overwriting the saved position with 0 while a spinner is shown.
+    if (saveScrollPosition && isSameTableGrid) {
         state.scrollPosition.left = container.scrollLeft;
         state.scrollPosition.top = container.scrollTop;
     }
 
     if (showSpinner) {
         state.isLoadingData = true;
-        showLoading();
+        // Dedicated guard the grid handlers + global delete/select-all shortcuts
+        // key on. Separate from isLoadingData (also set by BLOB uploads in dnd.js)
+        // so the two can't clear each other; released by the latest load below.
+        state.isGridReloading = true;
+        // Keep the existing grid visible during a same-table refetch (prevents
+        // flicker); show the spinner on a true first load or a table switch, where
+        // nothing valid for this table is on screen yet.
+        if (!isSameTableGrid) {
+            showLoading();
+        }
     }
+
     updateToolbarButtons();
 
     try {
@@ -66,14 +106,19 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             }
         }
 
+        // Column names are needed both for the global-filter count and the data query.
+        const columnNames = state.tableColumns.map(c => c.name);
+
         const countOptions = {
             filters,
             globalFilter: state.filterQuery,
-            columns: state.tableColumns.map(c => c.name) // Needed for global filter
+            columns: columnNames // Needed for global filter
         };
 
         // Get total count
-        state.totalRecordCount = await backendApi.fetchTableCount(state.selectedTable, countOptions);
+        const totalRecordCount = await backendApi.fetchTableCount(requestedTable, countOptions);
+        if (isSuperseded()) return; // a newer load started, or the user switched tables
+        state.totalRecordCount = totalRecordCount;
         state.totalPageCount = Math.max(1, Math.ceil(state.totalRecordCount / state.rowsPerPage));
 
         if (state.currentPageIndex >= state.totalPageCount) {
@@ -81,8 +126,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         }
 
         // Get data
-        const isTable = state.selectedTableType === 'table';
-        const columnNames = state.tableColumns.map(c => c.name);
+        const isTable = requestedTableType === 'table';
 
         // For tables, we need to explicitly request the 'rowid' column to handle row identification.
         // The frontend expects rowid at index 0 for tables (see `getRowId` and `getRowDataOffset`).
@@ -99,15 +143,20 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             globalFilter: state.filterQuery
         };
 
-        const dataResult = await backendApi.fetchTableData(state.selectedTable, queryOptions);
+        const dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
+        if (isSuperseded()) return; // superseded (newer load or table switch) during the fetch
 
         state.gridData = dataResult.rows || [];
 
-        // If not showing spinner (background refresh), capture the current scroll position
-        // right before rendering. This ensures we use the latest scroll position,
-        // which covers cases where the user scrolled during fetch or if an edit operation
-        // updated the view (and restored scroll) while the fetch was pending.
-        if (!showSpinner && container && container.querySelector('.data-grid')) {
+        // When preserving scroll, re-capture the latest position right before
+        // rendering. Covers the user scrolling during the fetch — including a
+        // flicker-free refetch where the spinner was suppressed and the grid stayed
+        // interactive — and edit operations that restored scroll while the fetch was
+        // pending. Gated on saveScrollPosition (not !showSpinner) so callers that
+        // intentionally reset scroll (page change, table switch) aren't clobbered.
+        // Re-check the DOM here (not the cached flag): this runs after the await,
+        // so the rendered state may differ from when the function started.
+        if (saveScrollPosition && container && container.querySelector('.data-grid')) {
             state.scrollPosition.left = container.scrollLeft;
             state.scrollPosition.top = container.scrollTop;
         }
@@ -119,6 +168,9 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             // updateCellDom in edit.js handles the visual update of the modified cell.
         } else {
             renderDataGrid(state.scrollPosition.top, state.scrollPosition.left);
+            // The on-screen grid now reflects this table; remember it so the next
+            // load can distinguish a same-table refetch from a table switch.
+            state.renderedTable = requestedTable;
         }
 
         if (container) {
@@ -131,11 +183,23 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
     } catch (err) {
         console.error('Error loading data:', err);
-        updateStatus(`Error: ${err.message}`);
-        showErrorState(err.message);
+        // Don't let a superseded load's error replace the current table's view.
+        if (!isSuperseded()) {
+            updateStatus(`Error: ${err.message}`);
+            showErrorState(err.message);
+        }
     } finally {
+        // isLoadingData keeps its original lifecycle. It is also set by BLOB uploads
+        // (dnd.js), so a superseded or no-spinner load must NOT clear it — only the
+        // spinner load that set it does, mirroring the pre-change behavior.
         if (showSpinner) {
             state.isLoadingData = false;
+        }
+        // isGridReloading is owned solely here: the latest (non-superseded) load
+        // releases the grid-interaction guard once it settles, regardless of
+        // showSpinner. A superseded load leaves it set for the newer request to clear.
+        if (!isSuperseded()) {
+            state.isGridReloading = false;
         }
     }
 }

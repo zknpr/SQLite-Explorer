@@ -7,6 +7,10 @@ export const state = {
     isDbConnected: false,
     selectedTable: null,
     selectedTableType: 'table',
+    // Name of the table whose grid is currently rendered on screen. Lets
+    // loadTableData tell a same-table refetch (keep the grid, no flicker) apart
+    // from a table switch (show the spinner instead of the previous table's rows).
+    renderedTable: null,
     currentPageIndex: 0,
     rowsPerPage: 500,
     totalRecordCount: 0,
@@ -24,6 +28,12 @@ export const state = {
     activeCellInput: null,
     isSavingCell: false,
     isLoadingData: false,
+    // Dedicated guard for "a grid data reload is in flight", owned solely by
+    // loadTableData. Kept separate from isLoadingData (which BLOB uploads also set)
+    // so the grid-interaction guards can't be cleared by an unrelated upload. The
+    // grid event handlers and the global delete/select-all shortcuts key on this to
+    // avoid acting on rows that are about to be replaced.
+    isGridReloading: false,
     lastDoubleClickTime: 0,
     isTransitioningEdit: false,
     transitionLockTimeout: null,
