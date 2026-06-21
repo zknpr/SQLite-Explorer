@@ -52,8 +52,11 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
     if (showSpinner) {
         state.isLoadingData = true;
-        showLoading();
+        if (!container || !container.querySelector('.data-grid')) {
+            showLoading();
+        }
     }
+
     updateToolbarButtons();
 
     try {
