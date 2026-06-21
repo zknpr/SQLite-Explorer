@@ -6,20 +6,35 @@ import { updateToolbarButtons } from './ui.js';
 import { updateBatchSidebar } from './sidebar.js';
 import { getRowId, getCellValue } from './data-utils.js';
 import { openCellPreview, startCellEdit, openCellInVsCode } from './edit.js';
+import { navigateMatches, resetMatchNav } from './match-nav.js';
 
-export function onFilterChange() {
-    clearTimeout(state.filterTimer);
-    state.filterTimer = setTimeout(() => {
-        state.filterQuery = document.getElementById('filterInput').value;
+/**
+ * Apply the global filter and jump to a match. The filter is only run when the
+ * user submits (Enter / Search button) — there is no filter-as-you-type. If the
+ * term is unchanged the grid already reflects it, so we skip the refetch and
+ * just advance to the next match.
+ */
+export async function applyGlobalFilter(direction = 1) {
+    const value = document.getElementById('filterInput').value;
+    if (value !== state.filterQuery) {
+        state.filterQuery = value;
         state.currentPageIndex = 0;
-        loadTableData();
+        resetMatchNav();
+        await loadTableData();
         persistState();
-    }, 300);
+    }
+    navigateMatches('global', direction);
+}
+
+export function onFilterEnter(event) {
+    // Enter jumps to the next match, Shift+Enter to the previous one.
+    if (event.key === 'Enter') applyGlobalFilter(event.shiftKey ? -1 : 1);
 }
 
 export function onPageSizeChange() {
     state.rowsPerPage = parseInt(document.getElementById('pageSizeSelect').value, 10);
     state.currentPageIndex = 0;
+    resetMatchNav();
     loadTableData();
     persistState();
 }
@@ -37,6 +52,7 @@ export function goToPage(pageIndex) {
     if (pageIndex >= 0 && pageIndex < state.totalPageCount) {
         state.currentPageIndex = pageIndex;
         state.scrollPosition = { top: 0, left: 0 };
+        resetMatchNav();
         loadTableData(true, false);
     }
 }
@@ -54,23 +70,41 @@ export function onColumnSort(columnName) {
         state.sortedColumn = null;
         state.sortAscending = true;
     }
+    resetMatchNav();
     loadTableData();
     persistState();
 }
 
-export function applyColumnFilter(columnName) {
+/**
+ * Apply a column filter and jump to a match. Like the global filter, this only
+ * runs on submit (Enter / Search button). When the term changed we refetch and
+ * restore focus to the (rebuilt) input so the user can keep pressing Enter to
+ * cycle through matches; when unchanged we just advance to the next match.
+ */
+export async function applyColumnFilter(columnName, direction = 1) {
     const input = document.querySelector(`.column-filter[data-column="${columnName}"]`);
-    if (input) {
+    if (!input) return;
+
+    const changed = input.value !== (state.columnFilters[columnName] || '');
+    if (changed) {
         state.columnFilters[columnName] = input.value;
         state.currentPageIndex = 0;
-        loadTableData();
+        resetMatchNav();
+        await loadTableData();
+        // loadTableData() rebuilds the header, so the input we focused is gone.
+        // Re-focus the freshly rendered one and place the caret at the end.
+        const newInput = document.querySelector(`.column-filter[data-column="${columnName}"]`);
+        if (newInput) {
+            newInput.focus();
+            newInput.setSelectionRange(newInput.value.length, newInput.value.length);
+        }
     }
+    navigateMatches(columnName, direction);
 }
 
 export function onColumnFilterKeydown(event, columnName) {
-    if (event.key === 'Enter') {
-        applyColumnFilter(columnName);
-    }
+    // Enter jumps to the next match, Shift+Enter to the previous one.
+    if (event.key === 'Enter') applyColumnFilter(columnName, event.shiftKey ? -1 : 1);
 }
 
 // Column Selection

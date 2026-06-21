@@ -287,12 +287,24 @@ body {
     cursor: not-allowed;
 }
 
+/* Groups the filter input + Search button so they sit flush as one control */
+.filter-group {
+    display: flex;
+    align-items: stretch;
+}
+
+.filter-input-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+}
+
 .filter-input {
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
     color: var(--text-primary);
     padding: 4px 8px;
-    border-radius: 3px;
+    border-radius: 3px 0 0 3px;
     font-size: 12px;
     width: 200px;
 }
@@ -300,6 +312,29 @@ body {
 .filter-input:focus {
     outline: none;
     border-color: var(--accent-color);
+}
+
+/* Current/total match counter overlaid at the right edge inside the filter input */
+.filter-match-counter {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 10px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    pointer-events: none;
+}
+
+/* Reserve room for the counter only when it has content */
+.filter-input-wrap:has(.filter-match-counter:not(:empty)) .filter-input {
+    padding-right: 38px;
+}
+
+/* Search button flush against the global filter (inherits joined borders/radii
+   from .filter-apply-btn, matching the column filter); just match input padding */
+.filter-apply-btn-toolbar {
+    padding: 4px 8px;
 }
 
 /* ================================================================
@@ -458,6 +493,31 @@ body {
 .column-filter::placeholder {
     color: var(--text-secondary);
     opacity: 0.7;
+}
+
+/* Wrapper so the counter can overlay the right edge inside the column filter input */
+.column-filter-wrap {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    display: flex;
+}
+
+/* Current/total match counter overlaid inside the column filter input, when non-empty */
+.column-filter-counter {
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 10px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    pointer-events: none;
+}
+
+/* Reserve room for the counter only when it has content */
+.column-filter-wrap:has(.column-filter-counter:not(:empty)) .column-filter {
+    padding-right: 30px;
 }
 
 /* Filter apply button - triggers filter on click */
@@ -634,6 +694,13 @@ body {
 
 .data-cell.cell-selected {
     background: var(--active-bg);
+}
+
+/* Cell the user just jumped to via Enter-to-navigate on a filter */
+.data-cell.active-match-cell {
+    outline: 2px solid var(--accent-color);
+    outline-offset: -2px;
+    z-index: 3;
 }
 
 /* Header cell styling when entire column is selected */
