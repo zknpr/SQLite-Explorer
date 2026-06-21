@@ -1,5 +1,5 @@
 import { state } from './state.js';
-import { escapeHtml, formatCellValueAsText } from './utils.js';
+import { escapeHtml, formatCellValueAsText, appendHighlightedText, buildHighlightMatcher } from './utils.js';
 import { getRowId, getCellValue } from './data-utils.js';
 import { syncSelectionDOM } from './grid-selection.js';
 
@@ -106,6 +106,12 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
         ...state.gridData.map((row, idx) => ({ idx, rowId: getRowId(row, idx) })).filter(r => !state.pinnedRowIds.has(r.rowId))
     ];
 
+    // Precompute one highlight matcher per column (depends on the global filter +
+    // that column's filter, not on the row), so we don't rebuild a RegExp per cell.
+    const columnMatchers = orderedColumns.map(col =>
+        buildHighlightMatcher([state.filterQuery, state.columnFilters[col.name]])
+    );
+
     const fragment = document.createDocumentFragment();
 
     for (const { idx: rowIdx, rowId } of orderedRowIndices) {
@@ -175,9 +181,9 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
 
             const textSpan = document.createElement('span');
             textSpan.className = 'cell-text';
-            // Use textContent for security (prevents XSS).
-            // formatCellValueAsText returns unescaped text suitable for textContent.
-            textSpan.textContent = displayValue;
+            // Use DOM text nodes (never innerHTML) for security (prevents XSS).
+            // formatCellValueAsText returns unescaped text suitable for textContent/text nodes.
+            appendHighlightedText(textSpan, displayValue, columnMatchers[displayColIdx]);
             td.appendChild(textSpan);
 
             if (hasContent) {

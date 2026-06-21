@@ -16,6 +16,66 @@ export function escapeHtml(str) {
 }
 
 /**
+ * Escape a string for safe use inside a RegExp pattern.
+ */
+function escapeRegExp(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Build a reusable case-insensitive RegExp that matches any of the given filter
+ * terms, or null when there are no active terms. Compile this once per column
+ * and reuse the matcher across every cell rather than rebuilding it per cell.
+ *
+ * Terms are de-duplicated and sorted longest-first: regex alternation matches
+ * the first listed alternative that fits, so without this a shorter term that is
+ * a prefix of a longer one (e.g. "cat" vs "category") would shadow the longer
+ * match and only highlight the prefix.
+ */
+export function buildHighlightMatcher(terms) {
+    const seen = new Set();
+    for (const t of terms) {
+        const trimmed = t && t.trim();
+        if (trimmed) seen.add(trimmed);
+    }
+    if (seen.size === 0) return null;
+    const ordered = [...seen].sort((a, b) => b.length - a.length);
+    return new RegExp(`(${ordered.map(escapeRegExp).join('|')})`, 'gi');
+}
+
+/**
+ * Append text to a parent element, wrapping matches of a precompiled `matcher`
+ * (from buildHighlightMatcher) in <mark class="cell-highlight"> spans. Uses DOM
+ * text nodes (never innerHTML) so untrusted cell content can never be interpreted
+ * as markup. When `matcher` is null, the text is appended verbatim (fast path).
+ */
+export function appendHighlightedText(parentEl, text, matcher) {
+    if (!matcher) {
+        parentEl.appendChild(document.createTextNode(text));
+        return;
+    }
+
+    // The matcher is shared across cells; reset its state before scanning.
+    matcher.lastIndex = 0;
+    let lastIndex = 0;
+    let match;
+    while ((match = matcher.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+            parentEl.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+        }
+        const mark = document.createElement('mark');
+        mark.className = 'cell-highlight';
+        mark.textContent = match[0];
+        parentEl.appendChild(mark);
+        lastIndex = match.index + match[0].length;
+        if (match[0].length === 0) matcher.lastIndex++; // guard against zero-length matches
+    }
+    if (lastIndex < text.length) {
+        parentEl.appendChild(document.createTextNode(text.slice(lastIndex)));
+    }
+}
+
+/**
  * Validate and sanitize a rowid for use in SQL queries.
  */
 export function validateRowId(rowId) {
