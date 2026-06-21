@@ -28,10 +28,13 @@ export async function applyGlobalFilter(direction = 1) {
         state.currentPageIndex = 0;
         resetMatchNav();
         const ok = await loadTableData();
-        if (ok === false) {
-            // The fetch failed; don't treat the term as applied, so the user can
-            // retry the same query with Enter/Search without editing the text first.
-            state.filterQuery = previous;
+        if (ok !== true) {
+            // Only a fully-applied load (true) should persist/navigate. false = a
+            // genuine failure: revert so the same query can be retried. undefined =
+            // superseded by a newer load (pagination/page-size/table switch); leave
+            // the term (that load is using it) and don't navigate against the stale
+            // grid while it's still in flight.
+            if (ok === false) state.filterQuery = previous;
             return;
         }
         persistState();
@@ -114,11 +117,14 @@ export async function applyColumnFilter(columnName, direction = 1) {
         state.currentPageIndex = 0;
         resetMatchNav();
         const ok = await loadTableData();
-        if (ok === false) {
-            // The fetch failed; restore the prior value so the same query can be
-            // retried with Enter/Search rather than appearing already-applied.
-            if (previous === undefined) delete state.columnFilters[columnName];
-            else state.columnFilters[columnName] = previous;
+        if (ok !== true) {
+            // Only a fully-applied load (true) proceeds. false = genuine failure:
+            // restore the prior value so the query can be retried. undefined =
+            // superseded by a newer load; leave the value and don't navigate.
+            if (ok === false) {
+                if (previous === undefined) delete state.columnFilters[columnName];
+                else state.columnFilters[columnName] = previous;
+            }
             return;
         }
         // loadTableData() rebuilds the header, so the input we focused is gone.
