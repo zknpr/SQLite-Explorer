@@ -179,7 +179,7 @@
     "test": "npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts"
   },
   "devDependencies": {
-    "@types/node": "^25.9.2",
+    "@types/node": "^26.0.1",
     "@types/vscode": "=1.110.0",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.1",
