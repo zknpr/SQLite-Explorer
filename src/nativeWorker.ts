@@ -49,6 +49,7 @@ import {
   normalizeViewSelectSql
 } from './core/view-utils';
 import { crypto } from './platform/cryptoShim';
+import { DEFAULT_QUERY_TIMEOUT_MS } from './config';
 
 // ============================================================================
 // Utility Functions
@@ -99,7 +100,7 @@ const HEADER_SIZE = 4;
 const INIT_TIMEOUT = 10000;
 
 /** Timeout for individual queries (ms) */
-const QUERY_TIMEOUT = 30000;
+const QUERY_TIMEOUT = DEFAULT_QUERY_TIMEOUT_MS;
 
 // ============================================================================
 // Platform Detection
@@ -460,7 +461,7 @@ export async function createNativeDatabaseConnection(
   extensionUri: vsc.Uri,
   _reporter?: TelemetryReporter,
   outputChannel?: vsc.OutputChannel | null,
-  queryTimeout: number = 30000
+  queryTimeout: number = DEFAULT_QUERY_TIMEOUT_MS
 ): Promise<DatabaseConnectionBundle> {
   const extensionPath = extensionUri.fsPath;
   const binaryPath = await getNativeBinaryPath(extensionPath);
@@ -1089,6 +1090,9 @@ export async function createNativeDatabaseConnection(
         getViewDefinition: getNativeViewDefinition,
 
         validateViewDefinition: async (view: string, selectSql: string) => {
+          if (forceReadOnly) {
+            throw new Error('View validation is unavailable because the database is read-only');
+          }
           const body = normalizeViewSelectSql(selectSql);
           const existing = await worker.call<NativeQueryResult>('query', [
             "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
@@ -1115,9 +1119,15 @@ export async function createNativeDatabaseConnection(
         },
 
         previewViewDefinition: async (_view: string, selectSql: string, limit: number = 50) => {
+          if (forceReadOnly) {
+            throw new Error('View preview is unavailable because the database is read-only');
+          }
           const body = normalizeViewSelectSql(selectSql);
           const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
-          const previewView = `sqlite_explorer_preview_${crypto.randomUUID().replace(/-/g, '')}`;
+          // SQLite reserves every object name beginning with `sqlite_`, even
+          // inside a savepoint. Keep generated preview objects in our own
+          // non-reserved namespace.
+          const previewView = `sqlx_preview_${crypto.randomUUID().replace(/-/g, '')}`;
           const savepointName = createSavepointName('sp_preview_view');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
@@ -1194,6 +1204,11 @@ export async function createNativeDatabaseConnection(
               }
             }
             const after = await getNativeViewDefinition(view);
+            if (after.selectSql !== body) {
+              throw new Error(
+                'Native SQLite stored a view definition different from the submitted SQL; the replacement was rolled back'
+              );
+            }
             await worker.call('run', [`RELEASE ${savepointName}`]);
             return { before, after };
           } catch (err) {

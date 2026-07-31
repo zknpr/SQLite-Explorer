@@ -2,7 +2,7 @@ import './vscode_mock_setup';
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { webcrypto } from 'node:crypto';
 import path from 'node:path';
 import vm from 'node:vm';
@@ -12,11 +12,18 @@ interface WorkerHarness {
     invoke(method: string, ...payload: unknown[]): Promise<any>;
 }
 
-async function createWorkerHarness(options: { queryTimeout?: number; now?: () => number } = {}): Promise<WorkerHarness> {
-    const source = readFileSync(
-        path.resolve(process.cwd(), 'website/public/sqlite-viewer/worker.js'),
-        'utf8'
+async function createWorkerHarness(options: {
+    queryTimeout?: number;
+    now?: () => number;
+    readOnlyMode?: boolean;
+} = {}): Promise<WorkerHarness> {
+    const authoredWorkerPath = path.resolve(process.cwd(), 'website/src/sqlite-viewer/worker.js');
+    const bundledWorkerPath = path.resolve(process.cwd(), 'website/public/sqlite-viewer/worker.js');
+    assert.ok(
+        statSync(bundledWorkerPath).mtimeMs >= statSync(authoredWorkerPath).mtimeMs,
+        'website worker bundle is stale; run node scripts/build.mjs'
     );
+    const source = readFileSync(bundledWorkerPath, 'utf8');
     const responses: any[] = [];
     const workerGlobal: any = {
         initSqlJs,
@@ -70,7 +77,8 @@ async function createWorkerHarness(options: { queryTimeout?: number; now?: () =>
     await invoke('initializeDatabase', 'test.db', {
         content: null,
         wasmBinary,
-        queryTimeout: options.queryTimeout
+        queryTimeout: options.queryTimeout,
+        readOnlyMode: options.readOnlyMode
     });
     return { invoke };
 }
@@ -81,6 +89,25 @@ async function workerScalar(worker: WorkerHarness, sql: string): Promise<unknown
 }
 
 describe('web demo view worker', () => {
+    it('deletes a column using the demo worker table-info shape', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_delete (id INTEGER, kept TEXT, removed TEXT); " +
+            "INSERT INTO demo_delete VALUES (1, 'survives', 'gone')"
+        );
+
+        await worker.invoke('deleteColumns', 'demo_delete', ['removed']);
+
+        const tableInfo = await worker.invoke('getTableInfo', 'demo_delete');
+        assert.deepStrictEqual(
+            Array.from(tableInfo, (column: any) => column.identifier),
+            ['id', 'kept']
+        );
+        const rows = await worker.invoke('runQuery', 'SELECT id, kept FROM demo_delete');
+        assert.deepStrictEqual(Array.from(rows[0].rows[0]), [1, 'survives']);
+    });
+
     it('does not execute a trailing statement smuggled through preview', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke('runQuery', 'CREATE TABLE preview_sentinel (id INTEGER)');
@@ -137,6 +164,30 @@ describe('web demo view worker', () => {
             worker,
             "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'validation_target'"
         ), originalSql);
+    });
+
+    it('does not run validation DDL in demo read-only mode', async () => {
+        const worker = await createWorkerHarness({ readOnlyMode: true });
+
+        await assert.rejects(
+            worker.invoke('validateViewDefinition', 'read_only_view', 'SELECT 1 AS value'),
+            /View validation is unavailable because the database is read-only/
+        );
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'read_only_view',
+            'SELECT 1 AS value',
+            10
+        );
+        assert.deepStrictEqual(Array.from(preview.headers), ['value']);
+        assert.deepStrictEqual(
+            Array.from(preview.rows, (row: unknown[]) => Array.from(row)),
+            [[1]]
+        );
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'read_only_view'"
+        ), 0);
     });
 
     it('bounds preview stepping with the configured query timeout', async () => {

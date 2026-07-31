@@ -12,6 +12,7 @@ import { handleTextareaTab } from './text-editor.js';
 
 let editingViewName = null;
 let activeViewModalSession = 0;
+let activePreviewRequest = 0;
 let isSavingView = false;
 
 function getElements() {
@@ -85,6 +86,12 @@ function getDraft() {
         selectSql: elements.sql?.value.trim() ?? '',
         preserveTriggers: elements.preserveTriggers?.checked !== false
     };
+}
+
+function draftsMatch(left, right) {
+    return left.name === right.name
+        && left.selectSql === right.selectSql
+        && left.preserveTriggers === right.preserveTriggers;
 }
 
 export function initViews() {
@@ -173,19 +180,28 @@ async function validateDraft(draft = getDraft(), modalSession = activeViewModalS
 }
 
 async function previewDraft() {
+    const modalSession = activeViewModalSession;
+    const previewRequest = ++activePreviewRequest;
     const draft = getDraft();
+    const isCurrentPreview = () => previewRequest === activePreviewRequest
+        && isCurrentModalSession(modalSession)
+        && draftsMatch(draft, getDraft());
     if (!draft.name || !draft.selectSql) {
-        setFeedback('A view name and SELECT definition are required.', true);
+        if (isCurrentPreview()) {
+            setFeedback('A view name and SELECT definition are required.', true);
+        }
         return;
     }
 
     try {
-        setFeedback('Compiling preview...');
+        if (isCurrentPreview()) setFeedback('Compiling preview...');
         const result = await backendApi.previewViewDefinition(draft.name, draft.selectSql, 50);
+        if (!isCurrentPreview()) return;
         renderPreview(result);
         const rowCount = result?.rows?.length ?? result?.values?.length ?? 0;
         setFeedback(`Preview returned ${rowCount} row${rowCount === 1 ? '' : 's'} (maximum 50).`);
     } catch (err) {
+        if (!isCurrentPreview()) return;
         clearPreview();
         setFeedback(err.message, true);
     }
@@ -229,10 +245,12 @@ async function saveDraft() {
             await loadTableColumns();
             await loadTableData(true, false);
         }
-        updateStatus(`View "${changedView}" ${targetView ? 'updated' : 'created'} - Ctrl+S to save`);
+        if (modalSession === activeViewModalSession) {
+            updateStatus(`View "${changedView}" ${targetView ? 'updated' : 'created'} - Ctrl+S to save`);
+        }
     } catch (err) {
         if (isCurrentModalSession(modalSession)) setFeedback(err.message, true);
-        updateStatus(`Error: ${err.message}`);
+        if (modalSession === activeViewModalSession) updateStatus(`Error: ${err.message}`);
     } finally {
         isSavingView = false;
         if (saveButton) saveButton.disabled = false;

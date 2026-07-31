@@ -117,11 +117,6 @@ export function extractViewSelectSql(createSql: string): string {
   return normalizeViewSelectSql(createSql.slice(selectStart));
 }
 
-/** Whether the stored declaration pins view output names with `(column, ...)`. */
-export function hasExplicitViewColumnList(createSql: string): boolean {
-  return locateViewSqlParts(createSql).columnListSql !== undefined;
-}
-
 /** Return the stored explicit column-list SQL, including its parentheses. */
 export function extractViewColumnListSql(createSql: string): string | undefined {
   return locateViewSqlParts(createSql).columnListSql;

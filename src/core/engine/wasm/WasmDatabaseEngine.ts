@@ -63,6 +63,11 @@ export interface WasmEngineModule {
   Database: new (data?: ArrayLike<number>) => WasmDatabaseInstance;
 }
 
+export type WasmEngineLogHandler = (
+  level: 'log' | 'warn' | 'error',
+  ...args: unknown[]
+) => void;
+
 // ============================================================================
 // Database Engine Implementation
 // ============================================================================
@@ -75,13 +80,22 @@ const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 export class WasmDatabaseEngine implements DatabaseOperations {
   private readonly instance: WasmDatabaseInstance;
   private readonly queryTimeout: number;
+  private readonly readOnlyMode: boolean;
+  private readonly logger: WasmEngineLogHandler;
   /** Whether SQLite's json_patch() function is available (JSON1 extension). */
   private readonly hasJsonPatch: boolean;
   readonly engineKind = Promise.resolve('wasm' as const);
 
-  constructor(instance: WasmDatabaseInstance, timeoutMs: number = DEFAULT_QUERY_TIMEOUT_MS) {
+  constructor(
+    instance: WasmDatabaseInstance,
+    timeoutMs: number = DEFAULT_QUERY_TIMEOUT_MS,
+    readOnlyMode: boolean = false,
+    logger?: WasmEngineLogHandler
+  ) {
     this.instance = instance;
     this.queryTimeout = timeoutMs;
+    this.readOnlyMode = readOnlyMode;
+    this.logger = logger ?? ((level, ...args) => console[level](...args));
 
     // Probe for json_patch() availability at construction time.
     // json_patch() is part of the JSON1 extension, which is included in most
@@ -103,7 +117,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     try {
       await this.executeQuery('ROLLBACK');
     } catch (rollbackErr) {
-      console.warn(`Failed to rollback (${context}):`, rollbackErr);
+      this.logger('warn', `Failed to rollback (${context}):`, rollbackErr);
     }
   }
 
@@ -122,7 +136,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       await this.executeQuery(`ROLLBACK TO ${savepointName}`);
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (rollbackErr) {
-      console.warn(`Failed to rollback savepoint (${context}):`, rollbackErr);
+      this.logger('warn', `Failed to rollback savepoint (${context}):`, rollbackErr);
     }
   }
 
@@ -261,7 +275,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         try {
           currentStmt.free();
         } catch (freeErr) {
-          console.warn('Failed to free statement on error:', freeErr);
+          this.logger('warn', 'Failed to free statement on error:', freeErr);
         }
       }
       const errorDetail = err instanceof Error ? err.message : String(err);
@@ -355,7 +369,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         if (mod.viewDefBefore) {
           await this.restoreViewDefinition(mod.viewDefBefore);
         } else {
-          console.warn('[WasmDatabaseEngine] Skipping view undo: definition missing from history entry');
+          this.logger(
+            'warn',
+            '[WasmDatabaseEngine] Skipping view undo: definition missing from history entry'
+          );
         }
         break;
     }
@@ -961,6 +978,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   async validateViewDefinition(view: string, selectSql: string): Promise<void> {
+    if (this.readOnlyMode) {
+      throw new Error('View validation is unavailable because the database is read-only');
+    }
     const body = normalizeViewSelectSql(selectSql);
     const existingResult = await this.executeQuery(
       "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",

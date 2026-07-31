@@ -367,6 +367,38 @@ describe('view operations', () => {
         }
     });
 
+    it('does not run disposable validation DDL in WASM read-only mode', async () => {
+        const result = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: true
+        });
+        const engine = result.operations!;
+        try {
+            await assert.rejects(
+                () => engine.validateViewDefinition('read_only_view', 'SELECT 1 AS value'),
+                /View validation is unavailable because the database is read-only/
+            );
+
+            const preview = await engine.previewViewDefinition(
+                'read_only_view',
+                'SELECT 1 AS value',
+                10
+            );
+            assert.deepStrictEqual(preview.headers, ['value']);
+            assert.deepStrictEqual(preview.rows, [[1]]);
+            assert.strictEqual(
+                await readScalar(
+                    engine,
+                    "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'read_only_view'"
+                ),
+                0
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('does not execute a trailing statement smuggled through the preview wrapper', async () => {
         const engine = await createEngine();
         try {

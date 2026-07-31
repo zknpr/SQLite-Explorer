@@ -11,9 +11,12 @@ import * as vscode from 'vscode';
 describe('SQLiteFileSystemProvider', () => {
 
     function setupMockDocument(key: string, dbOps: any = {}) {
+        const disposeEmitter = new vscode.EventEmitter<void>();
         const mockDocument = {
             databaseOperations: dbOps,
-            recordExternalModification: mock.fn()
+            recordExternalModification: mock.fn(),
+            onDidDispose: disposeEmitter.event,
+            dispose: () => disposeEmitter.fire()
         } as unknown as DatabaseDocument;
         DocumentRegistry.set(key, mockDocument);
         return mockDocument;
@@ -421,6 +424,44 @@ describe('SQLiteFileSystemProvider', () => {
             assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 0);
         });
 
+        it('rejects a failed view save without waiting for the error notification', async () => {
+            const dbOps = {
+                editView: mock.fn(async () => {
+                    throw new Error('SQLite error 1: invalid body');
+                })
+            };
+            setupMockDocument(docKey, dbOps);
+            let resolveNotification!: (value: string | undefined) => void;
+            const notification = new Promise<string | undefined>(resolve => {
+                resolveNotification = resolve;
+            });
+            mock.method(vscode.window, 'showErrorMessage', () => notification);
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/slow-notification/group/__view__.sql/definition.sql`
+            );
+            const outcome = provider.writeFile(
+                uri,
+                new TextEncoder().encode('SELECT invalid body'),
+                { create: false, overwrite: true }
+            ).then(
+                () => ({ resolved: true as const }),
+                error => ({ resolved: false as const, error })
+            );
+
+            await new Promise<void>(resolve => setImmediate(resolve));
+            let settled = false;
+            void outcome.then(() => { settled = true; });
+            await Promise.resolve();
+            try {
+                assert.strictEqual(settled, true, 'writeFile remained pending on showErrorMessage');
+                const result = await outcome;
+                assert.strictEqual(result.resolved, false);
+                assert.match(String('error' in result ? result.error : ''), /Invalid view definition/);
+            } finally {
+                resolveNotification(undefined);
+            }
+        });
+
         it('maps invalid UTF-8 in a view document to the clean dirty-buffer error path', async () => {
             const dbOps = {
                 editView: mock.fn(async () => {
@@ -499,6 +540,26 @@ describe('SQLiteFileSystemProvider', () => {
 
             assert.strictEqual(s.permissions, undefined);
             assert.strictEqual(s.size, 'SELECT 1'.length);
+        });
+
+        it('forgets view metadata when its database document is disposed', async () => {
+            let now = 100;
+            mock.method(Date, 'now', () => now);
+            const disposableDocKey = 'disposed-view-doc';
+            const document = setupMockDocument(disposableDocKey, {
+                getViewDefinition: async () => ({ selectSql: 'SELECT 1' })
+            });
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${disposableDocKey}/users/group/__view__.sql/definition.sql`
+            );
+
+            const first = await provider.stat(uri);
+            now = 200;
+            document.dispose();
+            const afterDispose = await provider.stat(uri);
+
+            assert.strictEqual(first.ctime, 100);
+            assert.strictEqual(afterDispose.ctime, 200);
         });
 
         it('watch should return a generic Disposable', async () => {

@@ -219,7 +219,9 @@ const bundleWebDemoWorker = () =>
     platform: 'browser',
     format: 'iife',
     target: 'es2020',
-    minify: !DEV,
+    // This tracked artifact must be byte-stable regardless of the extension's
+    // development build mode.
+    minify: true,
   });
 
 /**

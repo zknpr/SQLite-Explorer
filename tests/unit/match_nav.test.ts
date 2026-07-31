@@ -99,4 +99,35 @@ describe('filter match navigation', () => {
         assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
         assert.strictEqual(cell.classList.contains('active-match-cell'), true);
     });
+
+    it('matches text that exists only in the formatted cell value', async () => {
+        const cell = {
+            classList: createClassList(),
+            scrollIntoView() {}
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cell-0-0') return cell;
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.tableColumns = [{ name: 'optional_value', type: 'TEXT' }];
+        state.gridData = [[null]];
+        state.dateFormat = 'raw';
+        state.filterQuery = 'null';
+        state.columnFilters = {};
+        resetMatchNav();
+
+        navigateMatches('global');
+
+        assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
+        assert.strictEqual(cell.classList.contains('active-match-cell'), true);
+    });
 });

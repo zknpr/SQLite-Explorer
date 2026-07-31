@@ -43,12 +43,12 @@ export const Title = 'SQLite Explorer';
 // Copilot integration
 export const CopilotChatId = 'github.copilot-chat';
 
+/** Default query timeout in milliseconds (30 seconds). */
+export const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+
 // ============================================================================
 // Configuration Accessors
 // ============================================================================
-
-/** Default query timeout in milliseconds (30 seconds) */
-const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 
 /**
  * Retrieve maximum file size from user configuration.

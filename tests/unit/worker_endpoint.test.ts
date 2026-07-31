@@ -89,6 +89,30 @@ describe('Worker Endpoint', () => {
         assert.ok(data.length > 0);
     });
 
+    it('forwards skipped view-undo diagnostics through the endpoint logger', async () => {
+        const logs: Array<{ level: string; args: unknown[] }> = [];
+        endpoint = createWorkerEndpoint((level, ...args) => {
+            logs.push({ level, args });
+        });
+        await endpoint.initializeDatabase('test.db', {
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false,
+            wasmBinary
+        });
+
+        await endpoint.undoModification({
+            description: 'Corrupt legacy view history',
+            modificationType: 'view_edit',
+            targetTable: 'missing_view'
+        });
+
+        assert.deepStrictEqual(logs, [{
+            level: 'warn',
+            args: ['[WasmDatabaseEngine] Skipping view undo: definition missing from history entry']
+        }]);
+    });
+
     it('should shutdown previous database when initializing a new one', async () => {
         await endpoint.initializeDatabase('test1.db', {
             content: null,

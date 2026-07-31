@@ -84,6 +84,41 @@ describe('editor keyboard and grid selection interactions', () => {
         assert.strictEqual(prevented, 2);
     });
 
+    it('lets Escape arm the next Tab to leave a multiline editor', async () => {
+        const { handleTextareaTab } = await import(textEditorModulePath);
+        const textarea = createTextarea('SELECT 1', 8);
+        let prevented = 0;
+        let stopped = 0;
+
+        assert.strictEqual(handleTextareaTab({
+            key: 'Escape',
+            shiftKey: false,
+            target: textarea,
+            preventDefault() { prevented++; },
+            stopPropagation() { stopped++; }
+        }), true);
+        assert.strictEqual(prevented, 1);
+        assert.strictEqual(stopped, 1);
+
+        assert.strictEqual(handleTextareaTab({
+            key: 'Tab',
+            shiftKey: false,
+            target: textarea,
+            preventDefault() { prevented++; }
+        }), false);
+        assert.strictEqual(prevented, 1);
+        assert.strictEqual(textarea.value, 'SELECT 1');
+
+        assert.strictEqual(handleTextareaTab({
+            key: 'Tab',
+            shiftKey: false,
+            target: textarea,
+            preventDefault() { prevented++; }
+        }), true);
+        assert.strictEqual(prevented, 2);
+        assert.strictEqual(textarea.value, 'SELECT 1    ');
+    });
+
     it('wires Tab indentation into the modal cell editor', async () => {
         const listeners = new Map<string, (event: any) => any>();
         const element = (id: string) => ({

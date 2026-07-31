@@ -45,6 +45,7 @@ let db = null;
  */
 let SQL = null;
 let queryTimeout = DEFAULT_QUERY_TIMEOUT_MS;
+let readOnlyMode = false;
 
 // ============================================================================
 // sql.js Loading
@@ -214,6 +215,7 @@ async function initializeDatabase(filename, config) {
   queryTimeout = Number.isFinite(config.queryTimeout) && config.queryTimeout > 0
     ? config.queryTimeout
     : DEFAULT_QUERY_TIMEOUT_MS;
+  readOnlyMode = config.readOnlyMode === true;
 
   // Initialize sql.js with WASM
   if (!SQL) {
@@ -242,7 +244,7 @@ async function initializeDatabase(filename, config) {
 
   return {
     operations: {},
-    isReadOnly: false
+    isReadOnly: readOnlyMode
   };
 }
 
@@ -764,14 +766,14 @@ async function deleteColumns(table, columns) {
   // Get current table info
   const tableInfo = await getTableInfo(table);
   const columnsSet = new Set(columns);
-  const remainingColumns = tableInfo.filter(c => !columnsSet.has(c.name));
+  const remainingColumns = tableInfo.filter(c => !columnsSet.has(c.identifier));
 
   if (remainingColumns.length === 0) {
     throw new Error('Cannot delete all columns');
   }
 
   const safeTable = table.replace(/"/g, '""');
-  const columnList = remainingColumns.map(c => `"${c.name.replace(/"/g, '""')}"`).join(', ');
+  const columnList = remainingColumns.map(c => `"${c.identifier.replace(/"/g, '""')}"`).join(', ');
 
   // Use transaction to recreate table without deleted columns
   db.run('BEGIN TRANSACTION');
@@ -858,6 +860,9 @@ async function getViewDefinition(view) {
 
 async function validateViewDefinition(view, selectSql) {
   if (!db) throw new Error('No database initialized');
+  if (readOnlyMode) {
+    throw new Error('View validation is unavailable because the database is read-only');
+  }
   const body = normalizeViewSelectSql(selectSql);
   const existingResult = db.exec(
     "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",

@@ -20,7 +20,11 @@ function getViewDefinitionErrorDetail(error: unknown): string {
 export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     readonly onDidChangeFile: vsc.Event<vsc.FileChangeEvent[]>;
     private _emitter = new vsc.EventEmitter<vsc.FileChangeEvent[]>();
-    private readonly viewDocumentMetadata = new Map<string, { ctime: number; mtime: number }>();
+    private readonly viewDocumentMetadata = new Map<
+        DatabaseDocument,
+        Map<string, { ctime: number; mtime: number }>
+    >();
+    private readonly viewDocumentDisposals = new Map<DatabaseDocument, vsc.Disposable>();
 
     constructor() {
         this.onDidChangeFile = this._emitter.event;
@@ -31,11 +35,11 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     }
 
     async stat(uri: vsc.Uri): Promise<vsc.FileStat> {
-        const { rowId } = this.parseUri(uri);
+        const { document, rowId } = this.parseUri(uri);
 
         if (rowId === '__view__.sql') {
             const content = await this.readFile(uri);
-            const metadata = this.getViewDocumentMetadata(uri);
+            const metadata = this.getViewDocumentMetadata(document, uri);
             return {
                 type: vsc.FileType.File,
                 ctime: metadata.ctime,
@@ -148,9 +152,13 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 const rawMessage = err instanceof Error ? err.message : String(err);
                 GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error writing view definition: ${rawMessage}`);
                 const detail = getViewDefinitionErrorDetail(err);
-                await vsc.window.showErrorMessage(
+                void vsc.window.showErrorMessage(
                     `Invalid view definition: ${detail}. The view was not modified.`
-                );
+                ).then(undefined, notificationError => {
+                    GlobalOutputChannel?.appendLine(
+                        `[VirtualFileSystem] Failed to show view error notification: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`
+                    );
+                });
                 throw vsc.FileSystemError.Unavailable(
                     'Invalid view definition. The view was not modified.'
                 );
@@ -164,7 +172,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 viewDefBefore: result.before,
                 viewDefAfter: result.after
             });
-            this.markViewDocumentWritten(uri);
+            this.markViewDocumentWritten(document, uri);
             this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
             return;
         }
@@ -255,19 +263,33 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         return { document, table, rowId, column };
     }
 
-    private getViewDocumentMetadata(uri: vsc.Uri): { ctime: number; mtime: number } {
+    private getViewDocumentMetadata(
+        document: DatabaseDocument,
+        uri: vsc.Uri
+    ): { ctime: number; mtime: number } {
+        let documentMetadata = this.viewDocumentMetadata.get(document);
+        if (!documentMetadata) {
+            documentMetadata = new Map();
+            this.viewDocumentMetadata.set(document, documentMetadata);
+            const disposal = document.onDidDispose(() => {
+                this.viewDocumentMetadata.delete(document);
+                this.viewDocumentDisposals.delete(document);
+            });
+            this.viewDocumentDisposals.set(document, disposal);
+        }
+
         const key = uri.toString();
-        let metadata = this.viewDocumentMetadata.get(key);
+        let metadata = documentMetadata.get(key);
         if (!metadata) {
             const now = Date.now();
             metadata = { ctime: now, mtime: now };
-            this.viewDocumentMetadata.set(key, metadata);
+            documentMetadata.set(key, metadata);
         }
         return metadata;
     }
 
-    private markViewDocumentWritten(uri: vsc.Uri): void {
-        const metadata = this.getViewDocumentMetadata(uri);
+    private markViewDocumentWritten(document: DatabaseDocument, uri: vsc.Uri): void {
+        const metadata = this.getViewDocumentMetadata(document, uri);
         metadata.mtime = Math.max(Date.now(), metadata.mtime + 1);
     }
 }

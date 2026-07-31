@@ -32,7 +32,7 @@ function log(level: 'log' | 'warn' | 'error', ...args: unknown[]) {
 log('log', '[DatabaseWorker] Starting...');
 
 // Create the endpoint that handles database operations
-const databaseEndpoint = createWorkerEndpoint();
+const databaseEndpoint = createWorkerEndpoint(log);
 
 // ============================================================================
 // Message Handler

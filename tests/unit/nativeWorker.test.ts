@@ -9,6 +9,27 @@ import * as vscode from 'vscode';
 import { isNativeAvailable, NativeWorkerProcess } from '../../src/nativeWorker';
 import type { DatabaseOperations } from '../../src/core/types';
 
+const nativeWorkerSource = fs.readFileSync(
+    path.resolve(process.cwd(), 'natives', 'native-worker.js'),
+    'utf8'
+);
+
+function loadNativeWorkerFunction(
+    functionName: string,
+    parameters: string[]
+): (...args: any[]) => any {
+    const signature = `function ${functionName}(${parameters.join(', ')})`;
+    const escapedSignature = signature.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const functionSource = nativeWorkerSource.match(
+        new RegExp(`${escapedSignature} \\{[\\s\\S]*?^\\}`, 'm')
+    )?.[0];
+    assert.ok(
+        functionSource,
+        `native worker signature changed; expected ${signature}`
+    );
+    return Function(`"use strict"; return (${functionSource});`)();
+}
+
 interface RecordedNativeCall {
     id: number;
     method: string;
@@ -220,7 +241,8 @@ describe('createNativeDatabaseConnection', () => {
     async function createRecordingConnection(
         respondToCall?: RecordedNativeResponder,
         outputChannel?: vscode.OutputChannel,
-        queryTimeout: number = 30000
+        queryTimeout: number = 30000,
+        forceReadOnly: boolean = false
     ): Promise<{
         databaseOps: DatabaseOperations;
         calls: RecordedNativeCall[];
@@ -236,7 +258,11 @@ describe('createNativeDatabaseConnection', () => {
             outputChannel,
             queryTimeout
         );
-        const connection = await bundle.establishConnection({ fsPath: '/db/path.sqlite' } as any, 'TestDB');
+        const connection = await bundle.establishConnection(
+            { fsPath: '/db/path.sqlite' } as any,
+            'TestDB',
+            forceReadOnly
+        );
 
         return {
             databaseOps: connection.databaseOps,
@@ -732,6 +758,33 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
+    it('rejects native validation and preview before DDL on a read-only connection', async () => {
+        const connection = await createRecordingConnection(
+            undefined,
+            undefined,
+            30000,
+            true
+        );
+        try {
+            const callsBefore = connection.calls.length;
+            await assert.rejects(
+                connection.databaseOps.validateViewDefinition('read_only_view', 'SELECT 1'),
+                /View validation is unavailable because the database is read-only/
+            );
+            await assert.rejects(
+                connection.databaseOps.previewViewDefinition('read_only_view', 'SELECT 1', 10),
+                /View preview is unavailable because the database is read-only/
+            );
+            assert.deepStrictEqual(
+                connection.calls.slice(callsBefore),
+                [],
+                'read-only validation and preview must not reach the native worker'
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('returns preview metadata for zero rows and duplicate aliases', async () => {
         let currentBody = '';
         const connection = await createRecordingConnection(call => {
@@ -901,6 +954,57 @@ describe('createNativeDatabaseConnection', () => {
             assert.strictEqual(
                 createCall?.args[1],
                 'CREATE VIEW "duplicate names" (a, a) AS SELECT 3, 4'
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rolls back a native edit if the stored SELECT body differs from the submitted SQL', async () => {
+        const submittedBody = `SELECT
+    o.created_at,
+    MAX(oi.price) AS max_item_price
+FROM orders o
+LEFT JOIN order_items oi ON o.id = oi.order_id`;
+        let currentViewSql = 'CREATE VIEW "order_summary" AS SELECT o.created_at FROM orders o';
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryBatch') {
+                return {
+                    result: {
+                        results: [
+                            { columns: ['sql'], values: [[currentViewSql]] },
+                            { columns: ['name', 'sql'], values: [] }
+                        ]
+                    }
+                };
+            }
+            if (
+                call.method === 'runSingle'
+                && String(call.args[1]).startsWith('CREATE VIEW "order_summary"')
+            ) {
+                currentViewSql = `CREATE VIEW "order_summary" AS SELECT
+    o.created_at
+    MAX
+FROM orders o`;
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.editView('order_summary', submittedBody, true),
+                /stored a view definition different from the submitted SQL/
+            );
+
+            const transactionSql = connection.calls
+                .filter(call => call.method === 'run')
+                .map(call => String(call.args[0]));
+            assert.ok(transactionSql.some(sql => sql.startsWith('ROLLBACK TO "sp_edit_view_')));
+            assert.strictEqual(
+                transactionSql.filter(sql => sql.startsWith('RELEASE "sp_edit_view_')).length,
+                1,
+                'the only RELEASE must be the one that closes the rolled-back savepoint'
             );
         } finally {
             connection.dispose();
@@ -1143,15 +1247,10 @@ describe('native querySingle worker handler', () => {
     });
 
     it('rejects a preview tail before stepping the prepared statement', () => {
-        const source = fs.readFileSync(
-            path.resolve(process.cwd(), 'natives', 'native-worker.js'),
-            'utf8'
+        const executeSingleQuery = loadNativeWorkerFunction(
+            'executeSingleQuery',
+            ['db', 'sql', 'params', 'requiredSuffix']
         );
-        const functionSource = source.match(
-            /function executeSingleQuery\(db, sql, params, requiredSuffix\) \{[\s\S]*?^\}/m
-        )?.[0];
-        assert.ok(functionSource, 'native worker must define executeSingleQuery');
-        const executeSingleQuery = Function(`"use strict"; return (${functionSource});`)();
         const boundary = '/*sqlite_explorer_boundary_test*/';
         const sql = [
             'SELECT * FROM (SELECT 1) LIMIT 1; DROP TABLE preview_sentinel; --',
@@ -1186,15 +1285,10 @@ describe('native querySingle worker handler', () => {
     });
 
     it('checks elapsed time while reading a native preview row-by-row', () => {
-        const source = fs.readFileSync(
-            path.resolve(process.cwd(), 'natives', 'native-worker.js'),
-            'utf8'
+        const executeBoundedQuery = loadNativeWorkerFunction(
+            'executeBoundedQuery',
+            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
         );
-        const functionSource = source.match(
-            /function executeBoundedQuery\(db, markedSql, sql, requiredSuffix, columns, limit, timeoutMs\) \{[\s\S]*?^\}/m
-        )?.[0];
-        assert.ok(functionSource, 'native worker must define executeBoundedQuery');
-        const executeBoundedQuery = Function(`"use strict"; return (${functionSource});`)();
         const boundary = '/*sqlite_explorer_boundary_test*/';
         let finalized = 0;
         let rowQueries = 0;
@@ -1234,16 +1328,58 @@ describe('native querySingle worker handler', () => {
         assert.strictEqual(finalized, 2);
     });
 
-    it('rejects a stored mutation tail before executing the original SQL', () => {
-        const source = fs.readFileSync(
-            path.resolve(process.cwd(), 'natives', 'native-worker.js'),
-            'utf8'
+    it('executes a 100-row duplicate-alias preview only once', () => {
+        const executeBoundedQuery = loadNativeWorkerFunction(
+            'executeBoundedQuery',
+            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
         );
-        const functionSource = source.match(
-            /function executeSingleStatement\(db, markedSql, sql, params, requiredSuffix\) \{[\s\S]*?^\}/m
-        )?.[0];
-        assert.ok(functionSource, 'native worker must define executeSingleStatement');
-        const executeSingleStatement = Function(`"use strict"; return (${functionSource});`)();
+        const boundary = '/*sqlite_explorer_boundary_test*/';
+        let dataPrepareCalls = 0;
+        let finalized = 0;
+        const database = {
+            prepare(sql: string) {
+                if (sql.endsWith(boundary)) {
+                    return {
+                        toString: () => sql,
+                        finalize() { finalized++; }
+                    };
+                }
+                dataPrepareCalls++;
+                return {
+                    all() {
+                        return Array.from({ length: 100 }, (_, index) => ({
+                            x: index + 1,
+                            'x:1': (index + 1) * 10
+                        }));
+                    },
+                    finalize() { finalized++; }
+                };
+            }
+        };
+        mock.method(Date, 'now', () => 0);
+
+        const result = executeBoundedQuery(
+            database,
+            `SELECT * FROM preview\n${boundary}`,
+            'SELECT * FROM preview',
+            boundary,
+            ['x', 'x:1'],
+            100,
+            5000
+        );
+
+        assert.strictEqual(dataPrepareCalls, 1);
+        assert.strictEqual(finalized, 2);
+        assert.strictEqual(result.rowCount, 100);
+        assert.deepStrictEqual(result.values[0], [1, 10]);
+        assert.deepStrictEqual(result.values[99], [100, 1000]);
+    });
+
+    it('rejects a stored mutation tail before executing the original SQL', () => {
+        const executeSingleStatement = loadNativeWorkerFunction(
+            'executeSingleStatement',
+            ['db', 'markedSql', 'sql', 'params', 'requiredSuffix']
+        );
         let finalized = false;
         let prepareCalls = 0;
         const database = {
@@ -1268,5 +1404,32 @@ describe('native querySingle worker handler', () => {
         );
         assert.strictEqual(prepareCalls, 1);
         assert.strictEqual(finalized, true);
+    });
+
+    it('rejects divergent marked and executable mutation payloads', () => {
+        const executeSingleStatement = loadNativeWorkerFunction(
+            'executeSingleStatement',
+            ['db', 'markedSql', 'sql', 'params', 'requiredSuffix']
+        );
+        let prepareCalls = 0;
+        const database = {
+            prepare() {
+                prepareCalls++;
+                throw new Error('prepare must not run for a divergent payload');
+            }
+        };
+        const boundary = '/*sqlite_explorer_boundary_test*/';
+
+        assert.throws(
+            () => executeSingleStatement(
+                database,
+                `CREATE VIEW sample AS SELECT MAX(1) AS value\n${boundary}`,
+                'CREATE VIEW sample AS SELECT MAX',
+                undefined,
+                boundary
+            ),
+            /Single-statement SQL payload mismatch/
+        );
+        assert.strictEqual(prepareCalls, 0);
     });
 });

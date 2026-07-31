@@ -73,6 +73,10 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     const hasRenderedGrid = !!(container && container.querySelector('.data-grid'));
     const isSameTableGrid = hasRenderedGrid && state.renderedTable === state.selectedTable;
 
+    // Every replacement load guards the currently rendered grid, including
+    // background refreshes that intentionally keep the spinner hidden.
+    state.isGridReloading = true;
+
     // Only capture scroll position if the current table's grid is visible (not a
     // loading/error state, and not a different table's grid mid-switch). This
     // prevents overwriting the saved position with 0 while a spinner is shown.
@@ -83,10 +87,6 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
     if (showSpinner) {
         state.isLoadingData = true;
-        // Dedicated guard the grid handlers + global delete/select-all shortcuts
-        // key on. Separate from isLoadingData (also set by BLOB uploads in dnd.js)
-        // so the two can't clear each other; released by the latest load below.
-        state.isGridReloading = true;
         // Keep the existing grid visible during a same-table refetch (prevents
         // flicker); show the spinner on a true first load or a table switch, where
         // nothing valid for this table is on screen yet.

@@ -284,6 +284,21 @@ function executeSingleQuery(db, sql, params, requiredSuffix) {
 
 /** Execute one mutation only after the marked SQL proves it has no tail. */
 function executeSingleStatement(db, markedSql, sql, params, requiredSuffix) {
+  const marker = requiredSuffix ? `\n${requiredSuffix}` : '';
+  if (!marker || !markedSql.endsWith(marker)) {
+    throw new Error('Exactly one SQL statement is required');
+  }
+
+  // Do not validate one RPC string and execute another. Besides weakening the
+  // statement-boundary guarantee, any transport divergence would make SQLite
+  // store SQL different from the definition the host compiled. Derive the
+  // executable bytes from the boundary-checked payload and use the duplicate
+  // argument only as an integrity assertion for protocol compatibility.
+  const validatedSql = markedSql.slice(0, -marker.length);
+  if (validatedSql !== sql) {
+    throw new Error('Single-statement SQL payload mismatch');
+  }
+
   const validationStmt = db.prepare(markedSql);
   try {
     const preparedSql = typeof validationStmt.toString === 'function'
@@ -295,7 +310,7 @@ function executeSingleStatement(db, markedSql, sql, params, requiredSuffix) {
   } finally {
     if (typeof validationStmt.finalize === 'function') validationStmt.finalize();
   }
-  return executeStatement(db, sql, params);
+  return executeStatement(db, validatedSql, params);
 }
 
 /**
@@ -317,24 +332,31 @@ function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, limit,
     if (typeof validationStmt.finalize === 'function') validationStmt.finalize();
   }
 
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    throw new Error('Preview row limit must be an integer between 1 and 100');
+  }
+
   const values = [];
   const startedAt = Date.now();
-  for (let offset = 0; offset < limit; offset++) {
-    if (Date.now() - startedAt > timeoutMs) {
-      throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+  const stmt = db.prepare(`${sql}\nLIMIT ${limit}`);
+  try {
+    // The disposable preview view gives duplicate aliases stable positional
+    // schema names (for example x and x:1), so row objects can be projected in
+    // PRAGMA order without re-running the SELECT for each OFFSET. txiki's
+    // statement API exposes all() but no step/iterator API, so SQLite executes
+    // once and the elapsed bound is checked while serializing each returned row.
+    const rows = stmt.all();
+    for (const row of rows) {
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+      }
+      values.push(columns.map(column => row[column]));
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+      }
     }
-    const stmt = db.prepare(`${sql} LIMIT 1 OFFSET ${offset}`);
-    let rows;
-    try {
-      rows = typeof stmt.all === 'function' ? stmt.all() : Array.from(stmt);
-    } finally {
-      if (typeof stmt.finalize === 'function') stmt.finalize();
-    }
-    if (Date.now() - startedAt > timeoutMs) {
-      throw new Error(`Query execution timed out after ${timeoutMs}ms`);
-    }
-    if (!rows || rows.length === 0) break;
-    values.push(columns.map(column => rows[0][column]));
+  } finally {
+    if (typeof stmt.finalize === 'function') stmt.finalize();
   }
 
   return { columns, values, rowCount: values.length };

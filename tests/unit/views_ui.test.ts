@@ -40,11 +40,13 @@ function installViewDocument() {
     const element = (overrides: Record<string, unknown> = {}) => ({
         textContent: '',
         value: '',
+        children: [] as any[],
         disabled: false,
         hidden: false,
         checked: true,
         classList: createClassList(),
-        replaceChildren() {},
+        replaceChildren(...children: any[]) { (this as any).children = children; },
+        appendChild(child: any) { (this as any).children.push(child); },
         focus() {},
         addEventListener(type: string, listener: (...args: any[]) => any) {
             listeners.set(`${(this as any).id}:${type}`, listener);
@@ -273,6 +275,125 @@ describe('view modal concurrency', () => {
             backendApi.validateViewDefinition = originalValidate;
             backendApi.editView = originalEdit;
             backendApi.createView = originalCreate;
+        }
+    });
+
+    it('ignores a preview response for a superseded draft', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { initViews, openCreateViewModal } = await import(viewsModulePath);
+        const oldPreview = createDeferred<any>();
+        const newPreview = createDeferred<any>();
+        const originalPreview = backendApi.previewViewDefinition;
+        backendApi.previewViewDefinition = async (_name: string, sql: string) => (
+            sql.includes('old') ? oldPreview.promise : newPreview.promise
+        );
+
+        try {
+            initViews();
+            openCreateViewModal();
+            elements.viewNameInput.value = 'previewed_view';
+            elements.viewSelectSql.value = 'SELECT old';
+            const preview = listener('btnPreviewView', 'click');
+            const staleRequest = preview();
+
+            elements.viewSelectSql.value = 'SELECT new';
+            const currentRequest = preview();
+            newPreview.resolve({ headers: ['value'], rows: [[1]] });
+            await currentRequest;
+            assert.match(elements.viewValidationStatus.textContent, /Preview returned 1 row/);
+
+            oldPreview.resolve({ headers: ['value'], rows: [[1], [2]] });
+            await staleRequest;
+            assert.match(elements.viewValidationStatus.textContent, /Preview returned 1 row/);
+        } finally {
+            backendApi.previewViewDefinition = originalPreview;
+        }
+    });
+
+    it('does not let a superseded successful save overwrite newer modal status', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openCreateViewModal, openEditViewModal } = await import(viewsModulePath);
+        const mutation = createDeferred<any>();
+        const originals = {
+            get: backendApi.getViewDefinition,
+            validate: backendApi.validateViewDefinition,
+            create: backendApi.createView
+        };
+        backendApi.getViewDefinition = async () => ({ selectSql: 'SELECT 2', triggers: [] });
+        backendApi.validateViewDefinition = async () => undefined;
+        backendApi.createView = async () => mutation.promise;
+        state.isReadOnly = false;
+        state.isDbConnected = false;
+
+        try {
+            initViews();
+            openCreateViewModal();
+            elements.viewNameInput.value = 'old_view';
+            elements.viewSelectSql.value = 'SELECT 1';
+            const pendingSave = listener('btnSaveView', 'click')();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            await openEditViewModal('new_view');
+            assert.strictEqual(elements.statusText.textContent, 'Ready');
+            mutation.resolve({});
+            await pendingSave;
+
+            assert.strictEqual(elements.statusText.textContent, 'Ready');
+        } finally {
+            backendApi.getViewDefinition = originals.get;
+            backendApi.validateViewDefinition = originals.validate;
+            backendApi.createView = originals.create;
+        }
+    });
+
+    it('does not let a superseded failed save overwrite newer modal status', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openCreateViewModal, openEditViewModal } = await import(viewsModulePath);
+        const mutation = createDeferred<any>();
+        const originals = {
+            get: backendApi.getViewDefinition,
+            validate: backendApi.validateViewDefinition,
+            create: backendApi.createView
+        };
+        backendApi.getViewDefinition = async () => ({ selectSql: 'SELECT 2', triggers: [] });
+        backendApi.validateViewDefinition = async () => undefined;
+        backendApi.createView = async () => mutation.promise;
+        state.isReadOnly = false;
+        state.isDbConnected = false;
+
+        try {
+            initViews();
+            openCreateViewModal();
+            elements.viewNameInput.value = 'old_view';
+            elements.viewSelectSql.value = 'SELECT 1';
+            const pendingSave = listener('btnSaveView', 'click')();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            await openEditViewModal('new_view');
+            assert.strictEqual(elements.statusText.textContent, 'Ready');
+            mutation.reject(new Error('stale failure'));
+            await pendingSave;
+
+            assert.strictEqual(elements.statusText.textContent, 'Ready');
+        } finally {
+            backendApi.getViewDefinition = originals.get;
+            backendApi.validateViewDefinition = originals.validate;
+            backendApi.createView = originals.create;
         }
     });
 

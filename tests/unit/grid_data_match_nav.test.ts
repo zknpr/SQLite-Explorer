@@ -18,6 +18,14 @@ function createClassList(initial: string[] = []) {
     };
 }
 
+function createDeferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>(resolvePromise => {
+        resolve = resolvePromise;
+    });
+    return { promise, resolve };
+}
+
 describe('grid data match cache', () => {
     afterEach(() => {
         delete (globalThis as any).document;
@@ -92,6 +100,54 @@ describe('grid data match cache', () => {
             backendApi.fetchTableCount = originalFetchCount;
             backendApi.fetchTableData = originalFetchData;
             state.editingCellInfo = null;
+        }
+    });
+
+    it('guards the old grid during a background data replacement', async () => {
+        const elements: Record<string, any> = {
+            pageIndicator: { textContent: '' },
+            btnFirst: { disabled: false },
+            btnPrev: { disabled: false },
+            btnNext: { disabled: false },
+            btnLast: { disabled: false },
+            statusText: { textContent: '' },
+            filterMatchCounter: { textContent: '' }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) { return elements[id] ?? null; },
+            querySelectorAll() { return []; }
+        };
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const gridDataModulePath = '../../core/ui/modules/grid-data.js';
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { loadTableData } = await import(gridDataModulePath);
+        const count = createDeferred<number>();
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        backendApi.fetchTableCount = async () => count.promise;
+        backendApi.fetchTableData = async () => ({ rows: [[7, 'fresh']] });
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.currentPageIndex = 0;
+        state.rowsPerPage = 500;
+        state.columnFilters = {};
+        state.filterQuery = '';
+        state.isLoadingData = false;
+        state.isGridReloading = false;
+
+        try {
+            const pendingLoad = loadTableData(false, false);
+            assert.strictEqual(state.isGridReloading, true);
+            assert.strictEqual(state.isLoadingData, false, 'background load must not show spinner state');
+            count.resolve(1);
+            await pendingLoad;
+            assert.strictEqual(state.isGridReloading, false);
+        } finally {
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
         }
     });
 });

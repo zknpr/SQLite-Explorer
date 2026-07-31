@@ -1,4 +1,5 @@
 const DEFAULT_INDENT = '    ';
+const focusEscapeArmed = new WeakSet();
 
 function clampPosition(value, position) {
     return Math.max(0, Math.min(value.length, Number.isFinite(position) ? position : 0));
@@ -45,9 +46,30 @@ function applyEdits(value, edits) {
 
 /** Apply code-editor Tab/Shift+Tab behavior to a textarea key event. */
 export function handleTextareaTab(event, indent = DEFAULT_INDENT) {
-    if (event.key !== 'Tab') return false;
     const textarea = event.target;
     if (!textarea || textarea.readOnly || textarea.disabled || typeof textarea.value !== 'string') {
+        return false;
+    }
+
+    // A code editor normally consumes Tab, so use the first Escape as a
+    // one-shot "Tab moves focus" command. A second Escape retains the modal's
+    // normal close behavior, and editing any other key cancels the armed state.
+    if (event.key === 'Escape') {
+        if (focusEscapeArmed.has(textarea)) {
+            focusEscapeArmed.delete(textarea);
+            return false;
+        }
+        focusEscapeArmed.add(textarea);
+        event.preventDefault();
+        event.stopPropagation();
+        return true;
+    }
+    if (event.key !== 'Tab') {
+        focusEscapeArmed.delete(textarea);
+        return false;
+    }
+    if (focusEscapeArmed.has(textarea)) {
+        focusEscapeArmed.delete(textarea);
         return false;
     }
 
