@@ -1,19 +1,29 @@
 import './vscode_mock_setup';
 
-import { after, it } from 'node:test';
+import { after, beforeEach, it } from 'node:test';
 import assert from 'node:assert';
 import { createDeferred } from './helpers/deferred';
 
 const postedMessages: any[] = [];
-const posted = createDeferred<any>();
+const postedWaiters = new Map<number, ReturnType<typeof createDeferred<any>>>();
 const confirmations: string[] = [];
 let confirmResult = false;
+
+function waitForPostedMessage(index: number): Promise<any> {
+    const existing = postedMessages[index];
+    if (existing) return Promise.resolve(existing);
+    const deferred = createDeferred<any>();
+    postedWaiters.set(index, deferred);
+    return deferred.promise;
+}
 
 (globalThis as any).window = {
     parent: {
         postMessage(message: any) {
+            const index = postedMessages.length;
             postedMessages.push(message);
-            posted.resolve(message);
+            postedWaiters.get(index)?.resolve(message);
+            postedWaiters.delete(index);
         }
     },
     location: { ancestorOrigins: [] },
@@ -22,6 +32,13 @@ let confirmResult = false;
         return confirmResult;
     }
 };
+
+beforeEach(() => {
+    postedMessages.length = 0;
+    postedWaiters.clear();
+    confirmations.length = 0;
+    confirmResult = false;
+});
 
 after(() => {
     delete (globalThis as any).window;
@@ -39,7 +56,7 @@ it('confirms demo view drops with a trigger-loss warning before forwarding once'
 
     confirmResult = true;
     const dropPromise = backendApi.dropView('demo_view');
-    const request = await posted.promise;
+    const request = await waitForPostedMessage(0);
     assert.strictEqual(request.content.targetMethod, 'dropView');
     assert.deepStrictEqual(request.content.payload, ['demo_view']);
 
@@ -52,4 +69,69 @@ it('confirms demo view drops with a trigger-loss warning before forwarding once'
     assert.deepStrictEqual(await dropPromise, { dropped: true });
     assert.strictEqual(confirmations.length, 2);
     assert.strictEqual(postedMessages.length, 1);
+});
+
+it('confirms the named demo triggers before an edit can discard them', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const { backendApi, handleRpcResponse } = await import(webApiModulePath);
+
+    const cancelledEdit = backendApi.editView(
+        'demo_view',
+        'SELECT 2 AS value',
+        false,
+        'CREATE VIEW demo_view AS SELECT 1 AS value'
+    );
+    const cancelledLookup = await waitForPostedMessage(0);
+    assert.strictEqual(cancelledLookup.content.targetMethod, 'getViewDefinition');
+    handleRpcResponse({
+        kind: 'response',
+        messageId: cancelledLookup.content.messageId,
+        success: true,
+        data: {
+            triggers: [
+                { identifier: 'demo_insert' },
+                { identifier: 'demo_update' }
+            ]
+        }
+    });
+
+    assert.deepStrictEqual(await cancelledEdit, { cancelled: true });
+    assert.strictEqual(postedMessages.length, 1, 'cancelled edits must not reach editView');
+    assert.match(confirmations[0], /demo_view/);
+    assert.match(confirmations[0], /demo_insert/);
+    assert.match(confirmations[0], /demo_update/);
+    assert.match(confirmations[0], /INSTEAD OF triggers/i);
+    assert.match(confirmations[0], /permanently/i);
+
+    confirmResult = true;
+    const acceptedEdit = backendApi.editView(
+        'demo_view',
+        'SELECT 2 AS value',
+        false,
+        'CREATE VIEW demo_view AS SELECT 1 AS value'
+    );
+    const acceptedLookup = await waitForPostedMessage(1);
+    handleRpcResponse({
+        kind: 'response',
+        messageId: acceptedLookup.content.messageId,
+        success: true,
+        data: { triggers: [{ identifier: 'demo_insert' }] }
+    });
+
+    const editRequest = await waitForPostedMessage(2);
+    assert.strictEqual(editRequest.content.targetMethod, 'editView');
+    assert.deepStrictEqual(editRequest.content.payload, [
+        'demo_view',
+        'SELECT 2 AS value',
+        false,
+        'CREATE VIEW demo_view AS SELECT 1 AS value'
+    ]);
+    handleRpcResponse({
+        kind: 'response',
+        messageId: editRequest.content.messageId,
+        success: true,
+        data: { updated: true }
+    });
+    assert.deepStrictEqual(await acceptedEdit, { updated: true });
+    assert.strictEqual(confirmations.length, 2);
 });

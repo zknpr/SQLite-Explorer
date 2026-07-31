@@ -315,7 +315,10 @@ export const backendApi = {
             const current = await sendRpcRequest('getViewDefinition', [view]);
             if (current.triggers?.length > 0) {
                 const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
-                if (!window.confirm(`Editing view "${view}" will permanently drop: ${triggerNames}`)) {
+                if (!window.confirm(
+                    `Editing view "${view}" without preserving triggers will permanently drop ` +
+                    `these INSTEAD OF triggers: ${triggerNames}. Continue?`
+                )) {
                     return { cancelled: true };
                 }
             }

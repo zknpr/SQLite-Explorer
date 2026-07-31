@@ -40,3 +40,4 @@ _repro_*.html
 _endpoint_bundle.mjs
 vscode-web-test-db.png
 docs/superpowers/
+test_db/

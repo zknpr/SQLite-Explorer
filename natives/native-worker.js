@@ -328,10 +328,14 @@ function executeSingleStatement(db, markedSql, sql, params, requiredSuffix) {
 }
 
 /**
- * Read a generated SELECT one row at a time so preview work observes the
- * configured elapsed-time bound. txiki's SQLite binding has no interrupt or
- * step API, so one individual SQLite call can still overrun; progress-handler
- * support is intentionally a follow-up.
+ * Read a generated SELECT with a best-effort elapsed-time bound. The bundled
+ * txiki SQLite Database exposes only close/exec/prepare/inTransaction/
+ * transaction/loadExtension; it has no sqlite3_interrupt or progress-handler
+ * API, and Statement exposes all()/run() but no stepping API. Consequently
+ * stmt.all() blocks the child event loop: the parent RPC deadline can reject
+ * its promise, but neither it nor a queued rollback can preempt this call. The
+ * checks below can only reject a result after SQLite returns. True interruption
+ * remains deferred until the binding exposes a native cancellation primitive.
  */
 function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, limit, timeoutMs) {
   const validatedSql = assertSingleStatementPayload(db, markedSql, sql, requiredSuffix);

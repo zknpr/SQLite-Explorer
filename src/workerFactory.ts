@@ -61,6 +61,10 @@ if (!import.meta.env?.VSCODE_BROWSER_EXT) {
 
 /**
  * Methods exposed by the database worker.
+ *
+ * Keep every parameter structured-cloneable. AbortSignal is deliberately not
+ * part of this RPC contract: worker_threads clones it into a plain object, so
+ * cancellation is checked in the host facade before dispatch instead.
  */
 interface WorkerMethods {
   initializeDatabase(
@@ -69,11 +73,11 @@ interface WorkerMethods {
   ): Promise<DatabaseInitResult>;
   runQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]>;
   exportDatabase(): Promise<Uint8Array>;
-  applyModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
+  applyModifications(mods: ModificationEntry[]): Promise<void>;
   undoModification(mod: ModificationEntry): Promise<void>;
   redoModification(mod: ModificationEntry): Promise<void>;
-  flushChanges(signal?: AbortSignal): Promise<void>;
-  discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
+  flushChanges(): Promise<void>;
+  discardModifications(mods: ModificationEntry[]): Promise<void>;
   updateCell(table: string, rowId: string | number, column: string, value: CellValue, patch?: string): Promise<void>;
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
@@ -468,21 +472,33 @@ async function createWorkerBackedWasmDatabaseConnection(
           return value;
         };
 
+        // AbortSignal cannot cross worker_threads RPC without losing its
+        // prototype. Preserve cancellation that was already requested, but do
+        // not serialize the signal. Mid-operation cancellation will require a
+        // dedicated cancel message and worker-local AbortController.
+        const callWorkerAfterAbortCheck = <T>(
+          signal: AbortSignal | undefined,
+          call: () => Promise<T>
+        ): Promise<T> => {
+          signal?.throwIfAborted();
+          return call();
+        };
+
         const operationsFacade: DatabaseOperations = {
           engineKind: Promise.resolve('wasm'),
           executeQuery: (sql: string, params?: CellValue[]) =>
             workerProxy.runQuery(sql, params),
           serializeDatabase: () => workerProxy.exportDatabase(),
           applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
-            workerProxy.applyModifications(mods, signal),
+            callWorkerAfterAbortCheck(signal, () => workerProxy.applyModifications(mods)),
           undoModification: (mod: ModificationEntry) =>
             workerProxy.undoModification(mod),
           redoModification: (mod: ModificationEntry) =>
             workerProxy.redoModification(mod),
           flushChanges: (signal?: AbortSignal) =>
-            workerProxy.flushChanges(signal),
+            callWorkerAfterAbortCheck(signal, () => workerProxy.flushChanges()),
           discardModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
-            workerProxy.discardModifications(mods, signal),
+            callWorkerAfterAbortCheck(signal, () => workerProxy.discardModifications(mods)),
           // Preserve JSON merge patches through worker RPC while still
           // transferring Uint8Array cell values without copying.
           updateCell: (table: string, rowId: string | number, column: string, value: CellValue, patch?: string) =>

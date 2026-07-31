@@ -124,6 +124,9 @@ describe('workerFactory error path tests', () => {
 
   it('routes view history through the desktop worker-backed WASM facade', async () => {
     const views = new Map<string, any>();
+    const applyRpcArgumentCounts: number[] = [];
+    const discardRpcArgumentCounts: number[] = [];
+    const flushRpcArgumentCounts: number[] = [];
     const definition = (name: string, selectSql: string) => ({
       identifier: name,
       sql: `CREATE VIEW "${name}" AS ${selectSql}`,
@@ -161,15 +164,36 @@ describe('workerFactory error path tests', () => {
         if (mod.modificationType === 'view_drop') views.delete(mod.targetTable);
         else if (mod.viewDefAfter) views.set(mod.targetTable, mod.viewDefAfter);
       },
-      applyModifications: async (mods: any[]) => {
+      applyModifications: async (...args: any[]) => {
+        applyRpcArgumentCounts.push(args.length);
+        const [mods, transmittedSignal] = args;
+        // Model worker_threads structured cloning: AbortSignal loses its
+        // prototype and reaches the worker as a plain object.
+        const clonedSignal = transmittedSignal === undefined
+          ? undefined
+          : structuredClone(transmittedSignal);
+        (clonedSignal as any)?.throwIfAborted();
         for (const mod of mods) await workerProxy.redoModification(mod);
       },
-      discardModifications: async (mods: any[]) => {
+      discardModifications: async (...args: any[]) => {
+        discardRpcArgumentCounts.push(args.length);
+        const [mods, transmittedSignal] = args;
+        const clonedSignal = transmittedSignal === undefined
+          ? undefined
+          : structuredClone(transmittedSignal);
+        (clonedSignal as any)?.throwIfAborted();
         for (let index = mods.length - 1; index >= 0; index--) {
           await workerProxy.undoModification(mods[index]);
         }
       },
-      flushChanges: async () => {}
+      flushChanges: async (...args: any[]) => {
+        flushRpcArgumentCounts.push(args.length);
+        const [transmittedSignal] = args;
+        const clonedSignal = transmittedSignal === undefined
+          ? undefined
+          : structuredClone(transmittedSignal);
+        (clonedSignal as any)?.throwIfAborted();
+      }
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
@@ -183,6 +207,7 @@ describe('workerFactory error path tests', () => {
 
     const created = await databaseOps.createView('history_view', 'SELECT 1 AS value');
     const createMod = {
+      label: 'Create history_view',
       description: 'Create history_view',
       modificationType: 'view_create' as const,
       targetTable: 'history_view',
@@ -223,6 +248,33 @@ describe('workerFactory error path tests', () => {
     await databaseOps.discardModifications([createMod]);
     await assert.rejects(databaseOps.getViewDefinition('history_view'), /View not found/);
     await databaseOps.flushChanges();
+
+    // Hot-exit restoration supplies a real AbortSignal. The desktop facade
+    // must check it host-side without serializing it into worker RPC.
+    const { ModificationTracker } = require('../../src/core/undo-history');
+    const { reconcileRestoredDatabase } = require('../../src/core/restore-reconciler');
+    const restoredTracker = new ModificationTracker(10);
+    restoredTracker.record(createMod);
+    await reconcileRestoredDatabase(
+      databaseOps,
+      restoredTracker,
+      'wasm',
+      new AbortController().signal
+    );
+    assert.strictEqual(
+      (await databaseOps.getViewDefinition('history_view')).selectSql,
+      'SELECT 1 AS value'
+    );
+    assert.strictEqual(
+      applyRpcArgumentCounts.at(-1),
+      1,
+      'AbortSignal must not cross the worker_threads RPC boundary'
+    );
+    const rpcSignal = new AbortController().signal;
+    await databaseOps.discardModifications([], rpcSignal);
+    await databaseOps.flushChanges(rpcSignal);
+    assert.strictEqual(discardRpcArgumentCounts.at(-1), 1);
+    assert.strictEqual(flushRpcArgumentCounts.at(-1), 0);
 
     for (const method of [
       'applyModifications',
