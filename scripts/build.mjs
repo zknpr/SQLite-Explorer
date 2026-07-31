@@ -16,6 +16,7 @@ import { polyfillNode } from "esbuild-plugin-polyfill-node";
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
+import { createHash } from 'node:crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -211,14 +212,21 @@ const compileBrowserWorker = () =>
  * Bundle the standalone website worker from its authored source. The source
  * imports the canonical TypeScript view helpers, preventing parser drift.
  */
+const webDemoWorkerSourcePath = resolve('website', 'src', 'sqlite-viewer', 'worker.js');
+
 const bundleWebDemoWorker = () =>
   esbuild.build({
-    entryPoints: [resolve('website', 'src', 'sqlite-viewer', 'worker.js')],
+    entryPoints: [webDemoWorkerSourcePath],
     outfile: resolve('website', 'public', 'sqlite-viewer', 'worker.js'),
     bundle: true,
     platform: 'browser',
     format: 'iife',
     target: 'es2020',
+    banner: {
+      js: `/*! sqlite-viewer-source-sha256:${createHash('sha256')
+        .update(fs.readFileSync(webDemoWorkerSourcePath))
+        .digest('hex')} */`,
+    },
     // This tracked artifact must be byte-stable regardless of the extension's
     // development build mode.
     minify: true,
