@@ -126,7 +126,8 @@ export async function createDatabaseConnection(
         const nativeBundle = await nativeSupport.createNativeDatabaseConnection(
           extensionUri,
           _reporter,
-          GlobalOutputChannel
+          GlobalOutputChannel,
+          getQueryTimeout()
         );
 
         // Wrap the native bundle to provide fallback to WASM if file open fails

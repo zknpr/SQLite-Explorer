@@ -27,6 +27,7 @@ import {
  * Using jsDelivr for reliable global CDN delivery.
  */
 const SQL_JS_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.13.0/sql-wasm.js';
+const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 
 // ============================================================================
 // State
@@ -43,6 +44,7 @@ let db = null;
  * @type {Object|null}
  */
 let SQL = null;
+let queryTimeout = DEFAULT_QUERY_TIMEOUT_MS;
 
 // ============================================================================
 // sql.js Loading
@@ -163,8 +165,16 @@ function compileSingleStatement(sql) {
 function querySingleStatement(sql) {
   const statement = prepareSingleStatement(sql);
   const rows = [];
+  const startedAt = Date.now();
   try {
-    while (statement.step()) rows.push(statement.get());
+    while (true) {
+      const hasRow = statement.step();
+      if (Date.now() - startedAt > queryTimeout) {
+        throw new Error(`Query execution timed out after ${queryTimeout}ms`);
+      }
+      if (!hasRow) break;
+      rows.push(statement.get());
+    }
     const headers = statement.getColumnNames();
     return { headers, rows };
   } finally {
@@ -200,6 +210,10 @@ async function initializeDatabase(filename, config) {
     db.close();
     db = null;
   }
+
+  queryTimeout = Number.isFinite(config.queryTimeout) && config.queryTimeout > 0
+    ? config.queryTimeout
+    : DEFAULT_QUERY_TIMEOUT_MS;
 
   // Initialize sql.js with WASM
   if (!SQL) {
@@ -800,7 +814,7 @@ async function createTable(table, columns) {
   db.run(`CREATE TABLE "${safeTable}" (${columnDefs})`);
 }
 
-async function getViewDefinition(view) {
+async function readViewDefinition(view, allowUnparsed = false) {
   if (!db) throw new Error('No database initialized');
   const viewResult = db.exec(
     "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
@@ -820,19 +834,53 @@ async function getViewDefinition(view) {
     return { identifier: row[0], sql: row[1] };
   });
 
-  const selectSql = extractViewSelectSql(createSql);
+  let selectSql;
+  let columnListSql;
+  try {
+    selectSql = extractViewSelectSql(createSql);
+    columnListSql = extractViewColumnListSql(createSql);
+  } catch (error) {
+    if (!allowUnparsed) throw error;
+    selectSql = '';
+  }
   return {
     identifier: view,
     sql: createSql,
     selectSql,
-    columnListSql: extractViewColumnListSql(createSql),
+    columnListSql,
     triggers
   };
 }
 
-async function validateViewDefinition(_view, selectSql) {
+async function getViewDefinition(view) {
+  return readViewDefinition(view, false);
+}
+
+async function validateViewDefinition(view, selectSql) {
   if (!db) throw new Error('No database initialized');
-  compileSingleStatement(`EXPLAIN SELECT * FROM (${normalizeViewSelectSql(selectSql)}\n) LIMIT 0`);
+  const body = normalizeViewSelectSql(selectSql);
+  const existingResult = db.exec(
+    "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+    [view]
+  );
+  const existingSql = existingResult[0]?.values?.[0]?.[0];
+  const columnListSql = typeof existingSql === 'string'
+    ? extractViewColumnListSql(existingSql)
+    : undefined;
+  const savepointName = createViewSavepointName('sp_validate_view');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    if (typeof existingSql === 'string') {
+      runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+    }
+    runSingleStatement(buildCreateViewSql(view, body, columnListSql));
+    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+    runSingleStatement(`ROLLBACK TO ${savepointName}`);
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (error) {
+    safeRollbackViewSavepoint(savepointName, 'validateViewDefinition');
+    throw error;
+  }
 }
 
 async function previewViewDefinition(_view, selectSql, limit = 50) {
@@ -885,7 +933,7 @@ async function editView(view, selectSql, preserveTriggers = true) {
 
 async function dropView(view) {
   if (!db) throw new Error('No database initialized');
-  const before = await getViewDefinition(view);
+  const before = await readViewDefinition(view, true);
   const savepointName = createViewSavepointName('sp_drop_view');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {

@@ -20,6 +20,7 @@ function getViewDefinitionErrorDetail(error: unknown): string {
 export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     readonly onDidChangeFile: vsc.Event<vsc.FileChangeEvent[]>;
     private _emitter = new vsc.EventEmitter<vsc.FileChangeEvent[]>();
+    private readonly viewDocumentMetadata = new Map<string, { ctime: number; mtime: number }>();
 
     constructor() {
         this.onDidChangeFile = this._emitter.event;
@@ -30,17 +31,25 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     }
 
     async stat(uri: vsc.Uri): Promise<vsc.FileStat> {
-        // Return generic file stat
         const { rowId } = this.parseUri(uri);
 
-        const now = Date.now();
-        const isDir = false; // Only files (cells) supported
+        if (rowId === '__view__.sql') {
+            const content = await this.readFile(uri);
+            const metadata = this.getViewDocumentMetadata(uri);
+            return {
+                type: vsc.FileType.File,
+                ctime: metadata.ctime,
+                mtime: metadata.mtime,
+                size: content.byteLength
+            };
+        }
 
+        const now = Date.now();
         return {
-            type: isDir ? vsc.FileType.Directory : vsc.FileType.File,
+            type: vsc.FileType.File,
             ctime: now,
             mtime: now,
-            size: 0, // Dynamic size
+            size: 0,
             permissions: rowId === '__create__.sql' ? vsc.FilePermission.Readonly : undefined
         };
     }
@@ -131,9 +140,9 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         }
 
         if (rowId === '__view__.sql') {
-            const selectSql = new TextDecoder('utf-8', { fatal: true }).decode(content);
             let result: ViewEditResult;
             try {
+                const selectSql = new TextDecoder('utf-8', { fatal: true }).decode(content);
                 result = await document.databaseOperations.editView(table, selectSql, true);
             } catch (err) {
                 const rawMessage = err instanceof Error ? err.message : String(err);
@@ -155,6 +164,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 viewDefBefore: result.before,
                 viewDefAfter: result.after
             });
+            this.markViewDocumentWritten(uri);
             this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
             return;
         }
@@ -243,5 +253,21 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         }
 
         return { document, table, rowId, column };
+    }
+
+    private getViewDocumentMetadata(uri: vsc.Uri): { ctime: number; mtime: number } {
+        const key = uri.toString();
+        let metadata = this.viewDocumentMetadata.get(key);
+        if (!metadata) {
+            const now = Date.now();
+            metadata = { ctime: now, mtime: now };
+            this.viewDocumentMetadata.set(key, metadata);
+        }
+        return metadata;
+    }
+
+    private markViewDocumentWritten(uri: vsc.Uri): void {
+        const metadata = this.getViewDocumentMetadata(uri);
+        metadata.mtime = Math.max(Date.now(), metadata.mtime + 1);
     }
 }

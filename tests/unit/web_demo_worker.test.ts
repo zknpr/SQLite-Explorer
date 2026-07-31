@@ -12,7 +12,7 @@ interface WorkerHarness {
     invoke(method: string, ...payload: unknown[]): Promise<any>;
 }
 
-async function createWorkerHarness(): Promise<WorkerHarness> {
+async function createWorkerHarness(options: { queryTimeout?: number; now?: () => number } = {}): Promise<WorkerHarness> {
     const source = readFileSync(
         path.resolve(process.cwd(), 'website/public/sqlite-viewer/worker.js'),
         'utf8'
@@ -34,6 +34,7 @@ async function createWorkerHarness(): Promise<WorkerHarness> {
         crypto: webcrypto,
         TextEncoder,
         TextDecoder,
+        Date: options.now ? { now: options.now } : Date,
         setTimeout,
         clearTimeout
     });
@@ -66,7 +67,11 @@ async function createWorkerHarness(): Promise<WorkerHarness> {
     const wasmBinary = new Uint8Array(readFileSync(
         path.resolve(process.cwd(), 'assets/sqlite3.wasm')
     ));
-    await invoke('initializeDatabase', 'test.db', { content: null, wasmBinary });
+    await invoke('initializeDatabase', 'test.db', {
+        content: null,
+        wasmBinary,
+        queryTimeout: options.queryTimeout
+    });
     return { invoke };
 }
 
@@ -105,6 +110,70 @@ describe('web demo view worker', () => {
         );
         assert.match(String(storedSql), /\(a, a\)/);
         assert.doesNotMatch(String(storedSql), /a:1/);
+    });
+
+    it('validates the CREATE VIEW construct and leaves the schema unchanged', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE VIEW validation_target (a, b) AS SELECT 1, 2');
+        const originalSql = await workerScalar(
+            worker,
+            "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'validation_target'"
+        );
+
+        await assert.rejects(
+            worker.invoke('validateViewDefinition', 'parameter_view', 'SELECT ? AS value'),
+            /parameters are not allowed in views/
+        );
+        await assert.rejects(
+            worker.invoke('validateViewDefinition', 'validation_target', 'SELECT 1'),
+            /expected 2 columns/
+        );
+
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'parameter_view'"
+        ), 0);
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'validation_target'"
+        ), originalSql);
+    });
+
+    it('bounds preview stepping with the configured query timeout', async () => {
+        let now = 0;
+        const worker = await createWorkerHarness({
+            queryTimeout: 5,
+            now: () => {
+                now += 10;
+                return now;
+            }
+        });
+
+        await assert.rejects(
+            worker.invoke('previewViewDefinition', 'slow_preview', 'SELECT 1 AS value', 10),
+            /Query execution timed out after 5ms/
+        );
+    });
+
+    it('drops a view whose stored SQL cannot be extracted for editing', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE VIEW opaque_view AS SELECT 1 AS value');
+        await worker.invoke('runQuery', 'PRAGMA writable_schema = ON');
+        await worker.invoke(
+            'runQuery',
+            "UPDATE sqlite_schema SET sql = 'opaque stored view text' " +
+            "WHERE type = 'view' AND name = 'opaque_view'"
+        );
+        await worker.invoke('runQuery', 'PRAGMA writable_schema = OFF');
+
+        const dropped = await worker.invoke('dropView', 'opaque_view');
+
+        assert.strictEqual(dropped.sql, 'opaque stored view text');
+        assert.strictEqual(dropped.selectSql, '');
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'opaque_view'"
+        ), 0);
     });
 
     it('recreates same-event triggers in schema order', async () => {

@@ -282,6 +282,64 @@ function executeSingleQuery(db, sql, params, requiredSuffix) {
   };
 }
 
+/** Execute one mutation only after the marked SQL proves it has no tail. */
+function executeSingleStatement(db, markedSql, sql, params, requiredSuffix) {
+  const validationStmt = db.prepare(markedSql);
+  try {
+    const preparedSql = typeof validationStmt.toString === 'function'
+      ? validationStmt.toString().trimEnd()
+      : '';
+    if (!requiredSuffix || !preparedSql.endsWith(requiredSuffix)) {
+      throw new Error('Exactly one SQL statement is required');
+    }
+  } finally {
+    if (typeof validationStmt.finalize === 'function') validationStmt.finalize();
+  }
+  return executeStatement(db, sql, params);
+}
+
+/**
+ * Read a generated SELECT one row at a time so preview work observes the
+ * configured elapsed-time bound. txiki's SQLite binding has no interrupt or
+ * step API, so one individual SQLite call can still overrun; progress-handler
+ * support is intentionally a follow-up.
+ */
+function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, limit, timeoutMs) {
+  const validationStmt = db.prepare(markedSql);
+  try {
+    const preparedSql = typeof validationStmt.toString === 'function'
+      ? validationStmt.toString().trimEnd()
+      : '';
+    if (!requiredSuffix || !preparedSql.endsWith(requiredSuffix)) {
+      throw new Error('Exactly one SQL statement is required');
+    }
+  } finally {
+    if (typeof validationStmt.finalize === 'function') validationStmt.finalize();
+  }
+
+  const values = [];
+  const startedAt = Date.now();
+  for (let offset = 0; offset < limit; offset++) {
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+    }
+    const stmt = db.prepare(`${sql} LIMIT 1 OFFSET ${offset}`);
+    let rows;
+    try {
+      rows = typeof stmt.all === 'function' ? stmt.all() : Array.from(stmt);
+    } finally {
+      if (typeof stmt.finalize === 'function') stmt.finalize();
+    }
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+    }
+    if (!rows || rows.length === 0) break;
+    values.push(columns.map(column => rows[0][column]));
+  }
+
+  return { columns, values, rowCount: values.length };
+}
+
 /**
  * Handle incoming RPC request.
  *
@@ -376,6 +434,21 @@ async function handleRequest(request) {
         break;
       }
 
+      case "queryBounded": {
+        const [markedSql, sql, requiredSuffix, columns, limit, timeoutMs] = args;
+        if (!db) throw new Error("Database not open");
+        result = executeBoundedQuery(
+          db,
+          markedSql,
+          sql,
+          requiredSuffix,
+          columns,
+          limit,
+          timeoutMs
+        );
+        break;
+      }
+
       case "queryBatch": {
         // Execute a batch of queries and return results for each
         // args: [queries: { sql: string, params?: any[] }[]]
@@ -459,6 +532,13 @@ async function handleRequest(request) {
             throw e;
         }
         console.error("[native-worker] DEBUG: run complete, changes:", result?.changes);
+        break;
+      }
+
+      case "runSingle": {
+        const [markedSql, sql, params, requiredSuffix] = args;
+        if (!db) throw new Error("Database not open");
+        result = executeSingleStatement(db, markedSql, sql, params, requiredSuffix);
         break;
       }
 

@@ -95,6 +95,8 @@ export function clearSelection() {
     state.selectedRowIds.clear();
     state.selectedColumns.clear();
     state.lastSelectedCell = null;
+    state.lastSelectedColumnIndex = null;
+    state.lastSelectedRowIndex = null;
 
     updateSelectionStates();
     updateToolbarButtons();

@@ -5,9 +5,10 @@ import { state } from './state.js';
 import { backendApi } from './api.js';
 import { validateRowId, formatCellValueAsText } from './utils.js';
 import { updateStatus } from './ui.js';
-import { updateSelectionStates, clearSelection } from './grid.js';
-import { getRowDataOffset, getCellValue } from './data-utils.js';
+import { updateSelectionStates, clearSelection } from './grid-selection.js';
+import { getRowDataOffset, getCellValue, getRowId } from './data-utils.js';
 import { BlobInspector } from './blob-inspector.js';
+import { handleTextareaTab } from './text-editor.js';
 
 let blobInspector;
 
@@ -22,6 +23,7 @@ export function initEdit() {
     document.getElementById('openInVsCodeBtn')?.addEventListener('click', openCellInVsCode);
     document.getElementById('btnCancelCellPreview')?.addEventListener('click', closeCellPreview);
     document.getElementById('cellPreviewSaveBtn')?.addEventListener('click', saveCellPreview);
+    document.getElementById('cellPreviewTextarea')?.addEventListener('keydown', onCellPreviewKeydown);
 }
 
 // ================================================================
@@ -107,8 +109,11 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
     setTimeout(() => { state.isTransitioningEdit = false; }, 100);
 }
 
-export function onCellInputKeydown(event) {
-    if (event.key === 'Enter' && !event.shiftKey) {
+export async function onCellInputKeydown(event) {
+    if (event.key === 'Tab') {
+        event.preventDefault();
+        await saveCellEditAndMove(event.shiftKey ? -1 : 1);
+    } else if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
         saveCellEdit();
     } else if (event.key === 'Escape') {
@@ -127,8 +132,8 @@ export function onCellInputBlur() {
 }
 
 export async function saveCellEdit() {
-    if (state.isSavingCell) return;
-    if (!state.editingCellInfo || !state.activeCellInput) return;
+    if (state.isSavingCell) return false;
+    if (!state.editingCellInfo || !state.activeCellInput) return false;
 
     const { rowIdx, colIdx, rowId, columnName, originalValue } = state.editingCellInfo;
     const newValue = state.activeCellInput.value;
@@ -139,7 +144,7 @@ export async function saveCellEdit() {
         state.selectedCells = [];
         state.lastSelectedCell = null;
         updateSelectionStates();
-        return;
+        return true;
     }
 
     const column = state.tableColumns[colIdx];
@@ -178,6 +183,7 @@ export async function saveCellEdit() {
         updateSelectionStates();
 
         updateStatus('Saved');
+        return true;
 
     } catch (err) {
         console.error('Save failed:', err);
@@ -185,9 +191,29 @@ export async function saveCellEdit() {
         let errorMessage = err.message || String(err);
         // ... error message formatting ...
         updateStatus(`Save failed: ${errorMessage}`);
+        return false;
     } finally {
         state.isSavingCell = false;
     }
+}
+
+async function saveCellEditAndMove(direction) {
+    if (!state.editingCellInfo) return;
+    const { rowIdx, colIdx } = state.editingCellInfo;
+    if (!await saveCellEdit()) return;
+
+    const rowCount = state.gridData.length;
+    const columnCount = state.tableColumns.length;
+    const cellCount = rowCount * columnCount;
+    if (cellCount === 0) return;
+
+    const currentIndex = rowIdx * columnCount + colIdx;
+    const nextIndex = (currentIndex + direction + cellCount) % cellCount;
+    const nextRowIdx = Math.floor(nextIndex / columnCount);
+    const nextColIdx = nextIndex % columnCount;
+    const nextRow = state.gridData[nextRowIdx];
+    if (!nextRow) return;
+    startCellEdit(nextRowIdx, nextColIdx, getRowId(nextRow, nextRowIdx));
 }
 
 export function cancelCellEdit() {
@@ -319,16 +345,17 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
 
     // Attach listener for char count
     textarea.oninput = updateCellPreviewCharCount;
-    // Keydown listener for shortcuts
-    textarea.onkeydown = (e) => {
-        if (e.key === 'Escape') {
-            e.preventDefault();
-            closeCellPreview();
-        } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-            e.preventDefault();
-            saveCellPreview();
-        }
-    };
+}
+
+export function onCellPreviewKeydown(event) {
+    if (handleTextareaTab(event)) return;
+    if (event.key === 'Escape') {
+        event.preventDefault();
+        closeCellPreview();
+    } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        saveCellPreview();
+    }
 }
 
 function updateCellPreviewCharCount() {

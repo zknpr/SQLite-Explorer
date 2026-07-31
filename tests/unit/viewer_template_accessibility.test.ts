@@ -20,4 +20,21 @@ describe('viewer template accessibility', () => {
             'toolbar filter input must expose a non-empty accessible name'
         );
     });
+
+    it('marks selection-dependent controls so click-away handling preserves the selection', () => {
+        const template = readFileSync(
+            path.resolve(process.cwd(), 'core/ui/viewer.template.html'),
+            'utf8'
+        );
+
+        for (const id of ['btnDeleteRows', 'btnExport', 'batchUpdateSectionTitle', 'batchUpdateList']) {
+            const element = template.match(new RegExp(`<[^>]+\\bid=["']${id}["'][^>]*>`, 'i'))?.[0];
+            assert.ok(element, `${id} must exist`);
+            assert.match(
+                element,
+                /\bdata-preserve-grid-selection(?:\s|=|>)/i,
+                `${id} must preserve the active grid selection`
+            );
+        }
+    });
 });

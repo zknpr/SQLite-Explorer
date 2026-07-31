@@ -1,7 +1,14 @@
 import './vscode_mock_setup';
 
-import { afterEach, describe, it } from 'node:test';
+import { after, afterEach, describe, it } from 'node:test';
 import assert from 'node:assert';
+
+const persistedStates: any[] = [];
+(globalThis as any).acquireVsCodeApi = () => ({
+    getState: () => undefined,
+    setState: (value: any) => persistedStates.push(value),
+    postMessage() {}
+});
 
 function createDeferred<T>() {
     let resolve!: (value: T) => void;
@@ -47,7 +54,7 @@ function installViewDocument() {
     const elements: Record<string, any> = {
         viewModalTitle: element(),
         viewNameInput: element(),
-        viewSelectSql: element(),
+        viewSelectSql: element({ id: 'viewSelectSql', selectionStart: 0, selectionEnd: 0, dispatchEvent() {} }),
         viewValidationStatus: element(),
         viewPreview: element(),
         viewTriggerOptions: element(),
@@ -60,6 +67,8 @@ function installViewDocument() {
         viewModal: element({
             querySelector() { return { focus() {} }; }
         }),
+        tableNameLabel: element(),
+        gridContainer: element({ innerHTML: '' }),
         statusText: element()
     };
     (globalThis as any).document = {
@@ -80,8 +89,13 @@ function installViewDocument() {
 }
 
 describe('view modal concurrency', () => {
+    after(() => {
+        delete (globalThis as any).acquireVsCodeApi;
+    });
+
     afterEach(() => {
         delete (globalThis as any).document;
+        persistedStates.length = 0;
     });
 
     it('ignores an older edit response that resolves after a newer view', async () => {
@@ -155,6 +169,207 @@ describe('view modal concurrency', () => {
         } finally {
             backendApi.validateViewDefinition = originalValidate;
             backendApi.createView = originalCreate;
+        }
+    });
+
+    it('keeps the external editor result when the same view modal is reopened', async () => {
+        const { elements } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const modalsModulePath = '../../core/ui/modules/modals.js';
+        const { backendApi } = await import(apiModulePath);
+        const { openEditViewModal } = await import(viewsModulePath);
+        const { closeModal } = await import(modalsModulePath);
+        const originalGet = backendApi.getViewDefinition;
+        let selectSql = 'SELECT quantity FROM inventory';
+        backendApi.getViewDefinition = async () => ({ selectSql, triggers: [] });
+
+        try {
+            await openEditViewModal('inventory_view');
+            assert.strictEqual(elements.viewSelectSql.value, selectSql);
+            closeModal('viewModal');
+
+            // The virtual SQL document was saved and the host refreshed schema/data.
+            selectSql = 'SELECT SUM(quantity) AS total FROM inventory';
+            await openEditViewModal('inventory_view');
+
+            assert.strictEqual(elements.viewNameInput.value, 'inventory_view');
+            assert.strictEqual(elements.viewSelectSql.value, selectSql);
+            assert.notStrictEqual(elements.viewSelectSql.value, '');
+            assert.strictEqual(elements.viewModal.classList.contains('hidden'), false);
+        } finally {
+            backendApi.getViewDefinition = originalGet;
+        }
+    });
+
+    it('uses Tab for SQL indentation without moving focus to modal buttons', async () => {
+        const { elements, listener } = installViewDocument();
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { initViews, openCreateViewModal } = await import(viewsModulePath);
+
+        initViews();
+        openCreateViewModal();
+        elements.viewSelectSql.value = 'SELECT\nvalue';
+        elements.viewSelectSql.selectionStart = 7;
+        elements.viewSelectSql.selectionEnd = 7;
+        let prevented = false;
+
+        listener('viewSelectSql', 'keydown')({
+            key: 'Tab',
+            shiftKey: false,
+            target: elements.viewSelectSql,
+            preventDefault() { prevented = true; }
+        });
+
+        assert.strictEqual(prevented, true);
+        assert.strictEqual(elements.viewSelectSql.value, 'SELECT\n    value');
+        assert.strictEqual(elements.viewSelectSql.selectionStart, 11);
+    });
+
+    it('does not let a pending save mutate a newer modal session', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const modalsModulePath = '../../core/ui/modules/modals.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openCreateViewModal, openEditViewModal } = await import(viewsModulePath);
+        const { closeModal } = await import(modalsModulePath);
+        const validation = createDeferred<void>();
+        const originalGet = backendApi.getViewDefinition;
+        const originalValidate = backendApi.validateViewDefinition;
+        const originalEdit = backendApi.editView;
+        const originalCreate = backendApi.createView;
+        let editCalls = 0;
+        let createCalls = 0;
+        backendApi.getViewDefinition = async () => ({ selectSql: 'SELECT 1 AS a', triggers: [] });
+        backendApi.validateViewDefinition = async () => validation.promise;
+        backendApi.editView = async () => { editCalls++; };
+        backendApi.createView = async () => { createCalls++; };
+        state.isReadOnly = false;
+
+        try {
+            initViews();
+            await openEditViewModal('view_a');
+            elements.viewSelectSql.value = 'SELECT 2 AS a';
+            const pendingSave = listener('btnSaveView', 'click')();
+            await Promise.resolve();
+
+            closeModal('viewModal');
+            openCreateViewModal();
+            elements.viewNameInput.value = 'view_b';
+            elements.viewSelectSql.value = 'SELECT 3 AS b';
+            validation.resolve();
+            await pendingSave;
+
+            assert.strictEqual(editCalls, 0);
+            assert.strictEqual(createCalls, 0);
+            assert.strictEqual(elements.viewNameInput.value, 'view_b');
+            assert.strictEqual(elements.viewSelectSql.value, 'SELECT 3 AS b');
+            assert.strictEqual(elements.viewModal.classList.contains('hidden'), false);
+        } finally {
+            backendApi.getViewDefinition = originalGet;
+            backendApi.validateViewDefinition = originalValidate;
+            backendApi.editView = originalEdit;
+            backendApi.createView = originalCreate;
+        }
+    });
+
+    it('clears positional selection before reloading an edited selected view', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openEditViewModal } = await import(viewsModulePath);
+        const originals = {
+            get: backendApi.getViewDefinition,
+            validate: backendApi.validateViewDefinition,
+            edit: backendApi.editView,
+            info: backendApi.getTableInfo
+        };
+        let selectionWasClearedAtReload = false;
+        backendApi.getViewDefinition = async () => ({ selectSql: 'SELECT 1 AS a', triggers: [] });
+        backendApi.validateViewDefinition = async () => undefined;
+        backendApi.editView = async () => ({});
+        backendApi.getTableInfo = async () => {
+            selectionWasClearedAtReload = state.selectedCells.length === 0
+                && state.selectedRowIds.size === 0
+                && state.selectedColumns.size === 0
+                && state.lastSelectedCell === null
+                && state.lastSelectedColumnIndex === null
+                && state.lastSelectedRowIndex === null;
+            state.selectedTable = null;
+            return [];
+        };
+        state.isReadOnly = false;
+        state.isDbConnected = false;
+        state.selectedTable = 'selected_view';
+        state.selectedTableType = 'view';
+        state.gridData = [[1]];
+        state.selectedCells = [{ rowIdx: 0, colIdx: 0, rowId: 0, value: 1 }];
+        state.selectedRowIds = new Set([0]);
+        state.selectedColumns = new Set(['a']);
+        state.lastSelectedCell = { rowIdx: 0, colIdx: 0 };
+        state.lastSelectedColumnIndex = 0;
+        state.lastSelectedRowIndex = 0;
+
+        try {
+            initViews();
+            await openEditViewModal('selected_view');
+            elements.viewSelectSql.value = 'SELECT 2 AS b';
+            await listener('btnSaveView', 'click')();
+            assert.strictEqual(selectionWasClearedAtReload, true);
+        } finally {
+            backendApi.getViewDefinition = originals.get;
+            backendApi.validateViewDefinition = originals.validate;
+            backendApi.editView = originals.edit;
+            backendApi.getTableInfo = originals.info;
+            state.selectedTable = null;
+        }
+    });
+
+    it('persists the cleared selection after dropping the displayed view', async () => {
+        const { elements } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { dropViewFromSidebar } = await import(viewsModulePath);
+        const originalDrop = backendApi.dropView;
+        const originalSetTimeout = globalThis.setTimeout;
+        const originalClearTimeout = globalThis.clearTimeout;
+        let persistCallback: (() => void) | undefined;
+        backendApi.dropView = async () => ({});
+        (globalThis as any).setTimeout = (callback: () => void) => {
+            persistCallback = callback;
+            return 1;
+        };
+        (globalThis as any).clearTimeout = () => undefined;
+        state.isReadOnly = false;
+        state.isDbConnected = false;
+        state.selectedTable = 'dropped_view';
+        state.selectedTableType = 'view';
+        state.selectedColumns = new Set(['stale']);
+
+        try {
+            await dropViewFromSidebar('dropped_view');
+            assert.ok(persistCallback, 'dropping the selected view should schedule state persistence');
+            persistCallback();
+
+            assert.strictEqual(elements.tableNameLabel.textContent, 'No table selected');
+            assert.ok(persistedStates.at(-1));
+            assert.strictEqual(persistedStates.at(-1).selectedTable, null);
+            assert.strictEqual(persistedStates.at(-1).selectedTableType, 'table');
+            assert.deepStrictEqual(persistedStates.at(-1).selectedColumns, []);
+        } finally {
+            backendApi.dropView = originalDrop;
+            globalThis.setTimeout = originalSetTimeout;
+            globalThis.clearTimeout = originalClearTimeout;
+            state.selectedTable = null;
         }
     });
 });

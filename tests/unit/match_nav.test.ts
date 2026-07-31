@@ -68,4 +68,35 @@ describe('filter match navigation', () => {
         assert.strictEqual(formatCellValueAsText(fullValue).endsWith('...'), true);
         assert.strictEqual(formatCellValueAsText(fullValue, null, 'raw', null, false), fullValue);
     });
+
+    it('matches the stored date value when display formatting changes its text', async () => {
+        const cell = {
+            classList: createClassList(),
+            scrollIntoView() {}
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cell-0-0') return cell;
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.tableColumns = [{ name: 'created_at', type: 'DATETIME' }];
+        state.gridData = [['2024-01-15 12:34:56']];
+        state.dateFormat = 'relative';
+        state.filterQuery = '2024-01-15';
+        state.columnFilters = {};
+        resetMatchNav();
+
+        navigateMatches('global');
+
+        assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
+        assert.strictEqual(cell.classList.contains('active-match-cell'), true);
+    });
 });

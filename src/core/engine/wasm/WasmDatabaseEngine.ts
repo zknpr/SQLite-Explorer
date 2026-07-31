@@ -354,6 +354,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       case 'view_drop':
         if (mod.viewDefBefore) {
           await this.restoreViewDefinition(mod.viewDefBefore);
+        } else {
+          console.warn('[WasmDatabaseEngine] Skipping view undo: definition missing from history entry');
         }
         break;
     }
@@ -913,7 +915,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /** Read a view and every INSTEAD OF trigger SQLite associates with it. */
-  async getViewDefinition(view: string): Promise<ViewDefinition> {
+  private async readViewDefinition(view: string, allowUnparsed: boolean): Promise<ViewDefinition> {
     const viewResult = await this.executeQuery(
       "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
       [view]
@@ -934,19 +936,55 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       return { identifier: row[0], sql: row[1] };
     });
 
-    const selectSql = extractViewSelectSql(createSql);
+    let selectSql: string;
+    let columnListSql: string | undefined;
+    try {
+      selectSql = extractViewSelectSql(createSql);
+      columnListSql = extractViewColumnListSql(createSql);
+    } catch (err) {
+      if (!allowUnparsed) throw err;
+      // Dropping depends only on the schema object name. Preserve opaque raw SQL
+      // for history and let SQLite remain authoritative if it is replayed.
+      selectSql = '';
+    }
     return {
       identifier: view,
       sql: createSql,
       selectSql,
-      columnListSql: extractViewColumnListSql(createSql),
+      columnListSql,
       triggers
     };
   }
 
-  async validateViewDefinition(_view: string, selectSql: string): Promise<void> {
+  async getViewDefinition(view: string): Promise<ViewDefinition> {
+    return this.readViewDefinition(view, false);
+  }
+
+  async validateViewDefinition(view: string, selectSql: string): Promise<void> {
     const body = normalizeViewSelectSql(selectSql);
-    this.compileViewSelect(body);
+    const existingResult = await this.executeQuery(
+      "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+      [view]
+    );
+    const existingSql = existingResult[0]?.rows[0]?.[0];
+    const columnListSql = typeof existingSql === 'string'
+      ? extractViewColumnListSql(existingSql)
+      : undefined;
+    const savepointName = this.createSavepointName('sp_validate_view');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      if (typeof existingSql === 'string') {
+        this.runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+      }
+      this.runSingleStatement(buildCreateViewSql(view, body, columnListSql));
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+      // Successful validation is deliberately non-mutating.
+      await this.executeQuery(`ROLLBACK TO ${savepointName}`);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'validateViewDefinition');
+      throw err;
+    }
   }
 
   async previewViewDefinition(_view: string, selectSql: string, limit: number = 50): Promise<QueryResultSet> {
@@ -997,7 +1035,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   async dropView(view: string): Promise<ViewDefinition> {
-    const before = await this.getViewDefinition(view);
+    const before = await this.readViewDefinition(view, true);
     const savepointName = this.createSavepointName('sp_drop_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
@@ -1016,8 +1054,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
   /** Restore an exact tracked view state for undo, redo, and hot-exit replay. */
   private async restoreViewDefinition(definition: ViewDefinition): Promise<void> {
-    const body = normalizeViewSelectSql(definition.selectSql);
-    this.compileViewSelect(body);
     const savepointName = this.createSavepointName('sp_restore_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {

@@ -5,6 +5,7 @@ import assert from 'node:assert';
 import { SQLiteFileSystemProvider } from '../../src/virtualFileSystem';
 import { DocumentRegistry } from '../../src/documentRegistry';
 import type { DatabaseDocument } from '../../src/databaseModel';
+import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import * as vscode from 'vscode';
 
 describe('SQLiteFileSystemProvider', () => {
@@ -336,6 +337,55 @@ describe('SQLiteFileSystemProvider', () => {
             });
         });
 
+        it('keeps view document metadata coherent across the VS Code save protocol', async () => {
+            const engineResult = await createDatabaseEngine({
+                content: null,
+                maxSize: 0,
+                readOnlyMode: false
+            });
+            const engine = engineResult.operations!;
+            await engine.executeQuery('CREATE TABLE inventory (quantity INTEGER)');
+            await engine.createView('inventory_rollup', 'SELECT MAX(quantity) AS total FROM inventory');
+            setupMockDocument(docKey, engine);
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/inventory_rollup/group/__view__.sql/definition.sql`
+            );
+            const changedEvents: vscode.FileChangeEvent[][] = [];
+            const subscription = provider.onDidChangeFile(events => changedEvents.push(events));
+
+            try {
+                // VS Code stats before saving, then stats and re-reads after the
+                // Changed event. Metadata must describe the content it will read,
+                // and timestamps must stay stable until an actual write occurs.
+                const before = await provider.stat(uri);
+                const beforeAgain = await provider.stat(uri);
+                assert.strictEqual(before.size, 'SELECT MAX(quantity) AS total FROM inventory'.length);
+                assert.strictEqual(beforeAgain.mtime, before.mtime);
+
+                const saved = new TextEncoder().encode(
+                    'SELECT SUM(quantity) AS total FROM inventory;\n'
+                );
+                await provider.writeFile(uri, saved, { create: false, overwrite: true });
+
+                assert.strictEqual(changedEvents.length, 1);
+                assert.strictEqual(changedEvents[0][0].type, vscode.FileChangeType.Changed);
+                const after = await provider.stat(uri);
+                const reread = await provider.readFile(uri);
+                const afterAgain = await provider.stat(uri);
+                const rereadText = new TextDecoder().decode(reread);
+
+                assert.strictEqual(rereadText, 'SELECT SUM(quantity) AS total FROM inventory');
+                assert.notStrictEqual(rereadText, '');
+                assert.strictEqual(after.size, reread.byteLength);
+                assert.ok(after.mtime > before.mtime);
+                assert.strictEqual(afterAgain.mtime, after.mtime);
+                assert.strictEqual(afterAgain.size, after.size);
+            } finally {
+                subscription.dispose();
+                (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+
         it('keeps a rejected view edit dirty and reports the SQLite error clearly', async () => {
             const sqliteError = '[query] SQLite error 1: near "MAX": syntax error';
             const dbOps = {
@@ -369,6 +419,38 @@ describe('SQLiteFileSystemProvider', () => {
                 'Invalid view definition: near "MAX": syntax error. The view was not modified.'
             );
             assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 0);
+        });
+
+        it('maps invalid UTF-8 in a view document to the clean dirty-buffer error path', async () => {
+            const dbOps = {
+                editView: mock.fn(async () => {
+                    throw new Error('editView must not be called for invalid UTF-8');
+                })
+            };
+            const doc = setupMockDocument(docKey, dbOps);
+            const showErrorMessage = mock.method(vscode.window, 'showErrorMessage');
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/product_inventory/group/__view__.sql/definition.sql`
+            );
+
+            await assert.rejects(
+                provider.writeFile(uri, new Uint8Array([0xff, 0xfe]), {
+                    create: false,
+                    overwrite: true
+                }),
+                (error: Error) => {
+                    assert.strictEqual(
+                        error.message,
+                        'Invalid view definition. The view was not modified.'
+                    );
+                    return true;
+                }
+            );
+
+            assert.strictEqual(dbOps.editView.mock.callCount(), 0);
+            assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 0);
+            assert.strictEqual(showErrorMessage.mock.callCount(), 1);
+            assert.match(String(showErrorMessage.mock.calls[0].arguments[0]), /The view was not modified\.$/);
         });
     });
 
@@ -409,11 +491,14 @@ describe('SQLiteFileSystemProvider', () => {
 
         it('stat keeps __view__.sql writable', async () => {
             const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/__view__.sql/definition.sql`);
-            setupMockDocument(docKey, {});
+            setupMockDocument(docKey, {
+                getViewDefinition: async () => ({ selectSql: 'SELECT 1' })
+            });
 
             const s = await provider.stat(uri);
 
             assert.strictEqual(s.permissions, undefined);
+            assert.strictEqual(s.size, 'SELECT 1'.length);
         });
 
         it('watch should return a generic Disposable', async () => {

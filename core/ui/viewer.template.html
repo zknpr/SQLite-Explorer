@@ -58,12 +58,12 @@
                 <ul class="item-list hidden" id="indexesList"></ul>
 
                 <!-- Batch Update Section -->
-                <div class="section-title hidden" id="batchUpdateSectionTitle" data-section="batchUpdate">
+                <div class="section-title hidden" id="batchUpdateSectionTitle" data-section="batchUpdate" data-preserve-grid-selection>
                     <span class="arrow">▼</span>
                     <span>Batch Update</span>
                     <span class="badge" id="batchUpdateCount">0</span>
                 </div>
-                <div class="item-list hidden" id="batchUpdateList">
+                <div class="item-list hidden" id="batchUpdateList" data-preserve-grid-selection>
                     <div class="batch-update-container">
                         <button type="button" class="btn-primary batch-update-btn" id="btnApplyBatchUpdate">Apply Changes</button>
                         <div id="batchUpdateFields"></div>
@@ -97,10 +97,10 @@
                     <button type="button" class="toolbar-button" id="btnAddColumn" disabled>
                         <span class="codicon codicon-insert"></span> Add Column
                     </button>
-                    <button type="button" class="toolbar-button" id="btnDeleteRows" disabled>
+                    <button type="button" class="toolbar-button" id="btnDeleteRows" data-preserve-grid-selection disabled>
                         <span class="codicon codicon-trash"></span> Delete
                     </button>
-                    <button type="button" class="toolbar-button" id="btnExport" disabled>
+                    <button type="button" class="toolbar-button" id="btnExport" data-preserve-grid-selection disabled>
                         <span class="codicon codicon-export"></span> Export
                     </button>
                     <div class="filter-group">

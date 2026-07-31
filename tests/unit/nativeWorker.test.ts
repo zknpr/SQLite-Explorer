@@ -219,7 +219,8 @@ describe('createNativeDatabaseConnection', () => {
 
     async function createRecordingConnection(
         respondToCall?: RecordedNativeResponder,
-        outputChannel?: vscode.OutputChannel
+        outputChannel?: vscode.OutputChannel,
+        queryTimeout: number = 30000
     ): Promise<{
         databaseOps: DatabaseOperations;
         calls: RecordedNativeCall[];
@@ -229,7 +230,12 @@ describe('createNativeDatabaseConnection', () => {
         mock.method(child_process, 'spawn', () => createRecordingNativeProcess(calls, respondToCall));
 
         const { createNativeDatabaseConnection } = require('../../src/nativeWorker');
-        const bundle = await createNativeDatabaseConnection({ fsPath: tempDir } as any, undefined, outputChannel);
+        const bundle = await createNativeDatabaseConnection(
+            { fsPath: tempDir } as any,
+            undefined,
+            outputChannel,
+            queryTimeout
+        );
         const connection = await bundle.establishConnection({ fsPath: '/db/path.sqlite' } as any, 'TestDB');
 
         return {
@@ -654,12 +660,18 @@ describe('createNativeDatabaseConnection', () => {
     it('terminates line-comment view bodies before native wrapped compile and preview queries', async () => {
         const body = 'SELECT MAX(quantity) AS m FROM inventory -- rollup of stock';
         const connection = await createRecordingConnection(call => {
-            if (call.method === 'query' || call.method === 'querySingle') {
+            if (call.method === 'query') {
                 const sql = String(call.args[0]);
-                if (sql.startsWith('SELECT * FROM')) {
-                    return { result: { columns: ['m'], values: [[9]] } };
+                if (sql.startsWith('PRAGMA table_info')) {
+                    return { result: { columns: ['cid', 'name'], values: [[0, 'm']] } };
                 }
                 return { result: { columns: [], values: [] } };
+            }
+            if (call.method === 'querySingle') {
+                return { result: { columns: [], values: [] } };
+            }
+            if (call.method === 'queryBounded') {
+                return { result: { columns: ['m'], values: [[9]] } };
             }
             return { result: { changes: 1, lastInsertRowId: 1 } };
         });
@@ -676,17 +688,112 @@ describe('createNativeDatabaseConnection', () => {
 
             assert.deepStrictEqual(preview.headers, ['m']);
             assert.deepStrictEqual(preview.rows, [[9]]);
-            const wrappedQueries = connection.calls
-                .filter(call => call.method === 'querySingle');
-            assert.strictEqual(wrappedQueries.length, 2);
-            assert.ok(String(wrappedQueries[0].args[0]).startsWith(
-                `EXPLAIN SELECT * FROM (${body}\n) LIMIT 0\n/*sqlite_explorer_boundary_`
-            ));
-            assert.ok(String(wrappedQueries[1].args[0]).startsWith(
-                `SELECT * FROM (${body}\n) LIMIT 10\n/*sqlite_explorer_boundary_`
-            ));
-            assert.strictEqual(wrappedQueries[0].args[2], String(wrappedQueries[0].args[0]).split('\n').at(-1));
-            assert.strictEqual(wrappedQueries[1].args[2], String(wrappedQueries[1].args[0]).split('\n').at(-1));
+            const createCalls = connection.calls.filter(call => call.method === 'runSingle');
+            assert.strictEqual(createCalls.length, 2);
+            assert.ok(String(createCalls[0].args[0]).includes(`${body}\n/*sqlite_explorer_boundary_`));
+            assert.ok(String(createCalls[1].args[0]).includes(`${body}\n/*sqlite_explorer_boundary_`));
+            assert.strictEqual(createCalls[0].args[3], String(createCalls[0].args[0]).split('\n').at(-1));
+            assert.strictEqual(createCalls[1].args[3], String(createCalls[1].args[0]).split('\n').at(-1));
+            assert.strictEqual(connection.calls.filter(call => call.method === 'queryBounded').length, 1);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('validates with the disposable CREATE VIEW and rolls it back on rejection', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                return { result: { columns: ['sql'], values: [] } };
+            }
+            if (call.method === 'runSingle' && String(call.args[1]).includes('SELECT ? AS value')) {
+                return { error: 'parameters are not allowed in views' };
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.validateViewDefinition('parameter_view', 'SELECT ? AS value'),
+                /parameters are not allowed in views/
+            );
+
+            const calls = connection.calls.map(call => ({
+                method: call.method,
+                sql: String(call.method === 'runSingle' ? call.args[1] : call.args[0])
+            }));
+            assert.match(calls[1].sql, /^SAVEPOINT "sp_validate_view_/);
+            assert.strictEqual(calls[2].method, 'runSingle');
+            assert.match(calls[2].sql, /^CREATE VIEW "parameter_view" AS SELECT \? AS value$/);
+            assert.match(calls[3].sql, /^ROLLBACK TO "sp_validate_view_/);
+            assert.match(calls[4].sql, /^RELEASE "sp_validate_view_/);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('returns preview metadata for zero rows and duplicate aliases', async () => {
+        let currentBody = '';
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'runSingle') {
+                currentBody = String(call.args[1]);
+            }
+            if (call.method === 'querySingle') {
+                return { result: { columns: [], values: [] } };
+            }
+            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA table_info')) {
+                return {
+                    result: {
+                        columns: ['cid', 'name'],
+                        values: [[0, 'x'], [1, 'x:1']]
+                    }
+                };
+            }
+            if (call.method === 'queryBounded') {
+                const values = currentBody.includes('WHERE 0') ? [] : [[1, 2]];
+                return { result: { columns: ['x', 'x:1'], values } };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            const empty = await connection.databaseOps.previewViewDefinition(
+                'preview_empty',
+                'SELECT 1 AS x, 2 AS x WHERE 0',
+                10
+            );
+            assert.deepStrictEqual(empty.headers, ['x', 'x:1']);
+            assert.deepStrictEqual(empty.rows, []);
+
+            const duplicate = await connection.databaseOps.previewViewDefinition(
+                'preview_duplicate',
+                'SELECT 1 AS x, 2 AS x',
+                10
+            );
+            assert.deepStrictEqual(duplicate.headers, ['x', 'x:1']);
+            assert.deepStrictEqual(duplicate.rows, [[1, 2]]);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('propagates the configured timeout through the native preview query', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA table_info')) {
+                return { result: { columns: ['cid', 'name'], values: [[0, 'value']] } };
+            }
+            if (call.method === 'queryBounded') {
+                assert.strictEqual(call.args[5], 25);
+                return { error: 'Query execution timed out after 25ms' };
+            }
+            return { result: { columns: [], values: [] } };
+        }, undefined, 25);
+
+        try {
+            await assert.rejects(
+                connection.databaseOps.previewViewDefinition('slow_preview', 'SELECT 1', 10),
+                /Query execution timed out after 25ms/
+            );
         } finally {
             connection.dispose();
         }
@@ -702,7 +809,7 @@ describe('createNativeDatabaseConnection', () => {
         const warnMock = mock.method(console, 'warn', () => {});
         const connection = await createRecordingConnection(call => {
             const sql = String(call.args[0]);
-            if (call.method === 'run' && sql.startsWith('CREATE VIEW')) {
+            if (call.method === 'runSingle' && String(call.args[1]).startsWith('CREATE VIEW')) {
                 return { error: 'create failed' };
             }
             if (call.method === 'run' && sql.startsWith('ROLLBACK TO')) {
@@ -725,15 +832,11 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
-    it('uses a prepared single-query path for a preview with a smuggled trailing statement', async () => {
-        let sentinelExists = true;
+    it('rejects a preview with a smuggled trailing statement before querying it', async () => {
         const body = 'SELECT 1) LIMIT 1; DROP TABLE preview_sentinel; --';
         const connection = await createRecordingConnection(call => {
-            if (call.method === 'query' && String(call.args[0]).startsWith('SELECT * FROM')) {
-                sentinelExists = false;
-            }
-            if (call.method === 'querySingle') {
-                return { result: { columns: ['value'], values: [[1]] } };
+            if (call.method === 'runSingle' && String(call.args[1]).includes('DROP TABLE')) {
+                return { error: 'Exactly one SQL statement is required' };
             }
             return { result: { columns: [], values: [] } };
         });
@@ -741,13 +844,12 @@ describe('createNativeDatabaseConnection', () => {
         try {
             connection.calls.length = 0;
 
-            await connection.databaseOps.previewViewDefinition('unsafe_preview', body, 10);
+            await assert.rejects(
+                connection.databaseOps.previewViewDefinition('unsafe_preview', body, 10),
+                /Exactly one SQL statement is required/
+            );
 
-            assert.strictEqual(sentinelExists, true);
-            const previewCall = connection.calls.find(call => (
-                String(call.args[0]).startsWith('SELECT * FROM')
-            ));
-            assert.strictEqual(previewCall?.method, 'querySingle');
+            assert.strictEqual(connection.calls.some(call => call.method === 'queryBounded'), false);
         } finally {
             connection.dispose();
         }
@@ -778,8 +880,8 @@ describe('createNativeDatabaseConnection', () => {
                     }
                 };
             }
-            if (call.method === 'run') {
-                const sql = String(call.args[0]);
+            if (call.method === 'runSingle') {
+                const sql = String(call.args[1]);
                 if (sql.startsWith('CREATE VIEW "duplicate names"')) {
                     currentViewSql = sql;
                 }
@@ -793,13 +895,95 @@ describe('createNativeDatabaseConnection', () => {
             await connection.databaseOps.editView('duplicate names', 'SELECT 3, 4', true);
 
             const createCall = connection.calls.find(call => (
-                call.method === 'run'
-                && String(call.args[0]).startsWith('CREATE VIEW "duplicate names"')
+                call.method === 'runSingle'
+                && String(call.args[1]).startsWith('CREATE VIEW "duplicate names"')
             ));
             assert.strictEqual(
-                createCall?.args[0],
+                createCall?.args[1],
                 'CREATE VIEW "duplicate names" (a, a) AS SELECT 3, 4'
             );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rejects a stored view replay tail through the checked native path', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'runSingle') {
+                return { error: 'Exactly one SQL statement is required' };
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            await assert.rejects(
+                connection.databaseOps.undoModification({
+                    modificationType: 'view_drop',
+                    description: 'restore crafted view',
+                    targetTable: 'crafted_view',
+                    viewDefBefore: {
+                        identifier: 'crafted_view',
+                        sql: 'CREATE VIEW crafted_view AS SELECT 1; DROP TABLE sentinel',
+                        selectSql: '',
+                        triggers: []
+                    }
+                }),
+                /Exactly one SQL statement is required/
+            );
+            const replay = connection.calls.find(call => call.method === 'runSingle');
+            assert.strictEqual(
+                replay?.args[1],
+                'CREATE VIEW crafted_view AS SELECT 1; DROP TABLE sentinel'
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('drops a native view even when its stored SQL is not editable', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryBatch') {
+                return {
+                    result: {
+                        results: [
+                            { columns: ['sql'], values: [['opaque stored view text']] },
+                            { columns: ['name', 'sql'], values: [] }
+                        ]
+                    }
+                };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            const dropped = await connection.databaseOps.dropView('opaque_view');
+            assert.strictEqual(dropped.sql, 'opaque stored view text');
+            assert.strictEqual(dropped.selectSql, '');
+            assert.ok(connection.calls.some(call => (
+                call.method === 'run' && call.args[0] === 'DROP VIEW "opaque_view"'
+            )));
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('logs a missing native view definition while preserving undo no-op behavior', async () => {
+        const outputLines: string[] = [];
+        const outputChannel = {
+            appendLine(line: string) {
+                outputLines.push(line);
+            }
+        } as unknown as vscode.OutputChannel;
+        const connection = await createRecordingConnection(undefined, outputChannel);
+        try {
+            await connection.databaseOps.undoModification({
+                modificationType: 'view_edit',
+                description: 'legacy edit',
+                targetTable: 'legacy_view'
+            });
+            assert.deepStrictEqual(outputLines, [
+                '[NativeWorker] Skipping view undo: definition missing from history entry'
+            ]);
         } finally {
             connection.dispose();
         }
@@ -840,15 +1024,15 @@ describe('createNativeDatabaseConnection', () => {
                     }
                 };
             }
-            if (call.method === 'query') {
+            if (call.method === 'querySingle') {
                 const [sql] = call.args as [string];
                 if (sql.startsWith('EXPLAIN')) {
                     return { result: { columns: [], values: [] } };
                 }
             }
 
-            if (call.method === 'run') {
-                const [sql] = call.args as [string];
+            if (call.method === 'run' || call.method === 'runSingle') {
+                const sql = String(call.method === 'run' ? call.args[0] : call.args[1]);
                 if (sql === 'DROP VIEW "user names"') {
                     triggerPresent = false;
                 } else if (sql.startsWith('CREATE VIEW "user names" ')) {
@@ -878,8 +1062,8 @@ describe('createNativeDatabaseConnection', () => {
             );
 
             const runSql = connection.calls
-                .filter(call => call.method === 'run')
-                .map(call => (call.args as [string])[0]);
+                .filter(call => call.method === 'run' || call.method === 'runSingle')
+                .map(call => String(call.method === 'run' ? call.args[0] : call.args[1]));
             assert.match(runSql[0], /^SAVEPOINT "sp_edit_view_/);
             assert.strictEqual(runSql[1], 'DROP VIEW "user names"');
             assert.strictEqual(
@@ -903,16 +1087,18 @@ describe('createNativeDatabaseConnection', () => {
             assert.ok(triggerQueries.every(query => query.sql.endsWith('ORDER BY rowid')));
 
             const createIndex = connection.calls.findIndex(call => (
-                call.method === 'run'
-                && String(call.args[0]).startsWith('CREATE VIEW "user names" ')
+                call.method === 'runSingle'
+                && String(call.args[1]).startsWith('CREATE VIEW "user names" ')
             ));
             const releaseIndex = connection.calls.findIndex(call => (
                 call.method === 'run'
                 && String(call.args[0]).startsWith('RELEASE "sp_edit_view_')
             ));
             const replacementExplainIndex = connection.calls.findIndex(call => (
-                call.method === 'query'
-                && call.args[0] === 'EXPLAIN SELECT * FROM "user names"'
+                call.method === 'querySingle'
+                && String(call.args[0]).startsWith(
+                    'EXPLAIN SELECT * FROM "user names"\n/*sqlite_explorer_boundary_'
+                )
             ));
             assert.ok(createIndex >= 0);
             assert.ok(replacementExplainIndex > createIndex);
@@ -952,6 +1138,10 @@ describe('NativeWorkerProcess', () => {
 });
 
 describe('native querySingle worker handler', () => {
+    afterEach(() => {
+        mock.restoreAll();
+    });
+
     it('rejects a preview tail before stepping the prepared statement', () => {
         const source = fs.readFileSync(
             path.resolve(process.cwd(), 'natives', 'native-worker.js'),
@@ -992,6 +1182,91 @@ describe('native querySingle worker handler', () => {
             /Exactly one SQL statement is required/
         );
         assert.strictEqual(stepped, false);
+        assert.strictEqual(finalized, true);
+    });
+
+    it('checks elapsed time while reading a native preview row-by-row', () => {
+        const source = fs.readFileSync(
+            path.resolve(process.cwd(), 'natives', 'native-worker.js'),
+            'utf8'
+        );
+        const functionSource = source.match(
+            /function executeBoundedQuery\(db, markedSql, sql, requiredSuffix, columns, limit, timeoutMs\) \{[\s\S]*?^\}/m
+        )?.[0];
+        assert.ok(functionSource, 'native worker must define executeBoundedQuery');
+        const executeBoundedQuery = Function(`"use strict"; return (${functionSource});`)();
+        const boundary = '/*sqlite_explorer_boundary_test*/';
+        let finalized = 0;
+        let rowQueries = 0;
+        const database = {
+            prepare(sql: string) {
+                if (sql.endsWith(boundary)) {
+                    return {
+                        toString: () => sql,
+                        finalize() { finalized++; }
+                    };
+                }
+                return {
+                    all() {
+                        rowQueries++;
+                        return [{ value: 1 }];
+                    },
+                    finalize() { finalized++; }
+                };
+            }
+        };
+        const times = [0, 1, 10];
+        mock.method(Date, 'now', () => times.shift() ?? 10);
+
+        assert.throws(
+            () => executeBoundedQuery(
+                database,
+                `SELECT * FROM preview\n${boundary}`,
+                'SELECT * FROM preview',
+                boundary,
+                ['value'],
+                10,
+                5
+            ),
+            /Query execution timed out after 5ms/
+        );
+        assert.strictEqual(rowQueries, 1);
+        assert.strictEqual(finalized, 2);
+    });
+
+    it('rejects a stored mutation tail before executing the original SQL', () => {
+        const source = fs.readFileSync(
+            path.resolve(process.cwd(), 'natives', 'native-worker.js'),
+            'utf8'
+        );
+        const functionSource = source.match(
+            /function executeSingleStatement\(db, markedSql, sql, params, requiredSuffix\) \{[\s\S]*?^\}/m
+        )?.[0];
+        assert.ok(functionSource, 'native worker must define executeSingleStatement');
+        const executeSingleStatement = Function(`"use strict"; return (${functionSource});`)();
+        let finalized = false;
+        let prepareCalls = 0;
+        const database = {
+            prepare() {
+                prepareCalls++;
+                return {
+                    toString: () => 'CREATE VIEW crafted AS SELECT 1;',
+                    finalize() { finalized = true; }
+                };
+            }
+        };
+
+        assert.throws(
+            () => executeSingleStatement(
+                database,
+                'CREATE VIEW crafted AS SELECT 1; DROP TABLE sentinel\n/*boundary*/',
+                'CREATE VIEW crafted AS SELECT 1; DROP TABLE sentinel',
+                undefined,
+                '/*boundary*/'
+            ),
+            /Exactly one SQL statement is required/
+        );
+        assert.strictEqual(prepareCalls, 1);
         assert.strictEqual(finalized, true);
     });
 });

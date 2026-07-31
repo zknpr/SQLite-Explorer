@@ -1,16 +1,17 @@
 /**
  * View creation, validation, preview, editing, and deletion UI.
  */
-import { state } from './state.js';
+import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
 import { openModal, closeModal } from './modals.js';
 import { refreshSchema } from './sidebar.js';
-import { loadTableColumns, loadTableData } from './grid.js';
+import { clearSelection, loadTableColumns, loadTableData } from './grid.js';
 import { showEmptyState, updateStatus, updateToolbarButtons } from './ui.js';
 import { formatCellValueAsText } from './utils.js';
+import { handleTextareaTab } from './text-editor.js';
 
 let editingViewName = null;
-let activeViewLoadToken = 0;
+let activeViewModalSession = 0;
 let isSavingView = false;
 
 function getElements() {
@@ -87,7 +88,8 @@ function getDraft() {
 }
 
 export function initViews() {
-    document.getElementById('btnValidateView')?.addEventListener('click', validateDraft);
+    document.getElementById('viewSelectSql')?.addEventListener('keydown', handleTextareaTab);
+    document.getElementById('btnValidateView')?.addEventListener('click', () => validateDraft());
     document.getElementById('btnPreviewView')?.addEventListener('click', previewDraft);
     document.getElementById('btnSaveView')?.addEventListener('click', saveDraft);
     document.getElementById('btnOpenViewInVsCode')?.addEventListener('click', openDraftInVsCode);
@@ -98,7 +100,7 @@ export function openCreateViewModal() {
         updateStatus('Document is read-only');
         return;
     }
-    activeViewLoadToken++;
+    activeViewModalSession++;
     editingViewName = null;
     const elements = getElements();
     elements.title.textContent = 'Create View';
@@ -115,8 +117,8 @@ export function openCreateViewModal() {
 }
 
 export async function openEditViewModal(view) {
-    const loadToken = ++activeViewLoadToken;
-    const isSuperseded = () => loadToken !== activeViewLoadToken;
+    const modalSession = ++activeViewModalSession;
+    const isSuperseded = () => modalSession !== activeViewModalSession;
     try {
         updateStatus(`Loading view "${view}"...`);
         const definition = await backendApi.getViewDefinition(view);
@@ -147,20 +149,25 @@ export async function openEditViewModal(view) {
     }
 }
 
-async function validateDraft() {
-    const draft = getDraft();
+function isCurrentModalSession(modalSession) {
+    const modal = document.getElementById('viewModal');
+    return modalSession === activeViewModalSession && modal && !modal.classList.contains('hidden');
+}
+
+async function validateDraft(draft = getDraft(), modalSession = activeViewModalSession) {
+    const canUpdateFeedback = () => isCurrentModalSession(modalSession);
     if (!draft.name || !draft.selectSql) {
-        setFeedback('A view name and SELECT definition are required.', true);
+        if (canUpdateFeedback()) setFeedback('A view name and SELECT definition are required.', true);
         return false;
     }
 
     try {
-        setFeedback('Validating with SQLite...');
+        if (canUpdateFeedback()) setFeedback('Validating with SQLite...');
         await backendApi.validateViewDefinition(draft.name, draft.selectSql);
-        setFeedback('Definition is valid.');
+        if (canUpdateFeedback()) setFeedback('Definition is valid.');
         return true;
     } catch (err) {
-        setFeedback(err.message, true);
+        if (canUpdateFeedback()) setFeedback(err.message, true);
         return false;
     }
 }
@@ -191,32 +198,40 @@ async function saveDraft() {
     }
     if (isSavingView) return;
 
+    // The modal can be closed and reused while SQLite validation is pending.
+    // Snapshot every mutation input and require the same visible modal session
+    // before starting the write, so an old Save cannot target a newer draft.
+    const modalSession = activeViewModalSession;
+    const draft = getDraft();
+    const targetView = editingViewName;
     isSavingView = true;
     const saveButton = getElements().save;
     if (saveButton) saveButton.disabled = true;
     try {
-        if (!await validateDraft()) return;
+        if (!await validateDraft(draft, modalSession)) return;
+        if (!isCurrentModalSession(modalSession)) return;
 
-        const draft = getDraft();
-        setFeedback(editingViewName ? 'Replacing view atomically...' : 'Creating view...');
-        const result = editingViewName
-            ? await backendApi.editView(editingViewName, draft.selectSql, draft.preserveTriggers)
+        setFeedback(targetView ? 'Replacing view atomically...' : 'Creating view...');
+        const result = targetView
+            ? await backendApi.editView(targetView, draft.selectSql, draft.preserveTriggers)
             : await backendApi.createView(draft.name, draft.selectSql);
         if (result?.cancelled) {
-            setFeedback('Edit cancelled.');
+            if (isCurrentModalSession(modalSession)) setFeedback('Edit cancelled.');
             return;
         }
 
-        const changedView = editingViewName ?? draft.name;
-        closeModal('viewModal');
+        const changedView = targetView ?? draft.name;
+        if (isCurrentModalSession(modalSession)) closeModal('viewModal');
         await refreshSchema();
         if (state.selectedTable === changedView && state.selectedTableType === 'view') {
+            clearSelection();
+            persistState();
             await loadTableColumns();
             await loadTableData(true, false);
         }
-        updateStatus(`View "${changedView}" ${editingViewName ? 'updated' : 'created'} - Ctrl+S to save`);
+        updateStatus(`View "${changedView}" ${targetView ? 'updated' : 'created'} - Ctrl+S to save`);
     } catch (err) {
-        setFeedback(err.message, true);
+        if (isCurrentModalSession(modalSession)) setFeedback(err.message, true);
         updateStatus(`Error: ${err.message}`);
     } finally {
         isSavingView = false;
@@ -250,6 +265,7 @@ export async function dropViewFromSidebar(view) {
         }
 
         if (state.selectedTable === view && state.selectedTableType === 'view') {
+            clearSelection();
             state.selectedTable = null;
             state.selectedTableType = 'table';
             state.renderedTable = null;
@@ -258,6 +274,7 @@ export async function dropViewFromSidebar(view) {
             document.getElementById('tableNameLabel').textContent = 'No table selected';
             showEmptyState();
             updateToolbarButtons();
+            persistState();
         }
         await refreshSchema();
         updateStatus(`View "${view}" dropped - Ctrl+S to save`);

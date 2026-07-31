@@ -332,6 +332,41 @@ describe('view operations', () => {
         }
     });
 
+    it('validates the disposable CREATE VIEW construct, including view-only restrictions', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE VIEW validation_target (a, b) AS SELECT 1, 2');
+            const originalSql = await readScalar(
+                engine,
+                "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'validation_target'"
+            );
+
+            await assert.rejects(
+                () => engine.validateViewDefinition('new_parameter_view', 'SELECT ? AS value'),
+                /parameters are not allowed in views/
+            );
+            await assert.rejects(
+                () => engine.validateViewDefinition('validation_target', 'SELECT 1'),
+                /expected 2 columns/
+            );
+
+            assert.strictEqual(await readScalar(
+                engine,
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'new_parameter_view'"
+            ), 0);
+            assert.strictEqual(await readScalar(
+                engine,
+                "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'validation_target'"
+            ), originalSql);
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT * FROM validation_target'))[0].rows,
+                [[1, 2]]
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('does not execute a trailing statement smuggled through the preview wrapper', async () => {
         const engine = await createEngine();
         try {
@@ -347,6 +382,70 @@ describe('view operations', () => {
                 engine,
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'preview_sentinel'"
             ), 1);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('drops a view even when its stored SQL cannot be extracted for editing', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE VIEW opaque_view AS SELECT 1 AS value');
+            await engine.executeQuery('PRAGMA writable_schema = ON');
+            await engine.executeQuery(
+                "UPDATE sqlite_schema SET sql = 'opaque stored view text' " +
+                "WHERE type = 'view' AND name = 'opaque_view'"
+            );
+            await engine.executeQuery('PRAGMA writable_schema = OFF');
+
+            const dropped = await engine.dropView('opaque_view');
+
+            assert.strictEqual(dropped.sql, 'opaque stored view text');
+            assert.strictEqual(dropped.selectSql, '');
+            assert.strictEqual(await readScalar(
+                engine,
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'opaque_view'"
+            ), 0);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('restores a raw view definition without requiring an extracted SELECT body', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE VIEW raw_restore AS SELECT 7 AS value');
+            const definition = await engine.dropView('raw_restore');
+            definition.selectSql = '';
+
+            await engine.undoModification({
+                description: 'Restore raw view',
+                modificationType: 'view_drop',
+                targetTable: 'raw_restore',
+                viewDefBefore: definition
+            });
+
+            assert.strictEqual(await readScalar(engine, 'SELECT value FROM raw_restore'), 7);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('logs a missing WASM view definition while preserving undo no-op behavior', async () => {
+        const engine = await createEngine();
+        const warning = mock.method(console, 'warn', () => {});
+        try {
+            await engine.undoModification({
+                description: 'Legacy view edit',
+                modificationType: 'view_edit',
+                targetTable: 'legacy_view'
+            });
+
+            assert.strictEqual(warning.mock.callCount(), 1);
+            assert.strictEqual(
+                warning.mock.calls[0].arguments[0],
+                '[WasmDatabaseEngine] Skipping view undo: definition missing from history entry'
+            );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
         }

@@ -18,6 +18,7 @@ import {
     onCellDoubleClick
 } from './grid-actions.js';
 import { openCellPreview } from './edit.js';
+import { clearSelection } from './grid-selection.js';
 
 export function initGridControls() {
     document.getElementById('filterInput')?.addEventListener('keydown', onFilterEnter);
@@ -43,15 +44,44 @@ export function initGridInteraction() {
     container.addEventListener('dblclick', handleDoubleClick);
     container.addEventListener('mouseover', handleMouseover);
     container.addEventListener('scroll', handleScroll, { passive: true });
+    document.addEventListener('click', handleDocumentClick);
 }
 
 function handleMousedown(event) {
-    if (event.target.classList.contains('resize-handle')) {
+    const target = event.target;
+    if (event.shiftKey && typeof target.closest === 'function') {
+        const isEditor = target.closest('.cell-input, input, textarea, [contenteditable="true"]');
+        const isSelectionTarget = target.closest(
+            '.data-cell, .row-number, .select-column-icon, .row-number-header'
+        );
+        if (!isEditor && isSelectionTarget) {
+            // click.preventDefault() runs too late to stop the browser's native
+            // drag/range text selection; suppress it at mousedown instead.
+            event.preventDefault();
+        }
+    }
+
+    if (target.classList.contains('resize-handle')) {
         event.stopPropagation();
-        const headerCell = event.target.closest('.header-cell');
+        const headerCell = target.closest('.header-cell');
         if (headerCell && headerCell.dataset.column) {
             startColumnResize(event, headerCell.dataset.column);
         }
+    }
+}
+
+function handleDocumentClick(event) {
+    const target = event.target;
+    if (!target || typeof target.closest !== 'function' || state.editingCellInfo) return;
+    if (target.closest(
+        '.data-grid, [data-preserve-grid-selection], ' +
+        '.modal-overlay, .cell-preview-modal'
+    )) return;
+
+    if (state.selectedCells.length > 0 ||
+        state.selectedRowIds.size > 0 ||
+        state.selectedColumns.size > 0) {
+        clearSelection();
     }
 }
 
