@@ -314,7 +314,8 @@ export interface DatabaseOperations {
     view: string,
     selectSql: string,
     preserveTriggers?: boolean,
-    expectedSql?: string
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
   ): Promise<ViewEditResult>;
 
   /** Drop a view and return the definition required to undo the operation. */

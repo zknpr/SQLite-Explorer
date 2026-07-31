@@ -20,7 +20,8 @@ import type {
     ColumnMetadata,
     ColumnDefinition,
     ViewDefinition,
-    ViewEditResult
+    ViewEditResult,
+    ViewTriggerDefinition
 } from './core/types';
 import { escapeIdentifier } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -205,7 +206,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         view: string,
         selectSql: string,
         preserveTriggers?: boolean,
-        expectedSql?: string
+        expectedSql?: string,
+        expectedTriggers?: readonly ViewTriggerDefinition[]
     ): Promise<ViewEditResult> {
         return this.logAndDelegate(
             `Replacing view ${escapeIdentifier(view)} with ${this.sanitizeValue(selectSql)} (preserve triggers: ${preserveTriggers !== false})`,
@@ -214,7 +216,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
             view,
             selectSql,
             preserveTriggers,
-            expectedSql
+            expectedSql,
+            expectedTriggers
         );
     }
 

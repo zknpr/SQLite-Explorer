@@ -36,7 +36,8 @@ import type {
   ViewMetadata,
   IndexMetadata,
   ViewDefinition,
-  ViewEditResult
+  ViewEditResult,
+  ViewTriggerDefinition
 } from './core/types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -1136,21 +1137,23 @@ export async function createNativeDatabaseConnection(
           const columnListSql = typeof existingSql === 'string'
             ? extractViewColumnListSql(existingSql)
             : undefined;
-          // SQLite reserves every object name beginning with `sqlite_`, even
-          // inside a savepoint. Keep generated preview objects in our own
-          // non-reserved namespace. Unlike WASM/demo, native preview is DDL-
-          // based because the txiki row-object API needs a disposable view's
-          // positional schema; consequently it is explicitly refused read-only.
-          const previewView = `sqlx_preview_${crypto.randomUUID().replace(/-/g, '')}`;
+          // Native preview always needs DDL because the txiki row-object API
+          // needs the disposable view's positional schema; consequently it is
+          // explicitly refused read-only. WASM/demo can use a target-named CTE
+          // only as their read-only fallback. Replace the real target name here
+          // so even schema-qualified self-references cannot resolve the old view.
           const savepointName = createSavepointName('sp_preview_view');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
+            if (typeof existingSql === 'string') {
+              await worker.call('run', [`DROP VIEW ${escapeIdentifier(view)}`]);
+            }
             await runNativeSingleStatement(
-              buildCreateViewSql(previewView, body, columnListSql)
+              buildCreateViewSql(view, body, columnListSql)
             );
-            await compileNativeView(previewView);
+            await compileNativeView(view);
             const info = await worker.call<NativeQueryResult>('query', [
-              `PRAGMA table_info(${escapeIdentifier(previewView)})`
+              `PRAGMA table_info(${escapeIdentifier(view)})`
             ]);
             const nameIndex = info.columns.indexOf('name');
             if (nameIndex < 0) {
@@ -1163,7 +1166,7 @@ export async function createNativeDatabaseConnection(
               return row[nameIndex];
             });
             const result = await queryNativeBoundedStatement(
-              `SELECT * FROM ${escapeIdentifier(previewView)}`,
+              `SELECT * FROM ${escapeIdentifier(view)}`,
               columns,
               boundedLimit
             );
@@ -1204,7 +1207,8 @@ export async function createNativeDatabaseConnection(
           view: string,
           selectSql: string,
           preserveTriggers: boolean = true,
-          expectedSql?: string
+          expectedSql?: string,
+          expectedTriggers?: readonly ViewTriggerDefinition[]
         ): Promise<ViewEditResult> => {
           const body = normalizeViewSelectSql(selectSql);
           await compileNativeViewSelect(body);
@@ -1212,7 +1216,12 @@ export async function createNativeDatabaseConnection(
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
             const before = await getNativeViewDefinition(view);
-            assertViewDefinitionSnapshotCurrent(expectedSql, before.sql);
+            assertViewDefinitionSnapshotCurrent(
+              expectedSql,
+              before.sql,
+              expectedTriggers,
+              before.triggers
+            );
             await worker.call('run', [`DROP VIEW ${escapeIdentifier(view)}`]);
             await runNativeSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
             await compileNativeView(view);

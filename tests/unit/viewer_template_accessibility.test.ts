@@ -43,6 +43,43 @@ describe('viewer template accessibility', () => {
         );
     });
 
+    it('announces the keyboard escape route for both multiline editors', () => {
+        const template = readFileSync(
+            path.resolve(process.cwd(), 'core/ui/viewer.template.html'),
+            'utf8'
+        );
+        const css = readFileSync(
+            path.resolve(process.cwd(), 'core/ui/viewer.css'),
+            'utf8'
+        );
+        const descriptionId = 'multilineEditorKeyboardHint';
+        const description = template.match(
+            new RegExp(`<[^>]+\\bid=["']${descriptionId}["'][^>]*>[^<]+<\\/[^>]+>`, 'i')
+        )?.[0];
+
+        assert.ok(description, 'the multiline-editor keyboard hint must exist');
+        assert.match(description, /class=["'][^"']*\bvisually-hidden\b[^"']*["']/i);
+        assert.match(description, /Press Escape, then Tab to move focus out of the editor\./i);
+        assert.doesNotMatch(template, /\baria-description\s*=/i);
+
+        for (const id of ['viewSelectSql', 'cellPreviewTextarea']) {
+            const textarea = template.match(
+                new RegExp(`<textarea\\b(?=[^>]*\\bid=["']${id}["'])[^>]*>`, 'i')
+            )?.[0];
+            assert.ok(textarea, `${id} must exist`);
+            assert.match(
+                textarea,
+                new RegExp(`\\baria-describedby=["']${descriptionId}["']`, 'i'),
+                `${id} must reference the keyboard hint`
+            );
+        }
+
+        const hiddenRule = css.match(/\.visually-hidden\s*\{([^}]*)\}/s)?.[1];
+        assert.ok(hiddenRule, 'the visually-hidden utility must exist');
+        assert.match(hiddenRule, /position\s*:\s*absolute/i);
+        assert.match(hiddenRule, /overflow\s*:\s*hidden/i);
+    });
+
     it('marks selection-dependent controls so click-away handling preserves the selection', () => {
         const template = readFileSync(
             path.resolve(process.cwd(), 'core/ui/viewer.template.html'),

@@ -52,6 +52,12 @@ Module.prototype.require = function(id: string) {
           getQueryTimeout: () => 5000
         };
     }
+    if (id.endsWith('core/operation-serializer')) {
+        // Exercise the desktop facade's own Promise contract directly. The
+        // production serializer is async and would otherwise mask a synchronous
+        // throw from the facade method it wraps.
+        return { serializeOperations: (operations: unknown) => operations };
+    }
     if (id.endsWith('main')) {
         return { GlobalOutputChannel: null };
     }
@@ -285,5 +291,35 @@ describe('workerFactory error path tests', () => {
     ]) {
       assert.ok(exposedWorkerMethods.includes(method), `${method} was not exposed over worker RPC`);
     }
+  });
+
+  it('rejects pre-aborted desktop worker operations instead of throwing synchronously', async () => {
+    let applyCalls = 0;
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false }),
+      applyModifications: async () => { applyCalls++; }
+    };
+
+    const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
+    const fileUri = {
+      scheme: 'file',
+      fsPath: '/test/db.sqlite',
+      path: '/test/db.sqlite'
+    } as any;
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
+    const controller = new AbortController();
+    const cancellation = new Error('cancelled before worker dispatch');
+    controller.abort(cancellation);
+
+    let pending: Promise<void> | undefined;
+    assert.doesNotThrow(() => {
+      pending = databaseOps.applyModifications([], controller.signal);
+    });
+
+    let caught: unknown;
+    await pending!.catch(error => { caught = error; });
+    assert.strictEqual(caught, cancellation);
+    assert.strictEqual(applyCalls, 0);
   });
 });

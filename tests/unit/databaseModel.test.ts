@@ -817,7 +817,10 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         const doc = createDocBypassingFactory(dbOps);
         let undo: (() => Promise<void>) | undefined;
         let redo: (() => Promise<void>) | undefined;
-        doc.onDidChangeContent((event: any) => applied.push(event.modification));
+        doc.onDidChangeContent((event: any) => applied.push({
+            modification: event.modification,
+            direction: event.modificationDirection
+        }));
         doc.onDidChange((event: any) => {
             undo = event.undo;
             redo = event.redo;
@@ -827,7 +830,11 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         await undo!();
         await redo!();
 
-        assert.deepStrictEqual(applied, [modification, modification, modification]);
+        assert.deepStrictEqual(applied, [
+            { modification, direction: 'forward' },
+            { modification, direction: 'undo' },
+            { modification, direction: 'forward' }
+        ]);
     });
 
     it('invalidates every open view document after File Revert', async () => {

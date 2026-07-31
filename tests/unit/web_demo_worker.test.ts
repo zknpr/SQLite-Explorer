@@ -32,7 +32,6 @@ function readCurrentWorkerBundle(): Promise<string> {
     );
     const rendered = await esbuild.build({
         entryPoints: [authoredWorkerPath],
-        outfile: bundledWorkerPath,
         bundle: true,
         platform: 'browser',
         format: 'iife',
@@ -47,15 +46,18 @@ function readCurrentWorkerBundle(): Promise<string> {
     const bundledHash = bundledSource.match(
         /sqlite-viewer-bundle-sha256:([a-f0-9]{64})/
     )?.[1];
+    const freshnessFailure =
+        'website worker bundle is stale or esbuild output/version drifted; ' +
+        'run node scripts/build.mjs';
     assert.strictEqual(
         bundledHash,
         expectedHash,
-        'website worker bundle is stale; run node scripts/build.mjs'
+        freshnessFailure
     );
     assert.strictEqual(
         bundledSource,
         `/*! sqlite-viewer-bundle-sha256:${expectedHash} */\n${renderedSource}`,
-        'website worker bundle is stale; run node scripts/build.mjs'
+        freshnessFailure
     );
     return bundledSource;
     })();
@@ -232,6 +234,40 @@ describe('web demo view worker', () => {
         assert.strictEqual(await workerScalar(worker, 'SELECT value FROM shared_view'), 2);
     });
 
+    it('rejects a stale trigger snapshot before discarding demo triggers', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE VIEW trigger_cas_view AS SELECT 1 AS value');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TRIGGER trigger_cas_first INSTEAD OF INSERT ON trigger_cas_view ' +
+            'BEGIN SELECT 1; END'
+        );
+        const stale = await worker.invoke('getViewDefinition', 'trigger_cas_view');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TRIGGER trigger_cas_second INSTEAD OF UPDATE ON trigger_cas_view ' +
+            'BEGIN SELECT 2; END'
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'trigger_cas_view',
+                'SELECT 2 AS value',
+                false,
+                stale.sql,
+                stale.triggers
+            ),
+            /changed outside this editor/i
+        );
+        const current = await worker.invoke('getViewDefinition', 'trigger_cas_view');
+        assert.strictEqual(current.selectSql, 'SELECT 1 AS value');
+        assert.deepStrictEqual(
+            Array.from(current.triggers, (trigger: any) => trigger.identifier),
+            ['trigger_cas_first', 'trigger_cas_second']
+        );
+    });
+
     it('previews an edited view through its preserved explicit column list', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
@@ -252,6 +288,22 @@ describe('web demo view worker', () => {
             Array.from(preview.rows, (row: unknown[]) => Array.from(row)),
             [[2, 'after']]
         );
+    });
+
+    it('previews an edit in the target-name context instead of reading the old demo view', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('createView', 'self_shadowed_view', 'SELECT 7 AS value');
+
+        await assert.rejects(
+            worker.invoke(
+                'previewViewDefinition',
+                'self_shadowed_view',
+                'SELECT value FROM main.self_shadowed_view',
+                10
+            ),
+            /circular/i
+        );
+        assert.strictEqual(await workerScalar(worker, 'SELECT value FROM self_shadowed_view'), 7);
     });
 
     it('treats percent and underscore filters as literal LIKE text', async () => {

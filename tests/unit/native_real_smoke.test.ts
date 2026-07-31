@@ -203,6 +203,23 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             assert.deepStrictEqual(preview.rows, [[2, 'after']]);
         });
 
+        await testContext.test('previews an edit in the target-name context', async () => {
+            await engine.createView('native_self_shadowed_view', 'SELECT 7 AS value');
+
+            await assert.rejects(
+                engine.previewViewDefinition(
+                    'native_self_shadowed_view',
+                    'SELECT value FROM main.native_self_shadowed_view',
+                    10
+                ),
+                /circular/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM native_self_shadowed_view'))[0].rows,
+                [[7]]
+            );
+        });
+
         await testContext.test('round-trips the incident multiline view SQL exactly', async () => {
             await engine.createView('order_summary', INITIAL_VIEW_BODY);
             const initial = await engine.getViewDefinition('order_summary');
@@ -248,6 +265,36 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             assert.deepStrictEqual(
                 (await engine.executeQuery('SELECT value FROM native_shared_view'))[0].rows,
                 [[2]]
+            );
+        });
+
+        await testContext.test('atomically rejects a stale native trigger snapshot', async () => {
+            await engine.createView('native_trigger_cas_view', 'SELECT 1 AS value');
+            await engine.executeQuery(
+                'CREATE TRIGGER native_trigger_cas_first ' +
+                'INSTEAD OF INSERT ON native_trigger_cas_view BEGIN SELECT 1; END'
+            );
+            const stale = await engine.getViewDefinition('native_trigger_cas_view');
+            await engine.executeQuery(
+                'CREATE TRIGGER native_trigger_cas_second ' +
+                'INSTEAD OF UPDATE ON native_trigger_cas_view BEGIN SELECT 2; END'
+            );
+
+            await assert.rejects(
+                engine.editView(
+                    'native_trigger_cas_view',
+                    'SELECT 2 AS value',
+                    false,
+                    stale.sql,
+                    stale.triggers
+                ),
+                /changed outside this editor/i
+            );
+            const current = await engine.getViewDefinition('native_trigger_cas_view');
+            assert.strictEqual(current.selectSql, 'SELECT 1 AS value');
+            assert.deepStrictEqual(
+                current.triggers.map(trigger => trigger.identifier),
+                ['native_trigger_cas_first', 'native_trigger_cas_second']
             );
         });
 

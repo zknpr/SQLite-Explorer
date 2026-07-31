@@ -22,7 +22,8 @@ import type {
   SchemaSnapshot,
   ColumnMetadata,
   ColumnDefinition,
-  ModificationEntry
+  ModificationEntry,
+  ViewTriggerDefinition
 } from './types';
 import { getNodeFs } from './platform/fs';
 import {
@@ -250,8 +251,20 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().createView(view, selectSql);
     },
 
-    async editView(view: string, selectSql: string, preserveTriggers?: boolean, expectedSql?: string) {
-      return requireEngine().editView(view, selectSql, preserveTriggers, expectedSql);
+    async editView(
+      view: string,
+      selectSql: string,
+      preserveTriggers?: boolean,
+      expectedSql?: string,
+      expectedTriggers?: readonly ViewTriggerDefinition[]
+    ) {
+      return requireEngine().editView(
+        view,
+        selectSql,
+        preserveTriggers,
+        expectedSql,
+        expectedTriggers
+      );
     },
 
     async dropView(view: string) {

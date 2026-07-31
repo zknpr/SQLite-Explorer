@@ -146,6 +146,73 @@ describe('grid data match cache', () => {
         }
     });
 
+    it('disables visible column filters until a same-table reload settles', async () => {
+        const filterInputs = [{ disabled: false }, { disabled: false }];
+        const container = {
+            scrollLeft: 0,
+            scrollTop: 0,
+            querySelector(selector: string) {
+                return selector === '.data-grid' ? {} : null;
+            }
+        };
+        const elements: Record<string, any> = {
+            gridContainer: container,
+            pageIndicator: { textContent: '' },
+            btnFirst: { disabled: false },
+            btnPrev: { disabled: false },
+            btnNext: { disabled: false },
+            btnLast: { disabled: false },
+            statusText: { textContent: '' },
+            filterMatchCounter: { textContent: '' }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) { return elements[id] ?? null; },
+            querySelectorAll(selector: string) {
+                return selector === '.column-filter' ? filterInputs : [];
+            }
+        };
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const gridDataModulePath = '../../core/ui/modules/grid-data.js';
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { loadTableData } = await import(gridDataModulePath);
+        const count = createDeferred<number>();
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        backendApi.fetchTableCount = async () => count.promise;
+        backendApi.fetchTableData = async () => ({ rows: [[1, 'fresh']] });
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.renderedTable = 'items';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.currentPageIndex = 0;
+        state.rowsPerPage = 500;
+        state.columnFilters = { value: 'draft filter' };
+        state.filterQuery = '';
+        state.isLoadingData = false;
+        state.isGridReloading = false;
+        state.editingCellInfo = { rowIdx: 0, colIdx: 0 };
+
+        try {
+            const pendingLoad = loadTableData(false, true);
+            assert.deepStrictEqual(
+                filterInputs.map(input => input.disabled),
+                [true, true],
+                'typing must be blocked while the visible grid is stale'
+            );
+
+            count.resolve(1);
+            await pendingLoad;
+            assert.deepStrictEqual(filterInputs.map(input => input.disabled), [false, false]);
+        } finally {
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
+            state.isGridReloading = false;
+            state.editingCellInfo = null;
+        }
+    });
+
     it('does not let a superseded load clear the newer spinner loading state', async () => {
         const container = {
             innerHTML: '',

@@ -31,7 +31,8 @@ describe('SQLiteFileSystemProvider', () => {
             onDidChangeContent: contentEmitter.event,
             onDidDispose,
             dispose: () => disposeEmitter.fire(),
-            fireContentChange: (modification: any) => contentEmitter.fire({ modification }),
+            fireContentChange: (modification: any, modificationDirection = 'forward') =>
+                contentEmitter.fire({ modification, modificationDirection }),
             invalidateAllViewDocuments: () => contentEmitter.fire({
                 invalidateAllViewDocuments: true
             }),
@@ -39,7 +40,7 @@ describe('SQLiteFileSystemProvider', () => {
         };
         DocumentRegistry.set(key, mockDocument);
         return mockDocument as DatabaseDocument & {
-            fireContentChange(modification: any): void;
+            fireContentChange(modification: any, modificationDirection?: 'forward' | 'undo'): void;
             invalidateAllViewDocuments(): void;
             getDisposeSubscriptionDisposeCount(): number;
         };
@@ -355,6 +356,7 @@ describe('SQLiteFileSystemProvider', () => {
                 'active users',
                 after.selectSql,
                 true,
+                undefined,
                 undefined
             ]);
             assert.deepStrictEqual((doc.recordExternalModification as any).mock.calls[0].arguments[0], {
@@ -465,6 +467,53 @@ describe('SQLiteFileSystemProvider', () => {
             }
         });
 
+        it('emits view lifecycle file events for forward, undo, and redo semantics', async () => {
+            const definition = {
+                identifier: 'lifecycle_view',
+                sql: 'CREATE VIEW lifecycle_view AS SELECT 1 AS value',
+                selectSql: 'SELECT 1 AS value',
+                triggers: []
+            };
+            const document = setupMockDocument(docKey, {
+                getViewDefinition: mock.fn(async () => definition)
+            });
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/lifecycle_view/group/__view__.sql/definition.sql`
+            );
+            const events: vscode.FileChangeEvent[][] = [];
+            const subscription = provider.onDidChangeFile(changes => events.push(changes));
+            const modification = (modificationType: 'view_create' | 'view_edit' | 'view_drop') => ({
+                label: modificationType,
+                description: modificationType,
+                modificationType,
+                targetTable: 'lifecycle_view'
+            });
+
+            try {
+                await provider.stat(uri);
+                document.fireContentChange(modification('view_create'));
+                document.fireContentChange(modification('view_edit'));
+                document.fireContentChange(modification('view_drop'));
+                document.fireContentChange(modification('view_create'), 'undo');
+                document.fireContentChange(modification('view_edit'), 'undo');
+                document.fireContentChange(modification('view_drop'), 'undo');
+
+                assert.deepStrictEqual(
+                    events.map(changes => changes[0].type),
+                    [
+                        vscode.FileChangeType.Created,
+                        vscode.FileChangeType.Changed,
+                        vscode.FileChangeType.Deleted,
+                        vscode.FileChangeType.Deleted,
+                        vscode.FileChangeType.Changed,
+                        vscode.FileChangeType.Created
+                    ]
+                );
+            } finally {
+                subscription.dispose();
+            }
+        });
+
         it('invalidates every open view document when File Revert replaces the database state', async () => {
             let now = 100;
             mock.method(Date, 'now', () => now);
@@ -564,6 +613,58 @@ describe('SQLiteFileSystemProvider', () => {
             }
         });
 
+        it('preserves the stale-write conflict when the document registry entry disappears mid-check', async () => {
+            const original = {
+                identifier: 'detached_view',
+                sql: 'CREATE VIEW "detached_view" AS SELECT 1 AS value',
+                selectSql: 'SELECT 1 AS value',
+                triggers: []
+            };
+            const changed = {
+                ...original,
+                sql: 'CREATE VIEW "detached_view" AS SELECT 2 AS value',
+                selectSql: 'SELECT 2 AS value'
+            };
+            let definitionReads = 0;
+            const editView = mock.fn(async () => {
+                throw new Error('stale editor must not reach editView');
+            });
+            setupMockDocument(docKey, {
+                getViewDefinition: mock.fn(async () => {
+                    definitionReads++;
+                    if (definitionReads === 1) return original;
+                    // writeFile already resolved the document and metadata. A
+                    // later registry teardown must not mask the conflict it has
+                    // now detected or suppress the reload event.
+                    DocumentRegistry.delete(docKey);
+                    return changed;
+                }),
+                editView
+            });
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/detached_view/group/__view__.sql/definition.sql`
+            );
+            const events: vscode.FileChangeEvent[][] = [];
+            const subscription = provider.onDidChangeFile(changes => events.push(changes));
+
+            try {
+                await provider.readFile(uri);
+                await assert.rejects(
+                    provider.writeFile(
+                        uri,
+                        new TextEncoder().encode('SELECT 3 AS value'),
+                        { create: false, overwrite: true }
+                    ),
+                    /changed outside this editor.*not modified/i
+                );
+                assert.strictEqual(editView.mock.callCount(), 0);
+                assert.strictEqual(events.at(-1)?.[0].type, vscode.FileChangeType.Changed);
+                assert.strictEqual(events.at(-1)?.[0].uri.toString(), uri.toString());
+            } finally {
+                subscription.dispose();
+            }
+        });
+
         it('passes the read snapshot into the engine and maps a raced CAS conflict to reload', async () => {
             const original = {
                 identifier: 'raced_view',
@@ -601,7 +702,8 @@ describe('SQLiteFileSystemProvider', () => {
                     'raced_view',
                     'SELECT 3 AS value',
                     true,
-                    original.sql
+                    original.sql,
+                    original.triggers
                 ]);
                 assert.strictEqual(
                     (document.recordExternalModification as any).mock.callCount(),
@@ -611,6 +713,51 @@ describe('SQLiteFileSystemProvider', () => {
             } finally {
                 subscription.dispose();
             }
+        });
+
+        it('rejects a view save when only the attached trigger snapshot changed', async () => {
+            const original = {
+                identifier: 'trigger_conflict_view',
+                sql: 'CREATE VIEW trigger_conflict_view AS SELECT 1 AS value',
+                selectSql: 'SELECT 1 AS value',
+                triggers: [{
+                    identifier: 'trigger_conflict_first',
+                    sql: 'CREATE TRIGGER trigger_conflict_first INSTEAD OF INSERT ON trigger_conflict_view BEGIN SELECT 1; END'
+                }]
+            };
+            let current = original;
+            const editView = mock.fn(async () => {
+                throw new Error('stale trigger snapshot must not reach editView');
+            });
+            setupMockDocument(docKey, {
+                getViewDefinition: mock.fn(async () => current),
+                editView
+            });
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/trigger_conflict_view/group/__view__.sql/definition.sql`
+            );
+
+            await provider.readFile(uri);
+            current = {
+                ...original,
+                triggers: [
+                    ...original.triggers,
+                    {
+                        identifier: 'trigger_conflict_second',
+                        sql: 'CREATE TRIGGER trigger_conflict_second INSTEAD OF UPDATE ON trigger_conflict_view BEGIN SELECT 2; END'
+                    }
+                ]
+            };
+
+            await assert.rejects(
+                provider.writeFile(
+                    uri,
+                    new TextEncoder().encode('SELECT 2 AS value'),
+                    { create: false, overwrite: true }
+                ),
+                /changed outside this editor.*not modified/i
+            );
+            assert.strictEqual(editView.mock.callCount(), 0);
         });
 
         it('keeps a rejected view edit dirty and reports the SQLite error clearly', async () => {

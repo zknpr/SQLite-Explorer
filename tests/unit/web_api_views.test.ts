@@ -79,7 +79,8 @@ it('confirms the named demo triggers before an edit can discard them', async () 
         'demo_view',
         'SELECT 2 AS value',
         false,
-        'CREATE VIEW demo_view AS SELECT 1 AS value'
+        'CREATE VIEW demo_view AS SELECT 1 AS value',
+        [{ identifier: 'demo_insert', sql: 'CREATE TRIGGER demo_insert' }]
     );
     const cancelledLookup = await waitForPostedMessage(0);
     assert.strictEqual(cancelledLookup.content.targetMethod, 'getViewDefinition');
@@ -108,7 +109,8 @@ it('confirms the named demo triggers before an edit can discard them', async () 
         'demo_view',
         'SELECT 2 AS value',
         false,
-        'CREATE VIEW demo_view AS SELECT 1 AS value'
+        'CREATE VIEW demo_view AS SELECT 1 AS value',
+        [{ identifier: 'demo_insert', sql: 'CREATE TRIGGER demo_insert' }]
     );
     const acceptedLookup = await waitForPostedMessage(1);
     handleRpcResponse({
@@ -124,7 +126,8 @@ it('confirms the named demo triggers before an edit can discard them', async () 
         'demo_view',
         'SELECT 2 AS value',
         false,
-        'CREATE VIEW demo_view AS SELECT 1 AS value'
+        'CREATE VIEW demo_view AS SELECT 1 AS value',
+        [{ identifier: 'demo_insert', sql: 'CREATE TRIGGER demo_insert' }]
     ]);
     handleRpcResponse({
         kind: 'response',

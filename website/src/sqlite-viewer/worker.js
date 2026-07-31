@@ -27,11 +27,10 @@ import { escapeLikePattern } from '../../../src/core/sql-utils.ts';
 // Configuration
 // ============================================================================
 
-/**
- * sql.js CDN URL for the JavaScript module.
- * Using jsDelivr for reliable global CDN delivery.
- */
-const SQL_JS_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.14.1/sql-wasm.js';
+/** Package-aligned sql.js CDN base shared by the loader and WASM resolver. */
+const SQL_JS_VERSION = '1.14.1';
+const SQL_JS_CDN_BASE = `https://cdnjs.cloudflare.com/ajax/libs/sql.js/${SQL_JS_VERSION}`;
+const SQL_JS_CDN = `${SQL_JS_CDN_BASE}/sql-wasm.js`;
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 
 // ============================================================================
@@ -233,7 +232,7 @@ async function initializeDatabase(filename, config) {
       sqlConfig.wasmBinary = config.wasmBinary;
     } else {
       // Default to CDN WASM
-      sqlConfig.locateFile = (file) => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.14.1/${file}`;
+      sqlConfig.locateFile = (file) => `${SQL_JS_CDN_BASE}/${file}`;
     }
 
     SQL = await self.initSqlJs(sqlConfig);
@@ -900,16 +899,41 @@ async function previewViewDefinition(view, selectSql, limit = 50) {
     ? extractViewColumnListSql(existingSql)
     : undefined;
 
-  // Demo preview mirrors WASM's non-DDL CTE path so read-only databases stay
-  // previewable while explicit CREATE VIEW column names remain authoritative.
-  if (columnListSql) {
-    const previewSource = escapeIdentifier('sqlx_preview');
+  if (readOnlyMode) {
+    // Read-only demo databases cannot run disposable schema DDL. Match WASM's
+    // target-named CTE fallback; writable previews below use the exact CREATE
+    // VIEW context and therefore also catch schema-qualified self-references.
+    const previewSource = escapeIdentifier(view);
+    if (columnListSql) {
+      return querySingleStatement(
+        `WITH ${previewSource} ${columnListSql} AS (${body}\n) ` +
+        `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`
+      );
+    }
     return querySingleStatement(
-      `WITH ${previewSource} ${columnListSql} AS (${body}\n) ` +
+      `WITH ${previewSource} AS (${body}\n) ` +
       `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`
     );
   }
-  return querySingleStatement(`SELECT * FROM (${body}\n) LIMIT ${boundedLimit}`);
+
+  const savepointName = createViewSavepointName('sp_preview_view');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    if (typeof existingSql === 'string') {
+      runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+    }
+    runSingleStatement(buildCreateViewSql(view, body, columnListSql));
+    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+    const result = querySingleStatement(
+      `SELECT * FROM ${escapeIdentifier(view)} LIMIT ${boundedLimit}`
+    );
+    runSingleStatement(`ROLLBACK TO ${savepointName}`);
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return result;
+  } catch (error) {
+    safeRollbackViewSavepoint(savepointName, 'previewViewDefinition');
+    throw error;
+  }
 }
 
 async function createView(view, selectSql) {
@@ -930,7 +954,13 @@ async function createView(view, selectSql) {
   }
 }
 
-async function editView(view, selectSql, preserveTriggers = true, expectedSql) {
+async function editView(
+  view,
+  selectSql,
+  preserveTriggers = true,
+  expectedSql,
+  expectedTriggers
+) {
   if (!db) throw new Error('No database initialized');
   const body = normalizeViewSelectSql(selectSql);
   compileSingleStatement(`EXPLAIN SELECT * FROM (${body}\n) LIMIT 0`);
@@ -938,7 +968,12 @@ async function editView(view, selectSql, preserveTriggers = true, expectedSql) {
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     const before = await getViewDefinition(view);
-    assertViewDefinitionSnapshotCurrent(expectedSql, before.sql);
+    assertViewDefinitionSnapshotCurrent(
+      expectedSql,
+      before.sql,
+      expectedTriggers,
+      before.triggers
+    );
     runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
     runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
     compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);

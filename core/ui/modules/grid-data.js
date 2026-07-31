@@ -47,6 +47,12 @@ export async function loadTableColumns() {
 // the loading flag out from under the in-flight one.
 let activeLoadToken = 0;
 
+function setColumnFilterInputsDisabled(disabled) {
+    document.querySelectorAll('.column-filter').forEach(input => {
+        input.disabled = disabled;
+    });
+}
+
 export async function loadTableData(showSpinner = true, saveScrollPosition = true) {
     if (!state.selectedTable) return;
 
@@ -69,6 +75,10 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // this try: DOM access/rendering can throw before the first fetch, and the
         // finally below must still release both loading flags on that path.
         state.isGridReloading = true;
+        // Same-table refreshes deliberately keep the old grid visible. Disable
+        // its live filter inputs so draft keystrokes cannot be accepted and then
+        // discarded when renderDataGrid replaces them from state.columnFilters.
+        setColumnFilterInputsDisabled(true);
 
         const container = document.getElementById('gridContainer');
         // Whether a data grid is currently rendered (vs. a spinner/error/empty state),
@@ -201,6 +211,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         if (!isSuperseded()) {
             state.isLoadingData = false;
             state.isGridReloading = false;
+            setColumnFilterInputsDisabled(false);
         }
     }
 }

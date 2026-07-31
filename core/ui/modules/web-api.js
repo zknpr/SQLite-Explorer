@@ -310,9 +310,13 @@ export const backendApi = {
     validateViewDefinition: (view, selectSql) => sendRpcRequest('validateViewDefinition', [view, selectSql]),
     previewViewDefinition: (view, selectSql, limit) => sendRpcRequest('previewViewDefinition', [view, selectSql, limit]),
     createView: (view, selectSql) => sendRpcRequest('createView', [view, selectSql]),
-    editView: async (view, selectSql, preserveTriggers, expectedSql) => {
+    editView: async (view, selectSql, preserveTriggers, expectedSql, expectedTriggers) => {
+        let triggerSnapshot = expectedTriggers;
         if (!preserveTriggers) {
             const current = await sendRpcRequest('getViewDefinition', [view]);
+            // Bind the mutation to the exact trigger set shown in this dialog;
+            // the worker rechecks it atomically inside the edit savepoint.
+            triggerSnapshot ??= current.triggers ?? [];
             if (current.triggers?.length > 0) {
                 const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
                 if (!window.confirm(
@@ -323,7 +327,13 @@ export const backendApi = {
                 }
             }
         }
-        return sendRpcRequest('editView', [view, selectSql, preserveTriggers, expectedSql]);
+        return sendRpcRequest('editView', [
+            view,
+            selectSql,
+            preserveTriggers,
+            expectedSql,
+            triggerSnapshot
+        ]);
     },
     dropView: async (view) => {
         if (!window.confirm(

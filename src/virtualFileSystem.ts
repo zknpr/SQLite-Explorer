@@ -3,7 +3,8 @@ import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier } from './core/sql-utils';
 import {
     isViewDefinitionConflictError,
-    isViewDefinitionSnapshotCurrent
+    isViewDefinitionSnapshotCurrent,
+    isViewTriggerSnapshotCurrent
 } from './core/view-utils';
 import { GlobalOutputChannel } from './main';
 
@@ -12,7 +13,7 @@ import type {
     DocumentContentChange,
     DocumentModification
 } from './databaseModel';
-import type { ViewEditResult } from './core/types';
+import type { ViewEditResult, ViewTriggerDefinition } from './core/types';
 
 interface ViewDocumentMetadata {
     ctime: number;
@@ -21,6 +22,8 @@ interface ViewDocumentMetadata {
     uri: vsc.Uri;
     /** Stored CREATE VIEW SQL observed by the editor's most recent read. */
     snapshotSql?: string;
+    /** Ordered trigger state paired with snapshotSql for the atomic CAS. */
+    snapshotTriggers?: ViewTriggerDefinition[];
     /** Encoded SELECT-body size cached until the view is externally invalidated. */
     size?: number;
 }
@@ -117,6 +120,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 const metadata = this.getViewDocumentMetadata(document, uri, table);
                 const definition = await document.databaseOperations.getViewDefinition(table);
                 metadata.snapshotSql = definition.sql;
+                metadata.snapshotTriggers = this.cloneTriggerSnapshot(definition.triggers);
                 const content = new TextEncoder().encode(definition.selectSql);
                 metadata.size = content.byteLength;
                 return content;
@@ -179,20 +183,26 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
         if (rowId === '__view__.sql') {
             const metadata = this.getViewDocumentMetadata(document, uri, table);
-            if (metadata.snapshotSql !== undefined) {
-                let currentSql: string;
+            if (metadata.snapshotSql !== undefined || metadata.snapshotTriggers !== undefined) {
+                let currentDefinition;
                 try {
-                    currentSql = (await document.databaseOperations.getViewDefinition(table)).sql;
+                    currentDefinition = await document.databaseOperations.getViewDefinition(table);
                 } catch (err) {
                     if (this.isMissingViewError(err)) {
-                        this.rejectStaleViewWrite(document, uri);
+                        this.rejectStaleViewWrite(metadata, uri);
                     }
                     throw vsc.FileSystemError.Unavailable(
                         err instanceof Error ? err.message : String(err)
                     );
                 }
-                if (!isViewDefinitionSnapshotCurrent(metadata.snapshotSql, currentSql)) {
-                    this.rejectStaleViewWrite(document, uri);
+                if (!isViewDefinitionSnapshotCurrent(
+                    metadata.snapshotSql,
+                    currentDefinition.sql
+                ) || !isViewTriggerSnapshotCurrent(
+                    metadata.snapshotTriggers,
+                    currentDefinition.triggers
+                )) {
+                    this.rejectStaleViewWrite(metadata, uri);
                 }
             }
 
@@ -203,11 +213,12 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                     table,
                     selectSql,
                     true,
-                    metadata.snapshotSql
+                    metadata.snapshotSql,
+                    metadata.snapshotTriggers
                 );
             } catch (err) {
                 if (isViewDefinitionConflictError(err)) {
-                    this.rejectStaleViewWrite(document, uri);
+                    this.rejectStaleViewWrite(metadata, uri);
                 }
                 const rawMessage = err instanceof Error ? err.message : String(err);
                 GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error writing view definition: ${rawMessage}`);
@@ -227,6 +238,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             // Update this editor's baseline before recordExternalModification
             // synchronously broadcasts the change to every open URI.
             metadata.snapshotSql = result.after.sql;
+            metadata.snapshotTriggers = this.cloneTriggerSnapshot(result.after.triggers);
             document.recordExternalModification({
                 label: 'Edit View',
                 description: `Edit view ${table} from editor`,
@@ -395,7 +407,10 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             metadata.size = undefined;
             this.bumpViewDocumentMtime(metadata);
             changes.push({
-                type: vsc.FileChangeType.Changed,
+                type: this.getViewFileChangeType(
+                    modification,
+                    change.modificationDirection ?? 'forward'
+                ),
                 uri: metadata.uri
             });
         }
@@ -408,13 +423,38 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             || modification.modificationType === 'view_drop';
     }
 
+    private getViewFileChangeType(
+        modification: DocumentModification,
+        direction: 'forward' | 'undo'
+    ): vsc.FileChangeType {
+        if (modification.modificationType === 'view_edit') {
+            return vsc.FileChangeType.Changed;
+        }
+        const createsView = modification.modificationType === 'view_create';
+        const existsAfterChange = direction === 'forward' ? createsView : !createsView;
+        return existsAfterChange
+            ? vsc.FileChangeType.Created
+            : vsc.FileChangeType.Deleted;
+    }
+
+    private cloneTriggerSnapshot(
+        triggers: readonly ViewTriggerDefinition[] | undefined
+    ): ViewTriggerDefinition[] {
+        return (triggers ?? []).map(trigger => ({
+            identifier: trigger.identifier,
+            sql: trigger.sql,
+            ...(trigger.temporary ? { temporary: true } : {})
+        }));
+    }
+
     private bumpViewDocumentMtime(metadata: ViewDocumentMetadata): void {
         metadata.mtime = Math.max(Date.now(), metadata.mtime + 1);
     }
 
-    private rejectStaleViewWrite(document: DatabaseDocument, uri: vsc.Uri): never {
-        const { table } = this.parseUri(uri);
-        const metadata = this.getViewDocumentMetadata(document, uri, table);
+    private rejectStaleViewWrite(
+        metadata: ViewDocumentMetadata,
+        uri: vsc.Uri
+    ): never {
         metadata.size = undefined;
         this.bumpViewDocumentMtime(metadata);
         this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);

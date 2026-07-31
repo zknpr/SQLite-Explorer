@@ -43,7 +43,69 @@ export function normalizeViewSelectSql(selectSql: string): string {
   if (!trimmed) {
     throw new Error('View SELECT definition is required');
   }
-  return trimmed.endsWith(';') ? trimmed.slice(0, -1).trimEnd() : trimmed;
+
+  // A semicolon is still the statement terminator when only comments follow
+  // it. Track the last non-comment SQL token instead of looking at the final
+  // character, while treating quoted semicolons as expression text.
+  let lastSqlToken = -1;
+  let quote: "'" | '"' | '`' | ']' | undefined;
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  for (let index = 0; index < trimmed.length; index++) {
+    const char = trimmed[index];
+    const next = trimmed[index + 1];
+
+    if (inLineComment) {
+      if (char === '\n' || char === '\r') inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (char === '*' && next === '/') {
+        inBlockComment = false;
+        index++;
+      }
+      continue;
+    }
+    if (quote) {
+      lastSqlToken = index;
+      if (char === quote) {
+        if (next === quote) {
+          lastSqlToken = ++index;
+        } else {
+          quote = undefined;
+        }
+      }
+      continue;
+    }
+
+    if (char === '-' && next === '-') {
+      inLineComment = true;
+      index++;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      inBlockComment = true;
+      index++;
+      continue;
+    }
+    if (/\s/.test(char)) continue;
+
+    lastSqlToken = index;
+    if (char === "'" || char === '"' || char === '`') {
+      quote = char;
+    } else if (char === '[') {
+      quote = ']';
+    }
+  }
+
+  if (lastSqlToken >= 0 && trimmed[lastSqlToken] === ';') {
+    return (
+      trimmed.slice(0, lastSqlToken).trimEnd()
+      + trimmed.slice(lastSqlToken + 1)
+    ).trim();
+  }
+  return trimmed;
 }
 
 interface ViewSqlParts {
@@ -193,6 +255,21 @@ export function isViewDefinitionSnapshotCurrent(
   return snapshotSql === currentSql;
 }
 
+/** Compare an ordered trigger snapshot, including temp-schema provenance. */
+export function isViewTriggerSnapshotCurrent(
+  snapshot: readonly ViewTriggerDefinition[] | undefined,
+  current: readonly ViewTriggerDefinition[] | undefined
+): boolean {
+  if (snapshot === undefined) return true;
+  if (current === undefined || snapshot.length !== current.length) return false;
+  return snapshot.every((trigger, index) => {
+    const currentTrigger = current[index];
+    return trigger.identifier === currentTrigger.identifier
+      && trigger.sql === currentTrigger.sql
+      && (trigger.temporary === true) === (currentTrigger.temporary === true);
+  });
+}
+
 /** Stable cross-RPC error text used by both view-editor conflict surfaces. */
 export const VIEW_DEFINITION_CONFLICT_MESSAGE =
   'The view changed outside this editor. Reload before saving; the view was not modified.';
@@ -204,9 +281,12 @@ export const VIEW_DEFINITION_CONFLICT_MESSAGE =
  */
 export function assertViewDefinitionSnapshotCurrent(
   expectedSql: string | undefined,
-  currentSql: string | undefined
+  currentSql: string | undefined,
+  expectedTriggers?: readonly ViewTriggerDefinition[],
+  currentTriggers?: readonly ViewTriggerDefinition[]
 ): void {
-  if (expectedSql !== undefined && !isViewDefinitionSnapshotCurrent(expectedSql, currentSql)) {
+  if ((expectedSql !== undefined && !isViewDefinitionSnapshotCurrent(expectedSql, currentSql))
+      || !isViewTriggerSnapshotCurrent(expectedTriggers, currentTriggers)) {
     throw new Error(VIEW_DEFINITION_CONFLICT_MESSAGE);
   }
 }

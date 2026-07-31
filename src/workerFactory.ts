@@ -31,7 +31,8 @@ import type {
   SchemaSnapshot,
   ColumnMetadata,
   ViewDefinition,
-  ViewEditResult
+  ViewEditResult,
+  ViewTriggerDefinition
 } from './core/types';
 
 import { Worker } from './platform/threadPool';
@@ -89,7 +90,13 @@ interface WorkerMethods {
   validateViewDefinition(view: string, selectSql: string): Promise<void>;
   previewViewDefinition(view: string, selectSql: string, limit?: number): Promise<QueryResultSet>;
   createView(view: string, selectSql: string): Promise<ViewDefinition>;
-  editView(view: string, selectSql: string, preserveTriggers?: boolean, expectedSql?: string): Promise<ViewEditResult>;
+  editView(
+    view: string,
+    selectSql: string,
+    preserveTriggers?: boolean,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ): Promise<ViewEditResult>;
   dropView(view: string): Promise<ViewDefinition>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
@@ -101,6 +108,29 @@ interface WorkerMethods {
   setPragma(pragma: string, value: CellValue): Promise<void>;
   ping(): Promise<boolean>;
   writeToFile(path: string): Promise<void>;
+}
+
+type WorkerLogLevel = 'log' | 'warn' | 'error';
+
+function formatWorkerLogArgument(value: unknown): string {
+  if (value instanceof Error) return value.message;
+  if (typeof value === 'string') return value;
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? String(value) : serialized;
+  } catch {
+    // Logging must not mask the database failure it is trying to report.
+    return String(value);
+  }
+}
+
+function forwardWorkerLog(level: WorkerLogLevel, args: unknown[]): void {
+  const text = args.map(formatWorkerLogArgument).join(' ');
+  if (GlobalOutputChannel) {
+    GlobalOutputChannel.appendLine(`[Worker/${level}] ${text}`);
+  } else {
+    console[level]('[Worker]', ...args);
+  }
 }
 
 // ============================================================================
@@ -209,7 +239,11 @@ async function createWasmDatabaseConnection(
 async function createInProcessWasmDatabaseConnection(
   extensionUri: vsc.Uri
 ): Promise<DatabaseConnectionBundle> {
-  const endpoint = createWorkerEndpoint();
+  // The browser endpoint has no RPC worker envelope to carry engine warnings,
+  // so bridge the same logger directly to the extension output channel.
+  const endpoint = createWorkerEndpoint((level, ...args) => {
+    forwardWorkerLog(level, args);
+  });
 
   return {
     workerMethods: {
@@ -299,8 +333,19 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.previewViewDefinition(view, selectSql, limit),
         createView: (view: string, selectSql: string) =>
           endpoint.createView(view, selectSql),
-        editView: (view: string, selectSql: string, preserveTriggers?: boolean, expectedSql?: string) =>
-          endpoint.editView(view, selectSql, preserveTriggers, expectedSql),
+        editView: (
+          view: string,
+          selectSql: string,
+          preserveTriggers?: boolean,
+          expectedSql?: string,
+          expectedTriggers?: readonly ViewTriggerDefinition[]
+        ) => endpoint.editView(
+          view,
+          selectSql,
+          preserveTriggers,
+          expectedSql,
+          expectedTriggers
+        ),
         dropView: (view: string) =>
           endpoint.dropView(view),
         updateCellBatch: (table: string, updates: CellUpdate[]) =>
@@ -349,15 +394,6 @@ async function createWorkerBackedWasmDatabaseConnection(
   // Create IPC proxy for Node.js worker communication
   // Route worker log messages to the VS Code output channel for visibility.
   // Falls back to console if no output channel is available (e.g., during tests).
-  const logHandler = (level: 'log' | 'warn' | 'error', args: unknown[]) => {
-    const text = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
-    if (GlobalOutputChannel) {
-      GlobalOutputChannel.appendLine(`[Worker/${level}] ${text}`);
-    } else {
-      console[level]('[Worker]', ...args);
-    }
-  };
-
   const workerProxy = connectWorkerPort<WorkerMethods>(
     {
       postMessage: (data: unknown, transfer?: Transferable[]) => {
@@ -375,7 +411,7 @@ async function createWorkerBackedWasmDatabaseConnection(
       }
     },
     ['initializeDatabase', 'runQuery', 'exportDatabase', 'applyModifications', 'undoModification', 'redoModification', 'flushChanges', 'discardModifications', 'updateCell', 'insertRow', 'insertRowBatch', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'getViewDefinition', 'validateViewDefinition', 'previewViewDefinition', 'createView', 'editView', 'dropView', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile'],
-    logHandler
+    forwardWorkerLog
   );
 
   // Termination handler
@@ -476,7 +512,7 @@ async function createWorkerBackedWasmDatabaseConnection(
         // prototype. Preserve cancellation that was already requested, but do
         // not serialize the signal. Mid-operation cancellation will require a
         // dedicated cancel message and worker-local AbortController.
-        const callWorkerAfterAbortCheck = <T>(
+        const callWorkerAfterAbortCheck = async <T>(
           signal: AbortSignal | undefined,
           call: () => Promise<T>
         ): Promise<T> => {
@@ -529,8 +565,19 @@ async function createWorkerBackedWasmDatabaseConnection(
             workerProxy.previewViewDefinition(view, selectSql, limit),
           createView: (view: string, selectSql: string) =>
             workerProxy.createView(view, selectSql),
-          editView: (view: string, selectSql: string, preserveTriggers?: boolean, expectedSql?: string) =>
-            workerProxy.editView(view, selectSql, preserveTriggers, expectedSql),
+          editView: (
+            view: string,
+            selectSql: string,
+            preserveTriggers?: boolean,
+            expectedSql?: string,
+            expectedTriggers?: readonly ViewTriggerDefinition[]
+          ) => workerProxy.editView(
+            view,
+            selectSql,
+            preserveTriggers,
+            expectedSql,
+            expectedTriggers
+          ),
           dropView: (view: string) =>
             workerProxy.dropView(view),
           updateCellBatch: (table: string, updates: CellUpdate[]) => {

@@ -22,7 +22,8 @@ import type {
   ColumnMetadata,
   ColumnDefinition,
   ViewDefinition,
-  ViewEditResult
+  ViewEditResult,
+  ViewTriggerDefinition
 } from '../../types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from '../../sql-utils';
 import { crypto } from '../../../platform/cryptoShim';
@@ -1019,17 +1020,42 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       ? extractViewColumnListSql(existingSql)
       : undefined;
 
-    // WASM preview deliberately remains a non-DDL query, so it also works for
-    // read-only documents. A CTE column list gives it the exact schema names
-    // that CREATE VIEW will preserve without creating a disposable object.
-    if (columnListSql) {
-      const previewSource = escapeIdentifier('sqlx_preview');
+    if (this.readOnlyMode) {
+      // Read-only documents cannot run disposable schema DDL. A target-named
+      // CTE still shadows ordinary unqualified references to the installed
+      // view and preserves explicit output names; writable previews below use
+      // the exact CREATE VIEW context and also catch schema-qualified cycles.
+      const previewSource = escapeIdentifier(view);
+      if (columnListSql) {
+        return this.executeSingleQuery(
+          `WITH ${previewSource} ${columnListSql} AS (${body}\n) ` +
+          `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`
+        );
+      }
       return this.executeSingleQuery(
-        `WITH ${previewSource} ${columnListSql} AS (${body}\n) ` +
+        `WITH ${previewSource} AS (${body}\n) ` +
         `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`
       );
     }
-    return this.executeSingleQuery(`SELECT * FROM (${body}\n) LIMIT ${boundedLimit}`);
+
+    const savepointName = this.createSavepointName('sp_preview_view');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      if (typeof existingSql === 'string') {
+        this.runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+      }
+      this.runSingleStatement(buildCreateViewSql(view, body, columnListSql));
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+      const result = this.executeSingleQuery(
+        `SELECT * FROM ${escapeIdentifier(view)} LIMIT ${boundedLimit}`
+      );
+      await this.executeQuery(`ROLLBACK TO ${savepointName}`);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return result;
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'previewViewDefinition');
+      throw err;
+    }
   }
 
   async createView(view: string, selectSql: string): Promise<ViewDefinition> {
@@ -1053,7 +1079,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     view: string,
     selectSql: string,
     preserveTriggers: boolean = true,
-    expectedSql?: string
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
   ): Promise<ViewEditResult> {
     const body = normalizeViewSelectSql(selectSql);
     this.compileViewSelect(body);
@@ -1064,7 +1091,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       // prevents a stale editor snapshot from being silently overwritten even
       // when another connection races between the UI check and this mutation.
       const before = await this.getViewDefinition(view);
-      assertViewDefinitionSnapshotCurrent(expectedSql, before.sql);
+      assertViewDefinitionSnapshotCurrent(
+        expectedSql,
+        before.sql,
+        expectedTriggers,
+        before.triggers
+      );
       this.runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
       this.runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);

@@ -27,7 +27,15 @@ interface FakeEndpoint {
   ping(): Promise<boolean>;
 }
 
-function loadBrowserWorkerFactory(endpoint: FakeEndpoint) {
+type EndpointLogger = (
+  level: 'log' | 'warn' | 'error',
+  ...args: unknown[]
+) => void;
+
+function loadBrowserWorkerFactory(endpoint: FakeEndpoint, options: {
+  captureLogger?: (logger: EndpointLogger | undefined) => void;
+  outputChannel?: { appendLine(line: string): void };
+} = {}) {
   const jsCode = esbuild.transformSync(workerFactorySource, {
     loader: 'ts',
     format: 'cjs',
@@ -46,7 +54,10 @@ function loadBrowserWorkerFactory(endpoint: FakeEndpoint) {
     if (request === 'vscode') return mockVscode;
     if (request.endsWith('core/sqlite-db')) {
       return {
-        createWorkerEndpoint: () => endpoint
+        createWorkerEndpoint: (logger?: EndpointLogger) => {
+          options.captureLogger?.(logger);
+          return endpoint;
+        }
       };
     }
     if (request.endsWith('core/rpc')) {
@@ -75,7 +86,7 @@ function loadBrowserWorkerFactory(endpoint: FakeEndpoint) {
       };
     }
     if (request.endsWith('main')) {
-      return { GlobalOutputChannel: null };
+      return { GlobalOutputChannel: options.outputChannel ?? null };
     }
     return originalRequire.call(this, request);
   };
@@ -305,5 +316,35 @@ describe('workerFactory browser WASM connection', () => {
     await connection.databaseOps.discardModifications([mod], abortController.signal);
 
     assert.deepStrictEqual(calls, ['apply', 'undo', 'redo', 'flush', 'discard']);
+  });
+
+  it('routes in-process engine diagnostics to the SQLite Explorer output channel', async () => {
+    let logger: EndpointLogger | undefined;
+    const lines: string[] = [];
+    const endpoint: FakeEndpoint = {
+      initializeDatabase: async () => ({ isReadOnly: false }),
+      runQuery: async () => [],
+      exportDatabase: async () => new Uint8Array(),
+      updateCell: async () => {},
+      insertRow: async () => 1,
+      updateCellBatch: async () => {},
+      ping: async () => true
+    };
+
+    const workerFactory = loadBrowserWorkerFactory(endpoint, {
+      captureLogger: value => { logger = value; },
+      outputChannel: { appendLine: line => lines.push(line) }
+    });
+    await workerFactory.createDatabaseConnection(
+      { scheme: 'vscode-vfs', fsPath: '/ext', path: '/ext' } as any,
+      null as any
+    );
+
+    assert.ok(logger, 'the in-process endpoint must receive a logger');
+    logger('warn', 'Skipping view undo:', new Error('definition missing from history entry'));
+    assert.strictEqual(
+      lines.at(-1),
+      '[Worker/warn] Skipping view undo: definition missing from history entry'
+    );
   });
 });

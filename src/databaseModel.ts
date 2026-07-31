@@ -38,6 +38,8 @@ export type DocumentModification = LabeledModification;
 /** Database content change, optionally tied to the history entry just applied. */
 export interface DocumentContentChange {
   readonly modification?: DocumentModification;
+  /** Whether history applied the entry forward or restored its prior state. */
+  readonly modificationDirection?: 'forward' | 'undo';
   /** The whole live database was replaced, so every open schema document is stale. */
   readonly invalidateAllViewDocuments?: boolean;
 }
@@ -283,7 +285,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         }
         try {
             await this.databaseOperations.undoModification(undoneEntry);
-            this.#contentChangeEmitter.fire({ modification: undoneEntry });
+            this.#contentChangeEmitter.fire({
+              modification: undoneEntry,
+              modificationDirection: 'undo'
+            });
             this.#autoSaveIfNeeded();
         } catch (e) {
             const errorMessage = e instanceof Error ? e.message : String(e);
@@ -299,7 +304,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         }
         try {
             await this.databaseOperations.redoModification(redoneEntry);
-            this.#contentChangeEmitter.fire({ modification: redoneEntry });
+            this.#contentChangeEmitter.fire({
+              modification: redoneEntry,
+              modificationDirection: 'forward'
+            });
             this.#autoSaveIfNeeded();
         } catch (e) {
              const errorMessage = e instanceof Error ? e.message : String(e);
@@ -317,7 +325,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   recordExternalModification(modification: DocumentModification): void {
     this.recordModification(modification);
-    this.#contentChangeEmitter.fire({ modification });
+    this.#contentChangeEmitter.fire({
+      modification,
+      modificationDirection: 'forward'
+    });
   }
 
   // ============================================================================

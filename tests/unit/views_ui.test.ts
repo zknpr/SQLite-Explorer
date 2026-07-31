@@ -480,7 +480,8 @@ describe('view modal concurrency', () => {
                 'shared_view',
                 'SELECT 3 AS value',
                 true,
-                originalDefinition.sql
+                originalDefinition.sql,
+                originalDefinition.triggers
             ]]);
             assert.strictEqual(elements.viewModal.classList.contains('hidden'), false);
             assert.match(elements.viewValidationStatus.textContent, /changed outside this editor/i);
@@ -489,6 +490,60 @@ describe('view modal concurrency', () => {
             backendApi.getViewDefinition = originals.get;
             backendApi.validateViewDefinition = originals.validate;
             backendApi.editView = originals.edit;
+        }
+    });
+
+    it('keeps a modal draft open when only the view trigger snapshot changed', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openEditViewModal } = await import(viewsModulePath);
+        const originalDefinition = {
+            sql: 'CREATE VIEW trigger_shared_view AS SELECT 1 AS value',
+            selectSql: 'SELECT 1 AS value',
+            triggers: [{ identifier: 'first_trigger', sql: 'CREATE TRIGGER first_trigger' }]
+        };
+        const latestDefinition = {
+            ...originalDefinition,
+            triggers: [
+                ...originalDefinition.triggers,
+                { identifier: 'second_trigger', sql: 'CREATE TRIGGER second_trigger' }
+            ]
+        };
+        const originals = {
+            get: backendApi.getViewDefinition,
+            validate: backendApi.validateViewDefinition,
+            edit: backendApi.editView
+        };
+        let getCalls = 0;
+        let editCalls = 0;
+        backendApi.getViewDefinition = async () => (
+            getCalls++ === 0 ? originalDefinition : latestDefinition
+        );
+        backendApi.validateViewDefinition = async () => undefined;
+        backendApi.editView = async () => { editCalls++; };
+        const originalReadOnly = state.isReadOnly;
+        state.isReadOnly = false;
+
+        try {
+            initViews();
+            await openEditViewModal('trigger_shared_view');
+            elements.viewSelectSql.value = 'SELECT 2 AS value';
+
+            await listener('btnSaveView', 'click')();
+
+            assert.strictEqual(editCalls, 0);
+            assert.strictEqual(elements.viewModal.classList.contains('hidden'), false);
+            assert.match(elements.viewValidationStatus.textContent, /changed outside this editor/i);
+            assert.strictEqual(elements.btnReloadViewDefinition.hidden, false);
+        } finally {
+            backendApi.getViewDefinition = originals.get;
+            backendApi.validateViewDefinition = originals.validate;
+            backendApi.editView = originals.edit;
+            state.isReadOnly = originalReadOnly;
         }
     });
 

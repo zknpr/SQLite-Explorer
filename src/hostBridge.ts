@@ -14,7 +14,7 @@ import { ConfigurationSection, ExtensionId, SidebarLeft, SidebarRight, UriScheme
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewTriggerDefinition } from './core/types';
 import { generateMergePatch } from './core/json-utils';
 import { escapeIdentifier } from './core/sql-utils';
 
@@ -416,15 +416,21 @@ export class HostBridge implements ToastService {
     view: string,
     selectSql: string,
     preserveTriggers: boolean = true,
-    expectedSql?: string
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
   ) {
     const dbOps = this.ensureDatabaseInitialized();
     if (this.isReadOnly) {
       throw new Error('Document is read-only');
     }
 
+    let triggerSnapshot = expectedTriggers;
     if (!preserveTriggers) {
       const current = await dbOps.getViewDefinition(view);
+      // Direct callers may not already hold a modal/editor snapshot. Capture
+      // the exact trigger state shown in this confirmation so the engine can
+      // reject a trigger added or changed while the dialog is open.
+      triggerSnapshot ??= current.triggers;
       if (current.triggers.length > 0) {
         const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
         const answer = await vsc.window.showWarningMessage(
@@ -439,7 +445,13 @@ export class HostBridge implements ToastService {
       }
     }
 
-    const result = await dbOps.editView(view, selectSql, preserveTriggers, expectedSql);
+    const result = await dbOps.editView(
+      view,
+      selectSql,
+      preserveTriggers,
+      expectedSql,
+      triggerSnapshot
+    );
     this.document.recordExternalModification({
       label: 'Edit View',
       description: `Edit view ${view}`,

@@ -11,11 +11,13 @@ import { formatCellValueAsText } from './utils.js';
 import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
 import {
     isViewDefinitionConflictError,
-    isViewDefinitionSnapshotCurrent
+    isViewDefinitionSnapshotCurrent,
+    isViewTriggerSnapshotCurrent
 } from '../../../src/core/view-utils.ts';
 
 let editingViewName = null;
 let editingViewDefinitionSql;
+let editingViewDefinitionTriggers;
 let activeViewModalSession = 0;
 let activePreviewRequest = 0;
 let isSavingView = false;
@@ -103,6 +105,11 @@ function draftsMatch(left, right) {
 function applyViewDefinitionToEditor(definition) {
     const elements = getElements();
     editingViewDefinitionSql = definition.sql;
+    editingViewDefinitionTriggers = (definition.triggers ?? []).map(trigger => ({
+        identifier: trigger.identifier,
+        sql: trigger.sql,
+        ...(trigger.temporary ? { temporary: true } : {})
+    }));
     elements.sql.value = definition.selectSql;
     elements.preserveTriggers.checked = true;
 
@@ -146,6 +153,7 @@ export function openCreateViewModal() {
     activeViewModalSession++;
     editingViewName = null;
     editingViewDefinitionSql = undefined;
+    editingViewDefinitionTriggers = undefined;
     const elements = getElements();
     resetTextareaTabFocusEscape(elements.sql);
     elements.title.textContent = 'Create View';
@@ -258,6 +266,7 @@ async function saveDraft() {
     const draft = getDraft();
     const targetView = editingViewName;
     const targetDefinitionSql = editingViewDefinitionSql;
+    const targetDefinitionTriggers = editingViewDefinitionTriggers;
     isSavingView = true;
     const saveElements = getElements();
     const saveButton = saveElements.save;
@@ -274,7 +283,11 @@ async function saveDraft() {
         if (targetView) {
             const currentDefinition = await backendApi.getViewDefinition(targetView);
             if (!isCurrentModalSession(modalSession)) return;
-            if (!isViewDefinitionSnapshotCurrent(targetDefinitionSql, currentDefinition.sql)) {
+            if (!isViewDefinitionSnapshotCurrent(targetDefinitionSql, currentDefinition.sql)
+                || !isViewTriggerSnapshotCurrent(
+                    targetDefinitionTriggers,
+                    currentDefinition.triggers
+                )) {
                 showDefinitionConflict();
                 return;
             }
@@ -286,7 +299,8 @@ async function saveDraft() {
                 targetView,
                 draft.selectSql,
                 draft.preserveTriggers,
-                targetDefinitionSql
+                targetDefinitionSql,
+                targetDefinitionTriggers
             )
             : await backendApi.createView(draft.name, draft.selectSql);
         if (result?.cancelled) {

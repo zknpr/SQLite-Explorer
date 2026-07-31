@@ -6,6 +6,7 @@ import * as vscode from 'vscode';
 
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import type { DatabaseOperations, ViewDefinition } from '../../src/core/types';
+import { normalizeViewSelectSql } from '../../src/core/view-utils';
 import { HostBridge } from '../../src/hostBridge';
 
 async function createEngine(): Promise<DatabaseOperations> {
@@ -344,6 +345,41 @@ describe('view operations', () => {
         );
     });
 
+    for (const [commentKind, draft, normalized] of [
+        [
+            'line',
+            'SELECT MAX(quantity) AS m FROM inventory; -- rollup of stock',
+            'SELECT MAX(quantity) AS m FROM inventory -- rollup of stock'
+        ],
+        [
+            'block',
+            'SELECT MAX(quantity) AS m FROM inventory; /* rollup of stock */',
+            'SELECT MAX(quantity) AS m FROM inventory /* rollup of stock */'
+        ]
+    ] as const) {
+        it(`strips a terminator before a trailing ${commentKind} comment`, async () => {
+            assert.strictEqual(normalizeViewSelectSql(draft), normalized);
+
+            const engine = await createEngine();
+            try {
+                await engine.executeQuery('CREATE TABLE inventory (quantity INTEGER)');
+                await engine.executeQuery('INSERT INTO inventory VALUES (4), (9)');
+                const created = await engine.createView('commented_rollup', draft);
+                assert.strictEqual(created.selectSql, normalized);
+
+                await engine.validateViewDefinition('commented_rollup', draft);
+                const preview = await engine.previewViewDefinition('commented_rollup', draft, 10);
+                assert.deepStrictEqual(preview.headers, ['m']);
+                assert.deepStrictEqual(preview.rows, [[9]]);
+
+                const edit = await engine.editView('commented_rollup', draft, true);
+                assert.strictEqual(edit.after.selectSql, normalized);
+            } finally {
+                (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+    }
+
     it('rejects a trailing statement before creating any view', async () => {
         const engine = await createEngine();
         try {
@@ -425,6 +461,42 @@ describe('view operations', () => {
         }
     });
 
+    it('rejects a stale trigger snapshot atomically before discarding any trigger', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE VIEW trigger_cas_view AS SELECT 1 AS value');
+            await engine.executeQuery(
+                'CREATE TRIGGER trigger_cas_first INSTEAD OF INSERT ON trigger_cas_view ' +
+                'BEGIN SELECT 1; END'
+            );
+            const stale = await engine.getViewDefinition('trigger_cas_view');
+            await engine.executeQuery(
+                'CREATE TRIGGER trigger_cas_second INSTEAD OF UPDATE ON trigger_cas_view ' +
+                'BEGIN SELECT 2; END'
+            );
+
+            await assert.rejects(
+                () => engine.editView(
+                    'trigger_cas_view',
+                    'SELECT 2 AS value',
+                    false,
+                    stale.sql,
+                    stale.triggers
+                ),
+                /changed outside this editor/i
+            );
+
+            const current = await engine.getViewDefinition('trigger_cas_view');
+            assert.strictEqual(current.selectSql, 'SELECT 1 AS value');
+            assert.deepStrictEqual(
+                current.triggers.map(trigger => trigger.identifier),
+                ['trigger_cas_first', 'trigger_cas_second']
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('validates with SQLite and previews without changing the schema', async () => {
         const engine = await createEngine();
         try {
@@ -450,6 +522,33 @@ describe('view operations', () => {
 
             const schema = await engine.fetchSchema();
             assert.strictEqual(schema.views.some(view => view.identifier === 'preview_only'), false);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('previews an edit in the target-name context instead of resolving the old view', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.createView('self_shadowed_view', 'SELECT 7 AS value');
+
+            await assert.rejects(
+                () => engine.previewViewDefinition(
+                    'self_shadowed_view',
+                    'SELECT value FROM main.self_shadowed_view',
+                    10
+                ),
+                /circular/i
+            );
+
+            assert.strictEqual(
+                (await engine.getViewDefinition('self_shadowed_view')).selectSql,
+                'SELECT 7 AS value'
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM self_shadowed_view'))[0].rows,
+                [[7]]
+            );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
         }
@@ -685,17 +784,46 @@ describe('view operations', () => {
             'active_users',
             after.selectSql,
             true,
-            before.sql
+            before.sql,
+            before.triggers
         );
 
         assert.deepStrictEqual(editView.mock.calls[0].arguments, [
             'active_users',
             after.selectSql,
             true,
-            before.sql
+            before.sql,
+            before.triggers
         ]);
         assert.deepStrictEqual(result, { before, after });
         assert.strictEqual(recordExternalModification.mock.callCount(), 1);
+    });
+
+    it('atomically guards the trigger snapshot accepted by the discard confirmation', async () => {
+        const before = createViewDefinition({
+            triggers: [{
+                identifier: 'active_users_insert',
+                sql: 'CREATE TRIGGER active_users_insert INSTEAD OF INSERT ON active_users BEGIN SELECT 1; END'
+            }]
+        });
+        const after = { ...before, triggers: [] };
+        const editView = mock.fn(async () => ({ before, after }));
+        const getViewDefinition = mock.fn(async () => before);
+        const { bridge } = createHostBridge({ editView, getViewDefinition });
+        mock.method(vscode.window, 'showWarningMessage', async () => ({
+            title: 'Edit and Drop Triggers',
+            value: true
+        }));
+
+        await bridge.editView('active_users', 'SELECT id FROM users', false, before.sql);
+
+        assert.deepStrictEqual(editView.mock.calls[0].arguments, [
+            'active_users',
+            'SELECT id FROM users',
+            false,
+            before.sql,
+            before.triggers
+        ]);
     });
 
     it('drops a view only after modal confirmation and records the reversible definition', async () => {

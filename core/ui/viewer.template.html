@@ -157,6 +157,10 @@
         </div>
     </div>
 
+    <p id="multilineEditorKeyboardHint" class="visually-hidden">
+        Press Escape, then Tab to move focus out of the editor.
+    </p>
+
     <!-- Create/Edit View Modal -->
     <div class="modal-overlay hidden" id="viewModal">
         <div class="modal-dialog modal-dialog-lg view-editor-dialog">
@@ -172,7 +176,7 @@
                 <div class="form-field">
                     <label for="viewSelectSql">SELECT Definition</label>
                     <textarea id="viewSelectSql" class="view-sql-editor" spellcheck="false"
-                        aria-description="Press Escape, then Tab to move focus out of the editor."></textarea>
+                        aria-describedby="multilineEditorKeyboardHint"></textarea>
                 </div>
                 <div class="view-trigger-options" id="viewTriggerOptions" hidden>
                     <label class="view-trigger-label">
@@ -367,7 +371,7 @@
             </div>
             <div class="cell-preview-body">
                 <textarea class="cell-preview-textarea" id="cellPreviewTextarea" spellcheck="false"
-                    aria-description="Press Escape, then Tab to move focus out of the editor."></textarea>
+                    aria-describedby="multilineEditorKeyboardHint"></textarea>
             </div>
             <div class="cell-preview-footer">
                 <div class="cell-preview-info">
