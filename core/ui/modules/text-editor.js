@@ -1,6 +1,11 @@
 const DEFAULT_INDENT = '    ';
 const focusEscapeArmed = new WeakSet();
 
+/** Clear the one-shot focus escape when a static textarea starts a new session. */
+export function resetTextareaTabFocusEscape(textarea) {
+    if (textarea) focusEscapeArmed.delete(textarea);
+}
+
 function clampPosition(value, position) {
     return Math.max(0, Math.min(value.length, Number.isFinite(position) ? position : 0));
 }

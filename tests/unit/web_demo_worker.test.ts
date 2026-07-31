@@ -139,6 +139,65 @@ describe('web demo view worker', () => {
         assert.doesNotMatch(String(storedSql), /a:1/);
     });
 
+    it('previews an edited view through its preserved explicit column list', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE VIEW preview_columns (public_id, public_name) AS " +
+            "SELECT 1 AS internal_id, 'before' AS internal_name"
+        );
+
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'preview_columns',
+            "SELECT 2 AS replacement_id, 'after' AS replacement_name",
+            10
+        );
+
+        assert.deepStrictEqual(Array.from(preview.headers), ['public_id', 'public_name']);
+        assert.deepStrictEqual(
+            Array.from(preview.rows, (row: unknown[]) => Array.from(row)),
+            [[2, 'after']]
+        );
+    });
+
+    it('treats percent and underscore filters as literal LIKE text', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE literal_filters (value TEXT); " +
+            "INSERT INTO literal_filters VALUES ('100% literal'), ('1000 literal'), " +
+            "('under_score'), ('underXscore')"
+        );
+
+        const percent = await worker.invoke('fetchTableData', 'literal_filters', {
+            columns: ['value'],
+            filters: [{ column: 'value', value: '%' }],
+            limit: 100,
+            offset: 0
+        });
+        const underscore = await worker.invoke('fetchTableData', 'literal_filters', {
+            columns: ['value'],
+            globalFilter: '_',
+            limit: 100,
+            offset: 0
+        });
+        const underscoreCount = await worker.invoke('fetchTableCount', 'literal_filters', {
+            columns: ['value'],
+            globalFilter: '_'
+        });
+
+        assert.deepStrictEqual(
+            Array.from(percent.rows, (row: unknown[]) => Array.from(row)),
+            [['100% literal']]
+        );
+        assert.deepStrictEqual(
+            Array.from(underscore.rows, (row: unknown[]) => Array.from(row)),
+            [['under_score']]
+        );
+        assert.strictEqual(underscoreCount, 1);
+    });
+
     it('validates the CREATE VIEW construct and leaves the schema unchanged', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke('runQuery', 'CREATE VIEW validation_target (a, b) AS SELECT 1, 2');

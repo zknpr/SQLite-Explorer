@@ -40,4 +40,9 @@ describe('getQueryTimeout', () => {
     configStore.set('queryTimeout', 60000);
     assert.strictEqual(getQueryTimeout(), 60000);
   });
+
+  it('clamps hand-edited values below the configuration schema minimum', () => {
+    configStore.set('queryTimeout', 0);
+    assert.strictEqual(getQueryTimeout(), 1000);
+  });
 });

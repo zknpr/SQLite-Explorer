@@ -73,10 +73,13 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
     process.env.HOME = testDir;
     process.env.TMPDIR = testDir;
 
-    const rawWorker = new NativeWorkerProcess(binary, workerScript);
+    let rawWorker: NativeWorkerProcess | undefined;
+    let bundle: Awaited<ReturnType<typeof createNativeDatabaseConnection>> | undefined;
     try {
-        await rawWorker.start();
-        await rawWorker.call('open', [databasePath, false]);
+        const activeRawWorker = new NativeWorkerProcess(binary, workerScript);
+        rawWorker = activeRawWorker;
+        await activeRawWorker.start();
+        await activeRawWorker.call('open', [databasePath, false]);
 
         await testContext.test('retains the boundary on multiline SQL and rejects a statement tail', async () => {
             const body = `SELECT
@@ -84,14 +87,14 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
     MAX(2) AS second_value`;
             const createSql = `CREATE VIEW "boundary_multiline" AS ${body}`;
             const boundary = '/*sqlite_explorer_boundary_native_smoke*/';
-            await rawWorker.call('runSingle', [
+            await activeRawWorker.call('runSingle', [
                 `${createSql}\n${boundary}`,
                 createSql,
                 undefined,
                 boundary
             ]);
 
-            const stored = await rawWorker.call<{ values: unknown[][] }>('query', [
+            const stored = await activeRawWorker.call<{ values: unknown[][] }>('query', [
                 "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'boundary_multiline'"
             ]);
             assert.strictEqual(stored.values[0][0], createSql);
@@ -100,7 +103,7 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             const validatedMismatchSql = 'CREATE VIEW "boundary_mismatch" AS SELECT MAX(2) AS value';
             const mismatchBoundary = '/*sqlite_explorer_boundary_native_mismatch*/';
             await assert.rejects(
-                rawWorker.call('runSingle', [
+                activeRawWorker.call('runSingle', [
                     `${validatedMismatchSql}\n${mismatchBoundary}`,
                     mismatchSql,
                     undefined,
@@ -108,16 +111,16 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 ]),
                 /Single-statement SQL payload mismatch/
             );
-            const mismatchView = await rawWorker.call<{ values: unknown[][] }>('query', [
+            const mismatchView = await activeRawWorker.call<{ values: unknown[][] }>('query', [
                 "SELECT name FROM sqlite_schema WHERE type = 'view' AND name = 'boundary_mismatch'"
             ]);
             assert.deepStrictEqual(mismatchView.values, []);
 
-            await rawWorker.call('run', ['CREATE TABLE boundary_guard (id INTEGER)']);
+            await activeRawWorker.call('run', ['CREATE TABLE boundary_guard (id INTEGER)']);
             const tailedSql = 'DROP TABLE boundary_guard; SELECT 1';
             const tailBoundary = '/*sqlite_explorer_boundary_native_tail*/';
             await assert.rejects(
-                rawWorker.call('runSingle', [
+                activeRawWorker.call('runSingle', [
                     `${tailedSql}\n${tailBoundary}`,
                     tailedSql,
                     undefined,
@@ -125,17 +128,15 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 ]),
                 /Exactly one SQL statement is required/
             );
-            const guard = await rawWorker.call<{ values: unknown[][] }>('query', [
+            const guard = await activeRawWorker.call<{ values: unknown[][] }>('query', [
                 "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'boundary_guard'"
             ]);
             assert.deepStrictEqual(guard.values, [['boundary_guard']]);
         });
-    } finally {
-        rawWorker.stop();
-    }
+        activeRawWorker.stop();
+        rawWorker = undefined;
 
-    const bundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
-    try {
+        bundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
         const connection = await bundle.establishConnection(
             vscode.Uri.file(databasePath),
             'native-smoke.sqlite'
@@ -186,6 +187,22 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             assert.deepStrictEqual(preview.rows[99], [100, 1000]);
         });
 
+        await testContext.test('previews through an existing explicit column list', async () => {
+            await engine.executeQuery(
+                'CREATE VIEW preview_columns (public_id, public_name) AS ' +
+                "SELECT 1 AS internal_id, 'before' AS internal_name"
+            );
+
+            const preview = await engine.previewViewDefinition(
+                'preview_columns',
+                "SELECT 2 AS replacement_id, 'after' AS replacement_name",
+                10
+            );
+
+            assert.deepStrictEqual(preview.headers, ['public_id', 'public_name']);
+            assert.deepStrictEqual(preview.rows, [[2, 'after']]);
+        });
+
         await testContext.test('round-trips the incident multiline view SQL exactly', async () => {
             await engine.createView('order_summary', INITIAL_VIEW_BODY);
             const initial = await engine.getViewDefinition('order_summary');
@@ -209,7 +226,8 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             );
         });
     } finally {
-        bundle.workerMethods[Symbol.dispose]();
+        rawWorker?.stop();
+        bundle?.workerMethods[Symbol.dispose]();
         if (previousHome === undefined) delete process.env.HOME;
         else process.env.HOME = previousHome;
         if (previousTmpDir === undefined) delete process.env.TMPDIR;

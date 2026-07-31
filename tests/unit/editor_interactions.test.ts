@@ -156,6 +156,27 @@ describe('editor keyboard and grid selection interactions', () => {
 
         assert.strictEqual(prevented, true);
         assert.strictEqual(textarea.value, 'a\n    b');
+
+        listener({
+            key: 'Escape',
+            shiftKey: false,
+            target: textarea,
+            preventDefault() {},
+            stopPropagation() {}
+        });
+        const blur = listeners.get('cellPreviewTextarea:blur');
+        assert.ok(blur, 'modal cell editor blur listener was not registered');
+        blur({ target: textarea });
+        textarea.value = 'value';
+        textarea.selectionStart = textarea.value.length;
+        textarea.selectionEnd = textarea.value.length;
+        listener({
+            key: 'Tab',
+            shiftKey: false,
+            target: textarea,
+            preventDefault() {}
+        });
+        assert.strictEqual(textarea.value, 'value    ');
     });
 
     it('commits an inline edit on Tab and advances to the next cell', async () => {

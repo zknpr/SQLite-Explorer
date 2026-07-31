@@ -163,6 +163,27 @@ describe('view operations', () => {
         }
     });
 
+    it('previews an edited view through its preserved explicit column list', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE VIEW preview_columns (public_id, public_name) AS ' +
+                'SELECT 1 AS internal_id, \'before\' AS internal_name'
+            );
+
+            const preview = await engine.previewViewDefinition(
+                'preview_columns',
+                "SELECT 2 AS replacement_id, 'after' AS replacement_name",
+                10
+            );
+
+            assert.deepStrictEqual(preview.headers, ['public_id', 'public_name']);
+            assert.deepStrictEqual(preview.rows, [[2, 'after']]);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('round-trips a verbatim explicit column list with duplicate names', async () => {
         const engine = await createEngine();
         try {

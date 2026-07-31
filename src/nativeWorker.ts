@@ -1118,20 +1118,32 @@ export async function createNativeDatabaseConnection(
           }
         },
 
-        previewViewDefinition: async (_view: string, selectSql: string, limit: number = 50) => {
+        previewViewDefinition: async (view: string, selectSql: string, limit: number = 50) => {
           if (forceReadOnly) {
             throw new Error('View preview is unavailable because the database is read-only');
           }
           const body = normalizeViewSelectSql(selectSql);
           const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
+          const existing = await worker.call<NativeQueryResult>('query', [
+            "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+            [view]
+          ]);
+          const existingSql = existing.values?.[0]?.[0];
+          const columnListSql = typeof existingSql === 'string'
+            ? extractViewColumnListSql(existingSql)
+            : undefined;
           // SQLite reserves every object name beginning with `sqlite_`, even
           // inside a savepoint. Keep generated preview objects in our own
-          // non-reserved namespace.
+          // non-reserved namespace. Unlike WASM/demo, native preview is DDL-
+          // based because the txiki row-object API needs a disposable view's
+          // positional schema; consequently it is explicitly refused read-only.
           const previewView = `sqlx_preview_${crypto.randomUUID().replace(/-/g, '')}`;
           const savepointName = createSavepointName('sp_preview_view');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
-            await runNativeSingleStatement(buildCreateViewSql(previewView, body));
+            await runNativeSingleStatement(
+              buildCreateViewSql(previewView, body, columnListSql)
+            );
             await compileNativeView(previewView);
             const info = await worker.call<NativeQueryResult>('query', [
               `PRAGMA table_info(${escapeIdentifier(previewView)})`
@@ -1204,6 +1216,9 @@ export async function createNativeDatabaseConnection(
               }
             }
             const after = await getNativeViewDefinition(view);
+            // Only the native transport accepts duplicate validated/executable
+            // SQL payloads, so only this engine needs a post-edit comparison to
+            // detect transport divergence before releasing the savepoint.
             if (after.selectSql !== body) {
               throw new Error(
                 'Native SQLite stored a view definition different from the submitted SQL; the replacement was rolled back'

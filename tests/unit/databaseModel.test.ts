@@ -801,6 +801,44 @@ describe('DatabaseDocument save/saveAs fallback', () => {
 
         assert.deepStrictEqual(discardedModifications, [firstModification]);
     });
+
+    it('identifies view mutations on content changes from edits, undo, and redo', async () => {
+        const applied: unknown[] = [];
+        const modification = {
+            label: 'Edit View',
+            description: 'Edit report view',
+            modificationType: 'view_edit' as const,
+            targetTable: 'report_view'
+        };
+        const dbOps = {
+            undoModification: async (entry: unknown) => assert.strictEqual(entry, modification),
+            redoModification: async (entry: unknown) => assert.strictEqual(entry, modification)
+        };
+        const doc = createDocBypassingFactory(dbOps);
+        let undo: (() => Promise<void>) | undefined;
+        let redo: (() => Promise<void>) | undefined;
+        doc.onDidChangeContent((event: any) => applied.push(event.modification));
+        doc.onDidChange((event: any) => {
+            undo = event.undo;
+            redo = event.redo;
+        });
+
+        doc.recordExternalModification(modification);
+        await undo!();
+        await redo!();
+
+        assert.deepStrictEqual(applied, [modification, modification, modification]);
+    });
+
+    it('notifies document-disposal subscribers before emitter teardown', async () => {
+        const doc = createDocBypassingFactory({});
+        let disposalNotifications = 0;
+        doc.onDidDispose(() => { disposalNotifications++; });
+
+        await doc.dispose();
+
+        assert.strictEqual(disposalNotifications, 1);
+    });
 });
 
 describe('DatabaseDocument hot-exit restore', () => {

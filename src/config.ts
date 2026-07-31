@@ -45,6 +45,7 @@ export const CopilotChatId = 'github.copilot-chat';
 
 /** Default query timeout in milliseconds (30 seconds). */
 export const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+const MIN_QUERY_TIMEOUT_MS = 1000;
 
 // ============================================================================
 // Configuration Accessors
@@ -68,5 +69,8 @@ export function getMaximumFileSizeBytes(): number {
  */
 export function getQueryTimeout(): number {
   const config = vsc.workspace.getConfiguration(ConfigurationSection);
-  return config.get<number>('queryTimeout', DEFAULT_QUERY_TIMEOUT_MS);
+  return Math.max(
+    MIN_QUERY_TIMEOUT_MS,
+    config.get<number>('queryTimeout', DEFAULT_QUERY_TIMEOUT_MS)
+  );
 }

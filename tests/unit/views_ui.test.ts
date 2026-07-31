@@ -161,13 +161,16 @@ describe('view modal concurrency', () => {
             const secondSave = save();
             await Promise.resolve();
             const disabledWhilePending = elements.btnSaveView.disabled;
+            const editorDisabledWhilePending = elements.viewSelectSql.disabled;
             validation.resolve();
             await Promise.all([firstSave, secondSave]);
 
             assert.strictEqual(validationCalls, 1);
             assert.strictEqual(createCalls, 1);
             assert.strictEqual(disabledWhilePending, true);
+            assert.strictEqual(editorDisabledWhilePending, true);
             assert.strictEqual(elements.btnSaveView.disabled, false);
+            assert.strictEqual(elements.viewSelectSql.disabled, false);
         } finally {
             backendApi.validateViewDefinition = originalValidate;
             backendApi.createView = originalCreate;
@@ -226,6 +229,47 @@ describe('view modal concurrency', () => {
         assert.strictEqual(prevented, true);
         assert.strictEqual(elements.viewSelectSql.value, 'SELECT\n    value');
         assert.strictEqual(elements.viewSelectSql.selectionStart, 11);
+    });
+
+    it('clears the one-shot Tab focus escape on blur and modal reopen', async () => {
+        const { elements, listener } = installViewDocument();
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { initViews, openCreateViewModal } = await import(viewsModulePath);
+
+        initViews();
+        openCreateViewModal();
+        elements.viewSelectSql.value = 'SELECT 1';
+        elements.viewSelectSql.selectionStart = 8;
+        elements.viewSelectSql.selectionEnd = 8;
+        const keydown = listener('viewSelectSql', 'keydown');
+        const escapeEvent = () => ({
+            key: 'Escape',
+            shiftKey: false,
+            target: elements.viewSelectSql,
+            preventDefault() {},
+            stopPropagation() {}
+        });
+        const tabEvent = () => ({
+            key: 'Tab',
+            shiftKey: false,
+            target: elements.viewSelectSql,
+            preventDefault() {}
+        });
+
+        keydown(escapeEvent());
+        listener('viewSelectSql', 'blur')({ target: elements.viewSelectSql });
+        keydown(tabEvent());
+        assert.strictEqual(elements.viewSelectSql.value, 'SELECT 1    ');
+
+        elements.viewSelectSql.value = 'SELECT 2';
+        elements.viewSelectSql.selectionStart = 8;
+        elements.viewSelectSql.selectionEnd = 8;
+        keydown(escapeEvent());
+        openCreateViewModal();
+        elements.viewSelectSql.selectionStart = elements.viewSelectSql.value.length;
+        elements.viewSelectSql.selectionEnd = elements.viewSelectSql.value.length;
+        keydown(tabEvent());
+        assert.strictEqual(elements.viewSelectSql.value, 'SELECT 1 AS value    ');
     });
 
     it('does not let a pending save mutate a newer modal session', async () => {

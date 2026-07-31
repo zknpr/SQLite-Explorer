@@ -1,11 +1,23 @@
 import * as vsc from 'vscode';
 import { DocumentRegistry } from './documentRegistry';
-import { Disposable } from './lifecycle';
 import { escapeIdentifier } from './core/sql-utils';
 import { GlobalOutputChannel } from './main';
 
-import type { DatabaseDocument } from './databaseModel';
+import type {
+    DatabaseDocument,
+    DocumentContentChange,
+    DocumentModification
+} from './databaseModel';
 import type { ViewEditResult } from './core/types';
+
+interface ViewDocumentMetadata {
+    ctime: number;
+    mtime: number;
+    view: string;
+    uri: vsc.Uri;
+    /** Stored CREATE VIEW SQL observed by the editor's most recent read. */
+    snapshotSql?: string;
+}
 
 function getViewDefinitionErrorDetail(error: unknown): string {
     const rawMessage = error instanceof Error ? error.message : String(error);
@@ -22,7 +34,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     private _emitter = new vsc.EventEmitter<vsc.FileChangeEvent[]>();
     private readonly viewDocumentMetadata = new Map<
         DatabaseDocument,
-        Map<string, { ctime: number; mtime: number }>
+        Map<string, ViewDocumentMetadata>
     >();
     private readonly viewDocumentDisposals = new Map<DatabaseDocument, vsc.Disposable>();
 
@@ -35,16 +47,27 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     }
 
     async stat(uri: vsc.Uri): Promise<vsc.FileStat> {
-        const { document, rowId } = this.parseUri(uri);
+        const { document, table, rowId } = this.parseUri(uri);
 
         if (rowId === '__view__.sql') {
-            const content = await this.readFile(uri);
-            const metadata = this.getViewDocumentMetadata(document, uri);
+            let size: number;
+            try {
+                const definition = await document.databaseOperations.getViewDefinition(table);
+                size = new TextEncoder().encode(definition.selectSql).byteLength;
+            } catch (err) {
+                // A missing schema object is a missing virtual document, not a
+                // raw database error from getViewDefinition().
+                if (this.isMissingViewError(err)) {
+                    throw vsc.FileSystemError.FileNotFound(uri);
+                }
+                throw err;
+            }
+            const metadata = this.getViewDocumentMetadata(document, uri, table);
             return {
                 type: vsc.FileType.File,
                 ctime: metadata.ctime,
                 mtime: metadata.mtime,
-                size: content.byteLength
+                size
             };
         }
 
@@ -84,7 +107,9 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             }
 
             if (rowId === '__view__.sql') {
+                const metadata = this.getViewDocumentMetadata(document, uri, table);
                 const definition = await document.databaseOperations.getViewDefinition(table);
+                metadata.snapshotSql = definition.sql;
                 return new TextEncoder().encode(definition.selectSql);
             }
 
@@ -144,6 +169,24 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         }
 
         if (rowId === '__view__.sql') {
+            const metadata = this.getViewDocumentMetadata(document, uri, table);
+            if (metadata.snapshotSql !== undefined) {
+                let currentSql: string;
+                try {
+                    currentSql = (await document.databaseOperations.getViewDefinition(table)).sql;
+                } catch (err) {
+                    if (this.isMissingViewError(err)) {
+                        this.rejectStaleViewWrite(document, uri);
+                    }
+                    throw vsc.FileSystemError.Unavailable(
+                        err instanceof Error ? err.message : String(err)
+                    );
+                }
+                if (currentSql !== metadata.snapshotSql) {
+                    this.rejectStaleViewWrite(document, uri);
+                }
+            }
+
             let result: ViewEditResult;
             try {
                 const selectSql = new TextDecoder('utf-8', { fatal: true }).decode(content);
@@ -164,6 +207,9 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 );
             }
 
+            // Update this editor's baseline before recordExternalModification
+            // synchronously broadcasts the change to every open URI.
+            metadata.snapshotSql = result.after.sql;
             document.recordExternalModification({
                 label: 'Edit View',
                 description: `Edit view ${table} from editor`,
@@ -172,8 +218,6 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 viewDefBefore: result.before,
                 viewDefAfter: result.after
             });
-            this.markViewDocumentWritten(document, uri);
-            this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
             return;
         }
 
@@ -265,31 +309,87 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
     private getViewDocumentMetadata(
         document: DatabaseDocument,
-        uri: vsc.Uri
-    ): { ctime: number; mtime: number } {
+        uri: vsc.Uri,
+        view: string
+    ): ViewDocumentMetadata {
         let documentMetadata = this.viewDocumentMetadata.get(document);
         if (!documentMetadata) {
             documentMetadata = new Map();
             this.viewDocumentMetadata.set(document, documentMetadata);
-            const disposal = document.onDidDispose(() => {
+
+            const contentChangeSubscription = document.onDidChangeContent(change => {
+                this.handleDocumentContentChange(document, change);
+            });
+            let disposeSubscription: vsc.Disposable = { dispose() {} };
+            const combinedSubscription: vsc.Disposable = {
+                dispose: () => {
+                    contentChangeSubscription.dispose();
+                    disposeSubscription.dispose();
+                }
+            };
+            disposeSubscription = document.onDidDispose(() => {
                 this.viewDocumentMetadata.delete(document);
                 this.viewDocumentDisposals.delete(document);
+                combinedSubscription.dispose();
             });
-            this.viewDocumentDisposals.set(document, disposal);
+            this.viewDocumentDisposals.set(document, combinedSubscription);
         }
 
         const key = uri.toString();
         let metadata = documentMetadata.get(key);
         if (!metadata) {
             const now = Date.now();
-            metadata = { ctime: now, mtime: now };
+            metadata = { ctime: now, mtime: now, view, uri };
             documentMetadata.set(key, metadata);
         }
         return metadata;
     }
 
-    private markViewDocumentWritten(document: DatabaseDocument, uri: vsc.Uri): void {
-        const metadata = this.getViewDocumentMetadata(document, uri);
+    private handleDocumentContentChange(
+        document: DatabaseDocument,
+        change: DocumentContentChange
+    ): void {
+        const modification = change.modification;
+        if (!modification || !this.isViewModification(modification) || !modification.targetTable) {
+            return;
+        }
+
+        const documentMetadata = this.viewDocumentMetadata.get(document);
+        if (!documentMetadata) return;
+        const changes: vsc.FileChangeEvent[] = [];
+        for (const metadata of documentMetadata.values()) {
+            if (metadata.view !== modification.targetTable) continue;
+            this.bumpViewDocumentMtime(metadata);
+            changes.push({
+                type: vsc.FileChangeType.Changed,
+                uri: metadata.uri
+            });
+        }
+        if (changes.length > 0) this._emitter.fire(changes);
+    }
+
+    private isViewModification(modification: DocumentModification): boolean {
+        return modification.modificationType === 'view_create'
+            || modification.modificationType === 'view_edit'
+            || modification.modificationType === 'view_drop';
+    }
+
+    private bumpViewDocumentMtime(metadata: ViewDocumentMetadata): void {
         metadata.mtime = Math.max(Date.now(), metadata.mtime + 1);
+    }
+
+    private rejectStaleViewWrite(document: DatabaseDocument, uri: vsc.Uri): never {
+        const { table } = this.parseUri(uri);
+        const metadata = this.getViewDocumentMetadata(document, uri, table);
+        this.bumpViewDocumentMtime(metadata);
+        this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
+        throw vsc.FileSystemError.Unavailable(
+            'The view changed outside this editor. Reload before saving; the view was not modified.'
+        );
+    }
+
+    private isMissingViewError(error: unknown): boolean {
+        const message = error instanceof Error ? error.message : String(error);
+        return /\bView not found:/i.test(message);
     }
 }

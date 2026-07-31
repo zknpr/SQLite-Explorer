@@ -320,6 +320,18 @@ function executeSingleStatement(db, markedSql, sql, params, requiredSuffix) {
  * support is intentionally a follow-up.
  */
 function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, limit, timeoutMs) {
+  const marker = requiredSuffix ? `\n${requiredSuffix}` : '';
+  if (!marker || !markedSql.endsWith(marker)) {
+    throw new Error('Exactly one SQL statement is required');
+  }
+
+  // queryBounded has the same transport invariant as runSingle: the bytes
+  // SQLite validates must be the bytes we later execute with the LIMIT bound.
+  const validatedSql = markedSql.slice(0, -marker.length);
+  if (validatedSql !== sql) {
+    throw new Error('Single-statement SQL payload mismatch');
+  }
+
   const validationStmt = db.prepare(markedSql);
   try {
     const preparedSql = typeof validationStmt.toString === 'function'
@@ -338,7 +350,7 @@ function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, limit,
 
   const values = [];
   const startedAt = Date.now();
-  const stmt = db.prepare(`${sql}\nLIMIT ${limit}`);
+  const stmt = db.prepare(`${validatedSql}\nLIMIT ${limit}`);
   try {
     // The disposable preview view gives duplicate aliases stable positional
     // schema names (for example x and x:1), so row objects can be projected in

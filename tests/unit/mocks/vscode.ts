@@ -10,6 +10,9 @@ class classEventEmitter {
     fire(data: any) {
         this._listeners.forEach(l => l(data));
     }
+    dispose() {
+        this._listeners = [];
+    }
 }
 
 export const mockVscode = {

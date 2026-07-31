@@ -8,7 +8,7 @@ import { updateStatus } from './ui.js';
 import { updateSelectionStates, clearSelection } from './grid-selection.js';
 import { getRowDataOffset, getCellValue, getRowId } from './data-utils.js';
 import { BlobInspector } from './blob-inspector.js';
-import { handleTextareaTab } from './text-editor.js';
+import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
 
 let blobInspector;
 
@@ -23,7 +23,9 @@ export function initEdit() {
     document.getElementById('openInVsCodeBtn')?.addEventListener('click', openCellInVsCode);
     document.getElementById('btnCancelCellPreview')?.addEventListener('click', closeCellPreview);
     document.getElementById('cellPreviewSaveBtn')?.addEventListener('click', saveCellPreview);
-    document.getElementById('cellPreviewTextarea')?.addEventListener('keydown', onCellPreviewKeydown);
+    const previewTextarea = document.getElementById('cellPreviewTextarea');
+    previewTextarea?.addEventListener('keydown', onCellPreviewKeydown);
+    previewTextarea?.addEventListener('blur', () => resetTextareaTabFocusEscape(previewTextarea));
 }
 
 // ================================================================
@@ -304,6 +306,7 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     const columnNameEl = document.getElementById('cellPreviewColumnName');
     const typeBadgeEl = document.getElementById('cellPreviewTypeBadge');
     const textarea = document.getElementById('cellPreviewTextarea');
+    resetTextareaTabFocusEscape(textarea);
     const readonlyBadgeEl = document.getElementById('cellPreviewReadonlyBadge');
     const saveBtnEl = document.getElementById('cellPreviewSaveBtn');
     const wrapBtnEl = document.getElementById('wrapTextBtn');

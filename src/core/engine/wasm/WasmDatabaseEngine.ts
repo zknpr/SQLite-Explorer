@@ -1007,9 +1007,28 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
-  async previewViewDefinition(_view: string, selectSql: string, limit: number = 50): Promise<QueryResultSet> {
+  async previewViewDefinition(view: string, selectSql: string, limit: number = 50): Promise<QueryResultSet> {
     const body = normalizeViewSelectSql(selectSql);
     const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
+    const existingResult = await this.executeQuery(
+      "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+      [view]
+    );
+    const existingSql = existingResult[0]?.rows[0]?.[0];
+    const columnListSql = typeof existingSql === 'string'
+      ? extractViewColumnListSql(existingSql)
+      : undefined;
+
+    // WASM preview deliberately remains a non-DDL query, so it also works for
+    // read-only documents. A CTE column list gives it the exact schema names
+    // that CREATE VIEW will preserve without creating a disposable object.
+    if (columnListSql) {
+      const previewSource = escapeIdentifier('sqlx_preview');
+      return this.executeSingleQuery(
+        `WITH ${previewSource} ${columnListSql} AS (${body}\n) ` +
+        `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`
+      );
+    }
     return this.executeSingleQuery(`SELECT * FROM (${body}\n) LIMIT ${boundedLimit}`);
   }
 

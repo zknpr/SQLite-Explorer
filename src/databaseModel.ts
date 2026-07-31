@@ -35,6 +35,11 @@ import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
  */
 export type DocumentModification = LabeledModification;
 
+/** Database content change, optionally tied to the history entry just applied. */
+export interface DocumentContentChange {
+  readonly modification?: DocumentModification;
+}
+
 // ============================================================================
 // Environment Detection
 // ============================================================================
@@ -226,7 +231,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   readonly #disposeEmitter = this._register(new vsc.EventEmitter<void>());
   readonly onDidDispose = this.#disposeEmitter.event;
 
-  readonly #contentChangeEmitter = this._register(new vsc.EventEmitter<{}>());
+  readonly #contentChangeEmitter = this._register(new vsc.EventEmitter<DocumentContentChange>());
   readonly onDidChangeContent = this.#contentChangeEmitter.event;
 
   readonly #modificationEmitter = this._register(
@@ -246,8 +251,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const key = await this.#documentKey;
     DocumentRegistry.delete(key);
     this.workerMethods[Symbol.dispose]();
-    super.dispose();
+    // Consumers must see disposal before the registered emitter itself is
+    // disposed by the base class, otherwise their cleanup callbacks never run.
     this.#disposeEmitter.fire();
+    super.dispose();
   }
 
   // ============================================================================
@@ -274,7 +281,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         }
         try {
             await this.databaseOperations.undoModification(undoneEntry);
-            this.#contentChangeEmitter.fire({});
+            this.#contentChangeEmitter.fire({ modification: undoneEntry });
             this.#autoSaveIfNeeded();
         } catch (e) {
             const errorMessage = e instanceof Error ? e.message : String(e);
@@ -290,7 +297,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         }
         try {
             await this.databaseOperations.redoModification(redoneEntry);
-            this.#contentChangeEmitter.fire({});
+            this.#contentChangeEmitter.fire({ modification: redoneEntry });
             this.#autoSaveIfNeeded();
         } catch (e) {
              const errorMessage = e instanceof Error ? e.message : String(e);
@@ -308,7 +315,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   recordExternalModification(modification: DocumentModification): void {
     this.recordModification(modification);
-    this.#contentChangeEmitter.fire({});
+    this.#contentChangeEmitter.fire({ modification });
   }
 
   // ============================================================================

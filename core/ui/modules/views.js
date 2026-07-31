@@ -8,7 +8,7 @@ import { refreshSchema } from './sidebar.js';
 import { clearSelection, loadTableColumns, loadTableData } from './grid.js';
 import { showEmptyState, updateStatus, updateToolbarButtons } from './ui.js';
 import { formatCellValueAsText } from './utils.js';
-import { handleTextareaTab } from './text-editor.js';
+import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
 
 let editingViewName = null;
 let activeViewModalSession = 0;
@@ -95,7 +95,9 @@ function draftsMatch(left, right) {
 }
 
 export function initViews() {
-    document.getElementById('viewSelectSql')?.addEventListener('keydown', handleTextareaTab);
+    const sqlEditor = document.getElementById('viewSelectSql');
+    sqlEditor?.addEventListener('keydown', handleTextareaTab);
+    sqlEditor?.addEventListener('blur', () => resetTextareaTabFocusEscape(sqlEditor));
     document.getElementById('btnValidateView')?.addEventListener('click', () => validateDraft());
     document.getElementById('btnPreviewView')?.addEventListener('click', previewDraft);
     document.getElementById('btnSaveView')?.addEventListener('click', saveDraft);
@@ -110,10 +112,12 @@ export function openCreateViewModal() {
     activeViewModalSession++;
     editingViewName = null;
     const elements = getElements();
+    resetTextareaTabFocusEscape(elements.sql);
     elements.title.textContent = 'Create View';
     elements.name.value = '';
     elements.name.disabled = false;
     elements.sql.value = 'SELECT 1 AS value';
+    elements.sql.disabled = false;
     elements.triggerOptions.hidden = true;
     elements.preserveTriggers.checked = true;
     elements.openInVsCode.hidden = true;
@@ -133,10 +137,12 @@ export async function openEditViewModal(view) {
         editingViewName = view;
 
         const elements = getElements();
+        resetTextareaTabFocusEscape(elements.sql);
         elements.title.textContent = 'Edit View';
         elements.name.value = view;
         elements.name.disabled = true;
         elements.sql.value = definition.selectSql;
+        elements.sql.disabled = false;
         elements.preserveTriggers.checked = true;
         elements.save.textContent = 'Save View';
         elements.openInVsCode.hidden = !document.getElementById('vscode-env');
@@ -221,8 +227,11 @@ async function saveDraft() {
     const draft = getDraft();
     const targetView = editingViewName;
     isSavingView = true;
-    const saveButton = getElements().save;
+    const saveElements = getElements();
+    const saveButton = saveElements.save;
+    const sqlEditor = saveElements.sql;
     if (saveButton) saveButton.disabled = true;
+    if (sqlEditor) sqlEditor.disabled = true;
     try {
         if (!await validateDraft(draft, modalSession)) return;
         if (!isCurrentModalSession(modalSession)) return;
@@ -254,6 +263,7 @@ async function saveDraft() {
     } finally {
         isSavingView = false;
         if (saveButton) saveButton.disabled = false;
+        if (sqlEditor) sqlEditor.disabled = false;
     }
 }
 

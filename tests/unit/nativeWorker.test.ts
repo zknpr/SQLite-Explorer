@@ -1375,6 +1375,35 @@ describe('native querySingle worker handler', () => {
         assert.deepStrictEqual(result.values[99], [100, 1000]);
     });
 
+    it('rejects divergent marked and executable bounded-query payloads before prepare', () => {
+        const executeBoundedQuery = loadNativeWorkerFunction(
+            'executeBoundedQuery',
+            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
+        );
+        const boundary = '/*sqlite_explorer_boundary_test*/';
+        let prepareCalls = 0;
+        const database = {
+            prepare() {
+                prepareCalls++;
+                throw new Error('prepare must not run for a divergent payload');
+            }
+        };
+
+        assert.throws(
+            () => executeBoundedQuery(
+                database,
+                `SELECT * FROM safe_preview\n${boundary}`,
+                'SELECT * FROM safe_preview;',
+                boundary,
+                ['value'],
+                10,
+                5000
+            ),
+            /Single-statement SQL payload mismatch/
+        );
+        assert.strictEqual(prepareCalls, 0);
+    });
+
     it('rejects a stored mutation tail before executing the original SQL', () => {
         const executeSingleStatement = loadNativeWorkerFunction(
             'executeSingleStatement',

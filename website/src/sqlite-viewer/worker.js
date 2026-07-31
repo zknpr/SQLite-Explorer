@@ -17,6 +17,7 @@ import {
   extractViewSelectSql,
   normalizeViewSelectSql
 } from '../../../src/core/view-utils.ts';
+import { escapeLikePattern } from '../../../src/core/sql-utils.ts';
 
 // ============================================================================
 // Configuration
@@ -462,8 +463,8 @@ async function fetchTableData(table, options = {}) {
     for (const f of filters) {
       if (f.column && f.value) {
         const safeCol = f.column.replace(/"/g, '""');
-        whereClauses.push(`"${safeCol}" LIKE ?`);
-        params.push(`%${f.value}%`);
+        whereClauses.push(`"${safeCol}" LIKE ? ESCAPE '\\'`);
+        params.push(`%${escapeLikePattern(f.value)}%`);
       }
     }
   }
@@ -475,12 +476,12 @@ async function fetchTableData(table, options = {}) {
     if (searchCols.length > 0) {
       const globalClauses = searchCols.map(c => {
         const safeCol = c.replace(/"/g, '""');
-        return `"${safeCol}" LIKE ?`;
+        return `"${safeCol}" LIKE ? ESCAPE '\\'`;
       });
       whereClauses.push(`(${globalClauses.join(' OR ')})`);
       // Add the global filter parameter for each column in the OR clause
       for (let i = 0; i < searchCols.length; i++) {
-        params.push(`%${globalFilter}%`);
+        params.push(`%${escapeLikePattern(globalFilter)}%`);
       }
     }
   }
@@ -537,8 +538,8 @@ async function fetchTableCount(table, options = {}) {
     for (const f of filters) {
       if (f.column && f.value) {
         const safeCol = f.column.replace(/"/g, '""');
-        whereClauses.push(`"${safeCol}" LIKE ?`);
-        params.push(`%${f.value}%`);
+        whereClauses.push(`"${safeCol}" LIKE ? ESCAPE '\\'`);
+        params.push(`%${escapeLikePattern(f.value)}%`);
       }
     }
   }
@@ -549,12 +550,12 @@ async function fetchTableCount(table, options = {}) {
     if (searchCols.length > 0) {
       const globalClauses = searchCols.map(c => {
         const safeCol = c.replace(/"/g, '""');
-        return `"${safeCol}" LIKE ?`;
+        return `"${safeCol}" LIKE ? ESCAPE '\\'`;
       });
       whereClauses.push(`(${globalClauses.join(' OR ')})`);
       // Add the global filter parameter for each column in the OR clause
       for (let i = 0; i < searchCols.length; i++) {
-        params.push(`%${globalFilter}%`);
+        params.push(`%${escapeLikePattern(globalFilter)}%`);
       }
     }
   }
@@ -888,10 +889,28 @@ async function validateViewDefinition(view, selectSql) {
   }
 }
 
-async function previewViewDefinition(_view, selectSql, limit = 50) {
+async function previewViewDefinition(view, selectSql, limit = 50) {
   if (!db) throw new Error('No database initialized');
   const body = normalizeViewSelectSql(selectSql);
   const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
+  const existing = db.exec(
+    "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+    [view]
+  );
+  const existingSql = existing[0]?.values?.[0]?.[0];
+  const columnListSql = typeof existingSql === 'string'
+    ? extractViewColumnListSql(existingSql)
+    : undefined;
+
+  // Demo preview mirrors WASM's non-DDL CTE path so read-only databases stay
+  // previewable while explicit CREATE VIEW column names remain authoritative.
+  if (columnListSql) {
+    const previewSource = escapeIdentifier('sqlx_preview');
+    return querySingleStatement(
+      `WITH ${previewSource} ${columnListSql} AS (${body}\n) ` +
+      `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`
+    );
+  }
   return querySingleStatement(`SELECT * FROM (${body}\n) LIMIT ${boundedLimit}`);
 }
 

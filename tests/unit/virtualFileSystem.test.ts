@@ -12,14 +12,33 @@ describe('SQLiteFileSystemProvider', () => {
 
     function setupMockDocument(key: string, dbOps: any = {}) {
         const disposeEmitter = new vscode.EventEmitter<void>();
-        const mockDocument = {
+        const contentEmitter = new vscode.EventEmitter<any>();
+        let disposeSubscriptionDisposeCount = 0;
+        const onDidDispose = (listener: () => void) => {
+            const subscription = disposeEmitter.event(listener);
+            return {
+                dispose() {
+                    disposeSubscriptionDisposeCount++;
+                    subscription.dispose();
+                }
+            };
+        };
+        const mockDocument: any = {
             databaseOperations: dbOps,
-            recordExternalModification: mock.fn(),
-            onDidDispose: disposeEmitter.event,
-            dispose: () => disposeEmitter.fire()
-        } as unknown as DatabaseDocument;
+            recordExternalModification: mock.fn((modification: any) => {
+                contentEmitter.fire({ modification });
+            }),
+            onDidChangeContent: contentEmitter.event,
+            onDidDispose,
+            dispose: () => disposeEmitter.fire(),
+            fireContentChange: (modification: any) => contentEmitter.fire({ modification }),
+            getDisposeSubscriptionDisposeCount: () => disposeSubscriptionDisposeCount
+        };
         DocumentRegistry.set(key, mockDocument);
-        return mockDocument;
+        return mockDocument as DatabaseDocument & {
+            fireContentChange(modification: any): void;
+            getDisposeSubscriptionDisposeCount(): number;
+        };
     }
 
     afterEach(() => {
@@ -315,6 +334,7 @@ describe('SQLiteFileSystemProvider', () => {
                 selectSql: 'SELECT id, upper(name) AS name FROM users'
             };
             const dbOps = {
+                getViewDefinition: mock.fn(async () => before),
                 editView: mock.fn(async () => ({ before, after }))
             };
             const doc = setupMockDocument(docKey, dbOps);
@@ -386,6 +406,116 @@ describe('SQLiteFileSystemProvider', () => {
             } finally {
                 subscription.dispose();
                 (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+
+        it('invalidates every open URI for a view changed outside the virtual editor', async () => {
+            let now = 100;
+            mock.method(Date, 'now', () => now);
+            let definition = {
+                identifier: 'shared_view',
+                sql: 'CREATE VIEW "shared_view" AS SELECT 1 AS value',
+                selectSql: 'SELECT 1 AS value',
+                triggers: []
+            };
+            const document = setupMockDocument(docKey, {
+                getViewDefinition: mock.fn(async () => definition)
+            });
+            const firstUri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/shared_view/group/__view__.sql/definition.sql?webview-id=one`
+            );
+            const secondUri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/shared_view/group/__view__.sql/definition.sql?webview-id=two`
+            );
+            const events: vscode.FileChangeEvent[][] = [];
+            const subscription = provider.onDidChangeFile(changes => events.push(changes));
+
+            try {
+                const firstBefore = await provider.stat(firstUri);
+                const secondBefore = await provider.stat(secondUri);
+                now = 200;
+                definition = {
+                    ...definition,
+                    sql: 'CREATE VIEW "shared_view" AS SELECT 2 AS value',
+                    selectSql: 'SELECT 2 AS value'
+                };
+                document.fireContentChange({
+                    label: 'Edit View',
+                    description: 'Edit shared view',
+                    modificationType: 'view_edit',
+                    targetTable: 'shared_view'
+                });
+
+                assert.strictEqual(events.length, 1);
+                assert.deepStrictEqual(
+                    events[0].map(change => change.uri.toString()).sort(),
+                    [firstUri.toString(), secondUri.toString()].sort()
+                );
+                assert.ok((await provider.stat(firstUri)).mtime > firstBefore.mtime);
+                assert.ok((await provider.stat(secondUri)).mtime > secondBefore.mtime);
+            } finally {
+                subscription.dispose();
+            }
+        });
+
+        it('rejects a stale view editor save instead of overwriting an external edit', async () => {
+            const original = {
+                identifier: 'conflicted_view',
+                sql: 'CREATE VIEW "conflicted_view" AS SELECT 1 AS value',
+                selectSql: 'SELECT 1 AS value',
+                triggers: []
+            };
+            let definition = original;
+            const editView = mock.fn(async () => {
+                throw new Error('stale editor must not reach editView');
+            });
+            const document = setupMockDocument(docKey, {
+                getViewDefinition: mock.fn(async () => definition),
+                editView
+            });
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/conflicted_view/group/__view__.sql/definition.sql`
+            );
+            const events: vscode.FileChangeEvent[][] = [];
+            const subscription = provider.onDidChangeFile(changes => events.push(changes));
+
+            try {
+                assert.strictEqual(
+                    new TextDecoder().decode(await provider.readFile(uri)),
+                    original.selectSql
+                );
+                definition = {
+                    ...original,
+                    sql: 'CREATE VIEW "conflicted_view" AS SELECT 2 AS value',
+                    selectSql: 'SELECT 2 AS value'
+                };
+                document.fireContentChange({
+                    label: 'Edit View',
+                    description: 'Edit conflicted view in modal',
+                    modificationType: 'view_edit',
+                    targetTable: 'conflicted_view'
+                });
+                // VS Code stats a changed file before deciding whether a dirty
+                // buffer can reload. stat() must not advance the read snapshot.
+                await provider.stat(uri);
+
+                await assert.rejects(
+                    provider.writeFile(
+                        uri,
+                        new TextEncoder().encode('SELECT 3 AS value'),
+                        { create: false, overwrite: true }
+                    ),
+                    /changed outside this editor.*not modified/i
+                );
+                assert.strictEqual(editView.mock.callCount(), 0);
+                assert.strictEqual(
+                    (document.recordExternalModification as any).mock.callCount(),
+                    0
+                );
+                assert.ok(events.length >= 2, 'the mutation and conflict should both offer a reload');
+                assert.strictEqual(events.at(-1)?.[0].uri.toString(), uri.toString());
+            } finally {
+                subscription.dispose();
             }
         });
 
@@ -560,6 +690,23 @@ describe('SQLiteFileSystemProvider', () => {
 
             assert.strictEqual(first.ctime, 100);
             assert.strictEqual(afterDispose.ctime, 200);
+            assert.strictEqual(document.getDisposeSubscriptionDisposeCount(), 1);
+        });
+
+        it('maps a missing view stat to FileNotFound', async () => {
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/missing_view/group/__view__.sql/definition.sql`
+            );
+            setupMockDocument(docKey, {
+                getViewDefinition: async () => {
+                    throw new Error('View not found: missing_view');
+                }
+            });
+
+            await assert.rejects(
+                provider.stat(uri),
+                (error: any) => error.code === 'FileNotFound'
+            );
         });
 
         it('watch should return a generic Disposable', async () => {
