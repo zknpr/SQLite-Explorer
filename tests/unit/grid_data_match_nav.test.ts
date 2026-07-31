@@ -69,7 +69,6 @@ describe('grid data match cache', () => {
         state.rowsPerPage = 500;
         state.columnFilters = {};
         state.filterQuery = 'old';
-        state.editingCellInfo = { rowIdx: 0, colIdx: 0 };
         state.matchNav = {
             scope: 'global',
             term: 'old',
@@ -131,6 +130,7 @@ describe('grid data match cache', () => {
         state.filterQuery = '';
         state.isLoadingData = false;
         state.isGridReloading = false;
+        state.editingCellInfo = { rowIdx: 0, colIdx: 0 };
 
         try {
             const pendingLoad = loadTableData(false, false);
@@ -142,6 +142,7 @@ describe('grid data match cache', () => {
         } finally {
             backendApi.fetchTableCount = originalFetchCount;
             backendApi.fetchTableData = originalFetchData;
+            state.editingCellInfo = null;
         }
     });
 
@@ -154,7 +155,13 @@ describe('grid data match cache', () => {
         };
         const elements: Record<string, any> = {
             gridContainer: container,
-            statusText: { textContent: '' }
+            statusText: { textContent: '' },
+            pageIndicator: { textContent: '' },
+            btnFirst: { disabled: false },
+            btnPrev: { disabled: false },
+            btnNext: { disabled: false },
+            btnLast: { disabled: false },
+            filterMatchCounter: { textContent: '' }
         };
         (globalThis as any).document = {
             getElementById(id: string) { return elements[id] ?? null; },
@@ -213,6 +220,81 @@ describe('grid data match cache', () => {
             backendApi.fetchTableData = originalFetchData;
             state.isLoadingData = false;
             state.isGridReloading = false;
+            state.editingCellInfo = null;
+        }
+    });
+
+    it('lets the latest background load clear a superseded foreground spinner flag', async () => {
+        const container = {
+            innerHTML: '',
+            scrollLeft: 0,
+            scrollTop: 0,
+            querySelector() { return null; }
+        };
+        const elements: Record<string, any> = {
+            gridContainer: container,
+            statusText: { textContent: '' },
+            pageIndicator: { textContent: '' },
+            btnFirst: { disabled: false },
+            btnPrev: { disabled: false },
+            btnNext: { disabled: false },
+            btnLast: { disabled: false },
+            filterMatchCounter: { textContent: '' }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) { return elements[id] ?? null; },
+            querySelectorAll() { return []; }
+        };
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const gridDataModulePath = '../../core/ui/modules/grid-data.js';
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { loadTableData } = await import(gridDataModulePath);
+        const foregroundCount = createDeferred<number>();
+        const backgroundCount = createDeferred<number>();
+        const counts = [foregroundCount.promise, backgroundCount.promise];
+        let countCall = 0;
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        backendApi.fetchTableCount = async () => counts[countCall++];
+        backendApi.fetchTableData = async () => ({ rows: [[1, 'fresh']] });
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.renderedTable = null;
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.currentPageIndex = 0;
+        state.rowsPerPage = 500;
+        state.columnFilters = {};
+        state.filterQuery = '';
+        state.isLoadingData = false;
+        state.isGridReloading = false;
+        state.editingCellInfo = { rowIdx: 0, colIdx: 0 };
+
+        try {
+            const foregroundLoad = loadTableData(true, false);
+            assert.strictEqual(state.isLoadingData, true);
+
+            const backgroundLoad = loadTableData(false, false);
+            foregroundCount.resolve(1);
+            await foregroundLoad;
+            assert.strictEqual(state.isLoadingData, true);
+            assert.strictEqual(state.isGridReloading, true);
+
+            backgroundCount.resolve(1);
+            await backgroundLoad;
+            assert.strictEqual(
+                state.isLoadingData,
+                false,
+                'the latest load must release spinner state inherited from a superseded load'
+            );
+            assert.strictEqual(state.isGridReloading, false);
+        } finally {
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
+            state.isLoadingData = false;
+            state.isGridReloading = false;
+            state.editingCellInfo = null;
         }
     });
 

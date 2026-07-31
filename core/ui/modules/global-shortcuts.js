@@ -16,13 +16,14 @@ function hasActiveTextEditor() {
 /** Register shortcuts shared by the VS Code viewer and standalone web demo. */
 export function setupGlobalShortcuts() {
     document.addEventListener('keydown', async event => {
+        const shortcutKey = typeof event.key === 'string' ? event.key.toLowerCase() : '';
         if (event.key === 'Escape') {
             if (!state.editingCellInfo && !document.querySelector('.modal-overlay:not(.hidden)')) {
                 clearSelection();
             }
         }
 
-        if ((event.metaKey || event.ctrlKey) && event.key === 'c') {
+        if ((event.metaKey || event.ctrlKey) && shortcutKey === 'c') {
             if (hasActiveTextEditor()) return;
 
             if (state.selectedCells.length > 0) {
@@ -34,7 +35,7 @@ export function setupGlobalShortcuts() {
             }
         }
 
-        if ((event.metaKey || event.ctrlKey) && event.key === 'a') {
+        if ((event.metaKey || event.ctrlKey) && shortcutKey === 'a') {
             // Selecting all during a reload would capture row ids from the stale,
             // about-to-be-replaced result set.
             if (state.isGridReloading || hasActiveTextEditor()) return;

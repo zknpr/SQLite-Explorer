@@ -12,10 +12,13 @@
  */
 
 import {
+  assertViewDefinitionSnapshotCurrent,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
   extractViewSelectSql,
+  mapViewTriggerRows,
+  VIEW_TRIGGER_SCHEMA_QUERIES,
   normalizeViewSelectSql
 } from '../../../src/core/view-utils.ts';
 import { escapeLikePattern } from '../../../src/core/sql-utils.ts';
@@ -28,7 +31,7 @@ import { escapeLikePattern } from '../../../src/core/sql-utils.ts';
  * sql.js CDN URL for the JavaScript module.
  * Using jsDelivr for reliable global CDN delivery.
  */
-const SQL_JS_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.13.0/sql-wasm.js';
+const SQL_JS_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.14.1/sql-wasm.js';
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 
 // ============================================================================
@@ -230,7 +233,7 @@ async function initializeDatabase(filename, config) {
       sqlConfig.wasmBinary = config.wasmBinary;
     } else {
       // Default to CDN WASM
-      sqlConfig.locateFile = (file) => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.13.0/${file}`;
+      sqlConfig.locateFile = (file) => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.14.1/${file}`;
     }
 
     SQL = await self.initSqlJs(sqlConfig);
@@ -827,26 +830,10 @@ async function readViewDefinition(view, allowUnparsed = false) {
   const createSql = viewResult[0]?.values?.[0]?.[0];
   if (typeof createSql !== 'string') throw new Error(`View not found: ${view}`);
 
-  const triggerResult = db.exec(
-    "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
-    [view]
-  );
-  const tempTriggerResult = db.exec(
-    "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
-    [view]
-  );
-  const mapTriggers = (rows, temporary) => rows.map(row => {
-    if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
-      throw new Error(`View trigger definition is unavailable for ${view}`);
-    }
-    return temporary
-      ? { identifier: row[0], sql: row[1], temporary: true }
-      : { identifier: row[0], sql: row[1] };
-  });
-  const triggers = [
-    ...mapTriggers(triggerResult[0]?.values || [], false),
-    ...mapTriggers(tempTriggerResult[0]?.values || [], true)
-  ];
+  const triggerRows = VIEW_TRIGGER_SCHEMA_QUERIES.map(source => (
+    db.exec(source.sql, [view])[0]?.values || []
+  ));
+  const triggers = mapViewTriggerRows(view, triggerRows);
 
   let selectSql;
   let columnListSql;
@@ -943,14 +930,15 @@ async function createView(view, selectSql) {
   }
 }
 
-async function editView(view, selectSql, preserveTriggers = true) {
+async function editView(view, selectSql, preserveTriggers = true, expectedSql) {
   if (!db) throw new Error('No database initialized');
   const body = normalizeViewSelectSql(selectSql);
-  const before = await getViewDefinition(view);
   compileSingleStatement(`EXPLAIN SELECT * FROM (${body}\n) LIMIT 0`);
   const savepointName = createViewSavepointName('sp_edit_view');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
+    const before = await getViewDefinition(view);
+    assertViewDefinitionSnapshotCurrent(expectedSql, before.sql);
     runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
     runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
     compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);

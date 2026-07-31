@@ -30,10 +30,13 @@ import { buildSelectQuery, buildCountQuery } from '../../query-builder';
 import { applyMergePatch, computeJsonPatchUndo, parseJsonValueForPatching } from '../../json-utils';
 import { getNodeFs } from '../../platform/fs';
 import {
+  assertViewDefinitionSnapshotCurrent,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
   extractViewSelectSql,
+  mapViewTriggerRows,
+  VIEW_TRIGGER_SCHEMA_QUERIES,
   normalizeViewSelectSql
 } from '../../view-utils';
 
@@ -943,26 +946,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       throw new Error(`View not found: ${view}`);
     }
 
-    const triggerResult = await this.executeQuery(
-      "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
-      [view]
-    );
-    const tempTriggerResult = await this.executeQuery(
-      "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
-      [view]
-    );
-    const mapTriggers = (rows: CellValue[][], temporary: boolean) => rows.map(row => {
-      if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
-        throw new Error(`View trigger definition is unavailable for ${view}`);
-      }
-      return temporary
-        ? { identifier: row[0], sql: row[1], temporary: true }
-        : { identifier: row[0], sql: row[1] };
-    });
-    const triggers = [
-      ...mapTriggers(triggerResult[0]?.rows ?? [], false),
-      ...mapTriggers(tempTriggerResult[0]?.rows ?? [], true)
-    ];
+    const triggerRows: CellValue[][][] = [];
+    for (const source of VIEW_TRIGGER_SCHEMA_QUERIES) {
+      const result = await this.executeQuery(source.sql, [view]);
+      triggerRows.push(result[0]?.rows ?? []);
+    }
+    const triggers = mapViewTriggerRows(view, triggerRows);
 
     let selectSql: string;
     let columnListSql: string | undefined;
@@ -1060,13 +1049,22 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
-  async editView(view: string, selectSql: string, preserveTriggers: boolean = true): Promise<ViewEditResult> {
+  async editView(
+    view: string,
+    selectSql: string,
+    preserveTriggers: boolean = true,
+    expectedSql?: string
+  ): Promise<ViewEditResult> {
     const body = normalizeViewSelectSql(selectSql);
-    const before = await this.getViewDefinition(view);
     this.compileViewSelect(body);
     const savepointName = this.createSavepointName('sp_edit_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
+      // Read and compare after opening the savepoint. That read transaction
+      // prevents a stale editor snapshot from being silently overwritten even
+      // when another connection races between the UI check and this mutation.
+      const before = await this.getViewDefinition(view);
+      assertViewDefinitionSnapshotCurrent(expectedSql, before.sql);
       this.runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
       this.runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);

@@ -350,6 +350,9 @@ function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, limit,
     // statement API exposes all() but no step/iterator API, so SQLite executes
     // once and the elapsed bound is checked while serializing each returned row.
     const rows = stmt.all();
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+    }
     for (const row of rows) {
       if (Date.now() - startedAt > timeoutMs) {
         throw new Error(`Query execution timed out after ${timeoutMs}ms`);

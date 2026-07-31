@@ -309,8 +309,13 @@ export interface DatabaseOperations {
   /** Create a view from a SELECT body. */
   createView(view: string, selectSql: string): Promise<ViewDefinition>;
 
-  /** Atomically replace a view, optionally recreating its INSTEAD OF triggers. */
-  editView(view: string, selectSql: string, preserveTriggers?: boolean): Promise<ViewEditResult>;
+  /** Atomically replace a view, optionally guarded by its expected stored definition. */
+  editView(
+    view: string,
+    selectSql: string,
+    preserveTriggers?: boolean,
+    expectedSql?: string
+  ): Promise<ViewEditResult>;
 
   /** Drop a view and return the definition required to undo the operation. */
   dropView(view: string): Promise<ViewDefinition>;

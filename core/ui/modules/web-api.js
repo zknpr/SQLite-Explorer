@@ -310,7 +310,7 @@ export const backendApi = {
     validateViewDefinition: (view, selectSql) => sendRpcRequest('validateViewDefinition', [view, selectSql]),
     previewViewDefinition: (view, selectSql, limit) => sendRpcRequest('previewViewDefinition', [view, selectSql, limit]),
     createView: (view, selectSql) => sendRpcRequest('createView', [view, selectSql]),
-    editView: async (view, selectSql, preserveTriggers) => {
+    editView: async (view, selectSql, preserveTriggers, expectedSql) => {
         if (!preserveTriggers) {
             const current = await sendRpcRequest('getViewDefinition', [view]);
             if (current.triggers?.length > 0) {
@@ -320,10 +320,12 @@ export const backendApi = {
                 }
             }
         }
-        return sendRpcRequest('editView', [view, selectSql, preserveTriggers]);
+        return sendRpcRequest('editView', [view, selectSql, preserveTriggers, expectedSql]);
     },
     dropView: async (view) => {
-        if (!window.confirm(`Drop view "${view}" and its INSTEAD OF triggers?`)) {
+        if (!window.confirm(
+            `Drop view "${view}"? This permanently drops its INSTEAD OF triggers too.`
+        )) {
             return { cancelled: true };
         }
         return sendRpcRequest('dropView', [view]);

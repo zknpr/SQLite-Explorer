@@ -43,10 +43,13 @@ import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 import { computeJsonPatchUndo } from './core/json-utils';
 import { serializeOperations } from './core/operation-serializer';
 import {
+  assertViewDefinitionSnapshotCurrent,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
   extractViewSelectSql,
+  mapViewTriggerRows,
+  VIEW_TRIGGER_SCHEMA_QUERIES,
   normalizeViewSelectSql
 } from './core/view-utils';
 import { crypto } from './platform/cryptoShim';
@@ -542,21 +545,18 @@ export async function createNativeDatabaseConnection(
         view: string,
         allowUnparsed: boolean = false
       ): Promise<ViewDefinition> => {
-        const metadata = await worker.call<NativeQueryBatchResult>('queryBatch', [[
+        const metadataQueries = [
           {
             sql: "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
             params: [view]
           },
-          {
-            sql: "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
+          ...VIEW_TRIGGER_SCHEMA_QUERIES.map(source => ({
+            sql: source.sql,
             params: [view]
-          },
-          {
-            sql: "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
-            params: [view]
-          }
-        ]]);
-        if (!metadata?.results || metadata.results.length < 3) {
+          }))
+        ];
+        const metadata = await worker.call<NativeQueryBatchResult>('queryBatch', [metadataQueries]);
+        if (!metadata?.results || metadata.results.length < metadataQueries.length) {
           throw new Error('View definition fetch failed: queryBatch returned incomplete results');
         }
 
@@ -566,18 +566,12 @@ export async function createNativeDatabaseConnection(
           throw new Error(`View not found: ${view}`);
         }
 
-        const mapTriggers = (rows: CellValue[][], temporary: boolean) => rows.map(row => {
-          if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
-            throw new Error(`View trigger definition is unavailable for ${view}`);
-          }
-          return temporary
-            ? { identifier: row[0], sql: row[1], temporary: true }
-            : { identifier: row[0], sql: row[1] };
-        });
-        const triggers = [
-          ...mapTriggers(metadata.results[1].values ?? [], false),
-          ...mapTriggers(metadata.results[2].values ?? [], true)
-        ];
+        const triggers = mapViewTriggerRows(
+          view,
+          VIEW_TRIGGER_SCHEMA_QUERIES.map((_, index) => (
+            metadata.results[index + 1].values ?? []
+          ))
+        );
 
         let selectSql: string;
         let columnListSql: string | undefined;
@@ -1209,14 +1203,16 @@ export async function createNativeDatabaseConnection(
         editView: async (
           view: string,
           selectSql: string,
-          preserveTriggers: boolean = true
+          preserveTriggers: boolean = true,
+          expectedSql?: string
         ): Promise<ViewEditResult> => {
           const body = normalizeViewSelectSql(selectSql);
-          const before = await getNativeViewDefinition(view);
           await compileNativeViewSelect(body);
           const savepointName = createSavepointName('sp_edit_view');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
+            const before = await getNativeViewDefinition(view);
+            assertViewDefinitionSnapshotCurrent(expectedSql, before.sql);
             await worker.call('run', [`DROP VIEW ${escapeIdentifier(view)}`]);
             await runNativeSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
             await compileNativeView(view);

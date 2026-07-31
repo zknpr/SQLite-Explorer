@@ -226,6 +226,31 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             );
         });
 
+        await testContext.test('atomically rejects a stale expected view definition', async () => {
+            await engine.createView('native_shared_view', 'SELECT 1 AS value');
+            const stale = await engine.getViewDefinition('native_shared_view');
+            await engine.executeQuery('DROP VIEW native_shared_view');
+            await engine.executeQuery(
+                'CREATE VIEW native_shared_view AS SELECT 2 AS value'
+            );
+
+            await assert.rejects(
+                engine.editView(
+                    'native_shared_view',
+                    'SELECT 3 AS value',
+                    true,
+                    stale.sql
+                ),
+                /changed outside this editor/i
+            );
+            const current = await engine.getViewDefinition('native_shared_view');
+            assert.strictEqual(current.selectSql, 'SELECT 2 AS value');
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM native_shared_view'))[0].rows,
+                [[2]]
+            );
+        });
+
         await testContext.test('preserves TEMP view triggers through native edit and history replay', async () => {
             await engine.executeQuery('CREATE TABLE native_temp_trigger_rows (value INTEGER)');
             await engine.executeQuery('CREATE TABLE native_temp_trigger_log (value INTEGER)');

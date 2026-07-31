@@ -214,23 +214,32 @@ const compileBrowserWorker = () =>
  */
 const webDemoWorkerSourcePath = resolve('website', 'src', 'sqlite-viewer', 'worker.js');
 
-const bundleWebDemoWorker = () =>
-  esbuild.build({
+const bundleWebDemoWorker = async () => {
+  const outfile = resolve('website', 'public', 'sqlite-viewer', 'worker.js');
+  const result = await esbuild.build({
     entryPoints: [webDemoWorkerSourcePath],
-    outfile: resolve('website', 'public', 'sqlite-viewer', 'worker.js'),
+    outfile,
     bundle: true,
     platform: 'browser',
     format: 'iife',
     target: 'es2020',
-    banner: {
-      js: `/*! sqlite-viewer-source-sha256:${createHash('sha256')
-        .update(fs.readFileSync(webDemoWorkerSourcePath))
-        .digest('hex')} */`,
-    },
     // This tracked artifact must be byte-stable regardless of the extension's
     // development build mode.
     minify: true,
+    write: false,
   });
+  if (result.outputFiles.length !== 1) {
+    throw new Error(`Expected one standalone website worker output, received ${result.outputFiles.length}`);
+  }
+  const bundledSource = result.outputFiles[0].text;
+  // Hash the complete generated bundle, not just its entry point. Any imported
+  // helper change therefore changes the marker checked by the unit harness.
+  const digest = createHash('sha256').update(bundledSource).digest('hex');
+  fs.writeFileSync(
+    outfile,
+    `/*! sqlite-viewer-bundle-sha256:${digest} */\n${bundledSource}`
+  );
+};
 
 /**
  * Copy assets to output directory.

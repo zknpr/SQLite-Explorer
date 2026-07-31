@@ -1407,6 +1407,45 @@ describe('native querySingle worker handler', () => {
         assert.strictEqual(finalized, 2);
     });
 
+    it('reports a native preview timeout even when the query returns zero rows', () => {
+        const executeBoundedQuery = loadNativeBoundaryFunction(
+            'executeBoundedQuery',
+            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
+        );
+        const boundary = '/*sqlite_explorer_boundary_test*/';
+        let finalized = 0;
+        const database = {
+            prepare(sql: string) {
+                if (sql.endsWith(boundary)) {
+                    return {
+                        toString: () => sql,
+                        finalize() { finalized++; }
+                    };
+                }
+                return {
+                    all() { return []; },
+                    finalize() { finalized++; }
+                };
+            }
+        };
+        const times = [0, 10];
+        mock.method(Date, 'now', () => times.shift() ?? 10);
+
+        assert.throws(
+            () => executeBoundedQuery(
+                database,
+                `SELECT * FROM preview\n${boundary}`,
+                'SELECT * FROM preview',
+                boundary,
+                ['value'],
+                10,
+                5
+            ),
+            /Query execution timed out after 5ms/
+        );
+        assert.strictEqual(finalized, 2);
+    });
+
     it('executes a 100-row duplicate-alias preview only once', () => {
         const executeBoundedQuery = loadNativeBoundaryFunction(
             'executeBoundedQuery',
@@ -1552,6 +1591,34 @@ describe('native querySingle worker handler', () => {
             prepare() {
                 return {
                     toString: undefined,
+                    finalize() { finalized = true; }
+                };
+            }
+        };
+
+        assert.throws(
+            () => executeSingleStatement(
+                database,
+                `CREATE VIEW sample AS SELECT 1\n${boundary}`,
+                'CREATE VIEW sample AS SELECT 1',
+                undefined,
+                boundary
+            ),
+            /Statement introspection unavailable/
+        );
+        assert.strictEqual(finalized, true);
+    });
+
+    it('reports inherited Object.prototype introspection as unavailable', () => {
+        const executeSingleStatement = loadNativeBoundaryFunction(
+            'executeSingleStatement',
+            ['db', 'markedSql', 'sql', 'params', 'requiredSuffix']
+        );
+        const boundary = '/*sqlite_explorer_boundary_test*/';
+        let finalized = false;
+        const database = {
+            prepare() {
+                return {
                     finalize() { finalized = true; }
                 };
             }

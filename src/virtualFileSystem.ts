@@ -1,7 +1,10 @@
 import * as vsc from 'vscode';
 import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier } from './core/sql-utils';
-import { isViewDefinitionSnapshotCurrent } from './core/view-utils';
+import {
+    isViewDefinitionConflictError,
+    isViewDefinitionSnapshotCurrent
+} from './core/view-utils';
 import { GlobalOutputChannel } from './main';
 
 import type {
@@ -18,6 +21,8 @@ interface ViewDocumentMetadata {
     uri: vsc.Uri;
     /** Stored CREATE VIEW SQL observed by the editor's most recent read. */
     snapshotSql?: string;
+    /** Encoded SELECT-body size cached until the view is externally invalidated. */
+    size?: number;
 }
 
 function getViewDefinitionErrorDetail(error: unknown): string {
@@ -51,24 +56,25 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         const { document, table, rowId } = this.parseUri(uri);
 
         if (rowId === '__view__.sql') {
-            let size: number;
-            try {
-                const definition = await document.databaseOperations.getViewDefinition(table);
-                size = new TextEncoder().encode(definition.selectSql).byteLength;
-            } catch (err) {
-                // A missing schema object is a missing virtual document, not a
-                // raw database error from getViewDefinition().
-                if (this.isMissingViewError(err)) {
-                    throw vsc.FileSystemError.FileNotFound(uri);
-                }
-                throw err;
-            }
             const metadata = this.getViewDocumentMetadata(document, uri, table);
+            if (metadata.size === undefined) {
+                try {
+                    const definition = await document.databaseOperations.getViewDefinition(table);
+                    metadata.size = new TextEncoder().encode(definition.selectSql).byteLength;
+                } catch (err) {
+                    // A missing schema object is a missing virtual document, not a
+                    // raw database error from getViewDefinition().
+                    if (this.isMissingViewError(err)) {
+                        throw vsc.FileSystemError.FileNotFound(uri);
+                    }
+                    throw err;
+                }
+            }
             return {
                 type: vsc.FileType.File,
                 ctime: metadata.ctime,
                 mtime: metadata.mtime,
-                size
+                size: metadata.size
             };
         }
 
@@ -111,7 +117,9 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 const metadata = this.getViewDocumentMetadata(document, uri, table);
                 const definition = await document.databaseOperations.getViewDefinition(table);
                 metadata.snapshotSql = definition.sql;
-                return new TextEncoder().encode(definition.selectSql);
+                const content = new TextEncoder().encode(definition.selectSql);
+                metadata.size = content.byteLength;
+                return content;
             }
 
             
@@ -191,8 +199,16 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             let result: ViewEditResult;
             try {
                 const selectSql = new TextDecoder('utf-8', { fatal: true }).decode(content);
-                result = await document.databaseOperations.editView(table, selectSql, true);
+                result = await document.databaseOperations.editView(
+                    table,
+                    selectSql,
+                    true,
+                    metadata.snapshotSql
+                );
             } catch (err) {
+                if (isViewDefinitionConflictError(err)) {
+                    this.rejectStaleViewWrite(document, uri);
+                }
                 const rawMessage = err instanceof Error ? err.message : String(err);
                 GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error writing view definition: ${rawMessage}`);
                 const detail = getViewDefinitionErrorDetail(err);
@@ -219,6 +235,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 viewDefBefore: result.before,
                 viewDefAfter: result.after
             });
+            metadata.size = new TextEncoder().encode(result.after.selectSql).byteLength;
             return;
         }
 
@@ -356,6 +373,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         if (change.invalidateAllViewDocuments) {
             const changes: vsc.FileChangeEvent[] = [];
             for (const metadata of documentMetadata.values()) {
+                metadata.size = undefined;
                 this.bumpViewDocumentMtime(metadata);
                 changes.push({
                     type: vsc.FileChangeType.Changed,
@@ -374,6 +392,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         const changes: vsc.FileChangeEvent[] = [];
         for (const metadata of documentMetadata.values()) {
             if (metadata.view !== modification.targetTable) continue;
+            metadata.size = undefined;
             this.bumpViewDocumentMtime(metadata);
             changes.push({
                 type: vsc.FileChangeType.Changed,
@@ -396,6 +415,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     private rejectStaleViewWrite(document: DatabaseDocument, uri: vsc.Uri): never {
         const { table } = this.parseUri(uri);
         const metadata = this.getViewDocumentMetadata(document, uri, table);
+        metadata.size = undefined;
         this.bumpViewDocumentMtime(metadata);
         this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
         throw vsc.FileSystemError.Unavailable(

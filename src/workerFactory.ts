@@ -69,6 +69,11 @@ interface WorkerMethods {
   ): Promise<DatabaseInitResult>;
   runQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]>;
   exportDatabase(): Promise<Uint8Array>;
+  applyModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
+  undoModification(mod: ModificationEntry): Promise<void>;
+  redoModification(mod: ModificationEntry): Promise<void>;
+  flushChanges(signal?: AbortSignal): Promise<void>;
+  discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
   updateCell(table: string, rowId: string | number, column: string, value: CellValue, patch?: string): Promise<void>;
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
@@ -80,7 +85,7 @@ interface WorkerMethods {
   validateViewDefinition(view: string, selectSql: string): Promise<void>;
   previewViewDefinition(view: string, selectSql: string, limit?: number): Promise<QueryResultSet>;
   createView(view: string, selectSql: string): Promise<ViewDefinition>;
-  editView(view: string, selectSql: string, preserveTriggers?: boolean): Promise<ViewEditResult>;
+  editView(view: string, selectSql: string, preserveTriggers?: boolean, expectedSql?: string): Promise<ViewEditResult>;
   dropView(view: string): Promise<ViewDefinition>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
@@ -290,8 +295,8 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.previewViewDefinition(view, selectSql, limit),
         createView: (view: string, selectSql: string) =>
           endpoint.createView(view, selectSql),
-        editView: (view: string, selectSql: string, preserveTriggers?: boolean) =>
-          endpoint.editView(view, selectSql, preserveTriggers),
+        editView: (view: string, selectSql: string, preserveTriggers?: boolean, expectedSql?: string) =>
+          endpoint.editView(view, selectSql, preserveTriggers, expectedSql),
         dropView: (view: string) =>
           endpoint.dropView(view),
         updateCellBatch: (table: string, updates: CellUpdate[]) =>
@@ -365,7 +370,7 @@ async function createWorkerBackedWasmDatabaseConnection(
           .on(event, handler);
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'insertRowBatch', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'getViewDefinition', 'validateViewDefinition', 'previewViewDefinition', 'createView', 'editView', 'dropView', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile'],
+    ['initializeDatabase', 'runQuery', 'exportDatabase', 'applyModifications', 'undoModification', 'redoModification', 'flushChanges', 'discardModifications', 'updateCell', 'insertRow', 'insertRowBatch', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'getViewDefinition', 'validateViewDefinition', 'previewViewDefinition', 'createView', 'editView', 'dropView', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile'],
     logHandler
   );
 
@@ -468,11 +473,16 @@ async function createWorkerBackedWasmDatabaseConnection(
           executeQuery: (sql: string, params?: CellValue[]) =>
             workerProxy.runQuery(sql, params),
           serializeDatabase: () => workerProxy.exportDatabase(),
-          applyModifications: async () => {},
-          undoModification: async () => {},
-          redoModification: async () => {},
-          flushChanges: async () => {},
-          discardModifications: async () => {},
+          applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
+            workerProxy.applyModifications(mods, signal),
+          undoModification: (mod: ModificationEntry) =>
+            workerProxy.undoModification(mod),
+          redoModification: (mod: ModificationEntry) =>
+            workerProxy.redoModification(mod),
+          flushChanges: (signal?: AbortSignal) =>
+            workerProxy.flushChanges(signal),
+          discardModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
+            workerProxy.discardModifications(mods, signal),
           // Preserve JSON merge patches through worker RPC while still
           // transferring Uint8Array cell values without copying.
           updateCell: (table: string, rowId: string | number, column: string, value: CellValue, patch?: string) =>
@@ -503,8 +513,8 @@ async function createWorkerBackedWasmDatabaseConnection(
             workerProxy.previewViewDefinition(view, selectSql, limit),
           createView: (view: string, selectSql: string) =>
             workerProxy.createView(view, selectSql),
-          editView: (view: string, selectSql: string, preserveTriggers?: boolean) =>
-            workerProxy.editView(view, selectSql, preserveTriggers),
+          editView: (view: string, selectSql: string, preserveTriggers?: boolean, expectedSql?: string) =>
+            workerProxy.editView(view, selectSql, preserveTriggers, expectedSql),
           dropView: (view: string) =>
             workerProxy.dropView(view),
           updateCellBatch: (table: string, updates: CellUpdate[]) => {

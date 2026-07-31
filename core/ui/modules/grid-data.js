@@ -195,16 +195,11 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         }
         // Superseded failure: a newer load owns the outcome — return undefined.
     } finally {
-        // isLoadingData keeps its original lifecycle. It is also set by BLOB uploads
-        // (dnd.js), so a superseded or no-spinner load must NOT clear it — only the
-        // spinner load that set it does, mirroring the pre-change behavior.
-        // Both flags belong to the latest request. A superseded spinner load must
-        // leave isLoadingData set for the newer load just as it leaves the dedicated
-        // grid guard set; otherwise stale completion makes the current load appear idle.
+        // Both flags belong to the latest request. In particular, a background
+        // load may supersede a foreground spinner load; although it did not set
+        // isLoadingData itself, it inherits responsibility for releasing that flag.
         if (!isSuperseded()) {
-            if (showSpinner) {
-                state.isLoadingData = false;
-            }
+            state.isLoadingData = false;
             state.isGridReloading = false;
         }
     }

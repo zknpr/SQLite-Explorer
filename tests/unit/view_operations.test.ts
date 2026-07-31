@@ -396,6 +396,35 @@ describe('view operations', () => {
         }
     });
 
+    it('rejects a stale view replacement snapshot without overwriting the newer definition', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE VIEW shared_view AS SELECT 1 AS value');
+            const stale = await engine.getViewDefinition('shared_view');
+            await engine.executeQuery('DROP VIEW shared_view');
+            await engine.executeQuery('CREATE VIEW shared_view AS SELECT 2 AS value');
+
+            await assert.rejects(
+                () => engine.editView(
+                    'shared_view',
+                    'SELECT 3 AS value',
+                    true,
+                    stale.sql
+                ),
+                /changed outside this editor/i
+            );
+
+            const current = await engine.getViewDefinition('shared_view');
+            assert.strictEqual(current.selectSql, 'SELECT 2 AS value');
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM shared_view'))[0].rows,
+                [[2]]
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('validates with SQLite and previews without changing the schema', async () => {
         const engine = await createEngine();
         try {
@@ -641,6 +670,32 @@ describe('view operations', () => {
         assert.match(String(warning.mock.calls[0].arguments[0]), /active_users_insert/);
         assert.strictEqual(editView.mock.callCount(), 0);
         assert.strictEqual(recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('forwards the expected stored definition through the host edit bridge', async () => {
+        const before = createViewDefinition();
+        const after = createViewDefinition({
+            sql: 'CREATE VIEW "active_users" AS SELECT id FROM users',
+            selectSql: 'SELECT id FROM users'
+        });
+        const editView = mock.fn(async () => ({ before, after }));
+        const { bridge, recordExternalModification } = createHostBridge({ editView });
+
+        const result = await bridge.editView(
+            'active_users',
+            after.selectSql,
+            true,
+            before.sql
+        );
+
+        assert.deepStrictEqual(editView.mock.calls[0].arguments, [
+            'active_users',
+            after.selectSql,
+            true,
+            before.sql
+        ]);
+        assert.deepStrictEqual(result, { before, after });
+        assert.strictEqual(recordExternalModification.mock.callCount(), 1);
     });
 
     it('drops a view only after modal confirmation and records the reversible definition', async () => {

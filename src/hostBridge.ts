@@ -412,7 +412,12 @@ export class HostBridge implements ToastService {
    * Atomically replace a view. Trigger preservation is the default; discarding
    * attached triggers requires a separate modal confirmation.
    */
-  async editView(view: string, selectSql: string, preserveTriggers: boolean = true) {
+  async editView(
+    view: string,
+    selectSql: string,
+    preserveTriggers: boolean = true,
+    expectedSql?: string
+  ) {
     const dbOps = this.ensureDatabaseInitialized();
     if (this.isReadOnly) {
       throw new Error('Document is read-only');
@@ -434,7 +439,7 @@ export class HostBridge implements ToastService {
       }
     }
 
-    const result = await dbOps.editView(view, selectSql, preserveTriggers);
+    const result = await dbOps.editView(view, selectSql, preserveTriggers, expectedSql);
     this.document.recordExternalModification({
       label: 'Edit View',
       description: `Edit view ${view}`,

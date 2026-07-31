@@ -413,6 +413,65 @@ describe('editor keyboard and grid selection interactions', () => {
         assert.strictEqual(state.selectedCells.length, 1);
     });
 
+    it('handles uppercase copy and select-all shortcut keys with Caps Lock on', async () => {
+        let keydown: ((event: any) => Promise<void>) | undefined;
+        const clipboardWrites: string[] = [];
+        const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+        Object.defineProperty(globalThis, 'navigator', {
+            configurable: true,
+            value: { clipboard: { writeText: async (text: string) => clipboardWrites.push(text) } }
+        });
+        (globalThis as any).document = {
+            activeElement: { tagName: 'DIV' },
+            addEventListener(type: string, listener: (event: any) => Promise<void>) {
+                if (type === 'keydown') keydown = listener;
+            },
+            getElementById() { return null; },
+            querySelector() { return null; },
+            querySelectorAll() { return []; }
+        };
+
+        try {
+            const { setupGlobalShortcuts } = await import(globalShortcutsModulePath);
+            const { state } = await import(stateModulePath);
+            setupGlobalShortcuts();
+            assert.ok(keydown, 'global keydown listener was not registered');
+
+            state.selectedTable = 'items';
+            state.selectedTableType = 'table';
+            state.gridData = [[7, 'alpha']];
+            state.selectedCells = [{ rowIdx: 0, colIdx: 0, rowId: 7, value: 'alpha' }];
+            let copyPrevented = false;
+            await keydown({
+                key: 'C',
+                metaKey: false,
+                ctrlKey: true,
+                preventDefault() { copyPrevented = true; }
+            });
+
+            state.selectedCells = [];
+            let selectAllPrevented = false;
+            await keydown({
+                key: 'A',
+                metaKey: true,
+                ctrlKey: false,
+                preventDefault() { selectAllPrevented = true; },
+                stopPropagation() {}
+            });
+
+            assert.strictEqual(copyPrevented, true);
+            assert.deepStrictEqual(clipboardWrites, ['alpha']);
+            assert.strictEqual(selectAllPrevented, true);
+            assert.deepStrictEqual([...state.selectedRowIds], [7]);
+        } finally {
+            if (navigatorDescriptor) {
+                Object.defineProperty(globalThis, 'navigator', navigatorDescriptor);
+            } else {
+                delete (globalThis as any).navigator;
+            }
+        }
+    });
+
     it('clears selection on click-away but preserves selection-dependent controls', async () => {
         const containerListeners = new Map<string, (event: any) => any>();
         const documentListeners = new Map<string, (event: any) => any>();

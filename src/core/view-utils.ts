@@ -1,5 +1,38 @@
 import { escapeIdentifier } from './sql-utils';
-import type { ViewTriggerDefinition } from './types';
+import type { CellValue, ViewTriggerDefinition } from './types';
+
+/** Canonical trigger sources, ordered by the schema in which they are replayed. */
+export const VIEW_TRIGGER_SCHEMA_QUERIES = [
+  {
+    sql: "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
+    temporary: false
+  },
+  {
+    sql: "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
+    temporary: true
+  }
+] as const;
+
+/** Map canonical trigger-query rows while keeping temp-schema provenance intact. */
+export function mapViewTriggerRows(
+  view: string,
+  rowsBySchema: readonly (readonly (readonly CellValue[])[])[]
+): ViewTriggerDefinition[] {
+  if (rowsBySchema.length !== VIEW_TRIGGER_SCHEMA_QUERIES.length) {
+    throw new Error(`View trigger definition fetch was incomplete for ${view}`);
+  }
+
+  return VIEW_TRIGGER_SCHEMA_QUERIES.flatMap((source, index) => (
+    rowsBySchema[index].map(row => {
+      if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
+        throw new Error(`View trigger definition is unavailable for ${view}`);
+      }
+      return source.temporary
+        ? { identifier: row[0], sql: row[1], temporary: true }
+        : { identifier: row[0], sql: row[1] };
+    })
+  ));
+}
 
 /**
  * Remove one optional statement terminator from an editable SELECT body.
@@ -158,4 +191,29 @@ export function isViewDefinitionSnapshotCurrent(
   currentSql: string | undefined
 ): boolean {
   return snapshotSql === currentSql;
+}
+
+/** Stable cross-RPC error text used by both view-editor conflict surfaces. */
+export const VIEW_DEFINITION_CONFLICT_MESSAGE =
+  'The view changed outside this editor. Reload before saving; the view was not modified.';
+
+/**
+ * Enforce an optional compare-and-swap precondition for a stored CREATE VIEW.
+ * Undefined means the caller did not load a snapshot (undo/redo and legacy RPC
+ * callers); editor saves always supply the exact sqlite_schema.sql value.
+ */
+export function assertViewDefinitionSnapshotCurrent(
+  expectedSql: string | undefined,
+  currentSql: string | undefined
+): void {
+  if (expectedSql !== undefined && !isViewDefinitionSnapshotCurrent(expectedSql, currentSql)) {
+    throw new Error(VIEW_DEFINITION_CONFLICT_MESSAGE);
+  }
+}
+
+/** Recognize the stable conflict after it crosses worker/webview RPC boundaries. */
+export function isViewDefinitionConflictError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes(VIEW_DEFINITION_CONFLICT_MESSAGE)
+    || /\b(?:the|this) view changed outside this editor\b.*\bnot modified\b/i.test(message);
 }

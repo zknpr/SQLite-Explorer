@@ -8,6 +8,8 @@ const moduleCache = require('module')._cache;
 
 let connectionFailed = false;
 let workerTerminated = false;
+let exposedWorkerMethods: string[] = [];
+let workerProxy: Record<string, (...args: any[]) => any> = {};
 
 const Module = require('module');
 
@@ -27,12 +29,10 @@ Module.prototype.require = function(id: string) {
     if (id === 'vscode') return require('./mocks/vscode').mockVscode;
     if (id.endsWith('core/rpc')) {
         return {
-          connectWorkerPort: () => ({
-            initializeDatabase: async () => {
-              if (connectionFailed) throw new Error('Connection failed');
-              return { isReadOnly: false };
-            }
-          }),
+          connectWorkerPort: (_port: unknown, methods: string[]) => {
+            exposedWorkerMethods = methods;
+            return workerProxy;
+          },
           Transfer: class Transfer {}
         };
     }
@@ -71,6 +71,13 @@ describe('workerFactory error path tests', () => {
   beforeEach(() => {
     connectionFailed = false;
     workerTerminated = false;
+    exposedWorkerMethods = [];
+    workerProxy = {
+      initializeDatabase: async () => {
+        if (connectionFailed) throw new Error('Connection failed');
+        return { isReadOnly: false };
+      }
+    };
 
     // Reset VSCode mock behaviors
     Object.defineProperty(mockVscode.workspace, 'fs', {
@@ -112,6 +119,119 @@ describe('workerFactory error path tests', () => {
     } catch (err: any) {
       assert.strictEqual(err.message, 'Connection failed');
       assert.strictEqual(workerTerminated, true, 'terminateWorker should be called to prevent memory leaks');
+    }
+  });
+
+  it('routes view history through the desktop worker-backed WASM facade', async () => {
+    const views = new Map<string, any>();
+    const definition = (name: string, selectSql: string) => ({
+      identifier: name,
+      sql: `CREATE VIEW "${name}" AS ${selectSql}`,
+      selectSql,
+      triggers: []
+    });
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false }),
+      createView: async (name: string, selectSql: string) => {
+        const created = definition(name, selectSql);
+        views.set(name, created);
+        return created;
+      },
+      getViewDefinition: async (name: string) => {
+        const current = views.get(name);
+        if (!current) throw new Error(`View not found: ${name}`);
+        return current;
+      },
+      editView: async (name: string, selectSql: string) => {
+        const before = views.get(name);
+        const after = definition(name, selectSql);
+        views.set(name, after);
+        return { before, after };
+      },
+      dropView: async (name: string) => {
+        const before = views.get(name);
+        views.delete(name);
+        return before;
+      },
+      undoModification: async (mod: any) => {
+        if (mod.modificationType === 'view_create') views.delete(mod.targetTable);
+        else if (mod.viewDefBefore) views.set(mod.targetTable, mod.viewDefBefore);
+      },
+      redoModification: async (mod: any) => {
+        if (mod.modificationType === 'view_drop') views.delete(mod.targetTable);
+        else if (mod.viewDefAfter) views.set(mod.targetTable, mod.viewDefAfter);
+      },
+      applyModifications: async (mods: any[]) => {
+        for (const mod of mods) await workerProxy.redoModification(mod);
+      },
+      discardModifications: async (mods: any[]) => {
+        for (let index = mods.length - 1; index >= 0; index--) {
+          await workerProxy.undoModification(mods[index]);
+        }
+      },
+      flushChanges: async () => {}
+    };
+
+    const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
+    const fileUri = {
+      scheme: 'file',
+      fsPath: '/test/db.sqlite',
+      path: '/test/db.sqlite'
+    } as any;
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
+
+    const created = await databaseOps.createView('history_view', 'SELECT 1 AS value');
+    const createMod = {
+      description: 'Create history_view',
+      modificationType: 'view_create' as const,
+      targetTable: 'history_view',
+      viewDefAfter: created
+    };
+    await databaseOps.undoModification(createMod);
+    await assert.rejects(databaseOps.getViewDefinition('history_view'), /View not found/);
+    await databaseOps.redoModification(createMod);
+    assert.strictEqual((await databaseOps.getViewDefinition('history_view')).selectSql, 'SELECT 1 AS value');
+
+    const edited = await databaseOps.editView('history_view', 'SELECT 2 AS value', true);
+    const editMod = {
+      description: 'Edit history_view',
+      modificationType: 'view_edit' as const,
+      targetTable: 'history_view',
+      viewDefBefore: edited.before,
+      viewDefAfter: edited.after
+    };
+    await databaseOps.undoModification(editMod);
+    assert.strictEqual((await databaseOps.getViewDefinition('history_view')).selectSql, 'SELECT 1 AS value');
+    await databaseOps.redoModification(editMod);
+    assert.strictEqual((await databaseOps.getViewDefinition('history_view')).selectSql, 'SELECT 2 AS value');
+
+    const dropped = await databaseOps.dropView('history_view');
+    const dropMod = {
+      description: 'Drop history_view',
+      modificationType: 'view_drop' as const,
+      targetTable: 'history_view',
+      viewDefBefore: dropped
+    };
+    await databaseOps.undoModification(dropMod);
+    assert.strictEqual((await databaseOps.getViewDefinition('history_view')).selectSql, 'SELECT 2 AS value');
+    await databaseOps.redoModification(dropMod);
+    await assert.rejects(databaseOps.getViewDefinition('history_view'), /View not found/);
+
+    await databaseOps.applyModifications([createMod]);
+    assert.strictEqual((await databaseOps.getViewDefinition('history_view')).selectSql, 'SELECT 1 AS value');
+    await databaseOps.discardModifications([createMod]);
+    await assert.rejects(databaseOps.getViewDefinition('history_view'), /View not found/);
+    await databaseOps.flushChanges();
+
+    for (const method of [
+      'applyModifications',
+      'undoModification',
+      'redoModification',
+      'flushChanges',
+      'discardModifications'
+    ]) {
+      assert.ok(exposedWorkerMethods.includes(method), `${method} was not exposed over worker RPC`);
     }
   });
 });

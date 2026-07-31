@@ -412,6 +412,7 @@ describe('view modal concurrency', () => {
             editCalls++;
             return {};
         };
+        const originalReadOnly = state.isReadOnly;
         state.isReadOnly = false;
 
         try {
@@ -431,6 +432,59 @@ describe('view modal concurrency', () => {
             assert.strictEqual(elements.viewSelectSql.value, latestDefinition.selectSql);
             assert.strictEqual(elements.btnReloadViewDefinition.hidden, true);
             assert.match(elements.viewValidationStatus.textContent, /latest definition loaded/i);
+        } finally {
+            backendApi.getViewDefinition = originals.get;
+            backendApi.validateViewDefinition = originals.validate;
+            backendApi.editView = originals.edit;
+            state.isReadOnly = originalReadOnly;
+        }
+    });
+
+    it('shows the friendly reload conflict when the engine-side snapshot check wins a race', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openEditViewModal } = await import(viewsModulePath);
+        const originalDefinition = {
+            sql: 'CREATE VIEW shared_view AS SELECT 1 AS value',
+            selectSql: 'SELECT 1 AS value',
+            triggers: []
+        };
+        const originals = {
+            get: backendApi.getViewDefinition,
+            validate: backendApi.validateViewDefinition,
+            edit: backendApi.editView
+        };
+        const editArguments: unknown[][] = [];
+        backendApi.getViewDefinition = async () => originalDefinition;
+        backendApi.validateViewDefinition = async () => undefined;
+        backendApi.editView = async (...args: unknown[]) => {
+            editArguments.push(args);
+            throw new Error(
+                'This view changed outside this editor. Reload before saving; the view was not modified.'
+            );
+        };
+        state.isReadOnly = false;
+
+        try {
+            initViews();
+            await openEditViewModal('shared_view');
+            elements.viewSelectSql.value = 'SELECT 3 AS value';
+
+            await listener('btnSaveView', 'click')();
+
+            assert.deepStrictEqual(editArguments, [[
+                'shared_view',
+                'SELECT 3 AS value',
+                true,
+                originalDefinition.sql
+            ]]);
+            assert.strictEqual(elements.viewModal.classList.contains('hidden'), false);
+            assert.match(elements.viewValidationStatus.textContent, /changed outside this editor/i);
+            assert.strictEqual(elements.btnReloadViewDefinition.hidden, false);
         } finally {
             backendApi.getViewDefinition = originals.get;
             backendApi.validateViewDefinition = originals.validate;

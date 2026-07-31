@@ -123,8 +123,10 @@ describe('SQLiteFileSystemProvider', () => {
             );
 
             const content = await provider.readFile(uri);
+            const stat = await provider.stat(uri);
 
             assert.strictEqual(new TextDecoder().decode(content), 'SELECT id, name FROM users');
+            assert.strictEqual(stat.size, content.byteLength);
             assert.strictEqual(dbOps.getViewDefinition.mock.callCount(), 1);
         });
 
@@ -352,7 +354,8 @@ describe('SQLiteFileSystemProvider', () => {
             assert.deepStrictEqual(dbOps.editView.mock.calls[0].arguments, [
                 'active users',
                 after.selectSql,
-                true
+                true,
+                undefined
             ]);
             assert.deepStrictEqual((doc.recordExternalModification as any).mock.calls[0].arguments[0], {
                 label: 'Edit View',
@@ -561,6 +564,55 @@ describe('SQLiteFileSystemProvider', () => {
             }
         });
 
+        it('passes the read snapshot into the engine and maps a raced CAS conflict to reload', async () => {
+            const original = {
+                identifier: 'raced_view',
+                sql: 'CREATE VIEW "raced_view" AS SELECT 1 AS value',
+                selectSql: 'SELECT 1 AS value',
+                triggers: []
+            };
+            const editView = mock.fn(async () => {
+                throw new Error(
+                    'This view changed outside this editor. Reload before saving; the view was not modified.'
+                );
+            });
+            const document = setupMockDocument(docKey, {
+                getViewDefinition: mock.fn(async () => original),
+                editView
+            });
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/raced_view/group/__view__.sql/definition.sql`
+            );
+            const events: vscode.FileChangeEvent[][] = [];
+            const subscription = provider.onDidChangeFile(changes => events.push(changes));
+
+            try {
+                await provider.readFile(uri);
+                await assert.rejects(
+                    provider.writeFile(
+                        uri,
+                        new TextEncoder().encode('SELECT 3 AS value'),
+                        { create: false, overwrite: true }
+                    ),
+                    /changed outside this editor.*not modified/i
+                );
+
+                assert.deepStrictEqual(editView.mock.calls[0].arguments, [
+                    'raced_view',
+                    'SELECT 3 AS value',
+                    true,
+                    original.sql
+                ]);
+                assert.strictEqual(
+                    (document.recordExternalModification as any).mock.callCount(),
+                    0
+                );
+                assert.strictEqual(events.at(-1)?.[0].uri.toString(), uri.toString());
+            } finally {
+                subscription.dispose();
+            }
+        });
+
         it('keeps a rejected view edit dirty and reports the SQLite error clearly', async () => {
             const sqliteError = '[query] SQLite error 1: near "MAX": syntax error';
             const dbOps = {
@@ -704,14 +756,18 @@ describe('SQLiteFileSystemProvider', () => {
 
         it('stat keeps __view__.sql writable', async () => {
             const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/__view__.sql/definition.sql`);
+            const getViewDefinition = mock.fn(async () => ({ selectSql: 'SELECT 1' }));
             setupMockDocument(docKey, {
-                getViewDefinition: async () => ({ selectSql: 'SELECT 1' })
+                getViewDefinition
             });
 
             const s = await provider.stat(uri);
+            const again = await provider.stat(uri);
 
             assert.strictEqual(s.permissions, undefined);
             assert.strictEqual(s.size, 'SELECT 1'.length);
+            assert.strictEqual(again.size, s.size);
+            assert.strictEqual(getViewDefinition.mock.callCount(), 1);
         });
 
         it('forgets view metadata when its database document is disposed', async () => {

@@ -302,7 +302,8 @@ export const backendApi = {
     validateViewDefinition: (view, selectSql) => sendRpcRequest('validateViewDefinition', [view, selectSql]),
     previewViewDefinition: (view, selectSql, limit) => sendRpcRequest('previewViewDefinition', [view, selectSql, limit]),
     createView: (view, selectSql) => sendRpcRequest('createView', [view, selectSql]),
-    editView: (view, selectSql, preserveTriggers) => sendRpcRequest('editView', [view, selectSql, preserveTriggers]),
+    editView: (view, selectSql, preserveTriggers, expectedSql) =>
+        sendRpcRequest('editView', [view, selectSql, preserveTriggers, expectedSql]),
     dropView: (view) => sendRpcRequest('dropView', [view]),
     updateCellBatch: (table, updates, label) => sendRpcRequest('updateCellBatch', [table, updates, label]),
     addColumn: (table, column, type, defaultValue) => sendRpcRequest('addColumn', [table, column, type, defaultValue]),

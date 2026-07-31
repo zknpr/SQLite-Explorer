@@ -250,8 +250,8 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().createView(view, selectSql);
     },
 
-    async editView(view: string, selectSql: string, preserveTriggers?: boolean) {
-      return requireEngine().editView(view, selectSql, preserveTriggers);
+    async editView(view: string, selectSql: string, preserveTriggers?: boolean, expectedSql?: string) {
+      return requireEngine().editView(view, selectSql, preserveTriggers, expectedSql);
     },
 
     async dropView(view: string) {

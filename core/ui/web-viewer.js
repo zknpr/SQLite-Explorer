@@ -147,7 +147,9 @@ async function initializeApp() {
 
         // Initialize connection - parent window handles this
         const result = await backendApi.initialize();
-        applyConnectionResult(result);
+        if (!applyConnectionResult(result)) {
+            throw new Error('Failed to connect to database');
+        }
 
         // Test connection
         await backendApi.ping();

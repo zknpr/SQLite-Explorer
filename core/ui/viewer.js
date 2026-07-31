@@ -65,11 +65,9 @@ async function connectAndLoadSchema() {
     updateStatus('Connecting to database...');
 
     const result = await backendApi.initialize();
-    if (!result || !result.connected) {
+    if (!applyConnectionResult(result)) {
         throw new Error('Failed to connect to database');
     }
-
-    applyConnectionResult(result);
 
     // Test connection
     await backendApi.ping();

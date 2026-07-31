@@ -6,6 +6,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createHash, webcrypto } from 'node:crypto';
 import path from 'node:path';
 import vm from 'node:vm';
+import esbuild from 'esbuild';
 import initSqlJs from 'sql.js';
 
 interface WorkerHarness {
@@ -21,41 +22,65 @@ const bundledWorkerPath = path.resolve(
     'website/public/sqlite-viewer/worker.js'
 );
 
-function readCurrentWorkerBundle(): string {
+let currentWorkerBundle: Promise<string> | undefined;
+
+function readCurrentWorkerBundle(): Promise<string> {
+    currentWorkerBundle ??= (async () => {
     assert.ok(
         existsSync(bundledWorkerPath),
         'website worker bundle is missing; run node scripts/build.mjs'
     );
-    const authoredSource = readFileSync(authoredWorkerPath);
-    const expectedHash = createHash('sha256').update(authoredSource).digest('hex');
+    const rendered = await esbuild.build({
+        entryPoints: [authoredWorkerPath],
+        outfile: bundledWorkerPath,
+        bundle: true,
+        platform: 'browser',
+        format: 'iife',
+        target: 'es2020',
+        minify: true,
+        write: false
+    });
+    assert.strictEqual(rendered.outputFiles.length, 1);
+    const renderedSource = rendered.outputFiles[0].text;
+    const expectedHash = createHash('sha256').update(renderedSource).digest('hex');
     const bundledSource = readFileSync(bundledWorkerPath, 'utf8');
     const bundledHash = bundledSource.match(
-        /sqlite-viewer-source-sha256:([a-f0-9]{64})/
+        /sqlite-viewer-bundle-sha256:([a-f0-9]{64})/
     )?.[1];
     assert.strictEqual(
         bundledHash,
         expectedHash,
         'website worker bundle is stale; run node scripts/build.mjs'
     );
+    assert.strictEqual(
+        bundledSource,
+        `/*! sqlite-viewer-bundle-sha256:${expectedHash} */\n${renderedSource}`,
+        'website worker bundle is stale; run node scripts/build.mjs'
+    );
     return bundledSource;
+    })();
+    return currentWorkerBundle;
 }
 
 async function createWorkerHarness(options: {
     queryTimeout?: number;
     now?: () => number;
     readOnlyMode?: boolean;
+    useBundledWasm?: boolean;
+    initSqlJs?: (config: any) => Promise<any>;
+    onImportScripts?: (url: string) => void;
 } = {}): Promise<WorkerHarness> {
-    const source = readCurrentWorkerBundle();
+    const source = await readCurrentWorkerBundle();
     const responses: any[] = [];
     const workerGlobal: any = {
-        initSqlJs,
+        initSqlJs: options.initSqlJs ?? initSqlJs,
         postMessage(message: unknown) {
             responses.push(message);
         }
     };
     const context = vm.createContext({
         self: workerGlobal,
-        importScripts() {},
+        importScripts(url: string) { options.onImportScripts?.(url); },
         console: { log() {}, warn() {}, error() {} },
         Uint8Array,
         ArrayBuffer,
@@ -93,15 +118,17 @@ async function createWorkerHarness(options: {
         return response.content.data;
     };
 
-    const wasmBinary = new Uint8Array(readFileSync(
-        path.resolve(process.cwd(), 'assets/sqlite3.wasm')
-    ));
-    await invoke('initializeDatabase', 'test.db', {
+    const initConfig: Record<string, unknown> = {
         content: null,
-        wasmBinary,
         queryTimeout: options.queryTimeout,
         readOnlyMode: options.readOnlyMode
-    });
+    };
+    if (options.useBundledWasm !== false) {
+        initConfig.wasmBinary = new Uint8Array(readFileSync(
+            path.resolve(process.cwd(), 'assets/sqlite3.wasm')
+        ));
+    }
+    await invoke('initializeDatabase', 'test.db', initConfig);
     return { invoke };
 }
 
@@ -111,6 +138,28 @@ async function workerScalar(worker: WorkerHarness, sql: string): Promise<unknown
 }
 
 describe('web demo view worker', () => {
+    it('loads the package-aligned sql.js release from the CDN fallback', async () => {
+        const importedUrls: string[] = [];
+        let wasmUrl = '';
+
+        await createWorkerHarness({
+            useBundledWasm: false,
+            onImportScripts: url => importedUrls.push(url),
+            initSqlJs: async config => {
+                wasmUrl = config.locateFile('sql-wasm.wasm');
+                return { Database: class {} };
+            }
+        });
+
+        assert.deepStrictEqual(importedUrls, [
+            'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.14.1/sql-wasm.js'
+        ]);
+        assert.strictEqual(
+            wasmUrl,
+            'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.14.1/sql-wasm.wasm'
+        );
+    });
+
     it('deletes a column using the demo worker table-info shape', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
@@ -159,6 +208,28 @@ describe('web demo view worker', () => {
         );
         assert.match(String(storedSql), /\(a, a\)/);
         assert.doesNotMatch(String(storedSql), /a:1/);
+    });
+
+    it('rejects a stale expected view definition without replacing the newer demo view', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE VIEW shared_view AS SELECT 1 AS value');
+        const stale = await worker.invoke('getViewDefinition', 'shared_view');
+        await worker.invoke(
+            'runQuery',
+            'DROP VIEW shared_view; CREATE VIEW shared_view AS SELECT 2 AS value'
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'shared_view',
+                'SELECT 3 AS value',
+                true,
+                stale.sql
+            ),
+            /changed outside this editor/i
+        );
+        assert.strictEqual(await workerScalar(worker, 'SELECT value FROM shared_view'), 2);
     });
 
     it('previews an edited view through its preserved explicit column list', async () => {

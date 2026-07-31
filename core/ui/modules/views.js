@@ -9,7 +9,10 @@ import { clearSelection, loadTableColumns, loadTableData } from './grid.js';
 import { showEmptyState, updateStatus, updateToolbarButtons } from './ui.js';
 import { formatCellValueAsText } from './utils.js';
 import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
-import { isViewDefinitionSnapshotCurrent } from '../../../src/core/view-utils.ts';
+import {
+    isViewDefinitionConflictError,
+    isViewDefinitionSnapshotCurrent
+} from '../../../src/core/view-utils.ts';
 
 let editingViewName = null;
 let editingViewDefinitionSql;
@@ -279,7 +282,12 @@ async function saveDraft() {
 
         setFeedback(targetView ? 'Replacing view atomically...' : 'Creating view...');
         const result = targetView
-            ? await backendApi.editView(targetView, draft.selectSql, draft.preserveTriggers)
+            ? await backendApi.editView(
+                targetView,
+                draft.selectSql,
+                draft.preserveTriggers,
+                targetDefinitionSql
+            )
             : await backendApi.createView(draft.name, draft.selectSql);
         if (result?.cancelled) {
             if (isCurrentModalSession(modalSession)) setFeedback('Edit cancelled.');
@@ -299,7 +307,10 @@ async function saveDraft() {
             updateStatus(`View "${changedView}" ${targetView ? 'updated' : 'created'} - Ctrl+S to save`);
         }
     } catch (err) {
-        if (isCurrentModalSession(modalSession)) setFeedback(err.message, true);
+        if (isCurrentModalSession(modalSession)) {
+            if (targetView && isViewDefinitionConflictError(err)) showDefinitionConflict();
+            else setFeedback(err.message, true);
+        }
         if (modalSession === activeViewModalSession) updateStatus(`Error: ${err.message}`);
     } finally {
         isSavingView = false;

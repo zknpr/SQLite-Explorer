@@ -201,14 +201,20 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         );
     }
 
-    async editView(view: string, selectSql: string, preserveTriggers?: boolean): Promise<ViewEditResult> {
+    async editView(
+        view: string,
+        selectSql: string,
+        preserveTriggers?: boolean,
+        expectedSql?: string
+    ): Promise<ViewEditResult> {
         return this.logAndDelegate(
             `Replacing view ${escapeIdentifier(view)} with ${this.sanitizeValue(selectSql)} (preserve triggers: ${preserveTriggers !== false})`,
             true,
             'editView',
             view,
             selectSql,
-            preserveTriggers
+            preserveTriggers,
+            expectedSql
         );
     }
 
