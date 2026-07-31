@@ -382,14 +382,19 @@ async function reloadLatestViewDefinition() {
 }
 
 async function openDraftInVsCode() {
-    if (!editingViewName) return;
+    const modalSession = activeViewModalSession;
+    const targetView = editingViewName;
+    if (!targetView) return;
+    const isCurrentRequest = () => modalSession === activeViewModalSession
+        && editingViewName === targetView;
     try {
         const webviewId = document.getElementById('vscode-env')?.dataset.webviewId;
-        await backendApi.openViewEditor(editingViewName, webviewId);
+        await backendApi.openViewEditor(targetView, webviewId);
+        if (!isCurrentRequest()) return;
         closeModal('viewModal');
-        updateStatus(`Editing view "${editingViewName}" in VS Code`);
+        updateStatus(`Editing view "${targetView}" in VS Code`);
     } catch (err) {
-        setFeedback(err.message, true);
+        if (isCurrentRequest()) setFeedback(err.message, true);
     }
 }
 

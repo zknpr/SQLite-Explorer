@@ -573,7 +573,15 @@ describe('SQLiteFileSystemProvider', () => {
                 second_view: { selectSql: 'SELECT 2' }
             };
             const document = setupMockDocument(docKey, {
-                getViewDefinition: async (view: string) => definitions[view]
+                getViewDefinition: async (view: string) => definitions[view],
+                fetchSchema: async () => ({
+                    tables: [],
+                    views: [
+                        { identifier: 'first_view' },
+                        { identifier: 'second_view' }
+                    ],
+                    indexes: []
+                })
             });
             const firstUri = vscode.Uri.parse(
                 `vscode-sqlite://${docKey}/first_view/group/__view__.sql/definition.sql`
@@ -582,7 +590,12 @@ describe('SQLiteFileSystemProvider', () => {
                 `vscode-sqlite://${docKey}/second_view/group/__view__.sql/definition.sql`
             );
             const events: vscode.FileChangeEvent[][] = [];
-            const subscription = provider.onDidChangeFile(changes => events.push(changes));
+            let resolveEvent!: () => void;
+            const eventReceived = new Promise<void>(resolve => { resolveEvent = resolve; });
+            const subscription = provider.onDidChangeFile(changes => {
+                events.push(changes);
+                resolveEvent();
+            });
 
             try {
                 const firstBefore = await provider.stat(firstUri);
@@ -590,6 +603,7 @@ describe('SQLiteFileSystemProvider', () => {
                 now = 200;
 
                 document.invalidateAllViewDocuments();
+                await eventReceived;
 
                 assert.strictEqual(events.length, 1);
                 assert.deepStrictEqual(
@@ -598,6 +612,70 @@ describe('SQLiteFileSystemProvider', () => {
                 );
                 assert.ok((await provider.stat(firstUri)).mtime > firstBefore.mtime);
                 assert.ok((await provider.stat(secondUri)).mtime > secondBefore.mtime);
+            } finally {
+                subscription.dispose();
+            }
+        });
+
+        it('marks removed view documents Deleted while changing surviving views on reload', async () => {
+            let now = 100;
+            mock.method(Date, 'now', () => now);
+            const definitions = new Map([
+                ['surviving_view', {
+                    identifier: 'surviving_view',
+                    sql: 'CREATE VIEW surviving_view AS SELECT 1',
+                    selectSql: 'SELECT 1',
+                    triggers: []
+                }],
+                ['removed_view', {
+                    identifier: 'removed_view',
+                    sql: 'CREATE VIEW removed_view AS SELECT 2',
+                    selectSql: 'SELECT 2',
+                    triggers: []
+                }]
+            ]);
+            const document = setupMockDocument(docKey, {
+                getViewDefinition: async (view: string) => {
+                    const definition = definitions.get(view);
+                    if (!definition) throw new Error(`View not found: ${view}`);
+                    return definition;
+                },
+                fetchSchema: async () => ({
+                    tables: [],
+                    views: [{ identifier: 'surviving_view' }],
+                    indexes: []
+                })
+            });
+            const survivingUri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/surviving_view/group/__view__.sql/definition.sql`
+            );
+            const removedUri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/removed_view/group/__view__.sql/definition.sql`
+            );
+            await provider.stat(survivingUri);
+            await provider.stat(removedUri);
+            let resolveEvent!: (changes: vscode.FileChangeEvent[]) => void;
+            const eventReceived = new Promise<vscode.FileChangeEvent[]>(resolve => {
+                resolveEvent = resolve;
+            });
+            const subscription = provider.onDidChangeFile(resolveEvent);
+
+            try {
+                definitions.delete('removed_view');
+                now = 200;
+                document.invalidateAllViewDocuments();
+                const changes = await eventReceived;
+                const changesByUri = new Map(changes.map(change => [change.uri.toString(), change.type]));
+
+                assert.strictEqual(
+                    changesByUri.get(survivingUri.toString()),
+                    vscode.FileChangeType.Changed
+                );
+                assert.strictEqual(
+                    changesByUri.get(removedUri.toString()),
+                    vscode.FileChangeType.Deleted
+                );
+                await assert.rejects(provider.stat(removedUri), /FileNotFound/);
             } finally {
                 subscription.dispose();
             }
@@ -966,6 +1044,45 @@ describe('SQLiteFileSystemProvider', () => {
             assert.strictEqual(s.size, 'SELECT 1'.length);
             assert.strictEqual(again.size, s.size);
             assert.strictEqual(getViewDefinition.mock.callCount(), 1);
+        });
+
+        it('stat reflects a view document becoming read-only after reload', async () => {
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/wal_view/group/__view__.sql/definition.sql`
+            );
+            const document = setupMockDocument(docKey, {
+                getViewDefinition: async () => ({
+                    identifier: 'wal_view',
+                    sql: 'CREATE VIEW wal_view AS SELECT 1',
+                    selectSql: 'SELECT 1',
+                    triggers: []
+                }),
+                fetchSchema: async () => ({
+                    tables: [],
+                    views: [{ identifier: 'wal_view' }],
+                    indexes: []
+                })
+            });
+            (document as any).isReadOnlyMode = false;
+            assert.strictEqual((await provider.stat(uri)).permissions, undefined);
+            let resolveEvent!: (changes: vscode.FileChangeEvent[]) => void;
+            const eventReceived = new Promise<vscode.FileChangeEvent[]>(resolve => {
+                resolveEvent = resolve;
+            });
+            const subscription = provider.onDidChangeFile(resolveEvent);
+
+            try {
+                (document as any).isReadOnlyMode = true;
+                document.invalidateAllViewDocuments();
+                await eventReceived;
+
+                assert.strictEqual(
+                    (await provider.stat(uri)).permissions,
+                    vscode.FilePermission.Readonly
+                );
+            } finally {
+                subscription.dispose();
+            }
         });
 
         it('forgets view metadata when its database document is disposed', async () => {

@@ -87,7 +87,10 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 type: vsc.FileType.File,
                 ctime: metadata.ctime,
                 mtime: metadata.mtime,
-                size: metadata.size
+                size: metadata.size,
+                permissions: document.isReadOnlyMode
+                    ? vsc.FilePermission.Readonly
+                    : undefined
             };
         }
 
@@ -398,17 +401,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         if (!documentMetadata) return;
 
         if (change.invalidateAllViewDocuments) {
-            const changes: vsc.FileChangeEvent[] = [];
-            for (const metadata of documentMetadata.values()) {
-                metadata.pendingDefinition = undefined;
-                metadata.size = undefined;
-                this.bumpViewDocumentMtime(metadata);
-                changes.push({
-                    type: vsc.FileChangeType.Changed,
-                    uri: metadata.uri
-                });
-            }
-            if (changes.length > 0) this._emitter.fire(changes);
+            void this.invalidateAllTrackedViewDocuments(document, documentMetadata);
             return;
         }
 
@@ -434,6 +427,43 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             this.bumpViewDocumentMtime(metadata);
             changes.push({
                 type: fileChangeType,
+                uri: metadata.uri
+            });
+        }
+        if (changes.length > 0) this._emitter.fire(changes);
+    }
+
+    private async invalidateAllTrackedViewDocuments(
+        document: DatabaseDocument,
+        documentMetadata: Map<string, ViewDocumentMetadata>
+    ): Promise<void> {
+        let existingViews: Set<string> | undefined;
+        try {
+            const schema = await document.databaseOperations.fetchSchema();
+            existingViews = new Set(schema.views.map(view => view.identifier));
+        } catch (error) {
+            // A reload must still invalidate cached contents if schema
+            // classification fails. Falling back to Changed preserves the old
+            // behavior without silently hiding the diagnostic.
+            GlobalOutputChannel?.appendLine(
+                `[VirtualFileSystem] Failed to classify view documents after reload: ${error instanceof Error ? error.message : String(error)}`
+            );
+        }
+
+        // The database document may have closed while the schema request was in
+        // flight. Its metadata and subscriptions are already gone in that case.
+        if (this.viewDocumentMetadata.get(document) !== documentMetadata) return;
+
+        const changes: vsc.FileChangeEvent[] = [];
+        for (const metadata of documentMetadata.values()) {
+            const viewStillExists = existingViews?.has(metadata.view) ?? true;
+            metadata.pendingDefinition = viewStillExists ? undefined : null;
+            metadata.size = undefined;
+            this.bumpViewDocumentMtime(metadata);
+            changes.push({
+                type: viewStillExists
+                    ? vsc.FileChangeType.Changed
+                    : vsc.FileChangeType.Deleted,
                 uri: metadata.uri
             });
         }

@@ -205,6 +205,54 @@ describe('view modal concurrency', () => {
         }
     });
 
+    it('does not let a stale external-editor completion close a newer view draft', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const modalsModulePath = '../../core/ui/modules/modals.js';
+        const { backendApi } = await import(apiModulePath);
+        const { initViews, openEditViewModal } = await import(viewsModulePath);
+        const { closeModal } = await import(modalsModulePath);
+        const openingEditor = createDeferred<void>();
+        const originals = {
+            get: backendApi.getViewDefinition,
+            open: backendApi.openViewEditor
+        };
+        const openedViews: string[] = [];
+        backendApi.getViewDefinition = async (view: string) => ({
+            sql: `CREATE VIEW ${view} AS SELECT 1`,
+            selectSql: `SELECT '${view}'`,
+            triggers: []
+        });
+        backendApi.openViewEditor = async (view: string) => {
+            openedViews.push(view);
+            await openingEditor.promise;
+        };
+
+        try {
+            initViews();
+            await openEditViewModal('old_view');
+            const pendingOpen = listener('btnOpenViewInVsCode', 'click')();
+
+            closeModal('viewModal');
+            await openEditViewModal('new_view');
+            elements.viewSelectSql.value = 'SELECT new_draft';
+            assert.strictEqual(elements.statusText.textContent, 'Ready');
+
+            openingEditor.resolve();
+            await pendingOpen;
+
+            assert.deepStrictEqual(openedViews, ['old_view']);
+            assert.strictEqual(elements.viewNameInput.value, 'new_view');
+            assert.strictEqual(elements.viewSelectSql.value, 'SELECT new_draft');
+            assert.strictEqual(elements.viewModal.classList.contains('hidden'), false);
+            assert.strictEqual(elements.statusText.textContent, 'Ready');
+        } finally {
+            backendApi.getViewDefinition = originals.get;
+            backendApi.openViewEditor = originals.open;
+        }
+    });
+
     it('uses Tab for SQL indentation without moving focus to modal buttons', async () => {
         const { elements, listener } = installViewDocument();
         const viewsModulePath = '../../core/ui/modules/views.js';
