@@ -890,6 +890,8 @@ export async function createNativeDatabaseConnection(
             case 'view_edit':
               if (mod.viewDefAfter) {
                 await restoreNativeViewDefinition(mod.viewDefAfter);
+              } else {
+                outputChannel?.appendLine('[NativeWorker] Skipping view redo: definition missing from history entry');
               }
               break;
 

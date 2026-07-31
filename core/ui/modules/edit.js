@@ -192,7 +192,9 @@ export async function saveCellEdit() {
 
         // Update UI immediately (preserves scroll)
         // refreshContent RPC will handle final consistency check
-        updateCellDom(rowIdx, colIdx, valueToSave);
+        if (currentRowIdx >= 0 && currentColIdx >= 0) {
+            updateCellDom(currentRowIdx, currentColIdx, valueToSave);
+        }
 
         state.selectedCells = [];
         state.lastSelectedCell = null;

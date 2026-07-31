@@ -65,6 +65,7 @@ function readCurrentWorkerBundle(): Promise<string> {
 }
 
 async function createWorkerHarness(options: {
+    content?: Uint8Array;
     queryTimeout?: number;
     now?: () => number;
     readOnlyMode?: boolean;
@@ -121,7 +122,7 @@ async function createWorkerHarness(options: {
     };
 
     const initConfig: Record<string, unknown> = {
-        content: null,
+        content: options.content ?? null,
         queryTimeout: options.queryTimeout,
         readOnlyMode: options.readOnlyMode
     };
@@ -189,7 +190,8 @@ describe('web demo view worker', () => {
             'previewViewDefinition',
             'unsafe_preview',
             'SELECT 1) LIMIT 1; DROP TABLE preview_sentinel; --',
-            10
+            10,
+            'create'
         ));
 
         assert.strictEqual(await workerScalar(
@@ -352,7 +354,12 @@ describe('web demo view worker', () => {
         );
 
         await assert.rejects(
-            worker.invoke('validateViewDefinition', 'parameter_view', 'SELECT ? AS value'),
+            worker.invoke(
+                'validateViewDefinition',
+                'parameter_view',
+                'SELECT ? AS value',
+                'create'
+            ),
             /parameters are not allowed in views/
         );
         await assert.rejects(
@@ -370,8 +377,29 @@ describe('web demo view worker', () => {
         ), originalSql);
     });
 
-    it('rejects an existing name for create-intent validation and preview only', async () => {
+    it('enforces create and edit intent against the installed schema', async () => {
         const worker = await createWorkerHarness();
+
+        await assert.rejects(
+            worker.invoke(
+                'validateViewDefinition',
+                'missing_intent_target',
+                'SELECT 2 AS value',
+                'edit'
+            ),
+            /view no longer exists/i
+        );
+        await assert.rejects(
+            worker.invoke(
+                'previewViewDefinition',
+                'missing_intent_target',
+                'SELECT 2 AS value',
+                10,
+                'edit'
+            ),
+            /view no longer exists/i
+        );
+
         await worker.invoke('createView', 'intent_target', 'SELECT 1 AS value');
 
         await assert.rejects(
@@ -419,14 +447,20 @@ describe('web demo view worker', () => {
         const worker = await createWorkerHarness({ readOnlyMode: true });
 
         await assert.rejects(
-            worker.invoke('validateViewDefinition', 'read_only_view', 'SELECT 1 AS value'),
+            worker.invoke(
+                'validateViewDefinition',
+                'read_only_view',
+                'SELECT 1 AS value',
+                'create'
+            ),
             /View validation is unavailable because the database is read-only/
         );
         const preview = await worker.invoke(
             'previewViewDefinition',
             'read_only_view',
             'SELECT 1 AS value',
-            10
+            10,
+            'create'
         );
         assert.deepStrictEqual(Array.from(preview.headers), ['value']);
         assert.deepStrictEqual(
@@ -436,6 +470,38 @@ describe('web demo view worker', () => {
         assert.strictEqual(await workerScalar(
             worker,
             "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'read_only_view'"
+        ), 0);
+    });
+
+    it('rejects every demo view mutation when initialized read-only', async () => {
+        const writable = await createWorkerHarness();
+        await writable.invoke('createView', 'read_only_existing', 'SELECT 1 AS value');
+        const content = await writable.invoke('exportDatabase', 'test.db');
+        const worker = await createWorkerHarness({
+            content: Uint8Array.from(content),
+            readOnlyMode: true
+        });
+
+        await assert.rejects(
+            worker.invoke('createView', 'read_only_new', 'SELECT 2 AS value'),
+            /view creation is unavailable because the database is read-only/i
+        );
+        await assert.rejects(
+            worker.invoke('editView', 'read_only_existing', 'SELECT 2 AS value'),
+            /view editing is unavailable because the database is read-only/i
+        );
+        await assert.rejects(
+            worker.invoke('dropView', 'read_only_existing'),
+            /view deletion is unavailable because the database is read-only/i
+        );
+
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM read_only_existing'),
+            1
+        );
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'read_only_new'"
         ), 0);
     });
 
@@ -450,7 +516,13 @@ describe('web demo view worker', () => {
         });
 
         await assert.rejects(
-            worker.invoke('previewViewDefinition', 'slow_preview', 'SELECT 1 AS value', 10),
+            worker.invoke(
+                'previewViewDefinition',
+                'slow_preview',
+                'SELECT 1 AS value',
+                10,
+                'create'
+            ),
             /Query execution timed out after 5ms/
         );
     });

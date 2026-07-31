@@ -102,9 +102,27 @@ describe('view operations', () => {
         }
     });
 
-    it('rejects an existing name for create-intent validation and preview only', async () => {
+    it('enforces create and edit intent against the installed schema', async () => {
         const engine = await createEngine();
         try {
+            await assert.rejects(
+                () => engine.validateViewDefinition(
+                    'missing_intent_target',
+                    'SELECT 2 AS value',
+                    'edit'
+                ),
+                /view no longer exists/i
+            );
+            await assert.rejects(
+                () => engine.previewViewDefinition(
+                    'missing_intent_target',
+                    'SELECT 2 AS value',
+                    10,
+                    'edit'
+                ),
+                /view no longer exists/i
+            );
+
             await engine.createView('intent_target', 'SELECT 1 AS value');
 
             await assert.rejects(
@@ -545,18 +563,23 @@ describe('view operations', () => {
             await engine.executeQuery("INSERT INTO users (name) VALUES ('Ada'), ('Grace')");
 
             await assert.rejects(
-                () => engine.validateViewDefinition('preview_only', 'SELECT missing_column FROM users'),
+                () => engine.validateViewDefinition(
+                    'preview_only',
+                    'SELECT missing_column FROM users',
+                    'create'
+                ),
                 /missing_column/
             );
             await assert.rejects(
-                () => engine.validateViewDefinition('preview_only', 'DELETE FROM users'),
+                () => engine.validateViewDefinition('preview_only', 'DELETE FROM users', 'create'),
                 /syntax error/
             );
 
             const preview = await engine.previewViewDefinition(
                 'preview_only',
                 'SELECT id, upper(name) AS display_name FROM users ORDER BY id',
-                1
+                1,
+                'create'
             );
             assert.deepStrictEqual(preview.headers, ['id', 'display_name']);
             assert.deepStrictEqual(preview.rows, [[1, 'ADA']]);
@@ -605,7 +628,11 @@ describe('view operations', () => {
             );
 
             await assert.rejects(
-                () => engine.validateViewDefinition('new_parameter_view', 'SELECT ? AS value'),
+                () => engine.validateViewDefinition(
+                    'new_parameter_view',
+                    'SELECT ? AS value',
+                    'create'
+                ),
                 /parameters are not allowed in views/
             );
             await assert.rejects(
@@ -639,14 +666,19 @@ describe('view operations', () => {
         const engine = result.operations!;
         try {
             await assert.rejects(
-                () => engine.validateViewDefinition('read_only_view', 'SELECT 1 AS value'),
+                () => engine.validateViewDefinition(
+                    'read_only_view',
+                    'SELECT 1 AS value',
+                    'create'
+                ),
                 /View validation is unavailable because the database is read-only/
             );
 
             const preview = await engine.previewViewDefinition(
                 'read_only_view',
                 'SELECT 1 AS value',
-                10
+                10,
+                'create'
             );
             assert.deepStrictEqual(preview.headers, ['value']);
             assert.deepStrictEqual(preview.rows, [[1]]);
@@ -670,7 +702,8 @@ describe('view operations', () => {
             await assert.rejects(() => engine.previewViewDefinition(
                 'unsafe_preview',
                 'SELECT 1) LIMIT 1; DROP TABLE preview_sentinel; --',
-                10
+                10,
+                'create'
             ));
 
             assert.strictEqual(await readScalar(

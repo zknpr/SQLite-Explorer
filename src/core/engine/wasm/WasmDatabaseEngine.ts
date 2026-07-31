@@ -75,6 +75,11 @@ export type WasmEngineLogHandler = (
   ...args: unknown[]
 ) => void;
 
+interface ExistingViewForIntent {
+  storedSql: CellValue | undefined;
+  columnListSql: string | undefined;
+}
+
 // ============================================================================
 // Database Engine Implementation
 // ============================================================================
@@ -980,6 +985,26 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     return this.readViewDefinition(view, false);
   }
 
+  /** Resolve the installed view state once so validate and preview enforce identical intent rules. */
+  private async resolveExistingViewForIntent(
+    view: string,
+    intent: ViewDefinitionIntent
+  ): Promise<ExistingViewForIntent> {
+    const result = await this.executeQuery(
+      "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+      [view]
+    );
+    const row = result[0]?.rows[0];
+    assertViewDefinitionIntent(view, row !== undefined, intent);
+    const storedSql = row?.[0];
+    return {
+      storedSql,
+      columnListSql: typeof storedSql === 'string'
+        ? extractViewColumnListSql(storedSql)
+        : undefined
+    };
+  }
+
   async validateViewDefinition(
     view: string,
     selectSql: string,
@@ -989,16 +1014,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       throw new Error('View validation is unavailable because the database is read-only');
     }
     const body = normalizeViewSelectSql(selectSql);
-    const existingResult = await this.executeQuery(
-      "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
-      [view]
-    );
-    const existingRow = existingResult[0]?.rows[0];
-    const existingSql = existingRow?.[0];
-    assertViewDefinitionIntent(view, existingRow !== undefined, intent);
-    const columnListSql = typeof existingSql === 'string'
-      ? extractViewColumnListSql(existingSql)
-      : undefined;
+    const { storedSql: existingSql, columnListSql } =
+      await this.resolveExistingViewForIntent(view, intent);
     const savepointName = this.createSavepointName('sp_validate_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
@@ -1024,16 +1041,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   ): Promise<QueryResultSet> {
     const body = normalizeViewSelectSql(selectSql);
     const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
-    const existingResult = await this.executeQuery(
-      "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
-      [view]
-    );
-    const existingRow = existingResult[0]?.rows[0];
-    const existingSql = existingRow?.[0];
-    assertViewDefinitionIntent(view, existingRow !== undefined, intent);
-    const columnListSql = typeof existingSql === 'string'
-      ? extractViewColumnListSql(existingSql)
-      : undefined;
+    const { storedSql: existingSql, columnListSql } =
+      await this.resolveExistingViewForIntent(view, intent);
 
     if (this.readOnlyMode) {
       // Read-only documents cannot run disposable schema DDL. A target-named

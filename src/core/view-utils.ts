@@ -247,7 +247,7 @@ export function buildCreateViewTriggerSql(trigger: ViewTriggerDefinition): strin
   return trigger.sql.replace(createTriggerPrefix, '$1TEMP $2');
 }
 
-/** Reject create-mode validation/preview when SQLite already owns that name. */
+/** Enforce create/edit intent against SQLite's currently installed schema. */
 export function assertViewDefinitionIntent(
   view: string,
   viewExists: boolean,
@@ -258,6 +258,9 @@ export function assertViewDefinitionIntent(
   }
   if (intent === 'create' && viewExists) {
     throw new Error(`View already exists: ${view}`);
+  }
+  if (intent === 'edit' && !viewExists) {
+    throw new Error(`View no longer exists: ${view}`);
   }
 }
 

@@ -285,6 +285,7 @@ describe('editor keyboard and grid selection interactions', () => {
             }))
         );
         let cells: Record<string, any> = makeCells();
+        const paintedCells: string[] = [];
         const controls: Record<string, any> = {
             pageIndicator: { textContent: '' },
             btnFirst: { disabled: false },
@@ -296,7 +297,20 @@ describe('editor keyboard and grid selection interactions', () => {
         };
         const createdTextareas: any[] = [];
         (globalThis as any).document = {
-            getElementById(id: string) { return cells[id] ?? controls[id] ?? null; },
+            getElementById(id: string) {
+                const cell = cells[id];
+                if (cell && !cell.paintTracked) {
+                    const appendChild = cell.appendChild.bind(cell);
+                    cell.appendChild = (child: any) => {
+                        if (child.className === 'cell-text' && child.textContent === 'z') {
+                            paintedCells.push(id);
+                        }
+                        appendChild(child);
+                    };
+                    cell.paintTracked = true;
+                }
+                return cell ?? controls[id] ?? null;
+            },
             querySelectorAll() { return []; },
             querySelector() { return null; },
             createElement(tag: string) {
@@ -388,6 +402,11 @@ describe('editor keyboard and grid selection interactions', () => {
             assert.strictEqual(state.editingCellInfo?.rowIdx, 1);
             assert.strictEqual(state.editingCellInfo?.colIdx, 1);
             assert.strictEqual(createdTextareas.at(-1)?.value, 'first row note');
+            assert.deepStrictEqual(
+                paintedCells,
+                ['cell-1-0'],
+                'the immediate paint must follow the edited row identity after reordering'
+            );
 
             createdTextareas.at(-1).value = 'edited intended row';
             await onCellInputKeydown({

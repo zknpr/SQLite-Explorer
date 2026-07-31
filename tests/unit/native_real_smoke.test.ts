@@ -154,8 +154,13 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
         );
 
         await testContext.test('validates and previews with a legal disposable view name', async () => {
-            await engine.validateViewDefinition('preview_candidate', USER_VIEW_BODY);
-            const preview = await engine.previewViewDefinition('preview_candidate', USER_VIEW_BODY, 10);
+            await engine.validateViewDefinition('preview_candidate', USER_VIEW_BODY, 'create');
+            const preview = await engine.previewViewDefinition(
+                'preview_candidate',
+                USER_VIEW_BODY,
+                10,
+                'create'
+            );
             assert.deepStrictEqual(preview.headers, [
                 'order_id',
                 'order_number',
@@ -170,7 +175,25 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.deepStrictEqual(preview.rows, []);
         });
 
-        await testContext.test('rejects duplicate names only for create-intent validation and preview', async () => {
+        await testContext.test('enforces create and edit intent against the installed schema', async () => {
+            await assert.rejects(
+                engine.validateViewDefinition(
+                    'missing_native_intent_target',
+                    'SELECT 2 AS value',
+                    'edit'
+                ),
+                /view no longer exists/i
+            );
+            await assert.rejects(
+                engine.previewViewDefinition(
+                    'missing_native_intent_target',
+                    'SELECT 2 AS value',
+                    10,
+                    'edit'
+                ),
+                /view no longer exists/i
+            );
+
             await engine.createView('native_intent_target', 'SELECT 1 AS value');
 
             await assert.rejects(
@@ -218,8 +241,13 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
 )
 SELECT value AS x, value * 10 AS x FROM sequence`;
 
-            await engine.validateViewDefinition('duplicate_alias_preview', body);
-            const preview = await engine.previewViewDefinition('duplicate_alias_preview', body, 100);
+            await engine.validateViewDefinition('duplicate_alias_preview', body, 'create');
+            const preview = await engine.previewViewDefinition(
+                'duplicate_alias_preview',
+                body,
+                100,
+                'create'
+            );
 
             assert.deepStrictEqual(preview.headers, ['x', 'x:1']);
             assert.strictEqual(preview.rows.length, 100);

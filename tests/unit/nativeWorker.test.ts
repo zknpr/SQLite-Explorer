@@ -714,11 +714,12 @@ describe('createNativeDatabaseConnection', () => {
         try {
             connection.calls.length = 0;
 
-            await connection.databaseOps.validateViewDefinition('inventory_rollup', body);
+            await connection.databaseOps.validateViewDefinition('inventory_rollup', body, 'create');
             const preview = await connection.databaseOps.previewViewDefinition(
                 'inventory_rollup',
                 body,
-                10
+                10,
+                'create'
             );
 
             assert.deepStrictEqual(preview.headers, ['m']);
@@ -749,7 +750,11 @@ describe('createNativeDatabaseConnection', () => {
         try {
             connection.calls.length = 0;
             await assert.rejects(
-                connection.databaseOps.validateViewDefinition('parameter_view', 'SELECT ? AS value'),
+                connection.databaseOps.validateViewDefinition(
+                    'parameter_view',
+                    'SELECT ? AS value',
+                    'create'
+                ),
                 /parameters are not allowed in views/
             );
 
@@ -777,11 +782,20 @@ describe('createNativeDatabaseConnection', () => {
         try {
             const callsBefore = connection.calls.length;
             await assert.rejects(
-                connection.databaseOps.validateViewDefinition('read_only_view', 'SELECT 1'),
+                connection.databaseOps.validateViewDefinition(
+                    'read_only_view',
+                    'SELECT 1',
+                    'create'
+                ),
                 /View validation is unavailable because the database is read-only/
             );
             await assert.rejects(
-                connection.databaseOps.previewViewDefinition('read_only_view', 'SELECT 1', 10),
+                connection.databaseOps.previewViewDefinition(
+                    'read_only_view',
+                    'SELECT 1',
+                    10,
+                    'create'
+                ),
                 /View preview is unavailable because the database is read-only/
             );
             assert.deepStrictEqual(
@@ -822,7 +836,8 @@ describe('createNativeDatabaseConnection', () => {
             const empty = await connection.databaseOps.previewViewDefinition(
                 'preview_empty',
                 'SELECT 1 AS x, 2 AS x WHERE 0',
-                10
+                10,
+                'create'
             );
             assert.deepStrictEqual(empty.headers, ['x', 'x:1']);
             assert.deepStrictEqual(empty.rows, []);
@@ -830,7 +845,8 @@ describe('createNativeDatabaseConnection', () => {
             const duplicate = await connection.databaseOps.previewViewDefinition(
                 'preview_duplicate',
                 'SELECT 1 AS x, 2 AS x',
-                10
+                10,
+                'create'
             );
             assert.deepStrictEqual(duplicate.headers, ['x', 'x:1']);
             assert.deepStrictEqual(duplicate.rows, [[1, 2]]);
@@ -853,7 +869,12 @@ describe('createNativeDatabaseConnection', () => {
 
         try {
             await assert.rejects(
-                connection.databaseOps.previewViewDefinition('slow_preview', 'SELECT 1', 10),
+                connection.databaseOps.previewViewDefinition(
+                    'slow_preview',
+                    'SELECT 1',
+                    10,
+                    'create'
+                ),
                 /Query execution timed out after 25ms/
             );
         } finally {
@@ -907,7 +928,12 @@ describe('createNativeDatabaseConnection', () => {
             connection.calls.length = 0;
 
             await assert.rejects(
-                connection.databaseOps.previewViewDefinition('unsafe_preview', body, 10),
+                connection.databaseOps.previewViewDefinition(
+                    'unsafe_preview',
+                    body,
+                    10,
+                    'create'
+                ),
                 /Exactly one SQL statement is required/
             );
 
@@ -1142,6 +1168,28 @@ FROM orders o`;
             });
             assert.deepStrictEqual(outputLines, [
                 '[NativeWorker] Skipping view undo: definition missing from history entry'
+            ]);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('logs a missing native view definition while preserving redo no-op behavior', async () => {
+        const outputLines: string[] = [];
+        const outputChannel = {
+            appendLine(line: string) {
+                outputLines.push(line);
+            }
+        } as unknown as vscode.OutputChannel;
+        const connection = await createRecordingConnection(undefined, outputChannel);
+        try {
+            await connection.databaseOps.redoModification({
+                modificationType: 'view_edit',
+                description: 'legacy edit',
+                targetTable: 'legacy_view'
+            });
+            assert.deepStrictEqual(outputLines, [
+                '[NativeWorker] Skipping view redo: definition missing from history entry'
             ]);
         } finally {
             connection.dispose();

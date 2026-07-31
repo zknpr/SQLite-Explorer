@@ -857,22 +857,37 @@ async function getViewDefinition(view) {
   return readViewDefinition(view, false);
 }
 
+/** Resolve one canonical installed-view snapshot for intent checks and column preservation. */
+function resolveExistingViewForIntent(view, intent) {
+  const result = db.exec(
+    "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+    [view]
+  );
+  const row = result[0]?.values?.[0];
+  assertViewDefinitionIntent(view, row !== undefined, intent);
+  const storedSql = row?.[0];
+  return {
+    storedSql,
+    columnListSql: typeof storedSql === 'string'
+      ? extractViewColumnListSql(storedSql)
+      : undefined
+  };
+}
+
+function assertWritableViewMutation(operation) {
+  if (readOnlyMode) {
+    throw new Error(`View ${operation} is unavailable because the database is read-only`);
+  }
+}
+
 async function validateViewDefinition(view, selectSql, intent = 'edit') {
   if (!db) throw new Error('No database initialized');
   if (readOnlyMode) {
     throw new Error('View validation is unavailable because the database is read-only');
   }
   const body = normalizeViewSelectSql(selectSql);
-  const existingResult = db.exec(
-    "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
-    [view]
-  );
-  const existingRow = existingResult[0]?.values?.[0];
-  const existingSql = existingRow?.[0];
-  assertViewDefinitionIntent(view, existingRow !== undefined, intent);
-  const columnListSql = typeof existingSql === 'string'
-    ? extractViewColumnListSql(existingSql)
-    : undefined;
+  const { storedSql: existingSql, columnListSql } =
+    resolveExistingViewForIntent(view, intent);
   const savepointName = createViewSavepointName('sp_validate_view');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
@@ -893,16 +908,8 @@ async function previewViewDefinition(view, selectSql, limit = 50, intent = 'edit
   if (!db) throw new Error('No database initialized');
   const body = normalizeViewSelectSql(selectSql);
   const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
-  const existing = db.exec(
-    "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
-    [view]
-  );
-  const existingRow = existing[0]?.values?.[0];
-  const existingSql = existingRow?.[0];
-  assertViewDefinitionIntent(view, existingRow !== undefined, intent);
-  const columnListSql = typeof existingSql === 'string'
-    ? extractViewColumnListSql(existingSql)
-    : undefined;
+  const { storedSql: existingSql, columnListSql } =
+    resolveExistingViewForIntent(view, intent);
 
   if (readOnlyMode) {
     // Read-only demo databases cannot run disposable schema DDL. Match WASM's
@@ -943,6 +950,7 @@ async function previewViewDefinition(view, selectSql, limit = 50, intent = 'edit
 
 async function createView(view, selectSql) {
   if (!db) throw new Error('No database initialized');
+  assertWritableViewMutation('creation');
   const body = normalizeViewSelectSql(selectSql);
   compileSingleStatement(`EXPLAIN SELECT * FROM (${body}\n) LIMIT 0`);
   const savepointName = createViewSavepointName('sp_create_view');
@@ -967,6 +975,7 @@ async function editView(
   expectedTriggers
 ) {
   if (!db) throw new Error('No database initialized');
+  assertWritableViewMutation('editing');
   const body = normalizeViewSelectSql(selectSql);
   compileSingleStatement(`EXPLAIN SELECT * FROM (${body}\n) LIMIT 0`);
   const savepointName = createViewSavepointName('sp_edit_view');
@@ -998,6 +1007,7 @@ async function editView(
 
 async function dropView(view) {
   if (!db) throw new Error('No database initialized');
+  assertWritableViewMutation('deletion');
   const savepointName = createViewSavepointName('sp_drop_view');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
