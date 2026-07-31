@@ -11,7 +11,7 @@ const persistedStates: unknown[] = [];
 });
 
 const paginationElements = new Map(
-    ['pageIndicator', 'btnFirst', 'btnPrev', 'btnNext', 'btnLast'].map(id => [
+    ['pageIndicator', 'btnFirst', 'btnPrev', 'btnNext', 'btnLast', 'btnOpenCreateView'].map(id => [
         id,
         { textContent: '', disabled: false }
     ])
@@ -97,5 +97,37 @@ it('clears positional selection before externally refreshing a displayed view', 
         state.lastSelectedCell = null;
         state.lastSelectedColumnIndex = null;
         state.lastSelectedRowIndex = null;
+    }
+});
+
+it('re-applies read-only capabilities carried by a reload refresh', async () => {
+    const apiModulePath = '../../core/ui/modules/api.js';
+    const rpcModulePath = '../../core/ui/modules/rpc.js';
+    const stateModulePath = '../../core/ui/modules/state.js';
+    const { backendApi } = await import(apiModulePath);
+    const { refreshContent } = await import(rpcModulePath);
+    const { state } = await import(stateModulePath);
+    const originalFetchSchema = backendApi.fetchSchema;
+
+    backendApi.fetchSchema = async () => ({ tables: [], views: [], indexes: [] });
+    state.isDbConnected = true;
+    state.isReadOnly = false;
+    state.selectedTable = null;
+    const createViewButton = paginationElements.get('btnOpenCreateView')!;
+    createViewButton.disabled = false;
+
+    try {
+        await refreshContent('shared.db', { connected: true, readOnly: true });
+        assert.strictEqual(state.isReadOnly, true);
+        assert.strictEqual(createViewButton.disabled, true);
+
+        await refreshContent('shared.db', { connected: true, readOnly: false });
+        assert.strictEqual(state.isReadOnly, false);
+        assert.strictEqual(createViewButton.disabled, false);
+    } finally {
+        backendApi.fetchSchema = originalFetchSchema;
+        state.isDbConnected = false;
+        state.isReadOnly = false;
+        state.selectedTable = null;
     }
 });

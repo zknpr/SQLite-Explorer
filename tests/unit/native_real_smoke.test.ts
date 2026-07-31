@@ -324,6 +324,70 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             );
         });
 
+        await testContext.test('compiles created, edited, and restored main views through broken TEMP shadows', async () => {
+            await engine.executeQuery(
+                'CREATE TEMP VIEW native_create_compile_shadow AS ' +
+                'SELECT value FROM missing_native_create_source'
+            );
+            await engine.createView(
+                'native_create_compile_shadow',
+                "SELECT 'main-created' AS value"
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT value FROM main.native_create_compile_shadow'
+                ))[0].rows,
+                [['main-created']]
+            );
+
+            await engine.createView(
+                'native_edit_compile_shadow',
+                "SELECT 'main-before' AS value"
+            );
+            await engine.executeQuery(
+                'CREATE TEMP VIEW native_edit_compile_shadow AS ' +
+                'SELECT value FROM missing_native_edit_source'
+            );
+            await engine.editView(
+                'native_edit_compile_shadow',
+                "SELECT 'main-after' AS value",
+                true
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT value FROM main.native_edit_compile_shadow'
+                ))[0].rows,
+                [['main-after']]
+            );
+
+            await engine.createView(
+                'native_restore_compile_shadow',
+                "SELECT 'main-before' AS value"
+            );
+            const edit = await engine.editView(
+                'native_restore_compile_shadow',
+                "SELECT 'main-after' AS value",
+                true
+            );
+            await engine.executeQuery(
+                'CREATE TEMP VIEW native_restore_compile_shadow AS ' +
+                'SELECT value FROM missing_native_restore_source'
+            );
+            await engine.undoModification({
+                description: 'Edit native_restore_compile_shadow',
+                modificationType: 'view_edit',
+                targetTable: 'native_restore_compile_shadow',
+                viewDefBefore: edit.before,
+                viewDefAfter: edit.after
+            });
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT value FROM main.native_restore_compile_shadow'
+                ))[0].rows,
+                [['main-before']]
+            );
+        });
+
         await testContext.test('validates and previews main through a same-named TEMP shadow', async () => {
             await engine.createView(
                 'native_dry_run_shadow',

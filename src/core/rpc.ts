@@ -82,7 +82,21 @@ export interface PendingInvocation {
 /**
  * Default timeout for remote invocations (60 seconds to accommodate large blob operations).
  */
-const INVOCATION_TIMEOUT_MS = 60000;
+export const DEFAULT_INVOCATION_TIMEOUT_MS = 60000;
+
+/** A host-side RPC deadline expired before the remote endpoint replied. */
+export class InvocationTimeoutError extends Error {
+  constructor(readonly methodName: string) {
+    super(`Invocation timeout: ${methodName}`);
+    this.name = 'InvocationTimeoutError';
+  }
+}
+
+/** Resolve a deadline from the method and its structured-clone-ready arguments. */
+export type InvocationTimeoutPolicy = number | ((
+  methodName: string,
+  parameters: readonly unknown[]
+) => number);
 
 // ============================================================================
 // Proxy Factory
@@ -115,13 +129,13 @@ export type ProxyWithPendingInvocations<T> = T & {
  *
  * @param dispatcher - Function to send messages to remote context
  * @param methodNames - List of method names to expose on proxy
- * @param timeoutMs - Timeout for each invocation (default 30s)
+ * @param timeoutPolicy - Fixed or per-invocation timeout (default 60s)
  * @returns Proxy object with specified methods
  */
 export function buildMethodProxy<T extends object>(
   dispatcher: MessageDispatcher,
   methodNames: readonly Extract<keyof T, string>[],
-  timeoutMs: number = INVOCATION_TIMEOUT_MS
+  timeoutPolicy: InvocationTimeoutPolicy = DEFAULT_INVOCATION_TIMEOUT_MS
 ): ProxyWithPendingInvocations<T> {
   // Each proxy gets its own isolated pending invocations map to prevent
   // cross-connection correlation ID collisions when multiple workers are active.
@@ -165,11 +179,19 @@ export function buildMethodProxy<T extends object>(
         const transferList: Transferable[] = [];
         const cleanParameters = parameters.map(p => extractTransferables(p, transferList));
 
+        const timeoutMs = typeof timeoutPolicy === 'function'
+          ? timeoutPolicy(methodName, cleanParameters)
+          : timeoutPolicy;
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+          reject(new Error(`Invalid invocation timeout for ${methodName}: ${String(timeoutMs)}`));
+          return;
+        }
+
         // Set up expiration timer
         const expirationTimer = setTimeout(() => {
           if (pendingInvocations.has(correlationId)) {
             pendingInvocations.delete(correlationId);
-            reject(new Error(`Invocation timeout: ${methodName}`));
+            reject(new InvocationTimeoutError(methodName));
           }
         }, timeoutMs);
 
@@ -360,7 +382,8 @@ export interface WorkerPort {
 export function connectWorkerPort<T extends object>(
   port: WorkerPort,
   methodNames: readonly Extract<keyof T, string>[],
-  onLog?: LogHandler
+  onLog?: LogHandler,
+  timeoutPolicy: InvocationTimeoutPolicy = DEFAULT_INVOCATION_TIMEOUT_MS
 ): T {
   const dispatcher: MessageDispatcher = (envelope, transfer) => {
     // Check if port supports transfer list (Browser/Node worker compatible)
@@ -378,7 +401,7 @@ export function connectWorkerPort<T extends object>(
     }
   };
 
-  const proxy = buildMethodProxy<T>(dispatcher, methodNames);
+  const proxy = buildMethodProxy<T>(dispatcher, methodNames, timeoutPolicy);
 
   // Extract the per-proxy pending invocations map so response messages are routed
   // to the correct proxy instance (each worker gets its own isolated map).

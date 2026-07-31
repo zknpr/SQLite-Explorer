@@ -1372,7 +1372,7 @@ FROM orders o`;
             const replacementExplainIndex = connection.calls.findIndex(call => (
                 call.method === 'querySingle'
                 && String(call.args[0]).startsWith(
-                    'EXPLAIN SELECT * FROM "user names"\n/*sqlite_explorer_boundary_'
+                    'EXPLAIN SELECT * FROM main."user names"\n/*sqlite_explorer_boundary_'
                 )
             ));
             assert.ok(createIndex >= 0);

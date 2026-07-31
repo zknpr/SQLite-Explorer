@@ -1090,7 +1090,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       this.runSingleStatement(buildCreateViewSql(view, body));
-      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
       const definition = await this.getViewDefinition(view);
       await this.executeQuery(`RELEASE ${savepointName}`);
       return definition;
@@ -1124,7 +1124,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       );
       this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
       this.runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
-      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
       if (preserveTriggers) {
         for (const trigger of before.triggers) {
           this.runSingleStatement(buildCreateViewTriggerSql(trigger));
@@ -1164,7 +1164,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     try {
       await this.dropViewIfExists(definition.identifier);
       this.runSingleStatement(definition.sql);
-      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(definition.identifier)}`);
+      this.compileSingleStatement(
+        `EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(definition.identifier)}`
+      );
       for (const trigger of definition.triggers) {
         this.runSingleStatement(buildCreateViewTriggerSql(trigger));
       }

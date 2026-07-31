@@ -10,6 +10,7 @@ import { openCreateTableModal } from './crud.js';
 import { openSettingsModal } from './settings.js';
 import { openCreateViewModal, openEditViewModal, dropViewFromSidebar } from './views.js';
 import { groupSelectedCellsByColumn, summarizeColumnValue, prepareBatchUpdates } from './batch-update-logic.js';
+import { applyConnectionResult } from './connection-state.js';
 
 export function initSidebar() {
     const sidebarPanel = document.getElementById('sidebarPanel');
@@ -526,7 +527,10 @@ export async function reloadFromDisk() {
 
     try {
         updateStatus('Reloading...');
-        await backendApi.refreshFile();
+        const connectionResult = await backendApi.refreshFile();
+        if (connectionResult?.connected === true) {
+            applyConnectionResult(connectionResult);
+        }
         await refreshSchema();
         if (state.selectedTable) {
             await loadTableColumns();

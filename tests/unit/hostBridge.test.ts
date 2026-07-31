@@ -230,6 +230,34 @@ describe('HostBridge', () => {
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
+    it('returns refreshed connection capabilities after reloading from disk', async () => {
+        let readOnlyMode = false;
+        const reloadFromDisk = mock.fn(async () => {
+            readOnlyMode = true;
+        });
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            fileParts: { filename: 'test.db' },
+            get isReadOnlyMode() { return readOnlyMode; },
+            reloadFromDisk
+        };
+        const mockProvider = {
+            webviews: new Map(),
+            context: {},
+            isReadOnly: false
+        };
+        const bridge = new HostBridge(mockProvider as any, mockDocument as any);
+
+        const result = await bridge.refreshFile();
+
+        assert.strictEqual(reloadFromDisk.mock.callCount(), 1);
+        assert.deepStrictEqual(result, {
+            connected: true,
+            filename: 'test.db',
+            readOnly: true
+        });
+    });
+
     it('should catch and log error if fetch columns for undo history fails in deleteColumns', async () => {
         const consoleWarnMock = mock.method(console, 'warn', () => {});
         const error = new Error('Database disconnected during column info fetch');

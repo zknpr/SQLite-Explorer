@@ -5,13 +5,17 @@ import { state, persistState } from './state.js';
 import { clearSelection, loadTableData, loadTableColumns } from './grid.js';
 import { refreshSchema } from './sidebar.js';
 import { handleRpcResponse, sendRpcResult, sendRpcError } from './api.js';
+import { applyConnectionResult } from './connection-state.js';
 
 export { backendApi } from './api.js';
 
 /**
  * Methods called by the extension host.
  */
-export async function refreshContent(filename) {
+export async function refreshContent(filename, connectionResult) {
+    if (connectionResult) {
+        applyConnectionResult(connectionResult);
+    }
     if (state.isDbConnected) {
         // A broadcast view refresh may replace its projection and row order.
         // Clear positional state before any async reload so another webview's

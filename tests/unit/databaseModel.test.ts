@@ -280,7 +280,11 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         };
     };
 
-    const createDocBypassingFactory = (dbOps: any, uri: any = createFileUri('/test/db.sqlite')) => {
+    const createDocBypassingFactory = (
+        dbOps: any,
+        uri: any = createFileUri('/test/db.sqlite'),
+        establishConnection: (...args: any[]) => any = async () => {}
+    ) => {
         const mockViewerProvider = {
             reporter: {},
             isVerified: true,
@@ -296,7 +300,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             false, // autoCommitEnabled
             { databaseOps: dbOps, isReadOnly: false },
             { [Symbol.dispose]: () => {} }, // workerMethods
-            async () => {}, // establishConnection
+            establishConnection,
             {} // reporter
         );
     };
@@ -845,6 +849,90 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         await doc.revert(undefined);
 
         assert.deepStrictEqual(contentChanges, [{ invalidateAllViewDocuments: true }]);
+    });
+
+    it('replaces connection capabilities and invalidates view documents after Reload', async () => {
+        const originalOps = { engineKind: Promise.resolve('wasm') };
+        const replacementOps = { engineKind: Promise.resolve('wasm') };
+        const connectionCalls: unknown[][] = [];
+        const doc = createDocBypassingFactory(
+            originalOps,
+            createFileUri('/test/db.sqlite'),
+            async (...args: unknown[]) => {
+                connectionCalls.push(args);
+                return { databaseOps: replacementOps, isReadOnly: true };
+            }
+        );
+        const contentChanges: unknown[] = [];
+        doc.onDidChangeContent((event: unknown) => contentChanges.push(event));
+
+        const reloaded = await doc.reloadFromDisk();
+
+        assert.strictEqual(reloaded, replacementOps);
+        assert.strictEqual(doc.databaseOperations, replacementOps);
+        assert.strictEqual(doc.isReadOnlyMode, true);
+        assert.strictEqual(connectionCalls.length, 1);
+        assert.deepStrictEqual(contentChanges, [{ invalidateAllViewDocuments: true }]);
+    });
+
+    it('force-reloads saved bytes and rolls history back after a revert RPC timeout', async () => {
+        const { InvocationTimeoutError } = require('../../src/core/rpc');
+        const replacementOps = { engineKind: Promise.resolve('wasm') };
+        let discardCalls = 0;
+        const timedOutOps = {
+            engineKind: Promise.resolve('wasm'),
+            discardModifications: async () => {
+                discardCalls++;
+                throw new InvocationTimeoutError('discardModifications');
+            }
+        };
+        const doc = createDocBypassingFactory(
+            timedOutOps,
+            createFileUri('/test/db.sqlite'),
+            async () => ({ databaseOps: replacementOps, isReadOnly: false })
+        );
+        doc.recordModification({
+            label: 'Update Cell',
+            description: 'Update items.value',
+            modificationType: 'cell_update',
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'value',
+            priorValue: 'before',
+            newValue: 'after'
+        });
+        const contentChanges: unknown[] = [];
+        doc.onDidChangeContent((event: unknown) => contentChanges.push(event));
+        let backupContent: Uint8Array | undefined;
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (_uri: unknown, content: Uint8Array) => {
+                    backupContent = content;
+                }
+            },
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            await doc.revert(undefined);
+            await doc.backup(createUri('vscode-userdata', '/backups/test.db'), undefined);
+
+            assert.strictEqual(discardCalls, 1);
+            assert.strictEqual(doc.databaseOperations, replacementOps);
+            assert.deepStrictEqual(contentChanges, [{ invalidateAllViewDocuments: true }]);
+            assert.ok(backupContent);
+            const restoredTracker = ModificationTracker.deserialize(backupContent);
+            assert.strictEqual(restoredTracker.hasUncommittedChanges(), false);
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
     });
 
     it('notifies document-disposal subscribers before emitter teardown', async () => {

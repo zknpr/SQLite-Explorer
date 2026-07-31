@@ -980,7 +980,7 @@ async function createView(view, selectSql) {
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     runSingleStatement(buildCreateViewSql(view, body));
-    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
     const definition = await getViewDefinition(view);
     runSingleStatement(`RELEASE ${savepointName}`);
     return definition;
@@ -1013,7 +1013,7 @@ async function editView(
     );
     runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
     runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
-    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
     if (preserveTriggers) {
       for (const trigger of before.triggers) {
         runSingleStatement(buildCreateViewTriggerSql(trigger));

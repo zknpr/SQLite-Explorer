@@ -14,7 +14,11 @@ import type { TelemetryReporter } from '@vscode/extension-telemetry';
 import * as vsc from 'vscode';
 import path from 'path';
 
-import { connectWorkerPort, Transfer } from './core/rpc';
+import {
+  connectWorkerPort,
+  DEFAULT_INVOCATION_TIMEOUT_MS,
+  Transfer
+} from './core/rpc';
 import { serializeOperations } from './core/operation-serializer';
 import { GlobalOutputChannel } from './main';
 import type {
@@ -180,6 +184,24 @@ function forwardWorkerLog(level: WorkerLogLevel, args: unknown[]): void {
   } else {
     console[level]('[Worker]', ...args);
   }
+}
+
+/**
+ * History batches execute entries serially in the worker. Scale their host RPC
+ * deadline with the batch length so a long File Revert cannot time out merely
+ * because many individually healthy undo steps share one invocation.
+ */
+function getWorkerInvocationTimeout(
+  methodName: string,
+  parameters: readonly unknown[]
+): number {
+  if (methodName !== 'applyModifications' && methodName !== 'discardModifications') {
+    return DEFAULT_INVOCATION_TIMEOUT_MS;
+  }
+
+  const modifications = parameters[0];
+  const modificationCount = Array.isArray(modifications) ? modifications.length : 1;
+  return DEFAULT_INVOCATION_TIMEOUT_MS * Math.max(1, modificationCount);
 }
 
 // ============================================================================
@@ -467,7 +489,8 @@ async function createWorkerBackedWasmDatabaseConnection(
       }
     },
     COMPLETE_WORKER_METHOD_NAMES,
-    forwardWorkerLog
+    forwardWorkerLog,
+    getWorkerInvocationTimeout
   );
 
   // Termination handler

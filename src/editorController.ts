@@ -24,7 +24,10 @@ import { WebviewMessageHandler } from './webviewMessageHandler';
 interface WebviewBridgeFunctions {
   updateColorScheme(scheme: 'light' | 'dark'): Promise<void>;
   updateCellEditBehavior(value: string): Promise<void>;
-  refreshContent(filename: string): Promise<void>;
+  refreshContent(
+    filename: string,
+    connection?: { connected: boolean; readOnly: boolean }
+  ): Promise<void>;
 }
 
 // VS Code environment data passed to webview
@@ -323,11 +326,14 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
     }));
 
     // Update webviews when document content changes
-    this._register(document.onDidChangeContent(async () => {
+    this._register(document.onDidChangeContent(async change => {
       const { filename } = document.fileParts;
+      const connection = change.invalidateAllViewDocuments
+        ? { connected: true, readOnly: this.isReadOnly || document.isReadOnlyMode }
+        : undefined;
       for (const panel of this.webviews.get(document.uri)) {
         const bridge = this.webviewBridges.get(panel);
-        await bridge?.refreshContent(filename);
+        await bridge?.refreshContent(filename, connection);
       }
     }));
   }

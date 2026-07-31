@@ -748,12 +748,17 @@ export class HostBridge implements ToastService {
   /**
    * Refresh the database from disk.
    *
-   * @returns The refreshed database operations
+   * @returns Refreshed connection capabilities for immediate webview gating
    */
   async refreshFile() {
     const { document } = this;
     if (document.uri.scheme !== 'untitled') {
-      return document.reloadFromDisk();
+      await document.reloadFromDisk();
+      return {
+        connected: true,
+        filename: document.fileParts.filename,
+        readOnly: this.isReadOnly
+      };
     }
     throw new Error("Document not found in webviews");
   }

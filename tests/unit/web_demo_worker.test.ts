@@ -342,6 +342,46 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('compiles created and edited main views through broken TEMP shadows', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP VIEW demo_create_compile_shadow AS ' +
+            'SELECT value FROM missing_demo_create_source'
+        );
+
+        await worker.invoke(
+            'createView',
+            'demo_create_compile_shadow',
+            "SELECT 'main-created' AS value"
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_create_compile_shadow'),
+            'main-created'
+        );
+
+        await worker.invoke(
+            'createView',
+            'demo_edit_compile_shadow',
+            "SELECT 'main-before' AS value"
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP VIEW demo_edit_compile_shadow AS ' +
+            'SELECT value FROM missing_demo_edit_source'
+        );
+        await worker.invoke(
+            'editView',
+            'demo_edit_compile_shadow',
+            "SELECT 'main-after' AS value",
+            true
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_edit_compile_shadow'),
+            'main-after'
+        );
+    });
+
     it('validates and previews the main demo view through a same-named TEMP shadow', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke('createView', 'demo_dry_run_shadow', "SELECT 'main-before' AS value");

@@ -53,7 +53,10 @@ import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
  * Methods that can be called by the parent window.
  */
 const webviewMethods = {
-    async refreshContent(filename) {
+    async refreshContent(filename, connectionResult) {
+        if (connectionResult) {
+            applyConnectionResult(connectionResult);
+        }
         if (state.isDbConnected) {
             await refreshSchema();
             const tableExists = state.schemaCache.tables.some(t => t.name === state.selectedTable) ||

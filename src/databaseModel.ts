@@ -23,6 +23,7 @@ import { GlobalOutputChannel } from './main';
 
 import { ModificationTracker } from './core/undo-history';
 import { reconcileRestoredDatabase, revertDatabaseToSaved } from './core/restore-reconciler';
+import { InvocationTimeoutError } from './core/rpc';
 import type { LabeledModification, DatabaseOperations } from './core/types';
 import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
 
@@ -466,12 +467,38 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   async revert(cancellation: vsc.CancellationToken): Promise<void> {
     await this.ensureWritable();
-    await revertDatabaseToSaved(
-      this.databaseOperations,
-      this.#modificationTracker,
-      cancelTokenToAbortSignal(cancellation)
-    );
-    this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
+    let invalidatedByRecoveryReload = false;
+    try {
+      await revertDatabaseToSaved(
+        this.databaseOperations,
+        this.#modificationTracker,
+        cancelTokenToAbortSignal(cancellation)
+      );
+    } catch (error) {
+      if (!(error instanceof InvocationTimeoutError)) throw error;
+
+      // The worker may still be mutating after a host-side timeout. Queue a
+      // fresh connection behind it and only reconcile history after the saved
+      // bytes have been reopened, preventing the tracker from describing an
+      // unknown intermediate database state.
+      GlobalOutputChannel?.appendLine(
+        `[Revert recovery] ${error.message}; the document state may be inconsistent. Reloading from disk.`
+      );
+      try {
+        await this.reloadFromDisk();
+        this.#modificationTracker.rollbackToCheckpoint();
+        invalidatedByRecoveryReload = true;
+      } catch (reloadError) {
+        const details = reloadError instanceof Error ? reloadError.message : String(reloadError);
+        throw new Error(
+          `File Revert timed out and the document state may be inconsistent. Automatic reload failed: ${details}`,
+          { cause: error }
+        );
+      }
+    }
+    if (!invalidatedByRecoveryReload) {
+      this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
+    }
     this.#autoSaveIfNeeded();
   }
 
@@ -532,6 +559,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   async reloadFromDisk(): Promise<DatabaseOperations> {
     const currentOps = this.databaseOperations;
+    let reloadedOps = currentOps;
 
     if ((await currentOps.engineKind) === 'wasm') {
       const result = await this.establishConnection(
@@ -542,10 +570,14 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         databaseOps: result.databaseOps,
         isReadOnly: result.isReadOnly
       };
-      return result.databaseOps;
+      reloadedOps = result.databaseOps;
     }
 
-    return currentOps;
+    // File Revert and sidebar Reload both replace the database's externally
+    // observable contents. Invalidate every open virtual view definition so
+    // VS Code re-reads its SQL and mtime from the active engine.
+    this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
+    return reloadedOps;
   }
 
   // ============================================================================

@@ -10,6 +10,7 @@ let connectionFailed = false;
 let workerTerminated = false;
 let exposedWorkerMethods: string[] = [];
 let workerProxy: Record<string, (...args: any[]) => any> = {};
+let workerTimeoutPolicy: ((methodName: string, parameters: readonly unknown[]) => number) | undefined;
 
 const Module = require('module');
 
@@ -29,10 +30,17 @@ Module.prototype.require = function(id: string) {
     if (id === 'vscode') return require('./mocks/vscode').mockVscode;
     if (id.endsWith('core/rpc')) {
         return {
-          connectWorkerPort: (_port: unknown, methods: string[]) => {
+          connectWorkerPort: (
+            _port: unknown,
+            methods: string[],
+            _onLog?: unknown,
+            timeoutPolicy?: (methodName: string, parameters: readonly unknown[]) => number
+          ) => {
             exposedWorkerMethods = methods;
+            workerTimeoutPolicy = timeoutPolicy;
             return workerProxy;
           },
+          DEFAULT_INVOCATION_TIMEOUT_MS: 60_000,
           Transfer: class Transfer {}
         };
     }
@@ -78,6 +86,7 @@ describe('workerFactory error path tests', () => {
     connectionFailed = false;
     workerTerminated = false;
     exposedWorkerMethods = [];
+    workerTimeoutPolicy = undefined;
     workerProxy = {
       initializeDatabase: async () => {
         if (connectionFailed) throw new Error('Connection failed');
@@ -321,5 +330,55 @@ describe('workerFactory error path tests', () => {
     await pending!.catch(error => { caught = error; });
     assert.strictEqual(caught, cancellation);
     assert.strictEqual(applyCalls, 0);
+  });
+
+  it('waits for a delayed batch revert under a modification-scaled worker deadline', async () => {
+    let releaseDiscard: (() => void) | undefined;
+    let discarded: unknown[] | undefined;
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false }),
+      discardModifications: async (mods: unknown[]) => {
+        discarded = mods;
+        await new Promise<void>(resolve => { releaseDiscard = resolve; });
+      }
+    };
+
+    const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
+    const fileUri = {
+      scheme: 'file',
+      fsPath: '/test/db.sqlite',
+      path: '/test/db.sqlite'
+    } as any;
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
+    const { ModificationTracker } = require('../../src/core/undo-history');
+    const { revertDatabaseToSaved } = require('../../src/core/restore-reconciler');
+    const tracker = new ModificationTracker(10);
+    const modifications = [1, 2, 3].map(index => ({
+      description: `Update ${index}`,
+      modificationType: 'cell_update',
+      targetTable: 'items',
+      targetRowId: index,
+      targetColumn: 'value',
+      priorValue: index,
+      newValue: index + 1
+    }));
+    for (const modification of modifications) tracker.record(modification);
+
+    const pendingRevert = revertDatabaseToSaved(databaseOps, tracker);
+    await Promise.resolve();
+
+    assert.deepStrictEqual(discarded, modifications);
+    assert.strictEqual(tracker.hasUncommittedChanges(), true);
+    assert.ok(workerTimeoutPolicy, 'desktop worker should install a timeout policy');
+    assert.strictEqual(
+      workerTimeoutPolicy!('discardModifications', [modifications]),
+      180_000
+    );
+
+    releaseDiscard!();
+    await pendingRevert;
+    assert.strictEqual(tracker.hasUncommittedChanges(), false);
+    assert.deepStrictEqual(tracker.getUncommittedEntries(), []);
   });
 });

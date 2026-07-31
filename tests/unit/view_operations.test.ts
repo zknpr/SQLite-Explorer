@@ -349,6 +349,69 @@ describe('view operations', () => {
         }
     });
 
+    it('compiles created, edited, and restored main views through broken TEMP shadows', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE TEMP VIEW create_compile_shadow AS ' +
+                'SELECT value FROM missing_temp_create_source'
+            );
+            await engine.createView(
+                'create_compile_shadow',
+                "SELECT 'main-created' AS value"
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM main.create_compile_shadow'),
+                'main-created'
+            );
+
+            await engine.createView(
+                'edit_compile_shadow',
+                "SELECT 'main-before' AS value"
+            );
+            await engine.executeQuery(
+                'CREATE TEMP VIEW edit_compile_shadow AS ' +
+                'SELECT value FROM missing_temp_edit_source'
+            );
+            await engine.editView(
+                'edit_compile_shadow',
+                "SELECT 'main-after' AS value",
+                true
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM main.edit_compile_shadow'),
+                'main-after'
+            );
+
+            await engine.createView(
+                'restore_compile_shadow',
+                "SELECT 'main-before' AS value"
+            );
+            const edit = await engine.editView(
+                'restore_compile_shadow',
+                "SELECT 'main-after' AS value",
+                true
+            );
+            await engine.executeQuery(
+                'CREATE TEMP VIEW restore_compile_shadow AS ' +
+                'SELECT value FROM missing_temp_restore_source'
+            );
+            await engine.undoModification({
+                description: 'Edit restore_compile_shadow',
+                modificationType: 'view_edit',
+                targetTable: 'restore_compile_shadow',
+                viewDefBefore: edit.before,
+                viewDefAfter: edit.after
+            });
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM main.restore_compile_shadow'),
+                'main-before'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('validates and previews the main view through a same-named TEMP shadow', async () => {
         const engine = await createEngine();
         try {
