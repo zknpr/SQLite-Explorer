@@ -217,7 +217,10 @@ describe('createNativeDatabaseConnection', () => {
         mock.restoreAll();
     });
 
-    async function createRecordingConnection(respondToCall?: RecordedNativeResponder): Promise<{
+    async function createRecordingConnection(
+        respondToCall?: RecordedNativeResponder,
+        outputChannel?: vscode.OutputChannel
+    ): Promise<{
         databaseOps: DatabaseOperations;
         calls: RecordedNativeCall[];
         dispose: () => void;
@@ -226,7 +229,7 @@ describe('createNativeDatabaseConnection', () => {
         mock.method(child_process, 'spawn', () => createRecordingNativeProcess(calls, respondToCall));
 
         const { createNativeDatabaseConnection } = require('../../src/nativeWorker');
-        const bundle = await createNativeDatabaseConnection({ fsPath: tempDir } as any);
+        const bundle = await createNativeDatabaseConnection({ fsPath: tempDir } as any, undefined, outputChannel);
         const connection = await bundle.establishConnection({ fsPath: '/db/path.sqlite' } as any, 'TestDB');
 
         return {
@@ -648,6 +651,160 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
+    it('terminates line-comment view bodies before native wrapped compile and preview queries', async () => {
+        const body = 'SELECT MAX(quantity) AS m FROM inventory -- rollup of stock';
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query' || call.method === 'querySingle') {
+                const sql = String(call.args[0]);
+                if (sql.startsWith('SELECT * FROM')) {
+                    return { result: { columns: ['m'], values: [[9]] } };
+                }
+                return { result: { columns: [], values: [] } };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            connection.calls.length = 0;
+
+            await connection.databaseOps.validateViewDefinition('inventory_rollup', body);
+            const preview = await connection.databaseOps.previewViewDefinition(
+                'inventory_rollup',
+                body,
+                10
+            );
+
+            assert.deepStrictEqual(preview.headers, ['m']);
+            assert.deepStrictEqual(preview.rows, [[9]]);
+            const wrappedQueries = connection.calls
+                .filter(call => call.method === 'querySingle');
+            assert.strictEqual(wrappedQueries.length, 2);
+            assert.ok(String(wrappedQueries[0].args[0]).startsWith(
+                `EXPLAIN SELECT * FROM (${body}\n) LIMIT 0\n/*sqlite_explorer_boundary_`
+            ));
+            assert.ok(String(wrappedQueries[1].args[0]).startsWith(
+                `SELECT * FROM (${body}\n) LIMIT 10\n/*sqlite_explorer_boundary_`
+            ));
+            assert.strictEqual(wrappedQueries[0].args[2], String(wrappedQueries[0].args[0]).split('\n').at(-1));
+            assert.strictEqual(wrappedQueries[1].args[2], String(wrappedQueries[1].args[0]).split('\n').at(-1));
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('logs a failed savepoint rollback through the extension output channel', async () => {
+        const outputLines: string[] = [];
+        const outputChannel = {
+            appendLine(value: string) {
+                outputLines.push(value);
+            }
+        } as vscode.OutputChannel;
+        const warnMock = mock.method(console, 'warn', () => {});
+        const connection = await createRecordingConnection(call => {
+            const sql = String(call.args[0]);
+            if (call.method === 'run' && sql.startsWith('CREATE VIEW')) {
+                return { error: 'create failed' };
+            }
+            if (call.method === 'run' && sql.startsWith('ROLLBACK TO')) {
+                return { error: 'rollback failed' };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        }, outputChannel);
+
+        try {
+            await assert.rejects(
+                connection.databaseOps.createView('broken view', 'SELECT 1'),
+                /create failed/
+            );
+            assert.strictEqual(warnMock.mock.calls.length, 0);
+            assert.deepStrictEqual(outputLines, [
+                '[NativeWorker] Failed to rollback native savepoint (createView): rollback failed'
+            ]);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('uses a prepared single-query path for a preview with a smuggled trailing statement', async () => {
+        let sentinelExists = true;
+        const body = 'SELECT 1) LIMIT 1; DROP TABLE preview_sentinel; --';
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query' && String(call.args[0]).startsWith('SELECT * FROM')) {
+                sentinelExists = false;
+            }
+            if (call.method === 'querySingle') {
+                return { result: { columns: ['value'], values: [[1]] } };
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            connection.calls.length = 0;
+
+            await connection.databaseOps.previewViewDefinition('unsafe_preview', body, 10);
+
+            assert.strictEqual(sentinelExists, true);
+            const previewCall = connection.calls.find(call => (
+                String(call.args[0]).startsWith('SELECT * FROM')
+            ));
+            assert.strictEqual(previewCall?.method, 'querySingle');
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('preserves a duplicate explicit view column list through native replacement', async () => {
+        let currentViewSql = 'CREATE VIEW "duplicate names" (a, a) AS SELECT 1, 2';
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [Array<{ sql: string }>];
+                return {
+                    result: {
+                        results: queries.map(query => {
+                            if (query.sql.includes("type = 'view'")) {
+                                return { columns: ['sql'], values: [[currentViewSql]] };
+                            }
+                            if (query.sql.includes("type = 'trigger'")) {
+                                return { columns: ['name', 'sql'], values: [] };
+                            }
+                            if (query.sql.startsWith('PRAGMA table_info')) {
+                                return {
+                                    columns: ['cid', 'name'],
+                                    values: [[0, 'a'], [1, 'a:1']]
+                                };
+                            }
+                            return { columns: [], values: [] };
+                        })
+                    }
+                };
+            }
+            if (call.method === 'run') {
+                const sql = String(call.args[0]);
+                if (sql.startsWith('CREATE VIEW "duplicate names"')) {
+                    currentViewSql = sql;
+                }
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            connection.calls.length = 0;
+
+            await connection.databaseOps.editView('duplicate names', 'SELECT 3, 4', true);
+
+            const createCall = connection.calls.find(call => (
+                call.method === 'run'
+                && String(call.args[0]).startsWith('CREATE VIEW "duplicate names"')
+            ));
+            assert.strictEqual(
+                createCall?.args[0],
+                'CREATE VIEW "duplicate names" (a, a) AS SELECT 3, 4'
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('atomically replaces a view and recreates its triggers through the native worker', async () => {
         let currentViewSql = 'CREATE VIEW "user names" ("user id", "display name") AS SELECT id, name FROM users';
         const triggerSql = [
@@ -713,7 +870,7 @@ describe('createNativeDatabaseConnection', () => {
             );
 
             assert.strictEqual(result.before.triggers.length, 1);
-            assert.deepStrictEqual(result.before.columns, ['user id', 'display name']);
+            assert.strictEqual(result.before.columnListSql, '("user id", "display name")');
             assert.strictEqual(result.after.triggers.length, 1);
             assert.strictEqual(
                 result.after.selectSql,
@@ -738,10 +895,28 @@ describe('createNativeDatabaseConnection', () => {
                 'view and trigger metadata should share one native IPC round-trip per snapshot'
             );
 
-            const explainCall = connection.calls.find(call => (
-                call.method === 'query' && String(call.args[0]).startsWith('EXPLAIN SELECT * FROM')
+            const triggerQueries = connection.calls
+                .filter(call => call.method === 'queryBatch')
+                .flatMap(call => (call.args[0] as Array<{ sql: string }>))
+                .filter(query => query.sql.includes("type = 'trigger'"));
+            assert.ok(triggerQueries.length > 0);
+            assert.ok(triggerQueries.every(query => query.sql.endsWith('ORDER BY rowid')));
+
+            const createIndex = connection.calls.findIndex(call => (
+                call.method === 'run'
+                && String(call.args[0]).startsWith('CREATE VIEW "user names" ')
             ));
-            assert.ok(explainCall, 'replacement must be compiled before releasing its SAVEPOINT');
+            const releaseIndex = connection.calls.findIndex(call => (
+                call.method === 'run'
+                && String(call.args[0]).startsWith('RELEASE "sp_edit_view_')
+            ));
+            const replacementExplainIndex = connection.calls.findIndex(call => (
+                call.method === 'query'
+                && call.args[0] === 'EXPLAIN SELECT * FROM "user names"'
+            ));
+            assert.ok(createIndex >= 0);
+            assert.ok(replacementExplainIndex > createIndex);
+            assert.ok(replacementExplainIndex < releaseIndex);
         } finally {
             connection.dispose();
         }
@@ -773,5 +948,50 @@ describe('NativeWorkerProcess', () => {
         (worker as any).handleData(payload);
 
         assert.strictEqual(errorLogged, true, 'Should log error on bad deserialization');
+    });
+});
+
+describe('native querySingle worker handler', () => {
+    it('rejects a preview tail before stepping the prepared statement', () => {
+        const source = fs.readFileSync(
+            path.resolve(process.cwd(), 'natives', 'native-worker.js'),
+            'utf8'
+        );
+        const functionSource = source.match(
+            /function executeSingleQuery\(db, sql, params, requiredSuffix\) \{[\s\S]*?^\}/m
+        )?.[0];
+        assert.ok(functionSource, 'native worker must define executeSingleQuery');
+        const executeSingleQuery = Function(`"use strict"; return (${functionSource});`)();
+        const boundary = '/*sqlite_explorer_boundary_test*/';
+        const sql = [
+            'SELECT * FROM (SELECT 1) LIMIT 1; DROP TABLE preview_sentinel; --',
+            ') LIMIT 10',
+            boundary
+        ].join('\n');
+        let stepped = false;
+        let finalized = false;
+        const database = {
+            prepare() {
+                return {
+                    // txiki exposes only the first prepared statement here, so
+                    // the generated boundary is absent when a tail escaped.
+                    toString: () => 'SELECT * FROM (SELECT 1) LIMIT 1;',
+                    all() {
+                        stepped = true;
+                        return [];
+                    },
+                    finalize() {
+                        finalized = true;
+                    }
+                };
+            }
+        };
+
+        assert.throws(
+            () => executeSingleQuery(database, sql, undefined, boundary),
+            /Exactly one SQL statement is required/
+        );
+        assert.strictEqual(stepped, false);
+        assert.strictEqual(finalized, true);
     });
 });

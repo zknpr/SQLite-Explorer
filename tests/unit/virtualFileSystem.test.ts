@@ -335,6 +335,41 @@ describe('SQLiteFileSystemProvider', () => {
                 viewDefAfter: after
             });
         });
+
+        it('keeps a rejected view edit dirty and reports the SQLite error clearly', async () => {
+            const sqliteError = '[query] SQLite error 1: near "MAX": syntax error';
+            const dbOps = {
+                editView: mock.fn(async () => {
+                    throw new Error(sqliteError);
+                })
+            };
+            const doc = setupMockDocument(docKey, dbOps);
+            const showErrorMessage = mock.method(vscode.window, 'showErrorMessage');
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/product_inventory/group/__view__.sql/definition.sql`
+            );
+            const content = new TextEncoder().encode(
+                'SELECT quantity MAX(quantity) FROM inventory'
+            );
+
+            await assert.rejects(
+                provider.writeFile(uri, content, { create: false, overwrite: true }),
+                (error: Error) => {
+                    assert.strictEqual(
+                        error.message,
+                        'Invalid view definition. The view was not modified.'
+                    );
+                    return true;
+                }
+            );
+
+            assert.strictEqual(showErrorMessage.mock.callCount(), 1);
+            assert.strictEqual(
+                showErrorMessage.mock.calls[0].arguments[0],
+                'Invalid view definition: near "MAX": syntax error. The view was not modified.'
+            );
+            assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 0);
+        });
     });
 
     describe('delete / rename / stat / watch', () => {

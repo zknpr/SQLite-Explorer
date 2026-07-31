@@ -2,7 +2,7 @@
  * Filter Match Navigation
  *
  * Lets the user press Enter in the global filter or a column filter to jump
- * between cells whose displayed text contains the active filter term,
+ * between cells whose full formatted text contains the active filter term,
  * cycling through them with a visible border + a "current / total" counter.
  */
 import { state } from './state.js';
@@ -31,7 +31,13 @@ function computeMatches(scope, term) {
             const value = getCellValue(row, colIdx);
             // String() guards against formatters that may return a non-string
             // (number/null/undefined), which would otherwise throw on .toLowerCase().
-            const text = String(formatCellValueAsText(value, col.type, state.dateFormat, col.name));
+            const text = String(formatCellValueAsText(
+                value,
+                col.type,
+                state.dateFormat,
+                col.name,
+                false
+            ));
             if (text.toLowerCase().includes(term)) {
                 matches.push({ rowIdx, colIdx });
             }

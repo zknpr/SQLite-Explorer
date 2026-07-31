@@ -117,7 +117,9 @@ export interface ViewDefinition {
   sql: string;
   /** SELECT body editable by the user */
   selectSql: string;
-  /** Explicit output column list, when the original CREATE VIEW declared one. */
+  /** Verbatim explicit output column-list SQL, including parentheses. */
+  columnListSql?: string;
+  /** Legacy reconstructed output names retained for serialized history compatibility. */
   columns?: string[];
   /** INSTEAD OF triggers owned by the view */
   triggers: ViewTriggerDefinition[];

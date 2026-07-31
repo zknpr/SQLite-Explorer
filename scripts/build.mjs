@@ -208,6 +208,21 @@ const compileBrowserWorker = () =>
   });
 
 /**
+ * Bundle the standalone website worker from its authored source. The source
+ * imports the canonical TypeScript view helpers, preventing parser drift.
+ */
+const bundleWebDemoWorker = () =>
+  esbuild.build({
+    entryPoints: [resolve('website', 'src', 'sqlite-viewer', 'worker.js')],
+    outfile: resolve('website', 'public', 'sqlite-viewer', 'worker.js'),
+    bundle: true,
+    platform: 'browser',
+    format: 'iife',
+    target: 'es2020',
+    minify: !DEV,
+  });
+
+/**
  * Copy assets to output directory.
  * Ensures the webview HTML and WASM files are available.
  */
@@ -403,7 +418,8 @@ const validateBuildOutputs = () => {
     'out/worker.cjs',
     'out/worker-browser.js',
     'assets/sqlite3.wasm',
-    'core/ui/viewer.html'
+    'core/ui/viewer.html',
+    'website/public/sqlite-viewer/worker.js'
   ];
 
   const missingFiles = requiredFiles.filter(file => !fs.existsSync(resolve(file)));
@@ -423,6 +439,7 @@ const compileExt = async (target) => {
     { name: 'compileBrowserMain', fn: compileBrowserMain },
     { name: 'compileNodeWorker', fn: compileNodeWorker },
     { name: 'compileBrowserWorker', fn: compileBrowserWorker },
+    { name: 'bundleWebDemoWorker', fn: bundleWebDemoWorker },
     { name: 'copyAssets', fn: copyAssets },
     { name: 'bundleWebview', fn: bundleWebview },
     { name: 'bundleWebDemoViewer', fn: bundleWebDemoViewer },

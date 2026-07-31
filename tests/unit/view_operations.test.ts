@@ -53,6 +53,29 @@ function createHostBridge(databaseOperations: Partial<DatabaseOperations>) {
     };
 }
 
+async function assertCommentBodyRoundTrip(body: string): Promise<void> {
+    const engine = await createEngine();
+    try {
+        await engine.executeQuery('CREATE TABLE inventory (quantity INTEGER)');
+        await engine.executeQuery('INSERT INTO inventory (quantity) VALUES (4), (9)');
+        await engine.executeQuery(`CREATE VIEW inventory_rollup AS ${body}`);
+
+        const before = await engine.getViewDefinition('inventory_rollup');
+        assert.strictEqual(before.selectSql, body);
+
+        await engine.validateViewDefinition('inventory_rollup', before.selectSql);
+        const preview = await engine.previewViewDefinition('inventory_rollup', before.selectSql, 10);
+        assert.deepStrictEqual(preview.headers, ['m']);
+        assert.deepStrictEqual(preview.rows, [[9]]);
+
+        const edit = await engine.editView('inventory_rollup', before.selectSql, true);
+        assert.strictEqual(edit.after.selectSql, body);
+        assert.strictEqual(await readScalar(engine, 'SELECT m FROM inventory_rollup'), 9);
+    } finally {
+        (engine as WasmDatabaseEngine).shutdown();
+    }
+}
+
 describe('view operations', () => {
     afterEach(() => {
         mock.restoreAll();
@@ -140,6 +163,93 @@ describe('view operations', () => {
         }
     });
 
+    it('round-trips a verbatim explicit column list with duplicate names', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE VIEW duplicate_names (a, a) AS SELECT 1, 2');
+
+            const edit = await engine.editView(
+                'duplicate_names',
+                'SELECT 3, 4',
+                true
+            );
+            const editedSql = await readScalar(
+                engine,
+                "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'duplicate_names'"
+            );
+            assert.match(String(editedSql), /\(a, a\)/);
+            assert.doesNotMatch(String(editedSql), /a:1/);
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT * FROM duplicate_names'))[0].rows,
+                [[3, 4]]
+            );
+
+            await engine.undoModification({
+                description: 'Edit duplicate_names',
+                modificationType: 'view_edit',
+                targetTable: 'duplicate_names',
+                viewDefBefore: edit.before,
+                viewDefAfter: edit.after
+            });
+            const restoredSql = await readScalar(
+                engine,
+                "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'duplicate_names'"
+            );
+            assert.match(String(restoredSql), /\(a, a\)/);
+            assert.doesNotMatch(String(restoredSql), /a:1/);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('recreates same-event triggers in schema order', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE TABLE trigger_log (label TEXT)');
+            await engine.executeQuery('CREATE VIEW trigger_order AS SELECT 1 AS value');
+            await engine.executeQuery(`
+                CREATE TRIGGER z_created_first
+                INSTEAD OF INSERT ON trigger_order
+                BEGIN INSERT INTO trigger_log VALUES ('z'); END
+            `);
+            await engine.executeQuery(`
+                CREATE TRIGGER a_created_second
+                INSTEAD OF INSERT ON trigger_order
+                BEGIN INSERT INTO trigger_log VALUES ('a'); END
+            `);
+
+            const before = await engine.getViewDefinition('trigger_order');
+            assert.deepStrictEqual(
+                before.triggers.map(trigger => trigger.identifier),
+                ['z_created_first', 'a_created_second']
+            );
+
+            await engine.executeQuery('INSERT INTO trigger_order VALUES (1)');
+            const originalOrder = (await engine.executeQuery('SELECT label FROM trigger_log ORDER BY rowid'))[0].rows;
+            assert.deepStrictEqual(originalOrder, [['a'], ['z']]);
+            await engine.executeQuery('DELETE FROM trigger_log');
+
+            await engine.editView('trigger_order', 'SELECT 2 AS value', true);
+            await engine.executeQuery('INSERT INTO trigger_order VALUES (2)');
+            const recreatedOrder = (await engine.executeQuery('SELECT label FROM trigger_log ORDER BY rowid'))[0].rows;
+            assert.deepStrictEqual(recreatedOrder, originalOrder);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('validates, previews, and edits a view body ending in a line comment', async () => {
+        await assertCommentBodyRoundTrip(
+            'SELECT MAX(quantity) AS m FROM inventory -- rollup of stock'
+        );
+    });
+
+    it('validates, previews, and edits a view body ending in a block comment', async () => {
+        await assertCommentBodyRoundTrip(
+            'SELECT MAX(quantity) AS m FROM inventory /* rollup of stock */'
+        );
+    });
+
     it('rejects a trailing statement before creating any view', async () => {
         const engine = await createEngine();
         try {
@@ -217,6 +327,26 @@ describe('view operations', () => {
 
             const schema = await engine.fetchSchema();
             assert.strictEqual(schema.views.some(view => view.identifier === 'preview_only'), false);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('does not execute a trailing statement smuggled through the preview wrapper', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE TABLE preview_sentinel (id INTEGER)');
+
+            await assert.rejects(() => engine.previewViewDefinition(
+                'unsafe_preview',
+                'SELECT 1) LIMIT 1; DROP TABLE preview_sentinel; --',
+                10
+            ));
+
+            assert.strictEqual(await readScalar(
+                engine,
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'preview_sentinel'"
+            ), 1);
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
         }

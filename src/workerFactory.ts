@@ -123,7 +123,11 @@ export async function createDatabaseConnection(
     if (await nativeSupport.isNativeAvailable(extensionPath)) {
       try {
         GlobalOutputChannel?.appendLine('[SQLite Explorer] Using native SQLite backend');
-        const nativeBundle = await nativeSupport.createNativeDatabaseConnection(extensionUri, _reporter);
+        const nativeBundle = await nativeSupport.createNativeDatabaseConnection(
+          extensionUri,
+          _reporter,
+          GlobalOutputChannel
+        );
 
         // Wrap the native bundle to provide fallback to WASM if file open fails
         // This handles cases where native SQLite can't access a specific file

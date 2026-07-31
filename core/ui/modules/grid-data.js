@@ -2,6 +2,7 @@ import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus, showLoading, showErrorState, updateToolbarButtons } from './ui.js';
 import { updatePagination, renderDataGrid } from './grid-render.js';
+import { resetMatchNav } from './match-nav.js';
 
 export async function loadTableColumns() {
     if (!state.selectedTable) return;
@@ -147,6 +148,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         if (isSuperseded()) return; // superseded (newer load or table switch) during the fetch
 
         state.gridData = dataResult.rows || [];
+        resetMatchNav();
 
         // When preserving scroll, re-capture the latest position right before
         // rendering. Covers the user scrolling during the fetch — including a

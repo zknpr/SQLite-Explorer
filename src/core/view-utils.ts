@@ -1,3 +1,5 @@
+import { escapeIdentifier } from './sql-utils';
+
 /**
  * Remove one optional statement terminator from an editable SELECT body.
  * SQLite still performs the actual syntax and semantic validation.
@@ -12,14 +14,15 @@ export function normalizeViewSelectSql(selectSql: string): string {
 
 interface ViewSqlParts {
   selectStart: number;
-  hasExplicitColumnList: boolean;
+  columnListSql?: string;
 }
 
 /** Locate the declaration's top-level AS without treating quoted text as SQL structure. */
 function locateViewSqlParts(createSql: string): ViewSqlParts {
   let depth = 0;
   let index = 0;
-  let hasExplicitColumnList = false;
+  let columnListStart = -1;
+  let columnListEnd = -1;
 
   while (index < createSql.length) {
     const char = createSql[index];
@@ -68,12 +71,15 @@ function locateViewSqlParts(createSql: string): ViewSqlParts {
       continue;
     }
     if (char === '(') {
-      if (depth === 0) hasExplicitColumnList = true;
+      if (depth === 0 && columnListStart === -1) columnListStart = index;
       depth++;
       index++;
       continue;
     }
     if (char === ')') {
+      if (depth === 1 && columnListStart !== -1 && columnListEnd === -1) {
+        columnListEnd = index + 1;
+      }
       depth = Math.max(0, depth - 1);
       index++;
       continue;
@@ -83,7 +89,12 @@ function locateViewSqlParts(createSql: string): ViewSqlParts {
       index++;
       while (index < createSql.length && /[A-Za-z0-9_$]/.test(createSql[index])) index++;
       if (createSql.slice(tokenStart, index).toUpperCase() === 'AS') {
-        return { selectStart: index, hasExplicitColumnList };
+        return {
+          selectStart: index,
+          columnListSql: columnListStart !== -1 && columnListEnd !== -1
+            ? createSql.slice(columnListStart, columnListEnd)
+            : undefined
+        };
       }
       continue;
     }
@@ -108,5 +119,24 @@ export function extractViewSelectSql(createSql: string): string {
 
 /** Whether the stored declaration pins view output names with `(column, ...)`. */
 export function hasExplicitViewColumnList(createSql: string): boolean {
-  return locateViewSqlParts(createSql).hasExplicitColumnList;
+  return locateViewSqlParts(createSql).columnListSql !== undefined;
+}
+
+/** Return the stored explicit column-list SQL, including its parentheses. */
+export function extractViewColumnListSql(createSql: string): string | undefined {
+  return locateViewSqlParts(createSql).columnListSql;
+}
+
+/** Build CREATE VIEW while preserving a stored explicit column list verbatim. */
+export function buildCreateViewSql(
+  view: string,
+  selectSql: string,
+  columnListSql?: string,
+  legacyColumns?: string[]
+): string {
+  const preservedColumnList = columnListSql
+    ?? (legacyColumns?.length
+      ? `(${legacyColumns.map(column => escapeIdentifier(column)).join(', ')})`
+      : undefined);
+  return `CREATE VIEW ${escapeIdentifier(view)}${preservedColumnList ? ` ${preservedColumnList}` : ''} AS ${selectSql}`;
 }

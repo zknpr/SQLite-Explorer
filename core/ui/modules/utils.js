@@ -121,7 +121,13 @@ export function formatCellValue(value, columnType = null, dateFormat = 'raw', co
  * Format a cell value for display as plain text (no HTML escaping).
  * Use this when setting textContent.
  */
-export function formatCellValueAsText(value, columnType = null, dateFormat = 'raw', columnName = null) {
+export function formatCellValueAsText(
+    value,
+    columnType = null,
+    dateFormat = 'raw',
+    columnName = null,
+    truncateLongText = true
+) {
     // Handle null and undefined as NULL display
     if (value === null || value === undefined) return 'NULL';
     if (value instanceof Uint8Array) return '[BLOB]';
@@ -135,7 +141,7 @@ export function formatCellValueAsText(value, columnType = null, dateFormat = 'ra
         }
     }
 
-    if (typeof value === 'string' && value.length > 100) {
+    if (truncateLongText && typeof value === 'string' && value.length > 100) {
         return value.substring(0, 100) + '...';
     }
     return String(value);

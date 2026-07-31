@@ -192,11 +192,24 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
     }
 
     async createView(view: string, selectSql: string): Promise<ViewDefinition> {
-        return this.logAndDelegate(`CREATE VIEW ${escapeIdentifier(view)} AS [definition]`, true, 'createView', view, selectSql);
+        return this.logAndDelegate(
+            `CREATE VIEW ${escapeIdentifier(view)} AS ${this.sanitizeValue(selectSql)}`,
+            true,
+            'createView',
+            view,
+            selectSql
+        );
     }
 
     async editView(view: string, selectSql: string, preserveTriggers?: boolean): Promise<ViewEditResult> {
-        return this.logAndDelegate(`Replacing view ${escapeIdentifier(view)} (preserve triggers: ${preserveTriggers !== false})`, true, 'editView', view, selectSql, preserveTriggers);
+        return this.logAndDelegate(
+            `Replacing view ${escapeIdentifier(view)} with ${this.sanitizeValue(selectSql)} (preserve triggers: ${preserveTriggers !== false})`,
+            true,
+            'editView',
+            view,
+            selectSql,
+            preserveTriggers
+        );
     }
 
     async dropView(view: string): Promise<ViewDefinition> {

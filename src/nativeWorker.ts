@@ -42,7 +42,12 @@ import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 import { computeJsonPatchUndo } from './core/json-utils';
 import { serializeOperations } from './core/operation-serializer';
-import { extractViewSelectSql, hasExplicitViewColumnList, normalizeViewSelectSql } from './core/view-utils';
+import {
+  buildCreateViewSql,
+  extractViewColumnListSql,
+  extractViewSelectSql,
+  normalizeViewSelectSql
+} from './core/view-utils';
 import { crypto } from './platform/cryptoShim';
 
 // ============================================================================
@@ -446,11 +451,13 @@ export async function isNativeAvailable(extensionPath: string): Promise<boolean>
  *
  * @param extensionUri - Extension installation directory URI
  * @param _reporter - Optional telemetry reporter
+ * @param outputChannel - Optional extension output channel for worker diagnostics
  * @returns Connection bundle with native worker
  */
 export async function createNativeDatabaseConnection(
   extensionUri: vsc.Uri,
-  _reporter?: TelemetryReporter
+  _reporter?: TelemetryReporter,
+  outputChannel?: vsc.OutputChannel | null
 ): Promise<DatabaseConnectionBundle> {
   const extensionPath = extensionUri.fsPath;
   const binaryPath = await getNativeBinaryPath(extensionPath);
@@ -521,15 +528,9 @@ export async function createNativeDatabaseConnection(
           await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
           await worker.call('run', [`RELEASE ${savepointName}`]);
         } catch (rollbackErr) {
-          console.warn(`Failed to rollback native savepoint (${context}):`, rollbackErr);
+          const message = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+          outputChannel?.appendLine(`[NativeWorker] Failed to rollback native savepoint (${context}): ${message}`);
         }
-      };
-
-      const buildCreateViewSql = (view: string, selectSql: string, columns?: string[]): string => {
-        const columnList = columns?.length
-          ? ` (${columns.map(column => escapeIdentifier(column)).join(', ')})`
-          : '';
-        return `CREATE VIEW ${escapeIdentifier(view)}${columnList} AS ${selectSql}`;
       };
 
       const getNativeViewDefinition = async (view: string): Promise<ViewDefinition> => {
@@ -539,14 +540,11 @@ export async function createNativeDatabaseConnection(
             params: [view]
           },
           {
-            sql: "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY name",
+            sql: "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
             params: [view]
-          },
-          {
-            sql: `PRAGMA table_info(${escapeIdentifier(view)})`
           }
         ]]);
-        if (!metadata?.results || metadata.results.length < 3) {
+        if (!metadata?.results || metadata.results.length < 2) {
           throw new Error('View definition fetch failed: queryBatch returned incomplete results');
         }
 
@@ -565,27 +563,22 @@ export async function createNativeDatabaseConnection(
         });
 
         const selectSql = extractViewSelectSql(createSql);
-        let columns: string[] | undefined;
-        if (hasExplicitViewColumnList(createSql)) {
-          columns = (metadata.results[2].values ?? []).map(row => {
-            if (typeof row[1] !== 'string') {
-              throw new Error(`View column definition is unavailable for ${view}`);
-            }
-            return row[1];
-          });
-        }
-
         return {
           identifier: view,
           sql: createSql,
           selectSql,
-          columns,
+          columnListSql: extractViewColumnListSql(createSql),
           triggers
         };
       };
 
+      const queryNativeSingleStatement = async <T>(sql: string): Promise<T> => {
+        const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
+        return worker.call<T>('querySingle', [`${sql}\n${boundary}`, undefined, boundary]);
+      };
+
       const compileNativeViewSelect = async (selectSql: string): Promise<void> => {
-        await worker.call('query', [`EXPLAIN SELECT * FROM (${selectSql}) LIMIT 0`]);
+        await queryNativeSingleStatement(`EXPLAIN SELECT * FROM (${selectSql}\n) LIMIT 0`);
       };
 
       const compileNativeView = async (view: string): Promise<void> => {
@@ -599,7 +592,7 @@ export async function createNativeDatabaseConnection(
         await worker.call('run', [`SAVEPOINT ${savepointName}`]);
         try {
           await worker.call('run', [`DROP VIEW IF EXISTS ${escapeIdentifier(definition.identifier)}`]);
-          await worker.call('run', [buildCreateViewSql(definition.identifier, body, definition.columns)]);
+          await worker.call('run', [definition.sql]);
           await compileNativeView(definition.identifier);
           for (const trigger of definition.triggers) {
             await worker.call('run', [trigger.sql]);
@@ -1068,9 +1061,9 @@ export async function createNativeDatabaseConnection(
         previewViewDefinition: async (_view: string, selectSql: string, limit: number = 50) => {
           const body = normalizeViewSelectSql(selectSql);
           const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
-          const result = await worker.call<NativeQueryResult>('query', [
-            `SELECT * FROM (${body}) LIMIT ${boundedLimit}`
-          ]);
+          const result = await queryNativeSingleStatement<NativeQueryResult>(
+            `SELECT * FROM (${body}\n) LIMIT ${boundedLimit}`
+          );
           return {
             headers: result.columns,
             rows: result.values,
@@ -1110,7 +1103,7 @@ export async function createNativeDatabaseConnection(
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
             await worker.call('run', [`DROP VIEW ${escapeIdentifier(view)}`]);
-            await worker.call('run', [buildCreateViewSql(view, body, before.columns)]);
+            await worker.call('run', [buildCreateViewSql(view, body, before.columnListSql, before.columns)]);
             await compileNativeView(view);
             if (preserveTriggers) {
               for (const trigger of before.triggers) {

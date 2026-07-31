@@ -5,6 +5,17 @@ import { escapeIdentifier } from './core/sql-utils';
 import { GlobalOutputChannel } from './main';
 
 import type { DatabaseDocument } from './databaseModel';
+import type { ViewEditResult } from './core/types';
+
+function getViewDefinitionErrorDetail(error: unknown): string {
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const sqliteMessage = rawMessage
+        .replace(/^\[query\]\s*/, '')
+        .replace(/^SQLite error(?:\s+\d+)?:\s*/i, '')
+        .trim()
+        .replace(/\.+$/, '');
+    return sqliteMessage || rawMessage;
+}
 
 export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     readonly onDidChangeFile: vsc.Event<vsc.FileChangeEvent[]>;
@@ -119,23 +130,36 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             throw vsc.FileSystemError.NoPermissions('Database is read-only');
         }
 
-        try {
-            if (rowId === '__view__.sql') {
-                const selectSql = new TextDecoder('utf-8', { fatal: true }).decode(content);
-                const result = await document.databaseOperations.editView(table, selectSql, true);
-
-                document.recordExternalModification({
-                    label: 'Edit View',
-                    description: `Edit view ${table} from editor`,
-                    modificationType: 'view_edit',
-                    targetTable: table,
-                    viewDefBefore: result.before,
-                    viewDefAfter: result.after
-                });
-                this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
-                return;
+        if (rowId === '__view__.sql') {
+            const selectSql = new TextDecoder('utf-8', { fatal: true }).decode(content);
+            let result: ViewEditResult;
+            try {
+                result = await document.databaseOperations.editView(table, selectSql, true);
+            } catch (err) {
+                const rawMessage = err instanceof Error ? err.message : String(err);
+                GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error writing view definition: ${rawMessage}`);
+                const detail = getViewDefinitionErrorDetail(err);
+                await vsc.window.showErrorMessage(
+                    `Invalid view definition: ${detail}. The view was not modified.`
+                );
+                throw vsc.FileSystemError.Unavailable(
+                    'Invalid view definition. The view was not modified.'
+                );
             }
 
+            document.recordExternalModification({
+                label: 'Edit View',
+                description: `Edit view ${table} from editor`,
+                modificationType: 'view_edit',
+                targetTable: table,
+                viewDefBefore: result.before,
+                viewDefAfter: result.after
+            });
+            this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
+            return;
+        }
+
+        try {
             const rowIdNum = Number(rowId);
             if (isNaN(rowIdNum)) {
                 throw vsc.FileSystemError.Unavailable('Invalid Row ID');

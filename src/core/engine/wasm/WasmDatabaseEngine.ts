@@ -29,7 +29,12 @@ import { crypto } from '../../../platform/cryptoShim';
 import { buildSelectQuery, buildCountQuery } from '../../query-builder';
 import { applyMergePatch, computeJsonPatchUndo, parseJsonValueForPatching } from '../../json-utils';
 import { getNodeFs } from '../../platform/fs';
-import { extractViewSelectSql, hasExplicitViewColumnList, normalizeViewSelectSql } from '../../view-utils';
+import {
+  buildCreateViewSql,
+  extractViewColumnListSql,
+  extractViewSelectSql,
+  normalizeViewSelectSql
+} from '../../view-utils';
 
 // ============================================================================
 // Internal sql.js Types
@@ -43,6 +48,7 @@ interface WasmPreparedStatement {
   reset(): void;
   free(): boolean;
   getColumnNames(): string[];
+  getSQL(): string;
 }
 
 export interface WasmDatabaseInstance {
@@ -120,8 +126,22 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
-  /** Execute exactly the first prepared statement, never a trailing statement. */
+  /** Prepare only when SQLite proves the statement consumed our generated suffix. */
+  private prepareSingleStatement(sql: string): WasmPreparedStatement {
+    const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
+    const statement = this.instance.prepare(`${sql}\n${boundary}`);
+    if (!statement.getSQL().trimEnd().endsWith(boundary)) {
+      statement.free();
+      throw new Error('Exactly one SQL statement is required');
+    }
+    return statement;
+  }
+
+  /** Execute exactly the checked prepared statement, never a trailing statement. */
   private runSingleStatement(sql: string): void {
+    // Validate with the boundary comment, then execute the original SQL so a
+    // CREATE statement does not persist our private marker in sqlite_schema.
+    this.compileSingleStatement(sql);
     const statement = this.instance.prepare(sql);
     try {
       statement.run();
@@ -132,20 +152,35 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
   /** Compile a statement through SQLite without retaining or executing it. */
   private compileSingleStatement(sql: string): void {
-    const statement = this.instance.prepare(sql);
+    const statement = this.prepareSingleStatement(sql);
     statement.free();
   }
 
   /** Compile the body in a SELECT-only context and reject trailing statements. */
   private compileViewSelect(selectSql: string): void {
-    this.compileSingleStatement(`EXPLAIN SELECT * FROM (${selectSql}) LIMIT 0`);
+    this.compileSingleStatement(`EXPLAIN SELECT * FROM (${selectSql}\n) LIMIT 0`);
   }
 
-  private buildCreateViewSql(view: string, selectSql: string, columns?: string[]): string {
-    const columnList = columns?.length
-      ? ` (${columns.map(column => escapeIdentifier(column)).join(', ')})`
-      : '';
-    return `CREATE VIEW ${escapeIdentifier(view)}${columnList} AS ${selectSql}`;
+  private executeSingleQuery(sql: string): QueryResultSet {
+    const statement = this.prepareSingleStatement(sql);
+    const rows: CellValue[][] = [];
+    const startedAt = Date.now();
+    try {
+      while (statement.step()) {
+        if (Date.now() - startedAt > this.queryTimeout) {
+          throw new Error(`Query execution timed out after ${this.queryTimeout}ms`);
+        }
+        const row = statement.get();
+        if (!row) {
+          throw new Error('SQLite returned no row after a successful statement step');
+        }
+        rows.push(row);
+      }
+      const headers = statement.getColumnNames();
+      return { headers, rows, columns: headers, values: rows };
+    } finally {
+      statement.free();
+    }
   }
 
   /**
@@ -889,7 +924,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
 
     const triggerResult = await this.executeQuery(
-      "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY name",
+      "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
       [view]
     );
     const triggers = (triggerResult[0]?.rows ?? []).map(row => {
@@ -900,22 +935,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     });
 
     const selectSql = extractViewSelectSql(createSql);
-    let columns: string[] | undefined;
-    if (hasExplicitViewColumnList(createSql)) {
-      const columnResult = await this.executeQuery(`PRAGMA table_info(${escapeIdentifier(view)})`);
-      columns = (columnResult[0]?.rows ?? []).map(row => {
-        if (typeof row[1] !== 'string') {
-          throw new Error(`View column definition is unavailable for ${view}`);
-        }
-        return row[1];
-      });
-    }
-
     return {
       identifier: view,
       sql: createSql,
       selectSql,
-      columns,
+      columnListSql: extractViewColumnListSql(createSql),
       triggers
     };
   }
@@ -928,8 +952,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   async previewViewDefinition(_view: string, selectSql: string, limit: number = 50): Promise<QueryResultSet> {
     const body = normalizeViewSelectSql(selectSql);
     const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
-    const result = await this.executeQuery(`SELECT * FROM (${body}) LIMIT ${boundedLimit}`);
-    return result[0] ?? { headers: [], rows: [] };
+    return this.executeSingleQuery(`SELECT * FROM (${body}\n) LIMIT ${boundedLimit}`);
   }
 
   async createView(view: string, selectSql: string): Promise<ViewDefinition> {
@@ -938,7 +961,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const savepointName = this.createSavepointName('sp_create_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
-      this.runSingleStatement(this.buildCreateViewSql(view, body));
+      this.runSingleStatement(buildCreateViewSql(view, body));
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
       const definition = await this.getViewDefinition(view);
       await this.executeQuery(`RELEASE ${savepointName}`);
@@ -957,7 +980,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       this.runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
-      this.runSingleStatement(this.buildCreateViewSql(view, body, before.columns));
+      this.runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
       if (preserveTriggers) {
         for (const trigger of before.triggers) {
@@ -999,7 +1022,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       await this.dropViewIfExists(definition.identifier);
-      this.runSingleStatement(this.buildCreateViewSql(definition.identifier, body, definition.columns));
+      this.runSingleStatement(definition.sql);
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(definition.identifier)}`);
       for (const trigger of definition.triggers) {
         this.runSingleStatement(trigger.sql);

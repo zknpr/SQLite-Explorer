@@ -10,6 +10,8 @@ import { showEmptyState, updateStatus, updateToolbarButtons } from './ui.js';
 import { formatCellValueAsText } from './utils.js';
 
 let editingViewName = null;
+let activeViewLoadToken = 0;
+let isSavingView = false;
 
 function getElements() {
     return {
@@ -96,6 +98,7 @@ export function openCreateViewModal() {
         updateStatus('Document is read-only');
         return;
     }
+    activeViewLoadToken++;
     editingViewName = null;
     const elements = getElements();
     elements.title.textContent = 'Create View';
@@ -112,9 +115,12 @@ export function openCreateViewModal() {
 }
 
 export async function openEditViewModal(view) {
+    const loadToken = ++activeViewLoadToken;
+    const isSuperseded = () => loadToken !== activeViewLoadToken;
     try {
         updateStatus(`Loading view "${view}"...`);
         const definition = await backendApi.getViewDefinition(view);
+        if (isSuperseded()) return;
         editingViewName = view;
 
         const elements = getElements();
@@ -137,7 +143,7 @@ export async function openEditViewModal(view) {
         openModal('viewModal');
         updateStatus('Ready');
     } catch (err) {
-        updateStatus(`Error: ${err.message}`);
+        if (!isSuperseded()) updateStatus(`Error: ${err.message}`);
     }
 }
 
@@ -183,10 +189,15 @@ async function saveDraft() {
         setFeedback('Document is read-only.', true);
         return;
     }
-    if (!await validateDraft()) return;
+    if (isSavingView) return;
 
-    const draft = getDraft();
+    isSavingView = true;
+    const saveButton = getElements().save;
+    if (saveButton) saveButton.disabled = true;
     try {
+        if (!await validateDraft()) return;
+
+        const draft = getDraft();
         setFeedback(editingViewName ? 'Replacing view atomically...' : 'Creating view...');
         const result = editingViewName
             ? await backendApi.editView(editingViewName, draft.selectSql, draft.preserveTriggers)
@@ -207,6 +218,9 @@ async function saveDraft() {
     } catch (err) {
         setFeedback(err.message, true);
         updateStatus(`Error: ${err.message}`);
+    } finally {
+        isSavingView = false;
+        if (saveButton) saveButton.disabled = false;
     }
 }
 

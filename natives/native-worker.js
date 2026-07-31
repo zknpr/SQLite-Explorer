@@ -252,6 +252,36 @@ function executeQuery(db, sql, params) {
   };
 }
 
+/** Execute one prepared query only after SQLite proves it consumed the boundary. */
+function executeSingleQuery(db, sql, params, requiredSuffix) {
+  const stmt = db.prepare(sql);
+  let rows = [];
+  try {
+    const preparedSql = typeof stmt.toString === 'function' ? stmt.toString().trimEnd() : '';
+    if (!requiredSuffix || !preparedSql.endsWith(requiredSuffix)) {
+      throw new Error('Exactly one SQL statement is required');
+    }
+
+    if (typeof stmt.all === 'function') {
+      rows = params && params.length > 0 ? stmt.all(...params) : stmt.all();
+    } else {
+      if (params && params.length > 0 && typeof stmt.bind === 'function') {
+        stmt.bind(...params);
+      }
+      for (const row of stmt) rows.push(row);
+    }
+  } finally {
+    if (typeof stmt.finalize === 'function') stmt.finalize();
+  }
+
+  const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+  return {
+    columns,
+    values: rows.map(row => columns.map(column => row[column])),
+    rowCount: rows.length
+  };
+}
+
 /**
  * Handle incoming RPC request.
  *
@@ -333,6 +363,16 @@ async function handleRequest(request) {
 
         result = executeQuery(db, sql, params);
         console.error("[native-worker] query complete");
+        break;
+      }
+
+      case "querySingle": {
+        // The caller appends an unpredictable comment suffix. SQLite's own
+        // parser must retain it in the prepared statement or a tail escaped
+        // the wrapper and this request is rejected before anything is stepped.
+        const [sql, params, requiredSuffix] = args;
+        if (!db) throw new Error("Database not open");
+        result = executeSingleQuery(db, sql, params, requiredSuffix);
         break;
       }
 
