@@ -102,14 +102,14 @@
         "sqliteExplorer.defaultPageSize": {
           "type": "number",
           "minimum": 10,
-          "maximum": 1e5,
+          "maximum": 100000,
           "default": 500,
           "markdownDescription": "Default number of rows to display per page."
         },
         "sqliteExplorer.maxRows": {
           "type": "number",
           "minimum": 0,
-          "maximum": 1e7,
+          "maximum": 10000000,
           "default": 0,
           "markdownDescription": "Maximum number of rows to load from a table. Set to 0 for unlimited."
         },
@@ -179,13 +179,13 @@
     "test": "npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts"
   },
   "devDependencies": {
-    "@types/node": "^25.9.2",
+    "@types/node": "^26.1.2",
     "@types/vscode": "=1.110.0",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.1",
     "esbuild-plugin-polyfill-node": "^0.3.0",
     "ts-node": "^10.9.2",
-    "tsx": "^4.22.4",
+    "tsx": "^4.23.1",
     "typescript": "^6.0.3"
   },
   "dependencies": {
