@@ -177,7 +177,7 @@ export default function DemoClient() {
             kind: 'response',
             messageId,
             success: true,
-            data: { isReadOnly: false }
+            data: { connected: true, isReadOnly: false }
           }
         }, { targetOrigin: window.location.origin });
         return;
