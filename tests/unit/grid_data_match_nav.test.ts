@@ -117,9 +117,11 @@ describe('grid data match cache', () => {
         const stateModulePath = '../../core/ui/modules/state.js';
         const apiModulePath = '../../core/ui/modules/api.js';
         const gridDataModulePath = '../../core/ui/modules/grid-data.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
         const { state } = await import(stateModulePath);
         const { backendApi } = await import(apiModulePath);
         const { loadTableData } = await import(gridDataModulePath);
+        const { GLOBAL_MATCH_SCOPE } = await import(matchNavModulePath);
         const originalFetchCount = backendApi.fetchTableCount;
         const originalFetchData = backendApi.fetchTableData;
 
@@ -135,7 +137,7 @@ describe('grid data match cache', () => {
         state.columnFilters = {};
         state.filterQuery = 'old';
         state.matchNav = {
-            scope: 'global',
+            scope: GLOBAL_MATCH_SCOPE,
             term: 'old',
             matches: [{ rowIdx: 0, colIdx: 0 }],
             currentIndex: 0

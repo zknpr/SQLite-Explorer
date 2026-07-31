@@ -19,8 +19,12 @@ import {
 } from './utils.js';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 
+// A Symbol cannot collide with any SQLite column name, unlike the former
+// string sentinel. This value stays entirely inside the webview process.
+export const GLOBAL_MATCH_SCOPE = Symbol('global-match-scope');
+
 function activeTerm(scope) {
-    const value = scope === 'global' ? state.filterQuery : state.columnFilters[scope];
+    const value = scope === GLOBAL_MATCH_SCOPE ? state.filterQuery : state.columnFilters[scope];
     const activeValue = getActiveFilterValue(value);
     // Case folding is only for the local SQLite-compatible comparison. The
     // active value itself stays untrimmed, matching the exact text sent to SQL.
@@ -150,7 +154,7 @@ function computeMatches(scope, term) {
     const columnsToScan = [];
     for (const idx of getOrderedColumnIndices()) {
         const col = state.tableColumns[idx];
-        if (scope === 'global' || col.name === scope) {
+        if (scope === GLOBAL_MATCH_SCOPE || col.name === scope) {
             columnsToScan.push({ col, colIdx: idx });
         }
     }
@@ -215,7 +219,7 @@ function updateMatchCounterUI() {
 
     const globalCounter = document.getElementById('filterMatchCounter');
     if (globalCounter) {
-        globalCounter.textContent = scope === 'global' ? counterText : '';
+        globalCounter.textContent = scope === GLOBAL_MATCH_SCOPE ? counterText : '';
     }
 
     document.querySelectorAll('.column-filter-counter').forEach(el => {
@@ -225,7 +229,7 @@ function updateMatchCounterUI() {
 
 /**
  * Move to the next (direction = 1) or previous (direction = -1) match for the
- * given scope ('global' or a column name), wrapping around at either end.
+ * given scope (GLOBAL_MATCH_SCOPE or a column name), wrapping around at either end.
  * Matches are cached on `state.matchNav` and only recomputed when the scope or
  * term changes (a fresh term is detected after `resetMatchNav()` cleared the
  * cache), so pressing Enter/Shift+Enter repeatedly is O(matches), not a full

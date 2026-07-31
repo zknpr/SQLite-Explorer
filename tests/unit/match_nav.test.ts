@@ -1,7 +1,14 @@
 import './vscode_mock_setup';
 
-import { afterEach, describe, it } from 'node:test';
+import { afterEach, before, describe, it } from 'node:test';
 import assert from 'node:assert';
+
+let GLOBAL_MATCH_SCOPE: symbol;
+
+before(async () => {
+    const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+    ({ GLOBAL_MATCH_SCOPE } = await import(matchNavModulePath));
+});
 
 function createClassList() {
     const classes = new Set<string>();
@@ -72,13 +79,13 @@ describe('filter match navigation', () => {
         state.filterQuery = 'ä';
         resetMatchNav();
 
-        navigateMatches('global');
+        navigateMatches(GLOBAL_MATCH_SCOPE);
 
         assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
 
         state.filterQuery = 'A';
         resetMatchNav();
-        navigateMatches('global');
+        navigateMatches(GLOBAL_MATCH_SCOPE);
 
         assert.deepStrictEqual(state.matchNav.matches, [
             { rowIdx: 0, colIdx: 2 },
@@ -101,6 +108,48 @@ describe('filter match navigation', () => {
         const excerpt = formatCellValueForActiveMatch(longValue, state.tableColumns[0], 'ä');
         assert.strictEqual(excerpt.includes('ä'), true);
         assert.strictEqual(excerpt.includes('Ä'), false);
+    });
+
+    it('treats a column named global as a column-filter scope', async () => {
+        const globalCounter = { textContent: '' };
+        const columnCounters = [
+            { dataset: { column: 'global' }, textContent: '' },
+            { dataset: { column: 'other' }, textContent: '' }
+        ];
+        const cells = new Map([
+            ['cell-0-0', { classList: createClassList(), scrollIntoView() {} }],
+            ['cell-0-1', { classList: createClassList(), scrollIntoView() {} }]
+        ]);
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'filterMatchCounter') return globalCounter;
+                return cells.get(id) ?? null;
+            },
+            querySelectorAll(selector: string) {
+                return selector === '.column-filter-counter' ? columnCounters : [];
+            }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.selectedTableType = 'view';
+        state.tableColumns = [
+            { name: 'global', type: 'TEXT' },
+            { name: 'other', type: 'TEXT' }
+        ];
+        state.gridData = [['column needle', 'toolbar needle']];
+        state.filterQuery = 'toolbar';
+        state.columnFilters = { global: 'column' };
+        resetMatchNav();
+
+        navigateMatches('global');
+
+        assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
+        assert.strictEqual(globalCounter.textContent, '');
+        assert.strictEqual(columnCounters[0].textContent, '1/1');
+        assert.strictEqual(columnCounters[1].textContent, '');
     });
 
     it('navigates to a term beyond the rendered text truncation point', async () => {
@@ -155,7 +204,7 @@ describe('filter match navigation', () => {
         state.columnFilters = {};
         resetMatchNav();
 
-        navigateMatches('global');
+        navigateMatches(GLOBAL_MATCH_SCOPE);
 
         assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
         assert.strictEqual(counter.textContent, '1/1');
@@ -207,7 +256,7 @@ describe('filter match navigation', () => {
         state.filterQuery = ' needle ';
         resetMatchNav();
 
-        navigateMatches('global');
+        navigateMatches(GLOBAL_MATCH_SCOPE);
 
         assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 1 }]);
 
@@ -216,7 +265,7 @@ describe('filter match navigation', () => {
         state.filterQuery = ' ';
         resetMatchNav();
 
-        navigateMatches('global');
+        navigateMatches(GLOBAL_MATCH_SCOPE);
 
         assert.deepStrictEqual(state.matchNav.matches, []);
         assert.strictEqual(state.matchNav.term, '');
@@ -256,7 +305,7 @@ describe('filter match navigation', () => {
         state.columnFilters = {};
         resetMatchNav();
 
-        navigateMatches('global');
+        navigateMatches(GLOBAL_MATCH_SCOPE);
 
         assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
         assert.strictEqual(cell.classList.contains('active-match-cell'), true);
@@ -287,7 +336,7 @@ describe('filter match navigation', () => {
         state.columnFilters = {};
         resetMatchNav();
 
-        navigateMatches('global');
+        navigateMatches(GLOBAL_MATCH_SCOPE);
 
         assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
         assert.strictEqual(cell.classList.contains('active-match-cell'), true);
@@ -329,7 +378,7 @@ describe('filter match navigation', () => {
             state.filterQuery = testCase.term;
             resetMatchNav();
 
-            navigateMatches('global');
+            navigateMatches(GLOBAL_MATCH_SCOPE);
 
             assert.deepStrictEqual(
                 state.matchNav.matches,
@@ -379,7 +428,7 @@ describe('filter match navigation', () => {
         resetMatchNav();
 
         try {
-            navigateMatches('global');
+            navigateMatches(GLOBAL_MATCH_SCOPE);
 
             assert.deepStrictEqual(state.matchNav.matches, [
                 { rowIdx: 1, colIdx: 1 },
@@ -390,6 +439,104 @@ describe('filter match navigation', () => {
             assert.deepStrictEqual(focusedCells, ['cell-1-1']);
         } finally {
             state.pinnedColumns.clear();
+            state.pinnedRowIds.clear();
+            resetMatchNav();
+        }
+    });
+
+    it('restarts navigation in rendered column order after a pin toggle', async () => {
+        const focusedCells: string[] = [];
+        const cells = new Map<string, any>();
+        for (let colIdx = 0; colIdx < 3; colIdx++) {
+            const id = `cell-0-${colIdx}`;
+            cells.set(id, {
+                classList: createClassList(),
+                scrollIntoView() { focusedCells.push(id); }
+            });
+        }
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return cells.get(id) ?? null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const gridActionsModulePath = '../../core/ui/modules/grid-actions.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        const { toggleColumnPin } = await import(gridActionsModulePath);
+        state.selectedTableType = 'view';
+        state.tableColumns = [
+            { name: 'first', type: 'TEXT' },
+            { name: 'second', type: 'TEXT' },
+            { name: 'third', type: 'TEXT' }
+        ];
+        state.gridData = [['hit first', 'hit second', 'hit third']];
+        state.filterQuery = 'hit';
+        state.columnFilters = {};
+        state.pinnedColumns.clear();
+        state.pinnedRowIds.clear();
+        resetMatchNav();
+
+        try {
+            navigateMatches(GLOBAL_MATCH_SCOPE);
+            toggleColumnPin({ stopPropagation() {} }, 'third');
+            navigateMatches(GLOBAL_MATCH_SCOPE);
+
+            assert.deepStrictEqual(focusedCells, ['cell-0-0', 'cell-0-2']);
+        } finally {
+            state.pinnedColumns.clear();
+            resetMatchNav();
+        }
+    });
+
+    it('restarts navigation in rendered row order after a pin toggle', async () => {
+        const focusedCells: string[] = [];
+        const cells = new Map<string, any>();
+        for (let rowIdx = 0; rowIdx < 3; rowIdx++) {
+            const id = `cell-${rowIdx}-0`;
+            cells.set(id, {
+                classList: createClassList(),
+                scrollIntoView() { focusedCells.push(id); }
+            });
+        }
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return cells.get(id) ?? null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const gridActionsModulePath = '../../core/ui/modules/grid-actions.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        const { toggleRowPin } = await import(gridActionsModulePath);
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.gridData = [
+            [1, 'hit first'],
+            [2, 'hit second'],
+            [3, 'hit third']
+        ];
+        state.filterQuery = 'hit';
+        state.columnFilters = {};
+        state.pinnedColumns.clear();
+        state.pinnedRowIds.clear();
+        resetMatchNav();
+
+        try {
+            navigateMatches(GLOBAL_MATCH_SCOPE);
+            toggleRowPin({ stopPropagation() {} }, 3);
+            navigateMatches(GLOBAL_MATCH_SCOPE);
+
+            assert.deepStrictEqual(focusedCells, ['cell-0-0', 'cell-2-0']);
+        } finally {
             state.pinnedRowIds.clear();
             resetMatchNav();
         }

@@ -6,7 +6,7 @@ import { updateToolbarButtons } from './ui.js';
 import { updateBatchSidebar } from './sidebar.js';
 import { getRowId, getCellValue } from './data-utils.js';
 import { openCellPreview, startCellEdit, openCellInVsCode } from './edit.js';
-import { navigateMatches, resetMatchNav } from './match-nav.js';
+import { GLOBAL_MATCH_SCOPE, navigateMatches, resetMatchNav } from './match-nav.js';
 
 /**
  * Apply the global filter and jump to a match. The filter is only run when the
@@ -39,7 +39,7 @@ export async function applyGlobalFilter(direction = 1) {
         }
         persistState();
     }
-    navigateMatches('global', direction);
+    navigateMatches(GLOBAL_MATCH_SCOPE, direction);
 }
 
 export function onFilterEnter(event) {
@@ -272,6 +272,7 @@ export function toggleColumnPin(event, columnName) {
     } else {
         state.pinnedColumns.add(columnName);
     }
+    resetMatchNav();
     renderDataGrid();
     persistState();
 }
@@ -284,6 +285,7 @@ export function toggleRowPin(event, rowId) {
     } else {
         state.pinnedRowIds.add(rowId);
     }
+    resetMatchNav();
     renderDataGrid();
     persistState();
 }

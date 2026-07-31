@@ -79,8 +79,8 @@ export const state = {
 
     // Filter match navigation (Enter-to-jump on global/column filters)
     matchNav: {
-        scope: null,       // 'global' or a column name
-        term: null,        // the lowercased term the cached matches were computed for
+        scope: null,       // GLOBAL_MATCH_SCOPE Symbol or a column name
+        term: null,        // the ASCII-folded term the cached matches were computed for
         matches: [],       // [{ rowIdx, colIdx }] in row/column order
         currentIndex: -1
     }
