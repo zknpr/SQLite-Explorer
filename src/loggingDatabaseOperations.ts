@@ -18,7 +18,9 @@ import type {
     TableCountOptions,
     SchemaSnapshot,
     ColumnMetadata,
-    ColumnDefinition
+    ColumnDefinition,
+    ViewDefinition,
+    ViewEditResult
 } from './core/types';
 import { escapeIdentifier } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -175,6 +177,30 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         const sql = `CREATE TABLE ${escapeIdentifier(table)} (${columnDefs})`;
         this.log(sql, true);
         return this.wrapped.createTable(table, columns);
+    }
+
+    async getViewDefinition(view: string): Promise<ViewDefinition> {
+        return this.logAndDelegate(`Reading view ${escapeIdentifier(view)}`, false, 'getViewDefinition', view);
+    }
+
+    async validateViewDefinition(view: string, selectSql: string): Promise<void> {
+        return this.logAndDelegate(`Validating view ${escapeIdentifier(view)}`, false, 'validateViewDefinition', view, selectSql);
+    }
+
+    async previewViewDefinition(view: string, selectSql: string, limit?: number): Promise<QueryResultSet> {
+        return this.logAndDelegate(`Previewing view ${escapeIdentifier(view)}`, false, 'previewViewDefinition', view, selectSql, limit);
+    }
+
+    async createView(view: string, selectSql: string): Promise<ViewDefinition> {
+        return this.logAndDelegate(`CREATE VIEW ${escapeIdentifier(view)} AS [definition]`, true, 'createView', view, selectSql);
+    }
+
+    async editView(view: string, selectSql: string, preserveTriggers?: boolean): Promise<ViewEditResult> {
+        return this.logAndDelegate(`Replacing view ${escapeIdentifier(view)} (preserve triggers: ${preserveTriggers !== false})`, true, 'editView', view, selectSql, preserveTriggers);
+    }
+
+    async dropView(view: string): Promise<ViewDefinition> {
+        return this.logAndDelegate(`DROP VIEW ${escapeIdentifier(view)}`, true, 'dropView', view);
     }
 
     async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {

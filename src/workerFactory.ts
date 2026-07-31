@@ -29,7 +29,9 @@ import type {
   TableQueryOptions,
   TableCountOptions,
   SchemaSnapshot,
-  ColumnMetadata
+  ColumnMetadata,
+  ViewDefinition,
+  ViewEditResult
 } from './core/types';
 
 import { Worker } from './platform/threadPool';
@@ -74,6 +76,12 @@ interface WorkerMethods {
   deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
+  getViewDefinition(view: string): Promise<ViewDefinition>;
+  validateViewDefinition(view: string, selectSql: string): Promise<void>;
+  previewViewDefinition(view: string, selectSql: string, limit?: number): Promise<QueryResultSet>;
+  createView(view: string, selectSql: string): Promise<ViewDefinition>;
+  editView(view: string, selectSql: string, preserveTriggers?: boolean): Promise<ViewEditResult>;
+  dropView(view: string): Promise<ViewDefinition>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
@@ -269,6 +277,18 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.findDependentIndexes(table, columns),
         createTable: (table: string, columns: ColumnDefinition[]) =>
           endpoint.createTable(table, columns),
+        getViewDefinition: (view: string) =>
+          endpoint.getViewDefinition(view),
+        validateViewDefinition: (view: string, selectSql: string) =>
+          endpoint.validateViewDefinition(view, selectSql),
+        previewViewDefinition: (view: string, selectSql: string, limit?: number) =>
+          endpoint.previewViewDefinition(view, selectSql, limit),
+        createView: (view: string, selectSql: string) =>
+          endpoint.createView(view, selectSql),
+        editView: (view: string, selectSql: string, preserveTriggers?: boolean) =>
+          endpoint.editView(view, selectSql, preserveTriggers),
+        dropView: (view: string) =>
+          endpoint.dropView(view),
         updateCellBatch: (table: string, updates: CellUpdate[]) =>
           endpoint.updateCellBatch(table, updates),
         addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
@@ -340,7 +360,7 @@ async function createWorkerBackedWasmDatabaseConnection(
           .on(event, handler);
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'insertRowBatch', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile'],
+    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'insertRowBatch', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'getViewDefinition', 'validateViewDefinition', 'previewViewDefinition', 'createView', 'editView', 'dropView', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile'],
     logHandler
   );
 
@@ -470,6 +490,18 @@ async function createWorkerBackedWasmDatabaseConnection(
             workerProxy.findDependentIndexes(table, columns),
           createTable: (table: string, columns: ColumnDefinition[]) =>
             workerProxy.createTable(table, columns),
+          getViewDefinition: (view: string) =>
+            workerProxy.getViewDefinition(view),
+          validateViewDefinition: (view: string, selectSql: string) =>
+            workerProxy.validateViewDefinition(view, selectSql),
+          previewViewDefinition: (view: string, selectSql: string, limit?: number) =>
+            workerProxy.previewViewDefinition(view, selectSql, limit),
+          createView: (view: string, selectSql: string) =>
+            workerProxy.createView(view, selectSql),
+          editView: (view: string, selectSql: string, preserveTriggers?: boolean) =>
+            workerProxy.editView(view, selectSql, preserveTriggers),
+          dropView: (view: string) =>
+            workerProxy.dropView(view),
           updateCellBatch: (table: string, updates: CellUpdate[]) => {
             // Wrap any Uint8Array values in updates for zero-copy transfer
             const wrappedUpdates = updates.map(u => ({

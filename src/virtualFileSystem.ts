@@ -59,6 +59,11 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 return new Uint8Array(0);
             }
 
+            if (rowId === '__view__.sql') {
+                const definition = await document.databaseOperations.getViewDefinition(table);
+                return new TextEncoder().encode(definition.selectSql);
+            }
+
             
 
             // Verify if the target is a valid table or view in the schema.
@@ -115,6 +120,22 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         }
 
         try {
+            if (rowId === '__view__.sql') {
+                const selectSql = new TextDecoder('utf-8', { fatal: true }).decode(content);
+                const result = await document.databaseOperations.editView(table, selectSql, true);
+
+                document.recordExternalModification({
+                    label: 'Edit View',
+                    description: `Edit view ${table} from editor`,
+                    modificationType: 'view_edit',
+                    targetTable: table,
+                    viewDefBefore: result.before,
+                    viewDefAfter: result.after
+                });
+                this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
+                return;
+            }
+
             const rowIdNum = Number(rowId);
             if (isNaN(rowIdNum)) {
                 throw vsc.FileSystemError.Unavailable('Invalid Row ID');

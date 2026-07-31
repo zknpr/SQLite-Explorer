@@ -217,6 +217,27 @@ body {
 .list-item .item-name {
     overflow: hidden;
     text-overflow: ellipsis;
+    flex: 1;
+}
+
+.view-item-actions {
+    display: none;
+    align-items: center;
+    margin-left: auto;
+}
+
+.list-item:hover .view-item-actions,
+.list-item:focus-within .view-item-actions {
+    display: flex;
+}
+
+.view-item-actions .icon-button {
+    padding: 2px;
+}
+
+.icon-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.35;
 }
 
 .resize-handle {
@@ -960,6 +981,86 @@ body {
 .form-field select:focus {
     outline: none;
     border-color: var(--accent-color);
+}
+
+.view-editor-dialog {
+    height: min(720px, 85vh);
+}
+
+.view-sql-editor {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 180px;
+    resize: vertical;
+    padding: 8px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    background: var(--vscode-editor-background, var(--bg-primary));
+    color: var(--vscode-editor-foreground, var(--text-primary));
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--vscode-editor-font-size, 13px);
+    line-height: 1.5;
+}
+
+.view-sql-editor:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+.view-trigger-options {
+    margin-bottom: 12px;
+    padding: 8px 10px;
+    border: 1px solid var(--vscode-editorWarning-foreground, #cca700);
+    border-radius: 3px;
+}
+
+.view-trigger-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+}
+
+.view-validation-status {
+    min-height: 18px;
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.view-feedback-error {
+    color: var(--error-color);
+}
+
+.view-preview {
+    margin-top: 8px;
+    max-height: 220px;
+    overflow: auto;
+    border: 1px solid var(--border-color);
+}
+
+.view-preview-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.view-preview-table th,
+.view-preview-table td {
+    padding: 4px 6px;
+    border-right: 1px solid var(--border-color);
+    border-bottom: 1px solid var(--border-color);
+    text-align: left;
+    white-space: nowrap;
+}
+
+.view-preview-table th {
+    position: sticky;
+    top: 0;
+    background: var(--bg-tertiary);
+}
+
+.view-modal-footer {
+    align-items: center;
 }
 
 .btn-primary {

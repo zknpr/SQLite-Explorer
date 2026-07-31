@@ -8,6 +8,7 @@ import { loadTableData, loadTableColumns } from './grid.js';
 import { getRowDataOffset } from './data-utils.js';
 import { openCreateTableModal } from './crud.js';
 import { openSettingsModal } from './settings.js';
+import { openCreateViewModal, openEditViewModal, dropViewFromSidebar } from './views.js';
 import { groupSelectedCellsByColumn, summarizeColumnValue, prepareBatchUpdates } from './batch-update-logic.js';
 
 export function initSidebar() {
@@ -39,19 +40,42 @@ export function initSidebar() {
             return;
         }
 
-        // 3. Reload Button
+        // 3. Create View Button
+        if (target.closest('#btnOpenCreateView')) {
+            event.stopPropagation();
+            openCreateViewModal();
+            return;
+        }
+
+        const editViewButton = target.closest('.view-action-edit');
+        if (editViewButton) {
+            event.stopPropagation();
+            const view = editViewButton.closest('.list-item')?.dataset.name;
+            if (view) void openEditViewModal(view);
+            return;
+        }
+
+        const dropViewButton = target.closest('.view-action-drop');
+        if (dropViewButton) {
+            event.stopPropagation();
+            const view = dropViewButton.closest('.list-item')?.dataset.name;
+            if (view) void dropViewFromSidebar(view);
+            return;
+        }
+
+        // 4. Reload Button
         if (target.closest('#btnReload')) {
             reloadFromDisk();
             return;
         }
 
-        // 4. Batch Update Apply
+        // 5. Batch Update Apply
         if (target.closest('#btnApplyBatchUpdate')) {
             applyBatchUpdate();
             return;
         }
 
-        // 5. Table/View Selection
+        // 6. Table/View Selection
         const listItem = target.closest('.list-item');
         if (listItem) {
             // Check if it's a table/view item (has data attributes)
@@ -64,7 +88,7 @@ export function initSidebar() {
             }
         }
 
-        // 6. Section Toggling
+        // 7. Section Toggling
         // Check if we clicked the section header
         const sectionTitle = target.closest('.section-title');
         if (sectionTitle) {
@@ -77,7 +101,7 @@ export function initSidebar() {
             }
         }
 
-        // 7. Batch Update Actions
+        // 8. Batch Update Actions
         const nullBtn = target.closest('.btn-batch-null');
         if (nullBtn) {
             const field = nullBtn.closest('.batch-field');
@@ -165,6 +189,35 @@ function renderSidebarList(listId, items, type, iconClass, emptyText) {
         nameSpan.className = 'item-name';
         nameSpan.textContent = item.name;
         li.appendChild(nameSpan);
+
+        if (type === 'view') {
+            const actions = document.createElement('span');
+            actions.className = 'view-item-actions';
+
+            const editButton = document.createElement('button');
+            editButton.type = 'button';
+            editButton.className = 'icon-button view-action-edit';
+            editButton.title = `Edit view ${item.name}`;
+            editButton.setAttribute('aria-label', `Edit view ${item.name}`);
+            editButton.disabled = state.isReadOnly;
+            const editIcon = document.createElement('span');
+            editIcon.className = 'codicon codicon-edit';
+            editButton.appendChild(editIcon);
+
+            const dropButton = document.createElement('button');
+            dropButton.type = 'button';
+            dropButton.className = 'icon-button view-action-drop';
+            dropButton.title = `Drop view ${item.name}`;
+            dropButton.setAttribute('aria-label', `Drop view ${item.name}`);
+            dropButton.disabled = state.isReadOnly;
+            const dropIcon = document.createElement('span');
+            dropIcon.className = 'codicon codicon-trash';
+            dropButton.appendChild(dropIcon);
+
+            actions.appendChild(editButton);
+            actions.appendChild(dropButton);
+            li.appendChild(actions);
+        }
 
         fragment.appendChild(li);
     });

@@ -81,6 +81,26 @@ describe('SQLiteFileSystemProvider', () => {
             assert.strictEqual(content.byteLength, 0);
         });
 
+        it('reads the SELECT body for a writable view definition document', async () => {
+            const dbOps = {
+                getViewDefinition: mock.fn(async () => ({
+                    identifier: 'active users',
+                    sql: 'CREATE VIEW "active users" AS SELECT id, name FROM users',
+                    selectSql: 'SELECT id, name FROM users',
+                    triggers: []
+                }))
+            };
+            setupMockDocument(docKey, dbOps);
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/active%20users/group/__view__.sql/definition.sql`
+            );
+
+            const content = await provider.readFile(uri);
+
+            assert.strictEqual(new TextDecoder().decode(content), 'SELECT id, name FROM users');
+            assert.strictEqual(dbOps.getViewDefinition.mock.callCount(), 1);
+        });
+
         it('should read regular string cell', async () => {
             // The virtualFileSystem first checks if table exists, then queries the cell
             let queryCount = 0;
@@ -277,6 +297,44 @@ describe('SQLiteFileSystemProvider', () => {
             assert.deepStrictEqual(dbOps.updateCell.mock.calls[0].arguments, ['users', 1, 'col', content]);
             assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 1);
         });
+
+        it('atomically saves a view definition and records its undo state', async () => {
+            const before = {
+                identifier: 'active users',
+                sql: 'CREATE VIEW "active users" AS SELECT id, name FROM users',
+                selectSql: 'SELECT id, name FROM users',
+                triggers: []
+            };
+            const after = {
+                ...before,
+                sql: 'CREATE VIEW "active users" AS SELECT id, upper(name) AS name FROM users',
+                selectSql: 'SELECT id, upper(name) AS name FROM users'
+            };
+            const dbOps = {
+                editView: mock.fn(async () => ({ before, after }))
+            };
+            const doc = setupMockDocument(docKey, dbOps);
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/active%20users/group/__view__.sql/definition.sql`
+            );
+            const content = new TextEncoder().encode(after.selectSql);
+
+            await provider.writeFile(uri, content, { create: false, overwrite: true });
+
+            assert.deepStrictEqual(dbOps.editView.mock.calls[0].arguments, [
+                'active users',
+                after.selectSql,
+                true
+            ]);
+            assert.deepStrictEqual((doc.recordExternalModification as any).mock.calls[0].arguments[0], {
+                label: 'Edit View',
+                description: 'Edit view active users from editor',
+                modificationType: 'view_edit',
+                targetTable: 'active users',
+                viewDefBefore: before,
+                viewDefAfter: after
+            });
+        });
     });
 
     describe('delete / rename / stat / watch', () => {
@@ -312,6 +370,15 @@ describe('SQLiteFileSystemProvider', () => {
             assert.strictEqual(s.type, vscode.FileType.File);
             assert.strictEqual(s.size, 0);
             assert.strictEqual(s.permissions, vscode.FilePermission.Readonly);
+        });
+
+        it('stat keeps __view__.sql writable', async () => {
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/__view__.sql/definition.sql`);
+            setupMockDocument(docKey, {});
+
+            const s = await provider.stat(uri);
+
+            assert.strictEqual(s.permissions, undefined);
         });
 
         it('watch should return a generic Disposable', async () => {

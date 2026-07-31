@@ -48,6 +48,7 @@ import {
 import {
     initDragAndDrop
 } from './modules/dnd.js';
+import { initViews } from './modules/views.js';
 
 // Initialize RPC system
 initRpc();
@@ -63,6 +64,7 @@ function initializeModules() {
     initGridInteraction();
     initSidebarResize();
     initDragAndDrop();
+    initViews();
 }
 
 async function connectAndLoadSchema() {
@@ -74,6 +76,9 @@ async function connectAndLoadSchema() {
     }
 
     state.isDbConnected = true;
+    state.isReadOnly = !!result.readOnly;
+    const createViewButton = document.getElementById('btnOpenCreateView');
+    if (createViewButton) createViewButton.disabled = state.isReadOnly;
 
     // Test connection
     await backendApi.ping();

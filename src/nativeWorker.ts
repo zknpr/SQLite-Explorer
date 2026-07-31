@@ -34,12 +34,16 @@ import type {
   ColumnDefinition,
   TableMetadata,
   ViewMetadata,
-  IndexMetadata
+  IndexMetadata,
+  ViewDefinition,
+  ViewEditResult
 } from './core/types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 import { computeJsonPatchUndo } from './core/json-utils';
 import { serializeOperations } from './core/operation-serializer';
+import { extractViewSelectSql, hasExplicitViewColumnList, normalizeViewSelectSql } from './core/view-utils';
+import { crypto } from './platform/cryptoShim';
 
 // ============================================================================
 // Utility Functions
@@ -508,6 +512,105 @@ export async function createNativeDatabaseConnection(
       // Public mutating operations are wrapped below with a per-connection
       // promise-chain lock. The raw implementation is used for internal
       // facade-to-facade calls so composite operations do not deadlock.
+      const createSavepointName = (prefix: string): string => (
+        escapeIdentifier(`${prefix}_${crypto.randomUUID().replace(/-/g, '')}`)
+      );
+
+      const safeRollbackSavepoint = async (savepointName: string, context: string): Promise<void> => {
+        try {
+          await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
+          await worker.call('run', [`RELEASE ${savepointName}`]);
+        } catch (rollbackErr) {
+          console.warn(`Failed to rollback native savepoint (${context}):`, rollbackErr);
+        }
+      };
+
+      const buildCreateViewSql = (view: string, selectSql: string, columns?: string[]): string => {
+        const columnList = columns?.length
+          ? ` (${columns.map(column => escapeIdentifier(column)).join(', ')})`
+          : '';
+        return `CREATE VIEW ${escapeIdentifier(view)}${columnList} AS ${selectSql}`;
+      };
+
+      const getNativeViewDefinition = async (view: string): Promise<ViewDefinition> => {
+        const metadata = await worker.call<NativeQueryBatchResult>('queryBatch', [[
+          {
+            sql: "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+            params: [view]
+          },
+          {
+            sql: "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY name",
+            params: [view]
+          },
+          {
+            sql: `PRAGMA table_info(${escapeIdentifier(view)})`
+          }
+        ]]);
+        if (!metadata?.results || metadata.results.length < 3) {
+          throw new Error('View definition fetch failed: queryBatch returned incomplete results');
+        }
+
+        const viewResult = metadata.results[0];
+        const createSql = viewResult.values?.[0]?.[0];
+        if (typeof createSql !== 'string') {
+          throw new Error(`View not found: ${view}`);
+        }
+
+        const triggerResult = metadata.results[1];
+        const triggers = (triggerResult.values ?? []).map(row => {
+          if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
+            throw new Error(`View trigger definition is unavailable for ${view}`);
+          }
+          return { identifier: row[0], sql: row[1] };
+        });
+
+        const selectSql = extractViewSelectSql(createSql);
+        let columns: string[] | undefined;
+        if (hasExplicitViewColumnList(createSql)) {
+          columns = (metadata.results[2].values ?? []).map(row => {
+            if (typeof row[1] !== 'string') {
+              throw new Error(`View column definition is unavailable for ${view}`);
+            }
+            return row[1];
+          });
+        }
+
+        return {
+          identifier: view,
+          sql: createSql,
+          selectSql,
+          columns,
+          triggers
+        };
+      };
+
+      const compileNativeViewSelect = async (selectSql: string): Promise<void> => {
+        await worker.call('query', [`EXPLAIN SELECT * FROM (${selectSql}) LIMIT 0`]);
+      };
+
+      const compileNativeView = async (view: string): Promise<void> => {
+        await worker.call('query', [`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`]);
+      };
+
+      const restoreNativeViewDefinition = async (definition: ViewDefinition): Promise<void> => {
+        const body = normalizeViewSelectSql(definition.selectSql);
+        await compileNativeViewSelect(body);
+        const savepointName = createSavepointName('sp_restore_view');
+        await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+        try {
+          await worker.call('run', [`DROP VIEW IF EXISTS ${escapeIdentifier(definition.identifier)}`]);
+          await worker.call('run', [buildCreateViewSql(definition.identifier, body, definition.columns)]);
+          await compileNativeView(definition.identifier);
+          for (const trigger of definition.triggers) {
+            await worker.call('run', [trigger.sql]);
+          }
+          await worker.call('run', [`RELEASE ${savepointName}`]);
+        } catch (err) {
+          await safeRollbackSavepoint(savepointName, 'restoreViewDefinition');
+          throw err;
+        }
+      };
+
       const rawOperations: DatabaseOperations = {
         engineKind: Promise.resolve('native'),
 
@@ -668,6 +771,17 @@ export async function createNativeDatabaseConnection(
             case 'table_create':
                 await worker.call('run', [`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`]);
                 break;
+
+            case 'view_create':
+                await worker.call('run', [`DROP VIEW IF EXISTS ${escapeIdentifier(targetTable)}`]);
+                break;
+
+            case 'view_edit':
+            case 'view_drop':
+                if (mod.viewDefBefore) {
+                  await restoreNativeViewDefinition(mod.viewDefBefore);
+                }
+                break;
           }
         },
 
@@ -734,6 +848,17 @@ export async function createNativeDatabaseConnection(
               if (tableDef && tableDef.columns) {
                 await rawOperations.createTable(targetTable, tableDef.columns);
               }
+              break;
+
+            case 'view_create':
+            case 'view_edit':
+              if (mod.viewDefAfter) {
+                await restoreNativeViewDefinition(mod.viewDefAfter);
+              }
+              break;
+
+            case 'view_drop':
+              await worker.call('run', [`DROP VIEW IF EXISTS ${escapeIdentifier(targetTable)}`]);
               break;
           }
         },
@@ -931,6 +1056,88 @@ export async function createNativeDatabaseConnection(
 
           const sql = `CREATE TABLE ${escapeIdentifier(table)} (${colDefs.join(', ')})`;
           await worker.call('run', [sql]);
+        },
+
+        getViewDefinition: getNativeViewDefinition,
+
+        validateViewDefinition: async (_view: string, selectSql: string) => {
+          const body = normalizeViewSelectSql(selectSql);
+          await compileNativeViewSelect(body);
+        },
+
+        previewViewDefinition: async (_view: string, selectSql: string, limit: number = 50) => {
+          const body = normalizeViewSelectSql(selectSql);
+          const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
+          const result = await worker.call<NativeQueryResult>('query', [
+            `SELECT * FROM (${body}) LIMIT ${boundedLimit}`
+          ]);
+          return {
+            headers: result.columns,
+            rows: result.values,
+            columns: result.columns,
+            values: result.values,
+            columnNames: result.columns,
+            records: result.values
+          };
+        },
+
+        createView: async (view: string, selectSql: string): Promise<ViewDefinition> => {
+          const body = normalizeViewSelectSql(selectSql);
+          await compileNativeViewSelect(body);
+          const savepointName = createSavepointName('sp_create_view');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            await worker.call('run', [buildCreateViewSql(view, body)]);
+            await compileNativeView(view);
+            const definition = await getNativeViewDefinition(view);
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return definition;
+          } catch (err) {
+            await safeRollbackSavepoint(savepointName, 'createView');
+            throw err;
+          }
+        },
+
+        editView: async (
+          view: string,
+          selectSql: string,
+          preserveTriggers: boolean = true
+        ): Promise<ViewEditResult> => {
+          const body = normalizeViewSelectSql(selectSql);
+          const before = await getNativeViewDefinition(view);
+          await compileNativeViewSelect(body);
+          const savepointName = createSavepointName('sp_edit_view');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            await worker.call('run', [`DROP VIEW ${escapeIdentifier(view)}`]);
+            await worker.call('run', [buildCreateViewSql(view, body, before.columns)]);
+            await compileNativeView(view);
+            if (preserveTriggers) {
+              for (const trigger of before.triggers) {
+                await worker.call('run', [trigger.sql]);
+              }
+            }
+            const after = await getNativeViewDefinition(view);
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return { before, after };
+          } catch (err) {
+            await safeRollbackSavepoint(savepointName, 'editView');
+            throw err;
+          }
+        },
+
+        dropView: async (view: string): Promise<ViewDefinition> => {
+          const before = await getNativeViewDefinition(view);
+          const savepointName = createSavepointName('sp_drop_view');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            await worker.call('run', [`DROP VIEW ${escapeIdentifier(view)}`]);
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return before;
+          } catch (err) {
+            await safeRollbackSavepoint(savepointName, 'dropView');
+            throw err;
+          }
         },
 
         /**

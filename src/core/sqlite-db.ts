@@ -227,6 +227,30 @@ export function createWorkerEndpoint() {
       return requireEngine().createTable(table, columns);
     },
 
+    async getViewDefinition(view: string) {
+      return requireEngine().getViewDefinition(view);
+    },
+
+    async validateViewDefinition(view: string, selectSql: string): Promise<void> {
+      return requireEngine().validateViewDefinition(view, selectSql);
+    },
+
+    async previewViewDefinition(view: string, selectSql: string, limit?: number) {
+      return requireEngine().previewViewDefinition(view, selectSql, limit);
+    },
+
+    async createView(view: string, selectSql: string) {
+      return requireEngine().createView(view, selectSql);
+    },
+
+    async editView(view: string, selectSql: string, preserveTriggers?: boolean) {
+      return requireEngine().editView(view, selectSql, preserveTriggers);
+    },
+
+    async dropView(view: string) {
+      return requireEngine().dropView(view);
+    },
+
     async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
       return requireEngine().updateCellBatch(table, updates);
     },

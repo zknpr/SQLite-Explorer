@@ -647,6 +647,105 @@ describe('createNativeDatabaseConnection', () => {
             connection.dispose();
         }
     });
+
+    it('atomically replaces a view and recreates its triggers through the native worker', async () => {
+        let currentViewSql = 'CREATE VIEW "user names" ("user id", "display name") AS SELECT id, name FROM users';
+        const triggerSql = [
+            'CREATE TRIGGER "user names insert"',
+            'INSTEAD OF INSERT ON "user names"',
+            'BEGIN SELECT 1; END'
+        ].join(' ');
+        let triggerPresent = true;
+
+        const connection = await createRecordingConnection((call) => {
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [Array<{ sql: string }>];
+                return {
+                    result: {
+                        results: queries.map(query => {
+                            if (query.sql.includes("type = 'view'")) {
+                                return { columns: ['sql'], values: [[currentViewSql]] };
+                            }
+                            if (query.sql.includes("type = 'trigger'")) {
+                                return {
+                                    columns: ['name', 'sql'],
+                                    values: triggerPresent ? [['user names insert', triggerSql]] : []
+                                };
+                            }
+                            if (query.sql.startsWith('PRAGMA table_info')) {
+                                return {
+                                    columns: ['cid', 'name'],
+                                    values: [[0, 'user id'], [1, 'display name']]
+                                };
+                            }
+                            return { columns: [], values: [] };
+                        })
+                    }
+                };
+            }
+            if (call.method === 'query') {
+                const [sql] = call.args as [string];
+                if (sql.startsWith('EXPLAIN')) {
+                    return { result: { columns: [], values: [] } };
+                }
+            }
+
+            if (call.method === 'run') {
+                const [sql] = call.args as [string];
+                if (sql === 'DROP VIEW "user names"') {
+                    triggerPresent = false;
+                } else if (sql.startsWith('CREATE VIEW "user names" ')) {
+                    currentViewSql = sql;
+                } else if (sql === triggerSql) {
+                    triggerPresent = true;
+                }
+            }
+
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            const result = await connection.databaseOps.editView(
+                'user names',
+                'SELECT id, name, upper(name) AS display_name FROM users',
+                true
+            );
+
+            assert.strictEqual(result.before.triggers.length, 1);
+            assert.deepStrictEqual(result.before.columns, ['user id', 'display name']);
+            assert.strictEqual(result.after.triggers.length, 1);
+            assert.strictEqual(
+                result.after.selectSql,
+                'SELECT id, name, upper(name) AS display_name FROM users'
+            );
+
+            const runSql = connection.calls
+                .filter(call => call.method === 'run')
+                .map(call => (call.args as [string])[0]);
+            assert.match(runSql[0], /^SAVEPOINT "sp_edit_view_/);
+            assert.strictEqual(runSql[1], 'DROP VIEW "user names"');
+            assert.strictEqual(
+                runSql[2],
+                'CREATE VIEW "user names" ("user id", "display name") AS SELECT id, name, upper(name) AS display_name FROM users'
+            );
+            assert.strictEqual(runSql[3], triggerSql);
+            assert.match(runSql[4], /^RELEASE "sp_edit_view_/);
+
+            assert.strictEqual(
+                connection.calls.filter(call => call.method === 'queryBatch').length,
+                2,
+                'view and trigger metadata should share one native IPC round-trip per snapshot'
+            );
+
+            const explainCall = connection.calls.find(call => (
+                call.method === 'query' && String(call.args[0]).startsWith('EXPLAIN SELECT * FROM')
+            ));
+            assert.ok(explainCall, 'replacement must be compiled before releasing its SAVEPOINT');
+        } finally {
+            connection.dispose();
+        }
+    });
 });
 
 describe('NativeWorkerProcess', () => {

@@ -5,6 +5,7 @@ import { saveVsCodeState } from './api.js';
 
 export const state = {
     isDbConnected: false,
+    isReadOnly: false,
     selectedTable: null,
     selectedTableType: 'table',
     // Name of the table whose grid is currently rendered on screen. Lets

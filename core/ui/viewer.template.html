@@ -43,6 +43,9 @@
                     <span class="arrow">▼</span>
                     <span>Views</span>
                     <span class="badge" id="viewsBadge">0</span>
+                    <button type="button" class="icon-button ml-auto" id="btnOpenCreateView" title="Create View">
+                        <span class="codicon codicon-add"></span>
+                    </button>
                 </div>
                 <ul class="item-list hidden" id="viewsList"></ul>
 
@@ -150,6 +153,42 @@
                         <button type="button" id="btnLast" disabled>⏭</button>
                     </div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create/Edit View Modal -->
+    <div class="modal-overlay hidden" id="viewModal">
+        <div class="modal-dialog modal-dialog-lg view-editor-dialog">
+            <div class="modal-header">
+                <span class="modal-title" id="viewModalTitle">Create View</span>
+                <button type="button" class="modal-close" data-modal="viewModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-field">
+                    <label for="viewNameInput">View Name</label>
+                    <input type="text" id="viewNameInput" placeholder="view_name">
+                </div>
+                <div class="form-field">
+                    <label for="viewSelectSql">SELECT Definition</label>
+                    <textarea id="viewSelectSql" class="view-sql-editor" spellcheck="false"></textarea>
+                </div>
+                <div class="view-trigger-options" id="viewTriggerOptions" hidden>
+                    <label class="view-trigger-label">
+                        <input type="checkbox" id="viewPreserveTriggers" checked>
+                        <span id="viewTriggerSummary">Preserve INSTEAD OF triggers</span>
+                    </label>
+                </div>
+                <div class="view-validation-status" id="viewValidationStatus" role="status"></div>
+                <div class="view-preview" id="viewPreview" hidden></div>
+            </div>
+            <div class="modal-footer view-modal-footer">
+                <button type="button" class="btn-secondary" id="btnOpenViewInVsCode" hidden>Edit in VS Code</button>
+                <span class="flex-spacer"></span>
+                <button type="button" class="btn-secondary" id="btnValidateView">Validate</button>
+                <button type="button" class="btn-secondary" id="btnPreviewView">Preview</button>
+                <button type="button" class="btn-secondary modal-cancel" data-modal="viewModal">Cancel</button>
+                <button type="button" class="btn-primary" id="btnSaveView">Create View</button>
             </div>
         </div>
     </div>

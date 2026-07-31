@@ -20,13 +20,16 @@ import type {
   TableCountOptions,
   SchemaSnapshot,
   ColumnMetadata,
-  ColumnDefinition
+  ColumnDefinition,
+  ViewDefinition,
+  ViewEditResult
 } from '../../types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from '../../sql-utils';
 import { crypto } from '../../../platform/cryptoShim';
 import { buildSelectQuery, buildCountQuery } from '../../query-builder';
 import { applyMergePatch, computeJsonPatchUndo, parseJsonValueForPatching } from '../../json-utils';
 import { getNodeFs } from '../../platform/fs';
+import { extractViewSelectSql, hasExplicitViewColumnList, normalizeViewSelectSql } from '../../view-utils';
 
 // ============================================================================
 // Internal sql.js Types
@@ -115,6 +118,34 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     } catch (rollbackErr) {
       console.warn(`Failed to rollback savepoint (${context}):`, rollbackErr);
     }
+  }
+
+  /** Execute exactly the first prepared statement, never a trailing statement. */
+  private runSingleStatement(sql: string): void {
+    const statement = this.instance.prepare(sql);
+    try {
+      statement.run();
+    } finally {
+      statement.free();
+    }
+  }
+
+  /** Compile a statement through SQLite without retaining or executing it. */
+  private compileSingleStatement(sql: string): void {
+    const statement = this.instance.prepare(sql);
+    statement.free();
+  }
+
+  /** Compile the body in a SELECT-only context and reject trailing statements. */
+  private compileViewSelect(selectSql: string): void {
+    this.compileSingleStatement(`EXPLAIN SELECT * FROM (${selectSql}) LIMIT 0`);
+  }
+
+  private buildCreateViewSql(view: string, selectSql: string, columns?: string[]): string {
+    const columnList = columns?.length
+      ? ` (${columns.map(column => escapeIdentifier(column)).join(', ')})`
+      : '';
+    return `CREATE VIEW ${escapeIdentifier(view)}${columnList} AS ${selectSql}`;
   }
 
   /**
@@ -278,6 +309,17 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
       case 'table_create':
         await this.undoTableCreate(targetTable);
+        break;
+
+      case 'view_create':
+        await this.dropViewIfExists(targetTable);
+        break;
+
+      case 'view_edit':
+      case 'view_drop':
+        if (mod.viewDefBefore) {
+          await this.restoreViewDefinition(mod.viewDefBefore);
+        }
         break;
     }
   }
@@ -525,6 +567,19 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             if (strict) {
                 throw new Error('Cannot apply table_drop: forward replay is not supported');
             }
+            break;
+
+        case 'view_create':
+        case 'view_edit':
+            if (mod.viewDefAfter) {
+                await this.restoreViewDefinition(mod.viewDefAfter);
+            } else if (strict) {
+                throw new Error(`Cannot apply ${modificationType}: missing view definition`);
+            }
+            break;
+
+        case 'view_drop':
+            await this.dropViewIfExists(targetTable);
             break;
 
         default:
@@ -820,6 +875,140 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
     const sql = `CREATE TABLE ${escapeIdentifier(table)} (${colDefs.join(', ')})`;
     await this.executeQuery(sql);
+  }
+
+  /** Read a view and every INSTEAD OF trigger SQLite associates with it. */
+  async getViewDefinition(view: string): Promise<ViewDefinition> {
+    const viewResult = await this.executeQuery(
+      "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+      [view]
+    );
+    const createSql = viewResult[0]?.rows[0]?.[0];
+    if (typeof createSql !== 'string') {
+      throw new Error(`View not found: ${view}`);
+    }
+
+    const triggerResult = await this.executeQuery(
+      "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY name",
+      [view]
+    );
+    const triggers = (triggerResult[0]?.rows ?? []).map(row => {
+      if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
+        throw new Error(`View trigger definition is unavailable for ${view}`);
+      }
+      return { identifier: row[0], sql: row[1] };
+    });
+
+    const selectSql = extractViewSelectSql(createSql);
+    let columns: string[] | undefined;
+    if (hasExplicitViewColumnList(createSql)) {
+      const columnResult = await this.executeQuery(`PRAGMA table_info(${escapeIdentifier(view)})`);
+      columns = (columnResult[0]?.rows ?? []).map(row => {
+        if (typeof row[1] !== 'string') {
+          throw new Error(`View column definition is unavailable for ${view}`);
+        }
+        return row[1];
+      });
+    }
+
+    return {
+      identifier: view,
+      sql: createSql,
+      selectSql,
+      columns,
+      triggers
+    };
+  }
+
+  async validateViewDefinition(_view: string, selectSql: string): Promise<void> {
+    const body = normalizeViewSelectSql(selectSql);
+    this.compileViewSelect(body);
+  }
+
+  async previewViewDefinition(_view: string, selectSql: string, limit: number = 50): Promise<QueryResultSet> {
+    const body = normalizeViewSelectSql(selectSql);
+    const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
+    const result = await this.executeQuery(`SELECT * FROM (${body}) LIMIT ${boundedLimit}`);
+    return result[0] ?? { headers: [], rows: [] };
+  }
+
+  async createView(view: string, selectSql: string): Promise<ViewDefinition> {
+    const body = normalizeViewSelectSql(selectSql);
+    this.compileViewSelect(body);
+    const savepointName = this.createSavepointName('sp_create_view');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      this.runSingleStatement(this.buildCreateViewSql(view, body));
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+      const definition = await this.getViewDefinition(view);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return definition;
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'createView');
+      throw err;
+    }
+  }
+
+  async editView(view: string, selectSql: string, preserveTriggers: boolean = true): Promise<ViewEditResult> {
+    const body = normalizeViewSelectSql(selectSql);
+    const before = await this.getViewDefinition(view);
+    this.compileViewSelect(body);
+    const savepointName = this.createSavepointName('sp_edit_view');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      this.runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+      this.runSingleStatement(this.buildCreateViewSql(view, body, before.columns));
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+      if (preserveTriggers) {
+        for (const trigger of before.triggers) {
+          this.runSingleStatement(trigger.sql);
+        }
+      }
+      const after = await this.getViewDefinition(view);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return { before, after };
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'editView');
+      throw err;
+    }
+  }
+
+  async dropView(view: string): Promise<ViewDefinition> {
+    const before = await this.getViewDefinition(view);
+    const savepointName = this.createSavepointName('sp_drop_view');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      this.runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return before;
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'dropView');
+      throw err;
+    }
+  }
+
+  private async dropViewIfExists(view: string): Promise<void> {
+    this.runSingleStatement(`DROP VIEW IF EXISTS ${escapeIdentifier(view)}`);
+  }
+
+  /** Restore an exact tracked view state for undo, redo, and hot-exit replay. */
+  private async restoreViewDefinition(definition: ViewDefinition): Promise<void> {
+    const body = normalizeViewSelectSql(definition.selectSql);
+    this.compileViewSelect(body);
+    const savepointName = this.createSavepointName('sp_restore_view');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      await this.dropViewIfExists(definition.identifier);
+      this.runSingleStatement(this.buildCreateViewSql(definition.identifier, body, definition.columns));
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(definition.identifier)}`);
+      for (const trigger of definition.triggers) {
+        this.runSingleStatement(trigger.sql);
+      }
+      await this.executeQuery(`RELEASE ${savepointName}`);
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'restoreViewDefinition');
+      throw err;
+    }
   }
 
   /**

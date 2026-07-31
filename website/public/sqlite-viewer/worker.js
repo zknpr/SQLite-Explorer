@@ -120,6 +120,131 @@ function formatDefaultValue(defaultValue) {
   }
 }
 
+let viewSavepointCounter = 0;
+
+function normalizeViewSelectSql(selectSql) {
+  const trimmed = String(selectSql ?? '').trim();
+  if (!trimmed) throw new Error('View SELECT definition is required');
+  return trimmed.endsWith(';') ? trimmed.slice(0, -1).trimEnd() : trimmed;
+}
+
+function locateViewSqlParts(createSql) {
+  let depth = 0;
+  let index = 0;
+  let hasExplicitColumnList = false;
+  while (index < createSql.length) {
+    const char = createSql[index];
+    const next = createSql[index + 1];
+    if (char === '-' && next === '-') {
+      index += 2;
+      while (index < createSql.length && createSql[index] !== '\n') index++;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      const end = createSql.indexOf('*/', index + 2);
+      if (end === -1) break;
+      index = end + 2;
+      continue;
+    }
+    if (char === "'" || char === '"' || char === '`') {
+      const quote = char;
+      index++;
+      while (index < createSql.length) {
+        if (createSql[index] === quote) {
+          if (createSql[index + 1] === quote) {
+            index += 2;
+            continue;
+          }
+          index++;
+          break;
+        }
+        index++;
+      }
+      continue;
+    }
+    if (char === '[') {
+      index++;
+      while (index < createSql.length) {
+        if (createSql[index] === ']') {
+          if (createSql[index + 1] === ']') {
+            index += 2;
+            continue;
+          }
+          index++;
+          break;
+        }
+        index++;
+      }
+      continue;
+    }
+    if (char === '(') {
+      if (depth === 0) hasExplicitColumnList = true;
+      depth++;
+      index++;
+      continue;
+    }
+    if (char === ')') {
+      depth = Math.max(0, depth - 1);
+      index++;
+      continue;
+    }
+    if (depth === 0 && /[A-Za-z_]/.test(char)) {
+      const start = index++;
+      while (index < createSql.length && /[A-Za-z0-9_$]/.test(createSql[index])) index++;
+      if (createSql.slice(start, index).toUpperCase() === 'AS') {
+        return { selectStart: index, hasExplicitColumnList };
+      }
+      continue;
+    }
+    index++;
+  }
+  throw new Error('Unable to locate the SELECT body in the stored view definition');
+}
+
+function extractViewSelectSql(createSql) {
+  const { selectStart } = locateViewSqlParts(createSql);
+  return normalizeViewSelectSql(createSql.slice(selectStart));
+}
+
+function hasExplicitViewColumnList(createSql) {
+  return locateViewSqlParts(createSql).hasExplicitColumnList;
+}
+
+function buildCreateViewSql(view, selectSql, columns) {
+  const columnList = columns?.length
+    ? ` (${columns.map(column => escapeIdentifier(column)).join(', ')})`
+    : '';
+  return `CREATE VIEW ${escapeIdentifier(view)}${columnList} AS ${selectSql}`;
+}
+
+function createViewSavepointName(prefix) {
+  viewSavepointCounter++;
+  return escapeIdentifier(`${prefix}_${viewSavepointCounter}`);
+}
+
+function runSingleStatement(sql) {
+  const statement = db.prepare(sql);
+  try {
+    statement.run();
+  } finally {
+    statement.free();
+  }
+}
+
+function compileSingleStatement(sql) {
+  const statement = db.prepare(sql);
+  statement.free();
+}
+
+function safeRollbackViewSavepoint(savepointName, context) {
+  try {
+    runSingleStatement(`ROLLBACK TO ${savepointName}`);
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (rollbackError) {
+    console.warn(`Failed to rollback view savepoint (${context}):`, rollbackError);
+  }
+}
+
 // ============================================================================
 // Database Operations
 // ============================================================================
@@ -739,6 +864,119 @@ async function createTable(table, columns) {
   db.run(`CREATE TABLE "${safeTable}" (${columnDefs})`);
 }
 
+async function getViewDefinition(view) {
+  if (!db) throw new Error('No database initialized');
+  const viewResult = db.exec(
+    "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+    [view]
+  );
+  const createSql = viewResult[0]?.values?.[0]?.[0];
+  if (typeof createSql !== 'string') throw new Error(`View not found: ${view}`);
+
+  const triggerResult = db.exec(
+    "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY name",
+    [view]
+  );
+  const triggers = (triggerResult[0]?.values || []).map(row => {
+    if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
+      throw new Error(`View trigger definition is unavailable for ${view}`);
+    }
+    return { identifier: row[0], sql: row[1] };
+  });
+
+  const selectSql = extractViewSelectSql(createSql);
+  let columns;
+  if (hasExplicitViewColumnList(createSql)) {
+    const columnResult = db.exec(`PRAGMA table_info(${escapeIdentifier(view)})`);
+    columns = (columnResult[0]?.values || []).map(row => {
+      if (typeof row[1] !== 'string') {
+        throw new Error(`View column definition is unavailable for ${view}`);
+      }
+      return row[1];
+    });
+  }
+
+  return {
+    identifier: view,
+    sql: createSql,
+    selectSql,
+    columns,
+    triggers
+  };
+}
+
+async function validateViewDefinition(_view, selectSql) {
+  if (!db) throw new Error('No database initialized');
+  compileSingleStatement(`EXPLAIN SELECT * FROM (${normalizeViewSelectSql(selectSql)}) LIMIT 0`);
+}
+
+async function previewViewDefinition(_view, selectSql, limit = 50) {
+  if (!db) throw new Error('No database initialized');
+  const body = normalizeViewSelectSql(selectSql);
+  const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
+  const result = db.exec(`SELECT * FROM (${body}) LIMIT ${boundedLimit}`)[0];
+  return {
+    headers: result?.columns || [],
+    rows: result?.values || []
+  };
+}
+
+async function createView(view, selectSql) {
+  if (!db) throw new Error('No database initialized');
+  const body = normalizeViewSelectSql(selectSql);
+  compileSingleStatement(`EXPLAIN SELECT * FROM (${body}) LIMIT 0`);
+  const savepointName = createViewSavepointName('sp_create_view');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    runSingleStatement(buildCreateViewSql(view, body));
+    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+    const definition = await getViewDefinition(view);
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return definition;
+  } catch (error) {
+    safeRollbackViewSavepoint(savepointName, 'createView');
+    throw error;
+  }
+}
+
+async function editView(view, selectSql, preserveTriggers = true) {
+  if (!db) throw new Error('No database initialized');
+  const body = normalizeViewSelectSql(selectSql);
+  const before = await getViewDefinition(view);
+  compileSingleStatement(`EXPLAIN SELECT * FROM (${body}) LIMIT 0`);
+  const savepointName = createViewSavepointName('sp_edit_view');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+    runSingleStatement(buildCreateViewSql(view, body, before.columns));
+    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+    if (preserveTriggers) {
+      for (const trigger of before.triggers) runSingleStatement(trigger.sql);
+    }
+    const after = await getViewDefinition(view);
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return { before, after };
+  } catch (error) {
+    safeRollbackViewSavepoint(savepointName, 'editView');
+    throw error;
+  }
+}
+
+async function dropView(view) {
+  if (!db) throw new Error('No database initialized');
+  const before = await getViewDefinition(view);
+  const savepointName = createViewSavepointName('sp_drop_view');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return before;
+  } catch (error) {
+    safeRollbackViewSavepoint(savepointName, 'dropView');
+    throw error;
+  }
+}
+
 /**
  * Batch update cells.
  *
@@ -846,6 +1084,12 @@ const methods = {
   deleteRows,
   deleteColumns,
   createTable,
+  getViewDefinition,
+  validateViewDefinition,
+  previewViewDefinition,
+  createView,
+  editView,
+  dropView,
   updateCellBatch,
   addColumn,
   ping,

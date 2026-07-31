@@ -306,6 +306,28 @@ export const backendApi = {
     deleteRows: (table, rowIds) => sendRpcRequest('deleteRows', [table, rowIds]),
     deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),
     createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
+    getViewDefinition: (view) => sendRpcRequest('getViewDefinition', [view]),
+    validateViewDefinition: (view, selectSql) => sendRpcRequest('validateViewDefinition', [view, selectSql]),
+    previewViewDefinition: (view, selectSql, limit) => sendRpcRequest('previewViewDefinition', [view, selectSql, limit]),
+    createView: (view, selectSql) => sendRpcRequest('createView', [view, selectSql]),
+    editView: async (view, selectSql, preserveTriggers) => {
+        if (!preserveTriggers) {
+            const current = await sendRpcRequest('getViewDefinition', [view]);
+            if (current.triggers?.length > 0) {
+                const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
+                if (!window.confirm(`Editing view "${view}" will permanently drop: ${triggerNames}`)) {
+                    return { cancelled: true };
+                }
+            }
+        }
+        return sendRpcRequest('editView', [view, selectSql, preserveTriggers]);
+    },
+    dropView: async (view) => {
+        if (!window.confirm(`Drop view "${view}" and its INSTEAD OF triggers?`)) {
+            return { cancelled: true };
+        }
+        return sendRpcRequest('dropView', [view]);
+    },
     updateCellBatch: (table, updates, label) => sendRpcRequest('updateCellBatch', [table, updates, label]),
     addColumn: (table, column, type, defaultValue) => sendRpcRequest('addColumn', [table, column, type, defaultValue]),
     fetchTableData: (table, options) => sendRpcRequest('fetchTableData', [table, options]),
@@ -320,6 +342,7 @@ export const backendApi = {
 
     // VS Code specific - disabled in web mode
     openCellEditor: () => Promise.resolve({ success: false, message: 'Not available in web mode' }),
+    openViewEditor: () => Promise.resolve({ success: false, message: 'Not available in web mode' }),
     readWorkspaceFileUri: () => Promise.resolve(null),
     triggerUndo: () => Promise.resolve(),
     triggerRedo: () => Promise.resolve(),

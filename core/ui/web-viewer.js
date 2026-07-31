@@ -49,6 +49,7 @@ import {
 import {
     initDragAndDrop
 } from './modules/dnd.js';
+import { initViews } from './modules/views.js';
 
 // ============================================================================
 // Web-specific RPC initialization
@@ -142,6 +143,7 @@ async function initializeApp() {
         initGridInteraction();
         initSidebarResize();
         initDragAndDrop();
+        initViews();
 
         // Hide VS Code-specific buttons
         const vscodeBtn = document.getElementById('openInVsCodeBtn');
@@ -152,6 +154,7 @@ async function initializeApp() {
         // Initialize connection - parent window handles this
         const result = await backendApi.initialize();
         state.isDbConnected = true;
+        state.isReadOnly = false;
 
         // Test connection
         await backendApi.ping();

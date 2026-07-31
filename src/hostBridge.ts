@@ -375,6 +375,104 @@ export class HostBridge implements ToastService {
     });
   }
 
+  /** Read the editable SELECT body and attached INSTEAD OF triggers for a view. */
+  async getViewDefinition(view: string) {
+    return this.ensureDatabaseInitialized().getViewDefinition(view);
+  }
+
+  /** Ask SQLite to compile a proposed view definition without changing the schema. */
+  async validateViewDefinition(view: string, selectSql: string) {
+    return this.ensureDatabaseInitialized().validateViewDefinition(view, selectSql);
+  }
+
+  /** Return a bounded preview for a proposed view definition. */
+  async previewViewDefinition(view: string, selectSql: string, limit: number = 50) {
+    return this.ensureDatabaseInitialized().previewViewDefinition(view, selectSql, limit);
+  }
+
+  /** Create a view and record enough state for save, undo, and redo. */
+  async createView(view: string, selectSql: string) {
+    const dbOps = this.ensureDatabaseInitialized();
+    if (this.isReadOnly) {
+      throw new Error('Document is read-only');
+    }
+
+    const definition = await dbOps.createView(view, selectSql);
+    this.document.recordExternalModification({
+      label: 'Create View',
+      description: `Create view ${view}`,
+      modificationType: 'view_create',
+      targetTable: view,
+      viewDefAfter: definition
+    });
+    return definition;
+  }
+
+  /**
+   * Atomically replace a view. Trigger preservation is the default; discarding
+   * attached triggers requires a separate modal confirmation.
+   */
+  async editView(view: string, selectSql: string, preserveTriggers: boolean = true) {
+    const dbOps = this.ensureDatabaseInitialized();
+    if (this.isReadOnly) {
+      throw new Error('Document is read-only');
+    }
+
+    if (!preserveTriggers) {
+      const current = await dbOps.getViewDefinition(view);
+      if (current.triggers.length > 0) {
+        const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
+        const answer = await vsc.window.showWarningMessage(
+          `Editing view "${view}" without preserving triggers will permanently drop: ${triggerNames}`,
+          { modal: true },
+          { title: 'Edit and Drop Triggers', value: true },
+          { title: 'Cancel', value: false, isCloseAffordance: true }
+        );
+        if (!answer?.value) {
+          return { cancelled: true } as const;
+        }
+      }
+    }
+
+    const result = await dbOps.editView(view, selectSql, preserveTriggers);
+    this.document.recordExternalModification({
+      label: 'Edit View',
+      description: `Edit view ${view}`,
+      modificationType: 'view_edit',
+      targetTable: view,
+      viewDefBefore: result.before,
+      viewDefAfter: result.after
+    });
+    return result;
+  }
+
+  /** Drop a view only after a modal confirmation. */
+  async dropView(view: string) {
+    const dbOps = this.ensureDatabaseInitialized();
+    if (this.isReadOnly) {
+      throw new Error('Document is read-only');
+    }
+
+    const answer = await vsc.window.showWarningMessage(
+      `Drop view "${view}"? This also drops its INSTEAD OF triggers.`,
+      { modal: true },
+      { title: 'Drop View', value: true },
+      { title: 'Cancel', value: false, isCloseAffordance: true }
+    );
+    if (!answer?.value) {
+      return { cancelled: true } as const;
+    }
+
+    const definition = await dbOps.dropView(view);
+    this.document.recordExternalModification({
+      label: 'Drop View',
+      description: `Drop view ${view}`,
+      modificationType: 'view_drop',
+      targetTable: view,
+      viewDefBefore: definition
+    });
+  }
+
   /**
    * Update multiple cells in batch.
    */
@@ -734,6 +832,30 @@ export class HostBridge implements ToastService {
 
       await vsc.commands.executeCommand('vscode.open', cellUri, vsc.ViewColumn.Two);
     }
+  }
+
+  /** Open a view's SELECT body in the writable virtual filesystem as SQL. */
+  async openViewEditor(view: string, webviewId?: string) {
+    if (this.isReadOnly) {
+      throw new Error('Document is read-only');
+    }
+
+    const { document } = this;
+    if (document.uri.scheme === 'untitled') {
+      throw new Error('The external view editor is unavailable for untitled databases');
+    }
+
+    const docKey = await document.documentKey;
+    const uriPath = [docKey, view, '-', '__view__.sql', 'definition.sql']
+      .map(part => encodeURIComponent(part))
+      .join('/');
+    const viewUri = vsc.Uri.from({
+      scheme: UriScheme,
+      path: `/${uriPath}`,
+      query: webviewId ? `webview-id=${encodeURIComponent(webviewId)}` : ''
+    });
+
+    await vsc.commands.executeCommand('vscode.open', viewUri, vsc.ViewColumn.Two);
   }
 
   /**

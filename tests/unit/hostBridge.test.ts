@@ -121,6 +121,41 @@ describe('HostBridge', () => {
         assert.ok(uri.path.endsWith('.txt'), `Path should end with .txt, got ${uri.path}`);
     });
 
+    it('opens a view definition as a writable SQL virtual document', async () => {
+        const executeCommandMock = mock.method(vscode.commands, 'executeCommand', async () => {});
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key')
+        };
+        const mockProvider = { webviews: new Map(), context: {} };
+        const bridge = new HostBridge(mockProvider as any, mockDocument as any);
+
+        await bridge.openViewEditor('active users', 'wv1');
+
+        const args = executeCommandMock.mock.calls[0].arguments;
+        assert.strictEqual(args[0], 'vscode.open');
+        assert.ok(args[1].path.includes('active%20users'));
+        assert.ok(args[1].path.includes('__view__.sql'));
+        assert.ok(args[1].path.endsWith('definition.sql'));
+        assert.strictEqual(args[2], vscode.ViewColumn.Two);
+    });
+
+    it('reports that the external view editor is unavailable for untitled databases', async () => {
+        const executeCommandMock = mock.method(vscode.commands, 'executeCommand', async () => {});
+        const mockDocument = {
+            uri: { scheme: 'untitled' },
+            documentKey: Promise.resolve('test-key')
+        };
+        const mockProvider = { webviews: new Map(), context: {} };
+        const bridge = new HostBridge(mockProvider as any, mockDocument as any);
+
+        await assert.rejects(
+            () => bridge.openViewEditor('active_users', 'wv1'),
+            /unavailable for untitled databases/
+        );
+        assert.strictEqual(executeCommandMock.mock.callCount(), 0);
+    });
+
     it('should catch and log error if fetch rows for undo history fails in deleteRows', async () => {
         const consoleWarnMock = mock.method(console, 'warn', () => {});
         const error = new Error('Database disconnected');
