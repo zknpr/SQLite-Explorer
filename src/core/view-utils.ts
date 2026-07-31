@@ -1,4 +1,5 @@
 import { escapeIdentifier } from './sql-utils';
+import type { ViewTriggerDefinition } from './types';
 
 /**
  * Remove one optional statement terminator from an editable SELECT body.
@@ -134,4 +135,27 @@ export function buildCreateViewSql(
       ? `(${legacyColumns.map(column => escapeIdentifier(column)).join(', ')})`
       : undefined);
   return `CREATE VIEW ${escapeIdentifier(view)}${preservedColumnList ? ` ${preservedColumnList}` : ''} AS ${selectSql}`;
+}
+
+/** Rebuild a captured trigger in the schema it originally occupied. */
+export function buildCreateViewTriggerSql(trigger: ViewTriggerDefinition): string {
+  if (!trigger.temporary) return trigger.sql;
+
+  const createTriggerPrefix = /^(\s*CREATE\s+)(?:(?:TEMP|TEMPORARY)\s+)?(TRIGGER\b)/i;
+  if (!createTriggerPrefix.test(trigger.sql)) {
+    throw new Error(
+      `Unable to recreate temporary trigger ${trigger.identifier}: stored SQL is not a CREATE TRIGGER statement`
+    );
+  }
+  // sqlite_temp_schema normally omits TEMP from its stored SQL, so restore the
+  // schema qualifier explicitly instead of accidentally creating a main trigger.
+  return trigger.sql.replace(createTriggerPrefix, '$1TEMP $2');
+}
+
+/** Compare the exact stored CREATE VIEW SQL used by editor conflict checks. */
+export function isViewDefinitionSnapshotCurrent(
+  snapshotSql: string | undefined,
+  currentSql: string | undefined
+): boolean {
+  return snapshotSql === currentSql;
 }

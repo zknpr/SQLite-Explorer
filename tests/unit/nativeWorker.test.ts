@@ -8,6 +8,7 @@ import { EventEmitter } from 'node:events';
 import * as vscode from 'vscode';
 import { isNativeAvailable, NativeWorkerProcess } from '../../src/nativeWorker';
 import type { DatabaseOperations } from '../../src/core/types';
+import { createDeferred } from './helpers/deferred';
 
 const nativeWorkerSource = fs.readFileSync(
     path.resolve(process.cwd(), 'natives', 'native-worker.js'),
@@ -16,7 +17,8 @@ const nativeWorkerSource = fs.readFileSync(
 
 function loadNativeWorkerFunction(
     functionName: string,
-    parameters: string[]
+    parameters: string[],
+    dependencies: Record<string, unknown> = {}
 ): (...args: any[]) => any {
     const signature = `function ${functionName}(${parameters.join(', ')})`;
     const escapedSignature = signature.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -27,7 +29,24 @@ function loadNativeWorkerFunction(
         functionSource,
         `native worker signature changed; expected ${signature}`
     );
-    return Function(`"use strict"; return (${functionSource});`)();
+    const dependencyNames = Object.keys(dependencies);
+    return Function(
+        ...dependencyNames,
+        `"use strict"; return (${functionSource});`
+    )(...dependencyNames.map(name => dependencies[name]));
+}
+
+function loadNativeBoundaryFunction(
+    functionName: 'executeSingleStatement' | 'executeBoundedQuery',
+    parameters: string[]
+): (...args: any[]) => any {
+    const assertSingleStatementPayload = loadNativeWorkerFunction(
+        'assertSingleStatementPayload',
+        ['db', 'markedSql', 'sql', 'requiredSuffix']
+    );
+    return loadNativeWorkerFunction(functionName, parameters, {
+        assertSingleStatementPayload
+    });
 }
 
 interface RecordedNativeCall {
@@ -38,16 +57,6 @@ interface RecordedNativeCall {
 
 type RecordedNativeResponse = { result?: unknown; error?: string };
 type RecordedNativeResponder = (call: RecordedNativeCall) => RecordedNativeResponse | Promise<RecordedNativeResponse>;
-
-function createDeferred<T>() {
-    let resolve!: (value: T) => void;
-    let reject!: (reason?: unknown) => void;
-    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-        resolve = resolvePromise;
-        reject = rejectPromise;
-    });
-    return { promise, resolve, reject };
-}
 
 function encodeNativeMessage(message: unknown): Buffer {
     // Native worker messages are length-prefixed V8 payloads, matching NativeWorkerProcess.writeMessage.
@@ -973,6 +982,7 @@ LEFT JOIN order_items oi ON o.id = oi.order_id`;
                     result: {
                         results: [
                             { columns: ['sql'], values: [[currentViewSql]] },
+                            { columns: ['name', 'sql'], values: [] },
                             { columns: ['name', 'sql'], values: [] }
                         ]
                     }
@@ -1051,6 +1061,7 @@ FROM orders o`;
                     result: {
                         results: [
                             { columns: ['sql'], values: [['opaque stored view text']] },
+                            { columns: ['name', 'sql'], values: [] },
                             { columns: ['name', 'sql'], values: [] }
                         ]
                     }
@@ -1093,6 +1104,69 @@ FROM orders o`;
         }
     });
 
+    it('recreates captured temp-schema triggers as TEMP through the native worker', async () => {
+        let currentViewSql = 'CREATE VIEW "temp native view" AS SELECT value FROM source_rows';
+        const storedTriggerSql = [
+            'CREATE TRIGGER "temp native insert"',
+            'INSTEAD OF INSERT ON "temp native view"',
+            'BEGIN SELECT 1; END'
+        ].join(' ');
+        const replayTriggerSql = storedTriggerSql.replace('CREATE TRIGGER', 'CREATE TEMP TRIGGER');
+        let tempTriggerPresent = true;
+
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [Array<{ sql: string }>];
+                return {
+                    result: {
+                        results: queries.map(query => {
+                            if (query.sql.includes("type = 'view'")) {
+                                return { columns: ['sql'], values: [[currentViewSql]] };
+                            }
+                            if (query.sql.includes('sqlite_temp_schema')) {
+                                return {
+                                    columns: ['name', 'sql'],
+                                    values: tempTriggerPresent
+                                        ? [['temp native insert', storedTriggerSql]]
+                                        : []
+                                };
+                            }
+                            return { columns: ['name', 'sql'], values: [] };
+                        })
+                    }
+                };
+            }
+            if (call.method === 'run' || call.method === 'runSingle') {
+                const sql = String(call.method === 'run' ? call.args[0] : call.args[1]);
+                if (sql === 'DROP VIEW "temp native view"') {
+                    tempTriggerPresent = false;
+                } else if (sql.startsWith('CREATE VIEW "temp native view"')) {
+                    currentViewSql = sql;
+                } else if (sql === replayTriggerSql) {
+                    tempTriggerPresent = true;
+                }
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            const result = await connection.databaseOps.editView(
+                'temp native view',
+                'SELECT value * 2 AS value FROM source_rows',
+                true
+            );
+
+            assert.strictEqual(result.before.triggers[0].temporary, true);
+            assert.strictEqual(result.after.triggers[0].temporary, true);
+            assert.ok(connection.calls.some(call => (
+                call.method === 'runSingle' && call.args[1] === replayTriggerSql
+            )));
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('atomically replaces a view and recreates its triggers through the native worker', async () => {
         let currentViewSql = 'CREATE VIEW "user names" ("user id", "display name") AS SELECT id, name FROM users';
         const triggerSql = [
@@ -1110,6 +1184,9 @@ FROM orders o`;
                         results: queries.map(query => {
                             if (query.sql.includes("type = 'view'")) {
                                 return { columns: ['sql'], values: [[currentViewSql]] };
+                            }
+                            if (query.sql.includes('sqlite_temp_schema')) {
+                                return { columns: ['name', 'sql'], values: [] };
                             }
                             if (query.sql.includes("type = 'trigger'")) {
                                 return {
@@ -1189,6 +1266,8 @@ FROM orders o`;
                 .filter(query => query.sql.includes("type = 'trigger'"));
             assert.ok(triggerQueries.length > 0);
             assert.ok(triggerQueries.every(query => query.sql.endsWith('ORDER BY rowid')));
+            assert.ok(triggerQueries.some(query => query.sql.includes('sqlite_schema')));
+            assert.ok(triggerQueries.some(query => query.sql.includes('sqlite_temp_schema')));
 
             const createIndex = connection.calls.findIndex(call => (
                 call.method === 'runSingle'
@@ -1285,7 +1364,7 @@ describe('native querySingle worker handler', () => {
     });
 
     it('checks elapsed time while reading a native preview row-by-row', () => {
-        const executeBoundedQuery = loadNativeWorkerFunction(
+        const executeBoundedQuery = loadNativeBoundaryFunction(
             'executeBoundedQuery',
             ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
         );
@@ -1329,7 +1408,7 @@ describe('native querySingle worker handler', () => {
     });
 
     it('executes a 100-row duplicate-alias preview only once', () => {
-        const executeBoundedQuery = loadNativeWorkerFunction(
+        const executeBoundedQuery = loadNativeBoundaryFunction(
             'executeBoundedQuery',
             ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
         );
@@ -1376,7 +1455,7 @@ describe('native querySingle worker handler', () => {
     });
 
     it('rejects divergent marked and executable bounded-query payloads before prepare', () => {
-        const executeBoundedQuery = loadNativeWorkerFunction(
+        const executeBoundedQuery = loadNativeBoundaryFunction(
             'executeBoundedQuery',
             ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
         );
@@ -1405,7 +1484,7 @@ describe('native querySingle worker handler', () => {
     });
 
     it('rejects a stored mutation tail before executing the original SQL', () => {
-        const executeSingleStatement = loadNativeWorkerFunction(
+        const executeSingleStatement = loadNativeBoundaryFunction(
             'executeSingleStatement',
             ['db', 'markedSql', 'sql', 'params', 'requiredSuffix']
         );
@@ -1436,7 +1515,7 @@ describe('native querySingle worker handler', () => {
     });
 
     it('rejects divergent marked and executable mutation payloads', () => {
-        const executeSingleStatement = loadNativeWorkerFunction(
+        const executeSingleStatement = loadNativeBoundaryFunction(
             'executeSingleStatement',
             ['db', 'markedSql', 'sql', 'params', 'requiredSuffix']
         );
@@ -1460,5 +1539,65 @@ describe('native querySingle worker handler', () => {
             /Single-statement SQL payload mismatch/
         );
         assert.strictEqual(prepareCalls, 0);
+    });
+
+    it('reports unavailable statement introspection for mutation boundaries', () => {
+        const executeSingleStatement = loadNativeBoundaryFunction(
+            'executeSingleStatement',
+            ['db', 'markedSql', 'sql', 'params', 'requiredSuffix']
+        );
+        const boundary = '/*sqlite_explorer_boundary_test*/';
+        let finalized = false;
+        const database = {
+            prepare() {
+                return {
+                    toString: undefined,
+                    finalize() { finalized = true; }
+                };
+            }
+        };
+
+        assert.throws(
+            () => executeSingleStatement(
+                database,
+                `CREATE VIEW sample AS SELECT 1\n${boundary}`,
+                'CREATE VIEW sample AS SELECT 1',
+                undefined,
+                boundary
+            ),
+            /Statement introspection unavailable/
+        );
+        assert.strictEqual(finalized, true);
+    });
+
+    it('reports unavailable statement introspection for bounded-query boundaries', () => {
+        const executeBoundedQuery = loadNativeBoundaryFunction(
+            'executeBoundedQuery',
+            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
+        );
+        const boundary = '/*sqlite_explorer_boundary_test*/';
+        let finalized = false;
+        const database = {
+            prepare() {
+                return {
+                    toString: undefined,
+                    finalize() { finalized = true; }
+                };
+            }
+        };
+
+        assert.throws(
+            () => executeBoundedQuery(
+                database,
+                `SELECT * FROM preview\n${boundary}`,
+                'SELECT * FROM preview',
+                boundary,
+                ['value'],
+                10,
+                5000
+            ),
+            /Statement introspection unavailable/
+        );
+        assert.strictEqual(finalized, true);
     });
 });

@@ -12,6 +12,7 @@
  */
 
 import {
+  buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
   extractViewSelectSql,
@@ -830,12 +831,22 @@ async function readViewDefinition(view, allowUnparsed = false) {
     "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
     [view]
   );
-  const triggers = (triggerResult[0]?.values || []).map(row => {
+  const tempTriggerResult = db.exec(
+    "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
+    [view]
+  );
+  const mapTriggers = (rows, temporary) => rows.map(row => {
     if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
       throw new Error(`View trigger definition is unavailable for ${view}`);
     }
-    return { identifier: row[0], sql: row[1] };
+    return temporary
+      ? { identifier: row[0], sql: row[1], temporary: true }
+      : { identifier: row[0], sql: row[1] };
   });
+  const triggers = [
+    ...mapTriggers(triggerResult[0]?.values || [], false),
+    ...mapTriggers(tempTriggerResult[0]?.values || [], true)
+  ];
 
   let selectSql;
   let columnListSql;
@@ -944,7 +955,9 @@ async function editView(view, selectSql, preserveTriggers = true) {
     runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
     compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
     if (preserveTriggers) {
-      for (const trigger of before.triggers) runSingleStatement(trigger.sql);
+      for (const trigger of before.triggers) {
+        runSingleStatement(buildCreateViewTriggerSql(trigger));
+      }
     }
     const after = await getViewDefinition(view);
     runSingleStatement(`RELEASE ${savepointName}`);

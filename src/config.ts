@@ -69,8 +69,11 @@ export function getMaximumFileSizeBytes(): number {
  */
 export function getQueryTimeout(): number {
   const config = vsc.workspace.getConfiguration(ConfigurationSection);
-  return Math.max(
-    MIN_QUERY_TIMEOUT_MS,
-    config.get<number>('queryTimeout', DEFAULT_QUERY_TIMEOUT_MS)
-  );
+  const configuredValue = config.get<unknown>('queryTimeout', DEFAULT_QUERY_TIMEOUT_MS);
+  // Settings can be hand-edited or supplied by another configuration provider,
+  // so do not let an invalid runtime value turn every query deadline into NaN.
+  if (typeof configuredValue !== 'number' || !Number.isFinite(configuredValue)) {
+    return DEFAULT_QUERY_TIMEOUT_MS;
+  }
+  return Math.max(MIN_QUERY_TIMEOUT_MS, configuredValue);
 }

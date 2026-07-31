@@ -32,11 +32,15 @@ describe('SQLiteFileSystemProvider', () => {
             onDidDispose,
             dispose: () => disposeEmitter.fire(),
             fireContentChange: (modification: any) => contentEmitter.fire({ modification }),
+            invalidateAllViewDocuments: () => contentEmitter.fire({
+                invalidateAllViewDocuments: true
+            }),
             getDisposeSubscriptionDisposeCount: () => disposeSubscriptionDisposeCount
         };
         DocumentRegistry.set(key, mockDocument);
         return mockDocument as DatabaseDocument & {
             fireContentChange(modification: any): void;
+            invalidateAllViewDocuments(): void;
             getDisposeSubscriptionDisposeCount(): number;
         };
     }
@@ -445,6 +449,44 @@ describe('SQLiteFileSystemProvider', () => {
                     modificationType: 'view_edit',
                     targetTable: 'shared_view'
                 });
+
+                assert.strictEqual(events.length, 1);
+                assert.deepStrictEqual(
+                    events[0].map(change => change.uri.toString()).sort(),
+                    [firstUri.toString(), secondUri.toString()].sort()
+                );
+                assert.ok((await provider.stat(firstUri)).mtime > firstBefore.mtime);
+                assert.ok((await provider.stat(secondUri)).mtime > secondBefore.mtime);
+            } finally {
+                subscription.dispose();
+            }
+        });
+
+        it('invalidates every open view document when File Revert replaces the database state', async () => {
+            let now = 100;
+            mock.method(Date, 'now', () => now);
+            const definitions: Record<string, { selectSql: string }> = {
+                first_view: { selectSql: 'SELECT 1' },
+                second_view: { selectSql: 'SELECT 2' }
+            };
+            const document = setupMockDocument(docKey, {
+                getViewDefinition: async (view: string) => definitions[view]
+            });
+            const firstUri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/first_view/group/__view__.sql/definition.sql`
+            );
+            const secondUri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/second_view/group/__view__.sql/definition.sql`
+            );
+            const events: vscode.FileChangeEvent[][] = [];
+            const subscription = provider.onDidChangeFile(changes => events.push(changes));
+
+            try {
+                const firstBefore = await provider.stat(firstUri);
+                const secondBefore = await provider.stat(secondUri);
+                now = 200;
+
+                document.invalidateAllViewDocuments();
 
                 assert.strictEqual(events.length, 1);
                 assert.deepStrictEqual(

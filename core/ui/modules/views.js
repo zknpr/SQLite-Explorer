@@ -9,8 +9,10 @@ import { clearSelection, loadTableColumns, loadTableData } from './grid.js';
 import { showEmptyState, updateStatus, updateToolbarButtons } from './ui.js';
 import { formatCellValueAsText } from './utils.js';
 import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
+import { isViewDefinitionSnapshotCurrent } from '../../../src/core/view-utils.ts';
 
 let editingViewName = null;
+let editingViewDefinitionSql;
 let activeViewModalSession = 0;
 let activePreviewRequest = 0;
 let isSavingView = false;
@@ -26,6 +28,7 @@ function getElements() {
         triggerSummary: document.getElementById('viewTriggerSummary'),
         preserveTriggers: document.getElementById('viewPreserveTriggers'),
         openInVsCode: document.getElementById('btnOpenViewInVsCode'),
+        reloadLatest: document.getElementById('btnReloadViewDefinition'),
         save: document.getElementById('btnSaveView')
     };
 }
@@ -94,6 +97,33 @@ function draftsMatch(left, right) {
         && left.preserveTriggers === right.preserveTriggers;
 }
 
+function applyViewDefinitionToEditor(definition) {
+    const elements = getElements();
+    editingViewDefinitionSql = definition.sql;
+    elements.sql.value = definition.selectSql;
+    elements.preserveTriggers.checked = true;
+
+    const triggerCount = definition.triggers?.length ?? 0;
+    elements.triggerOptions.hidden = triggerCount === 0;
+    elements.triggerSummary.textContent = triggerCount === 1
+        ? `Preserve trigger: ${definition.triggers[0].identifier}`
+        : `Preserve ${triggerCount} INSTEAD OF triggers`;
+}
+
+function hideReloadDefinitionOffer() {
+    const reloadLatest = getElements().reloadLatest;
+    if (reloadLatest) reloadLatest.hidden = true;
+}
+
+function showDefinitionConflict() {
+    setFeedback(
+        'This view changed outside this editor. Your draft was not saved. Reload the latest definition before saving again.',
+        true
+    );
+    const reloadLatest = getElements().reloadLatest;
+    if (reloadLatest) reloadLatest.hidden = false;
+}
+
 export function initViews() {
     const sqlEditor = document.getElementById('viewSelectSql');
     sqlEditor?.addEventListener('keydown', handleTextareaTab);
@@ -102,6 +132,7 @@ export function initViews() {
     document.getElementById('btnPreviewView')?.addEventListener('click', previewDraft);
     document.getElementById('btnSaveView')?.addEventListener('click', saveDraft);
     document.getElementById('btnOpenViewInVsCode')?.addEventListener('click', openDraftInVsCode);
+    document.getElementById('btnReloadViewDefinition')?.addEventListener('click', reloadLatestViewDefinition);
 }
 
 export function openCreateViewModal() {
@@ -111,6 +142,7 @@ export function openCreateViewModal() {
     }
     activeViewModalSession++;
     editingViewName = null;
+    editingViewDefinitionSql = undefined;
     const elements = getElements();
     resetTextareaTabFocusEscape(elements.sql);
     elements.title.textContent = 'Create View';
@@ -121,6 +153,7 @@ export function openCreateViewModal() {
     elements.triggerOptions.hidden = true;
     elements.preserveTriggers.checked = true;
     elements.openInVsCode.hidden = true;
+    hideReloadDefinitionOffer();
     elements.save.textContent = 'Create View';
     setFeedback('');
     clearPreview();
@@ -141,17 +174,11 @@ export async function openEditViewModal(view) {
         elements.title.textContent = 'Edit View';
         elements.name.value = view;
         elements.name.disabled = true;
-        elements.sql.value = definition.selectSql;
+        applyViewDefinitionToEditor(definition);
         elements.sql.disabled = false;
-        elements.preserveTriggers.checked = true;
         elements.save.textContent = 'Save View';
         elements.openInVsCode.hidden = !document.getElementById('vscode-env');
-
-        const triggerCount = definition.triggers?.length ?? 0;
-        elements.triggerOptions.hidden = triggerCount === 0;
-        elements.triggerSummary.textContent = triggerCount === 1
-            ? `Preserve trigger: ${definition.triggers[0].identifier}`
-            : `Preserve ${triggerCount} INSTEAD OF triggers`;
+        hideReloadDefinitionOffer();
 
         setFeedback('');
         clearPreview();
@@ -168,7 +195,8 @@ function isCurrentModalSession(modalSession) {
 }
 
 async function validateDraft(draft = getDraft(), modalSession = activeViewModalSession) {
-    const canUpdateFeedback = () => isCurrentModalSession(modalSession);
+    const canUpdateFeedback = () => isCurrentModalSession(modalSession)
+        && draftsMatch(draft, getDraft());
     if (!draft.name || !draft.selectSql) {
         if (canUpdateFeedback()) setFeedback('A view name and SELECT definition are required.', true);
         return false;
@@ -226,15 +254,28 @@ async function saveDraft() {
     const modalSession = activeViewModalSession;
     const draft = getDraft();
     const targetView = editingViewName;
+    const targetDefinitionSql = editingViewDefinitionSql;
     isSavingView = true;
     const saveElements = getElements();
     const saveButton = saveElements.save;
     const sqlEditor = saveElements.sql;
+    const reloadLatest = saveElements.reloadLatest;
     if (saveButton) saveButton.disabled = true;
     if (sqlEditor) sqlEditor.disabled = true;
+    if (reloadLatest) reloadLatest.disabled = true;
+    hideReloadDefinitionOffer();
     try {
         if (!await validateDraft(draft, modalSession)) return;
         if (!isCurrentModalSession(modalSession)) return;
+
+        if (targetView) {
+            const currentDefinition = await backendApi.getViewDefinition(targetView);
+            if (!isCurrentModalSession(modalSession)) return;
+            if (!isViewDefinitionSnapshotCurrent(targetDefinitionSql, currentDefinition.sql)) {
+                showDefinitionConflict();
+                return;
+            }
+        }
 
         setFeedback(targetView ? 'Replacing view atomically...' : 'Creating view...');
         const result = targetView
@@ -264,6 +305,32 @@ async function saveDraft() {
         isSavingView = false;
         if (saveButton) saveButton.disabled = false;
         if (sqlEditor) sqlEditor.disabled = false;
+        if (reloadLatest) reloadLatest.disabled = false;
+    }
+}
+
+async function reloadLatestViewDefinition() {
+    const modalSession = activeViewModalSession;
+    const targetView = editingViewName;
+    if (!targetView || !isCurrentModalSession(modalSession)) return;
+
+    const reloadLatest = getElements().reloadLatest;
+    if (reloadLatest) reloadLatest.disabled = true;
+    try {
+        setFeedback('Loading the latest view definition...');
+        const definition = await backendApi.getViewDefinition(targetView);
+        if (!isCurrentModalSession(modalSession) || editingViewName !== targetView) return;
+        applyViewDefinitionToEditor(definition);
+        activePreviewRequest++;
+        clearPreview();
+        hideReloadDefinitionOffer();
+        setFeedback('Latest definition loaded. Review it before saving.');
+    } catch (err) {
+        if (isCurrentModalSession(modalSession) && editingViewName === targetView) {
+            setFeedback(err.message, true);
+        }
+    } finally {
+        if (reloadLatest) reloadLatest.disabled = false;
     }
 }
 

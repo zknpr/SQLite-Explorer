@@ -6,6 +6,28 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 describe('viewer template accessibility', () => {
+    it('keeps sidebar view actions keyboard-focusable while visually hidden', () => {
+        const css = readFileSync(
+            path.resolve(process.cwd(), 'core/ui/viewer.css'),
+            'utf8'
+        );
+        const hiddenRule = css.match(/\.view-item-actions\s*\{([^}]*)\}/s)?.[1];
+        const revealRule = css.match(
+            /\.list-item:hover\s+\.view-item-actions,\s*\.list-item:focus-within\s+\.view-item-actions\s*\{([^}]*)\}/s
+        )?.[1];
+
+        assert.ok(hiddenRule, 'view action base rule must exist');
+        assert.doesNotMatch(
+            hiddenRule,
+            /display\s*:\s*none/i,
+            'display:none removes Edit and Drop from sequential keyboard focus'
+        );
+        assert.match(hiddenRule, /display\s*:\s*flex/i);
+        assert.match(hiddenRule, /opacity\s*:\s*0(?:\D|$)/i);
+        assert.ok(revealRule, 'view action hover/focus reveal rule must exist');
+        assert.match(revealRule, /opacity\s*:\s*1(?:\D|$)/i);
+    });
+
     it('gives the toolbar table filter an accessible name', () => {
         const template = readFileSync(
             path.resolve(process.cwd(), 'core/ui/viewer.template.html'),
@@ -36,5 +58,15 @@ describe('viewer template accessibility', () => {
                 `${id} must preserve the active grid selection`
             );
         }
+
+        const filterGroup = template.match(
+            /<[^>]+\bclass=["'][^"']*\bfilter-group\b[^"']*["'][^>]*>/i
+        )?.[0];
+        assert.ok(filterGroup, 'toolbar filter group must exist');
+        assert.match(
+            filterGroup,
+            /\bdata-preserve-grid-selection(?:\s|=|>)/i,
+            'using the table filter must preserve the active grid selection'
+        );
     });
 });

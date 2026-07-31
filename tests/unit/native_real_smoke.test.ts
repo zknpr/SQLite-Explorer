@@ -225,6 +225,61 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
                 `CREATE VIEW "order_summary" AS ${USER_VIEW_BODY}`
             );
         });
+
+        await testContext.test('preserves TEMP view triggers through native edit and history replay', async () => {
+            await engine.executeQuery('CREATE TABLE native_temp_trigger_rows (value INTEGER)');
+            await engine.executeQuery('CREATE TABLE native_temp_trigger_log (value INTEGER)');
+            await engine.executeQuery(
+                'CREATE VIEW native_temp_trigger_view AS SELECT value FROM native_temp_trigger_rows'
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TRIGGER native_temp_trigger_insert ' +
+                'INSTEAD OF INSERT ON native_temp_trigger_view ' +
+                'BEGIN INSERT INTO native_temp_trigger_log VALUES (NEW.value); END'
+            );
+
+            const before = await engine.getViewDefinition('native_temp_trigger_view');
+            assert.strictEqual(before.triggers.length, 1);
+            assert.strictEqual(before.triggers[0].temporary, true);
+
+            const edit = await engine.editView(
+                'native_temp_trigger_view',
+                'SELECT value * 2 AS value FROM native_temp_trigger_rows',
+                true
+            );
+            const modification = {
+                description: 'Edit native_temp_trigger_view',
+                modificationType: 'view_edit' as const,
+                targetTable: 'native_temp_trigger_view',
+                viewDefBefore: edit.before,
+                viewDefAfter: edit.after
+            };
+
+            const assertTemporaryTriggerWorks = async (value: number) => {
+                const tempTrigger = await engine.executeQuery(
+                    "SELECT count(*) FROM sqlite_temp_schema " +
+                    "WHERE type = 'trigger' AND name = 'native_temp_trigger_insert'"
+                );
+                const mainTrigger = await engine.executeQuery(
+                    "SELECT count(*) FROM sqlite_schema " +
+                    "WHERE type = 'trigger' AND name = 'native_temp_trigger_insert'"
+                );
+                assert.strictEqual(tempTrigger[0].rows[0][0], 1);
+                assert.strictEqual(mainTrigger[0].rows[0][0], 0);
+                await engine.executeQuery(`INSERT INTO native_temp_trigger_view VALUES (${value})`);
+                const logged = await engine.executeQuery(
+                    'SELECT value FROM native_temp_trigger_log ORDER BY rowid DESC LIMIT 1'
+                );
+                assert.strictEqual(logged[0].rows[0][0], value);
+            };
+
+            assert.strictEqual(edit.after.triggers[0].temporary, true);
+            await assertTemporaryTriggerWorks(21);
+            await engine.undoModification(modification);
+            await assertTemporaryTriggerWorks(22);
+            await engine.redoModification(modification);
+            await assertTemporaryTriggerWorks(23);
+        });
     } finally {
         rawWorker?.stop();
         bundle?.workerMethods[Symbol.dispose]();

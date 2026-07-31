@@ -30,6 +30,7 @@ import { buildSelectQuery, buildCountQuery } from '../../query-builder';
 import { applyMergePatch, computeJsonPatchUndo, parseJsonValueForPatching } from '../../json-utils';
 import { getNodeFs } from '../../platform/fs';
 import {
+  buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
   extractViewSelectSql,
@@ -946,12 +947,22 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
       [view]
     );
-    const triggers = (triggerResult[0]?.rows ?? []).map(row => {
+    const tempTriggerResult = await this.executeQuery(
+      "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
+      [view]
+    );
+    const mapTriggers = (rows: CellValue[][], temporary: boolean) => rows.map(row => {
       if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
         throw new Error(`View trigger definition is unavailable for ${view}`);
       }
-      return { identifier: row[0], sql: row[1] };
+      return temporary
+        ? { identifier: row[0], sql: row[1], temporary: true }
+        : { identifier: row[0], sql: row[1] };
     });
+    const triggers = [
+      ...mapTriggers(triggerResult[0]?.rows ?? [], false),
+      ...mapTriggers(tempTriggerResult[0]?.rows ?? [], true)
+    ];
 
     let selectSql: string;
     let columnListSql: string | undefined;
@@ -1061,7 +1072,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
       if (preserveTriggers) {
         for (const trigger of before.triggers) {
-          this.runSingleStatement(trigger.sql);
+          this.runSingleStatement(buildCreateViewTriggerSql(trigger));
         }
       }
       const after = await this.getViewDefinition(view);
@@ -1100,7 +1111,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       this.runSingleStatement(definition.sql);
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(definition.identifier)}`);
       for (const trigger of definition.triggers) {
-        this.runSingleStatement(trigger.sql);
+        this.runSingleStatement(buildCreateViewTriggerSql(trigger));
       }
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (err) {

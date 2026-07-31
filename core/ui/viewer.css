@@ -221,14 +221,17 @@ body {
 }
 
 .view-item-actions {
-    display: none;
+    display: flex;
     align-items: center;
     margin-left: auto;
+    opacity: 0;
+    pointer-events: none;
 }
 
 .list-item:hover .view-item-actions,
 .list-item:focus-within .view-item-actions {
-    display: flex;
+    opacity: 1;
+    pointer-events: auto;
 }
 
 .view-item-actions .icon-button {

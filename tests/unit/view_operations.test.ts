@@ -132,6 +132,79 @@ describe('view operations', () => {
         }
     });
 
+    it('preserves TEMP view triggers through edit, undo, and redo', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE TABLE temp_trigger_rows (value INTEGER)');
+            await engine.executeQuery('CREATE TABLE temp_trigger_log (value INTEGER)');
+            await engine.executeQuery(
+                'CREATE VIEW temp_trigger_view AS SELECT value FROM temp_trigger_rows'
+            );
+            await engine.executeQuery(`
+                CREATE TEMP TRIGGER temp_trigger_view_insert
+                INSTEAD OF INSERT ON temp_trigger_view
+                BEGIN
+                    INSERT INTO temp_trigger_log (value) VALUES (NEW.value);
+                END
+            `);
+
+            const before = await engine.getViewDefinition('temp_trigger_view');
+            assert.strictEqual(before.triggers.length, 1);
+            assert.strictEqual(before.triggers[0].identifier, 'temp_trigger_view_insert');
+            assert.strictEqual(before.triggers[0].temporary, true);
+
+            const edit = await engine.editView(
+                'temp_trigger_view',
+                'SELECT value * 2 AS value FROM temp_trigger_rows',
+                true
+            );
+            const modification = {
+                description: 'Edit temp_trigger_view',
+                modificationType: 'view_edit' as const,
+                targetTable: 'temp_trigger_view',
+                viewDefBefore: edit.before,
+                viewDefAfter: edit.after
+            };
+
+            const assertTemporaryTriggerWorks = async (value: number) => {
+                assert.strictEqual(await readScalar(
+                    engine,
+                    "SELECT count(*) FROM sqlite_temp_schema " +
+                    "WHERE type = 'trigger' AND name = 'temp_trigger_view_insert'"
+                ), 1);
+                assert.strictEqual(await readScalar(
+                    engine,
+                    "SELECT count(*) FROM sqlite_schema " +
+                    "WHERE type = 'trigger' AND name = 'temp_trigger_view_insert'"
+                ), 0);
+                await engine.executeQuery(`INSERT INTO temp_trigger_view VALUES (${value})`);
+                assert.strictEqual(await readScalar(
+                    engine,
+                    'SELECT value FROM temp_trigger_log ORDER BY rowid DESC LIMIT 1'
+                ), value);
+            };
+
+            assert.strictEqual(edit.after.triggers[0].temporary, true);
+            await assertTemporaryTriggerWorks(11);
+
+            await engine.undoModification(modification);
+            assert.strictEqual(
+                (await engine.getViewDefinition('temp_trigger_view')).triggers[0].temporary,
+                true
+            );
+            await assertTemporaryTriggerWorks(12);
+
+            await engine.redoModification(modification);
+            assert.strictEqual(
+                (await engine.getViewDefinition('temp_trigger_view')).triggers[0].temporary,
+                true
+            );
+            await assertTemporaryTriggerWorks(13);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('preserves an explicit view column list when replacing its SELECT body', async () => {
         const engine = await createEngine();
         try {

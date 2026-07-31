@@ -103,7 +103,7 @@
                     <button type="button" class="toolbar-button" id="btnExport" data-preserve-grid-selection disabled>
                         <span class="codicon codicon-export"></span> Export
                     </button>
-                    <div class="filter-group">
+                    <div class="filter-group" data-preserve-grid-selection>
                         <div class="filter-input-wrap">
                             <input type="text" class="filter-input" id="filterInput" placeholder="Filter..." aria-label="Filter table data">
                             <span class="filter-match-counter" id="filterMatchCounter"></span>
@@ -185,6 +185,7 @@
             </div>
             <div class="modal-footer view-modal-footer">
                 <button type="button" class="btn-secondary" id="btnOpenViewInVsCode" hidden>Edit in VS Code</button>
+                <button type="button" class="btn-secondary" id="btnReloadViewDefinition" hidden>Reload Latest</button>
                 <span class="flex-spacer"></span>
                 <button type="button" class="btn-secondary" id="btnValidateView">Validate</button>
                 <button type="button" class="btn-secondary" id="btnPreviewView">Preview</button>

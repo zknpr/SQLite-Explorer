@@ -2,8 +2,8 @@ import './vscode_mock_setup';
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { readFileSync, statSync } from 'node:fs';
-import { webcrypto } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { createHash, webcrypto } from 'node:crypto';
 import path from 'node:path';
 import vm from 'node:vm';
 import initSqlJs from 'sql.js';
@@ -12,18 +12,40 @@ interface WorkerHarness {
     invoke(method: string, ...payload: unknown[]): Promise<any>;
 }
 
+const authoredWorkerPath = path.resolve(
+    process.cwd(),
+    'website/src/sqlite-viewer/worker.js'
+);
+const bundledWorkerPath = path.resolve(
+    process.cwd(),
+    'website/public/sqlite-viewer/worker.js'
+);
+
+function readCurrentWorkerBundle(): string {
+    assert.ok(
+        existsSync(bundledWorkerPath),
+        'website worker bundle is missing; run node scripts/build.mjs'
+    );
+    const authoredSource = readFileSync(authoredWorkerPath);
+    const expectedHash = createHash('sha256').update(authoredSource).digest('hex');
+    const bundledSource = readFileSync(bundledWorkerPath, 'utf8');
+    const bundledHash = bundledSource.match(
+        /sqlite-viewer-source-sha256:([a-f0-9]{64})/
+    )?.[1];
+    assert.strictEqual(
+        bundledHash,
+        expectedHash,
+        'website worker bundle is stale; run node scripts/build.mjs'
+    );
+    return bundledSource;
+}
+
 async function createWorkerHarness(options: {
     queryTimeout?: number;
     now?: () => number;
     readOnlyMode?: boolean;
 } = {}): Promise<WorkerHarness> {
-    const authoredWorkerPath = path.resolve(process.cwd(), 'website/src/sqlite-viewer/worker.js');
-    const bundledWorkerPath = path.resolve(process.cwd(), 'website/public/sqlite-viewer/worker.js');
-    assert.ok(
-        statSync(bundledWorkerPath).mtimeMs >= statSync(authoredWorkerPath).mtimeMs,
-        'website worker bundle is stale; run node scripts/build.mjs'
-    );
-    const source = readFileSync(bundledWorkerPath, 'utf8');
+    const source = readCurrentWorkerBundle();
     const responses: any[] = [];
     const workerGlobal: any = {
         initSqlJs,
@@ -315,6 +337,50 @@ describe('web demo view worker', () => {
         assert.deepStrictEqual(
             Array.from(recreatedOrder[0].rows, (row: unknown[]) => Array.from(row)),
             Array.from(originalOrder[0].rows, (row: unknown[]) => Array.from(row))
+        );
+    });
+
+    it('preserves a TEMP trigger when editing a main-schema view', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_temp_trigger_rows (value INTEGER)');
+        await worker.invoke('runQuery', 'CREATE TABLE demo_temp_trigger_log (value INTEGER)');
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW demo_temp_trigger_view AS SELECT value FROM demo_temp_trigger_rows'
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP TRIGGER demo_temp_trigger_insert ' +
+            'INSTEAD OF INSERT ON demo_temp_trigger_view ' +
+            'BEGIN INSERT INTO demo_temp_trigger_log VALUES (NEW.value); END'
+        );
+
+        const before = await worker.invoke('getViewDefinition', 'demo_temp_trigger_view');
+        assert.strictEqual(before.triggers.length, 1);
+        assert.strictEqual(before.triggers[0].temporary, true);
+
+        const edit = await worker.invoke(
+            'editView',
+            'demo_temp_trigger_view',
+            'SELECT value * 2 AS value FROM demo_temp_trigger_rows',
+            true
+        );
+        assert.strictEqual(edit.after.triggers[0].temporary, true);
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_temp_schema " +
+            "WHERE type = 'trigger' AND name = 'demo_temp_trigger_insert'"
+        ), 1);
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_schema " +
+            "WHERE type = 'trigger' AND name = 'demo_temp_trigger_insert'"
+        ), 0);
+
+        await worker.invoke('runQuery', 'INSERT INTO demo_temp_trigger_view VALUES (17)');
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_temp_trigger_log'),
+            17
         );
     });
 });

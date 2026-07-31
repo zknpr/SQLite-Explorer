@@ -38,6 +38,8 @@ export type DocumentModification = LabeledModification;
 /** Database content change, optionally tied to the history entry just applied. */
 export interface DocumentContentChange {
   readonly modification?: DocumentModification;
+  /** The whole live database was replaced, so every open schema document is stale. */
+  readonly invalidateAllViewDocuments?: boolean;
 }
 
 // ============================================================================
@@ -458,7 +460,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       this.#modificationTracker,
       cancelTokenToAbortSignal(cancellation)
     );
-    this.#contentChangeEmitter.fire({});
+    this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
     this.#autoSaveIfNeeded();
   }
 

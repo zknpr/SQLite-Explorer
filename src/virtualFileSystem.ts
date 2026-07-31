@@ -1,6 +1,7 @@
 import * as vsc from 'vscode';
 import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier } from './core/sql-utils';
+import { isViewDefinitionSnapshotCurrent } from './core/view-utils';
 import { GlobalOutputChannel } from './main';
 
 import type {
@@ -182,7 +183,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                         err instanceof Error ? err.message : String(err)
                     );
                 }
-                if (currentSql !== metadata.snapshotSql) {
+                if (!isViewDefinitionSnapshotCurrent(metadata.snapshotSql, currentSql)) {
                     this.rejectStaleViewWrite(document, uri);
                 }
             }
@@ -349,13 +350,27 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         document: DatabaseDocument,
         change: DocumentContentChange
     ): void {
+        const documentMetadata = this.viewDocumentMetadata.get(document);
+        if (!documentMetadata) return;
+
+        if (change.invalidateAllViewDocuments) {
+            const changes: vsc.FileChangeEvent[] = [];
+            for (const metadata of documentMetadata.values()) {
+                this.bumpViewDocumentMtime(metadata);
+                changes.push({
+                    type: vsc.FileChangeType.Changed,
+                    uri: metadata.uri
+                });
+            }
+            if (changes.length > 0) this._emitter.fire(changes);
+            return;
+        }
+
         const modification = change.modification;
         if (!modification || !this.isViewModification(modification) || !modification.targetTable) {
             return;
         }
 
-        const documentMetadata = this.viewDocumentMetadata.get(document);
-        if (!documentMetadata) return;
         const changes: vsc.FileChangeEvent[] = [];
         for (const metadata of documentMetadata.values()) {
             if (metadata.view !== modification.targetTable) continue;

@@ -830,6 +830,16 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         assert.deepStrictEqual(applied, [modification, modification, modification]);
     });
 
+    it('invalidates every open view document after File Revert', async () => {
+        const doc = createDocBypassingFactory({});
+        const contentChanges: unknown[] = [];
+        doc.onDidChangeContent((event: unknown) => contentChanges.push(event));
+
+        await doc.revert(undefined);
+
+        assert.deepStrictEqual(contentChanges, [{ invalidateAllViewDocuments: true }]);
+    });
+
     it('notifies document-disposal subscribers before emitter teardown', async () => {
         const doc = createDocBypassingFactory({});
         let disposalNotifications = 0;

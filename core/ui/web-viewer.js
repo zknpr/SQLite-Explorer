@@ -50,6 +50,7 @@ import {
     initDragAndDrop
 } from './modules/dnd.js';
 import { initViews } from './modules/views.js';
+import { applyConnectionResult } from './modules/connection-state.js';
 
 // ============================================================================
 // Web-specific RPC initialization
@@ -153,8 +154,7 @@ async function initializeApp() {
 
         // Initialize connection - parent window handles this
         const result = await backendApi.initialize();
-        state.isDbConnected = true;
-        state.isReadOnly = false;
+        applyConnectionResult(result);
 
         // Test connection
         await backendApi.ping();

@@ -49,6 +49,7 @@ import {
     initDragAndDrop
 } from './modules/dnd.js';
 import { initViews } from './modules/views.js';
+import { applyConnectionResult } from './modules/connection-state.js';
 
 // Initialize RPC system
 initRpc();
@@ -75,10 +76,7 @@ async function connectAndLoadSchema() {
         throw new Error('Failed to connect to database');
     }
 
-    state.isDbConnected = true;
-    state.isReadOnly = !!result.readOnly;
-    const createViewButton = document.getElementById('btnOpenCreateView');
-    if (createViewButton) createViewButton.disabled = state.isReadOnly;
+    applyConnectionResult(result);
 
     // Test connection
     await backendApi.ping();

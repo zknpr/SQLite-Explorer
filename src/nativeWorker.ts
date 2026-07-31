@@ -43,6 +43,7 @@ import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 import { computeJsonPatchUndo } from './core/json-utils';
 import { serializeOperations } from './core/operation-serializer';
 import {
+  buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
   extractViewSelectSql,
@@ -549,9 +550,13 @@ export async function createNativeDatabaseConnection(
           {
             sql: "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
             params: [view]
+          },
+          {
+            sql: "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
+            params: [view]
           }
         ]]);
-        if (!metadata?.results || metadata.results.length < 2) {
+        if (!metadata?.results || metadata.results.length < 3) {
           throw new Error('View definition fetch failed: queryBatch returned incomplete results');
         }
 
@@ -561,13 +566,18 @@ export async function createNativeDatabaseConnection(
           throw new Error(`View not found: ${view}`);
         }
 
-        const triggerResult = metadata.results[1];
-        const triggers = (triggerResult.values ?? []).map(row => {
+        const mapTriggers = (rows: CellValue[][], temporary: boolean) => rows.map(row => {
           if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
             throw new Error(`View trigger definition is unavailable for ${view}`);
           }
-          return { identifier: row[0], sql: row[1] };
+          return temporary
+            ? { identifier: row[0], sql: row[1], temporary: true }
+            : { identifier: row[0], sql: row[1] };
         });
+        const triggers = [
+          ...mapTriggers(metadata.results[1].values ?? [], false),
+          ...mapTriggers(metadata.results[2].values ?? [], true)
+        ];
 
         let selectSql: string;
         let columnListSql: string | undefined;
@@ -629,7 +639,7 @@ export async function createNativeDatabaseConnection(
           await runNativeSingleStatement(definition.sql);
           await compileNativeView(definition.identifier);
           for (const trigger of definition.triggers) {
-            await runNativeSingleStatement(trigger.sql);
+            await runNativeSingleStatement(buildCreateViewTriggerSql(trigger));
           }
           await worker.call('run', [`RELEASE ${savepointName}`]);
         } catch (err) {
@@ -1212,7 +1222,7 @@ export async function createNativeDatabaseConnection(
             await compileNativeView(view);
             if (preserveTriggers) {
               for (const trigger of before.triggers) {
-                await runNativeSingleStatement(trigger.sql);
+                await runNativeSingleStatement(buildCreateViewTriggerSql(trigger));
               }
             }
             const after = await getNativeViewDefinition(view);

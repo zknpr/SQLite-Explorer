@@ -2,6 +2,7 @@ import './vscode_mock_setup';
 
 import { after, afterEach, describe, it } from 'node:test';
 import assert from 'node:assert';
+import { createDeferred } from './helpers/deferred';
 
 const persistedStates: any[] = [];
 (globalThis as any).acquireVsCodeApi = () => ({
@@ -9,16 +10,6 @@ const persistedStates: any[] = [];
     setState: (value: any) => persistedStates.push(value),
     postMessage() {}
 });
-
-function createDeferred<T>() {
-    let resolve!: (value: T) => void;
-    let reject!: (reason?: unknown) => void;
-    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-        resolve = resolvePromise;
-        reject = rejectPromise;
-    });
-    return { promise, resolve, reject };
-}
 
 function createClassList() {
     const classes = new Set<string>();
@@ -63,6 +54,7 @@ function installViewDocument() {
         viewTriggerSummary: element(),
         viewPreserveTriggers: element(),
         btnOpenViewInVsCode: element({ id: 'btnOpenViewInVsCode' }),
+        btnReloadViewDefinition: element({ id: 'btnReloadViewDefinition', hidden: true }),
         btnSaveView: element({ id: 'btnSaveView' }),
         btnValidateView: element({ id: 'btnValidateView' }),
         btnPreviewView: element({ id: 'btnPreviewView' }),
@@ -357,6 +349,95 @@ describe('view modal concurrency', () => {
         }
     });
 
+    it('ignores validation feedback when the draft changes before validation settles', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { initViews, openCreateViewModal } = await import(viewsModulePath);
+        const validation = createDeferred<void>();
+        const originalValidate = backendApi.validateViewDefinition;
+        backendApi.validateViewDefinition = async () => validation.promise;
+
+        try {
+            initViews();
+            openCreateViewModal();
+            elements.viewNameInput.value = 'draft_bound_validation';
+            elements.viewSelectSql.value = 'SELECT old_value';
+            const pendingValidation = listener('btnValidateView', 'click')();
+
+            elements.viewSelectSql.value = 'SELECT new_value';
+            validation.resolve();
+            await pendingValidation;
+
+            assert.notStrictEqual(
+                elements.viewValidationStatus.textContent,
+                'Definition is valid.'
+            );
+        } finally {
+            backendApi.validateViewDefinition = originalValidate;
+        }
+    });
+
+    it('keeps a modal draft open when the stored view changed and can reload the latest definition', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openEditViewModal } = await import(viewsModulePath);
+        const originalDefinition = {
+            sql: 'CREATE VIEW shared_view AS SELECT 1 AS value',
+            selectSql: 'SELECT 1 AS value',
+            triggers: []
+        };
+        const latestDefinition = {
+            sql: 'CREATE VIEW shared_view AS SELECT 2 AS value',
+            selectSql: 'SELECT 2 AS value',
+            triggers: []
+        };
+        const originals = {
+            get: backendApi.getViewDefinition,
+            validate: backendApi.validateViewDefinition,
+            edit: backendApi.editView
+        };
+        let getCalls = 0;
+        let editCalls = 0;
+        backendApi.getViewDefinition = async () => (
+            getCalls++ === 0 ? originalDefinition : latestDefinition
+        );
+        backendApi.validateViewDefinition = async () => undefined;
+        backendApi.editView = async () => {
+            editCalls++;
+            return {};
+        };
+        state.isReadOnly = false;
+
+        try {
+            initViews();
+            await openEditViewModal('shared_view');
+            elements.viewSelectSql.value = 'SELECT 3 AS value';
+
+            await listener('btnSaveView', 'click')();
+
+            assert.strictEqual(editCalls, 0);
+            assert.strictEqual(elements.viewModal.classList.contains('hidden'), false);
+            assert.match(elements.viewValidationStatus.textContent, /changed outside this editor/i);
+            assert.strictEqual(elements.btnReloadViewDefinition.hidden, false);
+            assert.strictEqual(elements.viewSelectSql.value, 'SELECT 3 AS value');
+
+            await listener('btnReloadViewDefinition', 'click')();
+            assert.strictEqual(elements.viewSelectSql.value, latestDefinition.selectSql);
+            assert.strictEqual(elements.btnReloadViewDefinition.hidden, true);
+            assert.match(elements.viewValidationStatus.textContent, /latest definition loaded/i);
+        } finally {
+            backendApi.getViewDefinition = originals.get;
+            backendApi.validateViewDefinition = originals.validate;
+            backendApi.editView = originals.edit;
+        }
+    });
+
     it('does not let a superseded successful save overwrite newer modal status', async () => {
         const { elements, listener } = installViewDocument();
         const apiModulePath = '../../core/ui/modules/api.js';
@@ -365,15 +446,20 @@ describe('view modal concurrency', () => {
         const { backendApi } = await import(apiModulePath);
         const { state } = await import(stateModulePath);
         const { initViews, openCreateViewModal, openEditViewModal } = await import(viewsModulePath);
+        const validation = createDeferred<void>();
         const mutation = createDeferred<any>();
+        const mutationStarted = createDeferred<void>();
         const originals = {
             get: backendApi.getViewDefinition,
             validate: backendApi.validateViewDefinition,
             create: backendApi.createView
         };
         backendApi.getViewDefinition = async () => ({ selectSql: 'SELECT 2', triggers: [] });
-        backendApi.validateViewDefinition = async () => undefined;
-        backendApi.createView = async () => mutation.promise;
+        backendApi.validateViewDefinition = async () => validation.promise;
+        backendApi.createView = async () => {
+            mutationStarted.resolve();
+            return mutation.promise;
+        };
         state.isReadOnly = false;
         state.isDbConnected = false;
 
@@ -383,8 +469,8 @@ describe('view modal concurrency', () => {
             elements.viewNameInput.value = 'old_view';
             elements.viewSelectSql.value = 'SELECT 1';
             const pendingSave = listener('btnSaveView', 'click')();
-            await Promise.resolve();
-            await Promise.resolve();
+            validation.resolve();
+            await mutationStarted.promise;
 
             await openEditViewModal('new_view');
             assert.strictEqual(elements.statusText.textContent, 'Ready');
@@ -407,15 +493,20 @@ describe('view modal concurrency', () => {
         const { backendApi } = await import(apiModulePath);
         const { state } = await import(stateModulePath);
         const { initViews, openCreateViewModal, openEditViewModal } = await import(viewsModulePath);
+        const validation = createDeferred<void>();
         const mutation = createDeferred<any>();
+        const mutationStarted = createDeferred<void>();
         const originals = {
             get: backendApi.getViewDefinition,
             validate: backendApi.validateViewDefinition,
             create: backendApi.createView
         };
         backendApi.getViewDefinition = async () => ({ selectSql: 'SELECT 2', triggers: [] });
-        backendApi.validateViewDefinition = async () => undefined;
-        backendApi.createView = async () => mutation.promise;
+        backendApi.validateViewDefinition = async () => validation.promise;
+        backendApi.createView = async () => {
+            mutationStarted.resolve();
+            return mutation.promise;
+        };
         state.isReadOnly = false;
         state.isDbConnected = false;
 
@@ -425,8 +516,8 @@ describe('view modal concurrency', () => {
             elements.viewNameInput.value = 'old_view';
             elements.viewSelectSql.value = 'SELECT 1';
             const pendingSave = listener('btnSaveView', 'click')();
-            await Promise.resolve();
-            await Promise.resolve();
+            validation.resolve();
+            await mutationStarted.promise;
 
             await openEditViewModal('new_view');
             assert.strictEqual(elements.statusText.textContent, 'Ready');

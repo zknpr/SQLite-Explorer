@@ -282,8 +282,8 @@ function executeSingleQuery(db, sql, params, requiredSuffix) {
   };
 }
 
-/** Execute one mutation only after the marked SQL proves it has no tail. */
-function executeSingleStatement(db, markedSql, sql, params, requiredSuffix) {
+/** Validate one marked payload and return the exact executable SQL it contains. */
+function assertSingleStatementPayload(db, markedSql, sql, requiredSuffix) {
   const marker = requiredSuffix ? `\n${requiredSuffix}` : '';
   if (!marker || !markedSql.endsWith(marker)) {
     throw new Error('Exactly one SQL statement is required');
@@ -301,15 +301,29 @@ function executeSingleStatement(db, markedSql, sql, params, requiredSuffix) {
 
   const validationStmt = db.prepare(markedSql);
   try {
-    const preparedSql = typeof validationStmt.toString === 'function'
-      ? validationStmt.toString().trimEnd()
-      : '';
+    if (
+      typeof validationStmt.toString !== 'function' ||
+      validationStmt.toString === Object.prototype.toString
+    ) {
+      throw new Error('Statement introspection unavailable');
+    }
+    const introspectedSql = validationStmt.toString();
+    if (typeof introspectedSql !== 'string') {
+      throw new Error('Statement introspection unavailable');
+    }
+    const preparedSql = introspectedSql.trimEnd();
     if (!requiredSuffix || !preparedSql.endsWith(requiredSuffix)) {
       throw new Error('Exactly one SQL statement is required');
     }
   } finally {
     if (typeof validationStmt.finalize === 'function') validationStmt.finalize();
   }
+  return validatedSql;
+}
+
+/** Execute one mutation only after the marked SQL proves it has no tail. */
+function executeSingleStatement(db, markedSql, sql, params, requiredSuffix) {
+  const validatedSql = assertSingleStatementPayload(db, markedSql, sql, requiredSuffix);
   return executeStatement(db, validatedSql, params);
 }
 
@@ -320,29 +334,7 @@ function executeSingleStatement(db, markedSql, sql, params, requiredSuffix) {
  * support is intentionally a follow-up.
  */
 function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, limit, timeoutMs) {
-  const marker = requiredSuffix ? `\n${requiredSuffix}` : '';
-  if (!marker || !markedSql.endsWith(marker)) {
-    throw new Error('Exactly one SQL statement is required');
-  }
-
-  // queryBounded has the same transport invariant as runSingle: the bytes
-  // SQLite validates must be the bytes we later execute with the LIMIT bound.
-  const validatedSql = markedSql.slice(0, -marker.length);
-  if (validatedSql !== sql) {
-    throw new Error('Single-statement SQL payload mismatch');
-  }
-
-  const validationStmt = db.prepare(markedSql);
-  try {
-    const preparedSql = typeof validationStmt.toString === 'function'
-      ? validationStmt.toString().trimEnd()
-      : '';
-    if (!requiredSuffix || !preparedSql.endsWith(requiredSuffix)) {
-      throw new Error('Exactly one SQL statement is required');
-    }
-  } finally {
-    if (typeof validationStmt.finalize === 'function') validationStmt.finalize();
-  }
+  const validatedSql = assertSingleStatementPayload(db, markedSql, sql, requiredSuffix);
 
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
     throw new Error('Preview row limit must be an integer between 1 and 100');

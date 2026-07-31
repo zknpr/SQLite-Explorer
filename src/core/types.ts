@@ -105,6 +105,8 @@ export interface ViewTriggerDefinition {
   identifier: string;
   /** Original CREATE TRIGGER statement from sqlite_schema */
   sql: string;
+  /** True when the trigger belongs to the connection-local temp schema. */
+  temporary?: boolean;
 }
 
 /**
