@@ -4,6 +4,7 @@
  * Constructs safe SQL queries for read operations.
  */
 import { escapeIdentifier, escapeLikePattern } from './sql-utils';
+import { getActiveFilterValue } from './filter-utils';
 import type { CellValue, TableQueryOptions, TableCountOptions } from './types';
 
 /**
@@ -89,21 +90,23 @@ function buildFilterConditions(
 
   // Column filters
   for (const filter of filters) {
-    if (filter.value) {
+    const filterValue = getActiveFilterValue(filter.value);
+    if (filterValue !== undefined) {
       conditions.push(`${escapeIdentifier(filter.column)} LIKE ? ESCAPE '\\'`);
-      params.push(`%${escapeLikePattern(filter.value)}%`);
+      params.push(`%${escapeLikePattern(filterValue)}%`);
     }
   }
 
   // Global filter
-  if (globalFilter && searchColumns.length > 0) {
+  const activeGlobalFilter = getActiveFilterValue(globalFilter);
+  if (activeGlobalFilter !== undefined && searchColumns.length > 0) {
     const globalConditions = searchColumns
       .map(col => `${escapeIdentifier(col)} LIKE ? ESCAPE '\\'`)
       .join(' OR ');
 
     conditions.push(`(${globalConditions})`);
     for (let i = 0; i < searchColumns.length; i++) {
-      params.push(`%${escapeLikePattern(globalFilter)}%`);
+      params.push(`%${escapeLikePattern(activeGlobalFilter)}%`);
     }
   }
 

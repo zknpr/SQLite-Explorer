@@ -3,6 +3,7 @@ import { backendApi } from './api.js';
 import { updateStatus, showLoading, showErrorState, updateToolbarButtons } from './ui.js';
 import { updatePagination, renderDataGrid } from './grid-render.js';
 import { resetMatchNav } from './match-nav.js';
+import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 
 export async function loadTableColumns() {
     if (!state.selectedTable) return;
@@ -113,17 +114,20 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         const filters = [];
         // Column filters
         for (const [colName, filterValue] of Object.entries(state.columnFilters)) {
-            if (filterValue && filterValue.trim()) {
-                filters.push({ column: colName, value: filterValue });
+            const activeFilterValue = getActiveFilterValue(filterValue);
+            if (activeFilterValue !== undefined) {
+                filters.push({ column: colName, value: activeFilterValue });
             }
         }
+
+        const globalFilter = getActiveFilterValue(state.filterQuery);
 
         // Column names are needed both for the global-filter count and the data query.
         const columnNames = state.tableColumns.map(c => c.name);
 
         const countOptions = {
             filters,
-            globalFilter: state.filterQuery,
+            globalFilter,
             columns: columnNames // Needed for global filter
         };
 
@@ -152,7 +156,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             limit: state.rowsPerPage,
             offset: state.currentPageIndex * state.rowsPerPage,
             filters,
-            globalFilter: state.filterQuery
+            globalFilter
         };
 
         const dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);

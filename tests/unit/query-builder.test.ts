@@ -74,6 +74,23 @@ describe('Query Builder', () => {
       assert.strictEqual(sql, 'SELECT  FROM "products"');
       assert.deepStrictEqual(params, []);
     });
+
+    it('skips whitespace-only filters while preserving padded nonblank values', () => {
+      const inactive = buildSelectQuery('products', {
+        columns: ['name'],
+        filters: [{ column: 'name', value: '   ' }],
+        globalFilter: '\t '
+      });
+      assert.strictEqual(inactive.sql, 'SELECT "name" FROM "products"');
+      assert.deepStrictEqual(inactive.params, []);
+
+      const padded = buildSelectQuery('products', {
+        columns: ['name'],
+        filters: [{ column: 'name', value: ' needle ' }],
+        globalFilter: ' global '
+      });
+      assert.deepStrictEqual(padded.params, ['% needle %', '% global %']);
+    });
   });
 
   describe('buildCountQuery', () => {
@@ -101,6 +118,22 @@ describe('Query Builder', () => {
       const { sql, params } = buildCountQuery('products', options);
       assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM "products"');
       assert.deepStrictEqual(params, []);
+    });
+
+    it('uses the same whitespace policy for count queries', () => {
+      const inactive = buildCountQuery('products', {
+        columns: ['name'],
+        filters: [{ column: 'name', value: '   ' }],
+        globalFilter: '\n'
+      });
+      assert.strictEqual(inactive.sql, 'SELECT COUNT(*) as count FROM "products"');
+      assert.deepStrictEqual(inactive.params, []);
+
+      const padded = buildCountQuery('products', {
+        columns: ['name'],
+        globalFilter: ' needle '
+      });
+      assert.deepStrictEqual(padded.params, ['% needle %']);
     });
   });
 });

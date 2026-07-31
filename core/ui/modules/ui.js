@@ -57,10 +57,14 @@ export function updateToolbarButtons() {
     const btnDeleteRows = document.getElementById('btnDeleteRows');
     const btnExport = document.getElementById('btnExport');
 
-    if (btnAddRow) btnAddRow.disabled = !hasTable;
-    if (btnAddColumn) btnAddColumn.disabled = !hasTable;
+    if (btnAddRow) btnAddRow.disabled = state.isReadOnly || !hasTable;
+    if (btnAddColumn) btnAddColumn.disabled = state.isReadOnly || !hasTable;
     // Enable delete button if rows OR columns are selected
-    if (btnDeleteRows) btnDeleteRows.disabled = !hasTable || (!hasRowSelection && !hasColumnSelection);
+    if (btnDeleteRows) {
+        btnDeleteRows.disabled = state.isReadOnly
+            || !hasTable
+            || (!hasRowSelection && !hasColumnSelection);
+    }
     if (btnExport) btnExport.disabled = !state.selectedTable;
 }
 

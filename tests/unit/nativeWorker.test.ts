@@ -1101,7 +1101,7 @@ FROM orders o`;
             assert.strictEqual(dropped.sql, 'opaque stored view text');
             assert.strictEqual(dropped.selectSql, '');
             assert.ok(connection.calls.some(call => (
-                call.method === 'run' && call.args[0] === 'DROP VIEW "opaque_view"'
+                call.method === 'run' && call.args[0] === 'DROP VIEW main."opaque_view"'
             )));
         } finally {
             connection.dispose();
@@ -1136,7 +1136,7 @@ FROM orders o`;
                     return ['savepoint'];
                 }
                 if (call.method === 'queryBatch') return ['snapshot'];
-                if (call.method === 'run' && sql === 'DROP VIEW "drop_order_view"') {
+                if (call.method === 'run' && sql === 'DROP VIEW main."drop_order_view"') {
                     return ['drop'];
                 }
                 if (call.method === 'run' && /^RELEASE "sp_drop_view_/.test(sql)) {
@@ -1230,7 +1230,7 @@ FROM orders o`;
             }
             if (call.method === 'run' || call.method === 'runSingle') {
                 const sql = String(call.method === 'run' ? call.args[0] : call.args[1]);
-                if (sql === 'DROP VIEW "temp native view"') {
+                if (sql === 'DROP VIEW main."temp native view"') {
                     tempTriggerPresent = false;
                 } else if (sql.startsWith('CREATE VIEW "temp native view"')) {
                     currentViewSql = sql;
@@ -1306,7 +1306,7 @@ FROM orders o`;
 
             if (call.method === 'run' || call.method === 'runSingle') {
                 const sql = String(call.method === 'run' ? call.args[0] : call.args[1]);
-                if (sql === 'DROP VIEW "user names"') {
+                if (sql === 'DROP VIEW main."user names"') {
                     triggerPresent = false;
                 } else if (sql.startsWith('CREATE VIEW "user names" ')) {
                     currentViewSql = sql;
@@ -1338,7 +1338,7 @@ FROM orders o`;
                 .filter(call => call.method === 'run' || call.method === 'runSingle')
                 .map(call => String(call.method === 'run' ? call.args[0] : call.args[1]));
             assert.match(runSql[0], /^SAVEPOINT "sp_edit_view_/);
-            assert.strictEqual(runSql[1], 'DROP VIEW "user names"');
+            assert.strictEqual(runSql[1], 'DROP VIEW main."user names"');
             assert.strictEqual(
                 runSql[2],
                 'CREATE VIEW "user names" ("user id", "display name") AS SELECT id, name, upper(name) AS display_name FROM users'

@@ -16,12 +16,14 @@ import {
     buildHighlightMatcher,
     formatCellValueAsText
 } from './utils.js';
+import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 
 function activeTerm(scope) {
     const value = scope === 'global' ? state.filterQuery : state.columnFilters[scope];
-    // SQLite receives the filter verbatim. Lowercasing is only for the local
-    // case-insensitive comparison; trimming would change which text is matched.
-    return String(value ?? '').toLowerCase();
+    const activeValue = getActiveFilterValue(value);
+    // Lowercasing is only for the local case-insensitive comparison. The active
+    // value itself stays untrimmed, matching the exact text sent to SQLite.
+    return activeValue?.toLowerCase() ?? '';
 }
 
 function formatSqliteReal(significand, exponent, negative) {

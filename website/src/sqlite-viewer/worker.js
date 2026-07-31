@@ -18,11 +18,13 @@ import {
   buildCreateViewSql,
   extractViewColumnListSql,
   extractViewSelectSql,
+  escapeMainViewIdentifier,
   mapViewTriggerRows,
   VIEW_TRIGGER_SCHEMA_QUERIES,
   normalizeViewSelectSql
 } from '../../../src/core/view-utils.ts';
 import { escapeLikePattern } from '../../../src/core/sql-utils.ts';
+import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 
 // ============================================================================
 // Configuration
@@ -246,6 +248,12 @@ async function initializeDatabase(filename, config) {
     // Create empty database
     db = new SQL.Database();
   }
+  if (readOnlyMode) {
+    // Defense in depth for every current and future RPC path. Public mutators
+    // still fail early with operation-specific errors, while SQLite itself
+    // refuses an accidentally unguarded write on this connection.
+    db.run('PRAGMA query_only = ON');
+  }
 
   return {
     operations: {},
@@ -262,6 +270,11 @@ async function initializeDatabase(filename, config) {
  */
 async function runQuery(sql, params = []) {
   if (!db) throw new Error('No database initialized');
+  if (readOnlyMode) {
+    // This low-level test/debug RPC accepts arbitrary SQL, so there is no safe
+    // statement-level capability distinction to infer in JavaScript.
+    throw new Error('Ad hoc SQL execution is unavailable because the database is read-only');
+  }
 
   try {
     const results = db.exec(sql, params);
@@ -465,16 +478,18 @@ async function fetchTableData(table, options = {}) {
   // Column-specific filters: [{column: 'name', value: 'foo'}, ...]
   if (filters && filters.length > 0) {
     for (const f of filters) {
-      if (f.column && f.value) {
+      const filterValue = getActiveFilterValue(f.value);
+      if (f.column && filterValue !== undefined) {
         const safeCol = f.column.replace(/"/g, '""');
         whereClauses.push(`"${safeCol}" LIKE ? ESCAPE '\\'`);
-        params.push(`%${escapeLikePattern(f.value)}%`);
+        params.push(`%${escapeLikePattern(filterValue)}%`);
       }
     }
   }
 
   // Global filter: search across all text columns
-  if (globalFilter && globalFilter.trim()) {
+  const activeGlobalFilter = getActiveFilterValue(globalFilter);
+  if (activeGlobalFilter !== undefined) {
     // Get column names to search
     const searchCols = columns ? columns.filter(c => c !== 'rowid') : [];
     if (searchCols.length > 0) {
@@ -485,7 +500,7 @@ async function fetchTableData(table, options = {}) {
       whereClauses.push(`(${globalClauses.join(' OR ')})`);
       // Add the global filter parameter for each column in the OR clause
       for (let i = 0; i < searchCols.length; i++) {
-        params.push(`%${escapeLikePattern(globalFilter)}%`);
+        params.push(`%${escapeLikePattern(activeGlobalFilter)}%`);
       }
     }
   }
@@ -540,16 +555,18 @@ async function fetchTableCount(table, options = {}) {
   // Column-specific filters
   if (filters && filters.length > 0) {
     for (const f of filters) {
-      if (f.column && f.value) {
+      const filterValue = getActiveFilterValue(f.value);
+      if (f.column && filterValue !== undefined) {
         const safeCol = f.column.replace(/"/g, '""');
         whereClauses.push(`"${safeCol}" LIKE ? ESCAPE '\\'`);
-        params.push(`%${escapeLikePattern(f.value)}%`);
+        params.push(`%${escapeLikePattern(filterValue)}%`);
       }
     }
   }
 
   // Global filter
-  if (globalFilter && globalFilter.trim()) {
+  const activeGlobalFilter = getActiveFilterValue(globalFilter);
+  if (activeGlobalFilter !== undefined) {
     const searchCols = columns.filter(c => c !== 'rowid');
     if (searchCols.length > 0) {
       const globalClauses = searchCols.map(c => {
@@ -559,7 +576,7 @@ async function fetchTableCount(table, options = {}) {
       whereClauses.push(`(${globalClauses.join(' OR ')})`);
       // Add the global filter parameter for each column in the OR clause
       for (let i = 0; i < searchCols.length; i++) {
-        params.push(`%${escapeLikePattern(globalFilter)}%`);
+        params.push(`%${escapeLikePattern(activeGlobalFilter)}%`);
       }
     }
   }
@@ -683,6 +700,7 @@ async function getPragmas() {
  */
 async function setPragma(pragma, value) {
   if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Pragma updates');
 
   // Sanitize pragma name
   const safePragma = pragma.replace(/[^a-z_]/gi, '');
@@ -699,6 +717,7 @@ async function setPragma(pragma, value) {
  */
 async function updateCell(table, rowId, column, value) {
   if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Cell updates');
 
   const safeTable = table.replace(/"/g, '""');
   const safeColumn = column.replace(/"/g, '""');
@@ -718,6 +737,7 @@ async function updateCell(table, rowId, column, value) {
  */
 async function insertRow(table, data) {
   if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Row insertion');
 
   const safeTable = table.replace(/"/g, '""');
   const columns = Object.keys(data);
@@ -748,6 +768,7 @@ async function insertRow(table, data) {
  */
 async function deleteRows(table, rowIds) {
   if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Row deletion');
 
   const safeTable = table.replace(/"/g, '""');
   const placeholders = rowIds.map(() => '?').join(', ');
@@ -767,6 +788,7 @@ async function deleteRows(table, rowIds) {
  */
 async function deleteColumns(table, columns) {
   if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Column deletion');
 
   // Get current table info
   const tableInfo = await getTableInfo(table);
@@ -801,6 +823,7 @@ async function deleteColumns(table, columns) {
  */
 async function createTable(table, columns) {
   if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Table creation');
 
   const safeTable = table.replace(/"/g, '""');
   const columnDefs = columns.map(col => {
@@ -874,9 +897,9 @@ function resolveExistingViewForIntent(view, intent) {
   };
 }
 
-function assertWritableViewMutation(operation) {
+function assertWritableMutation(operation) {
   if (readOnlyMode) {
-    throw new Error(`View ${operation} is unavailable because the database is read-only`);
+    throw new Error(`${operation} is unavailable because the database is read-only`);
   }
 }
 
@@ -950,7 +973,7 @@ async function previewViewDefinition(view, selectSql, limit = 50, intent = 'edit
 
 async function createView(view, selectSql) {
   if (!db) throw new Error('No database initialized');
-  assertWritableViewMutation('creation');
+  assertWritableMutation('View creation');
   const body = normalizeViewSelectSql(selectSql);
   compileSingleStatement(`EXPLAIN SELECT * FROM (${body}\n) LIMIT 0`);
   const savepointName = createViewSavepointName('sp_create_view');
@@ -975,7 +998,7 @@ async function editView(
   expectedTriggers
 ) {
   if (!db) throw new Error('No database initialized');
-  assertWritableViewMutation('editing');
+  assertWritableMutation('View editing');
   const body = normalizeViewSelectSql(selectSql);
   compileSingleStatement(`EXPLAIN SELECT * FROM (${body}\n) LIMIT 0`);
   const savepointName = createViewSavepointName('sp_edit_view');
@@ -988,7 +1011,7 @@ async function editView(
       expectedTriggers,
       before.triggers
     );
-    runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+    runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
     runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
     compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
     if (preserveTriggers) {
@@ -1007,12 +1030,12 @@ async function editView(
 
 async function dropView(view) {
   if (!db) throw new Error('No database initialized');
-  assertWritableViewMutation('deletion');
+  assertWritableMutation('View deletion');
   const savepointName = createViewSavepointName('sp_drop_view');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     const before = await readViewDefinition(view, true);
-    runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+    runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
     runSingleStatement(`RELEASE ${savepointName}`);
     return before;
   } catch (error) {
@@ -1029,6 +1052,7 @@ async function dropView(view) {
  */
 async function updateCellBatch(table, updates) {
   if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Batch cell updates');
 
   db.run('BEGIN TRANSACTION');
   try {
@@ -1052,6 +1076,7 @@ async function updateCellBatch(table, updates) {
  */
 async function addColumn(table, column, type, defaultValue) {
   if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Column creation');
 
   validateSqlType(type);
 

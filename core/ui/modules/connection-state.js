@@ -1,5 +1,25 @@
 import { state } from './state.js';
 
+const MUTATION_CONTROL_IDS = [
+    'btnOpenCreateTable',
+    'btnOpenCreateView',
+    'btnApplyBatchUpdate',
+    'btnSubmitAddRow',
+    'btnSubmitDelete',
+    'btnAddColumnDef',
+    'btnSubmitCreateTable',
+    'btnSubmitAddColumn',
+    'cellPreviewSaveBtn',
+    'blob-replace-btn'
+];
+
+function updateMutationControlCapabilities() {
+    for (const id of MUTATION_CONTROL_IDS) {
+        const control = document.getElementById(id);
+        if (control) control.disabled = state.isReadOnly;
+    }
+}
+
 /** Apply the connection metadata shared by the extension and demo entry points. */
 export function applyConnectionResult(result) {
     const connected = result?.connected === true;
@@ -13,7 +33,6 @@ export function applyConnectionResult(result) {
             ? result.isReadOnly
             : true;
 
-    const createViewButton = document.getElementById('btnOpenCreateView');
-    if (createViewButton) createViewButton.disabled = state.isReadOnly;
+    updateMutationControlCapabilities();
     return connected;
 }

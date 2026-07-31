@@ -168,11 +168,16 @@ describe('view operations', () => {
             await engine.createView('user_names', 'SELECT id, name FROM users');
             await engine.executeQuery(`
                 CREATE TRIGGER "insert user name"
-                INSTEAD OF INSERT ON "user_names"
+                INSTEAD OF INSERT ON "USER_NAMES"
                 BEGIN
                     INSERT INTO users (id, name) VALUES (NEW.id, NEW.name);
                 END
             `);
+
+            assert.strictEqual(await readScalar(
+                engine,
+                "SELECT tbl_name FROM sqlite_schema WHERE name = 'insert user name'"
+            ), 'USER_NAMES');
 
             const result = await engine.editView(
                 'user_names',
@@ -202,7 +207,7 @@ describe('view operations', () => {
             );
             await engine.executeQuery(`
                 CREATE TEMP TRIGGER temp_trigger_view_insert
-                INSTEAD OF INSERT ON temp_trigger_view
+                INSTEAD OF INSERT ON TEMP_TRIGGER_VIEW
                 BEGIN
                     INSERT INTO temp_trigger_log (value) VALUES (NEW.value);
                 END
@@ -312,6 +317,61 @@ describe('view operations', () => {
 
             assert.deepStrictEqual(preview.headers, ['public_id', 'public_name']);
             assert.deepStrictEqual(preview.rows, [[2, 'after']]);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('edits the main view without replacing a same-named TEMP view', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.createView('shadowed_view', "SELECT 'main-before' AS value");
+            await engine.executeQuery(
+                "CREATE TEMP VIEW shadowed_view AS SELECT 'temp-value' AS value"
+            );
+
+            await engine.editView(
+                'shadowed_view',
+                "SELECT 'main-after' AS value",
+                true
+            );
+
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM main.shadowed_view'),
+                'main-after'
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM temp.shadowed_view'),
+                'temp-value'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('drops the main view without deleting a same-named TEMP view', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.createView('shadowed_view', "SELECT 'main-value' AS value");
+            await engine.executeQuery(
+                "CREATE TEMP VIEW shadowed_view AS SELECT 'temp-value' AS value"
+            );
+
+            const dropped = await engine.dropView('shadowed_view');
+
+            assert.strictEqual(dropped.selectSql, "SELECT 'main-value' AS value");
+            assert.strictEqual(await readScalar(
+                engine,
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'shadowed_view'"
+            ), 0);
+            assert.strictEqual(await readScalar(
+                engine,
+                "SELECT count(*) FROM sqlite_temp_schema WHERE type = 'view' AND name = 'shadowed_view'"
+            ), 1);
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM temp.shadowed_view'),
+                'temp-value'
+            );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
         }
@@ -759,7 +819,7 @@ describe('view operations', () => {
                 return readViewDefinition(...args);
             });
             mock.method(target, 'runSingleStatement', (sql: string) => {
-                if (sql === 'DROP VIEW "drop_order_view"') order.push('drop');
+                if (sql === 'DROP VIEW main."drop_order_view"') order.push('drop');
                 return runSingleStatement(sql);
             });
 

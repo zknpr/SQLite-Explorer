@@ -23,6 +23,18 @@ describe('filter match navigation', () => {
         delete (globalThis as any).document;
     });
 
+    it('uses the whitespace policy for highlighting terms', async () => {
+        const utilsModulePath = '../../core/ui/modules/utils.js';
+        const { buildHighlightMatcher } = await import(utilsModulePath);
+
+        assert.strictEqual(buildHighlightMatcher(['   ', '\t']), null);
+        const padded = buildHighlightMatcher([' needle ']);
+        assert.ok(padded);
+        assert.strictEqual(padded.test('x needle y'), true);
+        padded.lastIndex = 0;
+        assert.strictEqual(padded.test('needle'), false);
+    });
+
     it('navigates to a term beyond the rendered text truncation point', async () => {
         const textSpan = {
             children: [] as any[],
@@ -100,7 +112,7 @@ describe('filter match navigation', () => {
         );
     });
 
-    it('preserves literal whitespace in global navigation terms', async () => {
+    it('ignores whitespace-only navigation terms while preserving padded nonblank terms', async () => {
         const cells = new Map([
             ['cell-0-0', { classList: createClassList(), scrollIntoView() {} }],
             ['cell-0-1', { classList: createClassList(), scrollIntoView() {} }]
@@ -138,7 +150,17 @@ describe('filter match navigation', () => {
 
         navigateMatches('global');
 
-        assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
+        assert.deepStrictEqual(state.matchNav.matches, []);
+        assert.strictEqual(state.matchNav.term, '');
+
+        state.filterQuery = '';
+        state.columnFilters = { spaced: '\t ' };
+        resetMatchNav();
+
+        navigateMatches('spaced');
+
+        assert.deepStrictEqual(state.matchNav.matches, []);
+        assert.strictEqual(state.matchNav.term, '');
     });
 
     it('matches the stored date value when display formatting changes its text', async () => {

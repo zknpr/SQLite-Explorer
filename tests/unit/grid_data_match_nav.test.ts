@@ -25,6 +25,71 @@ describe('grid data match cache', () => {
         mock.restoreAll();
     });
 
+    it('omits whitespace-only filters from both count and data requests', async () => {
+        const elements: Record<string, any> = {
+            pageIndicator: { textContent: '' },
+            btnFirst: { disabled: false },
+            btnPrev: { disabled: false },
+            btnNext: { disabled: false },
+            btnLast: { disabled: false },
+            statusText: { textContent: '' },
+            filterMatchCounter: { textContent: '' }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) { return elements[id] ?? null; },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const gridDataModulePath = '../../core/ui/modules/grid-data.js';
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { loadTableData } = await import(gridDataModulePath);
+        const calls: any[] = [];
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        backendApi.fetchTableCount = async (_table: string, options: any) => {
+            calls.push(options);
+            return 1;
+        };
+        backendApi.fetchTableData = async (_table: string, options: any) => {
+            calls.push(options);
+            return { rows: [[1, ' needle ']] };
+        };
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.renderedTable = null;
+        state.tableColumns = [
+            { name: 'blank', type: 'TEXT' },
+            { name: 'padded', type: 'TEXT' }
+        ];
+        state.currentPageIndex = 0;
+        state.rowsPerPage = 500;
+        state.columnFilters = { blank: '   ', padded: ' needle ' };
+        state.filterQuery = '\t ';
+        state.isLoadingData = false;
+        state.isGridReloading = false;
+
+        try {
+            assert.strictEqual(await loadTableData(false, false), true);
+            assert.strictEqual(calls.length, 2);
+            for (const options of calls) {
+                assert.deepStrictEqual(options.filters, [
+                    { column: 'padded', value: ' needle ' }
+                ]);
+                assert.strictEqual(options.globalFilter, undefined);
+            }
+        } finally {
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
+            state.selectedTable = null;
+            state.isLoadingData = false;
+            state.isGridReloading = false;
+            state.editingCellInfo = null;
+        }
+    });
+
     it('invalidates cached match coordinates after replacement data is applied', async () => {
         const activeCell = { classList: createClassList(['active-match-cell']) };
         const counter = { textContent: '1/1' };

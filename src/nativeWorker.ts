@@ -51,6 +51,7 @@ import {
   buildCreateViewSql,
   extractViewColumnListSql,
   extractViewSelectSql,
+  escapeMainViewIdentifier,
   mapViewTriggerRows,
   VIEW_TRIGGER_SCHEMA_QUERIES,
   normalizeViewSelectSql
@@ -632,7 +633,7 @@ export async function createNativeDatabaseConnection(
         const savepointName = createSavepointName('sp_restore_view');
         await worker.call('run', [`SAVEPOINT ${savepointName}`]);
         try {
-          await worker.call('run', [`DROP VIEW IF EXISTS ${escapeIdentifier(definition.identifier)}`]);
+          await worker.call('run', [`DROP VIEW IF EXISTS ${escapeMainViewIdentifier(definition.identifier)}`]);
           await runNativeSingleStatement(definition.sql);
           await compileNativeView(definition.identifier);
           for (const trigger of definition.triggers) {
@@ -807,7 +808,7 @@ export async function createNativeDatabaseConnection(
                 break;
 
             case 'view_create':
-                await worker.call('run', [`DROP VIEW IF EXISTS ${escapeIdentifier(targetTable)}`]);
+                await worker.call('run', [`DROP VIEW IF EXISTS ${escapeMainViewIdentifier(targetTable)}`]);
                 break;
 
             case 'view_edit':
@@ -896,7 +897,7 @@ export async function createNativeDatabaseConnection(
               break;
 
             case 'view_drop':
-              await worker.call('run', [`DROP VIEW IF EXISTS ${escapeIdentifier(targetTable)}`]);
+              await worker.call('run', [`DROP VIEW IF EXISTS ${escapeMainViewIdentifier(targetTable)}`]);
               break;
           }
         },
@@ -1239,7 +1240,7 @@ export async function createNativeDatabaseConnection(
               expectedTriggers,
               before.triggers
             );
-            await worker.call('run', [`DROP VIEW ${escapeIdentifier(view)}`]);
+            await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
             await runNativeSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
             await compileNativeView(view);
             if (preserveTriggers) {
@@ -1269,7 +1270,7 @@ export async function createNativeDatabaseConnection(
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
             const before = await getNativeViewDefinition(view, true);
-            await worker.call('run', [`DROP VIEW ${escapeIdentifier(view)}`]);
+            await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
             await worker.call('run', [`RELEASE ${savepointName}`]);
             return before;
           } catch (err) {

@@ -288,6 +288,42 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             );
         });
 
+        await testContext.test('edits and drops main views without touching a TEMP shadow', async () => {
+            await engine.createView(
+                'native_shadowed_view',
+                "SELECT 'main-before' AS value"
+            );
+            await engine.executeQuery(
+                "CREATE TEMP VIEW native_shadowed_view AS SELECT 'temp-value' AS value"
+            );
+
+            await engine.editView(
+                'native_shadowed_view',
+                "SELECT 'main-after' AS value",
+                true
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM main.native_shadowed_view'))[0].rows,
+                [['main-after']]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM temp.native_shadowed_view'))[0].rows,
+                [['temp-value']]
+            );
+
+            await engine.dropView('native_shadowed_view');
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'native_shadowed_view'"
+                ))[0].rows,
+                [[0]]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM temp.native_shadowed_view'))[0].rows,
+                [['temp-value']]
+            );
+        });
+
         await testContext.test('round-trips the incident multiline view SQL exactly', async () => {
             await engine.createView('order_summary', INITIAL_VIEW_BODY);
             const initial = await engine.getViewDefinition('order_summary');
@@ -374,7 +410,7 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             );
             await engine.executeQuery(
                 'CREATE TEMP TRIGGER native_temp_trigger_insert ' +
-                'INSTEAD OF INSERT ON native_temp_trigger_view ' +
+                'INSTEAD OF INSERT ON NATIVE_TEMP_TRIGGER_VIEW ' +
                 'BEGIN INSERT INTO native_temp_trigger_log VALUES (NEW.value); END'
             );
 

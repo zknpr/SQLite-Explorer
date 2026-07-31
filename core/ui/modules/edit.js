@@ -40,7 +40,7 @@ export function initEdit() {
 // ================================================================
 
 export function startCellEdit(rowIdx, colIdx, rowId) {
-    if (state.selectedTableType !== 'table') {
+    if (state.isReadOnly || state.selectedTableType !== 'table') {
         updateStatus('Views are read-only');
         return;
     }
@@ -373,7 +373,7 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
 
     textarea.value = displayValue;
 
-    const isReadonly = state.selectedTableType !== 'table';
+    const isReadonly = state.isReadOnly || state.selectedTableType !== 'table';
     textarea.readOnly = isReadonly;
     if (isReadonly) {
         textarea.classList.add('readonly');

@@ -39,7 +39,7 @@ function onDragOver(e) {
     // Don't offer a drop target while a grid reload is in flight: the cells under
     // the cursor are stale and about to be replaced. Leave dropEffect unset so the
     // cursor shows "no-drop", and clear any lingering highlight.
-    if (state.isGridReloading) {
+    if (state.isReadOnly || state.isGridReloading) {
         if (lastHighlightedCell) {
             lastHighlightedCell.classList.remove('drag-over');
             lastHighlightedCell = null;
@@ -79,7 +79,7 @@ async function onDrop(e) {
     // Ignore drops while a grid reload is in flight: the targeted cell belongs to
     // the stale result set about to be replaced, so the upload would land on the
     // wrong row/column once the new data renders.
-    if (state.isGridReloading) return;
+    if (state.isReadOnly || state.isGridReloading) return;
 
     const cell = e.target.closest('.data-cell');
     if (!cell || cell.classList.contains('row-number')) {
@@ -183,7 +183,7 @@ async function uploadDataToCell(cell, fileName, uint8Array) {
     const rowId = getRowId(row, rowIdx);
     const column = state.tableColumns[colIdx];
 
-    if (state.selectedTableType !== 'table') {
+    if (state.isReadOnly || state.selectedTableType !== 'table') {
         updateStatus('Cannot upload to a view');
         return;
     }

@@ -4,14 +4,19 @@ import type { CellValue, ViewDefinitionIntent, ViewTriggerDefinition } from './t
 /** Canonical trigger sources, ordered by the schema in which they are replayed. */
 export const VIEW_TRIGGER_SCHEMA_QUERIES = [
   {
-    sql: "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
+    sql: "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE ORDER BY rowid",
     temporary: false
   },
   {
-    sql: "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY rowid",
+    sql: "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE ORDER BY rowid",
     temporary: true
   }
 ] as const;
+
+/** Qualify a persistent view so a same-named TEMP view cannot shadow DDL. */
+export function escapeMainViewIdentifier(view: string): string {
+  return `main.${escapeIdentifier(view)}`;
+}
 
 /** Map canonical trigger-query rows while keeping temp-schema provenance intact. */
 export function mapViewTriggerRows(

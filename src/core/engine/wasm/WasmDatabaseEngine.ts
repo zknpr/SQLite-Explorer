@@ -38,6 +38,7 @@ import {
   buildCreateViewSql,
   extractViewColumnListSql,
   extractViewSelectSql,
+  escapeMainViewIdentifier,
   mapViewTriggerRows,
   VIEW_TRIGGER_SCHEMA_QUERIES,
   normalizeViewSelectSql
@@ -1121,7 +1122,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         expectedTriggers,
         before.triggers
       );
-      this.runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+      this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
       this.runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
       if (preserveTriggers) {
@@ -1143,7 +1144,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const before = await this.readViewDefinition(view, true);
-      this.runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+      this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
       await this.executeQuery(`RELEASE ${savepointName}`);
       return before;
     } catch (err) {
@@ -1153,7 +1154,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   private async dropViewIfExists(view: string): Promise<void> {
-    this.runSingleStatement(`DROP VIEW IF EXISTS ${escapeIdentifier(view)}`);
+    this.runSingleStatement(`DROP VIEW IF EXISTS ${escapeMainViewIdentifier(view)}`);
   }
 
   /** Restore an exact tracked view state for undo, redo, and hot-exit replay. */

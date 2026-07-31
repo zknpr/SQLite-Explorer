@@ -106,7 +106,7 @@ export async function copySelectedRowsToClipboard() {
 
 export async function clearSelectedCellValues() {
     if (state.selectedCells.length === 0) return;
-    if (state.selectedTableType !== 'table') {
+    if (state.isReadOnly || state.selectedTableType !== 'table') {
         updateStatus('Views are read-only');
         return;
     }

@@ -308,6 +308,40 @@ describe('web demo view worker', () => {
         assert.strictEqual(await workerScalar(worker, 'SELECT value FROM self_shadowed_view'), 7);
     });
 
+    it('edits and drops main views without touching same-named TEMP views', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('createView', 'demo_shadowed_view', "SELECT 'main-before' AS value");
+        await worker.invoke(
+            'runQuery',
+            "CREATE TEMP VIEW demo_shadowed_view AS SELECT 'temp-value' AS value"
+        );
+
+        await worker.invoke(
+            'editView',
+            'demo_shadowed_view',
+            "SELECT 'main-after' AS value",
+            true
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_shadowed_view'),
+            'main-after'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_shadowed_view'),
+            'temp-value'
+        );
+
+        await worker.invoke('dropView', 'demo_shadowed_view');
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'demo_shadowed_view'"
+        ), 0);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_shadowed_view'),
+            'temp-value'
+        );
+    });
+
     it('treats percent and underscore filters as literal LIKE text', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
@@ -343,6 +377,45 @@ describe('web demo view worker', () => {
             [['under_score']]
         );
         assert.strictEqual(underscoreCount, 1);
+    });
+
+    it('treats whitespace-only filters as inactive but preserves padded terms', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE whitespace_filters (value TEXT); " +
+            "INSERT INTO whitespace_filters VALUES ('needle'), (' needle '), ('other')"
+        );
+
+        for (const options of [
+            { columns: ['value'], globalFilter: '   ' },
+            { columns: ['value'], filters: [{ column: 'value', value: '   ' }] }
+        ]) {
+            const data = await worker.invoke('fetchTableData', 'whitespace_filters', {
+                ...options,
+                limit: 100,
+                offset: 0
+            });
+            const count = await worker.invoke('fetchTableCount', 'whitespace_filters', options);
+            assert.strictEqual(data.rows.length, 3);
+            assert.strictEqual(count, 3);
+        }
+
+        const padded = await worker.invoke('fetchTableData', 'whitespace_filters', {
+            columns: ['value'],
+            globalFilter: ' needle ',
+            limit: 100,
+            offset: 0
+        });
+        const paddedCount = await worker.invoke('fetchTableCount', 'whitespace_filters', {
+            columns: ['value'],
+            globalFilter: ' needle '
+        });
+        assert.deepStrictEqual(
+            Array.from(padded.rows, (row: unknown[]) => Array.from(row)),
+            [[' needle ']]
+        );
+        assert.strictEqual(paddedCount, 1);
     });
 
     it('validates the CREATE VIEW construct and leaves the schema unchanged', async () => {
@@ -467,14 +540,20 @@ describe('web demo view worker', () => {
             Array.from(preview.rows, (row: unknown[]) => Array.from(row)),
             [[1]]
         );
-        assert.strictEqual(await workerScalar(
-            worker,
-            "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'read_only_view'"
-        ), 0);
+        const schema = await worker.invoke('fetchSchema');
+        assert.strictEqual(
+            schema.views.some((view: { identifier: string }) => view.identifier === 'read_only_view'),
+            false
+        );
     });
 
-    it('rejects every demo view mutation when initialized read-only', async () => {
+    it('rejects every demo mutation when initialized read-only', async () => {
         const writable = await createWorkerHarness();
+        await writable.invoke(
+            'runQuery',
+            "CREATE TABLE read_only_rows (value TEXT, spare TEXT); " +
+            "INSERT INTO read_only_rows VALUES ('original', 'keep')"
+        );
         await writable.invoke('createView', 'read_only_existing', 'SELECT 1 AS value');
         const content = await writable.invoke('exportDatabase', 'test.db');
         const worker = await createWorkerHarness({
@@ -482,27 +561,55 @@ describe('web demo view worker', () => {
             readOnlyMode: true
         });
 
-        await assert.rejects(
-            worker.invoke('createView', 'read_only_new', 'SELECT 2 AS value'),
-            /view creation is unavailable because the database is read-only/i
-        );
-        await assert.rejects(
-            worker.invoke('editView', 'read_only_existing', 'SELECT 2 AS value'),
-            /view editing is unavailable because the database is read-only/i
-        );
-        await assert.rejects(
-            worker.invoke('dropView', 'read_only_existing'),
-            /view deletion is unavailable because the database is read-only/i
-        );
+        const mutations: Array<[string, ...unknown[]]> = [
+            ['runQuery', "UPDATE read_only_rows SET value = 'raw-sql'"],
+            ['setPragma', 'foreign_keys', 1],
+            ['updateCell', 'read_only_rows', 1, 'value', 'changed'],
+            ['insertRow', 'read_only_rows', { value: 'inserted' }],
+            ['deleteRows', 'read_only_rows', [1]],
+            ['deleteColumns', 'read_only_rows', ['spare']],
+            ['createTable', 'read_only_new_table', [{ name: 'id', type: 'INTEGER' }]],
+            ['updateCellBatch', 'read_only_rows', [{ rowId: 1, column: 'value', value: 'batch' }]],
+            ['addColumn', 'read_only_rows', 'added', 'TEXT'],
+            ['createView', 'read_only_new', 'SELECT 2 AS value'],
+            ['editView', 'read_only_existing', 'SELECT 2 AS value'],
+            ['dropView', 'read_only_existing']
+        ];
+        for (const [method, ...args] of mutations) {
+            await assert.rejects(
+                worker.invoke(method, ...args),
+                /unavailable because the database is read-only/i,
+                method
+            );
+        }
 
-        assert.strictEqual(
-            await workerScalar(worker, 'SELECT value FROM read_only_existing'),
-            1
+        const rows = await worker.invoke('fetchTableData', 'read_only_rows', {
+            columns: ['value', 'spare'],
+            limit: 10,
+            offset: 0
+        });
+        assert.deepStrictEqual(
+            Array.from(rows.rows, (row: unknown[]) => Array.from(row)),
+            [['original', 'keep']]
         );
-        assert.strictEqual(await workerScalar(
-            worker,
-            "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'read_only_new'"
-        ), 0);
+        const tableInfo = await worker.invoke('getTableInfo', 'read_only_rows');
+        assert.deepStrictEqual(
+            Array.from(tableInfo, (column: { identifier: string }) => column.identifier),
+            ['value', 'spare']
+        );
+        const schema = await worker.invoke('fetchSchema');
+        assert.strictEqual(
+            schema.tables.some((table: { identifier: string }) => table.identifier === 'read_only_new_table'),
+            false
+        );
+        assert.strictEqual(
+            schema.views.some((view: { identifier: string }) => view.identifier === 'read_only_new'),
+            false
+        );
+        assert.strictEqual(
+            schema.views.some((view: { identifier: string }) => view.identifier === 'read_only_existing'),
+            true
+        );
     });
 
     it('bounds preview stepping with the configured query timeout', async () => {
@@ -568,7 +675,7 @@ describe('web demo view worker', () => {
                     prepare(sql: string, params?: any) {
                         if (!sql.includes('sqlite_explorer_boundary_')) {
                             if (/^SAVEPOINT "sp_drop_view_/.test(sql)) order.push('savepoint');
-                            if (sql === 'DROP VIEW "drop_order_view"') order.push('drop');
+                            if (sql === 'DROP VIEW main."drop_order_view"') order.push('drop');
                             if (/^RELEASE "sp_drop_view_/.test(sql)) order.push('release');
                         }
                         return super.prepare(sql, params);
@@ -595,11 +702,11 @@ describe('web demo view worker', () => {
         await worker.invoke('runQuery', 'CREATE VIEW trigger_order AS SELECT 1 AS value');
         await worker.invoke(
             'runQuery',
-            "CREATE TRIGGER z_created_first INSTEAD OF INSERT ON trigger_order BEGIN INSERT INTO trigger_log VALUES ('z'); END"
+            "CREATE TRIGGER z_created_first INSTEAD OF INSERT ON TRIGGER_ORDER BEGIN INSERT INTO trigger_log VALUES ('z'); END"
         );
         await worker.invoke(
             'runQuery',
-            "CREATE TRIGGER a_created_second INSTEAD OF INSERT ON trigger_order BEGIN INSERT INTO trigger_log VALUES ('a'); END"
+            "CREATE TRIGGER a_created_second INSTEAD OF INSERT ON TRIGGER_ORDER BEGIN INSERT INTO trigger_log VALUES ('a'); END"
         );
 
         const before = await worker.invoke('getViewDefinition', 'trigger_order');
@@ -632,7 +739,7 @@ describe('web demo view worker', () => {
         await worker.invoke(
             'runQuery',
             'CREATE TEMP TRIGGER demo_temp_trigger_insert ' +
-            'INSTEAD OF INSERT ON demo_temp_trigger_view ' +
+            'INSTEAD OF INSERT ON DEMO_TEMP_TRIGGER_VIEW ' +
             'BEGIN INSERT INTO demo_temp_trigger_log VALUES (NEW.value); END'
         );
 

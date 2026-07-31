@@ -1,6 +1,7 @@
 /**
  * Utility Functions
  */
+import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 
 /**
  * Escape HTML special characters to prevent XSS attacks.
@@ -35,10 +36,8 @@ function escapeRegExp(str) {
 export function buildHighlightMatcher(terms) {
     const seen = new Set();
     for (const t of terms) {
-        const term = t === null || t === undefined ? '' : String(t);
-        // Filter values are passed to SQLite verbatim. Preserve their whitespace
-        // here too, otherwise highlighting/navigation describes a different query.
-        if (term) seen.add(term);
+        const term = getActiveFilterValue(t);
+        if (term !== undefined) seen.add(term);
     }
     if (seen.size === 0) return null;
     const ordered = [...seen].sort((a, b) => b.length - a.length);
