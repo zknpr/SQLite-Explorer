@@ -4,7 +4,18 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # Pinned =1.110.0: must not exceed engines.vscode (^1.110.0) or vsce
+      # refuses to package. Raise together with a deliberate engines bump.
+      - dependency-name: "@types/vscode"
+      # TS 7 (native compiler) is a toolchain migration, not a routine bump.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: "npm"
     directory: "/website"
     schedule:
       interval: "weekly"
+    ignore:
+      # Same TS 7 migration gate as the root manifest.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]

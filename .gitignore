@@ -39,3 +39,4 @@ tmp/
 _repro_*.html
 _endpoint_bundle.mjs
 vscode-web-test-db.png
+docs/superpowers/
