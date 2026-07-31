@@ -24,10 +24,19 @@ describe('filter match navigation', () => {
     });
 
     it('navigates to a term beyond the rendered text truncation point', async () => {
+        const textSpan = {
+            children: [] as any[],
+            appendChild(child: any) { this.children.push(child); },
+            replaceChildren(...children: any[]) { this.children = children; }
+        };
         const cell = {
             classList: createClassList(),
+            dataset: { rowidx: '0', colidx: '0' },
             scrollIntoViewCalls: 0,
-            scrollIntoView() { this.scrollIntoViewCalls++; }
+            scrollIntoView() { this.scrollIntoViewCalls++; },
+            querySelector(selector: string) {
+                return selector === '.cell-text' ? textSpan : null;
+            }
         };
         const counter = { textContent: '' };
         (globalThis as any).document = {
@@ -41,6 +50,12 @@ describe('filter match navigation', () => {
                     return cell.classList.contains('active-match-cell') ? [cell] : [];
                 }
                 return [];
+            },
+            createTextNode(text: string) {
+                return { textContent: text };
+            },
+            createElement(tag: string) {
+                return { tag, className: '', textContent: '' };
             }
         };
 
@@ -50,7 +65,8 @@ describe('filter match navigation', () => {
         const { state } = await import(stateModulePath);
         const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
         const { formatCellValueAsText } = await import(utilsModulePath);
-        const fullValue = `${'x'.repeat(101)}Needle`;
+        const fullValue = `${'x'.repeat(140)}Needle${'y'.repeat(140)}`;
+        textSpan.children = [{ textContent: formatCellValueAsText(fullValue) }];
 
         state.selectedTableType = 'view';
         state.tableColumns = [{ name: 'notes', type: 'TEXT' }];
@@ -67,6 +83,62 @@ describe('filter match navigation', () => {
         assert.strictEqual(cell.scrollIntoViewCalls, 1);
         assert.strictEqual(formatCellValueAsText(fullValue).endsWith('...'), true);
         assert.strictEqual(formatCellValueAsText(fullValue, null, 'raw', null, false), fullValue);
+        const renderedText = textSpan.children.map(child => child.textContent).join('');
+        assert.strictEqual(renderedText.startsWith('...'), true);
+        assert.strictEqual(renderedText.endsWith('...'), true);
+        assert.strictEqual(renderedText.includes('Needle'), true);
+        assert.ok(
+            textSpan.children.some(child => child.className === 'cell-highlight' && child.textContent === 'Needle'),
+            'the active match should be visibly highlighted inside the excerpt'
+        );
+
+        resetMatchNav();
+        assert.strictEqual(
+            textSpan.children.map(child => child.textContent).join(''),
+            formatCellValueAsText(fullValue),
+            'leaving the active match should restore the normal truncated rendering'
+        );
+    });
+
+    it('preserves literal whitespace in global navigation terms', async () => {
+        const cells = new Map([
+            ['cell-0-0', { classList: createClassList(), scrollIntoView() {} }],
+            ['cell-0-1', { classList: createClassList(), scrollIntoView() {} }]
+        ]);
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return cells.get(id) ?? null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.selectedTableType = 'view';
+        state.tableColumns = [
+            { name: 'compact', type: 'TEXT' },
+            { name: 'padded', type: 'TEXT' }
+        ];
+        state.gridData = [['needle', 'x needle y']];
+        state.columnFilters = {};
+        state.filterQuery = ' needle ';
+        resetMatchNav();
+
+        navigateMatches('global');
+
+        assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 1 }]);
+
+        state.tableColumns = [{ name: 'spaced', type: 'TEXT' }];
+        state.gridData = [['left right']];
+        state.filterQuery = ' ';
+        resetMatchNav();
+
+        navigateMatches('global');
+
+        assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
     });
 
     it('matches the stored date value when display formatting changes its text', async () => {

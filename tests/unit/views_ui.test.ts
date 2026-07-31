@@ -154,6 +154,8 @@ describe('view modal concurrency', () => {
             await Promise.resolve();
             const disabledWhilePending = elements.btnSaveView.disabled;
             const editorDisabledWhilePending = elements.viewSelectSql.disabled;
+            const nameDisabledWhilePending = elements.viewNameInput.disabled;
+            const preserveTriggersDisabledWhilePending = elements.viewPreserveTriggers.disabled;
             validation.resolve();
             await Promise.all([firstSave, secondSave]);
 
@@ -161,8 +163,12 @@ describe('view modal concurrency', () => {
             assert.strictEqual(createCalls, 1);
             assert.strictEqual(disabledWhilePending, true);
             assert.strictEqual(editorDisabledWhilePending, true);
+            assert.strictEqual(nameDisabledWhilePending, true);
+            assert.strictEqual(preserveTriggersDisabledWhilePending, true);
             assert.strictEqual(elements.btnSaveView.disabled, false);
             assert.strictEqual(elements.viewSelectSql.disabled, false);
+            assert.strictEqual(elements.viewNameInput.disabled, false);
+            assert.strictEqual(elements.viewPreserveTriggers.disabled, false);
         } finally {
             backendApi.validateViewDefinition = originalValidate;
             backendApi.createView = originalCreate;
@@ -467,6 +473,7 @@ describe('view modal concurrency', () => {
                 'This view changed outside this editor. Reload before saving; the view was not modified.'
             );
         };
+        const originalReadOnly = state.isReadOnly;
         state.isReadOnly = false;
 
         try {
@@ -490,6 +497,7 @@ describe('view modal concurrency', () => {
             backendApi.getViewDefinition = originals.get;
             backendApi.validateViewDefinition = originals.validate;
             backendApi.editView = originals.edit;
+            state.isReadOnly = originalReadOnly;
         }
     });
 

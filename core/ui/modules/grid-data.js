@@ -208,7 +208,11 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // Both flags belong to the latest request. In particular, a background
         // load may supersede a foreground spinner load; although it did not set
         // isLoadingData itself, it inherits responsibility for releasing that flag.
-        if (!isSuperseded()) {
+        // Clearing selection (for example after dropping the displayed view)
+        // supersedes this request without starting another load. In that case the
+        // latest token still owns the guards and must release them itself.
+        const latestLoadHasNoTarget = loadToken === activeLoadToken && !state.selectedTable;
+        if (!isSuperseded() || latestLoadHasNoTarget) {
             state.isLoadingData = false;
             state.isGridReloading = false;
             setColumnFilterInputsDisabled(false);

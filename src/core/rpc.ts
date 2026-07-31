@@ -120,7 +120,7 @@ export type ProxyWithPendingInvocations<T> = T & {
  */
 export function buildMethodProxy<T extends object>(
   dispatcher: MessageDispatcher,
-  methodNames: string[],
+  methodNames: readonly Extract<keyof T, string>[],
   timeoutMs: number = INVOCATION_TIMEOUT_MS
 ): ProxyWithPendingInvocations<T> {
   // Each proxy gets its own isolated pending invocations map to prevent
@@ -359,7 +359,7 @@ export interface WorkerPort {
  */
 export function connectWorkerPort<T extends object>(
   port: WorkerPort,
-  methodNames: string[],
+  methodNames: readonly Extract<keyof T, string>[],
   onLog?: LogHandler
 ): T {
   const dispatcher: MessageDispatcher = (envelope, transfer) => {

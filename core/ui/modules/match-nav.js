@@ -7,10 +7,17 @@
  */
 import { state } from './state.js';
 import { getCellValue } from './data-utils.js';
-import { formatCellValueAsText } from './utils.js';
+import {
+    appendHighlightedText,
+    buildHighlightMatcher,
+    formatCellValueAsText
+} from './utils.js';
 
 function activeTerm(scope) {
-    return (scope === 'global' ? state.filterQuery : state.columnFilters[scope] || '').trim().toLowerCase();
+    const value = scope === 'global' ? state.filterQuery : state.columnFilters[scope];
+    // SQLite receives the filter verbatim. Lowercasing is only for the local
+    // case-insensitive comparison; trimming would change which text is matched.
+    return String(value ?? '').toLowerCase();
 }
 
 function formatSqliteReal(significand, exponent, negative) {
@@ -76,6 +83,58 @@ function sqliteNumericTextCandidates(value) {
     return [...candidates];
 }
 
+function getMatchingTextCandidate(value, col, term) {
+    const rawText = value === null || value === undefined || value instanceof Uint8Array
+        ? ''
+        : String(value);
+    const formattedText = String(formatCellValueAsText(
+        value,
+        col.type,
+        state.dateFormat,
+        col.name,
+        false
+    ));
+    const candidates = [rawText, formattedText];
+    if (typeof value === 'number') {
+        candidates.push(...sqliteNumericTextCandidates(value));
+    }
+    return candidates.find(candidate => candidate.toLowerCase().includes(term)) ?? null;
+}
+
+function excerptAroundMatch(text, term, maxLength = 100) {
+    if (text.length <= maxLength) return text;
+
+    const matchStart = text.toLowerCase().indexOf(term);
+    if (matchStart < 0) return formatCellValueAsText(text);
+
+    // Keep the complete match visible even when the filter itself exceeds the
+    // usual display width, and divide the remaining context around the match.
+    const windowLength = Math.max(maxLength, term.length);
+    const contextLength = Math.max(0, windowLength - term.length);
+    let start = Math.max(0, matchStart - Math.floor(contextLength / 2));
+    let end = Math.min(text.length, start + windowLength);
+    if (end - start < windowLength) {
+        start = Math.max(0, end - windowLength);
+    }
+
+    return `${start > 0 ? '...' : ''}${text.slice(start, end)}${end < text.length ? '...' : ''}`;
+}
+
+/**
+ * Return the normal truncated display text, or an excerpt centered on the
+ * active navigation term using the exact raw/formatted/numeric candidate that
+ * made the cell a match.
+ */
+export function formatCellValueForActiveMatch(value, col, term) {
+    if (!term) {
+        return formatCellValueAsText(value, col.type, state.dateFormat, col.name);
+    }
+    const candidate = getMatchingTextCandidate(value, col, term);
+    return candidate === null
+        ? formatCellValueAsText(value, col.type, state.dateFormat, col.name)
+        : excerptAroundMatch(candidate, term);
+}
+
 function computeMatches(scope, term) {
     const matches = [];
     if (!term) return matches;
@@ -92,21 +151,7 @@ function computeMatches(scope, term) {
         const row = state.gridData[rowIdx];
         for (const { col, colIdx } of columnsToScan) {
             const value = getCellValue(row, colIdx);
-            const rawText = value === null || value === undefined || value instanceof Uint8Array
-                ? ''
-                : String(value);
-            const formattedText = String(formatCellValueAsText(
-                value,
-                col.type,
-                state.dateFormat,
-                col.name,
-                false
-            ));
-            const candidates = [rawText, formattedText];
-            if (typeof value === 'number') {
-                candidates.push(...sqliteNumericTextCandidates(value));
-            }
-            if (candidates.some(candidate => candidate.toLowerCase().includes(term))) {
+            if (getMatchingTextCandidate(value, col, term) !== null) {
                 matches.push({ rowIdx, colIdx });
             }
         }
@@ -114,8 +159,35 @@ function computeMatches(scope, term) {
     return matches;
 }
 
+function renderMatchCellText(cellEl, rowIdx, colIdx, term) {
+    if (!cellEl || typeof cellEl.querySelector !== 'function') return;
+    const textSpan = cellEl.querySelector('.cell-text');
+    const row = state.gridData[rowIdx];
+    const col = state.tableColumns[colIdx];
+    if (!textSpan || !row || !col || typeof textSpan.replaceChildren !== 'function') return;
+
+    const value = getCellValue(row, colIdx);
+    const displayValue = term
+        ? formatCellValueForActiveMatch(value, col, term)
+        : formatCellValueAsText(value, col.type, state.dateFormat, col.name);
+    const matcher = buildHighlightMatcher([state.filterQuery, state.columnFilters[col.name]]);
+    textSpan.replaceChildren();
+    appendHighlightedText(textSpan, displayValue, matcher);
+}
+
+function clearActiveMatchCells() {
+    document.querySelectorAll('.active-match-cell').forEach(cellEl => {
+        const rowIdx = Number(cellEl.dataset?.rowidx);
+        const colIdx = Number(cellEl.dataset?.colidx);
+        if (Number.isInteger(rowIdx) && Number.isInteger(colIdx)) {
+            renderMatchCellText(cellEl, rowIdx, colIdx, null);
+        }
+        cellEl.classList.remove('active-match-cell');
+    });
+}
+
 function focusActiveMatch() {
-    document.querySelectorAll('.active-match-cell').forEach(el => el.classList.remove('active-match-cell'));
+    clearActiveMatchCells();
 
     const { matches, currentIndex } = state.matchNav;
     if (currentIndex < 0 || currentIndex >= matches.length) return;
@@ -124,6 +196,7 @@ function focusActiveMatch() {
     const cellEl = document.getElementById(`cell-${rowIdx}-${colIdx}`);
     if (cellEl) {
         cellEl.classList.add('active-match-cell');
+        renderMatchCellText(cellEl, rowIdx, colIdx, state.matchNav.term);
         cellEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     }
 }
@@ -184,10 +257,10 @@ export function navigateMatches(scope, direction = 1) {
  * wrong cell and the cache is invalidated.
  */
 export function resetMatchNav() {
+    clearActiveMatchCells();
     state.matchNav.scope = null;
     state.matchNav.term = null;
     state.matchNav.matches = [];
     state.matchNav.currentIndex = -1;
-    document.querySelectorAll('.active-match-cell').forEach(el => el.classList.remove('active-match-cell'));
     updateMatchCounterUI();
 }

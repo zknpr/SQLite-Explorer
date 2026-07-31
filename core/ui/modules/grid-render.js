@@ -1,5 +1,6 @@
 import { state } from './state.js';
 import { escapeHtml, formatCellValueAsText, appendHighlightedText, buildHighlightMatcher } from './utils.js';
+import { formatCellValueForActiveMatch } from './match-nav.js';
 import {
     getRowId,
     getCellValue,
@@ -168,13 +169,15 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
             const col = orderedColumns[displayColIdx];
             const originalColIdx = columnIndexMap.get(col.name);
             const value = getCellValue(row, originalColIdx);
-            const displayValue = formatCellValueAsText(value, col.type, state.dateFormat, col.name);
             const isNull = value === null || value === undefined;
             const isCellSelected = selectedCellKeys.has(`${rowIdx},${originalColIdx}`);
             const isColPinned = state.pinnedColumns.has(col.name);
             const hasContent = !isNull && !(value instanceof Uint8Array);
             const colWidth = state.columnWidths[col.name] || 120;
             const isActiveMatch = !!activeMatch && activeMatch.rowIdx === rowIdx && activeMatch.colIdx === originalColIdx;
+            const displayValue = isActiveMatch
+                ? formatCellValueForActiveMatch(value, col, state.matchNav.term)
+                : formatCellValueAsText(value, col.type, state.dateFormat, col.name);
 
             const td = document.createElement('td');
             td.id = `cell-${rowIdx}-${originalColIdx}`;

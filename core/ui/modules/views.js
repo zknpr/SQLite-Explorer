@@ -270,10 +270,16 @@ async function saveDraft() {
     isSavingView = true;
     const saveElements = getElements();
     const saveButton = saveElements.save;
+    const nameInput = saveElements.name;
     const sqlEditor = saveElements.sql;
+    const preserveTriggers = saveElements.preserveTriggers;
     const reloadLatest = saveElements.reloadLatest;
+    const draftInputDisabledStates = [nameInput, sqlEditor, preserveTriggers]
+        .map(element => element?.disabled);
     if (saveButton) saveButton.disabled = true;
-    if (sqlEditor) sqlEditor.disabled = true;
+    for (const element of [nameInput, sqlEditor, preserveTriggers]) {
+        if (element) element.disabled = true;
+    }
     if (reloadLatest) reloadLatest.disabled = true;
     hideReloadDefinitionOffer();
     try {
@@ -329,8 +335,17 @@ async function saveDraft() {
     } finally {
         isSavingView = false;
         if (saveButton) saveButton.disabled = false;
-        if (sqlEditor) sqlEditor.disabled = false;
         if (reloadLatest) reloadLatest.disabled = false;
+        if (modalSession === activeViewModalSession) {
+            [nameInput, sqlEditor, preserveTriggers].forEach((element, index) => {
+                if (element) element.disabled = draftInputDisabledStates[index];
+            });
+        } else if (preserveTriggers) {
+            // Modal controls are static DOM nodes. A newer modal session already
+            // initialized its name/SQL state, but this checkbox inherited the old
+            // save lock and must be released when that request settles.
+            preserveTriggers.disabled = false;
+        }
     }
 }
 

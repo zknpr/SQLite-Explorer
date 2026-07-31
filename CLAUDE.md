@@ -369,7 +369,7 @@ Settings in `package.json` → `contributes.configuration`:
 ### Testing
 - **VS Code mocks required**: Unit tests need `tests/unit/vscode_mock_setup.ts` imported first (path-mapped via `tsconfig.test.json`)
 - **JSON patch tests**: Test behavior (merged result) not implementation (SQL function)
-- **Test organization**: 57 test files (608 tests) in `tests/unit/`, benchmarks in `tests/benchmarks/`, performance tests in `tests/performance/`
+- **Test organization**: 57 test files (611 tests) in `tests/unit/`, benchmarks in `tests/benchmarks/`, performance tests in `tests/performance/`
 - **Native real-binary smoke lane**: `tests/unit/native_real_smoke.test.ts` spawns the bundled txiki binary (`npm run test:native-smoke`; also part of the `npm test` glob, skips gracefully without a bundled binary). It guards native-only regressions that mocked-worker tests structurally cannot catch (reserved object names, statement-boundary behavior, edit round-trip integrity) — extend it when touching the native worker
 - **Test runner**: Uses `tsx` with Node's built-in test runner (`npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts`)
 - **Readonly mock properties**: Use `Object.defineProperty(obj, prop, { value, writable: true, configurable: true })` for readonly VS Code API fields like `vscode.env.uiKind`

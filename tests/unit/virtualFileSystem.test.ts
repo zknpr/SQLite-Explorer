@@ -514,6 +514,57 @@ describe('SQLiteFileSystemProvider', () => {
             }
         });
 
+        it('serves the direction-appropriate view definition after undo and redo', async () => {
+            const before = {
+                identifier: 'history_view',
+                sql: 'CREATE VIEW history_view AS SELECT 1 AS value',
+                selectSql: 'SELECT 1 AS value',
+                triggers: []
+            };
+            const after = {
+                identifier: 'history_view',
+                sql: 'CREATE VIEW history_view AS SELECT 222 AS updated_value',
+                selectSql: 'SELECT 222 AS updated_value',
+                triggers: []
+            };
+            const getViewDefinition = mock.fn(async () => after);
+            const document = setupMockDocument(docKey, { getViewDefinition });
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/history_view/group/__view__.sql/definition.sql`
+            );
+            const modification = {
+                label: 'Edit View',
+                description: 'Edit history view',
+                modificationType: 'view_edit' as const,
+                targetTable: 'history_view',
+                viewDefBefore: before,
+                viewDefAfter: after
+            };
+
+            assert.strictEqual(
+                new TextDecoder().decode(await provider.readFile(uri)),
+                after.selectSql
+            );
+
+            document.fireContentChange(modification, 'undo');
+            assert.strictEqual((await provider.stat(uri)).size, before.selectSql.length);
+            assert.strictEqual(
+                new TextDecoder().decode(await provider.readFile(uri)),
+                before.selectSql
+            );
+
+            document.fireContentChange(modification, 'forward');
+            assert.strictEqual(
+                new TextDecoder().decode(await provider.readFile(uri)),
+                after.selectSql
+            );
+            assert.strictEqual(
+                getViewDefinition.mock.callCount(),
+                1,
+                'history payloads should not be replaced by a stale engine/cache reread'
+            );
+        });
+
         it('invalidates every open view document when File Revert replaces the database state', async () => {
             let now = 100;
             mock.method(Date, 'now', () => now);

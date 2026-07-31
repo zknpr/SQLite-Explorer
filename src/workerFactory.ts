@@ -110,6 +110,45 @@ interface WorkerMethods {
   writeToFile(path: string): Promise<void>;
 }
 
+const WORKER_METHOD_NAMES = [
+  'initializeDatabase',
+  'runQuery',
+  'exportDatabase',
+  'applyModifications',
+  'undoModification',
+  'redoModification',
+  'flushChanges',
+  'discardModifications',
+  'updateCell',
+  'insertRow',
+  'insertRowBatch',
+  'deleteRows',
+  'deleteColumns',
+  'findDependentIndexes',
+  'createTable',
+  'getViewDefinition',
+  'validateViewDefinition',
+  'previewViewDefinition',
+  'createView',
+  'editView',
+  'dropView',
+  'updateCellBatch',
+  'addColumn',
+  'fetchTableData',
+  'fetchTableCount',
+  'fetchSchema',
+  'getTableInfo',
+  'getPragmas',
+  'setPragma',
+  'ping',
+  'writeToFile'
+] as const satisfies ReadonlyArray<keyof WorkerMethods>;
+
+type MissingWorkerMethod = Exclude<keyof WorkerMethods, typeof WORKER_METHOD_NAMES[number]>;
+const COMPLETE_WORKER_METHOD_NAMES: [MissingWorkerMethod] extends [never]
+  ? typeof WORKER_METHOD_NAMES
+  : never = WORKER_METHOD_NAMES;
+
 type WorkerLogLevel = 'log' | 'warn' | 'error';
 
 function formatWorkerLogArgument(value: unknown): string {
@@ -410,7 +449,7 @@ async function createWorkerBackedWasmDatabaseConnection(
           .on(event, handler);
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase', 'applyModifications', 'undoModification', 'redoModification', 'flushChanges', 'discardModifications', 'updateCell', 'insertRow', 'insertRowBatch', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'getViewDefinition', 'validateViewDefinition', 'previewViewDefinition', 'createView', 'editView', 'dropView', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile'],
+    COMPLETE_WORKER_METHOD_NAMES,
     forwardWorkerLog
   );
 

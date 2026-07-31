@@ -365,6 +365,80 @@ describe('grid data match cache', () => {
         }
     });
 
+    it('releases loading guards when selection clearing supersedes the latest load', async () => {
+        const filterInputs = [{ disabled: false }, { disabled: false }];
+        const container = {
+            innerHTML: '',
+            scrollLeft: 0,
+            scrollTop: 0,
+            querySelector() { return null; }
+        };
+        const elements: Record<string, any> = {
+            gridContainer: container,
+            statusText: { textContent: '' },
+            pageIndicator: { textContent: '' },
+            btnFirst: { disabled: false },
+            btnPrev: { disabled: false },
+            btnNext: { disabled: false },
+            btnLast: { disabled: false },
+            filterMatchCounter: { textContent: '' }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) { return elements[id] ?? null; },
+            querySelectorAll(selector: string) {
+                return selector === '.column-filter' ? filterInputs : [];
+            }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const gridDataModulePath = '../../core/ui/modules/grid-data.js';
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { loadTableData } = await import(gridDataModulePath);
+        const count = createDeferred<number>();
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        backendApi.fetchTableCount = async () => count.promise;
+        backendApi.fetchTableData = async () => {
+            throw new Error('a load superseded by cleared selection must not fetch rows');
+        };
+        state.selectedTable = 'dropped_view';
+        state.selectedTableType = 'view';
+        state.renderedTable = 'dropped_view';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.currentPageIndex = 0;
+        state.rowsPerPage = 500;
+        state.columnFilters = {};
+        state.filterQuery = '';
+        state.isLoadingData = false;
+        state.isGridReloading = false;
+
+        try {
+            const pendingLoad = loadTableData(true, false);
+            assert.strictEqual(state.isLoadingData, true);
+            assert.strictEqual(state.isGridReloading, true);
+            assert.deepStrictEqual(filterInputs.map(input => input.disabled), [true, true]);
+
+            // Dropping the displayed view clears selection and starts no successor
+            // data load, so this request remains responsible for releasing guards.
+            state.selectedTable = null;
+            count.resolve(1);
+            assert.strictEqual(await pendingLoad, undefined);
+
+            assert.strictEqual(state.isLoadingData, false);
+            assert.strictEqual(state.isGridReloading, false);
+            assert.deepStrictEqual(filterInputs.map(input => input.disabled), [false, false]);
+        } finally {
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
+            state.selectedTable = null;
+            state.isLoadingData = false;
+            state.isGridReloading = false;
+            state.editingCellInfo = null;
+        }
+    });
+
     it('releases both loading guards when spinner rendering fails before the fetch', async () => {
         let renderedHtml = '';
         let htmlWrites = 0;

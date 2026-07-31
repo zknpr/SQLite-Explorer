@@ -13,7 +13,7 @@ import type {
     DocumentContentChange,
     DocumentModification
 } from './databaseModel';
-import type { ViewEditResult, ViewTriggerDefinition } from './core/types';
+import type { ViewDefinition, ViewEditResult, ViewTriggerDefinition } from './core/types';
 
 interface ViewDocumentMetadata {
     ctime: number;
@@ -24,6 +24,12 @@ interface ViewDocumentMetadata {
     snapshotSql?: string;
     /** Ordered trigger state paired with snapshotSql for the atomic CAS. */
     snapshotTriggers?: ViewTriggerDefinition[];
+    /**
+     * Definition supplied by the latest history event. Kept separate from the
+     * editor snapshot so a dirty buffer still conflicts with an undo/redo rather
+     * than silently adopting the newer CAS baseline. null means the view is gone.
+     */
+    pendingDefinition?: ViewDefinition | null;
     /** Encoded SELECT-body size cached until the view is externally invalidated. */
     size?: number;
 }
@@ -62,7 +68,11 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             const metadata = this.getViewDocumentMetadata(document, uri, table);
             if (metadata.size === undefined) {
                 try {
-                    const definition = await document.databaseOperations.getViewDefinition(table);
+                    if (metadata.pendingDefinition === null) {
+                        throw vsc.FileSystemError.FileNotFound(uri);
+                    }
+                    const definition = metadata.pendingDefinition
+                        ?? await document.databaseOperations.getViewDefinition(table);
                     metadata.size = new TextEncoder().encode(definition.selectSql).byteLength;
                 } catch (err) {
                     // A missing schema object is a missing virtual document, not a
@@ -118,7 +128,12 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
             if (rowId === '__view__.sql') {
                 const metadata = this.getViewDocumentMetadata(document, uri, table);
-                const definition = await document.databaseOperations.getViewDefinition(table);
+                if (metadata.pendingDefinition === null) {
+                    throw vsc.FileSystemError.FileNotFound(uri);
+                }
+                const definition = metadata.pendingDefinition
+                    ?? await document.databaseOperations.getViewDefinition(table);
+                metadata.pendingDefinition = undefined;
                 metadata.snapshotSql = definition.sql;
                 metadata.snapshotTriggers = this.cloneTriggerSnapshot(definition.triggers);
                 const content = new TextEncoder().encode(definition.selectSql);
@@ -385,6 +400,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         if (change.invalidateAllViewDocuments) {
             const changes: vsc.FileChangeEvent[] = [];
             for (const metadata of documentMetadata.values()) {
+                metadata.pendingDefinition = undefined;
                 metadata.size = undefined;
                 this.bumpViewDocumentMtime(metadata);
                 changes.push({
@@ -401,16 +417,23 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             return;
         }
 
+        const direction = change.modificationDirection ?? 'forward';
+        const fileChangeType = this.getViewFileChangeType(modification, direction);
+        const pendingDefinition = this.getViewDefinitionAfterChange(
+            modification,
+            direction,
+            fileChangeType
+        );
         const changes: vsc.FileChangeEvent[] = [];
         for (const metadata of documentMetadata.values()) {
             if (metadata.view !== modification.targetTable) continue;
-            metadata.size = undefined;
+            metadata.pendingDefinition = pendingDefinition;
+            metadata.size = pendingDefinition
+                ? new TextEncoder().encode(pendingDefinition.selectSql).byteLength
+                : undefined;
             this.bumpViewDocumentMtime(metadata);
             changes.push({
-                type: this.getViewFileChangeType(
-                    modification,
-                    change.modificationDirection ?? 'forward'
-                ),
+                type: fileChangeType,
                 uri: metadata.uri
             });
         }
@@ -435,6 +458,17 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         return existsAfterChange
             ? vsc.FileChangeType.Created
             : vsc.FileChangeType.Deleted;
+    }
+
+    private getViewDefinitionAfterChange(
+        modification: DocumentModification,
+        direction: 'forward' | 'undo',
+        fileChangeType: vsc.FileChangeType
+    ): ViewDefinition | null | undefined {
+        if (fileChangeType === vsc.FileChangeType.Deleted) return null;
+        return direction === 'forward'
+            ? modification.viewDefAfter
+            : modification.viewDefBefore;
     }
 
     private cloneTriggerSnapshot(
