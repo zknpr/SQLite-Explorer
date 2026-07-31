@@ -13,6 +13,69 @@ function activeTerm(scope) {
     return (scope === 'global' ? state.filterQuery : state.columnFilters[scope] || '').trim().toLowerCase();
 }
 
+function formatSqliteReal(significand, exponent, negative) {
+    // Normalize a rounded 15-digit significand across a power-of-ten boundary.
+    if (significand >= 1e15) {
+        significand /= 10;
+        exponent++;
+    } else if (significand < 1e14) {
+        significand *= 10;
+        exponent--;
+    }
+    const digits = String(Math.trunc(significand)).padStart(15, '0');
+    let body;
+
+    // SQLite's REAL-to-TEXT path uses its %!.15g shape: scientific notation
+    // below 1e-4 and at/above 1e15, a mandatory decimal point, and a signed
+    // exponent with at least two digits.
+    if (exponent < -4 || exponent >= 15) {
+        const fraction = digits.slice(1).replace(/0+$/, '') || '0';
+        const exponentSign = exponent < 0 ? '-' : '+';
+        body = `${digits[0]}.${fraction}e${exponentSign}${String(Math.abs(exponent)).padStart(2, '0')}`;
+    } else {
+        const decimalPosition = exponent + 1;
+        if (decimalPosition <= 0) {
+            body = `0.${'0'.repeat(-decimalPosition)}${digits}`;
+        } else if (decimalPosition >= digits.length) {
+            body = `${digits}${'0'.repeat(decimalPosition - digits.length)}.0`;
+        } else {
+            body = `${digits.slice(0, decimalPosition)}.${digits.slice(decimalPosition)}`;
+        }
+        body = body.replace(/0+$/, '');
+        if (body.endsWith('.')) body += '0';
+    }
+    return negative ? `-${body}` : body;
+}
+
+function sqliteNumericTextCandidates(value) {
+    if (!Number.isFinite(value)) return [];
+    if (value === 0) return ['0.0'];
+
+    const negative = value < 0;
+    const absolute = Math.abs(value);
+    const [mantissa, exponentText] = absolute.toExponential(14).split('e');
+    const exponent = Number(exponentText);
+    const candidates = new Set([
+        formatSqliteReal(Number(mantissa.replace('.', '')), exponent, negative)
+    ]);
+
+    // SQLite and JavaScript use independent binary-to-decimal algorithms. For
+    // doubles exactly adjacent to a 15-digit halfway case they can choose opposite
+    // last digits. Include both possible roundings only for that narrow case so
+    // navigation favors matching an SQL LIKE result over omitting one. String(value)
+    // remains a separate candidate because row RPC data does not retain whether an
+    // integer-valued Number came from SQLite INTEGER or REAL storage.
+    const [wideMantissa] = absolute.toExponential(16).split('e');
+    const wideDigits = wideMantissa.replace('.', '');
+    if (wideDigits[15] === '5') {
+        const lower = Number(wideDigits.slice(0, 15));
+        candidates.add(formatSqliteReal(lower, exponent, negative));
+        candidates.add(formatSqliteReal(lower + 1, exponent, negative));
+    }
+
+    return [...candidates];
+}
+
 function computeMatches(scope, term) {
     const matches = [];
     if (!term) return matches;
@@ -39,7 +102,11 @@ function computeMatches(scope, term) {
                 col.name,
                 false
             ));
-            if (rawText.toLowerCase().includes(term) || formattedText.toLowerCase().includes(term)) {
+            const candidates = [rawText, formattedText];
+            if (typeof value === 'number') {
+                candidates.push(...sqliteNumericTextCandidates(value));
+            }
+            if (candidates.some(candidate => candidate.toLowerCase().includes(term))) {
                 matches.push({ rowIdx, colIdx });
             }
         }

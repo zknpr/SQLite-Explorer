@@ -130,4 +130,50 @@ describe('filter match navigation', () => {
         assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
         assert.strictEqual(cell.classList.contains('active-match-cell'), true);
     });
+
+    it('matches SQLite REAL text coercion for exponent and integer-valued numbers', async () => {
+        const cell = {
+            classList: createClassList(),
+            scrollIntoView() {}
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cell-0-0') return cell;
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.selectedTableType = 'view';
+        state.tableColumns = [{ name: 'measurement', type: 'REAL' }];
+        state.columnFilters = {};
+
+        const cases = [
+            { value: 1e20, term: '1.0e+20' },
+            { value: 1e-7, term: '1.0e-07' },
+            { value: 1e-5, term: '1.0e-05' },
+            { value: 1, term: '1.0' },
+            // SQLite and JS choose opposite final digits for this halfway-adjacent
+            // binary64 value; the SQL-side rendering must remain navigable.
+            { value: -2.330004368663885e137, term: '-2.33000436866388e+137' }
+        ];
+        for (const testCase of cases) {
+            state.gridData = [[testCase.value]];
+            state.filterQuery = testCase.term;
+            resetMatchNav();
+
+            navigateMatches('global');
+
+            assert.deepStrictEqual(
+                state.matchNav.matches,
+                [{ rowIdx: 0, colIdx: 0 }],
+                `${testCase.value} should match SQLite text ${testCase.term}`
+            );
+        }
+    });
 });

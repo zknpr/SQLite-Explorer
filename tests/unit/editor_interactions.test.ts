@@ -13,6 +13,7 @@ const stateModulePath = '../../core/ui/modules/state.js';
 const textEditorModulePath = '../../core/ui/modules/text-editor.js';
 const editModulePath = '../../core/ui/modules/edit.js';
 const gridEventsModulePath = '../../core/ui/modules/grid-events.js';
+const globalShortcutsModulePath = '../../core/ui/modules/global-shortcuts.js';
 
 function createClassList(initial: string[] = []) {
     const classes = new Set(initial);
@@ -54,6 +55,10 @@ describe('editor keyboard and grid selection interactions', () => {
         state.lastSelectedCell = null;
         state.tableColumns = [];
         state.gridData = [];
+        state.pinnedColumns.clear();
+        state.pinnedRowIds.clear();
+        state.selectedTable = null;
+        state.selectedTableType = 'table';
     });
 
     it('inserts indentation and outdents selected lines in multiline editors', async () => {
@@ -261,6 +266,151 @@ describe('editor keyboard and grid selection interactions', () => {
         assert.strictEqual(createdTextareas.length, 2);
         assert.strictEqual(createdTextareas[1].value, 'alpha');
         assert.strictEqual(createdTextareas[1].focused, true);
+    });
+
+    it('advances inline edits in the rendered pinned row and column order', async () => {
+        const makeCell = (id: string) => ({
+            id,
+            innerHTML: '',
+            textContent: '',
+            classList: createClassList(),
+            children: [] as any[],
+            appendChild(child: any) { this.children.push(child); },
+            querySelector() { return null; }
+        });
+        const cells: Record<string, any> = {};
+        for (let rowIdx = 0; rowIdx < 2; rowIdx++) {
+            for (let colIdx = 0; colIdx < 3; colIdx++) {
+                const id = `cell-${rowIdx}-${colIdx}`;
+                cells[id] = makeCell(id);
+            }
+        }
+        const createdTextareas: any[] = [];
+        (globalThis as any).document = {
+            getElementById(id: string) { return cells[id] ?? null; },
+            querySelectorAll() { return []; },
+            querySelector() { return null; },
+            createElement(tag: string) {
+                const created: any = {
+                    className: '',
+                    textContent: '',
+                    value: '',
+                    classList: createClassList(),
+                    style: {},
+                    scrollWidth: 0,
+                    clientWidth: 0,
+                    addEventListener() {},
+                    removeEventListener() {},
+                    focus() { this.focused = true; }
+                };
+                if (tag === 'textarea') createdTextareas.push(created);
+                return created;
+            }
+        };
+        const { state } = await import(stateModulePath);
+        const { onCellInputKeydown } = await import(editModulePath);
+        state.selectedTable = 'items';
+        state.tableColumns = [
+            { name: 'first', type: 'TEXT' },
+            { name: 'second', type: 'TEXT' },
+            { name: 'third', type: 'TEXT' }
+        ];
+        state.gridData = [
+            [7, 'alpha', 'beta', 'gamma'],
+            [8, 'delta', 'epsilon', 'zeta']
+        ];
+        state.pinnedColumns.add('third');
+        state.pinnedRowIds.add(8);
+
+        state.editingCellInfo = {
+            rowIdx: 0,
+            colIdx: 2,
+            rowId: 7,
+            columnName: 'third',
+            originalValue: 'gamma'
+        };
+        state.activeCellInput = { value: 'gamma', removeEventListener() {} };
+        await onCellInputKeydown({
+            key: 'Tab',
+            shiftKey: false,
+            preventDefault() {}
+        });
+
+        assert.strictEqual(state.editingCellInfo?.rowIdx, 0);
+        assert.strictEqual(state.editingCellInfo?.colIdx, 0);
+        assert.strictEqual(createdTextareas.at(-1)?.value, 'alpha');
+
+        await onCellInputKeydown({
+            key: 'Tab',
+            shiftKey: true,
+            preventDefault() {}
+        });
+        assert.strictEqual(state.editingCellInfo?.rowIdx, 0);
+        assert.strictEqual(state.editingCellInfo?.colIdx, 2);
+        assert.strictEqual(createdTextareas.at(-1)?.value, 'gamma');
+
+        // Row 0 is rendered after pinned row 1. Its final rendered column is
+        // therefore followed by pinned row 1's first rendered column on wrap.
+        state.editingCellInfo = {
+            rowIdx: 0,
+            colIdx: 1,
+            rowId: 7,
+            columnName: 'second',
+            originalValue: 'beta'
+        };
+        state.activeCellInput = { value: 'beta', removeEventListener() {} };
+        await onCellInputKeydown({
+            key: 'Tab',
+            shiftKey: false,
+            preventDefault() {}
+        });
+
+        assert.strictEqual(state.editingCellInfo?.rowIdx, 1);
+        assert.strictEqual(state.editingCellInfo?.colIdx, 2);
+        assert.strictEqual(state.editingCellInfo?.rowId, 8);
+        assert.strictEqual(createdTextareas.at(-1)?.value, 'zeta');
+    });
+
+    it('leaves copy and select-all shortcuts with an active textarea', async () => {
+        let keydown: ((event: any) => Promise<void>) | undefined;
+        (globalThis as any).document = {
+            activeElement: { tagName: 'TEXTAREA' },
+            addEventListener(type: string, listener: (event: any) => Promise<void>) {
+                if (type === 'keydown') keydown = listener;
+            },
+            getElementById() { return null; },
+            querySelector() { return null; },
+            querySelectorAll() { return []; }
+        };
+        const shortcuts = await import(globalShortcutsModulePath).catch(() => null);
+        assert.ok(shortcuts?.setupGlobalShortcuts, 'shared global shortcut handler is unavailable');
+        shortcuts.setupGlobalShortcuts();
+        assert.ok(keydown, 'global keydown listener was not registered');
+
+        const { state } = await import(stateModulePath);
+        state.selectedTable = 'items';
+        state.gridData = [[7, 'alpha']];
+        state.selectedCells = [{ rowIdx: 0, colIdx: 0, rowId: 7, value: 'alpha' }];
+        let copyPrevented = false;
+        await keydown({
+            key: 'c',
+            metaKey: true,
+            ctrlKey: false,
+            preventDefault() { copyPrevented = true; }
+        });
+        let selectAllPrevented = false;
+        await keydown({
+            key: 'a',
+            metaKey: true,
+            ctrlKey: false,
+            preventDefault() { selectAllPrevented = true; },
+            stopPropagation() {}
+        });
+
+        assert.strictEqual(copyPrevented, false);
+        assert.strictEqual(selectAllPrevented, false);
+        assert.deepStrictEqual([...state.selectedRowIds], []);
+        assert.strictEqual(state.selectedCells.length, 1);
     });
 
     it('clears selection on click-away but preserves selection-dependent controls', async () => {

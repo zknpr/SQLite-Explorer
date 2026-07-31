@@ -16,8 +16,7 @@ import {
 } from './modules/export.js';
 
 import {
-    initCrud,
-    submitDelete
+    initCrud
 } from './modules/crud.js';
 import {
     updateStatus,
@@ -30,19 +29,12 @@ import {
 } from './modules/modals.js';
 import {
     loadTableData,
-    onSelectAllClick,
     initGridInteraction,
-    initGridControls,
-    clearSelection
+    initGridControls
 } from './modules/grid.js';
 import {
     initEdit
 } from './modules/edit.js';
-import {
-    copyCellsToClipboard,
-    copySelectedRowsToClipboard,
-    clearSelectedCellValues
-} from './modules/clipboard.js';
 import {
     initSettings
 } from './modules/settings.js';
@@ -51,6 +43,7 @@ import {
 } from './modules/dnd.js';
 import { initViews } from './modules/views.js';
 import { applyConnectionResult } from './modules/connection-state.js';
+import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
 
 // ============================================================================
 // Web-specific RPC initialization
@@ -165,58 +158,7 @@ async function initializeApp() {
         updateStatus('Ready');
         showEmptyState();
 
-        // Global shortcuts
-        document.addEventListener('keydown', async (event) => {
-            // Escape
-            if (event.key === 'Escape') {
-                if (!state.editingCellInfo && !document.querySelector('.modal-overlay:not(.hidden)')) {
-                    clearSelection();
-                }
-            }
-
-            // Cmd+C / Ctrl+C
-            if ((event.metaKey || event.ctrlKey) && event.key === 'c') {
-                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT') return;
-
-                if (state.selectedCells.length > 0) {
-                    event.preventDefault();
-                    await copyCellsToClipboard();
-                } else if (state.selectedRowIds.size > 0) {
-                    event.preventDefault();
-                    await copySelectedRowsToClipboard();
-                }
-            }
-
-            // Cmd+A / Ctrl+A
-            if ((event.metaKey || event.ctrlKey) && event.key === 'a') {
-                // Bail during a grid reload: "select all" would capture row ids from
-                // the stale, about-to-be-replaced result set (mirrors core viewer.js).
-                if (state.isGridReloading || state.editingCellInfo || document.activeElement.tagName === 'INPUT') return;
-
-                if (state.selectedTable) {
-                    event.preventDefault();
-                    onSelectAllClick(event);
-                }
-            }
-
-            // Delete / Backspace
-            if ((event.metaKey || event.ctrlKey) && (event.key === 'Delete' || event.key === 'Backspace')) {
-                // Bail during a grid reload: deleting now would act on selections
-                // from the stale result set about to be replaced (mirrors viewer.js).
-                if (state.isGridReloading || state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
-
-                if (state.selectedTable && state.selectedTableType === 'table') {
-                    event.preventDefault();
-                    if (state.selectedColumns.size > 0) {
-                        await submitDelete();
-                    } else if (state.selectedRowIds.size > 0) {
-                        await submitDelete();
-                    } else if (state.selectedCells.length > 0) {
-                        await clearSelectedCellValues();
-                    }
-                }
-            }
-        });
+        setupGlobalShortcuts();
 
     } catch (err) {
         console.error('Init error:', err);

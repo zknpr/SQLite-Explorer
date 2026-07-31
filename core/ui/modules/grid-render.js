@@ -1,6 +1,11 @@
 import { state } from './state.js';
 import { escapeHtml, formatCellValueAsText, appendHighlightedText, buildHighlightMatcher } from './utils.js';
-import { getRowId, getCellValue } from './data-utils.js';
+import {
+    getRowId,
+    getCellValue,
+    getOrderedColumnIndices,
+    getOrderedRowIndices
+} from './data-utils.js';
 import { syncSelectionDOM } from './grid-selection.js';
 
 function createEmptyView() {
@@ -111,10 +116,10 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
         pinnedRowOffsets.set(pinnedRowsList[i].rowId, topOffset);
     }
 
-    const orderedRowIndices = [
-        ...state.gridData.map((row, idx) => ({ idx, rowId: getRowId(row, idx) })).filter(r => state.pinnedRowIds.has(r.rowId)),
-        ...state.gridData.map((row, idx) => ({ idx, rowId: getRowId(row, idx) })).filter(r => !state.pinnedRowIds.has(r.rowId))
-    ];
+    const orderedRowIndices = getOrderedRowIndices().map(idx => ({
+        idx,
+        rowId: getRowId(state.gridData[idx], idx)
+    }));
 
     // Precompute one highlight matcher per column (depends on the global filter +
     // that column's filter, not on the row), so we don't rebuild a RegExp per cell.
@@ -280,10 +285,7 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     }
 
     // Reorder columns: pinned first
-    const orderedColumns = [
-        ...state.tableColumns.filter(col => state.pinnedColumns.has(col.name)),
-        ...state.tableColumns.filter(col => !state.pinnedColumns.has(col.name))
-    ];
+    const orderedColumns = getOrderedColumnIndices().map(index => state.tableColumns[index]);
 
     // Pinned column offsets
     const pinnedColumnOffsets = new Map();

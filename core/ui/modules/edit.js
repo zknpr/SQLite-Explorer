@@ -6,7 +6,13 @@ import { backendApi } from './api.js';
 import { validateRowId, formatCellValueAsText } from './utils.js';
 import { updateStatus } from './ui.js';
 import { updateSelectionStates, clearSelection } from './grid-selection.js';
-import { getRowDataOffset, getCellValue, getRowId } from './data-utils.js';
+import {
+    getRowDataOffset,
+    getCellValue,
+    getRowId,
+    getOrderedColumnIndices,
+    getOrderedRowIndices
+} from './data-utils.js';
 import { BlobInspector } from './blob-inspector.js';
 import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
 
@@ -204,15 +210,21 @@ async function saveCellEditAndMove(direction) {
     const { rowIdx, colIdx } = state.editingCellInfo;
     if (!await saveCellEdit()) return;
 
-    const rowCount = state.gridData.length;
-    const columnCount = state.tableColumns.length;
+    const orderedRowIndices = getOrderedRowIndices();
+    const orderedColumnIndices = getOrderedColumnIndices();
+    const rowCount = orderedRowIndices.length;
+    const columnCount = orderedColumnIndices.length;
     const cellCount = rowCount * columnCount;
     if (cellCount === 0) return;
 
-    const currentIndex = rowIdx * columnCount + colIdx;
+    const renderedRowIdx = orderedRowIndices.indexOf(rowIdx);
+    const renderedColIdx = orderedColumnIndices.indexOf(colIdx);
+    if (renderedRowIdx === -1 || renderedColIdx === -1) return;
+
+    const currentIndex = renderedRowIdx * columnCount + renderedColIdx;
     const nextIndex = (currentIndex + direction + cellCount) % cellCount;
-    const nextRowIdx = Math.floor(nextIndex / columnCount);
-    const nextColIdx = nextIndex % columnCount;
+    const nextRowIdx = orderedRowIndices[Math.floor(nextIndex / columnCount)];
+    const nextColIdx = orderedColumnIndices[nextIndex % columnCount];
     const nextRow = state.gridData[nextRowIdx];
     if (!nextRow) return;
     startCellEdit(nextRowIdx, nextColIdx, getRowId(nextRow, nextRowIdx));
