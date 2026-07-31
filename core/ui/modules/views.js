@@ -206,6 +206,7 @@ function isCurrentModalSession(modalSession) {
 }
 
 async function validateDraft(draft = getDraft(), modalSession = activeViewModalSession) {
+    const intent = editingViewName ? 'edit' : 'create';
     const canUpdateFeedback = () => isCurrentModalSession(modalSession)
         && draftsMatch(draft, getDraft());
     if (!draft.name || !draft.selectSql) {
@@ -215,7 +216,7 @@ async function validateDraft(draft = getDraft(), modalSession = activeViewModalS
 
     try {
         if (canUpdateFeedback()) setFeedback('Validating with SQLite...');
-        await backendApi.validateViewDefinition(draft.name, draft.selectSql);
+        await backendApi.validateViewDefinition(draft.name, draft.selectSql, intent);
         if (canUpdateFeedback()) setFeedback('Definition is valid.');
         return true;
     } catch (err) {
@@ -228,6 +229,7 @@ async function previewDraft() {
     const modalSession = activeViewModalSession;
     const previewRequest = ++activePreviewRequest;
     const draft = getDraft();
+    const intent = editingViewName ? 'edit' : 'create';
     const isCurrentPreview = () => previewRequest === activePreviewRequest
         && isCurrentModalSession(modalSession)
         && draftsMatch(draft, getDraft());
@@ -240,7 +242,12 @@ async function previewDraft() {
 
     try {
         if (isCurrentPreview()) setFeedback('Compiling preview...');
-        const result = await backendApi.previewViewDefinition(draft.name, draft.selectSql, 50);
+        const result = await backendApi.previewViewDefinition(
+            draft.name,
+            draft.selectSql,
+            50,
+            intent
+        );
         if (!isCurrentPreview()) return;
         renderPreview(result);
         const rowCount = result?.rows?.length ?? result?.values?.length ?? 0;

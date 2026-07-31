@@ -1,5 +1,5 @@
 import { escapeIdentifier } from './sql-utils';
-import type { CellValue, ViewTriggerDefinition } from './types';
+import type { CellValue, ViewDefinitionIntent, ViewTriggerDefinition } from './types';
 
 /** Canonical trigger sources, ordered by the schema in which they are replayed. */
 export const VIEW_TRIGGER_SCHEMA_QUERIES = [
@@ -245,6 +245,20 @@ export function buildCreateViewTriggerSql(trigger: ViewTriggerDefinition): strin
   // sqlite_temp_schema normally omits TEMP from its stored SQL, so restore the
   // schema qualifier explicitly instead of accidentally creating a main trigger.
   return trigger.sql.replace(createTriggerPrefix, '$1TEMP $2');
+}
+
+/** Reject create-mode validation/preview when SQLite already owns that name. */
+export function assertViewDefinitionIntent(
+  view: string,
+  viewExists: boolean,
+  intent: ViewDefinitionIntent
+): void {
+  if (intent !== 'create' && intent !== 'edit') {
+    throw new Error(`Invalid view definition intent: ${String(intent)}`);
+  }
+  if (intent === 'create' && viewExists) {
+    throw new Error(`View already exists: ${view}`);
+  }
 }
 
 /** Compare the exact stored CREATE VIEW SQL used by editor conflict checks. */

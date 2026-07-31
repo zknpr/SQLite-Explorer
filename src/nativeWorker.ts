@@ -36,6 +36,7 @@ import type {
   ViewMetadata,
   IndexMetadata,
   ViewDefinition,
+  ViewDefinitionIntent,
   ViewEditResult,
   ViewTriggerDefinition
 } from './core/types';
@@ -45,6 +46,7 @@ import { computeJsonPatchUndo } from './core/json-utils';
 import { serializeOperations } from './core/operation-serializer';
 import {
   assertViewDefinitionSnapshotCurrent,
+  assertViewDefinitionIntent,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
@@ -1094,7 +1096,11 @@ export async function createNativeDatabaseConnection(
 
         getViewDefinition: getNativeViewDefinition,
 
-        validateViewDefinition: async (view: string, selectSql: string) => {
+        validateViewDefinition: async (
+          view: string,
+          selectSql: string,
+          intent: ViewDefinitionIntent = 'edit'
+        ) => {
           if (forceReadOnly) {
             throw new Error('View validation is unavailable because the database is read-only');
           }
@@ -1103,7 +1109,9 @@ export async function createNativeDatabaseConnection(
             "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
             [view]
           ]);
-          const existingSql = existing.values?.[0]?.[0];
+          const existingRow = existing.values?.[0];
+          const existingSql = existingRow?.[0];
+          assertViewDefinitionIntent(view, existingRow !== undefined, intent);
           const columnListSql = typeof existingSql === 'string'
             ? extractViewColumnListSql(existingSql)
             : undefined;
@@ -1123,7 +1131,12 @@ export async function createNativeDatabaseConnection(
           }
         },
 
-        previewViewDefinition: async (view: string, selectSql: string, limit: number = 50) => {
+        previewViewDefinition: async (
+          view: string,
+          selectSql: string,
+          limit: number = 50,
+          intent: ViewDefinitionIntent = 'edit'
+        ) => {
           if (forceReadOnly) {
             throw new Error('View preview is unavailable because the database is read-only');
           }
@@ -1133,7 +1146,9 @@ export async function createNativeDatabaseConnection(
             "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
             [view]
           ]);
-          const existingSql = existing.values?.[0]?.[0];
+          const existingRow = existing.values?.[0];
+          const existingSql = existingRow?.[0];
+          assertViewDefinitionIntent(view, existingRow !== undefined, intent);
           const columnListSql = typeof existingSql === 'string'
             ? extractViewColumnListSql(existingSql)
             : undefined;

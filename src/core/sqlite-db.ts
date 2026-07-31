@@ -23,6 +23,7 @@ import type {
   ColumnMetadata,
   ColumnDefinition,
   ModificationEntry,
+  ViewDefinitionIntent,
   ViewTriggerDefinition
 } from './types';
 import { getNodeFs } from './platform/fs';
@@ -239,12 +240,21 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().getViewDefinition(view);
     },
 
-    async validateViewDefinition(view: string, selectSql: string): Promise<void> {
-      return requireEngine().validateViewDefinition(view, selectSql);
+    async validateViewDefinition(
+      view: string,
+      selectSql: string,
+      intent?: ViewDefinitionIntent
+    ): Promise<void> {
+      return requireEngine().validateViewDefinition(view, selectSql, intent);
     },
 
-    async previewViewDefinition(view: string, selectSql: string, limit?: number) {
-      return requireEngine().previewViewDefinition(view, selectSql, limit);
+    async previewViewDefinition(
+      view: string,
+      selectSql: string,
+      limit?: number,
+      intent?: ViewDefinitionIntent
+    ) {
+      return requireEngine().previewViewDefinition(view, selectSql, limit, intent);
     },
 
     async createView(view: string, selectSql: string) {

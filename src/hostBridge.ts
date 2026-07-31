@@ -14,7 +14,7 @@ import { ConfigurationSection, ExtensionId, SidebarLeft, SidebarRight, UriScheme
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewTriggerDefinition } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition } from './core/types';
 import { generateMergePatch } from './core/json-utils';
 import { escapeIdentifier } from './core/sql-utils';
 
@@ -381,13 +381,22 @@ export class HostBridge implements ToastService {
   }
 
   /** Ask SQLite to compile a proposed view definition without changing the schema. */
-  async validateViewDefinition(view: string, selectSql: string) {
-    return this.ensureDatabaseInitialized().validateViewDefinition(view, selectSql);
+  async validateViewDefinition(
+    view: string,
+    selectSql: string,
+    intent: ViewDefinitionIntent = 'edit'
+  ) {
+    return this.ensureDatabaseInitialized().validateViewDefinition(view, selectSql, intent);
   }
 
   /** Return a bounded preview for a proposed view definition. */
-  async previewViewDefinition(view: string, selectSql: string, limit: number = 50) {
-    return this.ensureDatabaseInitialized().previewViewDefinition(view, selectSql, limit);
+  async previewViewDefinition(
+    view: string,
+    selectSql: string,
+    limit: number = 50,
+    intent: ViewDefinitionIntent = 'edit'
+  ) {
+    return this.ensureDatabaseInitialized().previewViewDefinition(view, selectSql, limit, intent);
   }
 
   /** Create a view and record enough state for save, undo, and redo. */

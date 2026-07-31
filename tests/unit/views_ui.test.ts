@@ -385,6 +385,65 @@ describe('view modal concurrency', () => {
         }
     });
 
+    it('passes create and edit intent through validation and preview requests', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openCreateViewModal, openEditViewModal } = await import(viewsModulePath);
+        const originals = {
+            get: backendApi.getViewDefinition,
+            validate: backendApi.validateViewDefinition,
+            preview: backendApi.previewViewDefinition
+        };
+        const validateCalls: unknown[][] = [];
+        const previewCalls: unknown[][] = [];
+        backendApi.getViewDefinition = async () => ({
+            sql: 'CREATE VIEW existing_view AS SELECT 1 AS value',
+            selectSql: 'SELECT 1 AS value',
+            triggers: []
+        });
+        backendApi.validateViewDefinition = async (...args: unknown[]) => {
+            validateCalls.push(args);
+        };
+        backendApi.previewViewDefinition = async (...args: unknown[]) => {
+            previewCalls.push(args);
+            return { headers: ['value'], rows: [[1]] };
+        };
+        const originalReadOnly = state.isReadOnly;
+        state.isReadOnly = false;
+
+        try {
+            initViews();
+            openCreateViewModal();
+            elements.viewNameInput.value = 'new_view';
+            elements.viewSelectSql.value = 'SELECT 2 AS value';
+            await listener('btnValidateView', 'click')();
+            await listener('btnPreviewView', 'click')();
+
+            await openEditViewModal('existing_view');
+            elements.viewSelectSql.value = 'SELECT 3 AS value';
+            await listener('btnValidateView', 'click')();
+            await listener('btnPreviewView', 'click')();
+
+            assert.deepStrictEqual(validateCalls, [
+                ['new_view', 'SELECT 2 AS value', 'create'],
+                ['existing_view', 'SELECT 3 AS value', 'edit']
+            ]);
+            assert.deepStrictEqual(previewCalls, [
+                ['new_view', 'SELECT 2 AS value', 50, 'create'],
+                ['existing_view', 'SELECT 3 AS value', 50, 'edit']
+            ]);
+        } finally {
+            backendApi.getViewDefinition = originals.get;
+            backendApi.validateViewDefinition = originals.validate;
+            backendApi.previewViewDefinition = originals.preview;
+            state.isReadOnly = originalReadOnly;
+        }
+    });
+
     it('keeps a modal draft open when the stored view changed and can reload the latest definition', async () => {
         const { elements, listener } = installViewDocument();
         const apiModulePath = '../../core/ui/modules/api.js';

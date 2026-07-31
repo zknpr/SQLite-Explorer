@@ -22,6 +22,7 @@ import type {
   ColumnMetadata,
   ColumnDefinition,
   ViewDefinition,
+  ViewDefinitionIntent,
   ViewEditResult,
   ViewTriggerDefinition
 } from '../../types';
@@ -32,6 +33,7 @@ import { applyMergePatch, computeJsonPatchUndo, parseJsonValueForPatching } from
 import { getNodeFs } from '../../platform/fs';
 import {
   assertViewDefinitionSnapshotCurrent,
+  assertViewDefinitionIntent,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
@@ -978,7 +980,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     return this.readViewDefinition(view, false);
   }
 
-  async validateViewDefinition(view: string, selectSql: string): Promise<void> {
+  async validateViewDefinition(
+    view: string,
+    selectSql: string,
+    intent: ViewDefinitionIntent = 'edit'
+  ): Promise<void> {
     if (this.readOnlyMode) {
       throw new Error('View validation is unavailable because the database is read-only');
     }
@@ -987,7 +993,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
       [view]
     );
-    const existingSql = existingResult[0]?.rows[0]?.[0];
+    const existingRow = existingResult[0]?.rows[0];
+    const existingSql = existingRow?.[0];
+    assertViewDefinitionIntent(view, existingRow !== undefined, intent);
     const columnListSql = typeof existingSql === 'string'
       ? extractViewColumnListSql(existingSql)
       : undefined;
@@ -1008,14 +1016,21 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
-  async previewViewDefinition(view: string, selectSql: string, limit: number = 50): Promise<QueryResultSet> {
+  async previewViewDefinition(
+    view: string,
+    selectSql: string,
+    limit: number = 50,
+    intent: ViewDefinitionIntent = 'edit'
+  ): Promise<QueryResultSet> {
     const body = normalizeViewSelectSql(selectSql);
     const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
     const existingResult = await this.executeQuery(
       "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
       [view]
     );
-    const existingSql = existingResult[0]?.rows[0]?.[0];
+    const existingRow = existingResult[0]?.rows[0];
+    const existingSql = existingRow?.[0];
+    assertViewDefinitionIntent(view, existingRow !== undefined, intent);
     const columnListSql = typeof existingSql === 'string'
       ? extractViewColumnListSql(existingSql)
       : undefined;

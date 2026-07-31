@@ -102,6 +102,47 @@ describe('view operations', () => {
         }
     });
 
+    it('rejects an existing name for create-intent validation and preview only', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.createView('intent_target', 'SELECT 1 AS value');
+
+            await assert.rejects(
+                () => engine.validateViewDefinition(
+                    'intent_target',
+                    'SELECT 2 AS value',
+                    'create'
+                ),
+                /view already exists/i
+            );
+            await assert.rejects(
+                () => engine.previewViewDefinition(
+                    'intent_target',
+                    'SELECT 2 AS value',
+                    10,
+                    'create'
+                ),
+                /view already exists/i
+            );
+
+            await engine.validateViewDefinition('intent_target', 'SELECT 2 AS value', 'edit');
+            const preview = await engine.previewViewDefinition(
+                'intent_target',
+                'SELECT 2 AS value',
+                10,
+                'edit'
+            );
+            assert.deepStrictEqual(preview.headers, ['value']);
+            assert.deepStrictEqual(preview.rows, [[2]]);
+            assert.strictEqual(
+                (await engine.getViewDefinition('intent_target')).selectSql,
+                'SELECT 1 AS value'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('edits a view and recreates its INSTEAD OF triggers', async () => {
         const engine = await createEngine();
         try {

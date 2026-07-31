@@ -170,6 +170,46 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.deepStrictEqual(preview.rows, []);
         });
 
+        await testContext.test('rejects duplicate names only for create-intent validation and preview', async () => {
+            await engine.createView('native_intent_target', 'SELECT 1 AS value');
+
+            await assert.rejects(
+                engine.validateViewDefinition(
+                    'native_intent_target',
+                    'SELECT 2 AS value',
+                    'create'
+                ),
+                /view already exists/i
+            );
+            await assert.rejects(
+                engine.previewViewDefinition(
+                    'native_intent_target',
+                    'SELECT 2 AS value',
+                    10,
+                    'create'
+                ),
+                /view already exists/i
+            );
+
+            await engine.validateViewDefinition(
+                'native_intent_target',
+                'SELECT 2 AS value',
+                'edit'
+            );
+            const preview = await engine.previewViewDefinition(
+                'native_intent_target',
+                'SELECT 2 AS value',
+                10,
+                'edit'
+            );
+            assert.deepStrictEqual(preview.headers, ['value']);
+            assert.deepStrictEqual(preview.rows, [[2]]);
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM native_intent_target'))[0].rows,
+                [[1]]
+            );
+        });
+
         await testContext.test('previews 100 duplicate-alias rows positionally in one native query', async () => {
             const body = `WITH RECURSIVE sequence(value) AS (
     SELECT 1

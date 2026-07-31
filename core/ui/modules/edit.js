@@ -6,6 +6,7 @@ import { backendApi } from './api.js';
 import { validateRowId, formatCellValueAsText } from './utils.js';
 import { updateStatus } from './ui.js';
 import { updateSelectionStates, clearSelection } from './grid-selection.js';
+import { loadTableData } from './grid-data.js';
 import {
     getRowDataOffset,
     getCellValue,
@@ -177,8 +178,15 @@ export async function saveCellEdit() {
 
         await backendApi.updateCell(state.selectedTable, validateRowId(rowId), columnName, valueToSave, originalValue);
 
-        // Update local grid data
-        state.gridData[rowIdx][colIdx + getRowDataOffset()] = valueToSave;
+        // A broadcast refresh can reorder gridData before this RPC resolves.
+        // Update the row by its stable SQLite identity, never by the stale DOM index.
+        const currentRowIdx = state.gridData.findIndex((row, index) => (
+            getRowId(row, index) === rowId
+        ));
+        const currentColIdx = state.tableColumns.findIndex(column => column.name === columnName);
+        if (currentRowIdx >= 0 && currentColIdx >= 0) {
+            state.gridData[currentRowIdx][currentColIdx + getRowDataOffset()] = valueToSave;
+        }
 
         cleanupCellEdit();
 
@@ -207,27 +215,53 @@ export async function saveCellEdit() {
 
 async function saveCellEditAndMove(direction) {
     if (!state.editingCellInfo) return;
-    const { rowIdx, colIdx } = state.editingCellInfo;
-    if (!await saveCellEdit()) return;
+    const { rowIdx, colIdx, originalValue } = state.editingCellInfo;
+    const submittedValue = state.activeCellInput?.value;
 
+    // Pin traversal to the pre-commit rendered ordering. A sort/filter-changing
+    // update may reorder gridData while the old DOM remains mounted, so indices
+    // captured after the RPC would identify a different row.
     const orderedRowIndices = getOrderedRowIndices();
     const orderedColumnIndices = getOrderedColumnIndices();
     const rowCount = orderedRowIndices.length;
     const columnCount = orderedColumnIndices.length;
     const cellCount = rowCount * columnCount;
-    if (cellCount === 0) return;
-
     const renderedRowIdx = orderedRowIndices.indexOf(rowIdx);
     const renderedColIdx = orderedColumnIndices.indexOf(colIdx);
-    if (renderedRowIdx === -1 || renderedColIdx === -1) return;
+    let targetRowId;
+    let targetColumnName;
+    if (cellCount > 0 && renderedRowIdx >= 0 && renderedColIdx >= 0) {
+        const currentIndex = renderedRowIdx * columnCount + renderedColIdx;
+        const nextIndex = (currentIndex + direction + cellCount) % cellCount;
+        const targetRowIdx = orderedRowIndices[Math.floor(nextIndex / columnCount)];
+        const targetColIdx = orderedColumnIndices[nextIndex % columnCount];
+        const targetRow = state.gridData[targetRowIdx];
+        const targetColumn = state.tableColumns[targetColIdx];
+        if (targetRow && targetColumn) {
+            targetRowId = getRowId(targetRow, targetRowIdx);
+            targetColumnName = targetColumn.name;
+        }
+    }
 
-    const currentIndex = renderedRowIdx * columnCount + renderedColIdx;
-    const nextIndex = (currentIndex + direction + cellCount) % cellCount;
-    const nextRowIdx = orderedRowIndices[Math.floor(nextIndex / columnCount)];
-    const nextColIdx = orderedColumnIndices[nextIndex % columnCount];
-    const nextRow = state.gridData[nextRowIdx];
-    if (!nextRow) return;
-    startCellEdit(nextRowIdx, nextColIdx, getRowId(nextRow, nextRowIdx));
+    if (!await saveCellEdit()) return;
+    if (targetRowId === undefined || targetColumnName === undefined) return;
+
+    const originalText = originalValue === null ? '' : String(originalValue);
+    if (submittedValue !== originalText) {
+        // recordExternalModification posts refreshContent before the update RPC
+        // response, but that broadcast is not awaited. Start an authoritative
+        // post-commit reload after the editor is cleaned up; its load token
+        // supersedes any still-running broadcast refresh and it renders the row
+        // indices that startCellEdit will use below.
+        if (await loadTableData(false) !== true) return;
+    }
+
+    const nextRowIdx = state.gridData.findIndex((row, index) => (
+        getRowId(row, index) === targetRowId
+    ));
+    const nextColIdx = state.tableColumns.findIndex(column => column.name === targetColumnName);
+    if (nextRowIdx < 0 || nextColIdx < 0) return;
+    startCellEdit(nextRowIdx, nextColIdx, targetRowId);
 }
 
 export function cancelCellEdit() {

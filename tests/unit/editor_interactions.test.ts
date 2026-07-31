@@ -268,6 +268,148 @@ describe('editor keyboard and grid selection interactions', () => {
         assert.strictEqual(createdTextareas[1].focused, true);
     });
 
+    it('keeps Tab advancement bound to the intended row when the edit changes sort order', async () => {
+        const makeCell = (id: string) => ({
+            id,
+            innerHTML: '',
+            textContent: '',
+            classList: createClassList(),
+            children: [] as any[],
+            appendChild(child: any) { this.children.push(child); },
+            querySelector() { return null; }
+        });
+        const makeCells = () => Object.fromEntries(
+            [0, 1].flatMap(rowIdx => [0, 1].map(colIdx => {
+                const id = `cell-${rowIdx}-${colIdx}`;
+                return [id, makeCell(id)];
+            }))
+        );
+        let cells: Record<string, any> = makeCells();
+        const controls: Record<string, any> = {
+            pageIndicator: { textContent: '' },
+            btnFirst: { disabled: false },
+            btnPrev: { disabled: false },
+            btnNext: { disabled: false },
+            btnLast: { disabled: false },
+            statusText: { textContent: '' },
+            filterMatchCounter: { textContent: '' }
+        };
+        const createdTextareas: any[] = [];
+        (globalThis as any).document = {
+            getElementById(id: string) { return cells[id] ?? controls[id] ?? null; },
+            querySelectorAll() { return []; },
+            querySelector() { return null; },
+            createElement(tag: string) {
+                const created: any = {
+                    className: '',
+                    textContent: '',
+                    value: '',
+                    classList: createClassList(),
+                    style: {},
+                    scrollWidth: 0,
+                    clientWidth: 0,
+                    addEventListener() {},
+                    removeEventListener() {},
+                    focus() { this.focused = true; }
+                };
+                if (tag === 'textarea') createdTextareas.push(created);
+                return created;
+            }
+        };
+
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { onCellInputKeydown } = await import(editModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        const updateCalls: Array<{ rowId: number; column: string; value: unknown }> = [];
+        const databaseRows: any[][] = [
+            [1, 'a', 'first row note'],
+            [2, 'b', 'second row note']
+        ];
+        const sortedRows = () => databaseRows
+            .map(row => [...row])
+            .sort((left, right) => String(left[1]).localeCompare(String(right[1])));
+
+        backendApi.updateCell = async (
+            _table: string,
+            rowId: number,
+            column: string,
+            value: unknown
+        ) => {
+            updateCalls.push({ rowId, column, value });
+            const row = databaseRows.find(candidate => candidate[0] === rowId);
+            assert.ok(row);
+            row[column === 'rank' ? 1 : 2] = value;
+            // Mirror the external refresh landing while the inline textarea keeps
+            // the pre-refresh DOM mounted.
+            state.gridData = sortedRows();
+        };
+        backendApi.fetchTableCount = async () => databaseRows.length;
+        backendApi.fetchTableData = async () => {
+            // A completed refresh rebuilds row-indexed cell ids for the new order.
+            cells = makeCells();
+            return { rows: sortedRows() };
+        };
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.renderedTable = 'items';
+        state.tableColumns = [
+            { name: 'rank', type: 'TEXT' },
+            { name: 'note', type: 'TEXT' }
+        ];
+        state.gridData = sortedRows();
+        state.sortedColumn = 'rank';
+        state.sortAscending = true;
+        state.currentPageIndex = 0;
+        state.totalPageCount = 1;
+        state.rowsPerPage = 500;
+        state.columnFilters = {};
+        state.filterQuery = '';
+        state.editingCellInfo = {
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 1,
+            columnName: 'rank',
+            originalValue: 'a'
+        };
+        state.activeCellInput = { value: 'z', removeEventListener() {} };
+
+        try {
+            await onCellInputKeydown({
+                key: 'Tab',
+                shiftKey: false,
+                preventDefault() {}
+            });
+
+            assert.strictEqual(state.editingCellInfo?.rowId, 1);
+            assert.strictEqual(state.editingCellInfo?.rowIdx, 1);
+            assert.strictEqual(state.editingCellInfo?.colIdx, 1);
+            assert.strictEqual(createdTextareas.at(-1)?.value, 'first row note');
+
+            createdTextareas.at(-1).value = 'edited intended row';
+            await onCellInputKeydown({
+                key: 'Tab',
+                shiftKey: false,
+                preventDefault() {}
+            });
+
+            assert.deepStrictEqual(updateCalls.slice(0, 2), [
+                { rowId: 1, column: 'rank', value: 'z' },
+                { rowId: 1, column: 'note', value: 'edited intended row' }
+            ]);
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
+            state.sortedColumn = null;
+            state.sortAscending = true;
+            state.renderedTable = null;
+        }
+    });
+
     it('advances inline edits in the rendered pinned row and column order', async () => {
         const makeCell = (id: string) => ({
             id,

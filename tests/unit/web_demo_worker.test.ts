@@ -370,6 +370,51 @@ describe('web demo view worker', () => {
         ), originalSql);
     });
 
+    it('rejects an existing name for create-intent validation and preview only', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('createView', 'intent_target', 'SELECT 1 AS value');
+
+        await assert.rejects(
+            worker.invoke(
+                'validateViewDefinition',
+                'intent_target',
+                'SELECT 2 AS value',
+                'create'
+            ),
+            /view already exists/i
+        );
+        await assert.rejects(
+            worker.invoke(
+                'previewViewDefinition',
+                'intent_target',
+                'SELECT 2 AS value',
+                10,
+                'create'
+            ),
+            /view already exists/i
+        );
+
+        await worker.invoke(
+            'validateViewDefinition',
+            'intent_target',
+            'SELECT 2 AS value',
+            'edit'
+        );
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'intent_target',
+            'SELECT 2 AS value',
+            10,
+            'edit'
+        );
+        assert.deepStrictEqual(Array.from(preview.headers), ['value']);
+        assert.deepStrictEqual(
+            Array.from(preview.rows, (row: unknown[]) => Array.from(row)),
+            [[2]]
+        );
+        assert.strictEqual(await workerScalar(worker, 'SELECT value FROM intent_target'), 1);
+    });
+
     it('does not run validation DDL in demo read-only mode', async () => {
         const worker = await createWorkerHarness({ readOnlyMode: true });
 

@@ -20,6 +20,7 @@ import type {
     ColumnMetadata,
     ColumnDefinition,
     ViewDefinition,
+    ViewDefinitionIntent,
     ViewEditResult,
     ViewTriggerDefinition
 } from './core/types';
@@ -184,12 +185,36 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.logAndDelegate(`Reading view ${escapeIdentifier(view)}`, false, 'getViewDefinition', view);
     }
 
-    async validateViewDefinition(view: string, selectSql: string): Promise<void> {
-        return this.logAndDelegate(`Validating view ${escapeIdentifier(view)}`, false, 'validateViewDefinition', view, selectSql);
+    async validateViewDefinition(
+        view: string,
+        selectSql: string,
+        intent?: ViewDefinitionIntent
+    ): Promise<void> {
+        return this.logAndDelegate(
+            `Validating view ${escapeIdentifier(view)}`,
+            false,
+            'validateViewDefinition',
+            view,
+            selectSql,
+            intent
+        );
     }
 
-    async previewViewDefinition(view: string, selectSql: string, limit?: number): Promise<QueryResultSet> {
-        return this.logAndDelegate(`Previewing view ${escapeIdentifier(view)}`, false, 'previewViewDefinition', view, selectSql, limit);
+    async previewViewDefinition(
+        view: string,
+        selectSql: string,
+        limit?: number,
+        intent?: ViewDefinitionIntent
+    ): Promise<QueryResultSet> {
+        return this.logAndDelegate(
+            `Previewing view ${escapeIdentifier(view)}`,
+            false,
+            'previewViewDefinition',
+            view,
+            selectSql,
+            limit,
+            intent
+        );
     }
 
     async createView(view: string, selectSql: string): Promise<ViewDefinition> {

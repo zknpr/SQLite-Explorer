@@ -13,6 +13,7 @@
 
 import {
   assertViewDefinitionSnapshotCurrent,
+  assertViewDefinitionIntent,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
@@ -856,7 +857,7 @@ async function getViewDefinition(view) {
   return readViewDefinition(view, false);
 }
 
-async function validateViewDefinition(view, selectSql) {
+async function validateViewDefinition(view, selectSql, intent = 'edit') {
   if (!db) throw new Error('No database initialized');
   if (readOnlyMode) {
     throw new Error('View validation is unavailable because the database is read-only');
@@ -866,7 +867,9 @@ async function validateViewDefinition(view, selectSql) {
     "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
     [view]
   );
-  const existingSql = existingResult[0]?.values?.[0]?.[0];
+  const existingRow = existingResult[0]?.values?.[0];
+  const existingSql = existingRow?.[0];
+  assertViewDefinitionIntent(view, existingRow !== undefined, intent);
   const columnListSql = typeof existingSql === 'string'
     ? extractViewColumnListSql(existingSql)
     : undefined;
@@ -886,7 +889,7 @@ async function validateViewDefinition(view, selectSql) {
   }
 }
 
-async function previewViewDefinition(view, selectSql, limit = 50) {
+async function previewViewDefinition(view, selectSql, limit = 50, intent = 'edit') {
   if (!db) throw new Error('No database initialized');
   const body = normalizeViewSelectSql(selectSql);
   const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
@@ -894,7 +897,9 @@ async function previewViewDefinition(view, selectSql, limit = 50) {
     "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
     [view]
   );
-  const existingSql = existing[0]?.values?.[0]?.[0];
+  const existingRow = existing[0]?.values?.[0];
+  const existingSql = existingRow?.[0];
+  assertViewDefinitionIntent(view, existingRow !== undefined, intent);
   const columnListSql = typeof existingSql === 'string'
     ? extractViewColumnListSql(existingSql)
     : undefined;

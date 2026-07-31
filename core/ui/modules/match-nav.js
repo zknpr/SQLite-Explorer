@@ -6,7 +6,11 @@
  * cycling through them with a visible border + a "current / total" counter.
  */
 import { state } from './state.js';
-import { getCellValue } from './data-utils.js';
+import {
+    getCellValue,
+    getOrderedColumnIndices,
+    getOrderedRowIndices
+} from './data-utils.js';
 import {
     appendHighlightedText,
     buildHighlightMatcher,
@@ -141,13 +145,14 @@ function computeMatches(scope, term) {
 
     // Resolve the columns to scan and their data indices once, outside the row loop.
     const columnsToScan = [];
-    state.tableColumns.forEach((col, idx) => {
+    for (const idx of getOrderedColumnIndices()) {
+        const col = state.tableColumns[idx];
         if (scope === 'global' || col.name === scope) {
             columnsToScan.push({ col, colIdx: idx });
         }
-    });
+    }
 
-    for (let rowIdx = 0; rowIdx < state.gridData.length; rowIdx++) {
+    for (const rowIdx of getOrderedRowIndices()) {
         const row = state.gridData[rowIdx];
         for (const { col, colIdx } of columnsToScan) {
             const value = getCellValue(row, colIdx);

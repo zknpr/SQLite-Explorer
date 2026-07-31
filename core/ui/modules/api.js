@@ -299,8 +299,10 @@ export const backendApi = {
     deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),
     createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
     getViewDefinition: (view) => sendRpcRequest('getViewDefinition', [view]),
-    validateViewDefinition: (view, selectSql) => sendRpcRequest('validateViewDefinition', [view, selectSql]),
-    previewViewDefinition: (view, selectSql, limit) => sendRpcRequest('previewViewDefinition', [view, selectSql, limit]),
+    validateViewDefinition: (view, selectSql, intent) =>
+        sendRpcRequest('validateViewDefinition', [view, selectSql, intent]),
+    previewViewDefinition: (view, selectSql, limit, intent) =>
+        sendRpcRequest('previewViewDefinition', [view, selectSql, limit, intent]),
     createView: (view, selectSql) => sendRpcRequest('createView', [view, selectSql]),
     editView: (view, selectSql, preserveTriggers, expectedSql, expectedTriggers) =>
         sendRpcRequest('editView', [

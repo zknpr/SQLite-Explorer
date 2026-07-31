@@ -31,6 +31,7 @@ import type {
   SchemaSnapshot,
   ColumnMetadata,
   ViewDefinition,
+  ViewDefinitionIntent,
   ViewEditResult,
   ViewTriggerDefinition
 } from './core/types';
@@ -87,8 +88,17 @@ interface WorkerMethods {
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
   getViewDefinition(view: string): Promise<ViewDefinition>;
-  validateViewDefinition(view: string, selectSql: string): Promise<void>;
-  previewViewDefinition(view: string, selectSql: string, limit?: number): Promise<QueryResultSet>;
+  validateViewDefinition(
+    view: string,
+    selectSql: string,
+    intent?: ViewDefinitionIntent
+  ): Promise<void>;
+  previewViewDefinition(
+    view: string,
+    selectSql: string,
+    limit?: number,
+    intent?: ViewDefinitionIntent
+  ): Promise<QueryResultSet>;
   createView(view: string, selectSql: string): Promise<ViewDefinition>;
   editView(
     view: string,
@@ -366,10 +376,17 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.createTable(table, columns),
         getViewDefinition: (view: string) =>
           endpoint.getViewDefinition(view),
-        validateViewDefinition: (view: string, selectSql: string) =>
-          endpoint.validateViewDefinition(view, selectSql),
-        previewViewDefinition: (view: string, selectSql: string, limit?: number) =>
-          endpoint.previewViewDefinition(view, selectSql, limit),
+        validateViewDefinition: (
+          view: string,
+          selectSql: string,
+          intent?: ViewDefinitionIntent
+        ) => endpoint.validateViewDefinition(view, selectSql, intent),
+        previewViewDefinition: (
+          view: string,
+          selectSql: string,
+          limit?: number,
+          intent?: ViewDefinitionIntent
+        ) => endpoint.previewViewDefinition(view, selectSql, limit, intent),
         createView: (view: string, selectSql: string) =>
           endpoint.createView(view, selectSql),
         editView: (
@@ -598,10 +615,17 @@ async function createWorkerBackedWasmDatabaseConnection(
             workerProxy.createTable(table, columns),
           getViewDefinition: (view: string) =>
             workerProxy.getViewDefinition(view),
-          validateViewDefinition: (view: string, selectSql: string) =>
-            workerProxy.validateViewDefinition(view, selectSql),
-          previewViewDefinition: (view: string, selectSql: string, limit?: number) =>
-            workerProxy.previewViewDefinition(view, selectSql, limit),
+          validateViewDefinition: (
+            view: string,
+            selectSql: string,
+            intent?: ViewDefinitionIntent
+          ) => workerProxy.validateViewDefinition(view, selectSql, intent),
+          previewViewDefinition: (
+            view: string,
+            selectSql: string,
+            limit?: number,
+            intent?: ViewDefinitionIntent
+          ) => workerProxy.previewViewDefinition(view, selectSql, limit, intent),
           createView: (view: string, selectSql: string) =>
             workerProxy.createView(view, selectSql),
           editView: (

@@ -127,6 +127,9 @@ export interface ViewDefinition {
   triggers: ViewTriggerDefinition[];
 }
 
+/** Whether validation/preview is for a new view or an existing replacement. */
+export type ViewDefinitionIntent = 'create' | 'edit';
+
 /**
  * Atomic view replacement result used by undo/redo tracking.
  */
@@ -301,10 +304,19 @@ export interface DatabaseOperations {
   getViewDefinition(view: string): Promise<ViewDefinition>;
 
   /** Compile a proposed SELECT body without changing the schema. */
-  validateViewDefinition(view: string, selectSql: string): Promise<void>;
+  validateViewDefinition(
+    view: string,
+    selectSql: string,
+    intent?: ViewDefinitionIntent
+  ): Promise<void>;
 
   /** Compile and execute a bounded preview of a proposed SELECT body. */
-  previewViewDefinition(view: string, selectSql: string, limit?: number): Promise<QueryResultSet>;
+  previewViewDefinition(
+    view: string,
+    selectSql: string,
+    limit?: number,
+    intent?: ViewDefinitionIntent
+  ): Promise<QueryResultSet>;
 
   /** Create a view from a SELECT body. */
   createView(view: string, selectSql: string): Promise<ViewDefinition>;

@@ -248,4 +248,60 @@ describe('filter match navigation', () => {
             );
         }
     });
+
+    it('navigates matches in the same pinned-first order as the rendered grid', async () => {
+        const focusedCells: string[] = [];
+        const cells = new Map<string, any>();
+        for (let rowIdx = 0; rowIdx < 2; rowIdx++) {
+            for (let colIdx = 0; colIdx < 2; colIdx++) {
+                const id = `cell-${rowIdx}-${colIdx}`;
+                cells.set(id, {
+                    classList: createClassList(),
+                    scrollIntoView() { focusedCells.push(id); }
+                });
+            }
+        }
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return cells.get(id) ?? null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.selectedTableType = 'table';
+        state.tableColumns = [
+            { name: 'first', type: 'TEXT' },
+            { name: 'second', type: 'TEXT' }
+        ];
+        state.gridData = [
+            [1, 'hit row 1 first', 'hit row 1 second'],
+            [2, 'hit row 2 first', 'hit row 2 second']
+        ];
+        state.pinnedColumns.add('second');
+        state.pinnedRowIds.add(2);
+        state.filterQuery = 'hit';
+        state.columnFilters = {};
+        resetMatchNav();
+
+        try {
+            navigateMatches('global');
+
+            assert.deepStrictEqual(state.matchNav.matches, [
+                { rowIdx: 1, colIdx: 1 },
+                { rowIdx: 1, colIdx: 0 },
+                { rowIdx: 0, colIdx: 1 },
+                { rowIdx: 0, colIdx: 0 }
+            ]);
+            assert.deepStrictEqual(focusedCells, ['cell-1-1']);
+        } finally {
+            state.pinnedColumns.clear();
+            state.pinnedRowIds.clear();
+            resetMatchNav();
+        }
+    });
 });
