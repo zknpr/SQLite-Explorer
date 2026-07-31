@@ -13,12 +13,14 @@
 
 - **No more grid flicker on refresh.** Reloading the same table (after an edit, undo, or filter change) previously unmounted the grid and showed the loading spinner, flashing the UI on every refresh. The grid now stays mounted during same-table refetches; the spinner only appears on a real table switch. Overlapping loads are serialized with a request token so a stale response can never render over a newer one, and a dedicated reload guard blocks the full stale-grid interaction surface (cell click/double-click/keyboard/scroll, the global select-all and delete shortcuts, and BLOB drag-and-drop) in both the extension webview and the web demo. (#498)
 
-### Security & Dependencies
+### Security
 
-- **All 20 open Dependabot alerts resolved.** The extension itself had no runtime exposure — every root-manifest alert was a development-scope transitive under the packaging toolchain (`js-yaml`, `fast-uri`, `linkify-it`, `brace-expansion`, `form-data`, `markdown-it`; nothing ships in the `.vsix`). The project website carried the real exposure and is fixed and redeployed: `next` 16.2.7 → 16.2.12 (8 CVEs, including SSRF in rewrites/Server Actions, middleware bypass, cache confusion, and image-optimization DoS) and `sharp` → 0.35.3 via an explicit override (`next` pins `sharp ^0.34.5`, below the patched libvips line).
-- **View DDL hardening by construction.** The new view operations escape every identifier, parameterize all schema lookups, compile user SQL through a single-statement `EXPLAIN` in a SELECT-only context (trailing statements cannot execute; DML cannot hide in a subquery), and clamp preview sizes engine-side.
-- **Dependabot policy gates.** `@types/vscode` updates are ignored (deliberately pinned to `engines.vscode` — `vsce` refuses to package when the types exceed the minimum supported engine) and TypeScript semver-major updates are ignored in both manifests until the TS 7 native-compiler migration is evaluated on its own.
-- Extension dev-dependencies: `tsx` 4.22.4 → 4.23.1, `@types/node` → 26.1.2. Website: `react`/`react-dom` 19.2.8, `eslint` 10.8.0, `tailwindcss`/`@tailwindcss/postcss` 4.3.3, `eslint-config-next` 16.2.12, `lucide-react` 1.28.0, `@types/node` 26.1.2.
+- **View DDL is hardened by construction.** The new view operations escape every identifier, parameterize all schema lookups, compile user SQL through a single-statement `EXPLAIN` in a SELECT-only context (trailing statements cannot execute; DML cannot hide in a subquery), clamp preview sizes engine-side, and run every schema change inside a SAVEPOINT that rolls back on failure. Destructive confirmations (drop view, discard triggers) run in the extension host, outside the webview's reach.
+
+### Dependencies
+
+- Extension dev-dependencies: `tsx` 4.22.4 → 4.23.1, `@types/node` → 26.1.2, plus transitive security refreshes (`js-yaml`, `fast-uri`, `linkify-it`, `brace-expansion`, `form-data`, `markdown-it`). Nothing in the shipped `.vsix` was affected.
+- Website: `next` 16.2.7 → 16.2.12 (security) with `sharp` → 0.35.3 forced via override (`next` still defaults to a vulnerable `sharp` line), `react`/`react-dom` 19.2.8, `eslint` 10.8.0, `tailwindcss` + `@tailwindcss/postcss` 4.3.3, `eslint-config-next` 16.2.12, `lucide-react` 1.28.0, `@types/node` 26.1.2.
 
 ## 1.5.3
 
