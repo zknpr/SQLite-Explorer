@@ -24,9 +24,24 @@ function escapeRegExp(str) {
 }
 
 /**
- * Build a reusable case-insensitive RegExp that matches any of the given filter
- * terms, or null when there are no active terms. Compile this once per column
- * and reuse the matcher across every cell rather than rebuilding it per cell.
+ * Fold only ASCII uppercase letters, matching SQLite LIKE's default
+ * case-insensitive range without conflating distinct non-ASCII characters.
+ */
+export function foldAsciiCase(str) {
+    return String(str).replace(/[A-Z]/g, char => char.toLowerCase());
+}
+
+function escapeAsciiCaseInsensitiveRegExp(str) {
+    return escapeRegExp(str).replace(/[A-Za-z]/g, char => {
+        const lower = foldAsciiCase(char);
+        return `[${lower}${lower.toUpperCase()}]`;
+    });
+}
+
+/**
+ * Build a reusable SQLite-compatible ASCII-case-insensitive RegExp that matches
+ * any of the given filter terms, or null when there are no active terms. Compile
+ * this once per column and reuse it across cells rather than rebuilding per cell.
  *
  * Terms are de-duplicated and sorted longest-first: regex alternation matches
  * the first listed alternative that fits, so without this a shorter term that is
@@ -41,7 +56,7 @@ export function buildHighlightMatcher(terms) {
     }
     if (seen.size === 0) return null;
     const ordered = [...seen].sort((a, b) => b.length - a.length);
-    return new RegExp(`(${ordered.map(escapeRegExp).join('|')})`, 'gi');
+    return new RegExp(`(${ordered.map(escapeAsciiCaseInsensitiveRegExp).join('|')})`, 'g');
 }
 
 /**

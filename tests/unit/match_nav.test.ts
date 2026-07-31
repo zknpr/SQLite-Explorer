@@ -35,6 +35,74 @@ describe('filter match navigation', () => {
         assert.strictEqual(padded.test('needle'), false);
     });
 
+    it('uses SQLite ASCII-only case folding for navigation and highlighting', async () => {
+        const cells = new Map([
+            ['cell-0-0', { classList: createClassList(), scrollIntoView() {} }],
+            ['cell-0-1', { classList: createClassList(), scrollIntoView() {} }],
+            ['cell-0-2', { classList: createClassList(), scrollIntoView() {} }],
+            ['cell-0-3', { classList: createClassList(), scrollIntoView() {} }]
+        ]);
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return cells.get(id) ?? null;
+            },
+            querySelectorAll() { return []; },
+            createTextNode(text: string) { return { textContent: text }; },
+            createElement(tag: string) {
+                return { tag, className: '', textContent: '' };
+            }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const utilsModulePath = '../../core/ui/modules/utils.js';
+        const { state } = await import(stateModulePath);
+        const { formatCellValueForActiveMatch, navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        const { appendHighlightedText, buildHighlightMatcher } = await import(utilsModulePath);
+        state.selectedTableType = 'view';
+        state.tableColumns = [
+            { name: 'lower_unicode', type: 'TEXT' },
+            { name: 'upper_unicode', type: 'TEXT' },
+            { name: 'lower_ascii', type: 'TEXT' },
+            { name: 'upper_ascii', type: 'TEXT' }
+        ];
+        state.gridData = [['ä', 'Ä', 'a', 'A']];
+        state.columnFilters = {};
+        state.filterQuery = 'ä';
+        resetMatchNav();
+
+        navigateMatches('global');
+
+        assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
+
+        state.filterQuery = 'A';
+        resetMatchNav();
+        navigateMatches('global');
+
+        assert.deepStrictEqual(state.matchNav.matches, [
+            { rowIdx: 0, colIdx: 2 },
+            { rowIdx: 0, colIdx: 3 }
+        ]);
+
+        const highlightParent = {
+            children: [] as any[],
+            appendChild(child: any) { this.children.push(child); }
+        };
+        appendHighlightedText(highlightParent, 'Ä ä', buildHighlightMatcher(['ä']));
+        assert.deepStrictEqual(
+            highlightParent.children
+                .filter(child => child.className === 'cell-highlight')
+                .map(child => child.textContent),
+            ['ä']
+        );
+
+        const longValue = `Ä${'x'.repeat(150)}ä`;
+        const excerpt = formatCellValueForActiveMatch(longValue, state.tableColumns[0], 'ä');
+        assert.strictEqual(excerpt.includes('ä'), true);
+        assert.strictEqual(excerpt.includes('Ä'), false);
+    });
+
     it('navigates to a term beyond the rendered text truncation point', async () => {
         const textSpan = {
             children: [] as any[],

@@ -14,6 +14,7 @@ import {
 import {
     appendHighlightedText,
     buildHighlightMatcher,
+    foldAsciiCase,
     formatCellValueAsText
 } from './utils.js';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
@@ -21,9 +22,9 @@ import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 function activeTerm(scope) {
     const value = scope === 'global' ? state.filterQuery : state.columnFilters[scope];
     const activeValue = getActiveFilterValue(value);
-    // Lowercasing is only for the local case-insensitive comparison. The active
-    // value itself stays untrimmed, matching the exact text sent to SQLite.
-    return activeValue?.toLowerCase() ?? '';
+    // Case folding is only for the local SQLite-compatible comparison. The
+    // active value itself stays untrimmed, matching the exact text sent to SQL.
+    return activeValue === undefined ? '' : foldAsciiCase(activeValue);
 }
 
 function formatSqliteReal(significand, exponent, negative) {
@@ -104,13 +105,13 @@ function getMatchingTextCandidate(value, col, term) {
     if (typeof value === 'number') {
         candidates.push(...sqliteNumericTextCandidates(value));
     }
-    return candidates.find(candidate => candidate.toLowerCase().includes(term)) ?? null;
+    return candidates.find(candidate => foldAsciiCase(candidate).includes(term)) ?? null;
 }
 
 function excerptAroundMatch(text, term, maxLength = 100) {
     if (text.length <= maxLength) return text;
 
-    const matchStart = text.toLowerCase().indexOf(term);
+    const matchStart = foldAsciiCase(text).indexOf(term);
     if (matchStart < 0) return formatCellValueAsText(text);
 
     // Keep the complete match visible even when the filter itself exceeds the
