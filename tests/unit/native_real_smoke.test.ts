@@ -324,6 +324,39 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             );
         });
 
+        await testContext.test('validates and previews main through a same-named TEMP shadow', async () => {
+            await engine.createView(
+                'native_dry_run_shadow',
+                "SELECT 'main-before' AS value"
+            );
+            await engine.executeQuery(
+                "CREATE TEMP VIEW native_dry_run_shadow AS SELECT 'temp-value' AS value"
+            );
+
+            await engine.validateViewDefinition(
+                'native_dry_run_shadow',
+                "SELECT 'candidate' AS value",
+                'edit'
+            );
+            const preview = await engine.previewViewDefinition(
+                'native_dry_run_shadow',
+                "SELECT 'candidate' AS value",
+                10,
+                'edit'
+            );
+
+            assert.deepStrictEqual(preview.headers, ['value']);
+            assert.deepStrictEqual(preview.rows, [['candidate']]);
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM main.native_dry_run_shadow'))[0].rows,
+                [['main-before']]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM temp.native_dry_run_shadow'))[0].rows,
+                [['temp-value']]
+            );
+        });
+
         await testContext.test('round-trips the incident multiline view SQL exactly', async () => {
             await engine.createView('order_summary', INITIAL_VIEW_BODY);
             const initial = await engine.getViewDefinition('order_summary');

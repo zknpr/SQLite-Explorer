@@ -915,10 +915,10 @@ async function validateViewDefinition(view, selectSql, intent = 'edit') {
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     if (typeof existingSql === 'string') {
-      runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+      runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
     }
     runSingleStatement(buildCreateViewSql(view, body, columnListSql));
-    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
     runSingleStatement(`ROLLBACK TO ${savepointName}`);
     runSingleStatement(`RELEASE ${savepointName}`);
   } catch (error) {
@@ -955,12 +955,12 @@ async function previewViewDefinition(view, selectSql, limit = 50, intent = 'edit
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     if (typeof existingSql === 'string') {
-      runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+      runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
     }
     runSingleStatement(buildCreateViewSql(view, body, columnListSql));
-    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
     const result = querySingleStatement(
-      `SELECT * FROM ${escapeIdentifier(view)} LIMIT ${boundedLimit}`
+      `SELECT * FROM ${escapeMainViewIdentifier(view)} LIMIT ${boundedLimit}`
     );
     runSingleStatement(`ROLLBACK TO ${savepointName}`);
     runSingleStatement(`RELEASE ${savepointName}`);

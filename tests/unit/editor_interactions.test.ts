@@ -2,6 +2,7 @@ import './vscode_mock_setup';
 
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert';
+import { createDeferred } from './helpers/deferred';
 
 (globalThis as any).acquireVsCodeApi = () => ({
     getState: () => undefined,
@@ -14,6 +15,7 @@ const textEditorModulePath = '../../core/ui/modules/text-editor.js';
 const editModulePath = '../../core/ui/modules/edit.js';
 const gridEventsModulePath = '../../core/ui/modules/grid-events.js';
 const globalShortcutsModulePath = '../../core/ui/modules/global-shortcuts.js';
+const dndModulePath = '../../core/ui/modules/dnd.js';
 
 function createClassList(initial: string[] = []) {
     const classes = new Set(initial);
@@ -59,6 +61,9 @@ describe('editor keyboard and grid selection interactions', () => {
         state.pinnedRowIds.clear();
         state.selectedTable = null;
         state.selectedTableType = 'table';
+        state.isReadOnly = false;
+        state.cellPreviewInfo = null;
+        state.isLoadingData = false;
     });
 
     it('inserts indentation and outdents selected lines in multiline editors', async () => {
@@ -182,6 +187,135 @@ describe('editor keyboard and grid selection interactions', () => {
             preventDefault() {}
         });
         assert.strictEqual(textarea.value, 'value    ');
+    });
+
+    it('blocks Ctrl+Enter cell-preview saves for read-only table documents', async () => {
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { onCellPreviewKeydown } = await import(editModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        let updateCalls = 0;
+        let textareaLookups = 0;
+        let prevented = false;
+        backendApi.updateCell = async () => {
+            updateCalls++;
+            return new Promise(() => {});
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cellPreviewTextarea') {
+                    textareaLookups++;
+                    return { value: 'changed' };
+                }
+                if (id === 'statusText') return { textContent: '' };
+                return null;
+            }
+        };
+        state.isReadOnly = true;
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.gridData = [[7, 'original']];
+        state.cellPreviewInfo = {
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 7,
+            columnName: 'value',
+            originalValue: 'original'
+        };
+
+        try {
+            onCellPreviewKeydown({
+                key: 'Enter',
+                ctrlKey: true,
+                metaKey: false,
+                preventDefault() { prevented = true; }
+            });
+
+            assert.strictEqual(prevented, true);
+            assert.strictEqual(textareaLookups, 0, 'the read-only guard must run before reading the draft');
+            assert.strictEqual(updateCalls, 0);
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+        }
+    });
+
+    it('aborts a BLOB drop when the selected table changes during the file read', async () => {
+        const listeners = new Map<string, (event: any) => Promise<void>>();
+        const source = createDeferred<Uint8Array>();
+        const cell = {
+            dataset: { rowidx: '0', colidx: '0' },
+            classList: createClassList(),
+            children: [] as any[],
+            closest(selector: string) {
+                return selector === '.data-cell' ? this : null;
+            },
+            appendChild(child: any) { this.children.push(child); }
+        };
+        const container = {
+            addEventListener(type: string, listener: (event: any) => Promise<void>) {
+                listeners.set(type, listener);
+            }
+        };
+        const status = { textContent: '' };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'gridContainer') return container;
+                if (id === 'statusText') return status;
+                return null;
+            },
+            addEventListener() {},
+            createElement() {
+                return { className: '', textContent: '', title: '' };
+            }
+        };
+
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initDragAndDrop } = await import(dndModulePath);
+        const originalReadWorkspaceFileUri = backendApi.readWorkspaceFileUri;
+        const originalUpdateCell = backendApi.updateCell;
+        const updateCalls: unknown[][] = [];
+        backendApi.readWorkspaceFileUri = async () => source.promise;
+        backendApi.updateCell = async (...args: unknown[]) => {
+            updateCalls.push(args);
+        };
+        state.selectedTable = 'first_table';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'payload', type: 'BLOB' }];
+        state.gridData = [[11, new Uint8Array([1])]];
+        state.isReadOnly = false;
+        state.isGridReloading = false;
+        initDragAndDrop();
+        const drop = listeners.get('drop');
+        assert.ok(drop, 'grid drop listener was not registered');
+
+        try {
+            const pendingDrop = drop({
+                preventDefault() {},
+                target: cell,
+                dataTransfer: {
+                    files: [],
+                    getData(type: string) {
+                        return type === 'text/uri-list' ? 'file:///tmp/payload.bin' : '';
+                    }
+                }
+            });
+
+            state.selectedTable = 'second_table';
+            state.tableColumns = [{ name: 'different_payload', type: 'BLOB' }];
+            state.gridData = [[22, new Uint8Array([2])]];
+            source.resolve(new Uint8Array([9, 8, 7]));
+            await pendingDrop;
+
+            assert.deepStrictEqual(updateCalls, []);
+            assert.deepStrictEqual(state.gridData, [[22, new Uint8Array([2])]]);
+        } finally {
+            backendApi.readWorkspaceFileUri = originalReadWorkspaceFileUri;
+            backendApi.updateCell = originalUpdateCell;
+        }
     });
 
     it('commits an inline edit on Tab and advances to the next cell', async () => {

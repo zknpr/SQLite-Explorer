@@ -423,6 +423,10 @@ export function closeCellPreview() {
 }
 
 export async function saveCellPreview() {
+    if (state.isReadOnly) {
+        updateStatus('Document is read-only');
+        return;
+    }
     if (!state.cellPreviewInfo) return;
     if (state.selectedTableType !== 'table') {
         updateStatus('Views are read-only');

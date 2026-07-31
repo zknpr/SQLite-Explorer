@@ -697,7 +697,7 @@ describe('createNativeDatabaseConnection', () => {
         const connection = await createRecordingConnection(call => {
             if (call.method === 'query') {
                 const sql = String(call.args[0]);
-                if (sql.startsWith('PRAGMA table_info')) {
+                if (sql.startsWith('PRAGMA main.table_info')) {
                     return { result: { columns: ['cid', 'name'], values: [[0, 'm']] } };
                 }
                 return { result: { columns: [], values: [] } };
@@ -817,7 +817,7 @@ describe('createNativeDatabaseConnection', () => {
             if (call.method === 'querySingle') {
                 return { result: { columns: [], values: [] } };
             }
-            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA table_info')) {
+            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA main.table_info')) {
                 return {
                     result: {
                         columns: ['cid', 'name'],
@@ -857,7 +857,7 @@ describe('createNativeDatabaseConnection', () => {
 
     it('propagates the configured timeout through the native preview query', async () => {
         const connection = await createRecordingConnection(call => {
-            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA table_info')) {
+            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA main.table_info')) {
                 return { result: { columns: ['cid', 'name'], values: [[0, 'value']] } };
             }
             if (call.method === 'queryBounded') {

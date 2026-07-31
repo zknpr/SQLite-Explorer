@@ -625,8 +625,14 @@ export async function createNativeDatabaseConnection(
         await queryNativeSingleStatement(`EXPLAIN SELECT * FROM (${selectSql}\n) LIMIT 0`);
       };
 
-      const compileNativeView = async (view: string): Promise<void> => {
-        await queryNativeSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+      const compileNativeView = async (
+        view: string,
+        qualifyMain: boolean = false
+      ): Promise<void> => {
+        const viewIdentifier = qualifyMain
+          ? escapeMainViewIdentifier(view)
+          : escapeIdentifier(view);
+        await queryNativeSingleStatement(`EXPLAIN SELECT * FROM ${viewIdentifier}`);
       };
 
       const restoreNativeViewDefinition = async (definition: ViewDefinition): Promise<void> => {
@@ -1122,10 +1128,10 @@ export async function createNativeDatabaseConnection(
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
             if (typeof existingSql === 'string') {
-              await worker.call('run', [`DROP VIEW ${escapeIdentifier(view)}`]);
+              await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
             }
             await runNativeSingleStatement(buildCreateViewSql(view, body, columnListSql));
-            await compileNativeView(view);
+            await compileNativeView(view, true);
             await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
             await worker.call('run', [`RELEASE ${savepointName}`]);
           } catch (err) {
@@ -1164,14 +1170,14 @@ export async function createNativeDatabaseConnection(
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
             if (typeof existingSql === 'string') {
-              await worker.call('run', [`DROP VIEW ${escapeIdentifier(view)}`]);
+              await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
             }
             await runNativeSingleStatement(
               buildCreateViewSql(view, body, columnListSql)
             );
-            await compileNativeView(view);
+            await compileNativeView(view, true);
             const info = await worker.call<NativeQueryResult>('query', [
-              `PRAGMA table_info(${escapeIdentifier(view)})`
+              `PRAGMA main.table_info(${escapeIdentifier(view)})`
             ]);
             const nameIndex = info.columns.indexOf('name');
             if (nameIndex < 0) {
@@ -1184,7 +1190,7 @@ export async function createNativeDatabaseConnection(
               return row[nameIndex];
             });
             const result = await queryNativeBoundedStatement(
-              `SELECT * FROM ${escapeIdentifier(view)}`,
+              `SELECT * FROM ${escapeMainViewIdentifier(view)}`,
               columns,
               boundedLimit
             );

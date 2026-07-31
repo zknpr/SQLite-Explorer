@@ -342,6 +342,43 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('validates and previews the main demo view through a same-named TEMP shadow', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('createView', 'demo_dry_run_shadow', "SELECT 'main-before' AS value");
+        await worker.invoke(
+            'runQuery',
+            "CREATE TEMP VIEW demo_dry_run_shadow AS SELECT 'temp-value' AS value"
+        );
+
+        await worker.invoke(
+            'validateViewDefinition',
+            'demo_dry_run_shadow',
+            "SELECT 'candidate' AS value",
+            'edit'
+        );
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'demo_dry_run_shadow',
+            "SELECT 'candidate' AS value",
+            10,
+            'edit'
+        );
+
+        assert.deepStrictEqual(Array.from(preview.headers), ['value']);
+        assert.deepStrictEqual(
+            Array.from(preview.rows, (row: unknown[]) => Array.from(row)),
+            [['candidate']]
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_dry_run_shadow'),
+            'main-before'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_dry_run_shadow'),
+            'temp-value'
+        );
+    });
+
     it('treats percent and underscore filters as literal LIKE text', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

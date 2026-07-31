@@ -1021,10 +1021,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       if (typeof existingSql === 'string') {
-        this.runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+        this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
       }
       this.runSingleStatement(buildCreateViewSql(view, body, columnListSql));
-      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
       // Successful validation is deliberately non-mutating.
       await this.executeQuery(`ROLLBACK TO ${savepointName}`);
       await this.executeQuery(`RELEASE ${savepointName}`);
@@ -1067,12 +1067,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       if (typeof existingSql === 'string') {
-        this.runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
+        this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
       }
       this.runSingleStatement(buildCreateViewSql(view, body, columnListSql));
-      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeIdentifier(view)}`);
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
       const result = this.executeSingleQuery(
-        `SELECT * FROM ${escapeIdentifier(view)} LIMIT ${boundedLimit}`
+        `SELECT * FROM ${escapeMainViewIdentifier(view)} LIMIT ${boundedLimit}`
       );
       await this.executeQuery(`ROLLBACK TO ${savepointName}`);
       await this.executeQuery(`RELEASE ${savepointName}`);

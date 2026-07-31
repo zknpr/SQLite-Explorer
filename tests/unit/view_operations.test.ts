@@ -349,6 +349,41 @@ describe('view operations', () => {
         }
     });
 
+    it('validates and previews the main view through a same-named TEMP shadow', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.createView('dry_run_shadow', "SELECT 'main-before' AS value");
+            await engine.executeQuery(
+                "CREATE TEMP VIEW dry_run_shadow AS SELECT 'temp-value' AS value"
+            );
+
+            await engine.validateViewDefinition(
+                'dry_run_shadow',
+                "SELECT 'candidate' AS value",
+                'edit'
+            );
+            const preview = await engine.previewViewDefinition(
+                'dry_run_shadow',
+                "SELECT 'candidate' AS value",
+                10,
+                'edit'
+            );
+
+            assert.deepStrictEqual(preview.headers, ['value']);
+            assert.deepStrictEqual(preview.rows, [['candidate']]);
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM main.dry_run_shadow'),
+                'main-before'
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM temp.dry_run_shadow'),
+                'temp-value'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('drops the main view without deleting a same-named TEMP view', async () => {
         const engine = await createEngine();
         try {
