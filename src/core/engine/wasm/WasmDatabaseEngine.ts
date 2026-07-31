@@ -1115,10 +1115,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   async dropView(view: string): Promise<ViewDefinition> {
-    const before = await this.readViewDefinition(view, true);
     const savepointName = this.createSavepointName('sp_drop_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
+      const before = await this.readViewDefinition(view, true);
       this.runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
       await this.executeQuery(`RELEASE ${savepointName}`);
       return before;

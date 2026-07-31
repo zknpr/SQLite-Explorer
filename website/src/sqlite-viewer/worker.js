@@ -993,10 +993,10 @@ async function editView(
 
 async function dropView(view) {
   if (!db) throw new Error('No database initialized');
-  const before = await readViewDefinition(view, true);
   const savepointName = createViewSavepointName('sp_drop_view');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
+    const before = await readViewDefinition(view, true);
     runSingleStatement(`DROP VIEW ${escapeIdentifier(view)}`);
     runSingleStatement(`RELEASE ${savepointName}`);
     return before;

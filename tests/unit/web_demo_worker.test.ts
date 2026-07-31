@@ -431,6 +431,47 @@ describe('web demo view worker', () => {
         ), 0);
     });
 
+    it('captures the demo drop snapshot inside the drop savepoint', async () => {
+        const order: string[] = [];
+        const worker = await createWorkerHarness({
+            initSqlJs: async config => {
+                const SQL = await initSqlJs(config);
+                const BaseDatabase = SQL.Database;
+                class RecordingDatabase extends BaseDatabase {
+                    exec(sql: string, params?: any) {
+                        if (
+                            sql.startsWith("SELECT sql FROM sqlite_schema WHERE type = 'view'") &&
+                            params?.[0] === 'drop_order_view'
+                        ) {
+                            order.push('snapshot');
+                        }
+                        return super.exec(sql, params);
+                    }
+
+                    prepare(sql: string, params?: any) {
+                        if (!sql.includes('sqlite_explorer_boundary_')) {
+                            if (/^SAVEPOINT "sp_drop_view_/.test(sql)) order.push('savepoint');
+                            if (sql === 'DROP VIEW "drop_order_view"') order.push('drop');
+                            if (/^RELEASE "sp_drop_view_/.test(sql)) order.push('release');
+                        }
+                        return super.prepare(sql, params);
+                    }
+                }
+                return { ...SQL, Database: RecordingDatabase };
+            }
+        });
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW drop_order_view AS SELECT 1 AS value'
+        );
+        order.length = 0;
+
+        const dropped = await worker.invoke('dropView', 'drop_order_view');
+
+        assert.strictEqual(dropped.selectSql, 'SELECT 1 AS value');
+        assert.deepStrictEqual(order, ['savepoint', 'snapshot', 'drop', 'release']);
+    });
+
     it('recreates same-event triggers in schema order', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke('runQuery', 'CREATE TABLE trigger_log (label TEXT)');

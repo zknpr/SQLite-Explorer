@@ -1082,6 +1082,50 @@ FROM orders o`;
         }
     });
 
+    it('captures the native drop snapshot inside the drop savepoint', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryBatch') {
+                return {
+                    result: {
+                        results: [
+                            {
+                                columns: ['sql'],
+                                values: [['CREATE VIEW drop_order_view AS SELECT 1 AS value']]
+                            },
+                            { columns: ['name', 'sql'], values: [] },
+                            { columns: ['name', 'sql'], values: [] }
+                        ]
+                    }
+                };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            const dropped = await connection.databaseOps.dropView('drop_order_view');
+            const order = connection.calls.flatMap(call => {
+                const sql = String(call.args[0] ?? '');
+                if (call.method === 'run' && /^SAVEPOINT "sp_drop_view_/.test(sql)) {
+                    return ['savepoint'];
+                }
+                if (call.method === 'queryBatch') return ['snapshot'];
+                if (call.method === 'run' && sql === 'DROP VIEW "drop_order_view"') {
+                    return ['drop'];
+                }
+                if (call.method === 'run' && /^RELEASE "sp_drop_view_/.test(sql)) {
+                    return ['release'];
+                }
+                return [];
+            });
+
+            assert.strictEqual(dropped.selectSql, 'SELECT 1 AS value');
+            assert.deepStrictEqual(order, ['savepoint', 'snapshot', 'drop', 'release']);
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('logs a missing native view definition while preserving undo no-op behavior', async () => {
         const outputLines: string[] = [];
         const outputChannel = {

@@ -665,6 +665,39 @@ describe('view operations', () => {
         }
     });
 
+    it('captures the WASM drop snapshot inside the drop savepoint', async () => {
+        const engine = await createEngine();
+        const target = engine as any;
+        const order: string[] = [];
+        const executeQuery = target.executeQuery.bind(target);
+        const readViewDefinition = target.readViewDefinition.bind(target);
+        const runSingleStatement = target.runSingleStatement.bind(target);
+        try {
+            await engine.createView('drop_order_view', 'SELECT 1 AS value');
+
+            mock.method(target, 'executeQuery', async (sql: string, ...args: unknown[]) => {
+                if (/^SAVEPOINT "sp_drop_view_/.test(sql)) order.push('savepoint');
+                if (/^RELEASE "sp_drop_view_/.test(sql)) order.push('release');
+                return executeQuery(sql, ...args);
+            });
+            mock.method(target, 'readViewDefinition', async (...args: unknown[]) => {
+                order.push('snapshot');
+                return readViewDefinition(...args);
+            });
+            mock.method(target, 'runSingleStatement', (sql: string) => {
+                if (sql === 'DROP VIEW "drop_order_view"') order.push('drop');
+                return runSingleStatement(sql);
+            });
+
+            const dropped = await engine.dropView('drop_order_view');
+
+            assert.strictEqual(dropped.selectSql, 'SELECT 1 AS value');
+            assert.deepStrictEqual(order, ['savepoint', 'snapshot', 'drop', 'release']);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('restores a raw view definition without requiring an extracted SELECT body', async () => {
         const engine = await createEngine();
         try {

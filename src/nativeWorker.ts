@@ -1248,10 +1248,10 @@ export async function createNativeDatabaseConnection(
         },
 
         dropView: async (view: string): Promise<ViewDefinition> => {
-          const before = await getNativeViewDefinition(view, true);
           const savepointName = createSavepointName('sp_drop_view');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
+            const before = await getNativeViewDefinition(view, true);
             await worker.call('run', [`DROP VIEW ${escapeIdentifier(view)}`]);
             await worker.call('run', [`RELEASE ${savepointName}`]);
             return before;
