@@ -191,6 +191,10 @@ function forwardWorkerLog(level: WorkerLogLevel, args: unknown[]): void {
  * deadline with the batch length so a long File Revert cannot time out merely
  * because many individually healthy undo steps share one invocation.
  */
+// Past ten base intervals, fail into DatabaseDocument's reconnect/reload
+// recovery instead of letting a hung worker invocation survive the session.
+const MAX_HISTORY_INVOCATION_TIMEOUT_MS = 10 * DEFAULT_INVOCATION_TIMEOUT_MS;
+
 function getWorkerInvocationTimeout(
   methodName: string,
   parameters: readonly unknown[]
@@ -201,7 +205,10 @@ function getWorkerInvocationTimeout(
 
   const modifications = parameters[0];
   const modificationCount = Array.isArray(modifications) ? modifications.length : 1;
-  return DEFAULT_INVOCATION_TIMEOUT_MS * Math.max(1, modificationCount);
+  return Math.min(
+    MAX_HISTORY_INVOCATION_TIMEOUT_MS,
+    DEFAULT_INVOCATION_TIMEOUT_MS * Math.max(1, modificationCount)
+  );
 }
 
 // ============================================================================

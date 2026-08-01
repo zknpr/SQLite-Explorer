@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import Module from 'node:module';
 import esbuild from 'esbuild';
 import { mockVscode } from './mocks/vscode';
+import { createDeferred } from './helpers/deferred';
 import { ModificationTracker } from '../../src/core/undo-history';
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
 import type { DatabaseOperations, LabeledModification } from '../../src/core/types';
@@ -927,6 +928,101 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             const restoredTracker = ModificationTracker.deserialize(backupContent);
             assert.strictEqual(restoredTracker.hasUncommittedChanges(), false);
         } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+
+    it('reconnects a native database before rolling history back after a revert RPC timeout', async () => {
+        const { InvocationTimeoutError } = require('../../src/core/rpc');
+        const reconnectMayFinish = createDeferred<void>();
+        const freshNativeOps = { engineKind: Promise.resolve('native') };
+        let reconnectCalls = 0;
+        const timedOutNativeOps = {
+            engineKind: Promise.resolve('native'),
+            executeQuery: async () => [],
+            discardModifications: async () => {
+                throw new InvocationTimeoutError('discardModifications');
+            }
+        };
+        const doc = createDocBypassingFactory(
+            timedOutNativeOps,
+            createFileUri('/test/native.db'),
+            async () => {
+                reconnectCalls++;
+                await reconnectMayFinish.promise;
+                return { databaseOps: freshNativeOps, isReadOnly: false };
+            }
+        );
+        const savedModification = {
+            label: 'Saved Update',
+            description: 'Update saved row',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'value',
+            priorValue: 'before-save',
+            newValue: 'saved'
+        };
+        const unsavedModification = {
+            label: 'Unsaved Update',
+            description: 'Update unsaved row',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 2,
+            targetColumn: 'value',
+            priorValue: 'before-draft',
+            newValue: 'draft'
+        };
+        doc.recordModification(savedModification);
+        await doc.save();
+        doc.recordModification(unsavedModification);
+
+        let backupContent: Uint8Array | undefined;
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (_uri: unknown, content: Uint8Array) => {
+                    backupContent = content;
+                }
+            },
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            const pendingRevert = doc.revert(undefined);
+            for (let attempt = 0; attempt < 20 && reconnectCalls === 0; attempt++) {
+                await Promise.resolve();
+            }
+
+            assert.strictEqual(reconnectCalls, 1, 'native recovery must open a fresh connection');
+            await doc.backup(createUri('vscode-userdata', '/backups/native-before-reconnect.db'), undefined);
+            assert.ok(backupContent);
+            assert.strictEqual(
+                ModificationTracker.deserialize(backupContent).hasUncommittedChanges(),
+                true,
+                'history must stay dirty until the fresh native connection is ready'
+            );
+
+            reconnectMayFinish.resolve();
+            await pendingRevert;
+            assert.strictEqual(doc.databaseOperations, freshNativeOps);
+
+            backupContent = undefined;
+            await doc.backup(createUri('vscode-userdata', '/backups/native-after-reconnect.db'), undefined);
+            assert.ok(backupContent);
+            assert.strictEqual(
+                ModificationTracker.deserialize(backupContent).hasUncommittedChanges(),
+                false,
+                'history may be rolled back only after native reconnection completes'
+            );
+        } finally {
+            reconnectMayFinish.resolve();
             Object.defineProperty(mockVscode.workspace, 'fs', {
                 value: originalFs,
                 writable: true,

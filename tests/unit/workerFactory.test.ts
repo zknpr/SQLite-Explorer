@@ -2,6 +2,7 @@ import './vscode_mock_setup';
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
+import { DEFAULT_INVOCATION_TIMEOUT_MS } from '../../src/core/rpc';
 
 // 1. Mock module cache before importing the module under test
 const moduleCache = require('module')._cache;
@@ -40,7 +41,7 @@ Module.prototype.require = function(id: string) {
             workerTimeoutPolicy = timeoutPolicy;
             return workerProxy;
           },
-          DEFAULT_INVOCATION_TIMEOUT_MS: 60_000,
+          DEFAULT_INVOCATION_TIMEOUT_MS,
           Transfer: class Transfer {}
         };
     }
@@ -373,12 +374,42 @@ describe('workerFactory error path tests', () => {
     assert.ok(workerTimeoutPolicy, 'desktop worker should install a timeout policy');
     assert.strictEqual(
       workerTimeoutPolicy!('discardModifications', [modifications]),
-      180_000
+      DEFAULT_INVOCATION_TIMEOUT_MS * modifications.length
     );
 
     releaseDiscard!();
     await pendingRevert;
     assert.strictEqual(tracker.hasUncommittedChanges(), false);
     assert.deepStrictEqual(tracker.getUncommittedEntries(), []);
+  });
+
+  it('caps modification-scaled worker deadlines so a hung history call cannot wait all session', async () => {
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false })
+    };
+
+    const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
+    const fileUri = {
+      scheme: 'file',
+      fsPath: '/test/db.sqlite',
+      path: '/test/db.sqlite'
+    } as any;
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    await bundle.establishConnection(fileUri, 'test.sqlite');
+    const veryLargeHistory = Array.from({ length: 10_000 }, (_, index) => ({ index }));
+
+    assert.ok(workerTimeoutPolicy, 'desktop worker should install a timeout policy');
+    assert.strictEqual(
+      workerTimeoutPolicy!('discardModifications', [veryLargeHistory]),
+      10 * DEFAULT_INVOCATION_TIMEOUT_MS
+    );
+    assert.strictEqual(
+      workerTimeoutPolicy!('applyModifications', [veryLargeHistory]),
+      10 * DEFAULT_INVOCATION_TIMEOUT_MS
+    );
+    assert.strictEqual(
+      workerTimeoutPolicy!('runQuery', ['SELECT 1']),
+      DEFAULT_INVOCATION_TIMEOUT_MS
+    );
   });
 });

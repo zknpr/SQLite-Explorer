@@ -478,14 +478,24 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       if (!(error instanceof InvocationTimeoutError)) throw error;
 
       // The worker may still be mutating after a host-side timeout. Queue a
-      // fresh connection behind it and only reconcile history after the saved
-      // bytes have been reopened, preventing the tracker from describing an
+      // fresh connection behind it and only reconcile history after the active
+      // database has been reopened, preventing the tracker from describing an
       // unknown intermediate database state.
       GlobalOutputChannel?.appendLine(
         `[Revert recovery] ${error.message}; the document state may be inconsistent. Reloading from disk.`
       );
       try {
-        await this.reloadFromDisk();
+        const engineKind = await this.databaseOperations.engineKind;
+        if (engineKind === 'native') {
+          // Native requests are processed serially by the txiki worker. Reopening
+          // through the same bundle therefore waits behind the timed-out mutation
+          // and gives this document a fresh handle to its post-mortem disk state.
+          // Do not clean the tracker until that reconnect barrier has completed.
+          await this.#reconnectFromDisk();
+          this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
+        } else {
+          await this.reloadFromDisk();
+        }
         this.#modificationTracker.rollbackToCheckpoint();
         invalidatedByRecoveryReload = true;
       } catch (reloadError) {
@@ -562,15 +572,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     let reloadedOps = currentOps;
 
     if ((await currentOps.engineKind) === 'wasm') {
-      const result = await this.establishConnection(
-        this.uri,
-        this.fileParts.filename
-      );
-      this.connectionState = {
-        databaseOps: result.databaseOps,
-        isReadOnly: result.isReadOnly
-      };
-      reloadedOps = result.databaseOps;
+      reloadedOps = await this.#reconnectFromDisk();
     }
 
     // File Revert and sidebar Reload both replace the database's externally
@@ -578,6 +580,19 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     // VS Code re-reads its SQL and mtime from the active engine.
     this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
     return reloadedOps;
+  }
+
+  /** Replace the active engine handle with a newly opened connection to this file. */
+  async #reconnectFromDisk(): Promise<DatabaseOperations> {
+    const result = await this.establishConnection(
+      this.uri,
+      this.fileParts.filename
+    );
+    this.connectionState = {
+      databaseOps: result.databaseOps,
+      isReadOnly: result.isReadOnly
+    };
+    return result.databaseOps;
   }
 
   // ============================================================================

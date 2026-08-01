@@ -5,7 +5,7 @@
  * instead of VS Code API. This enables the viewer to run standalone
  * in a browser iframe.
  */
-import { state } from './modules/state.js';
+import { state, persistState } from './modules/state.js';
 import { handleRpcResponse, sendRpcResult, sendRpcError, backendApi } from './modules/web-api.js';
 import {
     initSidebar,
@@ -28,6 +28,7 @@ import {
     initModals
 } from './modules/modals.js';
 import {
+    clearSelection,
     loadTableData,
     initGridInteraction,
     initGridControls
@@ -58,6 +59,14 @@ const webviewMethods = {
             applyConnectionResult(connectionResult);
         }
         if (state.isDbConnected) {
+            // A broadcast view refresh may change projection and row order.
+            // Clear positional state before the first await so controls cannot
+            // target cells from the previous result while schema reloads.
+            if (state.selectedTable && state.selectedTableType === 'view') {
+                clearSelection();
+                persistState();
+            }
+
             await refreshSchema();
             const tableExists = state.schemaCache.tables.some(t => t.name === state.selectedTable) ||
                                 state.schemaCache.views.some(v => v.name === state.selectedTable);

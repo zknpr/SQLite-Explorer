@@ -112,7 +112,7 @@ export class HostBridge implements ToastService {
   /**
    * Update a single cell value.
    */
-  async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, originalValue?: CellValue) {
+  async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, _originalValue?: CellValue) {
     const dbOps = this.ensureDatabaseInitialized();
 
     // Check if the document is read-only
@@ -120,7 +120,20 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
-    const patch = this.tryGeneratePatch(value, originalValue);
+    // The caller's original value may have been captured before asynchronous
+    // work (notably reading a dropped BLOB). Read by stable row identity as
+    // close to the write as possible so undo and JSON patches are based on the
+    // database value that this update actually replaces.
+    const current = await dbOps.executeQuery(
+      `SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} WHERE rowid = ? LIMIT 1`,
+      [rowId]
+    );
+    const currentRow = current[0]?.rows[0];
+    if (!currentRow) {
+      throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+    }
+    const priorValue = currentRow[0];
+    const patch = this.tryGeneratePatch(value, priorValue);
     const operation = patch ? 'json_patch' as const : 'set' as const;
 
     // Use specific method instead of generic exec
@@ -142,7 +155,7 @@ export class HostBridge implements ToastService {
       targetColumn: column,
       newValue: patch ?? value,
       operation,
-      priorValue: originalValue
+      priorValue
     });
   }
 

@@ -318,6 +318,119 @@ describe('editor keyboard and grid selection interactions', () => {
         }
     });
 
+    it('undoes a slow BLOB upload to the value written concurrently during the read', async () => {
+        const listeners = new Map<string, (event: any) => Promise<void>>();
+        const source = createDeferred<Uint8Array>();
+        const cell = {
+            dataset: { rowidx: '0', colidx: '0' },
+            classList: createClassList(),
+            children: [] as any[],
+            closest(selector: string) {
+                return selector === '.data-cell' ? this : null;
+            },
+            appendChild(child: any) { this.children.push(child); }
+        };
+        const container = {
+            addEventListener(type: string, listener: (event: any) => Promise<void>) {
+                listeners.set(type, listener);
+            }
+        };
+        const status = { textContent: '' };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'gridContainer') return container;
+                if (id === 'statusText') return status;
+                if (id === 'cell-0-0') return cell;
+                return null;
+            },
+            addEventListener() {},
+            createElement() {
+                return { className: '', textContent: '', title: '' };
+            }
+        };
+
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initDragAndDrop } = await import(dndModulePath);
+        const { HostBridge } = await import('../../src/hostBridge');
+        const { createDatabaseEngine } = await import('../../src/core/sqlite-db');
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const engine = database.operations!;
+        const originalReadWorkspaceFileUri = backendApi.readWorkspaceFileUri;
+        const originalUpdateCell = backendApi.updateCell;
+        const initialValue = new Uint8Array([1]);
+        const concurrentValue = new Uint8Array([4, 5]);
+        const uploadedValue = new Uint8Array([9, 8, 7]);
+        let recordedModification: any;
+
+        await engine.executeQuery('CREATE TABLE uploads (payload BLOB)');
+        await engine.executeQuery('INSERT INTO uploads (payload) VALUES (?)', [initialValue]);
+        const bridge = new HostBridge({
+            webviews: new Map(),
+            context: {},
+            isReadOnly: false
+        } as any, {
+            databaseOperations: engine,
+            isReadOnlyMode: false,
+            recordExternalModification(modification: any) {
+                recordedModification = modification;
+            }
+        } as any);
+
+        backendApi.readWorkspaceFileUri = async () => source.promise;
+        backendApi.updateCell = (...args: any[]) => (bridge.updateCell as any)(...args);
+        state.selectedTable = 'uploads';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'payload', type: 'BLOB' }];
+        state.gridData = [[1, initialValue]];
+        state.isReadOnly = false;
+        state.isGridReloading = false;
+        initDragAndDrop();
+        const drop = listeners.get('drop');
+        assert.ok(drop, 'grid drop listener was not registered');
+
+        try {
+            const pendingDrop = drop({
+                preventDefault() {},
+                target: cell,
+                dataTransfer: {
+                    files: [],
+                    getData(type: string) {
+                        return type === 'text/uri-list' ? 'file:///tmp/payload.bin' : '';
+                    }
+                }
+            });
+
+            // Simulate another panel writing while the URI read is still pending.
+            await engine.updateCell('uploads', 1, 'payload', concurrentValue);
+            source.resolve(uploadedValue);
+            await pendingDrop;
+
+            assert.ok(recordedModification, 'the upload modification was not recorded');
+            await engine.undoModification(recordedModification);
+            const result = await engine.executeQuery(
+                'SELECT payload FROM uploads WHERE rowid = ?',
+                [1]
+            );
+            const restoredValue = result[0]?.rows[0]?.[0];
+            assert.ok(restoredValue instanceof Uint8Array);
+            assert.deepStrictEqual(
+                Array.from(restoredValue),
+                Array.from(concurrentValue),
+                'undo must preserve the value written while the upload was reading'
+            );
+        } finally {
+            backendApi.readWorkspaceFileUri = originalReadWorkspaceFileUri;
+            backendApi.updateCell = originalUpdateCell;
+            (engine as any).shutdown();
+        }
+    });
+
     it('commits an inline edit on Tab and advances to the next cell', async () => {
         const listeners = new Map<string, (event: any) => any>();
         const makeCell = (id: string) => ({
