@@ -1238,9 +1238,9 @@ FROM orders o`;
                             }
                             if (query.sql.includes('sqlite_temp_schema')) {
                                 return {
-                                    columns: ['name', 'sql'],
+                                    columns: ['name', 'sql', 'temp_view_exists'],
                                     values: tempTriggerPresent
-                                        ? [['temp native insert', storedTriggerSql]]
+                                        ? [['temp native insert', storedTriggerSql, 0]]
                                         : []
                                 };
                             }
@@ -1380,7 +1380,9 @@ FROM orders o`;
                 .flatMap(call => (call.args[0] as Array<{ sql: string }>))
                 .filter(query => query.sql.includes("type = 'trigger'"));
             assert.ok(triggerQueries.length > 0);
-            assert.ok(triggerQueries.every(query => query.sql.endsWith('ORDER BY rowid')));
+            assert.ok(triggerQueries.every(query => (
+                /ORDER BY (?:temp_trigger\.)?rowid$/.test(query.sql)
+            )));
             assert.ok(triggerQueries.some(query => query.sql.includes('sqlite_schema')));
             assert.ok(triggerQueries.some(query => query.sql.includes('sqlite_temp_schema')));
 

@@ -14,16 +14,156 @@ export const VIEW_TRIGGER_SCHEMA_QUERIES = [
     temporary: false
   },
   {
-    // A TEMP trigger may target a main view, but when a same-named TEMP view
-    // exists SQLite resolves the trigger association to that shadow instead.
-    // sqlite_temp_schema.tbl_name alone cannot distinguish the two cases.
-    sql: "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE " +
-      "AND NOT EXISTS (SELECT 1 FROM sqlite_temp_schema WHERE type = 'view' AND name = ? COLLATE NOCASE) " +
-      "ORDER BY rowid",
+    // sqlite_temp_schema.tbl_name does not retain the target schema. Return the
+    // shadow state with every candidate so mapViewTriggerRows can distinguish
+    // an explicit ON main.v from an unqualified ON v when temp.v exists.
+    sql: "SELECT temp_trigger.name, temp_trigger.sql, " +
+      "EXISTS (SELECT 1 FROM sqlite_temp_schema AS temp_view " +
+      "WHERE temp_view.type = 'view' AND temp_view.name = ? COLLATE NOCASE) " +
+      "FROM sqlite_temp_schema AS temp_trigger WHERE temp_trigger.type = 'trigger' " +
+      "AND temp_trigger.tbl_name = ? COLLATE NOCASE ORDER BY temp_trigger.rowid",
     params: (view: string): CellValue[] => [view, view],
     temporary: true
   }
 ] as const;
+
+interface SqlToken {
+  kind: 'word' | 'identifier' | 'string' | 'symbol';
+  value: string;
+  start: number;
+  end: number;
+}
+
+function isSqlWordCharacter(char: string): boolean {
+  return /[A-Za-z0-9_$\u0080-\uFFFF]/.test(char);
+}
+
+/** Tokenize SQL structure while keeping quoted text and comments opaque. */
+function scanSqlTokens(sql: string): SqlToken[] {
+  const tokens: SqlToken[] = [];
+  let index = 0;
+
+  while (index < sql.length) {
+    const char = sql[index];
+    const next = sql[index + 1];
+    if (/\s/.test(char)) {
+      index++;
+      continue;
+    }
+    if (char === '-' && next === '-') {
+      index += 2;
+      while (index < sql.length && sql[index] !== '\n' && sql[index] !== '\r') index++;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      const commentEnd = sql.indexOf('*/', index + 2);
+      if (commentEnd === -1) break;
+      index = commentEnd + 2;
+      continue;
+    }
+    if (char === "'" || char === '"' || char === '`' || char === '[') {
+      const start = index;
+      const closingQuote = char === '[' ? ']' : char;
+      const kind = char === "'" ? 'string' : 'identifier';
+      let value = '';
+      index++;
+      while (index < sql.length) {
+        if (sql[index] === closingQuote) {
+          if (sql[index + 1] === closingQuote) {
+            value += closingQuote;
+            index += 2;
+            continue;
+          }
+          index++;
+          break;
+        }
+        value += sql[index++];
+      }
+      tokens.push({ kind, value, start, end: index });
+      continue;
+    }
+    if (isSqlWordCharacter(char)) {
+      const start = index++;
+      while (index < sql.length && isSqlWordCharacter(sql[index])) index++;
+      tokens.push({ kind: 'word', value: sql.slice(start, index), start, end: index });
+      continue;
+    }
+
+    tokens.push({ kind: 'symbol', value: char, start: index, end: ++index });
+  }
+
+  return tokens;
+}
+
+function isSqlKeyword(token: SqlToken | undefined, keyword: string): boolean {
+  return token?.kind === 'word' && token.value.toUpperCase() === keyword;
+}
+
+function consumeSqlIdentifier(tokens: readonly SqlToken[], index: number): number {
+  const token = tokens[index];
+  if (!token || (token.kind !== 'word' && token.kind !== 'identifier')) {
+    throw new Error('Expected an SQL identifier');
+  }
+  return index + 1;
+}
+
+function consumeQualifiedSqlIdentifier(tokens: readonly SqlToken[], index: number): number {
+  index = consumeSqlIdentifier(tokens, index);
+  if (tokens[index]?.kind === 'symbol' && tokens[index].value === '.') {
+    index = consumeSqlIdentifier(tokens, index + 1);
+  }
+  return index;
+}
+
+/** Return the schema explicitly named by a CREATE TRIGGER ON target, if any. */
+function extractTriggerTargetSchema(triggerSql: string): string | undefined {
+  const tokens = scanSqlTokens(triggerSql);
+  let index = 0;
+  const expectKeyword = (keyword: string) => {
+    if (!isSqlKeyword(tokens[index], keyword)) {
+      throw new Error(`Expected ${keyword} in stored CREATE TRIGGER SQL`);
+    }
+    index++;
+  };
+
+  expectKeyword('CREATE');
+  if (isSqlKeyword(tokens[index], 'TEMP') || isSqlKeyword(tokens[index], 'TEMPORARY')) index++;
+  expectKeyword('TRIGGER');
+  if (isSqlKeyword(tokens[index], 'IF')) {
+    index++;
+    expectKeyword('NOT');
+    expectKeyword('EXISTS');
+  }
+  index = consumeQualifiedSqlIdentifier(tokens, index);
+
+  if (isSqlKeyword(tokens[index], 'BEFORE') || isSqlKeyword(tokens[index], 'AFTER')) {
+    index++;
+  } else if (isSqlKeyword(tokens[index], 'INSTEAD')) {
+    index++;
+    expectKeyword('OF');
+  }
+
+  if (isSqlKeyword(tokens[index], 'INSERT') || isSqlKeyword(tokens[index], 'DELETE')) {
+    index++;
+  } else if (isSqlKeyword(tokens[index], 'UPDATE')) {
+    index++;
+    if (isSqlKeyword(tokens[index], 'OF')) {
+      index = consumeSqlIdentifier(tokens, index + 1);
+      while (tokens[index]?.kind === 'symbol' && tokens[index].value === ',') {
+        index = consumeSqlIdentifier(tokens, index + 1);
+      }
+    }
+  } else {
+    throw new Error('Expected a trigger event in stored CREATE TRIGGER SQL');
+  }
+
+  expectKeyword('ON');
+  const schemaToken = tokens[index];
+  index = consumeSqlIdentifier(tokens, index);
+  if (tokens[index]?.kind !== 'symbol' || tokens[index].value !== '.') return undefined;
+  consumeSqlIdentifier(tokens, index + 1);
+  return schemaToken.value;
+}
 
 /** Qualify a persistent view so a same-named TEMP view cannot shadow DDL. */
 export function escapeMainViewIdentifier(view: string): string {
@@ -40,13 +180,31 @@ export function mapViewTriggerRows(
   }
 
   return VIEW_TRIGGER_SCHEMA_QUERIES.flatMap((source, index) => (
-    rowsBySchema[index].map(row => {
+    rowsBySchema[index].flatMap(row => {
       if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
         throw new Error(`View trigger definition is unavailable for ${view}`);
       }
+      if (source.temporary) {
+        const hasTempShadow = row[2] === 1 || row[2] === 1n;
+        if (row[2] !== 0 && row[2] !== 0n && !hasTempShadow) {
+          throw new Error(`Temporary view shadow state is unavailable for ${view}`);
+        }
+        if (hasTempShadow) {
+          let targetSchema: string | undefined;
+          try {
+            targetSchema = extractTriggerTargetSchema(row[1]);
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            throw new Error(
+              `Unable to determine the target of temporary trigger ${row[0]}: ${detail}`
+            );
+          }
+          if (targetSchema?.toLowerCase() !== 'main') return [];
+        }
+      }
       return source.temporary
-        ? { identifier: row[0], sql: row[1], temporary: true }
-        : { identifier: row[0], sql: row[1] };
+        ? [{ identifier: row[0], sql: row[1], temporary: true }]
+        : [{ identifier: row[0], sql: row[1] }];
     })
   ));
 }
@@ -133,86 +291,30 @@ interface ViewSqlParts {
 /** Locate the declaration's top-level AS without treating quoted text as SQL structure. */
 function locateViewSqlParts(createSql: string): ViewSqlParts {
   let depth = 0;
-  let index = 0;
   let columnListStart = -1;
   let columnListEnd = -1;
 
-  while (index < createSql.length) {
-    const char = createSql[index];
-    const next = createSql[index + 1];
-
-    if (char === '-' && next === '-') {
-      index += 2;
-      while (index < createSql.length && createSql[index] !== '\n') index++;
-      continue;
-    }
-    if (char === '/' && next === '*') {
-      const commentEnd = createSql.indexOf('*/', index + 2);
-      if (commentEnd === -1) break;
-      index = commentEnd + 2;
-      continue;
-    }
-    if (char === "'" || char === '"' || char === '`') {
-      const quote = char;
-      index++;
-      while (index < createSql.length) {
-        if (createSql[index] === quote) {
-          if (createSql[index + 1] === quote) {
-            index += 2;
-            continue;
-          }
-          index++;
-          break;
-        }
-        index++;
-      }
-      continue;
-    }
-    if (char === '[') {
-      index++;
-      while (index < createSql.length) {
-        if (createSql[index] === ']') {
-          if (createSql[index + 1] === ']') {
-            index += 2;
-            continue;
-          }
-          index++;
-          break;
-        }
-        index++;
-      }
-      continue;
-    }
-    if (char === '(') {
-      if (depth === 0 && columnListStart === -1) columnListStart = index;
+  for (const token of scanSqlTokens(createSql)) {
+    if (token.kind === 'symbol' && token.value === '(') {
+      if (depth === 0 && columnListStart === -1) columnListStart = token.start;
       depth++;
-      index++;
       continue;
     }
-    if (char === ')') {
+    if (token.kind === 'symbol' && token.value === ')') {
       if (depth === 1 && columnListStart !== -1 && columnListEnd === -1) {
-        columnListEnd = index + 1;
+        columnListEnd = token.end;
       }
       depth = Math.max(0, depth - 1);
-      index++;
       continue;
     }
-    if (depth === 0 && /[A-Za-z_]/.test(char)) {
-      const tokenStart = index;
-      index++;
-      while (index < createSql.length && /[A-Za-z0-9_$]/.test(createSql[index])) index++;
-      if (createSql.slice(tokenStart, index).toUpperCase() === 'AS') {
-        return {
-          selectStart: index,
-          columnListSql: columnListStart !== -1 && columnListEnd !== -1
-            ? createSql.slice(columnListStart, columnListEnd)
-            : undefined
-        };
-      }
-      continue;
+    if (depth === 0 && isSqlKeyword(token, 'AS')) {
+      return {
+        selectStart: token.end,
+        columnListSql: columnListStart !== -1 && columnListEnd !== -1
+          ? createSql.slice(columnListStart, columnListEnd)
+          : undefined
+      };
     }
-
-    index++;
   }
 
   throw new Error('Unable to locate the SELECT body in the stored view definition');

@@ -1142,4 +1142,73 @@ describe('web demo view worker', () => {
             11
         );
     });
+
+    it('preserves a quoted-main TEMP trigger through a same-named TEMP view shadow', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_qualified_main_rows (value INTEGER)');
+        await worker.invoke('runQuery', 'INSERT INTO demo_qualified_main_rows VALUES (3)');
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW demo_qualified_trigger_view AS SELECT value FROM demo_qualified_main_rows'
+        );
+        await worker.invoke('runQuery', 'CREATE TEMP TABLE demo_qualified_temp_rows (value INTEGER)');
+        await worker.invoke('runQuery', 'INSERT INTO demo_qualified_temp_rows VALUES (7)');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP VIEW demo_qualified_trigger_view AS ' +
+            'SELECT value FROM demo_qualified_temp_rows'
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP TABLE demo_qualified_trigger_log (target TEXT, value INTEGER)'
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP TRIGGER demo_qualified_main_insert ' +
+            'INSTEAD OF INSERT ON "main"."demo_qualified_trigger_view" ' +
+            "BEGIN INSERT INTO demo_qualified_trigger_log VALUES ('main', NEW.value); END"
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP TRIGGER demo_qualified_temp_insert ' +
+            'INSTEAD OF INSERT ON demo_qualified_trigger_view ' +
+            "BEGIN INSERT INTO demo_qualified_trigger_log VALUES ('temp', NEW.value); END"
+        );
+
+        const edit = await worker.invoke(
+            'editView',
+            'demo_qualified_trigger_view',
+            'SELECT value * 2 AS value FROM demo_qualified_main_rows',
+            true
+        );
+
+        assert.deepStrictEqual(
+            Array.from(edit.before.triggers, (trigger: any) => trigger.identifier),
+            ['demo_qualified_main_insert']
+        );
+        assert.deepStrictEqual(
+            Array.from(edit.after.triggers, (trigger: any) => trigger.identifier),
+            ['demo_qualified_main_insert']
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_qualified_trigger_view'),
+            7
+        );
+        await worker.invoke('runQuery', 'INSERT INTO main.demo_qualified_trigger_view VALUES (13)');
+        await worker.invoke('runQuery', 'INSERT INTO temp.demo_qualified_trigger_view VALUES (17)');
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                "SELECT value FROM demo_qualified_trigger_log WHERE target = 'main'"
+            ),
+            13
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                "SELECT value FROM demo_qualified_trigger_log WHERE target = 'temp'"
+            ),
+            17
+        );
+    });
 });

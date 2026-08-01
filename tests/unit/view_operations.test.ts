@@ -321,6 +321,68 @@ describe('view operations', () => {
         }
     });
 
+    it('preserves a main-qualified TEMP trigger through a same-named TEMP view shadow', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE TABLE qualified_trigger_main_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO qualified_trigger_main_rows VALUES (3)');
+            await engine.executeQuery(
+                'CREATE VIEW qualified_trigger_view AS SELECT value FROM qualified_trigger_main_rows'
+            );
+            await engine.executeQuery('CREATE TEMP TABLE qualified_trigger_temp_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO qualified_trigger_temp_rows VALUES (7)');
+            await engine.executeQuery(
+                'CREATE TEMP VIEW qualified_trigger_view AS ' +
+                'SELECT value FROM qualified_trigger_temp_rows'
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TABLE qualified_trigger_log (target TEXT, value INTEGER)'
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TRIGGER qualified_main_insert ' +
+                'INSTEAD OF INSERT /* event comment */ ON /* target */ ' +
+                'main /* qualifier */ . /* object */ qualified_trigger_view ' +
+                "BEGIN INSERT INTO qualified_trigger_log VALUES ('main', NEW.value); END"
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TRIGGER qualified_temp_insert ' +
+                'INSTEAD OF INSERT ON qualified_trigger_view ' +
+                "BEGIN INSERT INTO qualified_trigger_log VALUES ('temp', NEW.value); END"
+            );
+
+            const edit = await engine.editView(
+                'qualified_trigger_view',
+                'SELECT value * 2 AS value FROM qualified_trigger_main_rows',
+                true
+            );
+
+            assert.deepStrictEqual(
+                edit.before.triggers.map(trigger => trigger.identifier),
+                ['qualified_main_insert']
+            );
+            assert.deepStrictEqual(
+                edit.after.triggers.map(trigger => trigger.identifier),
+                ['qualified_main_insert']
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM temp.qualified_trigger_view'),
+                7
+            );
+            await engine.executeQuery('INSERT INTO main.qualified_trigger_view VALUES (13)');
+            await engine.executeQuery('INSERT INTO temp.qualified_trigger_view VALUES (17)');
+            assert.strictEqual(await readScalar(
+                engine,
+                "SELECT value FROM qualified_trigger_log WHERE target = 'main'"
+            ), 13);
+            assert.strictEqual(await readScalar(
+                engine,
+                "SELECT value FROM qualified_trigger_log WHERE target = 'temp'"
+            ), 17);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('preserves an explicit view column list when replacing its SELECT body', async () => {
         const engine = await createEngine();
         try {
@@ -955,7 +1017,7 @@ describe('view operations', () => {
             assert.strictEqual(
                 await readScalar(
                     engine,
-                    "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'read_only_view'"
+                    "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'read_only_new'"
                 ),
                 0
             );

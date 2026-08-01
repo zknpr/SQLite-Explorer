@@ -725,6 +725,59 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             );
             assert.strictEqual(logged[0].rows[0][0], 11);
         });
+
+        await testContext.test('preserves a bracket-qualified main TEMP trigger through a temp shadow', async () => {
+            await engine.executeQuery('CREATE TABLE native_qualified_main_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO native_qualified_main_rows VALUES (3)');
+            await engine.executeQuery(
+                'CREATE VIEW native_qualified_trigger_view AS ' +
+                'SELECT value FROM native_qualified_main_rows'
+            );
+            await engine.executeQuery('CREATE TEMP TABLE native_qualified_temp_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO native_qualified_temp_rows VALUES (7)');
+            await engine.executeQuery(
+                'CREATE TEMP VIEW native_qualified_trigger_view AS ' +
+                'SELECT value FROM native_qualified_temp_rows'
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TABLE native_qualified_trigger_log (target TEXT, value INTEGER)'
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TRIGGER native_qualified_main_insert ' +
+                'INSTEAD OF INSERT ON [main].[native_qualified_trigger_view] ' +
+                "BEGIN INSERT INTO native_qualified_trigger_log VALUES ('main', NEW.value); END"
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TRIGGER native_qualified_temp_insert ' +
+                'INSTEAD OF INSERT ON native_qualified_trigger_view ' +
+                "BEGIN INSERT INTO native_qualified_trigger_log VALUES ('temp', NEW.value); END"
+            );
+
+            const edit = await engine.editView(
+                'native_qualified_trigger_view',
+                'SELECT value * 2 AS value FROM native_qualified_main_rows',
+                true
+            );
+
+            assert.deepStrictEqual(
+                edit.before.triggers.map(trigger => trigger.identifier),
+                ['native_qualified_main_insert']
+            );
+            assert.deepStrictEqual(
+                edit.after.triggers.map(trigger => trigger.identifier),
+                ['native_qualified_main_insert']
+            );
+            const tempRows = await engine.executeQuery(
+                'SELECT value FROM temp.native_qualified_trigger_view'
+            );
+            assert.strictEqual(tempRows[0].rows[0][0], 7);
+            await engine.executeQuery('INSERT INTO main.native_qualified_trigger_view VALUES (13)');
+            await engine.executeQuery('INSERT INTO temp.native_qualified_trigger_view VALUES (17)');
+            const logRows = await engine.executeQuery(
+                'SELECT target, value FROM native_qualified_trigger_log ORDER BY rowid'
+            );
+            assert.deepStrictEqual(logRows[0].rows, [['main', 13], ['temp', 17]]);
+        });
     } finally {
         rawWorker?.stop();
         bundle?.workerMethods[Symbol.dispose]();
