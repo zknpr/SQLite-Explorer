@@ -262,6 +262,27 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.strictEqual(preview.exactIntegerTexts?.[0]?.[1], undefined);
         });
 
+        await testContext.test('restores divergent REAL text for a 1001-column rowid-keyed native table', async () => {
+            const columnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+            await engine.executeQuery(
+                `CREATE TABLE native_wide_real_rows (${columnNames.map(name => `"${name}"`).join(', ')}); ` +
+                'INSERT INTO native_wide_real_rows(c0) VALUES (9.652937795298495e282)'
+            );
+            const result = await engine.fetchTableData('native_wide_real_rows', {
+                columns: ['rowid', ...columnNames],
+                globalFilterColumns: columnNames,
+                limit: 1,
+                offset: 0
+            });
+
+            assert.strictEqual(result.rows[0].length, 1001);
+            assert.strictEqual(typeof result.exactIntegerTexts?.[0]?.[1], 'string');
+            assert.notStrictEqual(
+                result.exactIntegerTexts?.[0]?.[1],
+                String(result.rows[0][1])
+            );
+        });
+
         await testContext.test('nests native batch writes inside a host savepoint', async () => {
             await engine.executeQuery(
                 "CREATE TABLE native_nested_batch (value TEXT); " +

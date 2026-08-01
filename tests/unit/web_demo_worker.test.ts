@@ -76,11 +76,30 @@ async function createWorkerHarness(options: {
     useBundledWasm?: boolean;
     initSqlJs?: (config: any) => Promise<any>;
     onImportScripts?: (url: string) => void;
+    onSql?: (kind: 'exec' | 'prepare', sql: string) => void;
 } = {}): Promise<WorkerHarness> {
     const source = await readCurrentWorkerBundle();
     const responses: any[] = [];
+    const initializeSqlJs = options.initSqlJs ?? initSqlJs;
     const workerGlobal: any = {
-        initSqlJs: options.initSqlJs ?? initSqlJs,
+        initSqlJs: async (config: any) => {
+            const sqlJs = await initializeSqlJs(config);
+            if (!options.onSql) return sqlJs;
+            const ObservedDatabase = new Proxy(sqlJs.Database, {
+                construct(Target: any, args: any[]): object {
+                    const database = Reflect.construct(Target, args) as Record<string, any>;
+                    for (const kind of ['exec', 'prepare'] as const) {
+                        const original = database[kind].bind(database);
+                        database[kind] = (sql: string, ...methodArgs: unknown[]) => {
+                            options.onSql?.(kind, sql);
+                            return original(sql, ...methodArgs);
+                        };
+                    }
+                    return database;
+                }
+            });
+            return { ...sqlJs, Database: ObservedDatabase };
+        },
         postMessage(message: unknown) {
             responses.push(message);
         }
@@ -711,6 +730,91 @@ describe('web demo view worker', () => {
         assert.strictEqual(preview.rows[0][0], 9007199254740992);
         assert.strictEqual(preview.exactIntegerTexts[0][0], '9007199254740993');
         assert.strictEqual(preview.exactIntegerTexts[0][1], undefined);
+    });
+
+    it('restores divergent REAL text for a 1001-column rowid-keyed demo table', async () => {
+        const worker = await createWorkerHarness();
+        const columnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        await worker.invoke(
+            'runQuery',
+            `CREATE TABLE demo_wide_real_rows (${columnNames.map(name => `"${name}"`).join(', ')}); ` +
+            'INSERT INTO demo_wide_real_rows(c0) VALUES (9.652937795298495e282)'
+        );
+
+        const result = await worker.invoke('fetchTableData', 'demo_wide_real_rows', {
+            columns: ['rowid', ...columnNames],
+            globalFilterColumns: columnNames,
+            limit: 1,
+            offset: 0
+        });
+        assert.strictEqual(result.rows[0].length, 1001);
+        assert.strictEqual(typeof result.exactIntegerTexts?.[0]?.[1], 'string');
+        assert.notStrictEqual(
+            result.exactIntegerTexts[0][1],
+            String(result.rows[0][1])
+        );
+    });
+
+    it('does not issue rowid companions for a wide demo view named rowid', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql(_kind, sql) { observedSql.push(sql); }
+        });
+        const dataColumnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        const viewExpressions = [
+            '1 AS rowid',
+            '9.652937795298495e282 AS c0',
+            ...dataColumnNames.slice(1).map(name => `0 AS "${name}"`)
+        ];
+        await worker.invoke(
+            'runQuery',
+            `CREATE VIEW demo_wide_named_rowid AS SELECT ${viewExpressions.join(', ')}`
+        );
+        observedSql.length = 0;
+
+        const result = await worker.invoke('fetchTableData', 'demo_wide_named_rowid', {
+            columns: ['rowid', ...dataColumnNames],
+            globalFilterColumns: dataColumnNames,
+            limit: 1,
+            offset: 0
+        });
+        assert.strictEqual(result.rows[0].length, 1001);
+        assert.strictEqual(result.exactIntegerTexts?.[0]?.[1], undefined);
+        assert.strictEqual(
+            observedSql.filter(sql => sql.includes('__sqlite_explorer_numeric_rowid')).length,
+            0
+        );
+    });
+
+    it('does not issue rowid companions for a wide demo WITHOUT ROWID table', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql(_kind, sql) { observedSql.push(sql); }
+        });
+        const dataColumnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_wide_without_rowid (' +
+            '"rowid" INTEGER PRIMARY KEY, ' +
+            dataColumnNames.map(name => `"${name}"`).join(', ') +
+            ') WITHOUT ROWID; ' +
+            'INSERT INTO demo_wide_without_rowid(rowid, c0) VALUES ' +
+            '(1, 9.652937795298495e282)'
+        );
+        observedSql.length = 0;
+
+        const result = await worker.invoke('fetchTableData', 'demo_wide_without_rowid', {
+            columns: ['rowid', ...dataColumnNames],
+            globalFilterColumns: dataColumnNames,
+            limit: 1,
+            offset: 0
+        });
+        assert.strictEqual(result.rows[0].length, 1001);
+        assert.strictEqual(result.exactIntegerTexts?.[0]?.[1], undefined);
+        assert.strictEqual(
+            observedSql.filter(sql => sql.includes('__sqlite_explorer_numeric_rowid')).length,
+            0
+        );
     });
 
     it('derives demo numeric sidecars from one evaluation of random expressions', async () => {

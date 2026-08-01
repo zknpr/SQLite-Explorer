@@ -43,14 +43,23 @@ it('keeps host-modal RPCs alive until their response in both transports', async 
             'editView',
             'dropView',
             'confirmLargeChanges',
-            'confirmLargeSelection'
+            'confirmLargeSelection',
+            'saveFile',
+            'selectFile',
+            'exportTable',
+            'showInformationToast',
+            'showWarningToast',
+            'showErrorToast'
         ]) {
             assert.strictEqual(shared.getRpcTimeoutMs(method), undefined, method);
             assert.strictEqual(extensionApi.getRpcTimeoutMs(method), undefined, method);
             assert.strictEqual(webApi.getRpcTimeoutMs(method), undefined, method);
         }
 
-        const extensionPromise = extensionApi.sendRpcRequest('dropView', ['slow_dialog']);
+        const extensionPromise = extensionApi.sendRpcRequest('saveFile', [
+            'slow-dialog.bin',
+            new Uint8Array([1, 2, 3])
+        ]);
         await new Promise<void>(resolve => setImmediate(resolve));
         const extensionRequest = extensionMessages.at(-1).content;
         assert.strictEqual(scheduled.length, 0, 'interactive extension RPC must have no fixed timer');

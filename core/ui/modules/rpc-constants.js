@@ -2,15 +2,22 @@
 export const RPC_TIMEOUT_MS = 60000;
 
 const INTERACTIVE_RPC_METHODS = new Set([
+    // Audited HostBridge waits: deleteColumns, editView, dropView, confirms, save/select/export pickers, and all button-returning toasts.
     'deleteColumns',
     'editView',
     'dropView',
     'confirmLargeChanges',
-    'confirmLargeSelection'
+    'confirmLargeSelection',
+    'saveFile',
+    'selectFile',
+    'exportTable',
+    'showInformationToast',
+    'showWarningToast',
+    'showErrorToast'
 ]);
 
 /**
- * Modal host calls are intentionally unbounded at the webview transport layer.
+ * Interactive host calls are intentionally unbounded at the webview transport layer.
  * A fixed client deadline can expire while VS Code owns the confirmation UI;
  * executing after that rejection would make a reported failure mutate data.
  * Database/worker calls beneath the host retain their own operation deadlines.

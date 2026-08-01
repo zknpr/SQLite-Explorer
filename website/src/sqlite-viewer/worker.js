@@ -29,7 +29,10 @@ import { escapeLikePattern } from '../../../src/core/sql-utils.ts';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 import {
   buildExactNumericTextQuery,
-  normalizeIntegerRowsForTransport
+  buildRowIdExactRealTextQueries,
+  collectRowIdExactRealTexts,
+  normalizeIntegerRowsForTransport,
+  ROWID_TABLE_AUTHORITY_SQL
 } from '../../../src/core/integer-utils.ts';
 
 // ============================================================================
@@ -551,9 +554,32 @@ async function fetchTableData(table, options = {}) {
     return { headers, rows: [] };
   }
 
+  const sourceRows = results[0].values;
+  const companionResults = [];
+  let canUseRowIdCompanions = false;
+  if (
+    transportQuery.valueColumnCount === undefined
+    && headers[0]?.toLowerCase() === 'rowid'
+    && sourceRows.length > 0
+  ) {
+    const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table]);
+    canUseRowIdCompanions = (authority[0]?.values.length ?? 0) > 0;
+  }
+  if (canUseRowIdCompanions) {
+    for (const query of buildRowIdExactRealTextQueries(
+      table,
+      headers,
+      sourceRows.map(row => row[0])
+    )) {
+      const result = db.exec(query.sql, query.params, { useBigInt: true });
+      companionResults.push({ query, rows: result[0]?.values ?? [] });
+    }
+  }
+  const companionExactTexts = collectRowIdExactRealTexts(sourceRows, companionResults);
   const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
-    results[0].values,
-    transportQuery.valueColumnCount
+    sourceRows,
+    transportQuery.valueColumnCount,
+    companionExactTexts
   );
   return {
     headers,

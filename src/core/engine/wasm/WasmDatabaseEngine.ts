@@ -32,7 +32,10 @@ import { buildSelectQuery, buildCountQuery } from '../../query-builder';
 import { applyMergePatch, computeJsonPatchUndo, parseJsonValueForPatching } from '../../json-utils';
 import {
   buildExactNumericTextQuery,
-  normalizeIntegerRowsForTransport
+  buildRowIdExactRealTextQueries,
+  collectRowIdExactRealTexts,
+  normalizeIntegerRowsForTransport,
+  ROWID_TABLE_AUTHORITY_SQL
 } from '../../integer-utils';
 import { getNodeFs } from '../../platform/fs';
 import {
@@ -1487,9 +1490,48 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             }
         }
 
+        const companionResults = [];
+        let canUseRowIdCompanions = false;
+        if (
+          transportQuery.valueColumnCount === undefined
+          && headers[0]?.toLowerCase() === 'rowid'
+          && sourceRows.length > 0
+        ) {
+          const authority = await this.executeQuery(ROWID_TABLE_AUTHORITY_SQL, [table]);
+          canUseRowIdCompanions = (authority[0]?.rows.length ?? 0) > 0;
+        }
+        if (canUseRowIdCompanions) {
+          for (const query of buildRowIdExactRealTextQueries(
+            table,
+            headers,
+            sourceRows.map(row => row[0])
+          )) {
+            let companionStmt: WasmPreparedStatement | null = null;
+            try {
+              companionStmt = this.instance.prepare(
+                query.sql,
+                normalizeWasmBindParams(query.params)
+              );
+              const companionRows: Array<Array<CellValue | bigint>> = [];
+              while (companionStmt.step()) {
+                const row = companionStmt.get(null, { useBigInt: true });
+                if (row) companionRows.push(row);
+              }
+              companionResults.push({ query, rows: companionRows });
+            } finally {
+              if (companionStmt) companionStmt.free();
+            }
+          }
+        }
+        const companionExactTexts = collectRowIdExactRealTexts(
+          sourceRows,
+          companionResults
+        );
+
         const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
           sourceRows,
-          transportQuery.valueColumnCount
+          transportQuery.valueColumnCount,
+          companionExactTexts
         );
         return {
             headers,

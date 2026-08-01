@@ -46,7 +46,10 @@ import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 import { computeJsonPatchUndo } from './core/json-utils';
 import {
   buildExactNumericTextQuery,
-  normalizeIntegerRowsForTransport
+  buildRowIdExactRealTextQueries,
+  collectRowIdExactRealTexts,
+  normalizeIntegerRowsForTransport,
+  ROWID_TABLE_AUTHORITY_SQL
 } from './core/integer-utils';
 import { serializeOperations } from './core/operation-serializer';
 import { InvocationTimeoutError } from './core/rpc';
@@ -1405,13 +1408,44 @@ export async function createNativeDatabaseConnection(
             transportQuery.valueColumnCount
           ]);
 
+          const companionResults = [];
+          let canUseRowIdCompanions = false;
+          if (
+            transportQuery.valueColumnCount === undefined
+            && columns[0]?.toLowerCase() === 'rowid'
+            && result.values.length > 0
+          ) {
+            const authority = await worker.call<NativeQueryResult>('query', [
+              ROWID_TABLE_AUTHORITY_SQL,
+              [table]
+            ]);
+            canUseRowIdCompanions = authority.values.length > 0;
+          }
+          if (canUseRowIdCompanions) {
+            for (const query of buildRowIdExactRealTextQueries(
+              table,
+              columns,
+              result.values.map(row => row[0])
+            )) {
+              const companion = await worker.call<NativeQueryResult>('query', [
+                query.sql,
+                query.params
+              ]);
+              companionResults.push({ query, rows: companion.values });
+            }
+          }
+          const companionExactTexts = collectRowIdExactRealTexts(
+            result.values,
+            companionResults
+          );
+
           // txiki preserves SQLite int64 values as BigInt. The generated
           // companion columns also retain authoritative REAL text before V8
           // normalizes the storage class into a JavaScript Number.
           const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
             result.values,
             undefined,
-            result.exactIntegerTexts
+            result.exactIntegerTexts ?? companionExactTexts
           );
 
           return {

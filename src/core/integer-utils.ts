@@ -4,16 +4,38 @@ import { escapeIdentifier } from './sql-utils';
 const NUMERIC_SOURCE_ALIAS = '__sqlite_explorer_numeric_source';
 const NUMERIC_VALUE_PREFIX = '__sqlite_explorer_numeric_value_';
 const NUMERIC_TEXT_PREFIX = '__sqlite_explorer_numeric_text_';
+const ROWID_COMPANION_ID = '__sqlite_explorer_numeric_rowid';
+const ROWID_COMPANION_TEXT_PREFIX = '__sqlite_explorer_numeric_rowid_text_';
 // Bundled SQLite engines use the default SQLITE_MAX_COLUMN value. Keep this
 // structural limit explicit so generated metadata can never make an otherwise
 // valid wide query fail with "too many columns in result set".
 const SQLITE_MAX_RESULT_COLUMNS = 2000;
+const ROWID_COMPANION_COLUMNS_PER_QUERY = 999;
+const SQLITE_MAX_VARIABLE_NUMBER = 32766;
+
+/** Authoritative main-schema capability check required before companion reads. */
+export const ROWID_TABLE_AUTHORITY_SQL =
+  `SELECT 1 FROM pragma_table_list ` +
+  `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' AND "wr" = 0 LIMIT 1`;
 
 export interface ExactNumericTextQuery {
   sql: string;
   transportColumns: string[];
   /** Present only when a second, SQLite-text companion exists per value. */
   valueColumnCount?: number;
+}
+
+export interface RowIdExactRealTextQuery {
+  sql: string;
+  params: CellValue[];
+  transportColumns: string[];
+  /** Positions in the original values row corresponding to the text columns. */
+  columnIndices: number[];
+}
+
+export interface RowIdExactRealTextResult {
+  query: RowIdExactRealTextQuery;
+  rows: readonly (readonly unknown[])[];
 }
 
 /**
@@ -66,9 +88,128 @@ export function buildExactNumericTextQuery(
   };
   if (includeRealTextSidecar) result.valueColumnCount = columnCount;
   // Unsafe INTEGERs still cross through value columns as BigInt and are
-  // normalized exactly. Ultra-wide results omit only divergent REAL text:
-  // evaluating the source twice would be incorrect for volatile expressions.
+  // normalized exactly. Ultra-wide arbitrary results omit only divergent REAL
+  // text because evaluating a volatile source twice would be incorrect;
+  // rowid-keyed table callers restore it with bounded companion reads below.
   return result;
+}
+
+/**
+ * Build exact-REAL companion reads for an already-fetched rowid-keyed page.
+ * Each query stays below both SQLite's 2,000-column result limit and the
+ * bundled engines' 32,766-variable limit. This is safe to do after the main
+ * query because table rowids identify the exact page rows and database
+ * operations on a connection are serialized; arbitrary view/preview sources
+ * deliberately retain the values-only degradation rather than being evaluated
+ * twice.
+ *
+ * The leading-column check below is only a cheap structural precondition.
+ * Callers must first prove ROWID_TABLE_AUTHORITY_SQL returned a row for the
+ * target; a view or WITHOUT ROWID table can legally expose a column named
+ * rowid without providing stable hidden-rowid identity.
+ */
+export function buildRowIdExactRealTextQueries(
+  table: string,
+  columns: readonly string[],
+  rowIds: readonly (CellValue | bigint)[]
+): RowIdExactRealTextQuery[] {
+  if (columns.length < 2 || columns[0].toLowerCase() !== 'rowid' || rowIds.length === 0) {
+    return [];
+  }
+
+  const dataColumns = columns.slice(1);
+  const queries: RowIdExactRealTextQuery[] = [];
+  for (
+    let columnOffset = 0;
+    columnOffset < dataColumns.length;
+    columnOffset += ROWID_COMPANION_COLUMNS_PER_QUERY
+  ) {
+    const columnChunk = dataColumns.slice(
+      columnOffset,
+      columnOffset + ROWID_COMPANION_COLUMNS_PER_QUERY
+    );
+    const columnIndices = columnChunk.map((_, index) => columnOffset + index + 1);
+    const textColumns = columnIndices.map(
+      columnIndex => `${ROWID_COMPANION_TEXT_PREFIX}${columnIndex}`
+    );
+    const textExpressions = columnChunk.map((column, index) => {
+      const quotedColumn = escapeIdentifier(column);
+      return (
+        `CASE WHEN typeof(${quotedColumn}) = 'real' ` +
+        `THEN CAST(${quotedColumn} AS TEXT) END AS ${escapeIdentifier(textColumns[index])}`
+      );
+    });
+
+    for (
+      let rowOffset = 0;
+      rowOffset < rowIds.length;
+      rowOffset += SQLITE_MAX_VARIABLE_NUMBER
+    ) {
+      const rowIdChunk = rowIds.slice(rowOffset, rowOffset + SQLITE_MAX_VARIABLE_NUMBER);
+      const params = rowIdChunk.map(rowId => (
+        typeof rowId === 'bigint' ? rowId.toString() : rowId
+      ));
+      queries.push({
+        sql:
+          `SELECT rowid AS ${escapeIdentifier(ROWID_COMPANION_ID)}, ` +
+          `${textExpressions.join(', ')} FROM ${escapeIdentifier(table)} ` +
+          `WHERE rowid IN (${rowIdChunk.map(() => '?').join(', ')})`,
+        params,
+        transportColumns: [ROWID_COMPANION_ID, ...textColumns],
+        columnIndices
+      });
+    }
+  }
+  return queries;
+}
+
+/** Merge positionally named companion rows into the sparse exact-text map. */
+export function collectRowIdExactRealTexts(
+  sourceRows: readonly (readonly unknown[])[],
+  companionResults: readonly RowIdExactRealTextResult[]
+): ExactIntegerTextMap | undefined {
+  const sourceRowById = new Map<string, number>();
+  sourceRows.forEach((row, rowIndex) => {
+    const rowId = row[0];
+    if (!['bigint', 'number', 'string'].includes(typeof rowId)) {
+      throw new Error(`Invalid rowid identity at source row ${rowIndex}`);
+    }
+    sourceRowById.set(String(rowId), rowIndex);
+  });
+
+  let exactTexts: ExactIntegerTextMap | undefined;
+  for (const { query, rows } of companionResults) {
+    for (const companionRow of rows) {
+      if (companionRow.length < query.columnIndices.length + 1) {
+        throw new Error('Rowid exact REAL companion result is missing columns');
+      }
+      const rowIndex = sourceRowById.get(String(companionRow[0]));
+      if (rowIndex === undefined) {
+        throw new Error(`Rowid exact REAL companion returned an unexpected row: ${String(companionRow[0])}`);
+      }
+      query.columnIndices.forEach((columnIndex, companionIndex) => {
+        const exactText = companionRow[companionIndex + 1];
+        if (exactText === null || exactText === undefined) return;
+        if (typeof exactText !== 'string') {
+          throw new Error(
+            `Rowid exact REAL text at row ${rowIndex}, column ${columnIndex} is not text`
+          );
+        }
+        const value = sourceRows[rowIndex]?.[columnIndex];
+        if (value === undefined) {
+          throw new Error(
+            `Rowid exact REAL text is outside row ${rowIndex}, column ${columnIndex}`
+          );
+        }
+        if (exactText !== String(value)) {
+          exactTexts ??= {};
+          exactTexts[rowIndex] ??= {};
+          exactTexts[rowIndex][columnIndex] = exactText;
+        }
+      });
+    }
+  }
+  return exactTexts;
 }
 
 /**

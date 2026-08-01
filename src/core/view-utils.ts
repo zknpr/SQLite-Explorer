@@ -625,7 +625,12 @@ export function assertViewTriggersCompatibleWithColumns(
   for (const trigger of triggers) {
     const parsed = parseStoredTriggerSql(trigger.sql);
     for (const column of parsed.updateOfColumns) {
-      if (!availableColumns.has(foldSqlIdentifier(column.value))) {
+      const foldedColumn = foldSqlIdentifier(column.value);
+      // SQLite accepts and fires UPDATE OF for its intrinsic rowid aliases.
+      // Keep rejecting other absent names: SQLite accepts those headers too,
+      // but no UPDATE can target them, so preserving one would retain a dead trigger.
+      if (!availableColumns.has(foldedColumn)
+          && !intrinsicPseudoRowColumns.has(foldedColumn)) {
         throwMissingTriggerColumn(trigger, column.value, `UPDATE OF ${column.value}`);
       }
     }
@@ -654,8 +659,7 @@ export function assertViewTriggersCompatibleWithColumns(
       }
       const foldedColumn = foldSqlIdentifier(column.value);
       // SQLite accepts intrinsic rowid aliases on NEW/OLD pseudo-rows even
-      // when they are not projected view columns. Keep UPDATE OF strict: its
-      // identifiers are event columns, not pseudo-row references.
+      // when they are not projected view columns.
       if (intrinsicPseudoRowColumns.has(foldedColumn)) {
         continue;
       }

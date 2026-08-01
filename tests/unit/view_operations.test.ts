@@ -6,6 +6,7 @@ import * as vscode from 'vscode';
 
 import {
     buildExactNumericTextQuery,
+    buildRowIdExactRealTextQueries,
     normalizeIntegerRowsForTransport
 } from '../../src/core/integer-utils';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
@@ -471,23 +472,45 @@ describe('view operations', () => {
         }
     });
 
-    it('keeps UPDATE OF rowid strict when rowid is not a projected view column', async () => {
+    it('preserves accepted UPDATE OF rowid aliases and their NEW pseudo-row references', async () => {
         const engine = await createEngine();
         try {
             await engine.executeQuery(
                 'CREATE TABLE update_of_rowid_source (value TEXT); ' +
+                "INSERT INTO update_of_rowid_source VALUES ('before'); " +
                 'CREATE VIEW update_of_rowid_view AS SELECT value FROM update_of_rowid_source; ' +
                 'CREATE TRIGGER update_of_rowid_trigger ' +
-                'INSTEAD OF UPDATE OF rowid ON update_of_rowid_view BEGIN SELECT 1; END'
+                'INSTEAD OF UPDATE OF rowid ON update_of_rowid_view ' +
+                'BEGIN SELECT NEW.rowid; END; ' +
+                'CREATE TRIGGER update_of_underscore_rowid_trigger ' +
+                'INSTEAD OF UPDATE OF _rowid_ ON update_of_rowid_view ' +
+                'BEGIN SELECT 1; END; ' +
+                'CREATE TRIGGER update_of_oid_trigger ' +
+                'INSTEAD OF UPDATE OF oid ON update_of_rowid_view ' +
+                'BEGIN SELECT 1; END'
             );
 
-            await assert.rejects(
-                () => engine.editView(
-                    'update_of_rowid_view',
-                    'SELECT value || value AS value FROM update_of_rowid_source',
-                    true
+            const edit = await engine.editView(
+                'update_of_rowid_view',
+                'SELECT value || value AS value FROM update_of_rowid_source',
+                true
+            );
+            assert.deepStrictEqual(
+                edit.after.triggers.map(trigger => trigger.identifier).sort(),
+                [
+                    'update_of_oid_trigger',
+                    'update_of_rowid_trigger',
+                    'update_of_underscore_rowid_trigger'
+                ]
+            );
+
+            assert.strictEqual(
+                await readScalar(
+                    engine,
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' " +
+                    "AND name LIKE 'update_of_%_trigger'"
                 ),
-                /update_of_rowid_trigger.*missing view column.*rowid/i
+                3
             );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
@@ -1222,6 +1245,148 @@ describe('view operations', () => {
                 'ultra-wide results deliberately omit divergent REAL text companions'
             );
         } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('chunks wide rowid companion queries at SQLite column and variable limits', () => {
+        const columnsAtBoundary = [
+            'rowid',
+            ...Array.from({ length: 999 }, (_, index) => `c${index}`)
+        ];
+        const oneColumnChunk = buildRowIdExactRealTextQueries(
+            'wide_rows',
+            columnsAtBoundary,
+            [1]
+        );
+        assert.strictEqual(oneColumnChunk.length, 1);
+        assert.strictEqual(oneColumnChunk[0].columnIndices.length, 999);
+        assert.strictEqual(oneColumnChunk[0].transportColumns.length, 1000);
+
+        const twoColumnChunks = buildRowIdExactRealTextQueries(
+            'wide_rows',
+            [...columnsAtBoundary, 'c999'],
+            [1]
+        );
+        assert.deepStrictEqual(
+            twoColumnChunks.map(query => query.columnIndices.length),
+            [999, 1]
+        );
+
+        assert.strictEqual(
+            buildRowIdExactRealTextQueries(
+                'wide_rows',
+                ['rowid', 'value'],
+                Array.from({ length: 32766 }, (_, index) => index + 1)
+            ).length,
+            1
+        );
+        const twoRowChunks = buildRowIdExactRealTextQueries(
+            'wide_rows',
+            ['rowid', 'value'],
+            Array.from({ length: 32767 }, (_, index) => index + 1)
+        );
+        assert.strictEqual(twoRowChunks.length, 2);
+        assert.deepStrictEqual(twoRowChunks.map(query => query.params.length), [32766, 1]);
+    });
+
+    it('restores divergent REAL text for a 1001-column rowid-keyed WASM table result', async () => {
+        const columnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                `CREATE TABLE wide_real_rows (${columnNames.map(name => `"${name}"`).join(', ')}); ` +
+                'INSERT INTO wide_real_rows(c0) VALUES (9.652937795298495e282)'
+            );
+            const result = await engine.fetchTableData('wide_real_rows', {
+                columns: ['rowid', ...columnNames],
+                limit: 1,
+                offset: 0
+            });
+
+            assert.strictEqual(result.rows[0].length, 1001);
+            const exactText = result.exactIntegerTexts?.[0]?.[1];
+            assert.strictEqual(typeof exactText, 'string');
+            assert.notStrictEqual(exactText, String(result.rows[0][1]));
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('does not issue rowid companions for a wide view whose first column is named rowid', async () => {
+        const dataColumnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        const viewExpressions = [
+            '1 AS rowid',
+            '9.652937795298495e282 AS c0',
+            ...dataColumnNames.slice(1).map(name => `0 AS "${name}"`)
+        ];
+        const engine = await createEngine();
+        const instance = (engine as any).instance;
+        const originalPrepare = instance.prepare;
+        const preparedSql: string[] = [];
+        instance.prepare = function (sql: string, ...args: unknown[]) {
+            preparedSql.push(sql);
+            return originalPrepare.call(this, sql, ...args);
+        };
+        try {
+            await engine.executeQuery(
+                `CREATE VIEW wide_named_rowid_view AS SELECT ${viewExpressions.join(', ')}`
+            );
+            preparedSql.length = 0;
+            const result = await engine.fetchTableData('wide_named_rowid_view', {
+                columns: ['rowid', ...dataColumnNames],
+                limit: 1,
+                offset: 0
+            });
+
+            assert.strictEqual(result.rows[0].length, 1001);
+            assert.strictEqual(result.exactIntegerTexts?.[0]?.[1], undefined);
+            assert.strictEqual(
+                preparedSql.filter(sql => sql.includes('__sqlite_explorer_numeric_rowid')).length,
+                0,
+                'a view result must never trigger a rowid companion read'
+            );
+        } finally {
+            instance.prepare = originalPrepare;
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('does not issue rowid companions for a wide WITHOUT ROWID table', async () => {
+        const dataColumnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        const engine = await createEngine();
+        const instance = (engine as any).instance;
+        const originalPrepare = instance.prepare;
+        const preparedSql: string[] = [];
+        instance.prepare = function (sql: string, ...args: unknown[]) {
+            preparedSql.push(sql);
+            return originalPrepare.call(this, sql, ...args);
+        };
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE wide_without_rowid (' +
+                '"rowid" INTEGER PRIMARY KEY, ' +
+                dataColumnNames.map(name => `"${name}"`).join(', ') +
+                ') WITHOUT ROWID; ' +
+                'INSERT INTO wide_without_rowid(rowid, c0) VALUES ' +
+                '(1, 9.652937795298495e282)'
+            );
+            preparedSql.length = 0;
+            const result = await engine.fetchTableData('wide_without_rowid', {
+                columns: ['rowid', ...dataColumnNames],
+                limit: 1,
+                offset: 0
+            });
+
+            assert.strictEqual(result.rows[0].length, 1001);
+            assert.strictEqual(result.exactIntegerTexts?.[0]?.[1], undefined);
+            assert.strictEqual(
+                preparedSql.filter(sql => sql.includes('__sqlite_explorer_numeric_rowid')).length,
+                0,
+                'a WITHOUT ROWID table must never trigger a rowid companion read'
+            );
+        } finally {
+            instance.prepare = originalPrepare;
             (engine as WasmDatabaseEngine).shutdown();
         }
     });
