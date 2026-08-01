@@ -38,6 +38,19 @@ export interface RowIdExactRealTextResult {
   rows: readonly (readonly unknown[])[];
 }
 
+/** True when a fetched SQLite int64 cannot be represented by a JS number. */
+export function hasUnsafeBigIntAtColumn(
+  rows: readonly (readonly unknown[])[],
+  columnIndex: number
+): boolean {
+  const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+  const minSafe = BigInt(Number.MIN_SAFE_INTEGER);
+  return rows.some(row => {
+    const value = row[columnIndex];
+    return typeof value === 'bigint' && (value > maxSafe || value < minSafe);
+  });
+}
+
 /**
  * Project each result value beside SQLite-generated text for every REAL.
  * normalizeIntegerRowsForTransport keeps the sidecar sparse by retaining only
@@ -227,7 +240,8 @@ export function collectRowIdExactRealTexts(
 export function normalizeIntegerRowsForTransport(
   sourceRows: readonly (readonly unknown[])[],
   valueColumnCount?: number,
-  transportedExactTexts?: ExactIntegerTextMap
+  transportedExactTexts?: ExactIntegerTextMap,
+  exactIntegerIdentityColumn?: number
 ): { rows: CellValue[][]; exactIntegerTexts?: ExactIntegerTextMap } {
   let exactIntegerTexts: ExactIntegerTextMap | undefined;
   const setExactText = (rowIndex: number, columnIndex: number, text: string) => {
@@ -250,9 +264,19 @@ export function normalizeIntegerRowsForTransport(
       if (typeof value === 'bigint') {
         const numericValue = Number(value);
         if (!Number.isSafeInteger(numericValue)) {
-          setExactText(rowIndex, columnIndex, value.toString());
+          const exactText = value.toString();
+          if (columnIndex === exactIntegerIdentityColumn) {
+            // RecordId already accepts strings. Keeping an unsafe rowid exact in
+            // the value slot makes every downstream selection/mutation/history
+            // path use the same lossless identity without a parallel lookup.
+            normalizedValue = exactText;
+          } else {
+            setExactText(rowIndex, columnIndex, exactText);
+            normalizedValue = numericValue;
+          }
+        } else {
+          normalizedValue = numericValue;
         }
-        normalizedValue = numericValue;
       }
 
       if (valueColumnCount !== undefined) {

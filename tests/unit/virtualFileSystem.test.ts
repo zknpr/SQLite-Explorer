@@ -23,8 +23,11 @@ describe('SQLiteFileSystemProvider', () => {
                 }
             };
         };
+        let connectionGeneration = 0;
         const mockDocument: any = {
             databaseOperations: dbOps,
+            get connectionGeneration() { return connectionGeneration; },
+            bumpConnectionGeneration: () => { connectionGeneration++; },
             recordExternalModification: mock.fn((modification: any) => {
                 contentEmitter.fire({ modification });
             }),
@@ -43,6 +46,7 @@ describe('SQLiteFileSystemProvider', () => {
             fireContentChange(modification: any, modificationDirection?: 'forward' | 'undo'): void;
             invalidateAllViewDocuments(): void;
             getDisposeSubscriptionDisposeCount(): number;
+            bumpConnectionGeneration(): void;
         };
     }
 
@@ -179,7 +183,7 @@ describe('SQLiteFileSystemProvider', () => {
                         return [{ rows: [['users']] }];
                     }
                     // Cell query
-                    assert.match(sql, /SELECT "name" FROM "users" WHERE rowid = \?/);
+                    assert.match(sql, /SELECT "name", CASE WHEN typeof\("name"\)/);
                     assert.deepStrictEqual(params, [1]);
                     return [{ rows: [['Alice']] }];
                 })
@@ -191,6 +195,26 @@ describe('SQLiteFileSystemProvider', () => {
             const text = new TextDecoder().decode(content);
 
             assert.strictEqual(text, 'Alice');
+        });
+
+        it('reads SQLite-exact unsafe INTEGER text for an external cell editor', async () => {
+            const dbOps = {
+                executeQuery: mock.fn(async (sql: string, params: any[]) => {
+                    if (sql.includes('sqlite_schema')) return [{ rows: [[1]] }];
+                    assert.match(sql, /CAST\("counter" AS TEXT\)/);
+                    assert.deepStrictEqual(params, ['9007199254740993']);
+                    return [{ rows: [[9007199254740992, '9007199254740993']] }];
+                })
+            };
+            setupMockDocument(docKey, dbOps);
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/counters/group/9007199254740993/counter.txt`
+            );
+
+            assert.strictEqual(
+                new TextDecoder().decode(await provider.readFile(uri)),
+                '9007199254740993'
+            );
         });
 
         it('should handle null values as empty content', async () => {
@@ -349,6 +373,37 @@ describe('SQLiteFileSystemProvider', () => {
             assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 1);
         });
 
+        it('keeps an unsafe INTEGER byte-identical across external-editor open and save', async () => {
+            const engineResult = await createDatabaseEngine({
+                content: null,
+                maxSize: 0,
+                readOnlyMode: false
+            });
+            const engine = engineResult.operations!;
+            await engine.executeQuery(
+                'CREATE TABLE exact_counter (counter INTEGER); ' +
+                'INSERT INTO exact_counter(rowid, counter) ' +
+                'VALUES (9007199254740993, 9007199254740993)'
+            );
+            setupMockDocument(docKey, engine);
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/exact_counter/group/9007199254740993/counter.txt`
+            );
+
+            try {
+                const opened = await provider.readFile(uri);
+                assert.strictEqual(new TextDecoder().decode(opened), '9007199254740993');
+                await provider.writeFile(uri, opened, { create: false, overwrite: true });
+                const stored = await engine.executeQuery(
+                    'SELECT typeof(counter), CAST(counter AS TEXT) FROM exact_counter ' +
+                    'WHERE rowid = 9007199254740993'
+                );
+                assert.deepStrictEqual(stored[0].rows, [['integer', '9007199254740993']]);
+            } finally {
+                (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+
         it('should write binary content if not valid UTF-8', async () => {
             const dbOps = {
                 updateCell: mock.fn(async () => {})
@@ -403,6 +458,44 @@ describe('SQLiteFileSystemProvider', () => {
                 viewDefBefore: before,
                 viewDefAfter: after
             });
+        });
+
+        it('does not adopt or record a view save completed on a reloaded connection', async () => {
+            const before = {
+                identifier: 'generation_view',
+                sql: 'CREATE VIEW generation_view AS SELECT 1 AS value',
+                selectSql: 'SELECT 1 AS value',
+                triggers: []
+            };
+            const after = {
+                ...before,
+                sql: 'CREATE VIEW generation_view AS SELECT 2 AS value',
+                selectSql: 'SELECT 2 AS value'
+            };
+            let document: ReturnType<typeof setupMockDocument>;
+            const dbOps = {
+                editView: mock.fn(async () => {
+                    document.bumpConnectionGeneration();
+                    return { before, after };
+                })
+            };
+            document = setupMockDocument(docKey, dbOps);
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/generation_view/group/__view__.sql/definition.sql`
+            );
+
+            await assert.rejects(
+                provider.writeFile(
+                    uri,
+                    new TextEncoder().encode(after.selectSql),
+                    { create: false, overwrite: true }
+                ),
+                /reloaded while the view definition was being saved/i
+            );
+            assert.strictEqual(
+                (document.recordExternalModification as any).mock.callCount(),
+                0
+            );
         });
 
         it('keeps view document metadata coherent across the VS Code save protocol', async () => {

@@ -23,6 +23,7 @@ import {
 } from './grid-actions.js';
 import { openCellPreview } from './edit.js';
 import { clearSelection } from './grid-selection.js';
+import { validateRowId } from './utils.js';
 
 export function initGridControls() {
     const globalFilter = document.getElementById('filterInput');
@@ -286,10 +287,7 @@ function handleScroll(event) {
     persistState();
 }
 
-function resolveRowIdType(idStr) {
+export function resolveRowIdType(idStr) {
     if (idStr === undefined || idStr === null) return idStr;
-    // Row IDs in SQLite are integers, but if using 'WITHOUT ROWID' tables, PK could be anything.
-    // However, for standard tables, we try to keep them as numbers to match what the backend returns.
-    const num = Number(idStr);
-    return !isNaN(num) && idStr.trim() !== '' ? num : idStr;
+    return validateRowId(idStr);
 }

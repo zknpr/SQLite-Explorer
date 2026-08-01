@@ -48,6 +48,7 @@ import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
   collectRowIdExactRealTexts,
+  hasUnsafeBigIntAtColumn,
   normalizeIntegerRowsForTransport,
   ROWID_TABLE_AUTHORITY_SQL
 } from './core/integer-utils';
@@ -867,7 +868,10 @@ export async function createNativeDatabaseConnection(
 
             case 'row_insert':
               if (targetRowId !== undefined) {
-                await worker.call('run', [`DELETE FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`, [Number(targetRowId)]]);
+                await worker.call('run', [
+                  `DELETE FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`,
+                  [validateRowId(targetRowId)]
+                ]);
               }
               break;
 
@@ -898,7 +902,7 @@ export async function createNativeDatabaseConnection(
                         for (const { rowId, value } of col.data) {
                             batch.push({
                                 sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`,
-                                params: [value, Number(rowId)]
+                                params: [value, validateRowId(rowId)]
                             });
                         }
                     }
@@ -1426,11 +1430,10 @@ export async function createNativeDatabaseConnection(
           const queryOptions = { ...options, columns };
           const { sql, params } = buildSelectQuery(table, queryOptions);
           const transportQuery = buildExactNumericTextQuery(sql, columns.length);
-          const needsRowIdCompanionSnapshot = (
-            transportQuery.valueColumnCount === undefined
-            && columns[0]?.toLowerCase() === 'rowid'
-          );
-          const snapshotName = needsRowIdCompanionSnapshot
+          const hasRowIdShape = columns[0]?.toLowerCase() === 'rowid';
+          const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
+            && hasRowIdShape;
+          const snapshotName = hasRowIdShape
             ? createSavepointName('sp_numeric_snapshot')
             : undefined;
           if (snapshotName) {
@@ -1441,6 +1444,17 @@ export async function createNativeDatabaseConnection(
           }
 
           try {
+            let isRowIdTable = false;
+            if (hasRowIdShape) {
+              // This authority read fixes the WAL snapshot before the main data
+              // read, so both exact identities and any companion text describe
+              // one committed database state.
+              const authority = await worker.call<NativeQueryResult>('query', [
+                ROWID_TABLE_AUTHORITY_SQL,
+                [table]
+              ]);
+              isRowIdTable = authority.values.length > 0;
+            }
             const result = await worker.call<NativeQueryResult>('queryNumeric', [
               transportQuery.sql,
               params,
@@ -1449,15 +1463,7 @@ export async function createNativeDatabaseConnection(
             ]);
 
             const companionResults = [];
-            let canUseRowIdCompanions = false;
-            if (needsRowIdCompanionSnapshot && result.values.length > 0) {
-              const authority = await worker.call<NativeQueryResult>('query', [
-                ROWID_TABLE_AUTHORITY_SQL,
-                [table]
-              ]);
-              canUseRowIdCompanions = authority.values.length > 0;
-            }
-            if (canUseRowIdCompanions) {
+            if (isRowIdTable && needsRowIdCompanions && result.values.length > 0) {
               const companionQueries = buildRowIdExactRealTextQueries(
                 table,
                 columns,
@@ -1480,6 +1486,8 @@ export async function createNativeDatabaseConnection(
               result.values,
               companionResults
             );
+            const needsExactRowIdIdentity = isRowIdTable
+              && hasUnsafeBigIntAtColumn(result.values, 0);
 
             // txiki preserves SQLite int64 values as BigInt. The generated
             // companion columns also retain authoritative REAL text before V8
@@ -1487,7 +1495,8 @@ export async function createNativeDatabaseConnection(
             const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
               result.values,
               undefined,
-              mergeExactIntegerTextMaps(companionExactTexts, result.exactIntegerTexts)
+              mergeExactIntegerTextMaps(companionExactTexts, result.exactIntegerTexts),
+              needsExactRowIdIdentity ? 0 : undefined
             );
 
             if (snapshotName) {

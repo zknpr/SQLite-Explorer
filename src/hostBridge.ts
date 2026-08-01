@@ -16,7 +16,7 @@ import { IsCursorIDE } from './helpers';
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
 import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition } from './core/types';
 import { generateMergePatch } from './core/json-utils';
-import { escapeIdentifier, validateRowId } from './core/sql-utils';
+import { escapeIdentifier, validateRowId, validateRowIds } from './core/sql-utils';
 import { isViewDefinitionConflictError } from './core/view-utils';
 import { crypto } from './platform/cryptoShim';
 
@@ -251,12 +251,14 @@ export class HostBridge implements ToastService {
     // Capture row data before deletion for undo
     let deletedRowsData: { rowId: RecordId; row: Record<string, CellValue> }[] = [];
     try {
-        const validIds = rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+        const validIds = validateRowIds(rowIds);
         if (validIds.length > 0) {
             const placeholders = validIds.map(() => '?').join(', ');
             // We select rowid to map back correctly, though we already have IDs.
             // Using * to get all columns.
-            const sql = `SELECT rowid, * FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`;
+            const sql =
+                `SELECT CAST(rowid AS TEXT) AS rowid, * FROM ${escapeIdentifier(table)} ` +
+                `WHERE rowid IN (${placeholders})`;
             const result = await dbOps.executeQuery(sql, validIds);
 
             if (result && result.length > 0 && result[0].rows) {
@@ -266,7 +268,7 @@ export class HostBridge implements ToastService {
                 deletedRowsData = rows.map(r => {
                     const rowData: Record<string, CellValue> = {};
                     // First col is rowid because we asked for it
-                    const rId = r[0] as number;
+                    const rId = validateRowId(r[0] as RecordId);
                   
 
                     for (let i = 0; i < headers.length; i++) {
@@ -357,7 +359,9 @@ export class HostBridge implements ToastService {
         // Fetch data for all columns in a single query to avoid N+1 query overhead
         if (columns.length > 0) {
             const escapedCols = columns.map(col => escapeIdentifier(col)).join(', ');
-            const sql = `SELECT rowid, ${escapedCols} FROM ${escapeIdentifier(table)}`;
+            const sql =
+                `SELECT CAST(rowid AS TEXT) AS rowid, ${escapedCols} ` +
+                `FROM ${escapeIdentifier(table)}`;
             const result = await dbOps.executeQuery(sql);
 
             if (result && result.length > 0 && result[0].rows) {
@@ -630,13 +634,13 @@ export class HostBridge implements ToastService {
       const columns = [...new Set(updates.map(update => update.column))];
       const placeholders = rowIds.map(() => '?').join(', ');
       const current = await dbOps.executeQuery(
-        `SELECT rowid, ${columns.map(escapeIdentifier).join(', ')} ` +
+        `SELECT CAST(rowid AS TEXT) AS rowid, ${columns.map(escapeIdentifier).join(', ')} ` +
         `FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
         rowIds
       );
       this.assertConnectionGeneration(connectionGeneration);
 
-      const currentValues = new Map<number, Map<string, CellValue>>();
+      const currentValues = new Map<RecordId, Map<string, CellValue>>();
       for (const row of current[0]?.rows ?? []) {
         const rowId = validateRowId(row[0] as RecordId);
         const values = new Map<string, CellValue>();

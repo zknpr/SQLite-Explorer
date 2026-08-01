@@ -34,6 +34,7 @@ import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
   collectRowIdExactRealTexts,
+  hasUnsafeBigIntAtColumn,
   normalizeIntegerRowsForTransport,
   ROWID_TABLE_AUTHORITY_SQL
 } from '../../integer-utils';
@@ -566,10 +567,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         // e.g. UPDATE table SET col1 = ?, col2 = ? WHERE rowid = ?
 
         // First, transform the data into a row-centric map
-        const rowUpdates = new Map<number, Record<string, CellValue | null>>();
+        const rowUpdates = new Map<RecordId, Record<string, CellValue | null>>();
         for (const col of deletedColumns) {
           for (const cell of col.data) {
-            const rId = Number(cell.rowId);
+            const rId = validateRowId(cell.rowId);
             let rowObj = rowUpdates.get(rId);
             if (!rowObj) {
               rowObj = {};
@@ -1501,18 +1502,22 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
 
         const companionResults = [];
-        let canUseRowIdCompanions = false;
+        let isRowIdTable = false;
+        const hasRowIdShape = headers[0]?.toLowerCase() === 'rowid';
+        const needsExactRowIdIdentity = hasRowIdShape
+          && hasUnsafeBigIntAtColumn(sourceRows, 0);
+        const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
+          && hasRowIdShape;
         // This engine owns a private in-memory copy, so no external process can
-        // commit between the source read and its rowid companion reads.
+        // commit between the source read and this authority/companion work.
         if (
-          transportQuery.valueColumnCount === undefined
-          && headers[0]?.toLowerCase() === 'rowid'
+          (needsRowIdCompanions || needsExactRowIdIdentity)
           && sourceRows.length > 0
         ) {
           const authority = await this.executeQuery(ROWID_TABLE_AUTHORITY_SQL, [table]);
-          canUseRowIdCompanions = (authority[0]?.rows.length ?? 0) > 0;
+          isRowIdTable = (authority[0]?.rows.length ?? 0) > 0;
         }
-        if (canUseRowIdCompanions) {
+        if (isRowIdTable && needsRowIdCompanions) {
           for (const query of buildRowIdExactRealTextQueries(
             table,
             headers,
@@ -1543,7 +1548,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
           sourceRows,
           transportQuery.valueColumnCount,
-          companionExactTexts
+          companionExactTexts,
+          isRowIdTable && needsExactRowIdIdentity ? 0 : undefined
         );
         return {
             headers,

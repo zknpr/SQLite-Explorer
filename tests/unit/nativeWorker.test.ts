@@ -997,10 +997,10 @@ describe('createNativeDatabaseConnection', () => {
             ));
 
             assert.ok(snapshotSavepointIndex >= 0, 'wide native reads must open a snapshot savepoint');
-            assert.ok(mainReadIndex > snapshotSavepointIndex);
-            assert.ok(authorityReadIndex > mainReadIndex);
+            assert.ok(authorityReadIndex > snapshotSavepointIndex);
+            assert.ok(mainReadIndex > authorityReadIndex);
             assert.deepStrictEqual(companionBatchIndices.length, 1);
-            assert.ok(companionBatchIndices[0] > authorityReadIndex);
+            assert.ok(companionBatchIndices[0] > mainReadIndex);
             assert.ok(snapshotReleaseIndex > companionBatchIndices[0]);
         } finally {
             connection.dispose();

@@ -1,6 +1,6 @@
 import * as vsc from 'vscode';
 import { DocumentRegistry } from './documentRegistry';
-import { escapeIdentifier } from './core/sql-utils';
+import { escapeIdentifier, validateRowId } from './core/sql-utils';
 import {
     isViewDefinitionConflictError,
     isViewDefinitionSnapshotCurrent,
@@ -157,19 +157,26 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             }
 
             const colName = column;
-            const rowIdNum = Number(rowId);
-
-            if (isNaN(rowIdNum)) {
+            let validatedRowId;
+            try {
+                validatedRowId = validateRowId(rowId);
+            } catch {
                 return new TextEncoder().encode(`Invalid Row ID: ${rowId}`);
             }
 
-            // For tables, use WHERE rowid = ?
-            // Escape identifiers.
-            // Reuse `fetchTableData` or `executeQuery`.
-            const query = `SELECT ${escapeIdentifier(colName)} FROM ${escapeIdentifier(table)} WHERE rowid = ?`;
-            const result = await document.databaseOperations.executeQuery(query, [rowIdNum]);
+            const escapedColumn = escapeIdentifier(colName);
+            // Ask SQLite for numeric text in the same read that supplies the
+            // cell. A rounded JavaScript Number must never become the contents
+            // of an external editor for an unsafe int64 value.
+            const query =
+                `SELECT ${escapedColumn}, ` +
+                `CASE WHEN typeof(${escapedColumn}) IN ('integer', 'real') ` +
+                `THEN CAST(${escapedColumn} AS TEXT) END ` +
+                `FROM ${escapeIdentifier(table)} WHERE rowid = ?`;
+            const result = await document.databaseOperations.executeQuery(query, [validatedRowId]);
 
             const value = result?.[0]?.rows?.[0]?.[0];
+            const exactNumericText = result?.[0]?.rows?.[0]?.[1];
 
             if (value === null) {
                 // Return empty content for NULL values as VS Code expects a string/buffer.
@@ -178,6 +185,10 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
             if (value instanceof Uint8Array) {
                 return value;
+            }
+
+            if (typeof exactNumericText === 'string') {
+                return new TextEncoder().encode(exactNumericText);
             }
 
             return new TextEncoder().encode(String(value));
@@ -211,10 +222,12 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
         if (rowId === '__view__.sql') {
             const metadata = this.getViewDocumentMetadata(document, uri, table);
+            const connectionGeneration = document.connectionGeneration;
+            const databaseOperations = document.databaseOperations;
             if (metadata.snapshotSql !== undefined || metadata.snapshotTriggers !== undefined) {
                 let currentDefinition;
                 try {
-                    currentDefinition = await document.databaseOperations.getViewDefinition(table);
+                    currentDefinition = await databaseOperations.getViewDefinition(table);
                 } catch (err) {
                     if (this.isMissingViewError(err)) {
                         this.rejectStaleViewWrite(metadata, uri);
@@ -234,10 +247,17 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 }
             }
 
+            if (document.connectionGeneration !== connectionGeneration) {
+                throw vsc.FileSystemError.Unavailable(
+                    'The database document was reloaded while the view definition was being saved. ' +
+                    'The active document and its history were not updated.'
+                );
+            }
+
             let result: ViewEditResult;
             try {
                 const selectSql = new TextDecoder('utf-8', { fatal: true }).decode(content);
-                result = await document.databaseOperations.editView(
+                result = await databaseOperations.editView(
                     table,
                     selectSql,
                     true,
@@ -263,6 +283,13 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 );
             }
 
+            if (document.connectionGeneration !== connectionGeneration) {
+                throw vsc.FileSystemError.Unavailable(
+                    'The database document was reloaded while the view definition was being saved. ' +
+                    'The active document and its history were not updated.'
+                );
+            }
+
             // Update this editor's baseline before recordExternalModification
             // synchronously broadcasts the change to every open URI.
             metadata.snapshotSql = result.after.sql;
@@ -280,8 +307,10 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         }
 
         try {
-            const rowIdNum = Number(rowId);
-            if (isNaN(rowIdNum)) {
+            let validatedRowId;
+            try {
+                validatedRowId = validateRowId(rowId);
+            } catch {
                 throw vsc.FileSystemError.Unavailable('Invalid Row ID');
             }
 
@@ -300,7 +329,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 // Keep as Uint8Array, treating as BLOB
             }
 
-            await document.databaseOperations.updateCell(table, rowIdNum, column, value);
+            await document.databaseOperations.updateCell(table, validatedRowId, column, value);
 
             // Trigger refresh
             document.recordExternalModification({
@@ -308,7 +337,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 description: `Update ${table}.${column} from editor`,
                 modificationType: 'cell_update',
                 targetTable: table,
-                targetRowId: rowIdNum,
+                targetRowId: validatedRowId,
                 targetColumn: column,
                 newValue: value
             });

@@ -395,7 +395,7 @@ describe('HostBridge', () => {
                 if (sql.includes('pragma_table_list')) {
                     return [{ headers: ['wr'], rows: [[0]] }];
                 }
-                if (sql.startsWith('SELECT rowid')) {
+                if (sql.startsWith('SELECT CAST(rowid AS TEXT)')) {
                     return [{
                         headers: ['rowid', 'payload', 'label'],
                         rows: [[7, '{"count":1,"concurrent":true}', 'database-current']]
@@ -450,7 +450,7 @@ describe('HostBridge', () => {
             }
         ]);
         assert.ok(sqlCalls[1].startsWith('SAVEPOINT '));
-        assert.ok(sqlCalls[2].startsWith('SELECT rowid'));
+        assert.ok(sqlCalls[2].startsWith('SELECT CAST(rowid AS TEXT)'));
         assert.ok(sqlCalls.at(-1)?.startsWith('RELEASE SAVEPOINT '));
 
         const modification = recordExternalModification.mock.calls[0].arguments[0] as any;
@@ -518,7 +518,7 @@ describe('HostBridge', () => {
                 if (sql.includes('pragma_table_list')) {
                     return [{ headers: ['wr'], rows: [[0]] }];
                 }
-                if (sql.startsWith('SELECT rowid')) {
+                if (sql.startsWith('SELECT CAST(rowid AS TEXT)')) {
                     connectionGeneration++;
                     return [{ headers: ['rowid', 'value'], rows: [[1, 'before']] }];
                 }
@@ -564,7 +564,7 @@ describe('HostBridge', () => {
                 if (sql.includes('pragma_table_list')) {
                     return [{ headers: ['wr'], rows: [[0]] }];
                 }
-                if (sql.startsWith('SELECT rowid')) {
+                if (sql.startsWith('SELECT CAST(rowid AS TEXT)')) {
                     return [{ headers: ['rowid', 'value'], rows: [[1, 'before']] }];
                 }
                 if (sql.startsWith('ROLLBACK TO SAVEPOINT ')) {

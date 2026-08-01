@@ -1229,6 +1229,73 @@ describe('view operations', () => {
         }
     });
 
+    it('keeps adjacent unsafe WASM table rowids distinct and edits by exact identity', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE unsafe_rowids (value TEXT); ' +
+                "INSERT INTO unsafe_rowids(rowid, value) VALUES " +
+                "(42, 'safe'), " +
+                "(9007199254740992, 'lower'), " +
+                "(9007199254740993, 'higher')"
+            );
+            const result = await engine.fetchTableData('unsafe_rowids', {
+                columns: ['rowid', 'value'],
+                orderBy: 'rowid',
+                limit: 10,
+                offset: 0
+            });
+
+            assert.strictEqual(result.rows[0][0], 42);
+            assert.deepStrictEqual(
+                result.rows.slice(1).map(row => row[0]),
+                ['9007199254740992', '9007199254740993']
+            );
+
+            await engine.updateCell(
+                'unsafe_rowids',
+                result.rows[2][0] as string,
+                'value',
+                'edited'
+            );
+            const values = await engine.executeQuery(
+                'SELECT CAST(rowid AS TEXT), value FROM unsafe_rowids ' +
+                'WHERE rowid >= 9007199254740992 ORDER BY rowid'
+            );
+            assert.deepStrictEqual(values[0].rows, [
+                ['9007199254740992', 'lower'],
+                ['9007199254740993', 'edited']
+            ]);
+
+            const modification = {
+                description: 'Edit exact rowid',
+                modificationType: 'cell_update' as const,
+                targetTable: 'unsafe_rowids',
+                targetRowId: '9007199254740993',
+                targetColumn: 'value',
+                priorValue: 'higher',
+                newValue: 'edited'
+            };
+            await engine.undoModification(modification);
+            assert.strictEqual(
+                await readScalar(
+                    engine,
+                    "SELECT value FROM unsafe_rowids WHERE rowid = '9007199254740993'"
+                ),
+                'higher'
+            );
+            await engine.redoModification(modification);
+            await engine.deleteRows('unsafe_rowids', ['9007199254740993']);
+            const survivors = await engine.executeQuery(
+                'SELECT CAST(rowid AS TEXT), value FROM unsafe_rowids ' +
+                'WHERE rowid >= 9007199254740992 ORDER BY rowid'
+            );
+            assert.deepStrictEqual(survivors[0].rows, [['9007199254740992', 'lower']]);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('carries integral REAL storage text through WASM view previews', async () => {
         const engine = await createEngine();
         try {

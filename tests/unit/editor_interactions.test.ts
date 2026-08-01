@@ -68,6 +68,13 @@ describe('editor keyboard and grid selection interactions', () => {
         state.matchNav = { scope: null, term: null, matches: [], currentIndex: -1 };
     });
 
+    it('keeps unsafe rowids exact when resolving grid DOM identities', async () => {
+        const { resolveRowIdType } = await import(gridEventsModulePath);
+        assert.strictEqual(resolveRowIdType('42'), 42);
+        assert.strictEqual(resolveRowIdType('9007199254740993'), '9007199254740993');
+        assert.strictEqual(resolveRowIdType('-9007199254740993'), '-9007199254740993');
+    });
+
     it('inserts indentation and outdents selected lines in multiline editors', async () => {
         const { handleTextareaTab } = await import(textEditorModulePath);
         const insertion = createTextarea('SELECT\nvalue', 7);

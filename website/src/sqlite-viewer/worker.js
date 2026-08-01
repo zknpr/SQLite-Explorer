@@ -32,6 +32,7 @@ import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
   collectRowIdExactRealTexts,
+  hasUnsafeBigIntAtColumn,
   normalizeIntegerRowsForTransport,
   ROWID_TABLE_AUTHORITY_SQL
 } from '../../../src/core/integer-utils.ts';
@@ -557,18 +558,22 @@ async function fetchTableData(table, options = {}) {
 
   const sourceRows = results[0].values;
   const companionResults = [];
-  let canUseRowIdCompanions = false;
+  let isRowIdTable = false;
+  const hasRowIdShape = headers[0]?.toLowerCase() === 'rowid';
+  const needsExactRowIdIdentity = hasRowIdShape
+    && hasUnsafeBigIntAtColumn(sourceRows, 0);
+  const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
+    && hasRowIdShape;
   // The demo owns a private in-memory database, so no external process can
-  // commit between the source read and its rowid companion reads.
+  // commit between the source read and this authority/companion work.
   if (
-    transportQuery.valueColumnCount === undefined
-    && headers[0]?.toLowerCase() === 'rowid'
+    (needsRowIdCompanions || needsExactRowIdIdentity)
     && sourceRows.length > 0
   ) {
     const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table]);
-    canUseRowIdCompanions = (authority[0]?.values.length ?? 0) > 0;
+    isRowIdTable = (authority[0]?.values.length ?? 0) > 0;
   }
-  if (canUseRowIdCompanions) {
+  if (isRowIdTable && needsRowIdCompanions) {
     for (const query of buildRowIdExactRealTextQueries(
       table,
       headers,
@@ -582,7 +587,8 @@ async function fetchTableData(table, options = {}) {
   const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
     sourceRows,
     transportQuery.valueColumnCount,
-    companionExactTexts
+    companionExactTexts,
+    isRowIdTable && needsExactRowIdIdentity ? 0 : undefined
   );
   return {
     headers,

@@ -238,6 +238,40 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.strictEqual(result.exactIntegerTexts?.[0]?.[0], '9007199254740993');
         });
 
+        await testContext.test('keeps adjacent unsafe native rowids distinct and editable', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_unsafe_rowids (value TEXT); ' +
+                "INSERT INTO native_unsafe_rowids(rowid, value) VALUES " +
+                "(11, 'safe'), (9007199254740992, 'lower'), (9007199254740993, 'higher')"
+            );
+            const result = await engine.fetchTableData('native_unsafe_rowids', {
+                columns: ['rowid', 'value'],
+                orderBy: 'rowid',
+                limit: 10,
+                offset: 0
+            });
+
+            assert.strictEqual(result.rows[0][0], 11);
+            assert.deepStrictEqual(
+                result.rows.slice(1).map(row => row[0]),
+                ['9007199254740992', '9007199254740993']
+            );
+            await engine.updateCell(
+                'native_unsafe_rowids',
+                result.rows[2][0] as string,
+                'value',
+                'edited'
+            );
+            const values = await engine.executeQuery(
+                'SELECT CAST(rowid AS TEXT), value FROM native_unsafe_rowids ' +
+                'WHERE rowid >= 9007199254740992 ORDER BY rowid'
+            );
+            assert.deepStrictEqual(values[0].rows, [
+                ['9007199254740992', 'lower'],
+                ['9007199254740993', 'edited']
+            ]);
+        });
+
         await testContext.test('carries exact unsafe INTEGER text through native view previews', async () => {
             const preview = await engine.previewViewDefinition(
                 'native_unsafe_integer_preview',

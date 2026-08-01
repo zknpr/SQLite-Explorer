@@ -110,11 +110,19 @@ export function appendHighlightedText(parentEl, text, matcher) {
  * Validate and sanitize a rowid for use in SQL queries.
  */
 export function validateRowId(rowId) {
-    const num = Number(rowId);
-    if (!Number.isFinite(num)) {
+    if (typeof rowId === 'number') {
+        if (!Number.isSafeInteger(rowId)) throw new Error(`Invalid rowid: ${rowId}`);
+        return rowId;
+    }
+    if (typeof rowId !== 'string' || !/^[+-]?\d+$/.test(rowId.trim())) {
         throw new Error(`Invalid rowid: ${rowId}`);
     }
-    return num;
+    const exact = BigInt(rowId.trim());
+    if (exact < -9223372036854775808n || exact > 9223372036854775807n) {
+        throw new Error(`Invalid rowid: ${rowId}`);
+    }
+    const num = Number(exact);
+    return Number.isSafeInteger(num) ? num : exact.toString();
 }
 
 /**

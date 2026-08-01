@@ -640,6 +640,49 @@ describe('web demo view worker', () => {
         assert.strictEqual(data.exactIntegerTexts[0][0], '9007199254740993');
     });
 
+    it('keeps adjacent unsafe demo table rowids distinct and editable', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE unsafe_demo_rowids (value TEXT); ' +
+            "INSERT INTO unsafe_demo_rowids(rowid, value) VALUES " +
+            "(7, 'safe'), (9007199254740992, 'lower'), (9007199254740993, 'higher')"
+        );
+
+        const data = await worker.invoke('fetchTableData', 'unsafe_demo_rowids', {
+            columns: ['rowid', 'value'],
+            orderBy: 'rowid',
+            limit: 10,
+            offset: 0
+        });
+        assert.strictEqual(data.rows[0][0], 7);
+        assert.deepStrictEqual(
+            data.rows.slice(1).map((row: unknown[]) => row[0]),
+            ['9007199254740992', '9007199254740993']
+        );
+
+        await worker.invoke(
+            'updateCell',
+            'unsafe_demo_rowids',
+            data.rows[2][0],
+            'value',
+            'edited'
+        );
+        const values = await worker.invoke('fetchTableData', 'unsafe_demo_rowids', {
+            columns: ['rowid', 'value'],
+            orderBy: 'rowid',
+            limit: 10,
+            offset: 0
+        });
+        assert.deepStrictEqual(
+            values.rows.slice(1).map((row: unknown[]) => Array.from(row)),
+            [
+                ['9007199254740992', 'lower'],
+                ['9007199254740993', 'edited']
+            ]
+        );
+    });
+
     it('returns exact unsafe INTEGER text from demo view previews', async () => {
         const worker = await createWorkerHarness();
 

@@ -144,6 +144,20 @@ describe('SQL Utils', () => {
       assert.strictEqual(validateRowId(-9007199254740991n), -9007199254740991);
     });
 
+    it('preserves full-precision decimal strings for unsafe SQLite rowids', () => {
+      assert.strictEqual(validateRowId('9007199254740993'), '9007199254740993');
+      assert.strictEqual(validateRowId('-9007199254740993'), '-9007199254740993');
+      assert.deepStrictEqual(
+        validateRowIds(['9007199254740992', '9007199254740993']),
+        ['9007199254740992', '9007199254740993']
+      );
+    });
+
+    it('rejects decimal strings outside SQLite signed-int64 rowid bounds', () => {
+      assert.throws(() => validateRowId('9223372036854775808'), /Invalid rowid:/);
+      assert.throws(() => validateRowId('-9223372036854775809'), /Invalid rowid:/);
+    });
+
     it('should reject empty or whitespace-only strings', () => {
       // Number('') and Number('   ') coerce to 0; a rowid must never silently become "row 0".
       assert.throws(() => validateRowId(''), /Invalid rowid:/);
