@@ -188,6 +188,15 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     this.compileSingleStatement(`EXPLAIN SELECT * FROM (${selectSql}\n) LIMIT 0`);
   }
 
+  /**
+   * Read a generated preview SELECT with a best-effort elapsed-time bound. The
+   * bundled sql.js API and WebAssembly exports expose neither sqlite3_interrupt
+   * nor sqlite3_progress_handler. Because statement.step() synchronously owns
+   * this worker thread, a queued host message cannot preempt an expensive first
+   * row. The checks below reject after a step returns, while the worker RPC
+   * deadline only bounds how long the host waits. True in-worker interruption is
+   * deferred until sql.js exposes an interrupt or progress-handler hook.
+   */
   private executeSingleQuery(sql: string): QueryResultSet {
     const statement = this.prepareSingleStatement(sql);
     const rows: CellValue[][] = [];

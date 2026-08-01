@@ -347,17 +347,12 @@ async function saveDraft() {
         if (modalSession === activeViewModalSession) updateStatus(`Error: ${err.message}`);
     } finally {
         isSavingView = false;
-        if (saveButton) saveButton.disabled = false;
-        if (reloadLatest) reloadLatest.disabled = false;
         if (modalSession === activeViewModalSession) {
+            if (saveButton) saveButton.disabled = false;
+            if (reloadLatest) reloadLatest.disabled = false;
             [nameInput, sqlEditor, preserveTriggers].forEach((element, index) => {
                 if (element) element.disabled = draftInputDisabledStates[index];
             });
-        } else if (preserveTriggers) {
-            // Modal controls are static DOM nodes. A newer modal session already
-            // initialized its name/SQL state, but this checkbox inherited the old
-            // save lock and must be released when that request settles.
-            preserveTriggers.disabled = false;
         }
     }
 }

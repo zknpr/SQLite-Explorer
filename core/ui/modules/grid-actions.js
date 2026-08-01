@@ -156,14 +156,16 @@ async function processFilterQueue(table = state.selectedTable, reloadRetryCount 
     }
 
     // Text typed during the fetch scheduled a later application. The first load
-    // rebuilt the header from the latest captured draft, so restore that input's
-    // focus immediately; defer only navigation until the successor rows arrive.
+    // rebuilt the header from the latest captured draft but returned rows for its
+    // older snapshot. Start the successor immediately so that mismatch is never
+    // left interactive for the remainder of the debounce window.
     if (state.filterApplyPending) {
         const pendingAction = state.filterPendingAction;
         if (pendingAction?.table === table && pendingAction.focusScope !== null) {
             focusFilterInput(pendingAction.focusScope);
         }
-        return true;
+        clearFilterTimer();
+        return processFilterQueue(table);
     }
 
     state.filterApplyTable = null;

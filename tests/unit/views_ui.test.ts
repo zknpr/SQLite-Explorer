@@ -368,6 +368,91 @@ describe('view modal concurrency', () => {
         }
     });
 
+    it('does not let an old save unlock controls owned by a newer reload', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const modalsModulePath = '../../core/ui/modules/modals.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openCreateViewModal, openEditViewModal } = await import(viewsModulePath);
+        const { closeModal } = await import(modalsModulePath);
+        const validation = createDeferred<void>();
+        const validationStarted = createDeferred<void>();
+        const latestDefinition = createDeferred<any>();
+        const originals = {
+            get: backendApi.getViewDefinition,
+            validate: backendApi.validateViewDefinition,
+            create: backendApi.createView
+        };
+        let getCalls = 0;
+        let createCalls = 0;
+        backendApi.getViewDefinition = async () => {
+            if (getCalls++ === 0) {
+                return {
+                    sql: 'CREATE VIEW newer_view AS SELECT 1 AS value',
+                    selectSql: 'SELECT 1 AS value',
+                    triggers: []
+                };
+            }
+            return latestDefinition.promise;
+        };
+        backendApi.validateViewDefinition = async () => {
+            validationStarted.resolve();
+            return validation.promise;
+        };
+        backendApi.createView = async () => { createCalls++; };
+        const originalReadOnly = state.isReadOnly;
+        state.isReadOnly = false;
+
+        try {
+            initViews();
+            openCreateViewModal();
+            elements.viewNameInput.value = 'older_view';
+            elements.viewSelectSql.value = 'SELECT 1 AS value';
+            const pendingSave = listener('btnSaveView', 'click')();
+            await validationStarted.promise;
+
+            closeModal('viewModal');
+            await openEditViewModal('newer_view');
+            elements.btnReloadViewDefinition.hidden = false;
+            const pendingReload = listener('btnReloadViewDefinition', 'click')();
+
+            assert.strictEqual(elements.viewSelectSql.disabled, true);
+            assert.strictEqual(elements.viewPreserveTriggers.disabled, true);
+            assert.strictEqual(elements.btnSaveView.disabled, true);
+            assert.strictEqual(elements.btnReloadViewDefinition.disabled, true);
+
+            validation.resolve();
+            await pendingSave;
+
+            assert.strictEqual(createCalls, 0);
+            assert.strictEqual(elements.viewSelectSql.disabled, true);
+            assert.strictEqual(elements.viewPreserveTriggers.disabled, true);
+            assert.strictEqual(elements.btnSaveView.disabled, true);
+            assert.strictEqual(elements.btnReloadViewDefinition.disabled, true);
+
+            latestDefinition.resolve({
+                sql: 'CREATE VIEW newer_view AS SELECT 2 AS value',
+                selectSql: 'SELECT 2 AS value',
+                triggers: []
+            });
+            await pendingReload;
+
+            assert.strictEqual(elements.viewNameInput.disabled, true);
+            assert.strictEqual(elements.viewSelectSql.disabled, false);
+            assert.strictEqual(elements.viewPreserveTriggers.disabled, false);
+            assert.strictEqual(elements.btnSaveView.disabled, false);
+            assert.strictEqual(elements.btnReloadViewDefinition.disabled, false);
+        } finally {
+            backendApi.getViewDefinition = originals.get;
+            backendApi.validateViewDefinition = originals.validate;
+            backendApi.createView = originals.create;
+            state.isReadOnly = originalReadOnly;
+        }
+    });
+
     it('ignores a preview response for a superseded draft', async () => {
         const { elements, listener } = installViewDocument();
         const apiModulePath = '../../core/ui/modules/api.js';

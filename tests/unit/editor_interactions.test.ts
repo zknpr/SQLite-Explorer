@@ -64,6 +64,7 @@ describe('editor keyboard and grid selection interactions', () => {
         state.isReadOnly = false;
         state.cellPreviewInfo = null;
         state.isLoadingData = false;
+        state.matchNav = { scope: null, term: null, matches: [], currentIndex: -1 };
     });
 
     it('inserts indentation and outdents selected lines in multiline editors', async () => {
@@ -513,6 +514,89 @@ describe('editor keyboard and grid selection interactions', () => {
         assert.strictEqual(createdTextareas.length, 2);
         assert.strictEqual(createdTextareas[1].value, 'alpha');
         assert.strictEqual(createdTextareas[1].focused, true);
+    });
+
+    it('invalidates cached match navigation after a local inline edit', async () => {
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { saveCellEdit } = await import(editModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const updateCalls: unknown[][] = [];
+        const matchCounter = { textContent: '1/1' };
+        const cell = {
+            dataset: { rowidx: '0', colidx: '0' },
+            textContent: '',
+            children: [] as any[],
+            classList: createClassList(['editing', 'active-match-cell']),
+            appendChild(child: any) { this.children.push(child); },
+            querySelector() { return null; }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cell-0-0') return cell;
+                if (id === 'filterMatchCounter') return matchCounter;
+                if (id === 'statusText') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll(selector: string) {
+                if (selector === '.active-match-cell') return [cell];
+                return [];
+            },
+            querySelector() { return null; },
+            createElement() {
+                return {
+                    className: '',
+                    textContent: '',
+                    title: '',
+                    scrollWidth: 0,
+                    clientWidth: 0
+                };
+            }
+        };
+        backendApi.updateCell = async (...args: unknown[]) => {
+            updateCalls.push(args);
+        };
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'value', type: 'TEXT', notnull: 0 }];
+        state.gridData = [[7, 'old match']];
+        state.editingCellInfo = {
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 7,
+            columnName: 'value',
+            originalValue: 'old match'
+        };
+        state.activeCellInput = {
+            value: 'replacement',
+            removeEventListener() {}
+        };
+        state.matchNav = {
+            scope: 'value',
+            term: 'old',
+            matches: [{ rowIdx: 0, colIdx: 0 }],
+            currentIndex: 0
+        };
+
+        try {
+            assert.strictEqual(await saveCellEdit(), true);
+
+            assert.deepStrictEqual(updateCalls, [[
+                'items', 7, 'value', 'replacement', 'old match'
+            ]]);
+            assert.deepStrictEqual(state.gridData, [[7, 'replacement']]);
+            assert.deepStrictEqual(state.matchNav, {
+                scope: null,
+                term: null,
+                matches: [],
+                currentIndex: -1
+            });
+            assert.strictEqual(cell.classList.contains('active-match-cell'), false);
+            assert.strictEqual(matchCounter.textContent, '');
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+        }
     });
 
     it('reveals an inline editor clear of sticky columns before focusing it', async () => {

@@ -17,6 +17,7 @@ import {
 import { BlobInspector } from './blob-inspector.js';
 import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
 import { revealGridCell } from './grid-reveal.js';
+import { resetMatchNav } from './match-nav.js';
 
 let blobInspector;
 
@@ -200,6 +201,7 @@ export async function saveCellEdit() {
         if (currentRowIdx >= 0 && currentColIdx >= 0) {
             updateCellDom(currentRowIdx, currentColIdx, valueToSave);
         }
+        if (state.matchNav.scope !== null) resetMatchNav();
 
         state.selectedCells = [];
         state.lastSelectedCell = null;
@@ -471,6 +473,7 @@ export async function saveCellPreview() {
 
         closeCellPreview();
         updateCellDom(rowIdx, colIdx, valueToSave);
+        if (state.matchNav.scope !== null) resetMatchNav();
 
         state.selectedCells = [];
         state.lastSelectedCell = null;

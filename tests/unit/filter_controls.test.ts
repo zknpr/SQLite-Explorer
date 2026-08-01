@@ -270,7 +270,7 @@ describe('filter controls', () => {
         }
     });
 
-    it('keeps keystrokes captured while a debounced reload is in flight', async () => {
+    it('applies a successor immediately when the filter changes during a reload', async () => {
         const timers = installTimerHarness();
         const { globalInput, columnInputs } = installFilterDocument({
             columns: [{ name: 'value', value: 'first' }]
@@ -280,20 +280,27 @@ describe('filter controls', () => {
         const originalFetchCount = backendApi.fetchTableCount;
         const originalFetchData = backendApi.fetchTableData;
         const firstCount = createDeferred<number>();
+        const firstCountStarted = createDeferred<void>();
         const seenFilters: string[] = [];
+        const seenDataFilters: string[] = [];
         let countCall = 0;
         backendApi.fetchTableCount = async (_table: string, options: any) => {
             seenFilters.push(options.filters[0]?.value ?? '');
             countCall++;
+            if (countCall === 1) firstCountStarted.resolve();
             return countCall === 1 ? firstCount.promise : 1;
         };
-        backendApi.fetchTableData = async () => ({ rows: [['latest']] });
+        backendApi.fetchTableData = async (_table: string, options: any) => {
+            const filter = options.filters[0]?.value ?? '';
+            seenDataFilters.push(filter);
+            return { rows: [[filter]] };
+        };
 
         try {
             const { onFilterInput } = await import(gridActionsModulePath);
             onFilterInput({ target: columnInputs[0], isComposing: false });
             const firstApply = timers.start(300);
-            await Promise.resolve();
+            await firstCountStarted.promise;
             assert.strictEqual(state.isGridReloading, true);
 
             columnInputs[0].value = 'latest';
@@ -308,9 +315,17 @@ describe('filter controls', () => {
                 true,
                 'the rebuilt input must regain focus before the successor reload'
             );
-            await timers.run(300);
 
             assert.deepStrictEqual(seenFilters, ['first', 'latest']);
+            assert.deepStrictEqual(seenDataFilters, ['first', 'latest']);
+            assert.deepStrictEqual(state.gridData, [['latest']]);
+            assert.strictEqual(state.filterTimer, null);
+            assert.strictEqual(
+                timers.delays().some(delay => delay === 300 || delay === 50),
+                false,
+                'the successor must not remain behind a debounce or reload-retry timer'
+            );
+            assert.strictEqual(state.isGridReloading, false);
             assert.strictEqual(globalInput.value, '');
         } finally {
             backendApi.fetchTableCount = originalFetchCount;
