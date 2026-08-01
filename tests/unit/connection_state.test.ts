@@ -73,6 +73,7 @@ describe('viewer connection state', () => {
     });
 
     it('does not submit a stale toolbar deletion during a grid reload', async () => {
+        const originalDocument = globalThis.document;
         (globalThis as any).document = {
             getElementById() { return null; },
             querySelectorAll() { return []; }
@@ -84,6 +85,8 @@ describe('viewer connection state', () => {
         const { backendApi } = await import(apiModulePath);
         const { submitDelete } = await import(crudModulePath);
         const originalDeleteRows = backendApi.deleteRows;
+        const originalSelectedTable = state.selectedTable;
+        const originalSelectedTableType = state.selectedTableType;
         let deleteCalls = 0;
         backendApi.deleteRows = async () => { deleteCalls++; };
         state.selectedTable = 'items';
@@ -97,6 +100,9 @@ describe('viewer connection state', () => {
             assert.strictEqual(deleteCalls, 0);
         } finally {
             backendApi.deleteRows = originalDeleteRows;
+            (globalThis as any).document = originalDocument;
+            state.selectedTable = originalSelectedTable;
+            state.selectedTableType = originalSelectedTableType;
             state.selectedRowIds.clear();
             state.selectedColumns.clear();
             state.isGridReloading = false;

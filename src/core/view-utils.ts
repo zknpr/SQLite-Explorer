@@ -16,7 +16,7 @@ export const VIEW_TRIGGER_SCHEMA_QUERIES = [
   {
     // sqlite_temp_schema.tbl_name does not retain the target schema. Return the
     // shadow state with every candidate so mapViewTriggerRows can distinguish
-    // an explicit ON main.v from an unqualified ON v when temp.v exists.
+    // an explicit ON main.v from an ambiguous unqualified ON v.
     sql: "SELECT temp_trigger.name, temp_trigger.sql, " +
       "EXISTS (SELECT 1 FROM sqlite_temp_schema AS temp_view " +
       "WHERE temp_view.type = 'view' AND temp_view.name = ? COLLATE NOCASE) " +
@@ -218,17 +218,24 @@ export function escapeMainViewIdentifier(view: string): string {
   return `main.${escapeIdentifier(view)}`;
 }
 
+export interface MappedViewTriggerRows {
+  triggers: ViewTriggerDefinition[];
+  ambiguousTemporaryTriggerNames: string[];
+}
+
 /** Map canonical trigger-query rows while keeping temp-schema provenance intact. */
 export function mapViewTriggerRows(
   view: string,
   rowsBySchema: readonly (readonly (readonly CellValue[])[])[]
-): ViewTriggerDefinition[] {
+): MappedViewTriggerRows {
   if (rowsBySchema.length !== VIEW_TRIGGER_SCHEMA_QUERIES.length) {
     throw new Error(`View trigger definition fetch was incomplete for ${view}`);
   }
 
-  return VIEW_TRIGGER_SCHEMA_QUERIES.flatMap((source, index) => (
-    rowsBySchema[index].flatMap(row => {
+  const triggers: ViewTriggerDefinition[] = [];
+  const ambiguousTemporaryTriggerNames: string[] = [];
+  VIEW_TRIGGER_SCHEMA_QUERIES.forEach((source, index) => {
+    rowsBySchema[index].forEach(row => {
       if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
         throw new Error(`View trigger definition is unavailable for ${view}`);
       }
@@ -248,14 +255,38 @@ export function mapViewTriggerRows(
         }
         // Explicit schema qualification is authoritative even without a TEMP
         // shadow: aux.v must never be captured as a trigger on main.v.
-        if (targetSchema !== undefined && targetSchema.toLowerCase() !== 'main') return [];
-        if (targetSchema === undefined && hasTempShadow) return [];
+        if (targetSchema !== undefined && foldSqlIdentifier(targetSchema) !== 'main') return;
+        if (targetSchema === undefined && hasTempShadow) {
+          // SQLite binds an unqualified TEMP trigger target at CREATE time,
+          // but neither temp.sqlite_schema nor the stored SQL records whether
+          // main.v or a now-present temp.v won that historical lookup. Keep the
+          // candidate visible in the snapshot and let destructive consumers
+          // reject instead of guessing and losing a trigger.
+          ambiguousTemporaryTriggerNames.push(row[0]);
+          return;
+        }
       }
-      return source.temporary
-        ? [{ identifier: row[0], sql: row[1], temporary: true }]
-        : [{ identifier: row[0], sql: row[1] }];
-    })
-  ));
+      triggers.push(source.temporary
+        ? { identifier: row[0], sql: row[1], temporary: true }
+        : { identifier: row[0], sql: row[1] });
+    });
+  });
+  return { triggers, ambiguousTemporaryTriggerNames };
+}
+
+/** Refuse destructive view changes when SQLite's catalogs cannot identify trigger ownership. */
+export function assertViewTriggerSnapshotIsMutationSafe(definition: ViewDefinition): void {
+  const ambiguous = definition.ambiguousTemporaryTriggerNames ?? [];
+  if (ambiguous.length === 0) return;
+
+  const triggerNames = ambiguous.map(name => `"${name}"`).join(', ');
+  throw new Error(
+    `Cannot modify main view "${definition.identifier}" because temporary trigger target ` +
+    `ownership is ambiguous for ${triggerNames}. Each named trigger uses an unqualified ON ` +
+    'target while a same-named TEMP view exists. Drop the TEMP shadow view or the TEMP trigger, ' +
+    'or recreate the trigger with an explicitly schema-qualified target, before editing or ' +
+    'dropping the main view.'
+  );
 }
 
 /**

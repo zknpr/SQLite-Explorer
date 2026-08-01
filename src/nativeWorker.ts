@@ -57,6 +57,7 @@ import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionStateCurrent,
   assertViewDefinitionIntent,
+  assertViewTriggerSnapshotIsMutationSafe,
   assertViewTriggersCompatibleWithColumns,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
@@ -75,6 +76,24 @@ import { DEFAULT_QUERY_TIMEOUT_MS } from './config';
 // ============================================================================
 
 // Utility functions moved to src/core/sql-utils.ts
+
+function mergeExactIntegerTextMaps(
+  companionTexts: ExactIntegerTextMap | undefined,
+  nativeTexts: ExactIntegerTextMap | undefined
+): ExactIntegerTextMap | undefined {
+  if (!companionTexts) return nativeTexts;
+  if (!nativeTexts) return companionTexts;
+
+  const merged: ExactIntegerTextMap = {};
+  for (const source of [companionTexts, nativeTexts]) {
+    for (const [rowIndex, columns] of Object.entries(source)) {
+      const numericRowIndex = Number(rowIndex);
+      merged[numericRowIndex] ??= {};
+      Object.assign(merged[numericRowIndex], columns);
+    }
+  }
+  return merged;
+}
 
 /**
  * Build a minimal env block for the txiki-js child process.
@@ -588,7 +607,7 @@ export async function createNativeDatabaseConnection(
           return null;
         }
 
-        const triggers = mapViewTriggerRows(
+        const { triggers, ambiguousTemporaryTriggerNames } = mapViewTriggerRows(
           view,
           VIEW_TRIGGER_SCHEMA_QUERIES.map((_, index) => (
             metadata.results[index + 1].values ?? []
@@ -609,7 +628,10 @@ export async function createNativeDatabaseConnection(
           sql: createSql,
           selectSql,
           columnListSql,
-          triggers
+          triggers,
+          ...(ambiguousTemporaryTriggerNames.length > 0
+            ? { ambiguousTemporaryTriggerNames }
+            : {})
         };
       };
 
@@ -710,6 +732,7 @@ export async function createNativeDatabaseConnection(
         await worker.call('run', [`SAVEPOINT ${savepointName}`]);
         try {
           const current = await findNativeViewDefinition(view, true);
+          if (current) assertViewTriggerSnapshotIsMutationSafe(current);
           assertViewDefinitionStateCurrent(expectedCurrent, current);
           if (current) {
             await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
@@ -1296,7 +1319,7 @@ export async function createNativeDatabaseConnection(
 
         createView: async (view: string, selectSql: string): Promise<ViewDefinition> => {
           if (forceReadOnly) {
-            throw new Error('Cannot create view because the database is read-only');
+            throw new Error('View creation is unavailable because the database is read-only');
           }
           const body = normalizeViewSelectSql(selectSql);
           await compileNativeViewSelect(body);
@@ -1322,7 +1345,7 @@ export async function createNativeDatabaseConnection(
           expectedTriggers?: readonly ViewTriggerDefinition[]
         ): Promise<ViewEditResult> => {
           if (forceReadOnly) {
-            throw new Error('Cannot edit view because the database is read-only');
+            throw new Error('View editing is unavailable because the database is read-only');
           }
           const body = normalizeViewSelectSql(selectSql);
           await compileNativeViewSelect(body);
@@ -1330,6 +1353,7 @@ export async function createNativeDatabaseConnection(
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
             const before = await getNativeViewDefinition(view);
+            assertViewTriggerSnapshotIsMutationSafe(before);
             assertViewDefinitionSnapshotCurrent(
               expectedSql,
               before.sql,
@@ -1369,12 +1393,13 @@ export async function createNativeDatabaseConnection(
           expectedTriggers?: readonly ViewTriggerDefinition[]
         ): Promise<ViewDefinition> => {
           if (forceReadOnly) {
-            throw new Error('Cannot drop view because the database is read-only');
+            throw new Error('View deletion is unavailable because the database is read-only');
           }
           const savepointName = createSavepointName('sp_drop_view');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
             const before = await getNativeViewDefinition(view, true);
+            assertViewTriggerSnapshotIsMutationSafe(before);
             assertViewDefinitionSnapshotCurrent(
               expectedSql,
               before.sql,
@@ -1445,7 +1470,7 @@ export async function createNativeDatabaseConnection(
           const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
             result.values,
             undefined,
-            result.exactIntegerTexts ?? companionExactTexts
+            mergeExactIntegerTextMaps(companionExactTexts, result.exactIntegerTexts)
           );
 
           return {

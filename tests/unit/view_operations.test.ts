@@ -275,7 +275,7 @@ describe('view operations', () => {
         }
     });
 
-    it('does not attribute a temp-shadow view trigger to the main view during edit', async () => {
+    it('rejects a shadowed unqualified TEMP trigger before editing the main view', async () => {
         const engine = await createEngine();
         try {
             await engine.executeQuery('CREATE TABLE shadow_trigger_main_rows (value INTEGER)');
@@ -295,17 +295,23 @@ describe('view operations', () => {
                 'BEGIN INSERT INTO shadow_trigger_log VALUES (NEW.value); END'
             );
 
-            const edit = await engine.editView(
-                'shadow_trigger_view',
-                'SELECT value * 2 AS value FROM shadow_trigger_main_rows',
-                true
+            const browsed = await engine.getViewDefinition('shadow_trigger_view');
+            assert.deepStrictEqual(browsed.triggers, []);
+            assert.deepStrictEqual(
+                browsed.ambiguousTemporaryTriggerNames,
+                ['shadow_trigger_insert']
             );
-
-            assert.deepStrictEqual(edit.before.triggers, []);
-            assert.deepStrictEqual(edit.after.triggers, []);
+            await assert.rejects(
+                () => engine.editView(
+                    'shadow_trigger_view',
+                    'SELECT value * 2 AS value FROM shadow_trigger_main_rows',
+                    true
+                ),
+                /shadow_trigger_insert.*drop the TEMP shadow view.*schema-qualified target/is
+            );
             assert.strictEqual(
                 await readScalar(engine, 'SELECT value FROM main.shadow_trigger_view'),
-                6
+                3
             );
             assert.strictEqual(
                 await readScalar(engine, 'SELECT value FROM temp.shadow_trigger_view'),
@@ -320,6 +326,71 @@ describe('view operations', () => {
             assert.strictEqual(
                 await readScalar(engine, 'SELECT value FROM shadow_trigger_log'),
                 11
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('rejects edit and drop when a main-bound TEMP trigger becomes catalog-ambiguous', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE TABLE ambiguous_main_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO ambiguous_main_rows VALUES (3)');
+            await engine.executeQuery('CREATE TABLE ambiguous_main_log (value INTEGER)');
+            await engine.executeQuery(
+                'CREATE VIEW ambiguous_trigger_view AS SELECT value FROM ambiguous_main_rows'
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TRIGGER ambiguous_main_insert ' +
+                'INSTEAD OF INSERT ON ambiguous_trigger_view ' +
+                'BEGIN INSERT INTO ambiguous_main_log VALUES (NEW.value); END'
+            );
+            await engine.executeQuery('CREATE TEMP TABLE ambiguous_temp_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO ambiguous_temp_rows VALUES (7)');
+            await engine.executeQuery(
+                'CREATE TEMP VIEW ambiguous_trigger_view AS SELECT value FROM ambiguous_temp_rows'
+            );
+
+            const browsed = await engine.getViewDefinition('ambiguous_trigger_view');
+            assert.strictEqual(browsed.selectSql, 'SELECT value FROM ambiguous_main_rows');
+            assert.deepStrictEqual(browsed.triggers, []);
+            assert.deepStrictEqual(
+                browsed.ambiguousTemporaryTriggerNames,
+                ['ambiguous_main_insert']
+            );
+
+            const expectedError = /ambiguous_main_insert.*drop the TEMP shadow view.*TEMP trigger.*schema-qualified target/is;
+            await assert.rejects(
+                () => engine.editView(
+                    'ambiguous_trigger_view',
+                    'SELECT value * 2 AS value FROM ambiguous_main_rows',
+                    true
+                ),
+                expectedError
+            );
+            await assert.rejects(
+                () => engine.dropView('ambiguous_trigger_view'),
+                expectedError
+            );
+
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM main.ambiguous_trigger_view'),
+                3
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM temp.ambiguous_trigger_view'),
+                7
+            );
+            assert.strictEqual(await readScalar(
+                engine,
+                "SELECT count(*) FROM sqlite_temp_schema " +
+                "WHERE type = 'trigger' AND name = 'ambiguous_main_insert'"
+            ), 1);
+            await engine.executeQuery('INSERT INTO main.ambiguous_trigger_view VALUES (19)');
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM ambiguous_main_log'),
+                19
             );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
@@ -351,7 +422,7 @@ describe('view operations', () => {
             );
             await engine.executeQuery(
                 'CREATE TEMP TRIGGER qualified_temp_insert ' +
-                'INSTEAD OF INSERT ON qualified_trigger_view ' +
+                'INSTEAD OF INSERT ON temp.qualified_trigger_view ' +
                 "BEGIN INSERT INTO qualified_trigger_log VALUES ('temp', NEW.value); END"
             );
 
@@ -1348,6 +1419,31 @@ describe('view operations', () => {
             );
         } finally {
             instance.prepare = originalPrepare;
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('loads a wide view with a null first column without rowid companions', async () => {
+        const dataColumnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        const viewExpressions = [
+            'NULL AS first_value',
+            ...dataColumnNames.map(name => `0 AS "${name}"`)
+        ];
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                `CREATE VIEW wide_null_first_view AS SELECT ${viewExpressions.join(', ')}`
+            );
+            const result = await engine.fetchTableData('wide_null_first_view', {
+                columns: ['first_value', ...dataColumnNames],
+                limit: 1,
+                offset: 0
+            });
+
+            assert.strictEqual(result.rows[0].length, 1001);
+            assert.strictEqual(result.rows[0][0], null);
+            assert.strictEqual(result.exactIntegerTexts, undefined);
+        } finally {
             (engine as WasmDatabaseEngine).shutdown();
         }
     });

@@ -42,6 +42,7 @@ import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionStateCurrent,
   assertViewDefinitionIntent,
+  assertViewTriggerSnapshotIsMutationSafe,
   assertViewTriggersCompatibleWithColumns,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
@@ -1058,7 +1059,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const result = await this.executeQuery(source.sql, source.params(view));
       triggerRows.push(result[0]?.rows ?? []);
     }
-    const triggers = mapViewTriggerRows(view, triggerRows);
+    const { triggers, ambiguousTemporaryTriggerNames } = mapViewTriggerRows(
+      view,
+      triggerRows
+    );
 
     let selectSql: string;
     let columnListSql: string | undefined;
@@ -1076,7 +1080,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       sql: createSql,
       selectSql,
       columnListSql,
-      triggers
+      triggers,
+      ...(ambiguousTemporaryTriggerNames.length > 0
+        ? { ambiguousTemporaryTriggerNames }
+        : {})
     };
   }
 
@@ -1222,6 +1229,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       // prevents a stale editor snapshot from being silently overwritten even
       // when another connection races between the UI check and this mutation.
       const before = await this.getViewDefinition(view);
+      assertViewTriggerSnapshotIsMutationSafe(before);
       assertViewDefinitionSnapshotCurrent(
         expectedSql,
         before.sql,
@@ -1265,6 +1273,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const before = await this.readViewDefinition(view, true);
+      assertViewTriggerSnapshotIsMutationSafe(before);
       assertViewDefinitionSnapshotCurrent(
         expectedSql,
         before.sql,
@@ -1296,6 +1305,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const current = await this.findViewDefinition(view, true);
+      if (current) assertViewTriggerSnapshotIsMutationSafe(current);
       assertViewDefinitionStateCurrent(expectedCurrent, current);
       if (current) {
         this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);

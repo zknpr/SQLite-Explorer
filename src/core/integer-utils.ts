@@ -168,6 +168,11 @@ export function collectRowIdExactRealTexts(
   sourceRows: readonly (readonly unknown[])[],
   companionResults: readonly RowIdExactRealTextResult[]
 ): ExactIntegerTextMap | undefined {
+  // No companion query means the caller deliberately selected values-only
+  // degradation (for example, a wide view or WITHOUT ROWID table). Do not
+  // interpret that source's first projected value as a rowid in this case.
+  if (companionResults.length === 0) return undefined;
+
   const sourceRowById = new Map<string, number>();
   sourceRows.forEach((row, rowIndex) => {
     const rowId = row[0];

@@ -15,6 +15,7 @@ import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionStateCurrent,
   assertViewDefinitionIntent,
+  assertViewTriggerSnapshotIsMutationSafe,
   assertViewTriggersCompatibleWithColumns,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
@@ -216,12 +217,12 @@ function resolveGlobalFilterColumns(columns, globalFilterColumns) {
   return fallbackColumns[0] === 'rowid' ? fallbackColumns.slice(1) : fallbackColumns;
 }
 
-function safeRollbackViewSavepoint(savepointName, context) {
+function safeRollbackSavepoint(savepointName, context) {
   try {
     runSingleStatement(`ROLLBACK TO ${savepointName}`);
     runSingleStatement(`RELEASE ${savepointName}`);
   } catch (rollbackError) {
-    console.warn(`Failed to rollback view savepoint (${context}):`, rollbackError);
+    console.warn(`Failed to rollback savepoint (${context}):`, rollbackError);
   }
 }
 
@@ -762,9 +763,37 @@ async function setPragma(pragma, value) {
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Pragma updates');
 
-  // Sanitize pragma name
-  const safePragma = pragma.replace(/[^a-z_]/gi, '');
-  db.run(`PRAGMA ${safePragma} = ${value}`);
+  const allowedPragmas = [
+    'foreign_keys',
+    'journal_mode',
+    'synchronous',
+    'cache_size',
+    'locking_mode',
+    'temp_store',
+    'auto_vacuum'
+  ];
+  if (!allowedPragmas.includes(pragma)) {
+    throw new Error(`Invalid or disallowed PRAGMA: ${pragma}`);
+  }
+
+  let sql;
+  if (typeof value === 'string') {
+    if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
+      throw new Error('Invalid PRAGMA string value: contains disallowed characters');
+    }
+    sql = `PRAGMA ${pragma} = '${value}'`;
+  } else if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new Error('Invalid PRAGMA numeric value: must be finite');
+    }
+    sql = `PRAGMA ${pragma} = ${value}`;
+  } else if (typeof value === 'boolean') {
+    sql = `PRAGMA ${pragma} = ${value ? 'ON' : 'OFF'}`;
+  } else {
+    throw new Error(`Invalid PRAGMA value type: ${typeof value}`);
+  }
+
+  runSingleStatement(sql);
 }
 
 /**
@@ -916,7 +945,10 @@ async function findViewDefinition(view, allowUnparsed = false) {
   const triggerRows = VIEW_TRIGGER_SCHEMA_QUERIES.map(source => (
     db.exec(source.sql, source.params(view))[0]?.values || []
   ));
-  const triggers = mapViewTriggerRows(view, triggerRows);
+  const { triggers, ambiguousTemporaryTriggerNames } = mapViewTriggerRows(
+    view,
+    triggerRows
+  );
 
   let selectSql;
   let columnListSql;
@@ -932,7 +964,10 @@ async function findViewDefinition(view, allowUnparsed = false) {
     sql: createSql,
     selectSql,
     columnListSql,
-    triggers
+    triggers,
+    ...(ambiguousTemporaryTriggerNames.length > 0
+      ? { ambiguousTemporaryTriggerNames }
+      : {})
   };
 }
 
@@ -988,7 +1023,7 @@ async function validateViewDefinition(view, selectSql, intent = 'edit') {
     runSingleStatement(`ROLLBACK TO ${savepointName}`);
     runSingleStatement(`RELEASE ${savepointName}`);
   } catch (error) {
-    safeRollbackViewSavepoint(savepointName, 'validateViewDefinition');
+    safeRollbackSavepoint(savepointName, 'validateViewDefinition');
     throw error;
   }
 }
@@ -1032,7 +1067,7 @@ async function previewViewDefinition(view, selectSql, limit = 50, intent = 'edit
     runSingleStatement(`RELEASE ${savepointName}`);
     return result;
   } catch (error) {
-    safeRollbackViewSavepoint(savepointName, 'previewViewDefinition');
+    safeRollbackSavepoint(savepointName, 'previewViewDefinition');
     throw error;
   }
 }
@@ -1051,7 +1086,7 @@ async function createView(view, selectSql) {
     runSingleStatement(`RELEASE ${savepointName}`);
     return definition;
   } catch (error) {
-    safeRollbackViewSavepoint(savepointName, 'createView');
+    safeRollbackSavepoint(savepointName, 'createView');
     throw error;
   }
 }
@@ -1071,6 +1106,7 @@ async function editView(
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     const before = await getViewDefinition(view);
+    assertViewTriggerSnapshotIsMutationSafe(before);
     assertViewDefinitionSnapshotCurrent(
       expectedSql,
       before.sql,
@@ -1097,7 +1133,7 @@ async function editView(
     runSingleStatement(`RELEASE ${savepointName}`);
     return { before, after };
   } catch (error) {
-    safeRollbackViewSavepoint(savepointName, 'editView');
+    safeRollbackSavepoint(savepointName, 'editView');
     throw error;
   }
 }
@@ -1109,6 +1145,7 @@ async function dropView(view, expectedSql, expectedTriggers) {
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     const before = await readViewDefinition(view, true);
+    assertViewTriggerSnapshotIsMutationSafe(before);
     assertViewDefinitionSnapshotCurrent(
       expectedSql,
       before.sql,
@@ -1119,7 +1156,7 @@ async function dropView(view, expectedSql, expectedTriggers) {
     runSingleStatement(`RELEASE ${savepointName}`);
     return before;
   } catch (error) {
-    safeRollbackViewSavepoint(savepointName, 'dropView');
+    safeRollbackSavepoint(savepointName, 'dropView');
     throw error;
   }
 }
@@ -1130,6 +1167,7 @@ async function applyViewHistoryState(view, expectedCurrent, replacement) {
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     const current = await findViewDefinition(view, true);
+    if (current) assertViewTriggerSnapshotIsMutationSafe(current);
     assertViewDefinitionStateCurrent(expectedCurrent, current);
     if (current) {
       runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
@@ -1145,7 +1183,7 @@ async function applyViewHistoryState(view, expectedCurrent, replacement) {
     }
     runSingleStatement(`RELEASE ${savepointName}`);
   } catch (error) {
-    safeRollbackViewSavepoint(savepointName, 'restoreViewDefinition');
+    safeRollbackSavepoint(savepointName, 'restoreViewDefinition');
     throw error;
   }
 }
@@ -1220,14 +1258,15 @@ async function updateCellBatch(table, updates) {
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Batch cell updates');
 
-  db.run('BEGIN TRANSACTION');
+  const savepointName = createViewSavepointName('sp_update_cell_batch');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     for (const update of updates) {
       await updateCell(table, update.rowId, update.column, update.value);
     }
-    db.run('COMMIT');
+    runSingleStatement(`RELEASE ${savepointName}`);
   } catch (e) {
-    db.run('ROLLBACK');
+    safeRollbackSavepoint(savepointName, 'updateCellBatch');
     throw e;
   }
 }

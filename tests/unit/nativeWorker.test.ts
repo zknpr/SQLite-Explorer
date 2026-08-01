@@ -806,15 +806,15 @@ describe('createNativeDatabaseConnection', () => {
             );
             await assert.rejects(
                 connection.databaseOps.createView('read_only_create', 'SELECT 1'),
-                /Cannot create view because the database is read-only/
+                /View creation is unavailable because the database is read-only/
             );
             await assert.rejects(
                 connection.databaseOps.editView('read_only_edit', 'SELECT 2'),
-                /Cannot edit view because the database is read-only/
+                /View editing is unavailable because the database is read-only/
             );
             await assert.rejects(
                 connection.databaseOps.dropView('read_only_drop'),
-                /Cannot drop view because the database is read-only/
+                /View deletion is unavailable because the database is read-only/
             );
             assert.deepStrictEqual(
                 connection.calls.slice(callsBefore),
@@ -879,7 +879,8 @@ describe('createNativeDatabaseConnection', () => {
                 return { result: { columns: ['cid', 'name'], values: [[0, 'value']] } };
             }
             if (call.method === 'queryBounded') {
-                assert.strictEqual(call.args[5], 10);
+                assert.strictEqual(call.args[5], 7, 'preview row limit');
+                assert.strictEqual(call.args[6], 10, 'worker execution timeout');
                 await new Promise(resolve => setTimeout(resolve, 30));
                 return { error: 'Query execution timed out after 10ms' };
             }
@@ -891,7 +892,7 @@ describe('createNativeDatabaseConnection', () => {
                 connection.databaseOps.previewViewDefinition(
                     'slow_preview',
                     'SELECT 1',
-                    10,
+                    7,
                     'create'
                 ),
                 (error: unknown) => {
@@ -904,6 +905,63 @@ describe('createNativeDatabaseConnection', () => {
                     );
                     return true;
                 }
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('merges native and companion exact numeric text maps with native entries winning', async () => {
+        const columns = ['rowid', ...Array.from({ length: 1000 }, (_, index) => `c${index}`)];
+        const sourceRow = [1, 1.25, 2.5, ...Array.from({ length: 998 }, () => 0)];
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryNumeric') {
+                return {
+                    result: {
+                        columns,
+                        values: [sourceRow],
+                        exactIntegerTexts: { 0: { 2: '2.50000000000001' } }
+                    }
+                };
+            }
+            if (
+                call.method === 'query'
+                && String(call.args[0]).includes('pragma_table_list')
+            ) {
+                return { result: { columns: ['1'], values: [[1]] } };
+            }
+            if (
+                call.method === 'query'
+                && String(call.args[0]).includes('__sqlite_explorer_numeric_rowid')
+            ) {
+                const sql = String(call.args[0]);
+                const companionColumnCount = (
+                    sql.match(/AS "__sqlite_explorer_numeric_rowid_text_\d+"/g) ?? []
+                ).length;
+                const row: unknown[] = [
+                    1,
+                    ...Array.from({ length: companionColumnCount }, () => null)
+                ];
+                if (companionColumnCount > 1) {
+                    row[1] = '1.25000000000001';
+                    row[2] = '2.50000000000000';
+                }
+                return { result: { columns: [], values: [row] } };
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            const result = await connection.databaseOps.fetchTableData('wide_numeric_rows', {
+                columns,
+                limit: 1,
+                offset: 0
+            });
+            assert.strictEqual(result.exactIntegerTexts?.[0]?.[1], '1.25000000000001');
+            assert.strictEqual(
+                result.exactIntegerTexts?.[0]?.[2],
+                '2.50000000000001',
+                'single-evaluation native sidecars must override companion reads'
             );
         } finally {
             connection.dispose();

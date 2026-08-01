@@ -440,6 +440,59 @@ describe('HostBridge', () => {
         );
     });
 
+    it('logs a batch rollback failure and preserves the original write error', async () => {
+        const writeError = new Error('batch write failed');
+        const rollbackError = new Error('rollback failed');
+        const appendLine = mock.fn();
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => {
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['wr'], rows: [[0]] }];
+                }
+                if (sql.startsWith('SELECT rowid')) {
+                    return [{ headers: ['rowid', 'value'], rows: [[1, 'before']] }];
+                }
+                if (sql.startsWith('ROLLBACK TO SAVEPOINT ')) {
+                    throw rollbackError;
+                }
+                return [];
+            }),
+            updateCellBatch: mock.fn(async () => {
+                throw writeError;
+            })
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({
+            webviews: new Map(),
+            context: {},
+            outputChannel: { appendLine }
+        } as any, mockDocument as any);
+
+        await assert.rejects(
+            bridge.updateCellBatch(
+                'items',
+                [{ rowId: 1, column: 'value', value: 'after' }],
+                'Batch'
+            ),
+            error => {
+                assert.strictEqual(error, writeError);
+                return true;
+            }
+        );
+        assert.strictEqual(appendLine.mock.callCount(), 1);
+        assert.match(
+            String(appendLine.mock.calls[0].arguments[0]),
+            /Failed to rollback batch update savepoint.*rollback failed/
+        );
+    });
+
     it('rejects a column deletion when reload supersedes its history capture', async () => {
         const rows = createDeferred<any>();
         const rowsStarted = createDeferred<void>();

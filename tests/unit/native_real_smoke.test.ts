@@ -862,7 +862,7 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             await assertTemporaryTriggerWorks(23);
         });
 
-        await testContext.test('keeps a temp-shadow view trigger separate from the edited main view', async () => {
+        await testContext.test('rejects a shadowed unqualified native TEMP trigger before editing main', async () => {
             await engine.executeQuery('CREATE TABLE native_shadow_trigger_main_rows (value INTEGER)');
             await engine.executeQuery('INSERT INTO native_shadow_trigger_main_rows VALUES (3)');
             await engine.executeQuery(
@@ -882,27 +882,95 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
                 'BEGIN INSERT INTO native_shadow_trigger_log VALUES (NEW.value); END'
             );
 
-            const edit = await engine.editView(
-                'native_shadow_trigger_view',
-                'SELECT value * 2 AS value FROM native_shadow_trigger_main_rows',
-                true
+            const browsed = await engine.getViewDefinition('native_shadow_trigger_view');
+            assert.deepStrictEqual(browsed.triggers, []);
+            assert.deepStrictEqual(
+                browsed.ambiguousTemporaryTriggerNames,
+                ['native_shadow_trigger_insert']
             );
-
-            assert.deepStrictEqual(edit.before.triggers, []);
-            assert.deepStrictEqual(edit.after.triggers, []);
+            await assert.rejects(
+                engine.editView(
+                    'native_shadow_trigger_view',
+                    'SELECT value * 2 AS value FROM native_shadow_trigger_main_rows',
+                    true
+                ),
+                /native_shadow_trigger_insert.*drop the TEMP shadow view.*schema-qualified target/is
+            );
             const mainRows = await engine.executeQuery(
                 'SELECT value FROM main.native_shadow_trigger_view'
             );
             const tempRows = await engine.executeQuery(
                 'SELECT value FROM temp.native_shadow_trigger_view'
             );
-            assert.strictEqual(mainRows[0].rows[0][0], 6);
+            assert.strictEqual(mainRows[0].rows[0][0], 3);
             assert.strictEqual(tempRows[0].rows[0][0], 7);
             await engine.executeQuery('INSERT INTO native_shadow_trigger_view VALUES (11)');
             const logged = await engine.executeQuery(
                 'SELECT value FROM native_shadow_trigger_log'
             );
             assert.strictEqual(logged[0].rows[0][0], 11);
+        });
+
+        await testContext.test('rejects native edit and drop for a main-bound TEMP trigger made ambiguous', async () => {
+            await engine.executeQuery('CREATE TABLE native_ambiguous_main_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO native_ambiguous_main_rows VALUES (3)');
+            await engine.executeQuery('CREATE TABLE native_ambiguous_main_log (value INTEGER)');
+            await engine.executeQuery(
+                'CREATE VIEW native_ambiguous_trigger_view AS ' +
+                'SELECT value FROM native_ambiguous_main_rows'
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TRIGGER native_ambiguous_main_insert ' +
+                'INSTEAD OF INSERT ON native_ambiguous_trigger_view ' +
+                'BEGIN INSERT INTO native_ambiguous_main_log VALUES (NEW.value); END'
+            );
+            await engine.executeQuery('CREATE TEMP TABLE native_ambiguous_temp_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO native_ambiguous_temp_rows VALUES (7)');
+            await engine.executeQuery(
+                'CREATE TEMP VIEW native_ambiguous_trigger_view AS ' +
+                'SELECT value FROM native_ambiguous_temp_rows'
+            );
+
+            const browsed = await engine.getViewDefinition('native_ambiguous_trigger_view');
+            assert.strictEqual(
+                browsed.selectSql,
+                'SELECT value FROM native_ambiguous_main_rows'
+            );
+            assert.deepStrictEqual(browsed.triggers, []);
+            assert.deepStrictEqual(
+                browsed.ambiguousTemporaryTriggerNames,
+                ['native_ambiguous_main_insert']
+            );
+
+            const expectedError = /native_ambiguous_main_insert.*drop the TEMP shadow view.*TEMP trigger.*schema-qualified target/is;
+            await assert.rejects(
+                engine.editView(
+                    'native_ambiguous_trigger_view',
+                    'SELECT value * 2 AS value FROM native_ambiguous_main_rows',
+                    true
+                ),
+                expectedError
+            );
+            await assert.rejects(
+                engine.dropView('native_ambiguous_trigger_view'),
+                expectedError
+            );
+
+            const mainRows = await engine.executeQuery(
+                'SELECT value FROM main.native_ambiguous_trigger_view'
+            );
+            const tempRows = await engine.executeQuery(
+                'SELECT value FROM temp.native_ambiguous_trigger_view'
+            );
+            assert.strictEqual(mainRows[0].rows[0][0], 3);
+            assert.strictEqual(tempRows[0].rows[0][0], 7);
+            await engine.executeQuery(
+                'INSERT INTO main.native_ambiguous_trigger_view VALUES (19)'
+            );
+            const logged = await engine.executeQuery(
+                'SELECT value FROM native_ambiguous_main_log'
+            );
+            assert.strictEqual(logged[0].rows[0][0], 19);
         });
 
         await testContext.test('preserves a bracket-qualified main TEMP trigger through a temp shadow', async () => {
@@ -928,7 +996,7 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             );
             await engine.executeQuery(
                 'CREATE TEMP TRIGGER native_qualified_temp_insert ' +
-                'INSTEAD OF INSERT ON native_qualified_trigger_view ' +
+                'INSTEAD OF INSERT ON temp.native_qualified_trigger_view ' +
                 "BEGIN INSERT INTO native_qualified_trigger_log VALUES ('temp', NEW.value); END"
             );
 

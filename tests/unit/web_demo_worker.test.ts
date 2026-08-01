@@ -786,6 +786,37 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('loads a wide demo view with a null first column without rowid companions', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql(_kind, sql) { observedSql.push(sql); }
+        });
+        const dataColumnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        const viewExpressions = [
+            'NULL AS first_value',
+            ...dataColumnNames.map(name => `0 AS "${name}"`)
+        ];
+        await worker.invoke(
+            'runQuery',
+            `CREATE VIEW demo_wide_null_first AS SELECT ${viewExpressions.join(', ')}`
+        );
+        observedSql.length = 0;
+
+        const result = await worker.invoke('fetchTableData', 'demo_wide_null_first', {
+            columns: ['first_value', ...dataColumnNames],
+            globalFilterColumns: dataColumnNames,
+            limit: 1,
+            offset: 0
+        });
+        assert.strictEqual(result.rows[0].length, 1001);
+        assert.strictEqual(result.rows[0][0], null);
+        assert.strictEqual(result.exactIntegerTexts, undefined);
+        assert.strictEqual(
+            observedSql.filter(sql => sql.includes('__sqlite_explorer_numeric_rowid')).length,
+            0
+        );
+    });
+
     it('does not issue rowid companions for a wide demo WITHOUT ROWID table', async () => {
         const observedSql: string[] = [];
         const worker = await createWorkerHarness({
@@ -1111,6 +1142,59 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('rejects unsafe demo PRAGMA assignments before execution', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE pragma_sentinel (id INTEGER)');
+
+        await worker.invoke('setPragma', 'foreign_keys', true);
+        await worker.invoke('setPragma', 'cache_size', 64);
+        await worker.invoke('setPragma', 'journal_mode', 'memory');
+        await assert.rejects(
+            worker.invoke(
+                'setPragma',
+                'foreign_keys',
+                'OFF; DROP TABLE pragma_sentinel; --'
+            ),
+            /Invalid PRAGMA string value/
+        );
+        await assert.rejects(
+            worker.invoke('setPragma', 'foreign_keys; DROP TABLE pragma_sentinel', 'OFF'),
+            /Invalid or disallowed PRAGMA/
+        );
+        await assert.rejects(
+            worker.invoke('setPragma', 'cache_size', Number.POSITIVE_INFINITY),
+            /Invalid PRAGMA numeric value/
+        );
+
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'pragma_sentinel'"
+            ),
+            1
+        );
+    });
+
+    it('nests demo batch updates inside an existing savepoint', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE nested_batch (value TEXT); " +
+            "INSERT INTO nested_batch VALUES ('before'); " +
+            'SAVEPOINT outer_batch'
+        );
+
+        await worker.invoke('updateCellBatch', 'nested_batch', [
+            { rowId: 1, column: 'value', value: 'after' }
+        ]);
+        await worker.invoke('runQuery', 'RELEASE outer_batch');
+
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM nested_batch WHERE rowid = 1'),
+            'after'
+        );
+    });
+
     it('bounds preview stepping with the configured query timeout', async () => {
         let now = 0;
         const worker = await createWorkerHarness({
@@ -1337,7 +1421,7 @@ describe('web demo view worker', () => {
         );
     });
 
-    it('does not attribute a temp-shadow view trigger to the edited main view', async () => {
+    it('rejects a shadowed unqualified demo TEMP trigger before editing the main view', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke('runQuery', 'CREATE TABLE demo_shadow_trigger_main_rows (value INTEGER)');
         await worker.invoke('runQuery', 'INSERT INTO demo_shadow_trigger_main_rows VALUES (3)');
@@ -1361,18 +1445,24 @@ describe('web demo view worker', () => {
             'BEGIN INSERT INTO demo_shadow_trigger_log VALUES (NEW.value); END'
         );
 
-        const edit = await worker.invoke(
-            'editView',
-            'demo_shadow_trigger_view',
-            'SELECT value * 2 AS value FROM demo_shadow_trigger_main_rows',
-            true
+        const browsed = await worker.invoke('getViewDefinition', 'demo_shadow_trigger_view');
+        assert.deepStrictEqual(Array.from(browsed.triggers), []);
+        assert.deepStrictEqual(
+            Array.from(browsed.ambiguousTemporaryTriggerNames),
+            ['demo_shadow_trigger_insert']
         );
-
-        assert.deepStrictEqual(Array.from(edit.before.triggers), []);
-        assert.deepStrictEqual(Array.from(edit.after.triggers), []);
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'demo_shadow_trigger_view',
+                'SELECT value * 2 AS value FROM demo_shadow_trigger_main_rows',
+                true
+            ),
+            /demo_shadow_trigger_insert.*drop the TEMP shadow view.*schema-qualified target/is
+        );
         assert.strictEqual(
             await workerScalar(worker, 'SELECT value FROM main.demo_shadow_trigger_view'),
-            6
+            3
         );
         assert.strictEqual(
             await workerScalar(worker, 'SELECT value FROM temp.demo_shadow_trigger_view'),
@@ -1382,6 +1472,73 @@ describe('web demo view worker', () => {
         assert.strictEqual(
             await workerScalar(worker, 'SELECT value FROM demo_shadow_trigger_log'),
             11
+        );
+    });
+
+    it('rejects demo edit and drop when a main-bound TEMP trigger becomes ambiguous', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_ambiguous_main_rows (value INTEGER); ' +
+            'INSERT INTO demo_ambiguous_main_rows VALUES (3); ' +
+            'CREATE TABLE demo_ambiguous_main_log (value INTEGER); ' +
+            'CREATE VIEW demo_ambiguous_trigger_view AS ' +
+            'SELECT value FROM demo_ambiguous_main_rows; ' +
+            'CREATE TEMP TRIGGER demo_ambiguous_main_insert ' +
+            'INSTEAD OF INSERT ON demo_ambiguous_trigger_view ' +
+            'BEGIN INSERT INTO demo_ambiguous_main_log VALUES (NEW.value); END; ' +
+            'CREATE TEMP TABLE demo_ambiguous_temp_rows (value INTEGER); ' +
+            'INSERT INTO demo_ambiguous_temp_rows VALUES (7); ' +
+            'CREATE TEMP VIEW demo_ambiguous_trigger_view AS ' +
+            'SELECT value FROM demo_ambiguous_temp_rows'
+        );
+
+        const browsed = await worker.invoke(
+            'getViewDefinition',
+            'demo_ambiguous_trigger_view'
+        );
+        assert.strictEqual(browsed.selectSql, 'SELECT value FROM demo_ambiguous_main_rows');
+        assert.deepStrictEqual(Array.from(browsed.triggers), []);
+        assert.deepStrictEqual(
+            Array.from(browsed.ambiguousTemporaryTriggerNames),
+            ['demo_ambiguous_main_insert']
+        );
+
+        const expectedError = /demo_ambiguous_main_insert.*drop the TEMP shadow view.*TEMP trigger.*schema-qualified target/is;
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'demo_ambiguous_trigger_view',
+                'SELECT value * 2 AS value FROM demo_ambiguous_main_rows',
+                true
+            ),
+            expectedError
+        );
+        await assert.rejects(
+            worker.invoke('dropView', 'demo_ambiguous_trigger_view'),
+            expectedError
+        );
+
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_ambiguous_trigger_view'),
+            3
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_ambiguous_trigger_view'),
+            7
+        );
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_temp_schema " +
+            "WHERE type = 'trigger' AND name = 'demo_ambiguous_main_insert'"
+        ), 1);
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO main.demo_ambiguous_trigger_view VALUES (19)'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_ambiguous_main_log'),
+            19
         );
     });
 
@@ -1413,7 +1570,7 @@ describe('web demo view worker', () => {
         await worker.invoke(
             'runQuery',
             'CREATE TEMP TRIGGER demo_qualified_temp_insert ' +
-            'INSTEAD OF INSERT ON demo_qualified_trigger_view ' +
+            'INSTEAD OF INSERT ON temp.demo_qualified_trigger_view ' +
             "BEGIN INSERT INTO demo_qualified_trigger_log VALUES ('temp', NEW.value); END"
         );
 

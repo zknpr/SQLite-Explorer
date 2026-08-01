@@ -133,6 +133,12 @@ export interface ViewDefinition {
   columns?: string[];
   /** INSTEAD OF triggers owned by the view */
   triggers: ViewTriggerDefinition[];
+  /**
+   * Unqualified TEMP trigger candidates whose historical target cannot be
+   * recovered while a same-named TEMP view shadows this main-schema view.
+   * Browsing remains available, but destructive view mutations must reject.
+   */
+  ambiguousTemporaryTriggerNames?: string[];
 }
 
 /** Whether validation/preview is for a new view or an existing replacement. */

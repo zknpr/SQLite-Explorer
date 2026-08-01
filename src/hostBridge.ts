@@ -696,9 +696,11 @@ export class HostBridge implements ToastService {
             await dbOps.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
           }
         } catch (rollbackErr) {
-          throw new AggregateError(
-            [err, rollbackErr],
-            'Batch update failed and its savepoint could not be rolled back cleanly'
+          const rollbackMessage = rollbackErr instanceof Error
+            ? rollbackErr.message
+            : String(rollbackErr);
+          this.viewerProvider.outputChannel?.appendLine(
+            `[HostBridge] Failed to rollback batch update savepoint: ${rollbackMessage}`
           );
         }
       }
