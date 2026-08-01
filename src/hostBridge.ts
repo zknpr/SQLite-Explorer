@@ -534,6 +534,7 @@ export class HostBridge implements ToastService {
       expectedSql,
       triggerSnapshot
     );
+    this.assertConnectionGeneration(connectionGeneration);
     this.document.recordExternalModification({
       label: 'Edit View',
       description: `Edit view ${view}`,
@@ -580,6 +581,7 @@ export class HostBridge implements ToastService {
           current.sql,
           current.triggers
         );
+        this.assertConnectionGeneration(connectionGeneration);
         this.document.recordExternalModification({
           label: 'Drop View',
           description: `Drop view ${view}`,

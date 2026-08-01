@@ -273,6 +273,85 @@ describe('HostBridge', () => {
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
+    it('does not record an edited view after Reload supersedes its connection', async () => {
+        const before = {
+            identifier: 'edited_view',
+            sql: 'CREATE VIEW edited_view AS SELECT 1 AS value',
+            selectSql: 'SELECT 1 AS value',
+            triggers: []
+        };
+        const after = {
+            ...before,
+            sql: 'CREATE VIEW edited_view AS SELECT 2 AS value',
+            selectSql: 'SELECT 2 AS value'
+        };
+        let connectionGeneration = 8;
+        const editStarted = createDeferred<void>();
+        const editResult = createDeferred<{ before: typeof before; after: typeof after }>();
+        const dbOps = {
+            editView: mock.fn(async () => {
+                editStarted.resolve();
+                return editResult.promise;
+            })
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            get connectionGeneration() { return connectionGeneration; },
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        const pending = bridge.editView('edited_view', 'SELECT 2 AS value');
+        await editStarted.promise;
+        connectionGeneration++;
+        editResult.resolve({ before, after });
+
+        await assert.rejects(pending, /document was reloaded/i);
+        assert.strictEqual(dbOps.editView.mock.callCount(), 1);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('does not record a dropped view after Reload supersedes its connection', async () => {
+        const definition = {
+            identifier: 'dropped_view',
+            sql: 'CREATE VIEW dropped_view AS SELECT 1 AS value',
+            selectSql: 'SELECT 1 AS value',
+            triggers: []
+        };
+        let connectionGeneration = 9;
+        const dropStarted = createDeferred<void>();
+        const dropResult = createDeferred<typeof definition>();
+        const dbOps = {
+            getViewDefinition: mock.fn(async () => definition),
+            dropView: mock.fn(async () => {
+                dropStarted.resolve();
+                return dropResult.promise;
+            })
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            get connectionGeneration() { return connectionGeneration; },
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+        mock.method(vscode.window, 'showWarningMessage', async () => ({ title: 'Drop View', value: true }));
+
+        const pending = bridge.dropView('dropped_view');
+        await dropStarted.promise;
+        connectionGeneration++;
+        dropResult.resolve(definition);
+
+        await assert.rejects(pending, /document was reloaded/i);
+        assert.strictEqual(dbOps.dropView.mock.callCount(), 1);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
     it('rejects a cell update when the document reloads while its undo baseline is loading', async () => {
         const baseline = createDeferred<any>();
         const baselineStarted = createDeferred<void>();

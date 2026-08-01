@@ -191,27 +191,51 @@ function forwardWorkerLog(level: WorkerLogLevel, args: unknown[]): void {
 }
 
 /**
- * History batches execute entries serially in the worker. Scale their host RPC
- * deadline with the batch length so a long File Revert cannot time out merely
- * because many individually healthy undo steps share one invocation.
+ * History batches execute entries serially in the worker, while one undo/redo
+ * entry can carry several payload arrays that each add replay work. Scale the
+ * host RPC deadline with the explicit work units so healthy history operations
+ * do not time out merely because one invocation contains many steps.
  */
 // Past ten base intervals, fail into DatabaseDocument's reconnect/reload
 // recovery instead of letting a hung worker invocation survive the session.
 const MAX_HISTORY_INVOCATION_TIMEOUT_MS = 10 * DEFAULT_INVOCATION_TIMEOUT_MS;
 
+/** Count the payload arrays that make a single history replay scale with stored work. */
+function getModificationWorkUnits(modification: ModificationEntry | undefined): number {
+  const scaledPayloads = [
+    modification?.affectedCells,
+    modification?.deletedRows,
+    modification?.affectedRowIds,
+    modification?.deletedColumns,
+    modification?.droppedIndexes,
+    modification?.viewDefBefore?.triggers,
+    modification?.viewDefAfter?.triggers
+  ];
+  const workUnits = scaledPayloads.reduce(
+    (total, payload) => total + (payload?.length ?? 0),
+    0
+  );
+  return Math.max(1, workUnits);
+}
+
 function getWorkerInvocationTimeout(
   methodName: string,
   parameters: readonly unknown[]
 ): number {
-  if (methodName !== 'applyModifications' && methodName !== 'discardModifications') {
+  let workUnits: number;
+  if (methodName === 'applyModifications' || methodName === 'discardModifications') {
+    const modifications = parameters[0];
+    workUnits = Array.isArray(modifications) ? Math.max(1, modifications.length) : 1;
+  } else if (methodName === 'undoModification' || methodName === 'redoModification') {
+    const modification = parameters[0] as ModificationEntry | undefined;
+    workUnits = getModificationWorkUnits(modification);
+  } else {
     return DEFAULT_INVOCATION_TIMEOUT_MS;
   }
 
-  const modifications = parameters[0];
-  const modificationCount = Array.isArray(modifications) ? modifications.length : 1;
   return Math.min(
     MAX_HISTORY_INVOCATION_TIMEOUT_MS,
-    DEFAULT_INVOCATION_TIMEOUT_MS * Math.max(1, modificationCount)
+    DEFAULT_INVOCATION_TIMEOUT_MS * workUnits
   );
 }
 

@@ -475,6 +475,121 @@ describe('workerFactory error path tests', () => {
     assert.deepStrictEqual(tracker.getUncommittedEntries(), []);
   });
 
+  async function establishTimeoutPolicy() {
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false })
+    };
+
+    const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
+    const fileUri = {
+      scheme: 'file',
+      fsPath: '/test/db.sqlite',
+      path: '/test/db.sqlite'
+    } as any;
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    await bundle.establishConnection(fileUri, 'test.sqlite');
+    assert.ok(workerTimeoutPolicy, 'desktop worker should install a timeout policy');
+    return workerTimeoutPolicy!;
+  }
+
+  async function assertSingleEntryDeadline(modification: unknown, expected: number) {
+    const timeoutPolicy = await establishTimeoutPolicy();
+    assert.strictEqual(timeoutPolicy('undoModification', [modification]), expected);
+    assert.strictEqual(timeoutPolicy('redoModification', [modification]), expected);
+  }
+
+  const createViewDefinition = (triggerCount: number) => ({
+    identifier: 'history_view',
+    sql: 'CREATE VIEW history_view AS SELECT 1 AS value',
+    selectSql: 'SELECT 1 AS value',
+    triggers: Array.from({ length: triggerCount }, (_, index) => ({
+      identifier: `history_trigger_${index}`,
+      sql: `CREATE TRIGGER history_trigger_${index} INSTEAD OF INSERT ON history_view BEGIN SELECT 1; END`
+    }))
+  });
+
+  it('scales single-entry deadlines by affectedCells', async () => {
+    await assertSingleEntryDeadline({
+      affectedCells: Array.from({ length: 3 }, (_, index) => ({
+        rowId: index,
+        columnName: 'value',
+        priorValue: index,
+        newValue: index + 1
+      }))
+    }, 3 * DEFAULT_INVOCATION_TIMEOUT_MS);
+  });
+
+  it('scales single-entry deadlines by deletedRows', async () => {
+    await assertSingleEntryDeadline({
+      deletedRows: [
+        { rowId: 1, row: { value: 'one' } },
+        { rowId: 2, row: { value: 'two' } }
+      ]
+    }, 2 * DEFAULT_INVOCATION_TIMEOUT_MS);
+  });
+
+  it('scales single-entry deadlines by affectedRowIds', async () => {
+    await assertSingleEntryDeadline({ affectedRowIds: [1, 2, 3, 4] }, 4 * DEFAULT_INVOCATION_TIMEOUT_MS);
+  });
+
+  it('scales single-entry deadlines by deletedColumns', async () => {
+    await assertSingleEntryDeadline({
+      deletedColumns: [
+        { name: 'first', type: 'TEXT', data: [] },
+        { name: 'second', type: 'INTEGER', data: [] }
+      ]
+    }, 2 * DEFAULT_INVOCATION_TIMEOUT_MS);
+  });
+
+  it('scales single-entry deadlines by droppedIndexes', async () => {
+    await assertSingleEntryDeadline({
+      droppedIndexes: ['idx_first', 'idx_second', 'idx_third']
+    }, 3 * DEFAULT_INVOCATION_TIMEOUT_MS);
+  });
+
+  it('scales single-entry deadlines by viewDefBefore triggers', async () => {
+    await assertSingleEntryDeadline({
+      viewDefBefore: createViewDefinition(2)
+    }, 2 * DEFAULT_INVOCATION_TIMEOUT_MS);
+  });
+
+  it('scales single-entry deadlines by viewDefAfter triggers', async () => {
+    await assertSingleEntryDeadline({
+      viewDefAfter: createViewDefinition(3)
+    }, 3 * DEFAULT_INVOCATION_TIMEOUT_MS);
+  });
+
+  it('uses one work unit for absent or empty single-entry payloads', async () => {
+    await assertSingleEntryDeadline(undefined, DEFAULT_INVOCATION_TIMEOUT_MS);
+    await assertSingleEntryDeadline({
+      affectedCells: [],
+      deletedRows: [],
+      affectedRowIds: [],
+      deletedColumns: [],
+      droppedIndexes: [],
+      viewDefBefore: createViewDefinition(0),
+      viewDefAfter: createViewDefinition(0)
+    }, DEFAULT_INVOCATION_TIMEOUT_MS);
+  });
+
+  it('sums mixed single-entry payload work', async () => {
+    await assertSingleEntryDeadline({
+      affectedCells: [{ rowId: 1, columnName: 'value' }, { rowId: 2, columnName: 'value' }],
+      deletedRows: [{ rowId: 1, row: {} }],
+      affectedRowIds: [1, 2],
+      deletedColumns: [{ name: 'old', type: 'TEXT', data: [] }],
+      droppedIndexes: ['idx_old'],
+      viewDefBefore: createViewDefinition(1),
+      viewDefAfter: createViewDefinition(1)
+    }, 9 * DEFAULT_INVOCATION_TIMEOUT_MS);
+  });
+
+  it('caps payload-scaled single-entry deadlines', async () => {
+    await assertSingleEntryDeadline({
+      affectedRowIds: Array.from({ length: 11 }, (_, index) => index)
+    }, 10 * DEFAULT_INVOCATION_TIMEOUT_MS);
+  });
+
   it('caps modification-scaled worker deadlines so a hung history call cannot wait all session', async () => {
     workerProxy = {
       initializeDatabase: async () => ({ isReadOnly: false })
