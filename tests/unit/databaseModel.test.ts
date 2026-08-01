@@ -9,6 +9,7 @@ import { mockVscode } from './mocks/vscode';
 import { createDeferred } from './helpers/deferred';
 import { ModificationTracker } from '../../src/core/undo-history';
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
+import { NativeWorkerProcess } from '../../src/nativeWorker';
 import type { DatabaseOperations, LabeledModification } from '../../src/core/types';
 
 const databaseModelPath = path.resolve(__dirname, '../../src/databaseModel.ts');
@@ -284,22 +285,28 @@ describe('DatabaseDocument save/saveAs fallback', () => {
     const createDocBypassingFactory = (
         dbOps: any,
         uri: any = createFileUri('/test/db.sqlite'),
-        establishConnection: (...args: any[]) => any = async () => {}
+        establishConnection: (...args: any[]) => any = async () => {},
+        options: {
+            forceReadOnly?: boolean;
+            autoCommitEnabled?: boolean;
+            outputChannel?: { appendLine(message: string): void };
+            initialReadOnly?: boolean;
+        } = {}
     ) => {
         const mockViewerProvider = {
             reporter: {},
             isVerified: true,
             context: { extensionUri: createFileUri('/ext') },
-            forceReadOnly: false,
-            outputChannel: undefined
+            forceReadOnly: options.forceReadOnly ?? false,
+            outputChannel: options.outputChannel
         };
 
         return new (DatabaseDocument as any)(
             mockViewerProvider,
             uri,
             null, // tracker
-            false, // autoCommitEnabled
-            { databaseOps: dbOps, isReadOnly: false },
+            options.autoCommitEnabled ?? false,
+            { databaseOps: dbOps, isReadOnly: options.initialReadOnly ?? false },
             { [Symbol.dispose]: () => {} }, // workerMethods
             establishConnection,
             {} // reporter
@@ -876,6 +883,48 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         assert.deepStrictEqual(contentChanges, [{ invalidateAllViewDocuments: true }]);
     });
 
+    it('preserves forced read-only, auto-commit, and SQL logging when reconnecting', async () => {
+        const originalOps = { engineKind: Promise.resolve('wasm') };
+        let freshQueryCalls = 0;
+        const freshOps = {
+            engineKind: Promise.resolve('wasm'),
+            executeQuery: async () => {
+                freshQueryCalls++;
+                return [{ headers: ['value'], rows: [[1]] }];
+            }
+        };
+        const connectionCalls: unknown[][] = [];
+        const loggedLines: string[] = [];
+        const doc = createDocBypassingFactory(
+            originalOps,
+            mockVscode.Uri.file('/test/reconnect.db'),
+            async (...args: unknown[]) => {
+                connectionCalls.push(args);
+                return { databaseOps: freshOps, isReadOnly: true };
+            },
+            {
+                forceReadOnly: true,
+                autoCommitEnabled: true,
+                outputChannel: { appendLine: message => loggedLines.push(message) }
+            }
+        );
+
+        const reloaded = await doc.reloadFromDisk();
+        const queryResult = await reloaded.executeQuery('SELECT 1');
+
+        assert.deepStrictEqual(connectionCalls, [[
+            doc.uri,
+            'reconnect.db',
+            true,
+            true
+        ]]);
+        assert.strictEqual(doc.isReadOnlyMode, true);
+        assert.deepStrictEqual(queryResult[0].rows, [[1]]);
+        assert.strictEqual(freshQueryCalls, 1);
+        assert.strictEqual(loggedLines.length, 1);
+        assert.match(loggedLines[0], /\[reconnect\.db\] SELECT 1/);
+    });
+
     it('force-reloads saved bytes and rolls history back after a revert RPC timeout', async () => {
         const { InvocationTimeoutError } = require('../../src/core/rpc');
         const replacementOps = { engineKind: Promise.resolve('wasm') };
@@ -937,22 +986,26 @@ describe('DatabaseDocument save/saveAs fallback', () => {
     });
 
     it('reconnects a native database before rolling history back after a revert RPC timeout', async () => {
-        const { InvocationTimeoutError } = require('../../src/core/rpc');
+        const reconnectStarted = createDeferred<void>();
         const reconnectMayFinish = createDeferred<void>();
         const freshNativeOps = { engineKind: Promise.resolve('native') };
         let reconnectCalls = 0;
+        const timedOutWorker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        (timedOutWorker as any).process = {
+            stdin: { write: () => true },
+            kill: () => {}
+        };
         const timedOutNativeOps = {
             engineKind: Promise.resolve('native'),
             executeQuery: async () => [],
-            discardModifications: async () => {
-                throw new InvocationTimeoutError('discardModifications');
-            }
+            discardModifications: () => timedOutWorker.call('discardModifications', [], 1)
         };
         const doc = createDocBypassingFactory(
             timedOutNativeOps,
             createFileUri('/test/native.db'),
             async () => {
                 reconnectCalls++;
+                reconnectStarted.resolve(undefined);
                 await reconnectMayFinish.promise;
                 return { databaseOps: freshNativeOps, isReadOnly: false };
             }
@@ -996,9 +1049,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
 
         try {
             const pendingRevert = doc.revert(undefined);
-            for (let attempt = 0; attempt < 20 && reconnectCalls === 0; attempt++) {
-                await Promise.resolve();
-            }
+            await reconnectStarted.promise;
 
             assert.strictEqual(reconnectCalls, 1, 'native recovery must open a fresh connection');
             await doc.backup(createUri('vscode-userdata', '/backups/native-before-reconnect.db'), undefined);
@@ -1023,6 +1074,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             );
         } finally {
             reconnectMayFinish.resolve();
+            timedOutWorker.stop();
             Object.defineProperty(mockVscode.workspace, 'fs', {
                 value: originalFs,
                 writable: true,

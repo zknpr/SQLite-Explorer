@@ -456,10 +456,14 @@ export class HostBridge implements ToastService {
       if (current.triggers.length > 0) {
         const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
         const answer = await vsc.window.showWarningMessage(
-          `Editing view "${view}" without preserving triggers will permanently drop: ${triggerNames}`,
+          vsc.l10n.t(
+            'Editing view "{0}" without preserving triggers will permanently drop: {1}',
+            view,
+            triggerNames
+          ),
           { modal: true },
-          { title: 'Edit and Drop Triggers', value: true },
-          { title: 'Cancel', value: false, isCloseAffordance: true }
+          { title: vsc.l10n.t('Edit and Drop Triggers'), value: true },
+          { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
         );
         if (!answer?.value) {
           return { cancelled: true } as const;
@@ -493,10 +497,13 @@ export class HostBridge implements ToastService {
     }
 
     const answer = await vsc.window.showWarningMessage(
-      `Drop view "${view}"? This also drops its INSTEAD OF triggers.`,
+      vsc.l10n.t(
+        'Drop view "{0}"? This also drops its INSTEAD OF triggers.',
+        view
+      ),
       { modal: true },
-      { title: 'Drop View', value: true },
-      { title: 'Cancel', value: false, isCloseAffordance: true }
+      { title: vsc.l10n.t('Drop View'), value: true },
+      { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
     );
     if (!answer?.value) {
       return { cancelled: true } as const;
@@ -773,7 +780,7 @@ export class HostBridge implements ToastService {
         readOnly: this.isReadOnly
       };
     }
-    throw new Error("Document not found in webviews");
+    throw new Error(vsc.l10n.t('Reload is unavailable for untitled databases'));
   }
 
 

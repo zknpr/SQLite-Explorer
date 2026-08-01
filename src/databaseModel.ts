@@ -23,7 +23,7 @@ import { GlobalOutputChannel } from './main';
 
 import { ModificationTracker } from './core/undo-history';
 import { reconcileRestoredDatabase, revertDatabaseToSaved } from './core/restore-reconciler';
-import { InvocationTimeoutError } from './core/rpc';
+import { isInvocationTimeoutError } from './core/rpc';
 import type { LabeledModification, DatabaseOperations } from './core/types';
 import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
 
@@ -93,6 +93,17 @@ function getMaxUndoMemory(): number {
   return config.get<number>('maxUndoMemory', DEFAULT_MAX_UNDO_MEMORY);
 }
 
+/** Apply the document's SQL logging decorator consistently across reconnects. */
+function withSqlLogging(
+  databaseOps: DatabaseOperations,
+  filename: string,
+  outputChannel: vsc.OutputChannel | null | undefined
+): DatabaseOperations {
+  return outputChannel
+    ? new LoggingDatabaseOperations(databaseOps, filename, outputChannel)
+    : databaseOps;
+}
+
 // ============================================================================
 // Document Class
 // ============================================================================
@@ -142,14 +153,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     databaseOps = result.databaseOps;
     forceReadOnly = result.isReadOnly;
 
-    // Wrap with logger if output channel is available
-    if (viewerProvider.outputChannel) {
-      databaseOps = new LoggingDatabaseOperations(
-        databaseOps,
-        filename,
-        viewerProvider.outputChannel
-      );
-    }
+    databaseOps = withSqlLogging(databaseOps, filename, viewerProvider.outputChannel);
 
     // Restore modification history from backup
     let tracker: ModificationTracker<DocumentModification> | null = null;
@@ -475,7 +479,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         cancelTokenToAbortSignal(cancellation)
       );
     } catch (error) {
-      if (!(error instanceof InvocationTimeoutError)) throw error;
+      if (!isInvocationTimeoutError(error)) throw error;
 
       // The worker may still be mutating after a host-side timeout. Queue a
       // fresh connection behind it and only reconcile history after the active
@@ -584,15 +588,23 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
   /** Replace the active engine handle with a newly opened connection to this file. */
   async #reconnectFromDisk(): Promise<DatabaseOperations> {
+    const filename = this.fileParts.filename;
     const result = await this.establishConnection(
       this.uri,
-      this.fileParts.filename
+      filename,
+      this.viewerProvider.forceReadOnly,
+      this.autoCommitEnabled
+    );
+    const databaseOps = withSqlLogging(
+      result.databaseOps,
+      filename,
+      this.viewerProvider.outputChannel
     );
     this.connectionState = {
-      databaseOps: result.databaseOps,
-      isReadOnly: result.isReadOnly
+      databaseOps,
+      isReadOnly: result.isReadOnly ?? this.viewerProvider.forceReadOnly
     };
-    return result.databaseOps;
+    return databaseOps;
   }
 
   // ============================================================================

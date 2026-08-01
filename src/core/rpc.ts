@@ -86,10 +86,21 @@ export const DEFAULT_INVOCATION_TIMEOUT_MS = 60000;
 
 /** A host-side RPC deadline expired before the remote endpoint replied. */
 export class InvocationTimeoutError extends Error {
-  constructor(readonly methodName: string) {
-    super(`Invocation timeout: ${methodName}`);
+  constructor(
+    readonly methodName: string,
+    message: string = `Invocation timeout: ${methodName}`
+  ) {
+    super(message);
     this.name = 'InvocationTimeoutError';
   }
+}
+
+export function isInvocationTimeoutError(error: unknown): error is InvocationTimeoutError {
+  if (error instanceof InvocationTimeoutError) return true;
+  if (typeof error !== 'object' || error === null) return false;
+  const markedError = error as { name?: unknown; methodName?: unknown };
+  return markedError.name === 'InvocationTimeoutError'
+    && typeof markedError.methodName === 'string';
 }
 
 /** Resolve a deadline from the method and its structured-clone-ready arguments. */

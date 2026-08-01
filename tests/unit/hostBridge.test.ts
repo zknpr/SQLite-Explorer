@@ -258,6 +258,26 @@ describe('HostBridge', () => {
         });
     });
 
+    it('reports that reload is unavailable for untitled databases', async () => {
+        const reloadFromDisk = mock.fn(async () => {});
+        const mockDocument = {
+            uri: { scheme: 'untitled' },
+            reloadFromDisk
+        };
+        const mockProvider = {
+            webviews: new Map(),
+            context: {},
+            isReadOnly: false
+        };
+        const bridge = new HostBridge(mockProvider as any, mockDocument as any);
+
+        await assert.rejects(
+            () => bridge.refreshFile(),
+            /Reload is unavailable for untitled databases/
+        );
+        assert.strictEqual(reloadFromDisk.mock.callCount(), 0);
+    });
+
     it('should catch and log error if fetch columns for undo history fails in deleteColumns', async () => {
         const consoleWarnMock = mock.method(console, 'warn', () => {});
         const error = new Error('Database disconnected during column info fetch');

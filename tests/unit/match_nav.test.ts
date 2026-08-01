@@ -388,6 +388,38 @@ describe('filter match navigation', () => {
         }
     });
 
+    it('does not synthesize a REAL match candidate for INTEGER cells', async () => {
+        const cells = new Map([
+            ['cell-0-0', { classList: createClassList(), scrollIntoView() {} }],
+            ['cell-0-1', { classList: createClassList(), scrollIntoView() {} }]
+        ]);
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return cells.get(id) ?? null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.selectedTableType = 'view';
+        state.tableColumns = [
+            { name: 'n', type: 'INTEGER' },
+            { name: 'text', type: 'TEXT' }
+        ];
+        state.gridData = [[1, '.']];
+        state.filterQuery = '.';
+        state.columnFilters = {};
+        resetMatchNav();
+
+        navigateMatches(GLOBAL_MATCH_SCOPE);
+
+        assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 1 }]);
+    });
+
     it('navigates matches in the same pinned-first order as the rendered grid', async () => {
         const focusedCells: string[] = [];
         const cells = new Map<string, any>();

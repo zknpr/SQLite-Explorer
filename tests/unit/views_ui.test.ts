@@ -553,6 +553,57 @@ describe('view modal concurrency', () => {
         }
     });
 
+    it('locks every draft control while reloading the latest definition', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { initViews, openEditViewModal } = await import(viewsModulePath);
+        const latestDefinition = createDeferred<any>();
+        const originalGet = backendApi.getViewDefinition;
+        let getCalls = 0;
+        backendApi.getViewDefinition = async () => {
+            if (getCalls++ === 0) {
+                return {
+                    sql: 'CREATE VIEW shared_view AS SELECT 1 AS value',
+                    selectSql: 'SELECT 1 AS value',
+                    triggers: []
+                };
+            }
+            return latestDefinition.promise;
+        };
+
+        try {
+            initViews();
+            await openEditViewModal('shared_view');
+
+            const reload = listener('btnReloadViewDefinition', 'click')();
+            await Promise.resolve();
+
+            assert.strictEqual(elements.viewNameInput.disabled, true);
+            assert.strictEqual(elements.viewSelectSql.disabled, true);
+            assert.strictEqual(elements.viewPreserveTriggers.disabled, true);
+            assert.strictEqual(elements.btnSaveView.disabled, true);
+            assert.strictEqual(elements.btnReloadViewDefinition.disabled, true);
+
+            latestDefinition.resolve({
+                sql: 'CREATE VIEW shared_view AS SELECT 2 AS value',
+                selectSql: 'SELECT 2 AS value',
+                triggers: []
+            });
+            await reload;
+
+            assert.strictEqual(elements.viewNameInput.disabled, true);
+            assert.strictEqual(elements.viewSelectSql.disabled, false);
+            assert.strictEqual(elements.viewPreserveTriggers.disabled, false);
+            assert.strictEqual(elements.btnSaveView.disabled, false);
+            assert.strictEqual(elements.btnReloadViewDefinition.disabled, false);
+            assert.strictEqual(elements.viewSelectSql.value, 'SELECT 2 AS value');
+        } finally {
+            backendApi.getViewDefinition = originalGet;
+        }
+    });
+
     it('shows the friendly reload conflict when the engine-side snapshot check wins a race', async () => {
         const { elements, listener } = installViewDocument();
         const apiModulePath = '../../core/ui/modules/api.js';

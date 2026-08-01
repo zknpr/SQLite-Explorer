@@ -163,9 +163,12 @@ export function openCreateViewModal() {
     elements.sql.disabled = false;
     elements.triggerOptions.hidden = true;
     elements.preserveTriggers.checked = true;
+    elements.preserveTriggers.disabled = false;
     elements.openInVsCode.hidden = true;
     hideReloadDefinitionOffer();
     elements.save.textContent = 'Create View';
+    elements.save.disabled = false;
+    elements.reloadLatest.disabled = false;
     setFeedback('');
     clearPreview();
     openModal('viewModal');
@@ -187,9 +190,12 @@ export async function openEditViewModal(view) {
         elements.name.disabled = true;
         applyViewDefinitionToEditor(definition);
         elements.sql.disabled = false;
+        elements.preserveTriggers.disabled = false;
         elements.save.textContent = 'Save View';
+        elements.save.disabled = false;
         elements.openInVsCode.hidden = !document.getElementById('vscode-env');
         hideReloadDefinitionOffer();
+        elements.reloadLatest.disabled = false;
 
         setFeedback('');
         clearPreview();
@@ -361,8 +367,14 @@ async function reloadLatestViewDefinition() {
     const targetView = editingViewName;
     if (!targetView || !isCurrentModalSession(modalSession)) return;
 
-    const reloadLatest = getElements().reloadLatest;
-    if (reloadLatest) reloadLatest.disabled = true;
+    const elements = getElements();
+    const draftControls = [elements.name, elements.sql, elements.preserveTriggers, elements.save];
+    const disabledStates = draftControls.map(element => element?.disabled);
+    const reloadDisabled = elements.reloadLatest?.disabled;
+    for (const element of draftControls) {
+        if (element) element.disabled = true;
+    }
+    if (elements.reloadLatest) elements.reloadLatest.disabled = true;
     try {
         setFeedback('Loading the latest view definition...');
         const definition = await backendApi.getViewDefinition(targetView);
@@ -377,7 +389,12 @@ async function reloadLatestViewDefinition() {
             setFeedback(err.message, true);
         }
     } finally {
-        if (reloadLatest) reloadLatest.disabled = false;
+        if (isCurrentModalSession(modalSession) && editingViewName === targetView) {
+            draftControls.forEach((element, index) => {
+                if (element) element.disabled = disabledStates[index];
+            });
+            if (elements.reloadLatest) elements.reloadLatest.disabled = reloadDisabled;
+        }
     }
 }
 

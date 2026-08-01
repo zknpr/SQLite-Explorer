@@ -1021,17 +1021,29 @@ describe('view operations', () => {
         const editView = mock.fn(async () => ({ before, after: { ...before, triggers: [] } }));
         const getViewDefinition = mock.fn(async () => before);
         const { bridge, recordExternalModification } = createHostBridge({ editView, getViewDefinition });
-        const warning = mock.method(vscode.window, 'showWarningMessage', async () => ({
-            title: 'Cancel',
-            value: false,
-            isCloseAffordance: true
-        }));
+        mock.method(vscode.l10n, 't', (message: string, ...args: unknown[]) => {
+            let localized = message;
+            args.forEach((arg, index) => {
+                localized = localized.replace(`{${index}}`, String(arg));
+            });
+            return `localized:${localized}`;
+        });
+        const warning = mock.method(
+            vscode.window,
+            'showWarningMessage',
+            async (...args: any[]) => args[3]
+        );
 
         const result = await bridge.editView('active_users', 'SELECT id, name FROM users', false);
 
         assert.deepStrictEqual(result, { cancelled: true });
         assert.strictEqual(warning.mock.callCount(), 1);
-        assert.match(String(warning.mock.calls[0].arguments[0]), /active_users_insert/);
+        assert.deepStrictEqual(warning.mock.calls[0].arguments, [
+            'localized:Editing view "active_users" without preserving triggers will permanently drop: active_users_insert',
+            { modal: true },
+            { title: 'localized:Edit and Drop Triggers', value: true },
+            { title: 'localized:Cancel', value: false, isCloseAffordance: true }
+        ]);
         assert.strictEqual(editView.mock.callCount(), 0);
         assert.strictEqual(recordExternalModification.mock.callCount(), 0);
     });
@@ -1095,15 +1107,29 @@ describe('view operations', () => {
         const before = createViewDefinition();
         const dropView = mock.fn(async () => before);
         const { bridge, recordExternalModification } = createHostBridge({ dropView });
-        const warning = mock.method(vscode.window, 'showWarningMessage', async () => ({
-            title: 'Drop View',
-            value: true
-        }));
+        mock.method(vscode.l10n, 't', (message: string, ...args: unknown[]) => {
+            let localized = message;
+            args.forEach((arg, index) => {
+                localized = localized.replace(`{${index}}`, String(arg));
+            });
+            return `localized:${localized}`;
+        });
+        const warning = mock.method(
+            vscode.window,
+            'showWarningMessage',
+            async (...args: any[]) => args[2]
+        );
 
         const result = await bridge.dropView('active_users');
 
         assert.strictEqual(result, undefined);
         assert.strictEqual(warning.mock.callCount(), 1);
+        assert.deepStrictEqual(warning.mock.calls[0].arguments, [
+            'localized:Drop view "active_users"? This also drops its INSTEAD OF triggers.',
+            { modal: true },
+            { title: 'localized:Drop View', value: true },
+            { title: 'localized:Cancel', value: false, isCloseAffordance: true }
+        ]);
         assert.strictEqual(dropView.mock.callCount(), 1);
         assert.deepStrictEqual(recordExternalModification.mock.calls[0].arguments[0], {
             label: 'Drop View',

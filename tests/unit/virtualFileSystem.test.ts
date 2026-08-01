@@ -1021,6 +1021,16 @@ describe('SQLiteFileSystemProvider', () => {
             assert.strictEqual(s.permissions, undefined);
         });
 
+        it('stat marks a normal cell document read-only with its database', async () => {
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/col.txt`);
+            const document = setupMockDocument(docKey, {});
+            (document as any).isReadOnlyMode = true;
+
+            const s = await provider.stat(uri);
+
+            assert.strictEqual(s.permissions, vscode.FilePermission.Readonly);
+        });
+
         it('stat should return generic file stat with Readonly for __create__.sql', async () => {
             const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/__create__.sql/create.sql`);
             setupMockDocument(docKey, {});

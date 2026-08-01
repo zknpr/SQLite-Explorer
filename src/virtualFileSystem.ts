@@ -100,7 +100,9 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             ctime: now,
             mtime: now,
             size: 0,
-            permissions: rowId === '__create__.sql' ? vsc.FilePermission.Readonly : undefined
+            permissions: rowId === '__create__.sql' || document.isReadOnlyMode
+                ? vsc.FilePermission.Readonly
+                : undefined
         };
     }
 

@@ -44,6 +44,7 @@ import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 import { computeJsonPatchUndo } from './core/json-utils';
 import { serializeOperations } from './core/operation-serializer';
+import { InvocationTimeoutError } from './core/rpc';
 import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionIntent,
@@ -297,9 +298,12 @@ export class NativeWorkerProcess {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(id);
-        reject(method === 'queryBounded'
-          ? new Error(`Query execution timed out after ${timeoutMs}ms`)
-          : new Error(`Request ${method} timed out`));
+        reject(new InvocationTimeoutError(
+          method,
+          method === 'queryBounded'
+            ? `Query execution timed out after ${timeoutMs}ms`
+            : `Request ${method} timed out`
+        ));
       }, timeoutMs);
 
       this.pendingRequests.set(id, {

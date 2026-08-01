@@ -94,6 +94,18 @@ function sqliteNumericTextCandidates(value) {
     return [...candidates];
 }
 
+function hasRealStorageSemantics(value, col) {
+    const declaredType = String(col?.type ?? '');
+    const hasRealAffinity = /REAL|FLOA|DOUB/i.test(declaredType);
+    const outsideSqliteIntegerRange = value < -9223372036854775808
+        || value > 9223372036854775807;
+
+    // RPC numbers do not carry SQLite's storage class. A fractional or out-of-
+    // range value must be REAL; for ambiguous integer-valued Numbers, only REAL
+    // affinity is enough evidence to add SQLite's decimal-form candidate.
+    return hasRealAffinity || !Number.isInteger(value) || outsideSqliteIntegerRange;
+}
+
 function getMatchingTextCandidate(value, col, term) {
     const rawText = value === null || value === undefined || value instanceof Uint8Array
         ? ''
@@ -106,7 +118,7 @@ function getMatchingTextCandidate(value, col, term) {
         false
     ));
     const candidates = [rawText, formattedText];
-    if (typeof value === 'number') {
+    if (typeof value === 'number' && hasRealStorageSemantics(value, col)) {
         candidates.push(...sqliteNumericTextCandidates(value));
     }
     return candidates.find(candidate => foldAsciiCase(candidate).includes(term)) ?? null;

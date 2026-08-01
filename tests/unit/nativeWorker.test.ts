@@ -7,6 +7,7 @@ import * as v8 from 'node:v8';
 import { EventEmitter } from 'node:events';
 import * as vscode from 'vscode';
 import { isNativeAvailable, NativeWorkerProcess } from '../../src/nativeWorker';
+import { InvocationTimeoutError } from '../../src/core/rpc';
 import type { DatabaseOperations } from '../../src/core/types';
 import { createDeferred } from './helpers/deferred';
 
@@ -1409,6 +1410,28 @@ describe('NativeWorkerProcess', () => {
         (worker as any).handleData(payload);
 
         assert.strictEqual(errorLogged, true, 'Should log error on bad deserialization');
+    });
+
+    it('marks native request deadlines as invocation timeouts for recovery', async () => {
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        (worker as any).process = {
+            stdin: { write: () => true },
+            kill: () => {}
+        };
+
+        try {
+            await assert.rejects(
+                worker.call('run', [], 1),
+                (error: unknown) => {
+                    assert.ok(error instanceof InvocationTimeoutError);
+                    assert.strictEqual(error.methodName, 'run');
+                    assert.strictEqual(error.message, 'Request run timed out');
+                    return true;
+                }
+            );
+        } finally {
+            worker.stop();
+        }
     });
 });
 

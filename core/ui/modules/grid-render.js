@@ -1,5 +1,5 @@
 import { state } from './state.js';
-import { escapeHtml, formatCellValueAsText, appendHighlightedText, buildHighlightMatcher } from './utils.js';
+import { formatCellValueAsText, appendHighlightedText, buildHighlightMatcher } from './utils.js';
 import { formatCellValueForActiveMatch } from './match-nav.js';
 import {
     getRowId,
@@ -38,7 +38,13 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
         background: 'var(--bg-secondary)'
     });
     rowNumTh.title = 'Click to select all rows';
-    rowNumTh.innerHTML = '<div class="header-content"><div class="header-top header-top-center">#</div></div>';
+    const rowHeaderContent = document.createElement('div');
+    rowHeaderContent.className = 'header-content';
+    const rowHeaderTop = document.createElement('div');
+    rowHeaderTop.className = 'header-top header-top-center';
+    rowHeaderTop.textContent = '#';
+    rowHeaderContent.appendChild(rowHeaderTop);
+    rowNumTh.appendChild(rowHeaderContent);
     headerTr.appendChild(rowNumTh);
 
     for (const col of orderedColumns) {
@@ -62,33 +68,80 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
         }
         th.dataset.column = col.name;
 
-        const safeColName = escapeHtml(col.name);
-        const safeFilterValue = escapeHtml(filterValue);
-        const sortIndicator = isSorted ? `<span class="sort-indicator">${state.sortAscending ? '▲' : '▼'}</span>` : '';
-        const keyIcon = col.isPrimaryKey ? '<span class="key-icon codicon codicon-key" title="Primary Key"></span>' : '';
         const pinClass = isPinned ? 'pinned' : '';
         const pinTitle = isPinned ? 'Unpin column' : 'Pin column';
         const matchCounterText = state.matchNav.scope === col.name && state.matchNav.matches.length > 0
             ? `${state.matchNav.currentIndex + 1}/${state.matchNav.matches.length}`
             : '';
 
-        th.innerHTML = `
-            <div class="header-content">
-                <div class="header-top">
-                    ${keyIcon}<span class="header-text">${safeColName}</span>${sortIndicator}
-                    <span class="select-column-icon codicon codicon-selection" title="Select entire column"></span>
-                    <span class="pin-icon codicon codicon-pin ${pinClass}" title="${pinTitle}"></span>
-                </div>
-                <div class="header-bottom">
-                    <div class="column-filter-wrap">
-                        <input type="text" class="column-filter" data-column="${safeColName}" value="${safeFilterValue}" placeholder="Filter...">
-                        <span class="column-filter-counter" data-column="${safeColName}">${matchCounterText}</span>
-                    </div>
-                    <button class="filter-apply-btn" title="Apply filter — Enter: next match, Shift+Enter: previous"><span class="codicon codicon-search"></span></button>
-                </div>
-            </div>
-            <div class="resize-handle"></div>
-        `;
+        const headerContent = document.createElement('div');
+        headerContent.className = 'header-content';
+        const headerTop = document.createElement('div');
+        headerTop.className = 'header-top';
+
+        if (col.isPrimaryKey) {
+            const keyIcon = document.createElement('span');
+            keyIcon.className = 'key-icon codicon codicon-key';
+            keyIcon.title = 'Primary Key';
+            headerTop.appendChild(keyIcon);
+        }
+
+        const headerText = document.createElement('span');
+        headerText.className = 'header-text';
+        headerText.textContent = col.name;
+        headerTop.appendChild(headerText);
+
+        if (isSorted) {
+            const sortIndicator = document.createElement('span');
+            sortIndicator.className = 'sort-indicator';
+            sortIndicator.textContent = state.sortAscending ? '▲' : '▼';
+            headerTop.appendChild(sortIndicator);
+        }
+
+        const selectColumnIcon = document.createElement('span');
+        selectColumnIcon.className = 'select-column-icon codicon codicon-selection';
+        selectColumnIcon.title = 'Select entire column';
+        headerTop.appendChild(selectColumnIcon);
+
+        const pinIcon = document.createElement('span');
+        pinIcon.className = `pin-icon codicon codicon-pin ${pinClass}`;
+        pinIcon.title = pinTitle;
+        headerTop.appendChild(pinIcon);
+        headerContent.appendChild(headerTop);
+
+        const headerBottom = document.createElement('div');
+        headerBottom.className = 'header-bottom';
+        const filterWrap = document.createElement('div');
+        filterWrap.className = 'column-filter-wrap';
+        const filterInput = document.createElement('input');
+        filterInput.type = 'text';
+        filterInput.className = 'column-filter';
+        filterInput.dataset.column = col.name;
+        filterInput.value = filterValue;
+        filterInput.placeholder = 'Filter...';
+        filterWrap.appendChild(filterInput);
+
+        const matchCounter = document.createElement('span');
+        matchCounter.className = 'column-filter-counter';
+        matchCounter.dataset.column = col.name;
+        matchCounter.textContent = matchCounterText;
+        filterWrap.appendChild(matchCounter);
+        headerBottom.appendChild(filterWrap);
+
+        const applyFilterButton = document.createElement('button');
+        applyFilterButton.type = 'button';
+        applyFilterButton.className = 'filter-apply-btn';
+        applyFilterButton.title = 'Apply filter — Enter: next match, Shift+Enter: previous';
+        const searchIcon = document.createElement('span');
+        searchIcon.className = 'codicon codicon-search';
+        applyFilterButton.appendChild(searchIcon);
+        headerBottom.appendChild(applyFilterButton);
+        headerContent.appendChild(headerBottom);
+        th.appendChild(headerContent);
+
+        const resizeHandle = document.createElement('div');
+        resizeHandle.className = 'resize-handle';
+        th.appendChild(resizeHandle);
         headerTr.appendChild(th);
     }
     thead.appendChild(headerTr);
