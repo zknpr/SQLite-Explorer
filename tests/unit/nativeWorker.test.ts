@@ -963,6 +963,79 @@ describe('createNativeDatabaseConnection', () => {
                 '2.50000000000001',
                 'single-evaluation native sidecars must override companion reads'
             );
+
+            const snapshotSavepointIndex = connection.calls.findIndex(call => (
+                call.method === 'run'
+                && /^SAVEPOINT "sp_numeric_snapshot_/.test(String(call.args[0]))
+            ));
+            const mainReadIndex = connection.calls.findIndex(call => call.method === 'queryNumeric');
+            const companionReadIndices = connection.calls
+                .map((call, index) => ({ call, index }))
+                .filter(({ call }) => (
+                    call.method === 'query'
+                    && String(call.args[0]).includes('__sqlite_explorer_numeric_rowid')
+                ))
+                .map(({ index }) => index);
+            const snapshotReleaseIndex = connection.calls.findIndex(call => (
+                call.method === 'run'
+                && /^RELEASE "sp_numeric_snapshot_/.test(String(call.args[0]))
+            ));
+
+            assert.ok(snapshotSavepointIndex >= 0, 'wide native reads must open a snapshot savepoint');
+            assert.ok(mainReadIndex > snapshotSavepointIndex);
+            assert.ok(companionReadIndices.length > 0);
+            assert.ok(companionReadIndices.every(index => index > mainReadIndex));
+            assert.ok(snapshotReleaseIndex > companionReadIndices.at(-1)!);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rolls back and releases the native numeric snapshot when a companion read fails', async () => {
+        const columns = ['rowid', ...Array.from({ length: 1000 }, (_, index) => `c${index}`)];
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryNumeric') {
+                return {
+                    result: {
+                        columns,
+                        values: [[1, 1.25, ...Array.from({ length: 999 }, () => 0)]]
+                    }
+                };
+            }
+            if (
+                call.method === 'query'
+                && String(call.args[0]).includes('pragma_table_list')
+            ) {
+                return { result: { columns: ['1'], values: [[1]] } };
+            }
+            if (
+                call.method === 'query'
+                && String(call.args[0]).includes('__sqlite_explorer_numeric_rowid')
+            ) {
+                throw new Error('companion read failed');
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            await assert.rejects(
+                connection.databaseOps.fetchTableData('wide_numeric_rows', {
+                    columns,
+                    limit: 1,
+                    offset: 0
+                }),
+                /companion read failed/
+            );
+
+            const snapshotSql = connection.calls
+                .filter(call => (
+                    call.method === 'run'
+                    && String(call.args[0]).includes('sp_numeric_snapshot_')
+                ))
+                .map(call => String(call.args[0]));
+            assert.match(snapshotSql[0], /^SAVEPOINT "sp_numeric_snapshot_/);
+            assert.match(snapshotSql[1], /^ROLLBACK TO "sp_numeric_snapshot_/);
+            assert.match(snapshotSql[2], /^RELEASE "sp_numeric_snapshot_/);
         } finally {
             connection.dispose();
         }

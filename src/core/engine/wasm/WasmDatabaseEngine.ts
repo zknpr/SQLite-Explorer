@@ -1502,6 +1502,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
         const companionResults = [];
         let canUseRowIdCompanions = false;
+        // This engine owns a private in-memory copy, so no external process can
+        // commit between the source read and its rowid companion reads.
         if (
           transportQuery.valueColumnCount === undefined
           && headers[0]?.toLowerCase() === 'rowid'

@@ -147,6 +147,57 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             ]);
             assert.deepStrictEqual(guard.values, [['boundary_guard']]);
         });
+
+        await testContext.test('keeps native value and companion reads on one WAL snapshot', async () => {
+            await activeRawWorker.call('query', ['PRAGMA journal_mode = WAL']);
+            await activeRawWorker.call('run', [
+                'CREATE TABLE native_numeric_snapshot (value REAL)'
+            ]);
+            await activeRawWorker.call('run', [
+                'INSERT INTO native_numeric_snapshot(value) VALUES (1.25)'
+            ]);
+
+            const externalWriter = new NativeWorkerProcess(binary, workerScript);
+            await externalWriter.start();
+            try {
+                await externalWriter.call('open', [databasePath, false]);
+                await activeRawWorker.call('run', ['SAVEPOINT native_numeric_snapshot_read']);
+                try {
+                    const source = await activeRawWorker.call<{ values: unknown[][] }>(
+                        'queryNumeric',
+                        [
+                            'SELECT rowid, value FROM native_numeric_snapshot',
+                            [],
+                            ['rowid', 'value'],
+                            undefined
+                        ]
+                    );
+                    await externalWriter.call('run', [
+                        'UPDATE native_numeric_snapshot SET value = 2.5 WHERE rowid = 1'
+                    ]);
+                    const companion = await activeRawWorker.call<{ values: unknown[][] }>('query', [
+                        'SELECT rowid, CAST(value AS TEXT) FROM native_numeric_snapshot WHERE rowid = 1'
+                    ]);
+
+                    assert.strictEqual(source.values[0][1], 1.25);
+                    assert.strictEqual(companion.values[0][1], '1.25');
+                    await activeRawWorker.call('run', ['RELEASE native_numeric_snapshot_read']);
+                } catch (error) {
+                    await activeRawWorker.call('run', [
+                        'ROLLBACK TO native_numeric_snapshot_read'
+                    ]);
+                    await activeRawWorker.call('run', ['RELEASE native_numeric_snapshot_read']);
+                    throw error;
+                }
+
+                const latest = await activeRawWorker.call<{ values: unknown[][] }>('query', [
+                    'SELECT value FROM native_numeric_snapshot'
+                ]);
+                assert.strictEqual(latest.values[0][0], 2.5);
+            } finally {
+                externalWriter.stop();
+            }
+        });
         activeRawWorker.stop();
         rawWorker = undefined;
 

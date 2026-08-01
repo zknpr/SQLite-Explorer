@@ -558,6 +558,8 @@ async function fetchTableData(table, options = {}) {
   const sourceRows = results[0].values;
   const companionResults = [];
   let canUseRowIdCompanions = false;
+  // The demo owns a private in-memory database, so no external process can
+  // commit between the source read and its rowid companion reads.
   if (
     transportQuery.valueColumnCount === undefined
     && headers[0]?.toLowerCase() === 'rowid'

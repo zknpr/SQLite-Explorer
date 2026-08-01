@@ -1426,60 +1426,80 @@ export async function createNativeDatabaseConnection(
           const queryOptions = { ...options, columns };
           const { sql, params } = buildSelectQuery(table, queryOptions);
           const transportQuery = buildExactNumericTextQuery(sql, columns.length);
-          const result = await worker.call<NativeQueryResult>('queryNumeric', [
-            transportQuery.sql,
-            params,
-            transportQuery.transportColumns,
-            transportQuery.valueColumnCount
-          ]);
-
-          const companionResults = [];
-          let canUseRowIdCompanions = false;
-          if (
+          const needsRowIdCompanionSnapshot = (
             transportQuery.valueColumnCount === undefined
             && columns[0]?.toLowerCase() === 'rowid'
-            && result.values.length > 0
-          ) {
-            const authority = await worker.call<NativeQueryResult>('query', [
-              ROWID_TABLE_AUTHORITY_SQL,
-              [table]
+          );
+          const snapshotName = needsRowIdCompanionSnapshot
+            ? createSavepointName('sp_numeric_snapshot')
+            : undefined;
+          if (snapshotName) {
+            // Unlike the private WASM databases, the native file can receive a
+            // WAL commit from another process between RPCs. The first read below
+            // fixes one SQLite snapshot for both values and companion text.
+            await worker.call('run', [`SAVEPOINT ${snapshotName}`]);
+          }
+
+          try {
+            const result = await worker.call<NativeQueryResult>('queryNumeric', [
+              transportQuery.sql,
+              params,
+              transportQuery.transportColumns,
+              transportQuery.valueColumnCount
             ]);
-            canUseRowIdCompanions = authority.values.length > 0;
-          }
-          if (canUseRowIdCompanions) {
-            for (const query of buildRowIdExactRealTextQueries(
-              table,
-              columns,
-              result.values.map(row => row[0])
-            )) {
-              const companion = await worker.call<NativeQueryResult>('query', [
-                query.sql,
-                query.params
+
+            const companionResults = [];
+            let canUseRowIdCompanions = false;
+            if (needsRowIdCompanionSnapshot && result.values.length > 0) {
+              const authority = await worker.call<NativeQueryResult>('query', [
+                ROWID_TABLE_AUTHORITY_SQL,
+                [table]
               ]);
-              companionResults.push({ query, rows: companion.values });
+              canUseRowIdCompanions = authority.values.length > 0;
             }
+            if (canUseRowIdCompanions) {
+              for (const query of buildRowIdExactRealTextQueries(
+                table,
+                columns,
+                result.values.map(row => row[0])
+              )) {
+                const companion = await worker.call<NativeQueryResult>('query', [
+                  query.sql,
+                  query.params
+                ]);
+                companionResults.push({ query, rows: companion.values });
+              }
+            }
+            const companionExactTexts = collectRowIdExactRealTexts(
+              result.values,
+              companionResults
+            );
+
+            // txiki preserves SQLite int64 values as BigInt. The generated
+            // companion columns also retain authoritative REAL text before V8
+            // normalizes the storage class into a JavaScript Number.
+            const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+              result.values,
+              undefined,
+              mergeExactIntegerTextMaps(companionExactTexts, result.exactIntegerTexts)
+            );
+
+            if (snapshotName) {
+              await worker.call('run', [`RELEASE ${snapshotName}`]);
+            }
+            return {
+              headers: columns,
+              rows: rows,
+              columns,
+              values: rows,
+              exactIntegerTexts
+            };
+          } catch (err) {
+            if (snapshotName) {
+              await safeRollbackSavepoint(snapshotName, 'fetchTableData numeric snapshot');
+            }
+            throw err;
           }
-          const companionExactTexts = collectRowIdExactRealTexts(
-            result.values,
-            companionResults
-          );
-
-          // txiki preserves SQLite int64 values as BigInt. The generated
-          // companion columns also retain authoritative REAL text before V8
-          // normalizes the storage class into a JavaScript Number.
-          const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
-            result.values,
-            undefined,
-            mergeExactIntegerTextMaps(companionExactTexts, result.exactIntegerTexts)
-          );
-
-          return {
-            headers: columns,
-            rows: rows,
-            columns,
-            values: rows,
-            exactIntegerTexts
-          };
         },
 
         /**
