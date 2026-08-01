@@ -20,6 +20,12 @@ function hasActiveTextEditor(eventTarget = null) {
         || eventTarget?.isContentEditable === true;
 }
 
+function hasOpenModal() {
+    return !!document.querySelector(
+        '.modal-overlay:not(.hidden), .cell-preview-modal:not(.hidden)'
+    );
+}
+
 function isGridNavigationContext(target) {
     const tagName = target?.tagName;
     if (tagName === 'BUTTON' || tagName === 'SELECT' || tagName === 'A') return false;
@@ -34,8 +40,9 @@ function isGridNavigationContext(target) {
 export function setupGlobalShortcuts() {
     document.addEventListener('keydown', async event => {
         const shortcutKey = typeof event.key === 'string' ? event.key.toLowerCase() : '';
+        const modalOpen = hasOpenModal();
         if (event.key === 'Escape') {
-            if (!state.editingCellInfo && !document.querySelector('.modal-overlay:not(.hidden)')) {
+            if (!state.editingCellInfo && !modalOpen) {
                 const dismissMatchNavigation = !!event.target?.closest?.(
                     '#gridContainer, .filter-group'
                 ) || isGridNavigationContext(event.target);
@@ -53,7 +60,7 @@ export function setupGlobalShortcuts() {
             && !event.metaKey
             && !event.ctrlKey
             && !event.altKey
-            && !document.querySelector('.modal-overlay:not(.hidden)')
+            && !modalOpen
             && !hasActiveTextEditor(event.target)
             && isGridNavigationContext(event.target)) {
             const pending = applyCurrentFilter(event.shiftKey ? -1 : 1);
@@ -64,7 +71,7 @@ export function setupGlobalShortcuts() {
         }
 
         if ((event.metaKey || event.ctrlKey) && shortcutKey === 'c') {
-            if (hasActiveTextEditor(event.target)) return;
+            if (modalOpen || hasActiveTextEditor(event.target)) return;
 
             if (state.selectedCells.length > 0) {
                 event.preventDefault();
@@ -78,7 +85,7 @@ export function setupGlobalShortcuts() {
         if ((event.metaKey || event.ctrlKey) && shortcutKey === 'a') {
             // Selecting all during a reload would capture row ids from the stale,
             // about-to-be-replaced result set.
-            if (state.isGridReloading || hasActiveTextEditor(event.target)) return;
+            if (modalOpen || state.isGridReloading || hasActiveTextEditor(event.target)) return;
 
             if (state.selectedTable) {
                 event.preventDefault();
@@ -89,7 +96,7 @@ export function setupGlobalShortcuts() {
         if ((event.metaKey || event.ctrlKey) &&
             (event.key === 'Delete' || event.key === 'Backspace')) {
             // Deleting during a reload would act on stale row/column/cell state.
-            if (state.isGridReloading || hasActiveTextEditor(event.target)) return;
+            if (modalOpen || state.isGridReloading || hasActiveTextEditor(event.target)) return;
 
             if (state.selectedTable && state.selectedTableType === 'table') {
                 event.preventDefault();

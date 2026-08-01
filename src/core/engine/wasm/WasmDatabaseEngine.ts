@@ -39,6 +39,7 @@ import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionStateCurrent,
   assertViewDefinitionIntent,
+  assertViewTriggersCompatibleWithColumns,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
@@ -1228,6 +1229,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       this.runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
       if (preserveTriggers) {
+        const columnResult = await this.executeQuery(
+          `PRAGMA main.table_info(${escapeIdentifier(view)})`
+        );
+        const columns = (columnResult[0]?.rows ?? []).map(row => {
+          if (typeof row[1] !== 'string') {
+            throw new Error(`SQLite returned invalid column metadata for view ${view}`);
+          }
+          return row[1];
+        });
+        assertViewTriggersCompatibleWithColumns(before.triggers, columns);
         for (const trigger of before.triggers) {
           this.runSingleStatement(buildCreateViewTriggerSql(trigger));
         }

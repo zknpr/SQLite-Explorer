@@ -1071,6 +1071,72 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('rejects a preserved demo trigger that references a removed view column', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_trigger_column_source (a TEXT, b TEXT); " +
+            "INSERT INTO demo_trigger_column_source VALUES ('old-a', 'old-b'); " +
+            'CREATE TABLE demo_trigger_column_log (value TEXT); ' +
+            'CREATE VIEW demo_trigger_column_view AS SELECT a FROM demo_trigger_column_source; ' +
+            'CREATE TRIGGER demo_trigger_column_update ' +
+            'INSTEAD OF UPDATE ON demo_trigger_column_view ' +
+            "BEGIN INSERT INTO demo_trigger_column_log VALUES (NEW.\"a\" || ':' || OLD.[a]); END"
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'demo_trigger_column_view',
+                'SELECT b FROM demo_trigger_column_source',
+                true
+            ),
+            /demo_trigger_column_update.*missing view column.*\ba\b/i
+        );
+
+        const definition = await worker.invoke('getViewDefinition', 'demo_trigger_column_view');
+        assert.strictEqual(definition.selectSql, 'SELECT a FROM demo_trigger_column_source');
+        await worker.invoke(
+            'runQuery',
+            "UPDATE demo_trigger_column_view SET a = 'new-a'"
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_trigger_column_log'),
+            'new-a:old-a'
+        );
+    });
+
+    it('preserves a demo trigger whose quoted references match the renamed column', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_matching_trigger_source (a TEXT, b TEXT); " +
+            "INSERT INTO demo_matching_trigger_source VALUES ('old-a', 'old-b'); " +
+            'CREATE TABLE demo_matching_trigger_log (value TEXT); ' +
+            'CREATE VIEW demo_matching_trigger_view AS SELECT a FROM demo_matching_trigger_source; ' +
+            'CREATE TRIGGER demo_matching_trigger_update ' +
+            'INSTEAD OF UPDATE ON demo_matching_trigger_view ' +
+            'BEGIN INSERT INTO demo_matching_trigger_log VALUES (' +
+            "NEW.[b] || ':' || OLD.\"b\" || ':NEW.a' /* OLD.a */); END"
+        );
+
+        await worker.invoke(
+            'editView',
+            'demo_matching_trigger_view',
+            'SELECT b FROM demo_matching_trigger_source',
+            true
+        );
+        await worker.invoke(
+            'runQuery',
+            "UPDATE demo_matching_trigger_view SET b = 'new-b'"
+        );
+
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_matching_trigger_log'),
+            'new-b:old-b:NEW.a'
+        );
+    });
+
     it('preserves a TEMP trigger when editing a main-schema view', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke('runQuery', 'CREATE TABLE demo_temp_trigger_rows (value INTEGER)');

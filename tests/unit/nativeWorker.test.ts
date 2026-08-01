@@ -1326,6 +1326,17 @@ FROM orders o`;
                     return { result: { columns: [], values: [] } };
                 }
             }
+            if (call.method === 'query') {
+                const [sql] = call.args as [string];
+                if (sql.startsWith('PRAGMA main.table_info')) {
+                    return {
+                        result: {
+                            columns: ['cid', 'name'],
+                            values: [[0, 'user id'], [1, 'display name']]
+                        }
+                    };
+                }
+            }
 
             if (call.method === 'run' || call.method === 'runSingle') {
                 const sql = String(call.method === 'run' ? call.args[0] : call.args[1]);

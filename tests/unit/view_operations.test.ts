@@ -4,6 +4,7 @@ import { afterEach, describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import * as vscode from 'vscode';
 
+import { buildExactNumericTextQuery } from '../../src/core/integer-utils';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import type { DatabaseOperations, ViewDefinition } from '../../src/core/types';
 import { normalizeViewSelectSql } from '../../src/core/view-utils';
@@ -378,6 +379,76 @@ describe('view operations', () => {
                 engine,
                 "SELECT value FROM qualified_trigger_log WHERE target = 'temp'"
             ), 17);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('rejects a preserved trigger whose NEW or OLD column is absent from the edited view', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                "CREATE TABLE trigger_column_source (a TEXT, b TEXT); " +
+                "INSERT INTO trigger_column_source VALUES ('old-a', 'old-b'); " +
+                'CREATE TABLE trigger_column_log (value TEXT); ' +
+                'CREATE VIEW trigger_column_view AS SELECT a FROM trigger_column_source; ' +
+                'CREATE TRIGGER trigger_column_update INSTEAD OF UPDATE ON trigger_column_view ' +
+                "BEGIN INSERT INTO trigger_column_log VALUES (NEW.\"a\" || ':' || OLD.[a]); END"
+            );
+
+            await assert.rejects(
+                () => engine.editView(
+                    'trigger_column_view',
+                    'SELECT b FROM trigger_column_source',
+                    true
+                ),
+                error => {
+                    const message = error instanceof Error ? error.message : String(error);
+                    assert.match(message, /trigger_column_update/i);
+                    assert.match(message, /missing view column/i);
+                    assert.match(message, /\ba\b/i);
+                    return true;
+                }
+            );
+
+            assert.strictEqual(
+                (await engine.getViewDefinition('trigger_column_view')).selectSql,
+                'SELECT a FROM trigger_column_source'
+            );
+            await engine.executeQuery("UPDATE trigger_column_view SET a = 'new-a'");
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM trigger_column_log'),
+                'new-a:old-a'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('preserves a trigger when quoted NEW and OLD references match the renamed column', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                "CREATE TABLE matching_trigger_source (a TEXT, b TEXT); " +
+                "INSERT INTO matching_trigger_source VALUES ('old-a', 'old-b'); " +
+                'CREATE TABLE matching_trigger_log (value TEXT); ' +
+                'CREATE VIEW matching_trigger_view AS SELECT a FROM matching_trigger_source; ' +
+                'CREATE TRIGGER matching_trigger_update INSTEAD OF UPDATE ON matching_trigger_view ' +
+                'BEGIN INSERT INTO matching_trigger_log VALUES (' +
+                "NEW.[b] || ':' || OLD.\"b\" || ':NEW.a' /* OLD.a */); END"
+            );
+
+            await engine.editView(
+                'matching_trigger_view',
+                'SELECT b FROM matching_trigger_source',
+                true
+            );
+            await engine.executeQuery("UPDATE matching_trigger_view SET b = 'new-b'");
+
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM matching_trigger_log'),
+                'new-b:old-b:NEW.a'
+            );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
         }
@@ -963,6 +1034,28 @@ describe('view operations', () => {
                 assert.strictEqual(typeof exactText, 'string', `missing sidecar for row ${rowIndex}`);
                 assert.strictEqual(Number(exactText), preview.rows[rowIndex][0]);
             }
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('uses a pre-3.35-compatible flattening barrier for exact numeric text', async () => {
+        const transportQuery = buildExactNumericTextQuery(
+            'SELECT CAST(random() % 1000000 AS REAL) AS value',
+            1
+        );
+
+        assert.doesNotMatch(transportQuery.sql, /\bMATERIALIZED\b/i);
+        assert.match(transportQuery.sql, /\bLIMIT -1 OFFSET 0\b/i);
+
+        const engine = await createEngine();
+        try {
+            const plan = await engine.executeQuery(`EXPLAIN QUERY PLAN ${transportQuery.sql}`);
+            const details = plan.flatMap(result => result.rows.map(row => String(row[3])));
+            assert.ok(
+                details.some(detail => /CO-ROUTINE __sqlite_explorer_numeric_source/i.test(detail)),
+                `expected a non-flattened numeric source, got: ${details.join('; ')}`
+            );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
         }

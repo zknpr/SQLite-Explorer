@@ -1,12 +1,9 @@
 import type { CellValue, ExactIntegerTextMap } from './types';
+import { escapeIdentifier } from './sql-utils';
 
 const NUMERIC_SOURCE_ALIAS = '__sqlite_explorer_numeric_source';
 const NUMERIC_VALUE_PREFIX = '__sqlite_explorer_numeric_value_';
 const NUMERIC_TEXT_PREFIX = '__sqlite_explorer_numeric_text_';
-
-function quoteInternalIdentifier(identifier: string): string {
-  return `"${identifier}"`;
-}
 
 /**
  * Project each result value beside sparse SQLite-generated text for the one
@@ -30,21 +27,21 @@ export function buildExactNumericTextQuery(
     { length: columnCount },
     (_, index) => `${NUMERIC_TEXT_PREFIX}${index}`
   );
-  const quotedSource = quoteInternalIdentifier(NUMERIC_SOURCE_ALIAS);
-  const quotedValues = valueColumns.map(quoteInternalIdentifier);
+  const quotedSource = escapeIdentifier(NUMERIC_SOURCE_ALIAS);
+  const quotedValues = valueColumns.map(escapeIdentifier);
   const exactTextExpressions = quotedValues.map((valueColumn, index) => (
     `CASE WHEN typeof(${valueColumn}) = 'real' ` +
     `AND ${valueColumn} = CAST(${valueColumn} AS INTEGER) ` +
-    `THEN CAST(${valueColumn} AS TEXT) END AS ${quoteInternalIdentifier(textColumns[index])}`
+    `THEN CAST(${valueColumn} AS TEXT) END AS ${escapeIdentifier(textColumns[index])}`
   ));
 
   return {
-    // MATERIALIZED is an integrity barrier, not a performance hint here. If
-    // SQLite flattens this CTE, each typeof/comparison/cast reference may
-    // reevaluate a nondeterministic source expression and describe a value
-    // different from the one returned in the same transport row.
+    // OFFSET is a documented query-flattening barrier across older CTE-capable
+    // SQLite 3.x releases. The resulting coroutine evaluates each source row
+    // once before typeof/comparison/cast reference it in the outer query.
     sql:
-      `WITH ${quotedSource} (${quotedValues.join(', ')}) AS MATERIALIZED (\n${sourceSql}\n)\n` +
+      `WITH ${quotedSource} (${quotedValues.join(', ')}) AS (\n` +
+      `SELECT * FROM (\n${sourceSql}\n) LIMIT -1 OFFSET 0\n)\n` +
       `SELECT ${[...quotedValues, ...exactTextExpressions].join(', ')} FROM ${quotedSource}`,
     transportColumns: [...valueColumns, ...textColumns]
   };

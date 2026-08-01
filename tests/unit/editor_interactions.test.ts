@@ -1176,6 +1176,82 @@ describe('editor keyboard and grid selection interactions', () => {
         assert.strictEqual(state.selectedCells.length, 1);
     });
 
+    it('does not route copy, select-all, or destructive grid shortcuts behind a cell-preview modal', async () => {
+        let keydown: ((event: any) => Promise<void>) | undefined;
+        const clipboardWrites: string[] = [];
+        const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+        Object.defineProperty(globalThis, 'navigator', {
+            configurable: true,
+            value: { clipboard: { writeText: async (text: string) => clipboardWrites.push(text) } }
+        });
+        (globalThis as any).document = {
+            activeElement: { tagName: 'BUTTON' },
+            addEventListener(type: string, listener: (event: any) => Promise<void>) {
+                if (type === 'keydown') keydown = listener;
+            },
+            getElementById() { return null; },
+            querySelector(selector: string) {
+                return selector.includes('.cell-preview-modal:not(.hidden)') ? {} : null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const originalDeleteRows = backendApi.deleteRows;
+        let deleteCalls = 0;
+        backendApi.deleteRows = async () => {
+            deleteCalls++;
+            throw new Error('shortcut should have been blocked');
+        };
+        const originalConsoleError = console.error;
+        console.error = () => {};
+
+        try {
+            const { setupGlobalShortcuts } = await import(globalShortcutsModulePath);
+            const { state } = await import(stateModulePath);
+            setupGlobalShortcuts();
+            assert.ok(keydown, 'global keydown listener was not registered');
+
+            state.selectedTable = 'items';
+            state.selectedTableType = 'table';
+            state.gridData = [[7, 'alpha']];
+            state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+            state.selectedCells = [{ rowIdx: 0, colIdx: 0, rowId: 7, value: 'alpha' }];
+            state.selectedRowIds.add(7);
+
+            const events = ['c', 'a', 'Delete', 'Backspace'].map(key => ({
+                key,
+                metaKey: false,
+                ctrlKey: true,
+                target: { tagName: 'BUTTON' },
+                prevented: false,
+                preventDefault() { this.prevented = true; },
+                stopPropagation() {}
+            }));
+            for (const event of events) {
+                state.selectedCells = [{ rowIdx: 0, colIdx: 0, rowId: 7, value: 'alpha' }];
+                state.selectedRowIds.clear();
+                state.selectedRowIds.add(7);
+                await keydown(event);
+            }
+
+            assert.deepStrictEqual(events.map(event => event.prevented), [false, false, false, false]);
+            assert.deepStrictEqual(clipboardWrites, []);
+            assert.strictEqual(deleteCalls, 0);
+            assert.deepStrictEqual([...state.selectedRowIds], [7]);
+            assert.strictEqual(state.selectedCells.length, 1);
+        } finally {
+            backendApi.deleteRows = originalDeleteRows;
+            console.error = originalConsoleError;
+            if (navigatorDescriptor) {
+                Object.defineProperty(globalThis, 'navigator', navigatorDescriptor);
+            } else {
+                delete (globalThis as any).navigator;
+            }
+        }
+    });
+
     it('handles uppercase copy and select-all shortcut keys with Caps Lock on', async () => {
         let keydown: ((event: any) => Promise<void>) | undefined;
         const clipboardWrites: string[] = [];

@@ -339,12 +339,16 @@ export const backendApi = {
         ]);
     },
     dropView: async (view) => {
-        if (!window.confirm(
-            `Drop view "${view}"? This permanently drops its INSTEAD OF triggers too.`
-        )) {
+        const current = await sendRpcRequest('getViewDefinition', [view]);
+        const triggerSnapshot = current.triggers ?? [];
+        const triggerNames = triggerSnapshot.map(trigger => trigger.identifier).join(', ');
+        const message = triggerNames
+            ? `Drop view "${view}"? This will permanently drop its INSTEAD OF triggers: ${triggerNames}.`
+            : `Drop view "${view}"?`;
+        if (!window.confirm(message)) {
             return { cancelled: true };
         }
-        return sendRpcRequest('dropView', [view]);
+        return sendRpcRequest('dropView', [view, current.sql, triggerSnapshot]);
     },
     updateCellBatch: (table, updates, label) => sendRpcRequest('updateCellBatch', [table, updates, label]),
     addColumn: (table, column, type, defaultValue) => sendRpcRequest('addColumn', [table, column, type, defaultValue]),

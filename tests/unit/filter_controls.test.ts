@@ -584,7 +584,7 @@ describe('filter controls', () => {
             currentIndex: 0
         };
         documentObject.querySelector = (selector: string) =>
-            selector === '.modal-overlay:not(.hidden)' ? {} : null;
+            selector.includes('.modal-overlay:not(.hidden)') ? {} : null;
         await keydown({
             key: 'Escape',
             target: { closest() { return {}; } }

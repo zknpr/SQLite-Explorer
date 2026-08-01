@@ -135,16 +135,9 @@ function getMatchingTextCandidate(value, col, term, exactIntegerText) {
     }
 
     const rawText = truncateAtSqliteTextNul(value);
-    const formattedText = truncateAtSqliteTextNul(formatCellValueAsText(
-        value,
-        col.type,
-        state.dateFormat,
-        col.name,
-        false
-    ));
     const candidates = exactIntegerText === undefined
-        ? [rawText, formattedText]
-        : [exactIntegerText, rawText, formattedText];
+        ? [rawText]
+        : [exactIntegerText, rawText];
     if (typeof value === 'number' && hasRealStorageSemantics(value, col)) {
         candidates.push(...sqliteNumericTextCandidates(value));
     }
@@ -172,7 +165,7 @@ function excerptAroundMatch(text, term, maxLength = 100) {
 
 /**
  * Return the normal truncated display text, or an excerpt centered on the
- * active navigation term using the exact raw/formatted/numeric candidate that
+ * active navigation term using the exact raw/numeric candidate that
  * made the cell a match.
  */
 export function formatCellValueForActiveMatch(value, col, term, exactIntegerText) {

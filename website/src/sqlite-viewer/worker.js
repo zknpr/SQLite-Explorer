@@ -15,6 +15,7 @@ import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionStateCurrent,
   assertViewDefinitionIntent,
+  assertViewTriggersCompatibleWithColumns,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
@@ -1054,6 +1055,14 @@ async function editView(
     runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
     compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
     if (preserveTriggers) {
+      const columnResult = db.exec(`PRAGMA main.table_info(${escapeIdentifier(view)})`);
+      const columns = (columnResult[0]?.values ?? []).map(row => {
+        if (typeof row[1] !== 'string') {
+          throw new Error(`SQLite returned invalid column metadata for view ${view}`);
+        }
+        return row[1];
+      });
+      assertViewTriggersCompatibleWithColumns(before.triggers, columns);
       for (const trigger of before.triggers) {
         runSingleStatement(buildCreateViewTriggerSql(trigger));
       }

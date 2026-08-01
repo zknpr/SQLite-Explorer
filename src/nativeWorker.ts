@@ -54,6 +54,7 @@ import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionStateCurrent,
   assertViewDefinitionIntent,
+  assertViewTriggersCompatibleWithColumns,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
@@ -1326,6 +1327,8 @@ export async function createNativeDatabaseConnection(
             await runNativeSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
             await compileNativeView(view);
             if (preserveTriggers) {
+              const columns = await getNativeColumnNames(view, true);
+              assertViewTriggersCompatibleWithColumns(before.triggers, columns);
               for (const trigger of before.triggers) {
                 await runNativeSingleStatement(buildCreateViewTriggerSql(trigger));
               }

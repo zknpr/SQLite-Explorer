@@ -280,7 +280,7 @@ describe('filter match navigation', () => {
         assert.strictEqual(state.matchNav.term, '');
     });
 
-    it('matches the stored date value when display formatting changes its text', async () => {
+    it('matches raw stored date text even when display formatting changes it', async () => {
         const cell = {
             classList: createClassList(),
             scrollIntoView() {}
@@ -298,6 +298,7 @@ describe('filter match navigation', () => {
         const matchNavModulePath = '../../core/ui/modules/match-nav.js';
         const { state } = await import(stateModulePath);
         const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.selectedTableType = 'view';
         state.tableColumns = [{ name: 'created_at', type: 'DATETIME' }];
         state.gridData = [['2024-01-15 12:34:56']];
         state.dateFormat = 'relative';
@@ -309,6 +310,38 @@ describe('filter match navigation', () => {
 
         assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
         assert.strictEqual(cell.classList.contains('active-match-cell'), true);
+    });
+
+    it('does not match text introduced only by date display formatting', async () => {
+        const cell = {
+            classList: createClassList(),
+            scrollIntoView() {}
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cell-0-0') return cell;
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.selectedTableType = 'view';
+        state.tableColumns = [{ name: 'created_at', type: 'DATETIME' }];
+        state.gridData = [[1704067200]];
+        state.dateFormat = 'iso';
+        state.filterQuery = '2024';
+        state.columnFilters = {};
+        resetMatchNav();
+
+        navigateMatches(GLOBAL_MATCH_SCOPE);
+
+        assert.deepStrictEqual(state.matchNav.matches, []);
+        assert.strictEqual(cell.classList.contains('active-match-cell'), false);
     });
 
     it('does not match the display-only NULL placeholder', async () => {

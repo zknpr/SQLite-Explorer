@@ -99,6 +99,14 @@ function isSqlKeyword(token: SqlToken | undefined, keyword: string): boolean {
   return token?.kind === 'word' && token.value.toUpperCase() === keyword;
 }
 
+function isSqlIdentifierToken(token: SqlToken | undefined): token is SqlToken {
+  return token?.kind === 'word' || token?.kind === 'identifier';
+}
+
+function foldSqlIdentifier(identifier: string): string {
+  return identifier.replace(/[A-Z]/g, character => character.toLowerCase());
+}
+
 function consumeSqlIdentifier(tokens: readonly SqlToken[], index: number): number {
   const token = tokens[index];
   if (!token || (token.kind !== 'word' && token.kind !== 'identifier')) {
@@ -365,6 +373,42 @@ export function buildCreateViewTriggerSql(trigger: ViewTriggerDefinition): strin
   // sqlite_temp_schema normally omits TEMP from its stored SQL, so restore the
   // schema qualifier explicitly instead of accidentally creating a main trigger.
   return trigger.sql.replace(createTriggerPrefix, '$1TEMP $2');
+}
+
+/**
+ * Reject preserved triggers that would become unusable after a view edit.
+ * SQLite accepts unresolved NEW/OLD columns in CREATE TRIGGER and defers the
+ * error until DML fires, so the edit path must compare these references with
+ * the replacement view's actual schema before releasing its savepoint.
+ */
+export function assertViewTriggersCompatibleWithColumns(
+  triggers: readonly ViewTriggerDefinition[],
+  columns: readonly string[]
+): void {
+  const availableColumns = new Set(columns.map(foldSqlIdentifier));
+
+  for (const trigger of triggers) {
+    const tokens = scanSqlTokens(trigger.sql);
+    for (let index = 0; index + 2 < tokens.length; index++) {
+      const qualifier = tokens[index];
+      const separator = tokens[index + 1];
+      const column = tokens[index + 2];
+      if (!isSqlIdentifierToken(qualifier)
+          || !/^(?:NEW|OLD)$/i.test(qualifier.value)
+          || tokens[index - 1]?.value === '.'
+          || separator.kind !== 'symbol'
+          || separator.value !== '.'
+          || !isSqlIdentifierToken(column)) {
+        continue;
+      }
+      if (!availableColumns.has(foldSqlIdentifier(column.value))) {
+        throw new Error(
+          `Preserved trigger "${trigger.identifier}" references missing view column ` +
+          `"${column.value}" via ${qualifier.value.toUpperCase()}.${column.value}`
+        );
+      }
+    }
+  }
 }
 
 /** Enforce create/edit intent against SQLite's currently installed schema. */

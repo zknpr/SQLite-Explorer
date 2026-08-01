@@ -81,6 +81,15 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
         await activeRawWorker.start();
         await activeRawWorker.call('open', [databasePath, false]);
 
+        await testContext.test('pins the bundled txiki SQLite version', async () => {
+            const result = await activeRawWorker.call<{ values: unknown[][] }>('query', [
+                'SELECT sqlite_version() AS version'
+            ]);
+            const version = String(result.values[0]?.[0] ?? '');
+            console.log(`[native smoke] SQLite version: ${version}`);
+            assert.strictEqual(version, '3.50.1');
+        });
+
         await testContext.test('retains the boundary on multiline SQL and rejects a statement tail', async () => {
             const body = `SELECT
     1 AS first_value,
@@ -223,6 +232,67 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 assert.strictEqual(typeof exactText, 'string', `missing sidecar for row ${rowIndex}`);
                 assert.strictEqual(Number(exactText), preview.rows[rowIndex][0]);
             }
+        });
+
+        await testContext.test('validates preserved trigger columns against native view edits', async () => {
+            await engine.executeQuery(
+                "CREATE TABLE native_trigger_column_source (a TEXT, b TEXT); " +
+                "INSERT INTO native_trigger_column_source VALUES ('old-a', 'old-b'); " +
+                'CREATE TABLE native_trigger_column_log (value TEXT); ' +
+                'CREATE VIEW native_trigger_column_view AS ' +
+                'SELECT a FROM native_trigger_column_source; ' +
+                'CREATE TRIGGER native_trigger_column_update ' +
+                'INSTEAD OF UPDATE ON native_trigger_column_view ' +
+                "BEGIN INSERT INTO native_trigger_column_log VALUES (NEW.\"a\" || ':' || OLD.[a]); END"
+            );
+
+            await assert.rejects(
+                engine.editView(
+                    'native_trigger_column_view',
+                    'SELECT b FROM native_trigger_column_source',
+                    true
+                ),
+                error => {
+                    const message = error instanceof Error ? error.message : String(error);
+                    assert.match(message, /native_trigger_column_update/i);
+                    assert.match(message, /missing view column/i);
+                    assert.match(message, /\ba\b/i);
+                    return true;
+                }
+            );
+            assert.strictEqual(
+                (await engine.getViewDefinition('native_trigger_column_view')).selectSql,
+                'SELECT a FROM native_trigger_column_source'
+            );
+            await engine.executeQuery("UPDATE native_trigger_column_view SET a = 'new-a'");
+            assert.strictEqual(
+                (await engine.executeQuery('SELECT value FROM native_trigger_column_log'))[0]
+                    .rows[0][0],
+                'new-a:old-a'
+            );
+
+            await engine.executeQuery(
+                "CREATE TABLE native_matching_trigger_source (a TEXT, b TEXT); " +
+                "INSERT INTO native_matching_trigger_source VALUES ('old-a', 'old-b'); " +
+                'CREATE TABLE native_matching_trigger_log (value TEXT); ' +
+                'CREATE VIEW native_matching_trigger_view AS ' +
+                'SELECT a FROM native_matching_trigger_source; ' +
+                'CREATE TRIGGER native_matching_trigger_update ' +
+                'INSTEAD OF UPDATE ON native_matching_trigger_view ' +
+                'BEGIN INSERT INTO native_matching_trigger_log VALUES (' +
+                "NEW.[b] || ':' || OLD.\"b\" || ':NEW.a' /* OLD.a */); END"
+            );
+            await engine.editView(
+                'native_matching_trigger_view',
+                'SELECT b FROM native_matching_trigger_source',
+                true
+            );
+            await engine.executeQuery("UPDATE native_matching_trigger_view SET b = 'new-b'");
+            assert.strictEqual(
+                (await engine.executeQuery('SELECT value FROM native_matching_trigger_log'))[0]
+                    .rows[0][0],
+                'new-b:old-b:NEW.a'
+            );
         });
 
         await testContext.test('validates and previews with a legal disposable view name', async () => {

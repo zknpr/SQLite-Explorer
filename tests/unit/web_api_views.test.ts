@@ -17,6 +17,13 @@ function waitForPostedMessage(index: number): Promise<any> {
     return deferred.promise;
 }
 
+async function requirePostedMessageAfterTurn(index: number): Promise<any> {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const message = postedMessages[index];
+    assert.ok(message, `expected posted RPC message ${index}`);
+    return message;
+}
+
 (globalThis as any).window = {
     parent: {
         postMessage(message: any) {
@@ -57,21 +64,54 @@ after(() => {
     delete (globalThis as any).window;
 });
 
-it('confirms demo view drops with a trigger-loss warning before forwarding once', async () => {
+it('names demo view triggers before a confirmed drop and forwards that snapshot', async () => {
     const webApiModulePath = '../../core/ui/modules/web-api.js';
     const { backendApi, handleRpcResponse } = await import(webApiModulePath);
-    const cancelled = await backendApi.dropView('demo_view');
+
+    const definition = {
+        sql: 'CREATE VIEW demo_view AS SELECT 1 AS value',
+        triggers: [
+            { identifier: 'demo_insert', sql: 'CREATE TRIGGER demo_insert' },
+            { identifier: 'demo_update', sql: 'CREATE TRIGGER demo_update' }
+        ]
+    };
+    const cancelledDrop = backendApi.dropView('demo_view');
+    const cancelledLookup = await requirePostedMessageAfterTurn(0);
+    assert.strictEqual(cancelledLookup.content.targetMethod, 'getViewDefinition');
+    handleRpcResponse({
+        kind: 'response',
+        messageId: cancelledLookup.content.messageId,
+        success: true,
+        data: definition
+    });
+
+    const cancelled = await cancelledDrop;
     assert.deepStrictEqual(cancelled, { cancelled: true });
-    assert.strictEqual(postedMessages.length, 0);
+    assert.strictEqual(postedMessages.length, 1, 'cancelled drops must not reach dropView');
     assert.match(confirmations[0], /demo_view/);
     assert.match(confirmations[0], /permanently/i);
     assert.match(confirmations[0], /INSTEAD OF triggers/i);
+    assert.match(confirmations[0], /demo_insert/);
+    assert.match(confirmations[0], /demo_update/);
 
     confirmResult = true;
     const dropPromise = backendApi.dropView('demo_view');
-    const request = await waitForPostedMessage(0);
+    const acceptedLookup = await waitForPostedMessage(1);
+    assert.strictEqual(acceptedLookup.content.targetMethod, 'getViewDefinition');
+    handleRpcResponse({
+        kind: 'response',
+        messageId: acceptedLookup.content.messageId,
+        success: true,
+        data: definition
+    });
+
+    const request = await waitForPostedMessage(2);
     assert.strictEqual(request.content.targetMethod, 'dropView');
-    assert.deepStrictEqual(request.content.payload, ['demo_view']);
+    assert.deepStrictEqual(request.content.payload, [
+        'demo_view',
+        definition.sql,
+        definition.triggers
+    ]);
 
     handleRpcResponse({
         kind: 'response',
@@ -81,7 +121,45 @@ it('confirms demo view drops with a trigger-loss warning before forwarding once'
     });
     assert.deepStrictEqual(await dropPromise, { dropped: true });
     assert.strictEqual(confirmations.length, 2);
-    assert.strictEqual(postedMessages.length, 1);
+    assert.strictEqual(postedMessages.length, 3);
+});
+
+it('uses a plain confirmation when a demo view has no triggers', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const { backendApi, handleRpcResponse } = await import(webApiModulePath);
+    const definition = {
+        sql: 'CREATE VIEW plain_demo_view AS SELECT 1 AS value',
+        triggers: []
+    };
+
+    confirmResult = true;
+    const dropPromise = backendApi.dropView('plain_demo_view');
+    const lookup = await requirePostedMessageAfterTurn(0);
+    assert.strictEqual(lookup.content.targetMethod, 'getViewDefinition');
+    handleRpcResponse({
+        kind: 'response',
+        messageId: lookup.content.messageId,
+        success: true,
+        data: definition
+    });
+
+    const request = await waitForPostedMessage(1);
+    assert.strictEqual(confirmations.length, 1);
+    assert.match(confirmations[0], /plain_demo_view/);
+    assert.doesNotMatch(confirmations[0], /trigger/i);
+    assert.strictEqual(request.content.targetMethod, 'dropView');
+    assert.deepStrictEqual(request.content.payload, [
+        'plain_demo_view',
+        definition.sql,
+        definition.triggers
+    ]);
+    handleRpcResponse({
+        kind: 'response',
+        messageId: request.content.messageId,
+        success: true,
+        data: { dropped: true }
+    });
+    assert.deepStrictEqual(await dropPromise, { dropped: true });
 });
 
 it('confirms the named demo triggers before an edit can discard them', async () => {
