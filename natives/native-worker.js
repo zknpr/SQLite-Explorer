@@ -252,6 +252,49 @@ function executeQuery(db, sql, params) {
   };
 }
 
+/** Compact generated numeric metadata before crossing the V8 RPC boundary. */
+function compactExactNumericResult(result, transportColumns) {
+  if (!Array.isArray(transportColumns) || transportColumns.length < 2 || transportColumns.length % 2 !== 0) {
+    throw new Error('Invalid exact numeric transport column list');
+  }
+  const valueColumnCount = transportColumns.length / 2;
+  const values = [];
+  let exactIntegerTexts;
+
+  if (result.values.length === 0) {
+    return { columns: transportColumns.slice(0, valueColumnCount), values, rowCount: 0 };
+  }
+
+  const mapping = transportColumns.map(column => result.columns.indexOf(column));
+  if (mapping.some(index => index < 0)) {
+    throw new Error('Native query result omitted exact numeric transport metadata');
+  }
+
+  for (let rowIndex = 0; rowIndex < result.values.length; rowIndex++) {
+    const sourceRow = result.values[rowIndex];
+    const orderedRow = mapping.map(index => sourceRow[index]);
+    values.push(orderedRow.slice(0, valueColumnCount));
+    for (let columnIndex = 0; columnIndex < valueColumnCount; columnIndex++) {
+      const exactText = orderedRow[valueColumnCount + columnIndex];
+      if (exactText === null || exactText === undefined) continue;
+      if (typeof exactText !== 'string') {
+        throw new Error(`Exact numeric metadata at row ${rowIndex}, column ${columnIndex} is not text`);
+      }
+      exactIntegerTexts ??= {};
+      exactIntegerTexts[rowIndex] ??= {};
+      exactIntegerTexts[rowIndex][columnIndex] = exactText;
+    }
+  }
+
+  const compacted = {
+    columns: transportColumns.slice(0, valueColumnCount),
+    values,
+    rowCount: values.length
+  };
+  if (exactIntegerTexts) compacted.exactIntegerTexts = exactIntegerTexts;
+  return compacted;
+}
+
 /** Execute one prepared query only after SQLite proves it consumed the boundary. */
 function executeSingleQuery(db, sql, params, requiredSuffix) {
   const stmt = db.prepare(sql);
@@ -370,7 +413,10 @@ function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, limit,
     if (typeof stmt.finalize === 'function') stmt.finalize();
   }
 
-  return { columns, values, rowCount: values.length };
+  return compactExactNumericResult(
+    { columns, values, rowCount: values.length },
+    columns
+  );
 }
 
 /**
@@ -454,6 +500,16 @@ async function handleRequest(request) {
 
         result = executeQuery(db, sql, params);
         console.error("[native-worker] query complete");
+        break;
+      }
+
+      case "queryNumeric": {
+        const [sql, params, transportColumns] = args;
+        if (!db) throw new Error("Database not open");
+        result = compactExactNumericResult(
+          executeQuery(db, sql, params),
+          transportColumns
+        );
         break;
       }
 

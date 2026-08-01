@@ -1,5 +1,5 @@
 import { state, persistState } from './state.js';
-import { RPC_TIMEOUT_MS } from './api.js';
+import { RPC_TIMEOUT_MS } from './rpc-constants.js';
 import { getGridReloadOwner, loadTableData } from './grid-data.js';
 import { renderDataGrid } from './grid-render.js';
 import { updateSelectionStates } from './grid-selection.js';

@@ -30,7 +30,10 @@ import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from
 import { crypto } from '../../../platform/cryptoShim';
 import { buildSelectQuery, buildCountQuery } from '../../query-builder';
 import { applyMergePatch, computeJsonPatchUndo, parseJsonValueForPatching } from '../../json-utils';
-import { normalizeIntegerRowsForTransport } from '../../integer-utils';
+import {
+  buildExactNumericTextQuery,
+  normalizeIntegerRowsForTransport
+} from '../../integer-utils';
 import { getNodeFs } from '../../platform/fs';
 import {
   assertViewDefinitionSnapshotCurrent,
@@ -50,12 +53,14 @@ import {
 // Internal sql.js Types
 // ============================================================================
 
+type WasmBindValue = Exclude<CellValue, bigint>;
+
 interface WasmPreparedStatement {
-  run(params?: CellValue[]): void;
-  bind(params?: CellValue[]): boolean;
-  get(params?: CellValue[]): CellValue[] | undefined;
+  run(params?: WasmBindValue[]): void;
+  bind(params?: WasmBindValue[]): boolean;
+  get(params?: WasmBindValue[]): CellValue[] | undefined;
   get(
-    params: CellValue[] | null | undefined,
+    params: WasmBindValue[] | null | undefined,
     config: { useBigInt: true }
   ): Array<CellValue | bigint> | undefined;
   step(): boolean;
@@ -66,8 +71,8 @@ interface WasmPreparedStatement {
 }
 
 export interface WasmDatabaseInstance {
-  exec(sql: string, params?: CellValue[]): Array<{ columns: string[]; values: CellValue[][] }>;
-  prepare(sql: string, params?: CellValue[]): WasmPreparedStatement;
+  exec(sql: string, params?: WasmBindValue[]): Array<{ columns: string[]; values: CellValue[][] }>;
+  prepare(sql: string, params?: WasmBindValue[]): WasmPreparedStatement;
   iterateStatements(sql: string): Iterable<WasmPreparedStatement>;
   export(): Uint8Array;
   close(): void;
@@ -85,6 +90,17 @@ export type WasmEngineLogHandler = (
 interface ExistingViewForIntent {
   storedSql: CellValue | undefined;
   columnListSql: string | undefined;
+}
+
+/**
+ * sql.js does not expose a native int64 bind; its current BigInt branch binds
+ * decimal text internally. Perform that conversion at our boundary so history
+ * replay remains exact without depending on an undocumented binder detail.
+ */
+function normalizeWasmBindParams(
+  params?: readonly CellValue[]
+): WasmBindValue[] | undefined {
+  return params?.map(value => typeof value === 'bigint' ? value.toString() : value);
 }
 
 // ============================================================================
@@ -115,6 +131,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     this.queryTimeout = timeoutMs;
     this.readOnlyMode = readOnlyMode;
     this.logger = logger ?? ((level, ...args) => console[level](...args));
+
+    if (this.readOnlyMode) {
+      // Public mutation methods fail early with operation-specific messages,
+      // while SQLite itself blocks any overlooked or newly added write path.
+      instance.exec('PRAGMA query_only = ON');
+    }
 
     // Probe for json_patch() availability at construction time.
     // json_patch() is part of the JSON1 extension, which is included in most
@@ -204,7 +226,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * deferred until sql.js exposes an interrupt or progress-handler hook.
    */
   private executeSingleQuery(sql: string): QueryResultSet {
-    const statement = this.prepareSingleStatement(sql);
+    const sourceStatement = this.prepareSingleStatement(sql);
+    const headers = sourceStatement.getColumnNames();
+    sourceStatement.free();
+    const transportQuery = buildExactNumericTextQuery(sql, headers.length);
+    const statement = this.prepareSingleStatement(transportQuery.sql);
     const sourceRows: Array<Array<CellValue | bigint>> = [];
     const startedAt = Date.now();
     try {
@@ -218,8 +244,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
         sourceRows.push(row);
       }
-      const headers = statement.getColumnNames();
-      const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(sourceRows);
+      const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+        sourceRows,
+        headers.length
+      );
       return { headers, rows, columns: headers, values: rows, exactIntegerTexts };
     } finally {
       statement.free();
@@ -265,7 +293,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
         // Bind parameters only to the first statement to match exec behavior
         if (isFirstStatement && params && params.length > 0) {
-          stmt.bind(params);
+          stmt.bind(normalizeWasmBindParams(params));
         }
         isFirstStatement = false;
 
@@ -555,7 +583,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             for (const [rId, rowObj] of rowUpdates.entries()) {
               const params: CellValue[] = deletedColumns.map(c => rowObj[c.name] ?? null);
               params.push(rId);
-              stmt.run(params);
+              stmt.run(normalizeWasmBindParams(params));
             }
           } finally {
             stmt.free();
@@ -858,7 +886,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           const stmt = this.instance.prepare(sql);
           try {
             for (const params of data) {
-              stmt.run(params);
+              stmt.run(normalizeWasmBindParams(params));
             }
           } finally {
             stmt.free();
@@ -1156,6 +1184,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   async createView(view: string, selectSql: string): Promise<ViewDefinition> {
+    this.assertWritableMutation('View creation');
     const body = normalizeViewSelectSql(selectSql);
     this.compileViewSelect(body);
     const savepointName = this.createSavepointName('sp_create_view');
@@ -1179,6 +1208,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     expectedSql?: string,
     expectedTriggers?: readonly ViewTriggerDefinition[]
   ): Promise<ViewEditResult> {
+    this.assertWritableMutation('View editing');
     const body = normalizeViewSelectSql(selectSql);
     this.compileViewSelect(body);
     const savepointName = this.createSavepointName('sp_edit_view');
@@ -1216,6 +1246,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     expectedSql?: string,
     expectedTriggers?: readonly ViewTriggerDefinition[]
   ): Promise<ViewDefinition> {
+    this.assertWritableMutation('View deletion');
     const savepointName = this.createSavepointName('sp_drop_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
@@ -1232,6 +1263,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     } catch (err) {
       await this.safeRollbackSavepoint(savepointName, 'dropView');
       throw err;
+    }
+  }
+
+  private assertWritableMutation(operation: string): void {
+    if (this.readOnlyMode) {
+      throw new Error(`${operation} is unavailable because the database is read-only`);
     }
   }
 
@@ -1329,7 +1366,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                      const patchStr = typeof update.value === 'string'
                        ? update.value
                        : JSON.stringify(update.value);
-                     stmt.run([patchStr, rowIdNum]);
+                     stmt.run(normalizeWasmBindParams([patchStr, rowIdNum]));
 
                   } else if (op === 'json_patch') {
                      // JS fallback: read current value, apply patch, write back
@@ -1359,10 +1396,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                      const newValueObj = applyMergePatch(currentObj, patchObj);
                      const newValueStr = JSON.stringify(newValueObj);
 
-                     stmt.run([newValueStr, rowIdNum]);
+                     stmt.run(normalizeWasmBindParams([newValueStr, rowIdNum]));
                   } else {
                       // Standard update
-                      stmt.run([update.value, rowIdNum]);
+                      stmt.run(normalizeWasmBindParams([update.value, rowIdNum]));
                   }
               }
           } finally {
@@ -1418,9 +1455,17 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
     // Use prepare/step/get to avoid overhead of exec() which builds intermediate objects
     // and to allow for potentially better memory management in the future
+    let headerStmt: WasmPreparedStatement | null = null;
     let stmt: WasmPreparedStatement | null = null;
     try {
-        stmt = this.instance.prepare(sql, params);
+        const bindParams = normalizeWasmBindParams(params);
+        headerStmt = this.instance.prepare(sql, bindParams);
+        const headers = headerStmt.getColumnNames();
+        headerStmt.free();
+        headerStmt = null;
+
+        const transportQuery = buildExactNumericTextQuery(sql, headers.length);
+        stmt = this.instance.prepare(transportQuery.sql, bindParams);
         const sourceRows: Array<Array<CellValue | bigint>> = [];
 
         while (stmt.step()) {
@@ -1431,8 +1476,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             }
         }
 
-        const headers = stmt.getColumnNames();
-        const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(sourceRows);
+        const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+          sourceRows,
+          headers.length
+        );
         return {
             headers,
             rows,
@@ -1444,6 +1491,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const errorDetail = err instanceof Error ? err.message : String(err);
         throw new Error(`Fetch failed: ${errorDetail}`);
     } finally {
+        if (headerStmt) headerStmt.free();
         if (stmt) stmt.free();
     }
   }

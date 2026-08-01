@@ -28,7 +28,10 @@ export interface CellContentType {
  */
 export type CellValue = string | number | bigint | null | Uint8Array;
 
-/** Exact decimal text for grid INTEGER cells whose int64 value is unsafe as a JS number. */
+/**
+ * Sparse exact SQLite text for numeric cells whose Number transport is lossy
+ * (unsafe INTEGERs) or storage-class ambiguous (integral REALs).
+ */
 export type ExactIntegerTextMap = Record<number, Record<number, string>>;
 
 /**
@@ -54,7 +57,7 @@ export interface QueryResultSet {
   headers: string[];
   /** Row data as 2D array (primary naming) */
   rows: CellValue[][];
-  /** Sparse row/column sidecar for INTEGER values rounded by the number-based grid contract. */
+  /** Sparse row/column sidecar for numeric text lost by the number-based grid contract. */
   exactIntegerTexts?: ExactIntegerTextMap;
   /** Column names - sql.js compatible alias for webview */
   columns?: string[];

@@ -45,9 +45,14 @@ function loadNativeBoundaryFunction(
         'assertSingleStatementPayload',
         ['db', 'markedSql', 'sql', 'requiredSuffix']
     );
-    return loadNativeWorkerFunction(functionName, parameters, {
-        assertSingleStatementPayload
-    });
+    const dependencies: Record<string, unknown> = { assertSingleStatementPayload };
+    if (functionName === 'executeBoundedQuery') {
+        dependencies.compactExactNumericResult = loadNativeWorkerFunction(
+            'compactExactNumericResult',
+            ['result', 'transportColumns']
+        );
+    }
+    return loadNativeWorkerFunction(functionName, parameters, dependencies);
 }
 
 interface RecordedNativeCall {
@@ -1592,8 +1597,10 @@ describe('native querySingle worker handler', () => {
                 return {
                     all() {
                         return Array.from({ length: 100 }, (_, index) => ({
-                            x: index + 1,
-                            'x:1': (index + 1) * 10
+                            value0: index + 1,
+                            value1: (index + 1) * 10,
+                            exact0: null,
+                            exact1: null
                         }));
                     },
                     finalize() { finalized++; }
@@ -1607,7 +1614,7 @@ describe('native querySingle worker handler', () => {
             `SELECT * FROM preview\n${boundary}`,
             'SELECT * FROM preview',
             boundary,
-            ['x', 'x:1'],
+            ['value0', 'value1', 'exact0', 'exact1'],
             100,
             5000
         );
@@ -1617,6 +1624,44 @@ describe('native querySingle worker handler', () => {
         assert.strictEqual(result.rowCount, 100);
         assert.deepStrictEqual(result.values[0], [1, 10]);
         assert.deepStrictEqual(result.values[99], [100, 1000]);
+    });
+
+    it('compacts integral REAL metadata before returning a bounded native query', () => {
+        const executeBoundedQuery = loadNativeBoundaryFunction(
+            'executeBoundedQuery',
+            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
+        );
+        const boundary = '/*sqlite_explorer_boundary_test*/';
+        const database = {
+            prepare(sql: string) {
+                if (sql.endsWith(boundary)) {
+                    return {
+                        toString: () => sql,
+                        finalize() {}
+                    };
+                }
+                return {
+                    all() {
+                        return [{ value0: 1, exact0: '1.0' }];
+                    },
+                    finalize() {}
+                };
+            }
+        };
+        mock.method(Date, 'now', () => 0);
+
+        const result = executeBoundedQuery(
+            database,
+            `SELECT * FROM preview\n${boundary}`,
+            'SELECT * FROM preview',
+            boundary,
+            ['value0', 'exact0'],
+            10,
+            5000
+        );
+
+        assert.deepStrictEqual(result.values, [[1]]);
+        assert.deepStrictEqual(result.exactIntegerTexts, { 0: { 0: '1.0' } });
     });
 
     it('rejects divergent marked and executable bounded-query payloads before prepare', () => {

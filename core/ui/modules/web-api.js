@@ -6,6 +6,10 @@
  * This allows the viewer to work standalone in a browser.
  */
 
+import { RPC_TIMEOUT_MS } from './rpc-constants.js';
+
+export { RPC_TIMEOUT_MS };
+
 // Use parent window for RPC instead of VS Code API
 const parentWindow = window.parent;
 
@@ -24,9 +28,6 @@ export function getVsCodeState() {
 export function saveVsCodeState(_stateObj) {
     // No VS Code API available in web demo
 }
-
-// Default RPC timeout in milliseconds (60s to accommodate large blob operations)
-export const RPC_TIMEOUT_MS = 60000;
 
 // Message ID tracking
 let rpcMessageId = 0;

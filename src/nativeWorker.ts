@@ -38,12 +38,16 @@ import type {
   ViewDefinition,
   ViewDefinitionIntent,
   ViewEditResult,
-  ViewTriggerDefinition
+  ViewTriggerDefinition,
+  ExactIntegerTextMap
 } from './core/types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 import { computeJsonPatchUndo } from './core/json-utils';
-import { normalizeIntegerRowsForTransport } from './core/integer-utils';
+import {
+  buildExactNumericTextQuery,
+  normalizeIntegerRowsForTransport
+} from './core/integer-utils';
 import { serializeOperations } from './core/operation-serializer';
 import { InvocationTimeoutError } from './core/rpc';
 import {
@@ -422,6 +426,7 @@ interface NativeQueryResult {
   columns: string[];
   values: CellValue[][];
   rowCount?: number;
+  exactIntegerTexts?: ExactIntegerTextMap;
 }
 
 interface NativeQueryBatchResult {
@@ -630,6 +635,27 @@ export async function createNativeDatabaseConnection(
         };
       };
 
+      const getNativeColumnNames = async (
+        table: string,
+        qualifyMain: boolean = false
+      ): Promise<string[]> => {
+        const pragma = qualifyMain ? 'PRAGMA main.table_info' : 'PRAGMA table_info';
+        const info = await worker.call<NativeQueryResult>('query', [
+          `${pragma}(${escapeIdentifier(table)})`
+        ]);
+        const nameIndex = info.columns.indexOf('name');
+        if (nameIndex < 0 && (info.values?.length ?? 0) > 0) {
+          throw new Error('SQLite returned table metadata without a column name field');
+        }
+        return (info.values ?? []).map(row => {
+          const name = row[nameIndex];
+          if (typeof name !== 'string') {
+            throw new Error('SQLite returned invalid column metadata');
+          }
+          return name;
+        });
+      };
+
       const queryNativeSingleStatement = async <T>(sql: string): Promise<T> => {
         const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
         return worker.call<T>('querySingle', [`${sql}\n${boundary}`, undefined, boundary]);
@@ -645,12 +671,13 @@ export async function createNativeDatabaseConnection(
         columns: string[],
         limit: number
       ): Promise<NativeQueryResult> => {
+        const transportQuery = buildExactNumericTextQuery(sql, columns.length);
         const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
         return worker.call<NativeQueryResult>('queryBounded', [
-          `${sql}\n${boundary}`,
-          sql,
+          `${transportQuery.sql}\n${boundary}`,
+          transportQuery.sql,
           boundary,
-          columns,
+          transportQuery.transportColumns,
           limit,
           queryTimeout
         ], queryTimeout);
@@ -1231,25 +1258,17 @@ export async function createNativeDatabaseConnection(
               buildCreateViewSql(view, body, columnListSql)
             );
             await compileNativeView(view);
-            const info = await worker.call<NativeQueryResult>('query', [
-              `PRAGMA main.table_info(${escapeIdentifier(view)})`
-            ]);
-            const nameIndex = info.columns.indexOf('name');
-            if (nameIndex < 0) {
-              throw new Error('SQLite returned preview metadata without a column name field');
-            }
-            const columns = (info.values ?? []).map(row => {
-              if (typeof row[nameIndex] !== 'string') {
-                throw new Error('SQLite returned invalid preview column metadata');
-              }
-              return row[nameIndex];
-            });
+            const columns = await getNativeColumnNames(view, true);
             const result = await queryNativeBoundedStatement(
               `SELECT * FROM ${escapeMainViewIdentifier(view)}`,
               columns,
               boundedLimit
             );
-            const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(result.values);
+            const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+              result.values,
+              undefined,
+              result.exactIntegerTexts
+            );
             await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
             await worker.call('run', [`RELEASE ${savepointName}`]);
             return {
@@ -1356,57 +1375,32 @@ export async function createNativeDatabaseConnection(
          * Fetch table data.
          */
         fetchTableData: async (table: string, options: TableQueryOptions) => {
-          const { sql, params } = buildSelectQuery(table, options);
-          const result = await worker.call<NativeQueryResult>('query', [sql, params]);
-
-          let headers = result.columns;
-          // txiki preserves SQLite int64 values as BigInt over the V8 channel.
-          // Keep them exact through column reordering, then normalize once at
-          // the webview-facing boundary and attach the sparse text sidecar.
-          let sourceRows: unknown[][] = result.values;
-
-          // Native worker returns columns based on Object.keys() which doesn't guarantee order.
-          // Ensure the result matches the requested column order from options.columns.
-          if (options.columns && options.columns.length > 0 && headers && sourceRows) {
-            const expected = options.columns;
-
-            // Build map of lower-case header names to indices for robust matching
-            // Prioritize exact match, then case-insensitive
-            const headerIndexMap = new Map<string, number>();
-            headers.forEach((h: string, i: number) => {
-                headerIndexMap.set(h, i);
-                headerIndexMap.set(h.toLowerCase(), i);
-                // Also handle potentially quoted headers (though unlikely) by stripping quotes
-                const unquoted = h.replace(/^['"`]|['"`]$/g, '');
-                if (unquoted !== h) {
-                  headerIndexMap.set(unquoted, i);
-                  headerIndexMap.set(unquoted.toLowerCase(), i);
-                }
-            });
-
-            // Map expected columns to their indices in the result
-            const mapping = expected.map((c: string) => {
-                let idx = headerIndexMap.get(c);
-                if (idx === undefined) idx = headerIndexMap.get(c.toLowerCase());
-                return idx;
-            });
-
-            // If we found at least some columns, we attempt to reconstruct the row
-            // Missing columns will be undefined/null
-            if (mapping.some((idx: number | undefined) => idx !== undefined)) {
-              headers = expected;
-              sourceRows = sourceRows.map((row: unknown[]) => mapping.map((idx: number | undefined) =>
-                idx !== undefined ? row[idx as number] : null
-              ));
-            }
+          let columns = options.columns;
+          if (!columns || (columns.length === 1 && columns[0] === '*')) {
+            columns = await getNativeColumnNames(table);
           }
+          const queryOptions = { ...options, columns };
+          const { sql, params } = buildSelectQuery(table, queryOptions);
+          const transportQuery = buildExactNumericTextQuery(sql, columns.length);
+          const result = await worker.call<NativeQueryResult>('queryNumeric', [
+            transportQuery.sql,
+            params,
+            transportQuery.transportColumns
+          ]);
 
-          const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(sourceRows);
+          // txiki preserves SQLite int64 values as BigInt. The generated
+          // companion columns also retain integral REAL text before V8 erases
+          // that storage-class distinction from the Number value.
+          const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+            result.values,
+            undefined,
+            result.exactIntegerTexts
+          );
 
           return {
-            headers: headers,
+            headers: columns,
             rows: rows,
-            columns: headers,
+            columns,
             values: rows,
             exactIntegerTexts
           };

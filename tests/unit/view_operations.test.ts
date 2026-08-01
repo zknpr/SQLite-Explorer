@@ -766,6 +766,23 @@ describe('view operations', () => {
         }
     });
 
+    it('carries integral REAL storage text through WASM view previews', async () => {
+        const engine = await createEngine();
+        try {
+            const preview = await engine.previewViewDefinition(
+                'integral_real_preview',
+                'SELECT CAST(1 AS REAL) AS value',
+                10,
+                'create'
+            );
+
+            assert.strictEqual(preview.rows[0][0], 1);
+            assert.strictEqual(preview.exactIntegerTexts?.[0]?.[0], '1.0');
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('previews an edit in the target-name context instead of resolving the old view', async () => {
         const engine = await createEngine();
         try {
@@ -833,8 +850,17 @@ describe('view operations', () => {
     });
 
     it('does not run disposable validation DDL in WASM read-only mode', async () => {
+        const writable = await createEngine();
+        await writable.executeQuery(
+            'CREATE TABLE read_only_rows (value TEXT); ' +
+            "INSERT INTO read_only_rows VALUES ('original')"
+        );
+        await writable.createView('read_only_existing', 'SELECT value FROM read_only_rows');
+        const content = await writable.serializeDatabase();
+        (writable as WasmDatabaseEngine).shutdown();
+
         const result = await createDatabaseEngine({
-            content: null,
+            content,
             maxSize: 0,
             readOnlyMode: true
         });
@@ -857,12 +883,34 @@ describe('view operations', () => {
             );
             assert.deepStrictEqual(preview.headers, ['value']);
             assert.deepStrictEqual(preview.rows, [[1]]);
+
+            await assert.rejects(
+                () => engine.createView('read_only_new', 'SELECT 2 AS value'),
+                /View creation is unavailable because the database is read-only/
+            );
+            await assert.rejects(
+                () => engine.editView('read_only_existing', "SELECT 'changed' AS value"),
+                /View editing is unavailable because the database is read-only/
+            );
+            await assert.rejects(
+                () => engine.dropView('read_only_existing'),
+                /View deletion is unavailable because the database is read-only/
+            );
+            await assert.rejects(
+                () => engine.executeQuery('DROP VIEW main.read_only_existing'),
+                /readonly/i
+            );
+
             assert.strictEqual(
                 await readScalar(
                     engine,
                     "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'read_only_view'"
                 ),
                 0
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM read_only_existing'),
+                'original'
             );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();

@@ -464,13 +464,17 @@ describe('editor keyboard and grid selection interactions', () => {
         const engine = database.operations!;
         const originalReadWorkspaceFileUri = backendApi.readWorkspaceFileUri;
         const originalUpdateCell = backendApi.updateCell;
-        const initialValue = new Uint8Array([1]);
+        // The grid's number contract rounded the stored int64 and retained its
+        // exact digits in the sparse sidecar before the user dropped a BLOB.
+        const initialValue = 9007199254740992;
         const concurrentValue = new Uint8Array([4, 5]);
         const uploadedValue = new Uint8Array([9, 8, 7]);
         let recordedModification: any;
 
-        await engine.executeQuery('CREATE TABLE uploads (payload BLOB)');
-        await engine.executeQuery('INSERT INTO uploads (payload) VALUES (?)', [initialValue]);
+        await engine.executeQuery(
+            'CREATE TABLE uploads (payload); ' +
+            'INSERT INTO uploads (payload) VALUES (9007199254740993)'
+        );
         const bridge = new HostBridge({
             webviews: new Map(),
             context: {},
@@ -487,8 +491,9 @@ describe('editor keyboard and grid selection interactions', () => {
         backendApi.updateCell = (...args: any[]) => (bridge.updateCell as any)(...args);
         state.selectedTable = 'uploads';
         state.selectedTableType = 'table';
-        state.tableColumns = [{ name: 'payload', type: 'BLOB' }];
+        state.tableColumns = [{ name: 'payload', type: '' }];
         state.gridData = [[1, initialValue]];
+        state.gridExactIntegerTexts = { 0: { 1: '9007199254740993' } };
         state.isReadOnly = false;
         state.isGridReloading = false;
         initDragAndDrop();
@@ -513,6 +518,11 @@ describe('editor keyboard and grid selection interactions', () => {
             await pendingDrop;
 
             assert.ok(recordedModification, 'the upload modification was not recorded');
+            assert.deepStrictEqual(
+                state.gridExactIntegerTexts,
+                {},
+                'the BLOB must not retain the replaced INTEGER text sidecar'
+            );
             await engine.undoModification(recordedModification);
             const result = await engine.executeQuery(
                 'SELECT payload FROM uploads WHERE rowid = ?',

@@ -10,7 +10,7 @@ import { createDeferred } from './helpers/deferred';
 import { ModificationTracker } from '../../src/core/undo-history';
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
 import { NativeWorkerProcess } from '../../src/nativeWorker';
-import type { DatabaseOperations, LabeledModification } from '../../src/core/types';
+import type { DatabaseOperations, LabeledModification, ModificationEntry } from '../../src/core/types';
 
 const databaseModelPath = path.resolve(__dirname, '../../src/databaseModel.ts');
 const databaseModelSource = fs.readFileSync(databaseModelPath, 'utf8');
@@ -1146,10 +1146,34 @@ describe('DatabaseDocument hot-exit restore', () => {
         const backupData = tracker.serialize();
         let applyWasCalled = false;
         let appliedModificationCount = 0;
+        let appliedModifications: ModificationEntry[] = [];
+        let rawBigIntBindObserved = false;
+        const wasmInstance = (engine as unknown as {
+            instance: {
+                iterateStatements(sql: string): Iterable<{
+                    bind(params?: unknown[]): boolean;
+                }>;
+            };
+        }).instance;
+        const originalIterateStatements = wasmInstance.iterateStatements.bind(wasmInstance);
+        wasmInstance.iterateStatements = function* (sql: string) {
+            for (const statement of originalIterateStatements(sql)) {
+                const originalBind = statement.bind.bind(statement);
+                statement.bind = (params?: unknown[]) => {
+                    if (params?.some(value => typeof value === 'bigint')) {
+                        rawBigIntBindObserved = true;
+                        throw new Error('BigInt reached the sql.js binding boundary');
+                    }
+                    return originalBind(params);
+                };
+                yield statement;
+            }
+        };
         const originalApplyModifications = engine.applyModifications.bind(engine);
         engine.applyModifications = async (mods, signal) => {
             applyWasCalled = true;
             appliedModificationCount = mods.length;
+            appliedModifications = mods;
             return originalApplyModifications(mods, signal);
         };
 
@@ -1204,9 +1228,25 @@ describe('DatabaseDocument hot-exit restore', () => {
                 "SELECT id, name, CAST(counter AS TEXT) FROM restored_items ORDER BY id"
             );
 
+            assert.strictEqual(
+                rawBigIntBindObserved,
+                false,
+                'hot-exit replay must normalize BigInt before binding through sql.js'
+            );
             assert.strictEqual(applyWasCalled, true);
             assert.strictEqual(appliedModificationCount, 3);
             assert.deepStrictEqual(restoredRows[0].rows, [[1, 'Recovered', '9007199254740995']]);
+
+            await engine.undoModification(appliedModifications[2]);
+            const undoneCounter = await engine.executeQuery(
+                'SELECT CAST(counter AS TEXT) FROM restored_items WHERE id = 1'
+            );
+            assert.deepStrictEqual(undoneCounter[0].rows, [['9007199254740993']]);
+            assert.strictEqual(
+                rawBigIntBindObserved,
+                false,
+                'unsafe INTEGER priorValue must also be normalized before sql.js undo binding'
+            );
         } finally {
             Object.defineProperty(mockVscode.workspace, 'fs', {
                 value: originalFs,

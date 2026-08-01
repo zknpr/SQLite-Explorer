@@ -4,7 +4,7 @@
 import { backendApi } from './api.js';
 import { updateStatus } from './ui.js';
 import { state } from './state.js';
-import { getRowId, getRowDataOffset } from './data-utils.js';
+import { clearExactIntegerText, getRowId, getRowDataOffset } from './data-utils.js';
 import { formatCellValueAsText } from './utils.js';
 import { renderDataGrid } from './grid.js';
 
@@ -233,6 +233,7 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
             ));
             if (currentRowIdx >= 0 && currentColIdx >= 0) {
                 state.gridData[currentRowIdx][currentColIdx + getRowDataOffset()] = uint8Array;
+                clearExactIntegerText(currentRowIdx, currentColIdx);
                 const currentCell = document.getElementById(`cell-${currentRowIdx}-${currentColIdx}`);
                 if (currentCell) updateCellDom(currentCell, uint8Array);
             }

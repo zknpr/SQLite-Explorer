@@ -3,6 +3,10 @@
  * Handles outgoing RPC requests to the extension host.
  */
 
+import { RPC_TIMEOUT_MS } from './rpc-constants.js';
+
+export { RPC_TIMEOUT_MS };
+
 const vscodeApi = typeof acquireVsCodeApi !== 'undefined' ? acquireVsCodeApi() : null;
 
 /**
@@ -23,9 +27,6 @@ export function saveVsCodeState(stateObj) {
         vscodeApi.setState(stateObj);
     }
 }
-
-// Default RPC timeout in milliseconds (60s to accommodate large blob operations)
-export const RPC_TIMEOUT_MS = 60000;
 
 // Message ID tracking
 let rpcMessageId = 0;

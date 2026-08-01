@@ -182,6 +182,31 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.strictEqual(preview.exactIntegerTexts?.[0]?.[0], '9007199254740993');
         });
 
+        await testContext.test('carries integral REAL storage text through native data and previews', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_integral_reals (value); ' +
+                'INSERT INTO native_integral_reals(value) VALUES (CAST(1 AS REAL))'
+            );
+            const result = await engine.fetchTableData('native_integral_reals', {
+                columns: ['value'],
+                globalFilterColumns: ['value'],
+                globalFilter: '.',
+                limit: 10,
+                offset: 0
+            });
+            assert.strictEqual(result.rows[0][0], 1);
+            assert.strictEqual(result.exactIntegerTexts?.[0]?.[0], '1.0');
+
+            const preview = await engine.previewViewDefinition(
+                'native_integral_real_preview',
+                'SELECT CAST(1 AS REAL) AS value',
+                10,
+                'create'
+            );
+            assert.strictEqual(preview.rows[0][0], 1);
+            assert.strictEqual(preview.exactIntegerTexts?.[0]?.[0], '1.0');
+        });
+
         await testContext.test('validates and previews with a legal disposable view name', async () => {
             await engine.validateViewDefinition('preview_candidate', USER_VIEW_BODY, 'create');
             const preview = await engine.previewViewDefinition(

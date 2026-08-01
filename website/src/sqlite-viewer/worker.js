@@ -26,7 +26,10 @@ import {
 } from '../../../src/core/view-utils.ts';
 import { escapeLikePattern } from '../../../src/core/sql-utils.ts';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
-import { normalizeIntegerRowsForTransport } from '../../../src/core/integer-utils.ts';
+import {
+  buildExactNumericTextQuery,
+  normalizeIntegerRowsForTransport
+} from '../../../src/core/integer-utils.ts';
 
 // ============================================================================
 // Configuration
@@ -173,7 +176,11 @@ function compileSingleStatement(sql) {
 }
 
 function querySingleStatement(sql) {
-  const statement = prepareSingleStatement(sql);
+  const sourceStatement = prepareSingleStatement(sql);
+  const headers = sourceStatement.getColumnNames();
+  sourceStatement.free();
+  const transportQuery = buildExactNumericTextQuery(sql, headers.length);
+  const statement = prepareSingleStatement(transportQuery.sql);
   const sourceRows = [];
   const startedAt = Date.now();
   try {
@@ -185,8 +192,10 @@ function querySingleStatement(sql) {
       if (!hasRow) break;
       sourceRows.push(statement.get(null, { useBigInt: true }));
     }
-    const headers = statement.getColumnNames();
-    const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(sourceRows);
+    const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+      sourceRows,
+      headers.length
+    );
     return { headers, rows, exactIntegerTexts };
   } finally {
     statement.free();
@@ -531,15 +540,22 @@ async function fetchTableData(table, options = {}) {
   // Add pagination
   sql += ` LIMIT ${parseInt(limit, 10)} OFFSET ${parseInt(offset, 10)}`;
 
-  const results = db.exec(sql, params, { useBigInt: true });
+  const sourceStatement = db.prepare(sql, params);
+  const headers = sourceStatement.getColumnNames();
+  sourceStatement.free();
+  const transportQuery = buildExactNumericTextQuery(sql, headers.length);
+  const results = db.exec(transportQuery.sql, params, { useBigInt: true });
 
   if (results.length === 0) {
-    return { headers: [], rows: [] };
+    return { headers, rows: [] };
   }
 
-  const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(results[0].values);
+  const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+    results[0].values,
+    headers.length
+  );
   return {
-    headers: results[0].columns,
+    headers,
     rows,
     exactIntegerTexts
   };

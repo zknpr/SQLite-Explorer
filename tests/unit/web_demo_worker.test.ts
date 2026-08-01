@@ -632,6 +632,35 @@ describe('web demo view worker', () => {
         assert.strictEqual(preview.exactIntegerTexts[0][0], '9007199254740993');
     });
 
+    it('returns integral REAL storage text from demo table fetches and previews', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_integral_reals (value); ' +
+            'INSERT INTO demo_integral_reals(value) VALUES (CAST(1 AS REAL))'
+        );
+
+        const data = await worker.invoke('fetchTableData', 'demo_integral_reals', {
+            columns: ['value'],
+            globalFilterColumns: ['value'],
+            globalFilter: '.',
+            limit: 100,
+            offset: 0
+        });
+        assert.strictEqual(data.rows[0][0], 1);
+        assert.strictEqual(data.exactIntegerTexts[0][0], '1.0');
+
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'demo_integral_real_preview',
+            'SELECT CAST(1 AS REAL) AS value',
+            10,
+            'create'
+        );
+        assert.strictEqual(preview.rows[0][0], 1);
+        assert.strictEqual(preview.exactIntegerTexts[0][0], '1.0');
+    });
+
     it('uses the same narrowed global-filter columns for demo data and counts', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

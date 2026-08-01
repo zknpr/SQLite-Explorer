@@ -40,6 +40,19 @@ beforeEach(() => {
     confirmResult = false;
 });
 
+it('re-exports one shared RPC timeout from both UI transports', async () => {
+    const sharedModulePath = '../../core/ui/modules/rpc-constants.js';
+    const extensionApiModulePath = '../../core/ui/modules/api.js';
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const shared = await import(sharedModulePath).catch(() => null);
+    assert.ok(shared, 'RPC transports must consume one shared timeout module');
+    const extensionApi = await import(extensionApiModulePath);
+    const webApi = await import(webApiModulePath);
+
+    assert.strictEqual(extensionApi.RPC_TIMEOUT_MS, shared.RPC_TIMEOUT_MS);
+    assert.strictEqual(webApi.RPC_TIMEOUT_MS, shared.RPC_TIMEOUT_MS);
+});
+
 after(() => {
     delete (globalThis as any).window;
 });
