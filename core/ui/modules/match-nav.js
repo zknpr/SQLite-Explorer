@@ -16,7 +16,8 @@ import {
     appendHighlightedText,
     buildHighlightMatcher,
     foldAsciiCase,
-    formatCellValueAsText
+    formatCellValueAsText,
+    truncateAtSqliteTextNul
 } from './utils.js';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 import { revealGridCell } from './grid-reveal.js';
@@ -133,8 +134,8 @@ function getMatchingTextCandidate(value, col, term, exactIntegerText) {
         return null;
     }
 
-    const rawText = String(value);
-    const formattedText = String(formatCellValueAsText(
+    const rawText = truncateAtSqliteTextNul(value);
+    const formattedText = truncateAtSqliteTextNul(formatCellValueAsText(
         value,
         col.type,
         state.dateFormat,

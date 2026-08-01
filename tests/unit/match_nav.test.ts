@@ -373,6 +373,56 @@ describe('filter match navigation', () => {
         assert.strictEqual(cell.classList.contains('active-match-cell'), false);
     });
 
+    it('does not navigate to text after SQLite\'s NUL terminator', async () => {
+        const cell = {
+            classList: createClassList(),
+            scrollIntoView() {}
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cell-0-0') return cell;
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.tableColumns = [{ name: 'payload', type: 'TEXT' }];
+        state.gridData = [['abc\0needle']];
+        state.dateFormat = 'raw';
+        state.filterQuery = 'needle';
+        state.columnFilters = {};
+        resetMatchNav();
+
+        navigateMatches(GLOBAL_MATCH_SCOPE);
+
+        assert.deepStrictEqual(state.matchNav.matches, []);
+        assert.strictEqual(cell.classList.contains('active-match-cell'), false);
+    });
+
+    it('does not highlight text after SQLite\'s NUL terminator', async () => {
+        const children: any[] = [];
+        (globalThis as any).document = {
+            createTextNode(text: string) { return { textContent: text }; },
+            createElement() { return { className: '', textContent: '' }; }
+        };
+        const utilsModulePath = '../../core/ui/modules/utils.js';
+        const { appendHighlightedText, buildHighlightMatcher } = await import(utilsModulePath);
+        const parent = { appendChild(child: any) { children.push(child); } };
+
+        appendHighlightedText(parent, 'abc\0needle', buildHighlightMatcher(['needle']));
+
+        assert.strictEqual(
+            children.some(child => child.className === 'cell-highlight'),
+            false
+        );
+        assert.strictEqual(children.map(child => child.textContent).join(''), 'abc\0needle');
+    });
+
     it('matches SQLite REAL text coercion for exponent and integer-valued numbers', async () => {
         const cell = {
             classList: createClassList(),

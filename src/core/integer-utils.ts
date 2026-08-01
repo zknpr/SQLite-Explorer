@@ -39,8 +39,12 @@ export function buildExactNumericTextQuery(
   ));
 
   return {
+    // MATERIALIZED is an integrity barrier, not a performance hint here. If
+    // SQLite flattens this CTE, each typeof/comparison/cast reference may
+    // reevaluate a nondeterministic source expression and describe a value
+    // different from the one returned in the same transport row.
     sql:
-      `WITH ${quotedSource} (${quotedValues.join(', ')}) AS (\n${sourceSql}\n)\n` +
+      `WITH ${quotedSource} (${quotedValues.join(', ')}) AS MATERIALIZED (\n${sourceSql}\n)\n` +
       `SELECT ${[...quotedValues, ...exactTextExpressions].join(', ')} FROM ${quotedSource}`,
     transportColumns: [...valueColumns, ...textColumns]
   };

@@ -31,6 +31,13 @@ export function foldAsciiCase(str) {
     return String(str).replace(/[A-Z]/g, char => char.toLowerCase());
 }
 
+/** SQLite's built-in LIKE treats the first NUL as the end of a TEXT value. */
+export function truncateAtSqliteTextNul(value) {
+    const text = String(value);
+    const nulIndex = text.indexOf('\0');
+    return nulIndex < 0 ? text : text.slice(0, nulIndex);
+}
+
 function escapeAsciiCaseInsensitiveRegExp(str) {
     return escapeRegExp(str).replace(/[A-Za-z]/g, char => {
         const lower = foldAsciiCase(char);
@@ -71,13 +78,18 @@ export function appendHighlightedText(parentEl, text, matcher) {
         return;
     }
 
+    // Match only the prefix SQLite LIKE can inspect. Preserve the suffix for
+    // display, but never mark text that SQL could not have matched.
+    const searchableText = truncateAtSqliteTextNul(text);
+    const displaySuffix = text.slice(searchableText.length);
+
     // The matcher is shared across cells; reset its state before scanning.
     matcher.lastIndex = 0;
     let lastIndex = 0;
     let match;
-    while ((match = matcher.exec(text)) !== null) {
+    while ((match = matcher.exec(searchableText)) !== null) {
         if (match.index > lastIndex) {
-            parentEl.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+            parentEl.appendChild(document.createTextNode(searchableText.slice(lastIndex, match.index)));
         }
         const mark = document.createElement('mark');
         mark.className = 'cell-highlight';
@@ -86,8 +98,11 @@ export function appendHighlightedText(parentEl, text, matcher) {
         lastIndex = match.index + match[0].length;
         if (match[0].length === 0) matcher.lastIndex++; // guard against zero-length matches
     }
-    if (lastIndex < text.length) {
-        parentEl.appendChild(document.createTextNode(text.slice(lastIndex)));
+    if (lastIndex < searchableText.length) {
+        parentEl.appendChild(document.createTextNode(searchableText.slice(lastIndex)));
+    }
+    if (displaySuffix) {
+        parentEl.appendChild(document.createTextNode(displaySuffix));
     }
 }
 

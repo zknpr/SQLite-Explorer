@@ -661,6 +661,26 @@ describe('web demo view worker', () => {
         assert.strictEqual(preview.exactIntegerTexts[0][0], '1.0');
     });
 
+    it('derives demo numeric sidecars from one evaluation of random expressions', async () => {
+        const worker = await createWorkerHarness();
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'demo_random_numeric_preview',
+            'WITH RECURSIVE sequence(n) AS (' +
+            'SELECT 1 UNION ALL SELECT n + 1 FROM sequence WHERE n < 24' +
+            ') SELECT CAST(random() % 1000000 AS REAL) AS value FROM sequence',
+            24,
+            'create'
+        );
+
+        assert.strictEqual(preview.rows.length, 24);
+        for (let rowIndex = 0; rowIndex < preview.rows.length; rowIndex++) {
+            const exactText = preview.exactIntegerTexts?.[rowIndex]?.[0];
+            assert.strictEqual(typeof exactText, 'string', `missing sidecar for row ${rowIndex}`);
+            assert.strictEqual(Number(exactText), preview.rows[rowIndex][0]);
+        }
+    });
+
     it('uses the same narrowed global-filter columns for demo data and counts', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

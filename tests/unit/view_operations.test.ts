@@ -383,6 +383,55 @@ describe('view operations', () => {
         }
     });
 
+    it('does not attribute an attached-schema TEMP trigger to a same-named main view', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE TABLE attached_main_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO attached_main_rows VALUES (3)');
+            await engine.executeQuery(
+                'CREATE VIEW attached_trigger_view AS SELECT value FROM attached_main_rows'
+            );
+            await engine.executeQuery("ATTACH DATABASE ':memory:' AS aux");
+            await engine.executeQuery('CREATE TABLE aux.attached_aux_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO aux.attached_aux_rows VALUES (7)');
+            await engine.executeQuery(
+                'CREATE VIEW aux.attached_trigger_view AS SELECT value FROM attached_aux_rows'
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TABLE attached_trigger_log (target TEXT, value INTEGER)'
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TRIGGER attached_aux_insert ' +
+                'INSTEAD OF INSERT ON aux.attached_trigger_view ' +
+                "BEGIN INSERT INTO attached_trigger_log VALUES ('aux', NEW.value); END"
+            );
+
+            const edit = await engine.editView(
+                'attached_trigger_view',
+                'SELECT value * 2 AS value FROM attached_main_rows',
+                true
+            );
+
+            assert.deepStrictEqual(edit.before.triggers, []);
+            assert.deepStrictEqual(edit.after.triggers, []);
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM main.attached_trigger_view'),
+                6
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM aux.attached_trigger_view'),
+                7
+            );
+            await engine.executeQuery('INSERT INTO aux.attached_trigger_view VALUES (19)');
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM attached_trigger_log'),
+                19
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('preserves an explicit view column list when replacing its SELECT body', async () => {
         const engine = await createEngine();
         try {
@@ -891,6 +940,29 @@ describe('view operations', () => {
 
             assert.strictEqual(preview.rows[0][0], 1);
             assert.strictEqual(preview.exactIntegerTexts?.[0]?.[0], '1.0');
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('derives WASM numeric sidecars from one evaluation of random expressions', async () => {
+        const engine = await createEngine();
+        try {
+            const preview = await engine.previewViewDefinition(
+                'random_numeric_preview',
+                'WITH RECURSIVE sequence(n) AS (' +
+                'SELECT 1 UNION ALL SELECT n + 1 FROM sequence WHERE n < 24' +
+                ') SELECT CAST(random() % 1000000 AS REAL) AS value FROM sequence',
+                24,
+                'create'
+            );
+
+            assert.strictEqual(preview.rows.length, 24);
+            for (let rowIndex = 0; rowIndex < preview.rows.length; rowIndex++) {
+                const exactText = preview.exactIntegerTexts?.[rowIndex]?.[0];
+                assert.strictEqual(typeof exactText, 'string', `missing sidecar for row ${rowIndex}`);
+                assert.strictEqual(Number(exactText), preview.rows[rowIndex][0]);
+            }
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
         }

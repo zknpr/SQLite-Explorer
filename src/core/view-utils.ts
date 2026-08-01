@@ -189,18 +189,19 @@ export function mapViewTriggerRows(
         if (row[2] !== 0 && row[2] !== 0n && !hasTempShadow) {
           throw new Error(`Temporary view shadow state is unavailable for ${view}`);
         }
-        if (hasTempShadow) {
-          let targetSchema: string | undefined;
-          try {
-            targetSchema = extractTriggerTargetSchema(row[1]);
-          } catch (error) {
-            const detail = error instanceof Error ? error.message : String(error);
-            throw new Error(
-              `Unable to determine the target of temporary trigger ${row[0]}: ${detail}`
-            );
-          }
-          if (targetSchema?.toLowerCase() !== 'main') return [];
+        let targetSchema: string | undefined;
+        try {
+          targetSchema = extractTriggerTargetSchema(row[1]);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `Unable to determine the target of temporary trigger ${row[0]}: ${detail}`
+          );
         }
+        // Explicit schema qualification is authoritative even without a TEMP
+        // shadow: aux.v must never be captured as a trigger on main.v.
+        if (targetSchema !== undefined && targetSchema.toLowerCase() !== 'main') return [];
+        if (targetSchema === undefined && hasTempShadow) return [];
       }
       return source.temporary
         ? [{ identifier: row[0], sql: row[1], temporary: true }]
