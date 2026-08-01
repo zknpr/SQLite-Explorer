@@ -466,11 +466,14 @@ export class HostBridge implements ToastService {
   /** Create a view and record enough state for save, undo, and redo. */
   async createView(view: string, selectSql: string) {
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
     if (this.isReadOnly) {
       throw new Error('Document is read-only');
     }
 
+    this.assertConnectionGeneration(connectionGeneration);
     const definition = await dbOps.createView(view, selectSql);
+    this.assertConnectionGeneration(connectionGeneration);
     this.document.recordExternalModification({
       label: 'Create View',
       description: `Create view ${view}`,

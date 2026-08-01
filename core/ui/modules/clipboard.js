@@ -5,7 +5,7 @@ import { state } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus, updateToolbarButtons } from './ui.js';
 import { loadTableData } from './grid.js';
-import { getRowDataOffset } from './data-utils.js';
+import { getCellValueForDisplay, getRowDataOffset } from './data-utils.js';
 import { validateRowId, escapeIdentifier } from './utils.js';
 
 export async function copyCellsToClipboard() {
@@ -15,7 +15,11 @@ export async function copyCellsToClipboard() {
         let clipboardText;
 
         if (state.selectedCells.length === 1) {
-            const value = state.selectedCells[0].value;
+            const cell = state.selectedCells[0];
+            const row = state.gridData[cell.rowIdx];
+            const value = row
+                ? getCellValueForDisplay(row, cell.rowIdx, cell.colIdx)
+                : cell.value;
             if (value === null || value === undefined) {
                 clipboardText = '';
             } else if (value instanceof Uint8Array) {
@@ -30,7 +34,11 @@ export async function copyCellsToClipboard() {
 
             const cellMap = new Map();
             for (const cell of state.selectedCells) {
-                cellMap.set(`${cell.rowIdx},${cell.colIdx}`, cell.value);
+                const row = state.gridData[cell.rowIdx];
+                cellMap.set(
+                    `${cell.rowIdx},${cell.colIdx}`,
+                    row ? getCellValueForDisplay(row, cell.rowIdx, cell.colIdx) : cell.value
+                );
             }
 
             const lines = [];
@@ -81,9 +89,8 @@ export async function copySelectedRowsToClipboard() {
             }
 
             if (state.selectedRowIds.has(rowId)) {
-                // Get data columns only (skip rowid)
-                const dataStart = state.selectedTableType === 'table' ? 1 : 0;
-                const rowData = row.slice(dataStart).map(val => {
+                const rowData = state.tableColumns.map((_column, colIdx) => {
+                    const val = getCellValueForDisplay(row, i, colIdx);
                     if (val === null || val === undefined) return '';
                     if (val instanceof Uint8Array) return '[BLOB]';
                     return String(val);

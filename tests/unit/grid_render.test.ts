@@ -58,6 +58,7 @@ describe('grid header rendering', () => {
         const { state } = await import(stateModulePath);
         state.tableColumns = [];
         state.gridData = [];
+        state.gridExactIntegerTexts = {};
         state.columnWidths = {};
         state.columnFilters = {};
         state.filterQuery = '';
@@ -122,5 +123,52 @@ describe('grid header rendering', () => {
         assert.strictEqual(filterInput.value, hostileFilter);
         assert.strictEqual(clearButton.ariaLabel, `Clear filter for ${hostileColumn}`);
         assert.strictEqual(clearButton.hidden, false);
+    });
+
+    it('renders authoritative numeric sidecar text instead of a rounded Number', async () => {
+        const { state } = await import(stateModulePath);
+        const { renderDataGrid } = await import(gridRenderModulePath);
+        const elements = new Map<string, FakeNode>([
+            ['gridContainer', new FakeNode('div')],
+            ['pageIndicator', new FakeNode('span')],
+            ['btnFirst', new FakeNode('button')],
+            ['btnPrev', new FakeNode('button')],
+            ['btnNext', new FakeNode('button')],
+            ['btnLast', new FakeNode('button')]
+        ]);
+        (globalThis as any).document = {
+            createElement(tagName: string) {
+                return new FakeNode(tagName);
+            },
+            createDocumentFragment() {
+                return new FakeNode('#fragment');
+            },
+            createTextNode(text: string) {
+                const node = new FakeNode('#text');
+                node.textContent = text;
+                return node;
+            },
+            getElementById(id: string) {
+                return elements.get(id) ?? null;
+            },
+            querySelectorAll() {
+                return [];
+            },
+            querySelector() {
+                return null;
+            }
+        };
+        state.selectedTableType = 'view';
+        state.tableColumns = [{ name: 'value', type: 'INTEGER', isPrimaryKey: false }];
+        state.gridData = [[9007199254740992]];
+        state.gridExactIntegerTexts = { 0: { 0: '9007199254740993' } };
+        state.totalPageCount = 1;
+        state.currentPageIndex = 0;
+
+        renderDataGrid();
+
+        const text = findByClass(elements.get('gridContainer')!, 'cell-text');
+        assert.ok(text);
+        assert.strictEqual(text.children.map(child => child.textContent).join(''), '9007199254740993');
     });
 });

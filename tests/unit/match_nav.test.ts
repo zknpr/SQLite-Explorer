@@ -630,6 +630,44 @@ describe('filter match navigation', () => {
         }
     });
 
+    it('does not match the lossy Number rendering when authoritative SQLite text exists', async () => {
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                return id === 'filterMatchCounter' ? { textContent: '' } : null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        const originalState = {
+            selectedTableType: state.selectedTableType,
+            tableColumns: state.tableColumns,
+            gridData: state.gridData,
+            gridExactIntegerTexts: state.gridExactIntegerTexts,
+            filterQuery: state.filterQuery,
+            columnFilters: state.columnFilters
+        };
+        try {
+            state.selectedTableType = 'view';
+            state.tableColumns = [{ name: 'value', type: 'INTEGER' }];
+            state.gridData = [[9007199254740992]];
+            state.gridExactIntegerTexts = { 0: { 0: '9007199254740993' } };
+            state.filterQuery = '0992';
+            state.columnFilters = {};
+            resetMatchNav();
+
+            navigateMatches(GLOBAL_MATCH_SCOPE);
+
+            assert.deepStrictEqual(state.matchNav.matches, []);
+        } finally {
+            Object.assign(state, originalState);
+            resetMatchNav();
+        }
+    });
+
     it('does not navigate a match found only in the hidden table rowid', async () => {
         (globalThis as any).document = {
             getElementById(id: string) {

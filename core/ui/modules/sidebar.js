@@ -5,7 +5,7 @@ import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus } from './ui.js';
 import { loadTableData, loadTableColumns } from './grid.js';
-import { getRowDataOffset } from './data-utils.js';
+import { getCellValueForDisplay, getRowDataOffset } from './data-utils.js';
 import { openCreateTableModal } from './crud.js';
 import { openSettingsModal } from './settings.js';
 import { openCreateViewModal, openEditViewModal, dropViewFromSidebar } from './views.js';
@@ -309,7 +309,13 @@ export function updateBatchSidebar() {
     countBadge.textContent = cellCount;
 
     // Analyze selected cells - group by column (see batch-update-logic.js)
-    const columns = groupSelectedCellsByColumn(state.selectedCells, state.tableColumns);
+    const visibleCells = state.selectedCells.map(cell => {
+        const row = state.gridData[cell.rowIdx];
+        return row
+            ? { ...cell, value: getCellValueForDisplay(row, cell.rowIdx, cell.colIdx) }
+            : cell;
+    });
+    const columns = groupSelectedCellsByColumn(visibleCells, state.tableColumns);
 
     fieldsContainer.replaceChildren();
     const fragment = document.createDocumentFragment();

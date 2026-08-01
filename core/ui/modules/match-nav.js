@@ -62,7 +62,7 @@ function getMatchingTextCandidate(value, term, exactIntegerText) {
     const rawText = truncateAtSqliteTextNul(value);
     const candidates = exactIntegerText === undefined
         ? [rawText]
-        : [exactIntegerText, rawText];
+        : [truncateAtSqliteTextNul(exactIntegerText)];
     return candidates.find(candidate => foldAsciiCase(candidate).includes(term)) ?? null;
 }
 
@@ -91,12 +91,13 @@ function excerptAroundMatch(text, term, maxLength = 100) {
  * made the cell a match.
  */
 export function formatCellValueForActiveMatch(value, col, term, exactIntegerText) {
+    const displayValue = exactIntegerText ?? value;
     if (!term) {
-        return formatCellValueAsText(value, col.type, state.dateFormat, col.name);
+        return formatCellValueAsText(displayValue, col.type, state.dateFormat, col.name);
     }
     const candidate = getMatchingTextCandidate(value, term, exactIntegerText);
     return candidate === null
-        ? formatCellValueAsText(value, col.type, state.dateFormat, col.name)
+        ? formatCellValueAsText(displayValue, col.type, state.dateFormat, col.name)
         : excerptAroundMatch(candidate, term);
 }
 
@@ -135,9 +136,12 @@ function renderMatchCellText(cellEl, rowIdx, colIdx, term) {
 
     const value = getCellValue(row, colIdx);
     const exactIntegerText = getExactIntegerText(rowIdx, colIdx);
-    const displayValue = term
-        ? formatCellValueForActiveMatch(value, col, term, exactIntegerText)
-        : formatCellValueAsText(value, col.type, state.dateFormat, col.name);
+    const displayValue = formatCellValueForActiveMatch(
+        value,
+        col,
+        term,
+        exactIntegerText
+    );
     const matcher = buildHighlightMatcher([state.filterQuery, state.columnFilters[col.name]]);
     textSpan.replaceChildren();
     appendHighlightedText(textSpan, displayValue, matcher);

@@ -5,7 +5,7 @@ import { renderDataGrid } from './grid-render.js';
 import { updateSelectionStates } from './grid-selection.js';
 import { updateStatus, updateToolbarButtons } from './ui.js';
 import { updateBatchSidebar } from './sidebar.js';
-import { getRowId, getCellValue } from './data-utils.js';
+import { getRowId, getCellValue, getCellValueForDisplay } from './data-utils.js';
 import { openCellPreview, startCellEdit, openCellInVsCode } from './edit.js';
 import {
     GLOBAL_MATCH_SCOPE,
@@ -763,7 +763,8 @@ export function onCellDoubleClick(event, rowIdx, colIdx, rowId) {
             colIdx,
             rowId,
             columnName: column.name,
-            originalValue: value
+            originalValue: value,
+            originalText: String(getCellValueForDisplay(row, rowIdx, colIdx) ?? '')
         };
         openCellInVsCode();
 

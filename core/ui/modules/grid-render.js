@@ -4,6 +4,7 @@ import { formatCellValueForActiveMatch } from './match-nav.js';
 import {
     getRowId,
     getCellValue,
+    getCellValueForDisplay,
     getExactIntegerText,
     getOrderedColumnIndices,
     getOrderedRowIndices
@@ -242,6 +243,7 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
             const hasContent = !isNull && !(value instanceof Uint8Array);
             const colWidth = state.columnWidths[col.name] || 120;
             const isActiveMatch = !!activeMatch && activeMatch.rowIdx === rowIdx && activeMatch.colIdx === originalColIdx;
+            const visibleValue = getCellValueForDisplay(row, rowIdx, originalColIdx);
             const displayValue = isActiveMatch
                 ? formatCellValueForActiveMatch(
                     value,
@@ -249,7 +251,7 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
                     state.matchNav.term,
                     getExactIntegerText(rowIdx, originalColIdx)
                 )
-                : formatCellValueAsText(value, col.type, state.dateFormat, col.name);
+                : formatCellValueAsText(visibleValue, col.type, state.dateFormat, col.name);
 
             const td = document.createElement('td');
             td.id = `cell-${rowIdx}-${originalColIdx}`;

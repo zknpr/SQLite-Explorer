@@ -237,6 +237,42 @@ describe('HostBridge', () => {
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
+    it('does not record a created view after Reload supersedes its connection', async () => {
+        const definition = {
+            identifier: 'created_view',
+            sql: 'CREATE VIEW created_view AS SELECT 1 AS value',
+            selectSql: 'SELECT 1 AS value',
+            triggers: []
+        };
+        let connectionGeneration = 7;
+        const createStarted = createDeferred<void>();
+        const createResult = createDeferred<typeof definition>();
+        const dbOps = {
+            createView: mock.fn(async () => {
+                createStarted.resolve();
+                return createResult.promise;
+            })
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            get connectionGeneration() { return connectionGeneration; },
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        const pending = bridge.createView('created_view', 'SELECT 1 AS value');
+        await createStarted.promise;
+        connectionGeneration++;
+        createResult.resolve(definition);
+
+        await assert.rejects(pending, /document was reloaded/i);
+        assert.strictEqual(dbOps.createView.mock.callCount(), 1);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
     it('rejects a cell update when the document reloads while its undo baseline is loading', async () => {
         const baseline = createDeferred<any>();
         const baselineStarted = createDeferred<void>();

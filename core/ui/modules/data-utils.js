@@ -23,6 +23,11 @@ export function getExactIntegerText(rowIdx, colIdx) {
     return state.gridExactIntegerTexts?.[rowIdx]?.[colIdx + getRowDataOffset()];
 }
 
+/** Return the authoritative user-visible value when SQLite supplied one. */
+export function getCellValueForDisplay(row, rowIdx, colIdx) {
+    return getExactIntegerText(rowIdx, colIdx) ?? getCellValue(row, colIdx);
+}
+
 export function clearExactIntegerText(rowIdx, colIdx) {
     const exactRow = state.gridExactIntegerTexts?.[rowIdx];
     if (!exactRow) return;

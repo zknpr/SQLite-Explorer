@@ -10,6 +10,7 @@ import { loadTableData } from './grid-data.js';
 import {
     getRowDataOffset,
     getCellValue,
+    getCellValueForDisplay,
     clearExactIntegerText,
     getRowId,
     getOrderedColumnIndices,
@@ -96,11 +97,12 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
         colIdx,
         rowId,
         columnName: column.name,
-        originalValue: value
+        originalValue: value,
+        originalText: String(getCellValueForDisplay(row, rowIdx, colIdx) ?? '')
     };
 
     // Replace cell content with input
-    const currentText = value === null ? '' : String(value);
+    const currentText = state.editingCellInfo.originalText;
 
     cellEl.innerHTML = '';
     cellEl.classList.add('editing');
@@ -163,10 +165,10 @@ export async function saveCellEdit() {
 
     const editSession = state.editingCellInfo;
     const targetTable = state.selectedTable;
-    const { rowIdx, colIdx, rowId, columnName, originalValue } = editSession;
+    const { rowIdx, colIdx, rowId, columnName, originalValue, originalText } = editSession;
     const newValue = state.activeCellInput.value;
 
-    const origStr = originalValue === null ? '' : String(originalValue);
+    const origStr = originalText ?? (originalValue === null ? '' : String(originalValue));
     if (newValue === origStr) {
         cancelCellEdit();
         state.selectedCells = [];
@@ -236,7 +238,7 @@ export async function saveCellEdit() {
 async function saveCellEditAndMove(direction) {
     if (!state.editingCellInfo) return;
     const targetTable = state.selectedTable;
-    const { rowIdx, colIdx, originalValue } = state.editingCellInfo;
+    const { rowIdx, colIdx, originalValue, originalText } = state.editingCellInfo;
     const submittedValue = state.activeCellInput?.value;
 
     // Pin traversal to the pre-commit rendered ordering. A sort/filter-changing
@@ -268,8 +270,9 @@ async function saveCellEditAndMove(direction) {
     if (state.selectedTable !== targetTable) return;
     if (targetRowId === undefined || targetColumnName === undefined) return;
 
-    const originalText = originalValue === null ? '' : String(originalValue);
-    if (submittedValue !== originalText) {
+    const submittedOriginalText = originalText
+        ?? (originalValue === null ? '' : String(originalValue));
+    if (submittedValue !== submittedOriginalText) {
         // recordExternalModification posts refreshContent before the update RPC
         // response, but that broadcast is not awaited. Start an authoritative
         // post-commit reload after the editor is cleaned up; its load token
@@ -311,7 +314,7 @@ function cleanupCellEdit() {
 export async function openCellInVsCode() {
     if (!state.cellPreviewInfo) return;
 
-    const { rowIdx, colIdx, rowId, columnName, originalValue } = state.cellPreviewInfo;
+    const { rowIdx, colIdx, rowId, columnName, originalValue, originalText } = state.cellPreviewInfo;
     const column = state.tableColumns[colIdx];
 
     // We get the webview id from dataset if available or assume 'default'
@@ -328,7 +331,7 @@ export async function openCellInVsCode() {
             columnName,
             {}, // colTypes
             {
-                value: originalValue,
+                value: originalText ?? originalValue,
                 type: { type: column.type }, // Pass column type
                 webviewId,
                 rowCount: state.gridData.length
@@ -362,12 +365,14 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
         return;
     }
 
+    const originalText = String(getCellValueForDisplay(row, rowIdx, colIdx) ?? '');
     state.cellPreviewInfo = {
         rowIdx,
         colIdx,
         rowId,
         columnName: column.name,
-        originalValue: value
+        originalValue: value,
+        originalText
     };
 
     const modal = document.getElementById('cellPreviewModal');
@@ -388,7 +393,7 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     } else if (value instanceof Uint8Array) {
         displayValue = '[BLOB: ' + Array.from(value).map(b => b.toString(16).padStart(2, '0')).join(' ') + ']';
     } else {
-        displayValue = String(value);
+        displayValue = originalText;
     }
 
     textarea.value = displayValue;
@@ -455,11 +460,11 @@ export async function saveCellPreview() {
 
     const previewSession = state.cellPreviewInfo;
     const targetTable = state.selectedTable;
-    const { rowIdx, colIdx, rowId, columnName, originalValue } = previewSession;
+    const { rowIdx, colIdx, rowId, columnName, originalValue, originalText } = previewSession;
     const textarea = document.getElementById('cellPreviewTextarea');
     const newValue = textarea.value;
 
-    const origStr = originalValue === null ? '' : String(originalValue);
+    const origStr = originalText ?? (originalValue === null ? '' : String(originalValue));
     if (newValue === origStr) {
         closeCellPreview();
         state.selectedCells = [];
@@ -554,7 +559,9 @@ function updateCellDom(rowIdx, colIdx, value) {
     }
 
     const col = state.tableColumns[colIdx];
-    const displayValue = formatCellValueAsText(value, col?.type, state.dateFormat, col?.name);
+    const row = state.gridData[rowIdx];
+    const visibleValue = row ? getCellValueForDisplay(row, rowIdx, colIdx) : value;
+    const displayValue = formatCellValueAsText(visibleValue, col?.type, state.dateFormat, col?.name);
     const hasContent = value !== null && value !== undefined && !(value instanceof Uint8Array);
 
     // Use DOM creation with textContent for XSS prevention (defense-in-depth)
