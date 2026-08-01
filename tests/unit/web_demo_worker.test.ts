@@ -505,6 +505,23 @@ describe('web demo view worker', () => {
         assert.strictEqual(count, 0);
     });
 
+    it('falls back to selected columns when count globalFilterColumns is null', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE null_scoped_filters (visible TEXT, hidden TEXT); " +
+            "INSERT INTO null_scoped_filters VALUES ('shown', 'secret')"
+        );
+
+        const count = await worker.invoke('fetchTableCount', 'null_scoped_filters', {
+            columns: ['visible'],
+            globalFilterColumns: null,
+            globalFilter: 'secret'
+        });
+
+        assert.strictEqual(count, 0);
+    });
+
     it('treats whitespace-only filters as inactive but preserves padded terms', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

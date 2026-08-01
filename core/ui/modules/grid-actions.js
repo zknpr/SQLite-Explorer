@@ -2,7 +2,7 @@ import { state, persistState } from './state.js';
 import { loadTableData } from './grid-data.js';
 import { renderDataGrid } from './grid-render.js';
 import { updateSelectionStates } from './grid-selection.js';
-import { updateToolbarButtons } from './ui.js';
+import { updateStatus, updateToolbarButtons } from './ui.js';
 import { updateBatchSidebar } from './sidebar.js';
 import { getRowId, getCellValue } from './data-utils.js';
 import { openCellPreview, startCellEdit, openCellInVsCode } from './edit.js';
@@ -15,6 +15,7 @@ import {
 
 const FILTER_DEBOUNCE_MS = 300;
 const FILTER_RELOAD_RETRY_MS = 50;
+const FILTER_RELOAD_RETRY_LIMIT = 100;
 
 function getColumnFilterInput(columnName) {
     return [...document.querySelectorAll('.column-filter')]
@@ -85,15 +86,19 @@ function focusFilterInput(scope) {
     input.setSelectionRange?.(input.value.length, input.value.length);
 }
 
-function scheduleFilterApply(delay = FILTER_DEBOUNCE_MS, table = state.selectedTable) {
+function scheduleFilterApply(
+    delay = FILTER_DEBOUNCE_MS,
+    table = state.selectedTable,
+    reloadRetryCount = 0
+) {
     clearFilterTimer();
     state.filterTimer = setTimeout(() => {
         state.filterTimer = null;
-        return processFilterQueue(table);
+        return processFilterQueue(table, reloadRetryCount);
     }, delay);
 }
 
-async function processFilterQueue(table = state.selectedTable) {
+async function processFilterQueue(table = state.selectedTable, reloadRetryCount = 0) {
     // A table switch resets the filter state. Never let an old debounce reload or
     // focus a different table's controls.
     if (table !== state.selectedTable) {
@@ -120,8 +125,15 @@ async function processFilterQueue(table = state.selectedTable) {
     // Queue behind the owner of the reload guard instead of starting a competing
     // request. Input events still update state immediately while we wait.
     if (state.isGridReloading) {
-        scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table);
-        return;
+        if (reloadRetryCount >= FILTER_RELOAD_RETRY_LIMIT) {
+            state.filterApplyPending = false;
+            state.filterApplyTable = null;
+            state.filterPendingAction = null;
+            updateStatus('Filter not applied because the grid is still reloading.');
+            return false;
+        }
+        scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table, reloadRetryCount + 1);
+        return undefined;
     }
 
     if (state.filterApplyPending) {
@@ -135,7 +147,9 @@ async function processFilterQueue(table = state.selectedTable) {
             // A superseded request has another load in progress; retry when that
             // owner releases the guard. A real query failure remains retryable by
             // the next input/Enter without an automatic error loop.
-            if (result === undefined) scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table);
+            if (result === undefined) {
+                scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table, reloadRetryCount + 1);
+            }
             return result;
         }
         persistState();

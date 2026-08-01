@@ -569,7 +569,7 @@ async function fetchTableCount(table, options = {}) {
   // Global filter
   const activeGlobalFilter = getActiveFilterValue(globalFilter);
   if (activeGlobalFilter !== undefined) {
-    const searchCols = globalFilterColumns.filter(c => c !== 'rowid');
+    const searchCols = (globalFilterColumns ?? columns ?? []).filter(c => c !== 'rowid');
     if (searchCols.length > 0) {
       const globalClauses = searchCols.map(c => {
         const safeCol = c.replace(/"/g, '""');

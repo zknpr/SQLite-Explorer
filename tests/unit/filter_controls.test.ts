@@ -319,6 +319,34 @@ describe('filter controls', () => {
         }
     });
 
+    it('stops retrying and reports when a grid reload guard never clears', async () => {
+        const timers = installTimerHarness();
+        const { globalInput, elements } = installFilterDocument({ globalValue: 'needle' });
+        const state = await prepareState([{ name: 'value', type: 'TEXT' }]);
+        state.isGridReloading = true;
+
+        try {
+            const { onFilterInput } = await import(gridActionsModulePath);
+            onFilterInput({ target: globalInput, isComposing: false });
+            await timers.run(300);
+
+            let retryCount = 0;
+            while (timers.delays().includes(50) && retryCount < 200) {
+                await timers.run(50);
+                retryCount++;
+            }
+
+            assert.ok(retryCount < 200, 'reload retries must have a finite bound');
+            assert.deepStrictEqual(timers.delays(), []);
+            assert.strictEqual(state.filterApplyPending, false);
+            assert.strictEqual(state.filterApplyTable, null);
+            assert.strictEqual(state.filterPendingAction, null);
+            assert.match(elements.statusText.textContent, /filter.*not applied.*still reloading/i);
+        } finally {
+            timers.restore();
+        }
+    });
+
     it('uses Shift+Enter for previous-match navigation from the filter and grid', async () => {
         const focused: string[] = [];
         const cells = new Map<string, any>([

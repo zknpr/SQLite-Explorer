@@ -7,18 +7,6 @@
  * path lands in the actually visible portion of the grid.
  */
 
-const STICKY_COLUMN_SELECTOR = [
-    '.data-cell.row-number',
-    '.header-cell.row-number-header',
-    '.data-cell.pinned',
-    '.header-cell.pinned'
-].join(', ');
-
-const STICKY_ROW_SELECTOR = [
-    '.grid-header .header-cell',
-    '.data-row.pinned .data-cell'
-].join(', ');
-
 function measuredRect(element) {
     if (!element || typeof element.getBoundingClientRect !== 'function') return null;
     const rect = element.getBoundingClientRect();
@@ -28,30 +16,73 @@ function measuredRect(element) {
     return rect;
 }
 
-function queryAll(container, selector) {
-    if (typeof container.querySelectorAll !== 'function') return [];
-    return container.querySelectorAll(selector);
+function queryOne(container, selector) {
+    if (typeof container.querySelector !== 'function') return null;
+    return container.querySelector(selector);
+}
+
+function queryLast(container, selector) {
+    if (typeof container.querySelectorAll !== 'function') return null;
+    const elements = container.querySelectorAll(selector);
+    return elements.length > 0 ? elements[elements.length - 1] : null;
+}
+
+function extendVisibleEnd(current, element, containerStart, containerEnd, edge) {
+    const rect = measuredRect(element);
+    if (!rect || rect[edge] <= containerStart) return current;
+    const elementStart = edge === 'right' ? rect.left : rect.top;
+    if (elementStart >= containerEnd) return current;
+    return Math.max(current, Math.min(rect[edge], containerEnd));
 }
 
 function getVisibleLeft(container, containerRect, targetIsPinned) {
     if (targetIsPinned) return containerRect.left;
     let visibleLeft = containerRect.left;
-    for (const element of queryAll(container, STICKY_COLUMN_SELECTOR)) {
-        const rect = measuredRect(element);
-        if (!rect || rect.right <= containerRect.left || rect.left >= containerRect.right) continue;
-        visibleLeft = Math.max(visibleLeft, Math.min(rect.right, containerRect.right));
-    }
+    const rowNumber = queryOne(container, '.header-cell.row-number-header') ||
+        queryOne(container, '.data-cell.row-number');
+    // Pinned columns render contiguously from the left, so the final pinned
+    // header is the only column boundary that affects the unpinned viewport.
+    const lastPinnedColumn = queryLast(container, '.grid-header .header-cell.pinned') ||
+        queryLast(container, '.data-cell.pinned');
+    visibleLeft = extendVisibleEnd(
+        visibleLeft,
+        rowNumber,
+        containerRect.left,
+        containerRect.right,
+        'right'
+    );
+    visibleLeft = extendVisibleEnd(
+        visibleLeft,
+        lastPinnedColumn,
+        containerRect.left,
+        containerRect.right,
+        'right'
+    );
     return visibleLeft;
 }
 
 function getVisibleTop(container, containerRect, targetIsPinned) {
     if (targetIsPinned) return containerRect.top;
     let visibleTop = containerRect.top;
-    for (const element of queryAll(container, STICKY_ROW_SELECTOR)) {
-        const rect = measuredRect(element);
-        if (!rect || rect.bottom <= containerRect.top || rect.top >= containerRect.bottom) continue;
-        visibleTop = Math.max(visibleTop, Math.min(rect.bottom, containerRect.bottom));
-    }
+    const headerRow = queryOne(container, '.grid-header tr') ||
+        queryOne(container, '.grid-header .header-cell');
+    // Pinned rows also render contiguously below the header; measuring the final
+    // row captures the whole sticky stack without forcing layout for every cell.
+    const lastPinnedRow = queryLast(container, '.data-row.pinned');
+    visibleTop = extendVisibleEnd(
+        visibleTop,
+        headerRow,
+        containerRect.top,
+        containerRect.bottom,
+        'bottom'
+    );
+    visibleTop = extendVisibleEnd(
+        visibleTop,
+        lastPinnedRow,
+        containerRect.top,
+        containerRect.bottom,
+        'bottom'
+    );
     return visibleTop;
 }
 

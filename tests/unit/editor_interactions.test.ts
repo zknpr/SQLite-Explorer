@@ -527,6 +527,9 @@ describe('editor keyboard and grid selection interactions', () => {
             getBoundingClientRect: () => ({
                 left: 0, top: 0, right: 500, bottom: 300, width: 500, height: 300
             }),
+            querySelector(selector: string) {
+                return selector.includes('row-number') ? stickyColumn : null;
+            },
             querySelectorAll(selector: string) {
                 return selector.includes('row-number') ? [stickyColumn] : [];
             }

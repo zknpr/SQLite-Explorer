@@ -31,7 +31,14 @@ describe('grid cell reveal geometry', () => {
             scrollLeft: 300,
             scrollTop: 200,
             getBoundingClientRect: () => rect(0, 0, 500, 400),
+            querySelector(selector: string) {
+                if (selector.includes('row-number')) return stickyColumn;
+                if (selector.includes('grid-header')) return stickyRow;
+                return null;
+            },
             querySelectorAll(selector: string) {
+                if (selector === '.grid-header .header-cell.pinned') return [];
+                if (selector === '.data-row.pinned') return [stickyRow];
                 if (selector.includes('row-number')) return [stickyColumn];
                 if (selector.includes('grid-header')) return [stickyRow];
                 return [];
@@ -62,6 +69,7 @@ describe('grid cell reveal geometry', () => {
             scrollLeft: 40,
             scrollTop: 25,
             getBoundingClientRect: () => rect(0, 0, 500, 400),
+            querySelector: () => null,
             querySelectorAll: () => []
         };
         const target = {
@@ -78,6 +86,64 @@ describe('grid cell reveal geometry', () => {
 
         assert.strictEqual(container.scrollLeft, 100);
         assert.strictEqual(container.scrollTop, 80);
+    });
+
+    it('measures only representative sticky elements regardless of grid size', async () => {
+        let layoutReads = 0;
+        const measured = (bounds: ReturnType<typeof rect>) => ({
+            getBoundingClientRect() {
+                layoutReads++;
+                return bounds;
+            }
+        });
+        const rowNumberHeader = measured(rect(0, 0, 40, 50));
+        const headerRow = measured(rect(0, 0, 500, 50));
+        const pinnedHeaders = Array.from({ length: 200 }, (_, index) =>
+            measured(rect(40, 0, index === 199 ? 200 : 80, 50))
+        );
+        const pinnedRows = Array.from({ length: 200 }, (_, index) =>
+            measured(rect(0, 50, 500, index === 199 ? 100 : 75))
+        );
+        const container = {
+            scrollLeft: 300,
+            scrollTop: 200,
+            getBoundingClientRect: () => {
+                layoutReads++;
+                return rect(0, 0, 500, 400);
+            },
+            querySelector(selector: string) {
+                if (selector === '.header-cell.row-number-header') return rowNumberHeader;
+                if (selector === '.grid-header tr') return headerRow;
+                return null;
+            },
+            querySelectorAll(selector: string) {
+                if (selector.includes('row-number')) return [rowNumberHeader, ...pinnedHeaders];
+                if (selector.includes('grid-header') && selector.includes('data-row')) {
+                    return [headerRow, ...pinnedRows];
+                }
+                if (selector === '.grid-header .header-cell.pinned') return pinnedHeaders;
+                if (selector === '.data-row.pinned') return pinnedRows;
+                return [];
+            }
+        };
+        const target = {
+            classList: { contains: () => false },
+            closest: () => null,
+            getBoundingClientRect: () => {
+                layoutReads++;
+                return rect(100, 70, 180, 95);
+            }
+        };
+        (globalThis as any).document = {
+            getElementById: () => container
+        };
+
+        const { revealGridCell } = await import(revealModulePath);
+        revealGridCell(target);
+
+        assert.ok(layoutReads <= 6, `expected at most 6 layout reads, got ${layoutReads}`);
+        assert.strictEqual(container.scrollLeft, 200);
+        assert.strictEqual(container.scrollTop, 170);
     });
 
     it('uses the browser nearest fallback when layout geometry is unavailable', async () => {

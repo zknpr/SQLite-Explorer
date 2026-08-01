@@ -19,6 +19,7 @@ after(() => {
 
 it('clears and persists a displayed view selection before the demo refresh reloads it', async () => {
     const response = createDeferred<unknown>();
+    const initialSchemaRefresh = createDeferred<void>();
     const state = {
         isDbConnected: true,
         selectedTable: 'shared_view',
@@ -33,9 +34,12 @@ it('clears and persists a displayed view selection before the demo refresh reloa
     };
     let messageHandler: ((event: { data: unknown }) => void) | undefined;
     let persistCalls = 0;
+    let refreshSchemaCalls = 0;
     let selectionWasClearedBeforeSchemaReload = false;
+    const refreshOrder: string[] = [];
     (globalThis as any).__webViewerRefreshHarness = {
         state,
+        refreshOrder,
         backendApi: {
             initialize: async () => ({ connected: true, readOnly: false }),
             ping: async () => true
@@ -44,6 +48,9 @@ it('clears and persists a displayed view selection before the demo refresh reloa
             persistCalls++;
         },
         refreshSchema: async () => {
+            refreshOrder.push('schema');
+            refreshSchemaCalls++;
+            if (refreshSchemaCalls === 1) initialSchemaRefresh.resolve();
             selectionWasClearedBeforeSchemaReload = state.selectedCells.length === 0
                 && state.selectedRowIds.size === 0
                 && state.selectedColumns.size === 0
@@ -109,7 +116,12 @@ it('clears and persists a displayed view selection before the demo refresh reloa
                         `,
                         './modules/modals.js': 'export function initModals() {}',
                         './modules/grid.js': `
-                            export async function loadTableData() {}
+                            export async function loadTableColumns() {
+                                ${harness}.refreshOrder.push('columns');
+                            }
+                            export async function loadTableData() {
+                                ${harness}.refreshOrder.push('data');
+                            }
                             export function initGridInteraction() {}
                             export function initGridControls() {}
                             export function clearSelection() {
@@ -144,8 +156,9 @@ it('clears and persists a displayed view selection before the demo refresh reloa
     const compiled = bundle.outputFiles[0].text;
     const evaluatedModule = { exports: {} };
     new Function('module', 'exports', compiled)(evaluatedModule, evaluatedModule.exports);
-    await Promise.resolve();
+    await initialSchemaRefresh.promise;
     assert.ok(messageHandler, 'web demo RPC listener should be installed');
+    refreshOrder.length = 0;
 
     messageHandler!({
         data: {
@@ -159,4 +172,5 @@ it('clears and persists a displayed view selection before the demo refresh reloa
 
     assert.strictEqual(selectionWasClearedBeforeSchemaReload, true);
     assert.strictEqual(persistCalls, 1);
+    assert.deepStrictEqual(refreshOrder, ['schema', 'columns', 'data']);
 });

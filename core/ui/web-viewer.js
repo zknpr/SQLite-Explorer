@@ -29,6 +29,7 @@ import {
 } from './modules/modals.js';
 import {
     clearSelection,
+    loadTableColumns,
     loadTableData,
     initGridInteraction,
     initGridControls
@@ -78,6 +79,7 @@ const webviewMethods = {
                 showEmptyState();
                 persistState();
             } else if (state.selectedTable) {
+                await loadTableColumns();
                 await loadTableData(false);
             }
         }

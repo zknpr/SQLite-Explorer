@@ -186,10 +186,11 @@ describe('RPC', () => {
     );
 
     await assert.rejects(pending, error => {
-      assert.strictEqual(isInvocationTimeoutError(error), true);
-      assert.ok(error instanceof InvocationTimeoutError);
-      assert.strictEqual(error.methodName, 'discardModifications');
-      assert.strictEqual(error.message, 'worker history timed out');
+      if (!(error instanceof InvocationTimeoutError)) return false;
+      const timeoutError: InvocationTimeoutError = error;
+      assert.strictEqual(isInvocationTimeoutError(timeoutError), true);
+      assert.strictEqual(timeoutError.methodName, 'discardModifications');
+      assert.strictEqual(timeoutError.message, 'worker history timed out');
       return true;
     });
   });
