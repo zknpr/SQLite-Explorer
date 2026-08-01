@@ -13,7 +13,7 @@ const persistedStates: unknown[] = [];
 const paginationElements = new Map(
     ['pageIndicator', 'btnFirst', 'btnPrev', 'btnNext', 'btnLast', 'btnOpenCreateView'].map(id => [
         id,
-        { textContent: '', disabled: false }
+        { textContent: '', innerHTML: '', disabled: false }
     ])
 );
 (globalThis as any).document = {
@@ -129,5 +129,62 @@ it('re-applies read-only capabilities carried by a reload refresh', async () => 
         state.isDbConnected = false;
         state.isReadOnly = false;
         state.selectedTable = null;
+    }
+});
+
+it('clears and persists selection when refresh removes the selected table', async () => {
+    const apiModulePath = '../../core/ui/modules/api.js';
+    const rpcModulePath = '../../core/ui/modules/rpc.js';
+    const stateModulePath = '../../core/ui/modules/state.js';
+    const { backendApi } = await import(apiModulePath);
+    const { refreshContent } = await import(rpcModulePath);
+    const { state } = await import(stateModulePath);
+    const originalFetchSchema = backendApi.fetchSchema;
+    const persistCountBefore = persistedStates.length;
+    const originalSetTimeout = globalThis.setTimeout;
+    let persistCallback: (() => void) | undefined;
+
+    backendApi.fetchSchema = async () => ({ tables: [], views: [], indexes: [] });
+    paginationElements.set('tableNameLabel', { textContent: '', innerHTML: '', disabled: false });
+    paginationElements.set('gridContainer', { textContent: '', innerHTML: '', disabled: false });
+    (globalThis as any).setTimeout = (callback: () => void) => {
+        persistCallback = callback;
+        return 1;
+    };
+    state.isDbConnected = true;
+    state.selectedTable = 'removed_table';
+    state.selectedTableType = 'table';
+    state.selectedCells = [{ rowIdx: 0, colIdx: 0, rowId: 1, value: 'stale' }];
+    state.selectedRowIds = new Set([1]);
+    state.selectedColumns = new Set(['stale_column']);
+    state.lastSelectedCell = { rowIdx: 0, colIdx: 0 };
+    state.lastSelectedColumnIndex = 0;
+    state.lastSelectedRowIndex = 0;
+
+    try {
+        await refreshContent('shared.db');
+
+        assert.strictEqual(state.selectedTable, null);
+        assert.deepStrictEqual(state.selectedCells, []);
+        assert.deepStrictEqual([...state.selectedRowIds], []);
+        assert.deepStrictEqual([...state.selectedColumns], []);
+        assert.ok(persistCallback, 'removal should schedule persisted state');
+        persistCallback();
+        assert.strictEqual(persistedStates.length, persistCountBefore + 1);
+        assert.strictEqual((persistedStates.at(-1) as any).selectedTable, null);
+    } finally {
+        backendApi.fetchSchema = originalFetchSchema;
+        paginationElements.delete('tableNameLabel');
+        paginationElements.delete('gridContainer');
+        globalThis.setTimeout = originalSetTimeout;
+        state.isDbConnected = false;
+        state.selectedTable = null;
+        state.selectedTableType = 'table';
+        state.selectedCells = [];
+        state.selectedRowIds.clear();
+        state.selectedColumns.clear();
+        state.lastSelectedCell = null;
+        state.lastSelectedColumnIndex = null;
+        state.lastSelectedRowIndex = null;
     }
 });

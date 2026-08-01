@@ -125,6 +125,20 @@ describe('Query Builder', () => {
       assert.deepStrictEqual(params, ['%test%', '%test%']);
     });
 
+    it('uses the explicitly narrowed global-filter columns for counts', () => {
+      const { sql, params } = buildCountQuery('products', {
+        columns: ['visible', 'hidden'],
+        globalFilterColumns: ['visible'],
+        globalFilter: 'needle'
+      });
+
+      assert.strictEqual(
+        sql,
+        'SELECT COUNT(*) as count FROM "products" WHERE ("visible" LIKE ? ESCAPE \'\\\')'
+      );
+      assert.deepStrictEqual(params, ['%needle%']);
+    });
+
     it('should handle global filter with empty columns (safe behavior)', () => {
       const options = {
         columns: [],

@@ -16,6 +16,7 @@ import {
 } from './data-utils.js';
 import { BlobInspector } from './blob-inspector.js';
 import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
+import { revealGridCell } from './grid-reveal.js';
 
 let blobInspector;
 
@@ -59,6 +60,10 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
     // Find the cell element
     const cellEl = document.getElementById(`cell-${rowIdx}-${colIdx}`);
     if (!cellEl) return;
+
+    // Browser focus scrolling ignores sticky grid overlays; reveal the cell in
+    // the unpinned viewport before replacing it with the inline textarea.
+    revealGridCell(cellEl);
 
     const row = state.gridData[rowIdx];
     const value = getCellValue(row, colIdx);

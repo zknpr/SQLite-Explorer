@@ -95,12 +95,45 @@ export class InvocationTimeoutError extends Error {
   }
 }
 
+// Error objects do not retain their prototype when flattened through the
+// worker response's text-only fault field. Only this private, structured prefix
+// may restore timeout identity; ordinary messages that happen to mention a
+// timeout remain ordinary Error instances.
+const INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX = '\u001eSQLiteExplorerInvocationTimeout:';
+
 export function isInvocationTimeoutError(error: unknown): error is InvocationTimeoutError {
   if (error instanceof InvocationTimeoutError) return true;
   if (typeof error !== 'object' || error === null) return false;
   const markedError = error as { name?: unknown; methodName?: unknown };
   return markedError.name === 'InvocationTimeoutError'
     && typeof markedError.methodName === 'string';
+}
+
+function serializeInvocationError(error: unknown): string {
+  if (!isInvocationTimeoutError(error)) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX + JSON.stringify({
+    methodName: error.methodName,
+    message
+  });
+}
+
+function deserializeInvocationError(errorText: string): Error {
+  if (!errorText.startsWith(INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX)) {
+    return new Error(errorText);
+  }
+
+  try {
+    const payload = JSON.parse(errorText.slice(INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX.length));
+    if (typeof payload?.methodName === 'string' && typeof payload?.message === 'string') {
+      return new InvocationTimeoutError(payload.methodName, payload.message);
+    }
+  } catch {
+    // A malformed marker is an ordinary remote failure, never timeout recovery.
+  }
+  return new Error(errorText);
 }
 
 /** Resolve a deadline from the method and its structured-clone-ready arguments. */
@@ -333,7 +366,7 @@ export function processProtocolMessage(
         sendResponse({
           kind: 'result',
           correlationId,
-          errorText: err instanceof Error ? err.message : String(err)
+          errorText: serializeInvocationError(err)
         });
       });
 
@@ -359,7 +392,7 @@ export function processProtocolMessage(
       pendingInvocations.delete(correlationId);
 
       if (errorText) {
-        pending.onFault(new Error(errorText));
+        pending.onFault(deserializeInvocationError(errorText));
       } else {
         pending.onComplete(payload);
       }

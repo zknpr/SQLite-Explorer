@@ -515,6 +515,63 @@ describe('editor keyboard and grid selection interactions', () => {
         assert.strictEqual(createdTextareas[1].focused, true);
     });
 
+    it('reveals an inline editor clear of sticky columns before focusing it', async () => {
+        const stickyColumn = {
+            getBoundingClientRect: () => ({
+                left: 0, top: 0, right: 150, bottom: 300, width: 150, height: 300
+            })
+        };
+        const container = {
+            scrollLeft: 100,
+            scrollTop: 0,
+            getBoundingClientRect: () => ({
+                left: 0, top: 0, right: 500, bottom: 300, width: 500, height: 300
+            }),
+            querySelectorAll(selector: string) {
+                return selector.includes('row-number') ? [stickyColumn] : [];
+            }
+        };
+        const cell = {
+            innerHTML: '',
+            classList: createClassList(),
+            children: [] as any[],
+            closest: () => null,
+            getBoundingClientRect: () => ({
+                left: 80, top: 160, right: 180, bottom: 190, width: 100, height: 30
+            }),
+            appendChild(child: any) { this.children.push(child); }
+        };
+        let scrollLeftWhenFocused: number | undefined;
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'gridContainer') return container;
+                if (id === 'cell-0-0') return cell;
+                return null;
+            },
+            createElement() {
+                return {
+                    className: '',
+                    value: '',
+                    spellcheck: false,
+                    addEventListener() {},
+                    removeEventListener() {},
+                    focus() { scrollLeftWhenFocused = container.scrollLeft; }
+                };
+            }
+        };
+        const { state } = await import(stateModulePath);
+        const { startCellEdit } = await import(editModulePath);
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.gridData = [[1, 'draft']];
+
+        startCellEdit(0, 0, 1);
+
+        assert.strictEqual(container.scrollLeft, 30);
+        assert.strictEqual(scrollLeftWhenFocused, 30);
+    });
+
     it('keeps Tab advancement bound to the intended row when the edit changes sort order', async () => {
         const makeCell = (id: string) => ({
             id,

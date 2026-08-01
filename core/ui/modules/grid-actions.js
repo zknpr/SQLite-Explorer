@@ -6,40 +6,206 @@ import { updateToolbarButtons } from './ui.js';
 import { updateBatchSidebar } from './sidebar.js';
 import { getRowId, getCellValue } from './data-utils.js';
 import { openCellPreview, startCellEdit, openCellInVsCode } from './edit.js';
-import { GLOBAL_MATCH_SCOPE, navigateMatches, resetMatchNav } from './match-nav.js';
+import {
+    GLOBAL_MATCH_SCOPE,
+    getPreferredMatchScope,
+    navigateMatches,
+    resetMatchNav
+} from './match-nav.js';
+
+const FILTER_DEBOUNCE_MS = 300;
+const FILTER_RELOAD_RETRY_MS = 50;
+
+function getColumnFilterInput(columnName) {
+    return [...document.querySelectorAll('.column-filter')]
+        .find(input => input.dataset.column === columnName) || null;
+}
+
+function updateFilterClearButton(input) {
+    if (!input) return;
+    const isGlobal = input === document.getElementById('filterInput');
+    const button = isGlobal
+        ? document.getElementById('btnClearFilter')
+        : input.closest?.('.column-filter-wrap')?.querySelector?.('.filter-clear-btn');
+    if (button) button.hidden = input.value.length === 0;
+}
+
+function markFilterDraftChanged() {
+    state.currentPageIndex = 0;
+    state.filterApplyPending = true;
+    state.filterApplyTable = state.selectedTable;
+    // A newer draft supersedes navigation requested for older text.
+    state.filterPendingAction = null;
+    resetMatchNav();
+}
 
 /**
- * Apply the global filter and jump to a match. The filter is only run when the
- * user submits (Enter / Search button) — there is no filter-as-you-type. If the
- * term is unchanged the grid already reflects it, so we skip the refetch and
- * just advance to the next match.
+ * Capture every live filter input as one coherent draft. This must happen
+ * synchronously in the input event, before a reload can rebuild the header.
  */
-export async function applyGlobalFilter(direction = 1) {
-    // The toolbar filter input bypasses the #gridContainer guards, so block here
-    // while a reload is in flight to avoid a concurrent refetch / acting on the
-    // stale grid (the column filter is already covered by handleKeydown/handleClick).
-    if (state.isGridReloading) return;
-    const input = document.getElementById('filterInput');
+export function syncFilterInputsToState() {
+    let changed = false;
+    const globalInput = document.getElementById('filterInput');
+    if (globalInput) {
+        updateFilterClearButton(globalInput);
+        if (state.filterQuery !== globalInput.value) {
+            state.filterQuery = globalInput.value;
+            changed = true;
+        }
+    }
+
+    document.querySelectorAll('.column-filter').forEach(input => {
+        const columnName = input.dataset.column;
+        if (columnName === undefined) return;
+        updateFilterClearButton(input);
+        const previous = state.columnFilters[columnName] || '';
+        if (previous === input.value) return;
+        if (input.value === '') delete state.columnFilters[columnName];
+        else state.columnFilters[columnName] = input.value;
+        changed = true;
+    });
+
+    if (changed) markFilterDraftChanged();
+    return changed;
+}
+
+function clearFilterTimer() {
+    if (state.filterTimer !== null) {
+        clearTimeout(state.filterTimer);
+        state.filterTimer = null;
+    }
+}
+
+function focusFilterInput(scope) {
+    const input = scope === GLOBAL_MATCH_SCOPE
+        ? document.getElementById('filterInput')
+        : getColumnFilterInput(scope);
     if (!input) return;
-    const value = input.value;
-    if (value !== state.filterQuery) {
-        const previous = state.filterQuery;
-        state.filterQuery = value;
-        state.currentPageIndex = 0;
-        resetMatchNav();
-        const ok = await loadTableData();
-        if (ok !== true) {
-            // Only a fully-applied load (true) should persist/navigate. false = a
-            // genuine failure: revert so the same query can be retried. undefined =
-            // superseded by a newer load (pagination/page-size/table switch); leave
-            // the term (that load is using it) and don't navigate against the stale
-            // grid while it's still in flight.
-            if (ok === false) state.filterQuery = previous;
-            return;
+    input.focus();
+    input.setSelectionRange?.(input.value.length, input.value.length);
+}
+
+function scheduleFilterApply(delay = FILTER_DEBOUNCE_MS, table = state.selectedTable) {
+    clearFilterTimer();
+    state.filterTimer = setTimeout(() => {
+        state.filterTimer = null;
+        return processFilterQueue(table);
+    }, delay);
+}
+
+async function processFilterQueue(table = state.selectedTable) {
+    // A table switch resets the filter state. Never let an old debounce reload or
+    // focus a different table's controls.
+    if (table !== state.selectedTable) {
+        if (state.filterApplyTable === table) {
+            state.filterApplyPending = false;
+            state.filterApplyTable = null;
+        }
+        if (state.filterPendingAction?.table === table) state.filterPendingAction = null;
+        return;
+    }
+
+    if (!table) {
+        state.filterApplyPending = false;
+        state.filterApplyTable = null;
+        const action = state.filterPendingAction;
+        state.filterPendingAction = null;
+        if (action?.focusScope !== null && action?.focusScope !== undefined) {
+            focusFilterInput(action.focusScope);
+        }
+        persistState();
+        return false;
+    }
+
+    // Queue behind the owner of the reload guard instead of starting a competing
+    // request. Input events still update state immediately while we wait.
+    if (state.isGridReloading) {
+        scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table);
+        return;
+    }
+
+    if (state.filterApplyPending) {
+        state.filterApplyPending = false;
+        const result = await loadTableData(false);
+        if (result !== true) {
+            if (table === state.selectedTable && !state.filterApplyPending) {
+                state.filterApplyPending = true;
+                state.filterApplyTable = table;
+            }
+            // A superseded request has another load in progress; retry when that
+            // owner releases the guard. A real query failure remains retryable by
+            // the next input/Enter without an automatic error loop.
+            if (result === undefined) scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table);
+            return result;
         }
         persistState();
     }
-    navigateMatches(GLOBAL_MATCH_SCOPE, direction);
+
+    // Text typed during the fetch scheduled a later application. The first load
+    // rebuilt the header from the latest captured draft, so restore that input's
+    // focus immediately; defer only navigation until the successor rows arrive.
+    if (state.filterApplyPending) {
+        const pendingAction = state.filterPendingAction;
+        if (pendingAction?.table === table && pendingAction.focusScope !== null) {
+            focusFilterInput(pendingAction.focusScope);
+        }
+        return true;
+    }
+
+    state.filterApplyTable = null;
+    const action = state.filterPendingAction;
+    if (!action || action.table !== table) return true;
+    state.filterPendingAction = null;
+    if (action.focusScope !== null) focusFilterInput(action.focusScope);
+    if (action.navigate) navigateMatches(action.scope, action.direction);
+    return true;
+}
+
+function requestFilterAction({ scope, direction = 1, navigate = true, focusScope = scope }) {
+    clearFilterTimer();
+    state.filterPendingAction = {
+        table: state.selectedTable,
+        scope,
+        direction,
+        navigate,
+        focusScope
+    };
+    return processFilterQueue(state.selectedTable);
+}
+
+function scopeForInput(input) {
+    if (input === document.getElementById('filterInput')) return GLOBAL_MATCH_SCOPE;
+    return input?.dataset?.column ?? null;
+}
+
+/** Capture a draft on every keystroke and debounce its data reload. */
+export function onFilterInput(event) {
+    const changed = syncFilterInputsToState();
+    if (changed) {
+        const focusScope = scopeForInput(event.target);
+        state.filterPendingAction = {
+            table: state.selectedTable,
+            scope: focusScope,
+            direction: 1,
+            navigate: false,
+            focusScope
+        };
+    }
+
+    // Do not submit a partially composed IME value. compositionend is wired to
+    // this same handler and starts the normal debounce.
+    if (event.isComposing) {
+        clearFilterTimer();
+        return;
+    }
+    if (state.filterApplyPending) scheduleFilterApply();
+}
+
+export async function applyGlobalFilter(direction = 1) {
+    const input = document.getElementById('filterInput');
+    if (!input) return;
+    syncFilterInputsToState();
+    return requestFilterAction({ scope: GLOBAL_MATCH_SCOPE, direction });
 }
 
 export function onFilterEnter(event) {
@@ -48,7 +214,7 @@ export function onFilterEnter(event) {
     // submit the filter / preventDefault before the composed text is committed.
     if (event.key === 'Enter' && !event.isComposing) {
         event.preventDefault();
-        applyGlobalFilter(event.shiftKey ? -1 : 1);
+        return applyGlobalFilter(event.shiftKey ? -1 : 1);
     }
 }
 
@@ -99,43 +265,11 @@ export function onColumnSort(columnName) {
     persistState();
 }
 
-/**
- * Apply a column filter and jump to a match. Like the global filter, this only
- * runs on submit (Enter / Search button). When the term changed we refetch and
- * restore focus to the (rebuilt) input so the user can keep pressing Enter to
- * cycle through matches; when unchanged we just advance to the next match.
- */
 export async function applyColumnFilter(columnName, direction = 1) {
-    if (state.isGridReloading) return; // don't stack a refetch/navigate on an in-flight reload
-    const input = document.querySelector(`.column-filter[data-column="${columnName}"]`);
+    const input = getColumnFilterInput(columnName);
     if (!input) return;
-
-    const changed = input.value !== (state.columnFilters[columnName] || '');
-    if (changed) {
-        const previous = state.columnFilters[columnName];
-        state.columnFilters[columnName] = input.value;
-        state.currentPageIndex = 0;
-        resetMatchNav();
-        const ok = await loadTableData();
-        if (ok !== true) {
-            // Only a fully-applied load (true) proceeds. false = genuine failure:
-            // restore the prior value so the query can be retried. undefined =
-            // superseded by a newer load; leave the value and don't navigate.
-            if (ok === false) {
-                if (previous === undefined) delete state.columnFilters[columnName];
-                else state.columnFilters[columnName] = previous;
-            }
-            return;
-        }
-        // loadTableData() rebuilds the header, so the input we focused is gone.
-        // Re-focus the freshly rendered one and place the caret at the end.
-        const newInput = document.querySelector(`.column-filter[data-column="${columnName}"]`);
-        if (newInput) {
-            newInput.focus();
-            newInput.setSelectionRange(newInput.value.length, newInput.value.length);
-        }
-    }
-    navigateMatches(columnName, direction);
+    syncFilterInputsToState();
+    return requestFilterAction({ scope: columnName, direction });
 }
 
 export function onColumnFilterKeydown(event, columnName) {
@@ -143,8 +277,42 @@ export function onColumnFilterKeydown(event, columnName) {
     // IME composition-confirm Enter (isComposing) so CJK input isn't broken.
     if (event.key === 'Enter' && !event.isComposing) {
         event.preventDefault();
-        applyColumnFilter(columnName, event.shiftKey ? -1 : 1);
+        return applyColumnFilter(columnName, event.shiftKey ? -1 : 1);
     }
+}
+
+/** Apply/navigate the currently active filter from a non-editor grid cell. */
+export function applyCurrentFilter(direction = 1) {
+    syncFilterInputsToState();
+    const scope = getPreferredMatchScope();
+    if (scope === null) return null;
+    return requestFilterAction({ scope, direction });
+}
+
+export function clearGlobalFilter() {
+    const input = document.getElementById('filterInput');
+    if (!input) return;
+    input.value = '';
+    syncFilterInputsToState();
+    focusFilterInput(GLOBAL_MATCH_SCOPE);
+    return requestFilterAction({
+        scope: GLOBAL_MATCH_SCOPE,
+        navigate: false,
+        focusScope: GLOBAL_MATCH_SCOPE
+    });
+}
+
+export function clearColumnFilter(columnName) {
+    const input = getColumnFilterInput(columnName);
+    if (!input) return;
+    input.value = '';
+    syncFilterInputsToState();
+    focusFilterInput(columnName);
+    return requestFilterAction({
+        scope: columnName,
+        navigate: false,
+        focusScope: columnName
+    });
 }
 
 // Column Selection

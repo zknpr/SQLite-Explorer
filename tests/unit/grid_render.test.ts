@@ -14,6 +14,8 @@ class FakeNode {
     className = '';
     textContent = '';
     title = '';
+    ariaLabel = '';
+    hidden = false;
     value = '';
     scrollLeft = 0;
     scrollTop = 0;
@@ -112,9 +114,13 @@ describe('grid header rendering', () => {
         assert.doesNotThrow(() => renderDataGrid());
         const headerText = findByClass(container, 'header-text');
         const filterInput = findByClass(container, 'column-filter');
+        const clearButton = findByClass(container, 'filter-clear-btn');
         assert.ok(headerText);
         assert.ok(filterInput);
+        assert.ok(clearButton);
         assert.strictEqual(headerText.textContent, hostileColumn);
         assert.strictEqual(filterInput.value, hostileFilter);
+        assert.strictEqual(clearButton.ariaLabel, `Clear filter for ${hostileColumn}`);
+        assert.strictEqual(clearButton.hidden, false);
     });
 });

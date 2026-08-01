@@ -132,7 +132,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     cancellation?: vsc.CancellationToken
   ): Promise<DatabaseDocument> {
     const { reporter, isVerified, context: { extensionUri } } = viewerProvider;
-    let { forceReadOnly } = viewerProvider;
+    const configuredForceReadOnly = viewerProvider.forceReadOnly ?? false;
+    let forceReadOnlyOnReconnect = configuredForceReadOnly;
 
     // Use WebAssembly-based worker for database operations
     const connectionFactory = createDatabaseConnection;
@@ -147,11 +148,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const result = await connectionBundle.establishConnection(
       fileUri,
       filename,
-      forceReadOnly,
+      configuredForceReadOnly,
       autoCommit
     );
     databaseOps = result.databaseOps;
-    forceReadOnly = result.isReadOnly;
+    let isReadOnly = result.isReadOnly ?? configuredForceReadOnly;
 
     databaseOps = withSqlLogging(databaseOps, filename, viewerProvider.outputChannel);
 
@@ -186,7 +187,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             )
           }
         );
-        forceReadOnly = true;
+        isReadOnly = true;
+        // This is a safety downgrade, not a transient capability such as a WAL
+        // observed by the browser backend. Persist it separately so every later
+        // reconnect remains forced read-only.
+        forceReadOnlyOnReconnect = true;
       }
     }
 
@@ -195,10 +200,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       fileUri,
       tracker,
       autoCommit,
-      { databaseOps, isReadOnly: forceReadOnly },
+      { databaseOps, isReadOnly },
       connectionBundle.workerMethods,
       connectionBundle.establishConnection.bind(connectionBundle),
-      reporter
+      reporter,
+      forceReadOnlyOnReconnect
     );
   }
 
@@ -210,6 +216,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   // Private state
   readonly #modificationTracker: ModificationTracker<DocumentModification>;
   readonly #hostBridge: HostBridge;
+  readonly #forceReadOnlyOnReconnect: boolean;
 
   private constructor(
     readonly viewerProvider: DatabaseViewerProvider,
@@ -219,9 +226,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     private connectionState: { databaseOps: DatabaseOperations; isReadOnly?: boolean },
     private readonly workerMethods: DatabaseConnectionBundle['workerMethods'],
     private readonly establishConnection: DatabaseConnectionBundle['establishConnection'],
-    private readonly reporter?: TelemetryReporter
+    private readonly reporter?: TelemetryReporter,
+    forceReadOnlyOnReconnect: boolean = viewerProvider.forceReadOnly ?? false
   ) {
     super();
+    this.#forceReadOnlyOnReconnect = forceReadOnlyOnReconnect;
     this.#modificationTracker = tracker ?? new ModificationTracker<DocumentModification>(MODIFICATION_LIMIT, getMaxUndoMemory());
     this.#hostBridge = new HostBridge(viewerProvider, this);
     this.#documentKey = generateDatabaseDocumentKey(this.uri);
@@ -592,7 +601,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const result = await this.establishConnection(
       this.uri,
       filename,
-      this.viewerProvider.forceReadOnly,
+      this.#forceReadOnlyOnReconnect,
       this.autoCommitEnabled
     );
     const databaseOps = withSqlLogging(
@@ -602,7 +611,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     );
     this.connectionState = {
       databaseOps,
-      isReadOnly: result.isReadOnly ?? this.viewerProvider.forceReadOnly
+      isReadOnly: this.#forceReadOnlyOnReconnect || !!result.isReadOnly
     };
     return databaseOps;
   }

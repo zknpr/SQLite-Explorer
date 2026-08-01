@@ -52,6 +52,13 @@ export const state = {
 
     // Column filters
     columnFilters: {},
+    // Filter drafts are copied from every visible input before asynchronous work.
+    // A single debounce queue prevents overlapping reloads while preserving text
+    // typed into the still-visible header during an in-flight replacement.
+    filterTimer: null,
+    filterApplyPending: false,
+    filterApplyTable: null,
+    filterPendingAction: null,
 
     // Pinned items
     pinnedColumns: new Set(),

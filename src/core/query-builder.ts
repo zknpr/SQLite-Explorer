@@ -64,14 +64,23 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
  * Build a COUNT query from options.
  */
 export function buildCountQuery(table: string, options: TableCountOptions): { sql: string; params: CellValue[] } {
-  const { columns = [], filters = [], globalFilter } = options;
+  const {
+    columns = [],
+    globalFilterColumns = columns,
+    filters = [],
+    globalFilter
+  } = options;
 
   const escapedTable = escapeIdentifier(table);
   let sql = `SELECT COUNT(*) as count FROM ${escapedTable}`;
   const whereClauses: string[] = [];
   const params: CellValue[] = [];
 
-  const { conditions, params: filterParams } = buildFilterConditions(filters, globalFilter, columns);
+  const { conditions, params: filterParams } = buildFilterConditions(
+    filters,
+    globalFilter,
+    globalFilterColumns
+  );
   whereClauses.push(...conditions);
   params.push(...filterParams);
 

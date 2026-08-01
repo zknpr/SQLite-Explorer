@@ -466,14 +466,40 @@ describe('web demo view worker', () => {
 
         const data = await worker.invoke('fetchTableData', 'rowid_filters', {
             columns: ['rowid', 'value'],
+            globalFilterColumns: ['value'],
             globalFilter: '12',
             limit: 100,
             offset: 0
         });
         const count = await worker.invoke('fetchTableCount', 'rowid_filters', {
             columns: ['value'],
+            globalFilterColumns: ['value'],
             globalFilter: '12'
         });
+
+        assert.deepStrictEqual(Array.from(data.rows), []);
+        assert.strictEqual(count, 0);
+    });
+
+    it('uses the same narrowed global-filter columns for demo data and counts', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE scoped_filters (visible TEXT, hidden TEXT); " +
+            "INSERT INTO scoped_filters VALUES ('shown', 'secret')"
+        );
+        const options = {
+            columns: ['visible', 'hidden'],
+            globalFilterColumns: ['visible'],
+            globalFilter: 'secret'
+        };
+
+        const data = await worker.invoke('fetchTableData', 'scoped_filters', {
+            ...options,
+            limit: 100,
+            offset: 0
+        });
+        const count = await worker.invoke('fetchTableCount', 'scoped_filters', options);
 
         assert.deepStrictEqual(Array.from(data.rows), []);
         assert.strictEqual(count, 0);

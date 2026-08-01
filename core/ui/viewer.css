@@ -340,7 +340,7 @@ body {
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
     color: var(--text-primary);
-    padding: 4px 8px;
+    padding: 4px 28px 4px 8px;
     border-radius: 3px 0 0 3px;
     font-size: 12px;
     width: 200px;
@@ -354,7 +354,7 @@ body {
 /* Current/total match counter overlaid at the right edge inside the filter input */
 .filter-match-counter {
     position: absolute;
-    right: 8px;
+    right: 28px;
     top: 50%;
     transform: translateY(-50%);
     font-size: 10px;
@@ -365,7 +365,40 @@ body {
 
 /* Reserve room for the counter only when it has content */
 .filter-input-wrap:has(.filter-match-counter:not(:empty)) .filter-input {
-    padding-right: 38px;
+    padding-right: 64px;
+}
+
+.filter-clear-btn {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1;
+}
+
+.filter-clear-btn[hidden] {
+    display: none;
+}
+
+.filter-clear-btn:hover,
+.filter-clear-btn:focus-visible {
+    color: var(--text-primary);
+    background: var(--hover-bg);
+}
+
+.filter-clear-btn .codicon {
+    font-size: 12px;
 }
 
 /* Search button flush against the global filter (inherits joined borders/radii
@@ -511,7 +544,7 @@ body {
 .column-filter {
     flex: 1;
     min-width: 0;
-    padding: 2px 6px;
+    padding: 2px 26px 2px 6px;
     font-size: 11px;
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
@@ -543,7 +576,7 @@ body {
 /* Current/total match counter overlaid inside the column filter input, when non-empty */
 .column-filter-counter {
     position: absolute;
-    right: 6px;
+    right: 26px;
     top: 50%;
     transform: translateY(-50%);
     font-size: 10px;
@@ -554,7 +587,13 @@ body {
 
 /* Reserve room for the counter only when it has content */
 .column-filter-wrap:has(.column-filter-counter:not(:empty)) .column-filter {
-    padding-right: 30px;
+    padding-right: 58px;
+}
+
+.column-filter-wrap .filter-clear-btn {
+    right: 3px;
+    width: 16px;
+    height: 16px;
 }
 
 /* Filter apply button - triggers filter on click */
@@ -737,7 +776,10 @@ body {
 .data-cell.active-match-cell {
     outline: 2px solid var(--accent-color);
     outline-offset: -2px;
-    z-index: 3;
+    /* Sticky gutters, pinned rows, and pinned columns must cover cells that
+       scroll underneath them. The highlight remains inset and fully visible
+       once grid-reveal.js has moved the target into the unpinned viewport. */
+    z-index: 1;
 }
 
 /* A pinned cell must keep its sticky stacking (z-index 5) even when it is the

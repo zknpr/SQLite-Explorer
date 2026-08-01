@@ -109,6 +109,8 @@ async function restoreSavedState() {
         // Restore global filter input value
         const filterInput = document.getElementById('filterInput');
         if (filterInput) filterInput.value = state.filterQuery;
+        const clearFilterButton = document.getElementById('btnClearFilter');
+        if (clearFilterButton) clearFilterButton.hidden = state.filterQuery.length === 0;
 
         // Restore date format dropdown
         const dateFormatSelect = document.getElementById('dateFormatSelect');

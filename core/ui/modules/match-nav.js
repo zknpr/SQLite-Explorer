@@ -18,6 +18,7 @@ import {
     formatCellValueAsText
 } from './utils.js';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
+import { revealGridCell } from './grid-reveal.js';
 
 // A Symbol cannot collide with any SQLite column name, unlike the former
 // string sentinel. This value stays entirely inside the webview process.
@@ -29,6 +30,23 @@ function activeTerm(scope) {
     // Case folding is only for the local SQLite-compatible comparison. The
     // active value itself stays untrimmed, matching the exact text sent to SQL.
     return activeValue === undefined ? '' : foldAsciiCase(activeValue);
+}
+
+/**
+ * Pick the filter whose matches Enter should traverse from the grid itself.
+ * Keep an already-selected scope when it is still active; otherwise prefer the
+ * global filter, then the first active column in rendered (pinned-first) order.
+ */
+export function getPreferredMatchScope() {
+    if (state.matchNav.scope !== null && activeTerm(state.matchNav.scope)) {
+        return state.matchNav.scope;
+    }
+    if (activeTerm(GLOBAL_MATCH_SCOPE)) return GLOBAL_MATCH_SCOPE;
+    for (const colIdx of getOrderedColumnIndices()) {
+        const columnName = state.tableColumns[colIdx]?.name;
+        if (columnName !== undefined && activeTerm(columnName)) return columnName;
+    }
+    return null;
 }
 
 function formatSqliteReal(significand, exponent, negative) {
@@ -221,7 +239,7 @@ function focusActiveMatch() {
     if (cellEl) {
         cellEl.classList.add('active-match-cell');
         renderMatchCellText(cellEl, rowIdx, colIdx, state.matchNav.term);
-        cellEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        revealGridCell(cellEl);
     }
 }
 

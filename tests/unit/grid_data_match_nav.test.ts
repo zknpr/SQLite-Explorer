@@ -115,6 +115,22 @@ describe('grid data match cache', () => {
         const { loadTableData } = await import(gridDataModulePath);
         const { GLOBAL_MATCH_SCOPE, navigateMatches } = await import(matchNavModulePath);
         const { createDatabaseEngine } = await import(sqliteModulePath);
+        const originalState = {
+            selectedTable: state.selectedTable,
+            selectedTableType: state.selectedTableType,
+            renderedTable: state.renderedTable,
+            tableColumns: state.tableColumns,
+            gridData: state.gridData,
+            currentPageIndex: state.currentPageIndex,
+            totalRecordCount: state.totalRecordCount,
+            rowsPerPage: state.rowsPerPage,
+            columnFilters: state.columnFilters,
+            filterQuery: state.filterQuery,
+            isLoadingData: state.isLoadingData,
+            isGridReloading: state.isGridReloading,
+            editingCellInfo: state.editingCellInfo,
+            matchNav: state.matchNav
+        };
         const { operations } = await createDatabaseEngine({
             content: null,
             maxSize: 0,
@@ -153,11 +169,7 @@ describe('grid data match cache', () => {
         } finally {
             backendApi.fetchTableCount = originalFetchCount;
             backendApi.fetchTableData = originalFetchData;
-            state.selectedTable = null;
-            state.gridData = [];
-            state.editingCellInfo = null;
-            state.isLoadingData = false;
-            state.isGridReloading = false;
+            Object.assign(state, originalState);
             (operations as any).shutdown?.();
         }
     });
@@ -285,7 +297,7 @@ describe('grid data match cache', () => {
         }
     });
 
-    it('disables visible column filters until a same-table reload settles', async () => {
+    it('keeps visible column filters editable while their synchronous draft capture protects a reload', async () => {
         const filterInputs = [{ disabled: false }, { disabled: false }];
         const container = {
             scrollLeft: 0,
@@ -337,8 +349,8 @@ describe('grid data match cache', () => {
             const pendingLoad = loadTableData(false, true);
             assert.deepStrictEqual(
                 filterInputs.map(input => input.disabled),
-                [true, true],
-                'typing must be blocked while the visible grid is stale'
+                [false, false],
+                'input handlers capture drafts before the eventual header rebuild'
             );
 
             count.resolve(1);
@@ -557,7 +569,7 @@ describe('grid data match cache', () => {
             const pendingLoad = loadTableData(true, false);
             assert.strictEqual(state.isLoadingData, true);
             assert.strictEqual(state.isGridReloading, true);
-            assert.deepStrictEqual(filterInputs.map(input => input.disabled), [true, true]);
+            assert.deepStrictEqual(filterInputs.map(input => input.disabled), [false, false]);
 
             // Dropping the displayed view clears selection and starts no successor
             // data load, so this request remains responsible for releasing guards.

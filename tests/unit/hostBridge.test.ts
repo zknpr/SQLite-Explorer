@@ -142,6 +142,7 @@ describe('HostBridge', () => {
 
     it('reports that the external view editor is unavailable for untitled databases', async () => {
         const executeCommandMock = mock.method(vscode.commands, 'executeCommand', async () => {});
+        const originalTranslate = vscode.l10n.t;
         const mockDocument = {
             uri: { scheme: 'untitled' },
             documentKey: Promise.resolve('test-key')
@@ -149,11 +150,16 @@ describe('HostBridge', () => {
         const mockProvider = { webviews: new Map(), context: {} };
         const bridge = new HostBridge(mockProvider as any, mockDocument as any);
 
-        await assert.rejects(
-            () => bridge.openViewEditor('active_users', 'wv1'),
-            /unavailable for untitled databases/
-        );
-        assert.strictEqual(executeCommandMock.mock.callCount(), 0);
+        (vscode.l10n as any).t = (message: string) => `localized:${message}`;
+        try {
+            await assert.rejects(
+                () => bridge.openViewEditor('active_users', 'wv1'),
+                /localized:The external view editor is unavailable for untitled databases/
+            );
+            assert.strictEqual(executeCommandMock.mock.callCount(), 0);
+        } finally {
+            (vscode.l10n as any).t = originalTranslate;
+        }
     });
 
     it('should catch and log error if fetch rows for undo history fails in deleteRows', async () => {

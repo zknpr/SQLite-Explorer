@@ -2,6 +2,10 @@ import { state, persistState } from './state.js';
 import {
     goToPage,
     applyGlobalFilter,
+    applyCurrentFilter,
+    clearGlobalFilter,
+    clearColumnFilter,
+    onFilterInput,
     onFilterEnter,
     onPageSizeChange,
     onDateFormatChange,
@@ -21,7 +25,11 @@ import { openCellPreview } from './edit.js';
 import { clearSelection } from './grid-selection.js';
 
 export function initGridControls() {
-    document.getElementById('filterInput')?.addEventListener('keydown', onFilterEnter);
+    const globalFilter = document.getElementById('filterInput');
+    globalFilter?.addEventListener('input', onFilterInput);
+    globalFilter?.addEventListener('compositionend', onFilterInput);
+    globalFilter?.addEventListener('keydown', onFilterEnter);
+    document.getElementById('btnClearFilter')?.addEventListener('click', clearGlobalFilter);
     // Wrap so the click MouseEvent isn't passed as `direction` (which would make
     // navigateMatches compute NaN); the Search button always advances forward.
     document.getElementById('btnApplyFilter')?.addEventListener('click', () => applyGlobalFilter(1));
@@ -39,12 +47,18 @@ export function initGridInteraction() {
     if (!container) return;
 
     container.addEventListener('mousedown', handleMousedown);
+    container.addEventListener('input', handleFilterInput);
+    container.addEventListener('compositionend', handleFilterInput);
     container.addEventListener('keydown', handleKeydown);
     container.addEventListener('click', handleClick);
     container.addEventListener('dblclick', handleDoubleClick);
     container.addEventListener('mouseover', handleMouseover);
     container.addEventListener('scroll', handleScroll, { passive: true });
     document.addEventListener('click', handleDocumentClick);
+}
+
+function handleFilterInput(event) {
+    if (event.target?.classList?.contains('column-filter')) onFilterInput(event);
 }
 
 function handleMousedown(event) {
@@ -86,12 +100,22 @@ function handleDocumentClick(event) {
 }
 
 function handleKeydown(event) {
-    // Ignore filter Enter while a load is in flight: acting now would queue a
-    // concurrent reload and operate against the stale, soon-to-be-replaced grid.
-    if (state.isGridReloading) return;
-    if (event.target.classList.contains('column-filter')) {
+    if (event.target?.classList?.contains('column-filter')) {
         const colName = event.target.dataset.column;
-        if (colName) onColumnFilterKeydown(event, colName);
+        if (colName) return onColumnFilterKeydown(event, colName);
+        return;
+    }
+
+    if (event.key === 'Enter' && !event.isComposing) {
+        const isInteractiveControl = event.target?.closest?.(
+            'input, textarea, button, select, a, [contenteditable="true"]'
+        );
+        if (isInteractiveControl || state.editingCellInfo) return;
+        const pending = applyCurrentFilter(event.shiftKey ? -1 : 1);
+        if (pending) {
+            event.preventDefault();
+            return pending;
+        }
     }
 }
 
@@ -100,8 +124,11 @@ function handleClick(event) {
     // flicker fix keeps the previous grid visible during a same-table refetch, so
     // without this guard a click on the stale row numbers or cells could select
     // (and then delete) rows from the old result set before the new data arrives.
-    if (state.isGridReloading) return;
     const target = event.target;
+    const isFilterControl = target.closest(
+        '.filter-apply-btn, .filter-clear-btn, .column-filter'
+    );
+    if (state.isGridReloading && !isFilterControl) return;
     if (target.closest('.grid-header')) {
         handleHeaderClick(event, target);
         return;
@@ -110,7 +137,17 @@ function handleClick(event) {
 }
 
 function handleHeaderClick(event, target) {
-    // 1. Filter Apply Button
+    // 1. Filter Clear Button
+    const clearFilterButton = target.closest('.filter-clear-btn');
+    if (clearFilterButton) {
+        event.stopPropagation();
+        const columnName = clearFilterButton.dataset.column
+            || target.closest('.header-cell')?.dataset.column;
+        if (columnName) return clearColumnFilter(columnName);
+        return;
+    }
+
+    // 2. Filter Apply Button
     if (target.closest('.filter-apply-btn')) {
         event.stopPropagation();
         const headerCell = target.closest('.header-cell');
@@ -120,13 +157,13 @@ function handleHeaderClick(event, target) {
         return;
     }
 
-    // 2. Prevent sort when clicking inputs/bottom area
+    // 3. Prevent sort when clicking inputs/bottom area
     if (target.closest('.header-bottom') || target.closest('.column-filter')) {
         event.stopPropagation();
         return;
     }
 
-    // 3. Column Selection Icon
+    // 4. Column Selection Icon
     if (target.closest('.select-column-icon')) {
         event.stopPropagation();
         const headerCell = target.closest('.header-cell');
@@ -136,7 +173,7 @@ function handleHeaderClick(event, target) {
         return;
     }
 
-    // 4. Header Pin Icon
+    // 5. Header Pin Icon
     if (target.closest('.pin-icon')) {
         event.stopPropagation();
         const headerCell = target.closest('.header-cell');
@@ -146,13 +183,13 @@ function handleHeaderClick(event, target) {
         return;
     }
 
-    // 5. Select All (Row Number Header)
+    // 6. Select All (Row Number Header)
     if (target.closest('.row-number-header')) {
         onSelectAllClick(event);
         return;
     }
 
-    // 6. Sort (Header Top)
+    // 7. Sort (Header Top)
     const headerTop = target.closest('.header-top');
     if (headerTop) {
         const headerCell = headerTop.closest('.header-cell');

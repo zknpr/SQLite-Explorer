@@ -41,6 +41,12 @@ describe('viewer template accessibility', () => {
             /\baria-(?:label|labelledby)\s*=\s*["'][^"']+["']/i,
             'toolbar filter input must expose a non-empty accessible name'
         );
+
+        const clearButton = template.match(
+            /<button\b(?=[^>]*\bid=["']btnClearFilter["'])[^>]*>/i
+        )?.[0];
+        assert.ok(clearButton, 'toolbar filter must expose a clear button');
+        assert.match(clearButton, /\baria-label\s*=\s*["'][^"']+["']/i);
     });
 
     it('announces the keyboard escape route for both multiline editors', () => {

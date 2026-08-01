@@ -119,7 +119,20 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
         filterInput.dataset.column = col.name;
         filterInput.value = filterValue;
         filterInput.placeholder = 'Filter...';
+        filterInput.ariaLabel = `Filter column ${col.name}`;
         filterWrap.appendChild(filterInput);
+
+        const clearFilterButton = document.createElement('button');
+        clearFilterButton.type = 'button';
+        clearFilterButton.className = 'filter-clear-btn';
+        clearFilterButton.dataset.column = col.name;
+        clearFilterButton.ariaLabel = `Clear filter for ${col.name}`;
+        clearFilterButton.title = `Clear filter for ${col.name}`;
+        clearFilterButton.hidden = filterValue.length === 0;
+        const clearIcon = document.createElement('span');
+        clearIcon.className = 'codicon codicon-close';
+        clearFilterButton.appendChild(clearIcon);
+        filterWrap.appendChild(clearFilterButton);
 
         const matchCounter = document.createElement('span');
         matchCounter.className = 'column-filter-counter';

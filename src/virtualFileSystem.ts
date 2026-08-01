@@ -183,8 +183,16 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             return new TextEncoder().encode(String(value));
 
         } catch (err) {
-            GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error reading cell: ${err instanceof Error ? err.message : String(err)}`);
-            throw vsc.FileSystemError.FileNotFound(uri);
+            const details = err instanceof Error ? err.message : String(err);
+            GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error reading file: ${details}`);
+            // Preserve deliberate virtual-filesystem decisions (notably a view
+            // invalidated as Deleted). Database/worker faults are availability
+            // failures, not evidence that the virtual file disappeared.
+            if (this.isFileSystemError(err)) throw err;
+            if (rowId === '__view__.sql' && this.isMissingViewError(err)) {
+                throw vsc.FileSystemError.FileNotFound(uri);
+            }
+            throw vsc.FileSystemError.Unavailable(details);
         }
     }
 
@@ -532,5 +540,18 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     private isMissingViewError(error: unknown): boolean {
         const message = error instanceof Error ? error.message : String(error);
         return /\bView not found:/i.test(message);
+    }
+
+    private isFileSystemError(error: unknown): error is vsc.FileSystemError {
+        if (!(error instanceof Error)) return false;
+        const code = (error as Error & { code?: unknown }).code;
+        return typeof code === 'string' && [
+            'FileExists',
+            'FileNotFound',
+            'FileNotADirectory',
+            'FileIsADirectory',
+            'NoPermissions',
+            'Unavailable'
+        ].includes(code);
     }
 }

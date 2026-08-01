@@ -1208,6 +1208,94 @@ describe('DatabaseDocument hot-exit restore', () => {
             engine.shutdown?.();
         }
     });
+
+    it('keeps a failed hot-exit restore read-only across a later reconnect', async () => {
+        const tracker = new ModificationTracker<LabeledModification>(100);
+        tracker.record({
+            label: 'Restore draft',
+            description: 'Restore draft value',
+            modificationType: 'cell_update',
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'value',
+            priorValue: 'saved',
+            newValue: 'draft'
+        });
+        const backupData = tracker.serialize();
+        const restoreOps = {
+            engineKind: Promise.resolve('wasm' as const),
+            applyModifications: async () => { throw new Error('restore failed'); }
+        };
+        const reconnectedOps = { engineKind: Promise.resolve('wasm' as const) };
+        const connectionCalls: unknown[][] = [];
+        const originalFs = mockVscode.workspace.fs;
+        const originalShowErrorMessage = mockVscode.window.showErrorMessage;
+        const moduleCache = require('module')._cache;
+        const workerFactoryPath = require.resolve('../../src/workerFactory');
+        const originalWorkerFactoryCacheEntry = moduleCache[workerFactoryPath];
+        const databaseModelModulePath = require.resolve('../../src/databaseModel');
+
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: { ...originalFs, readFile: async () => backupData },
+            writable: true,
+            configurable: true
+        });
+        mockVscode.window.showErrorMessage = async () => undefined;
+        moduleCache[workerFactoryPath] = {
+            id: workerFactoryPath,
+            filename: workerFactoryPath,
+            loaded: true,
+            exports: {
+                createDatabaseConnection: async () => ({
+                    establishConnection: async (...args: unknown[]) => {
+                        connectionCalls.push(args);
+                        return connectionCalls.length === 1
+                            ? { databaseOps: restoreOps, isReadOnly: false }
+                            : { databaseOps: reconnectedOps, isReadOnly: true };
+                    },
+                    workerMethods: { [Symbol.dispose]: () => {} }
+                })
+            }
+        };
+        delete moduleCache[databaseModelModulePath];
+
+        try {
+            const { DatabaseDocument } = require('../../src/databaseModel');
+            const doc = await DatabaseDocument.create(
+                {
+                    reporter: undefined,
+                    isVerified: true,
+                    context: { extensionUri: mockVscode.Uri.file('/ext') },
+                    forceReadOnly: false,
+                    outputChannel: undefined
+                },
+                mockVscode.Uri.file('/test/failed-restore.db'),
+                { backupId: 'vscode-userdata:///backup/failed-restore.db' }
+            );
+
+            assert.strictEqual(doc.isReadOnlyMode, true);
+            await doc.reloadFromDisk();
+            assert.strictEqual(connectionCalls.length, 2);
+            assert.strictEqual(
+                connectionCalls[1][2],
+                true,
+                'the reconnect must retain the safety downgrade from failed restore'
+            );
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+            mockVscode.window.showErrorMessage = originalShowErrorMessage;
+            if (originalWorkerFactoryCacheEntry) {
+                moduleCache[workerFactoryPath] = originalWorkerFactoryCacheEntry;
+            } else {
+                delete moduleCache[workerFactoryPath];
+            }
+            delete moduleCache[databaseModelModulePath];
+        }
+    });
 });
 
 

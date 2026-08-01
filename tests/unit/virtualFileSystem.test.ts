@@ -131,6 +131,43 @@ describe('SQLiteFileSystemProvider', () => {
             assert.strictEqual(dbOps.getViewDefinition.mock.callCount(), 1);
         });
 
+        it('does not misreport a view-definition timeout as FileNotFound', async () => {
+            const { InvocationTimeoutError } = await import('../../src/core/rpc');
+            const dbOps = {
+                getViewDefinition: mock.fn(async () => {
+                    throw new InvocationTimeoutError('getViewDefinition');
+                })
+            };
+            setupMockDocument(docKey, dbOps);
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/slow_view/group/__view__.sql/definition.sql`
+            );
+
+            await assert.rejects(
+                () => provider.readFile(uri),
+                (error: any) => {
+                    assert.match(error.message, /Invocation timeout: getViewDefinition/);
+                    assert.doesNotMatch(error.message, /FileNotFound/);
+                    return true;
+                }
+            );
+        });
+
+        it('preserves an intentional virtual FileNotFound error', async () => {
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/gone_view/group/__view__.sql/definition.sql`
+            );
+            const missing = vscode.FileSystemError.FileNotFound(uri);
+            setupMockDocument(docKey, {
+                getViewDefinition: mock.fn(async () => { throw missing; })
+            });
+
+            await assert.rejects(
+                () => provider.readFile(uri),
+                error => error === missing
+            );
+        });
+
         it('should read regular string cell', async () => {
             // The virtualFileSystem first checks if table exists, then queries the cell
             let queryCount = 0;
@@ -210,7 +247,7 @@ describe('SQLiteFileSystemProvider', () => {
             assert.ok(text.includes('Invalid Row ID: invalid-id'));
         });
 
-        it('should throw FileNotFound on database error', async () => {
+        it('should preserve database errors as unavailable reads', async () => {
             const dbOps = {
                 executeQuery: mock.fn(async () => {
                     throw new Error('Database error');
@@ -220,10 +257,9 @@ describe('SQLiteFileSystemProvider', () => {
 
             const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/col.txt`);
 
-            // It catches error and rethrows as FileNotFound
             await assert.rejects(async () => {
                 await provider.readFile(uri);
-            }, /FileNotFound/);
+            }, /Database error/);
         });
     });
     describe('writeFile', () => {

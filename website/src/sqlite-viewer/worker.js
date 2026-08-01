@@ -456,7 +456,8 @@ async function fetchTableData(table, options = {}) {
     orderBy = null,
     orderDir = 'ASC',
     filters = [],
-    globalFilter = ''
+    globalFilter = '',
+    globalFilterColumns = null
   } = options;
 
   const safeTable = table.replace(/"/g, '""');
@@ -491,7 +492,7 @@ async function fetchTableData(table, options = {}) {
   const activeGlobalFilter = getActiveFilterValue(globalFilter);
   if (activeGlobalFilter !== undefined) {
     // Get column names to search
-    const searchCols = columns ? columns.filter(c => c !== 'rowid') : [];
+    const searchCols = (globalFilterColumns ?? columns ?? []).filter(c => c !== 'rowid');
     if (searchCols.length > 0) {
       const globalClauses = searchCols.map(c => {
         const safeCol = c.replace(/"/g, '""');
@@ -542,7 +543,8 @@ async function fetchTableCount(table, options = {}) {
   const {
     columns = [],
     filters = [],
-    globalFilter = ''
+    globalFilter = '',
+    globalFilterColumns = columns
   } = options;
 
   const safeTable = table.replace(/"/g, '""');
@@ -567,7 +569,7 @@ async function fetchTableCount(table, options = {}) {
   // Global filter
   const activeGlobalFilter = getActiveFilterValue(globalFilter);
   if (activeGlobalFilter !== undefined) {
-    const searchCols = columns.filter(c => c !== 'rowid');
+    const searchCols = globalFilterColumns.filter(c => c !== 'rowid');
     if (searchCols.length > 0) {
       const globalClauses = searchCols.map(c => {
         const safeCol = c.replace(/"/g, '""');

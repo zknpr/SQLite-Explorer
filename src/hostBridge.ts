@@ -893,7 +893,9 @@ export class HostBridge implements ToastService {
 
     const { document } = this;
     if (document.uri.scheme === 'untitled') {
-      throw new Error('The external view editor is unavailable for untitled databases');
+      throw new Error(vsc.l10n.t(
+        'The external view editor is unavailable for untitled databases'
+      ));
     }
 
     const docKey = await document.documentKey;

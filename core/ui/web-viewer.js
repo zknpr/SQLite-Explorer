@@ -71,10 +71,12 @@ const webviewMethods = {
             const tableExists = state.schemaCache.tables.some(t => t.name === state.selectedTable) ||
                                 state.schemaCache.views.some(v => v.name === state.selectedTable);
             if (!tableExists && state.selectedTable) {
+                clearSelection();
                 state.selectedTable = null;
                 state.selectedTableType = null;
                 document.getElementById('tableNameLabel').textContent = 'No table selected';
                 showEmptyState();
+                persistState();
             } else if (state.selectedTable) {
                 await loadTableData(false);
             }

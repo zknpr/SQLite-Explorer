@@ -34,6 +34,7 @@ export async function refreshContent(filename, connectionResult) {
 
         if (!tableExists && state.selectedTable) {
             // Table was deleted (e.g. undo create table)
+            clearSelection();
             state.selectedTable = null;
             state.selectedTableType = null;
             // Show empty state
@@ -45,6 +46,7 @@ export async function refreshContent(filename, connectionResult) {
                     <span class="empty-desc">Choose a table from the sidebar to view data</span>
                 </div>
             `;
+            persistState();
         } else if (state.selectedTable) {
             // Refresh columns to reflect added/removed columns
             await loadTableColumns();

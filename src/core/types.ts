@@ -407,6 +407,8 @@ export interface TableQueryOptions {
 
 export interface TableCountOptions {
   columns?: string[];
+  /** Displayed columns eligible for the global filter, matching TableQueryOptions. */
+  globalFilterColumns?: string[];
   filters?: {
     column: string;
     value: string;

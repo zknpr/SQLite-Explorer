@@ -499,6 +499,11 @@ export async function selectTableItem(name, type) {
     state.sortAscending = true;
     state.filterQuery = '';
     state.columnFilters = {};
+    if (state.filterTimer !== null) clearTimeout(state.filterTimer);
+    state.filterTimer = null;
+    state.filterApplyPending = false;
+    state.filterApplyTable = null;
+    state.filterPendingAction = null;
     state.selectedRowIds.clear();
     state.selectedCells = [];
     state.lastSelectedCell = null;
@@ -516,6 +521,8 @@ export async function selectTableItem(name, type) {
 
     const filterInput = document.getElementById('filterInput');
     if (filterInput) filterInput.value = '';
+    const clearFilterButton = document.getElementById('btnClearFilter');
+    if (clearFilterButton) clearFilterButton.hidden = true;
 
     await loadTableColumns();
     await loadTableData(true, false);
