@@ -118,6 +118,9 @@ const INIT_TIMEOUT = 10000;
 /** Timeout for individual queries (ms) */
 const QUERY_TIMEOUT = DEFAULT_QUERY_TIMEOUT_MS;
 
+/** Let a bounded worker query report its own precise timeout before RPC expires. */
+const BOUNDED_QUERY_TRANSPORT_MARGIN_MS = 2000;
+
 // ============================================================================
 // Platform Detection
 // ============================================================================
@@ -679,9 +682,10 @@ export async function createNativeDatabaseConnection(
           transportQuery.sql,
           boundary,
           transportQuery.transportColumns,
+          transportQuery.valueColumnCount,
           limit,
           queryTimeout
-        ], queryTimeout);
+        ], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS);
       };
 
       const compileNativeViewSelect = async (selectSql: string): Promise<void> => {
@@ -1288,6 +1292,9 @@ export async function createNativeDatabaseConnection(
         },
 
         createView: async (view: string, selectSql: string): Promise<ViewDefinition> => {
+          if (forceReadOnly) {
+            throw new Error('Cannot create view because the database is read-only');
+          }
           const body = normalizeViewSelectSql(selectSql);
           await compileNativeViewSelect(body);
           const savepointName = createSavepointName('sp_create_view');
@@ -1311,6 +1318,9 @@ export async function createNativeDatabaseConnection(
           expectedSql?: string,
           expectedTriggers?: readonly ViewTriggerDefinition[]
         ): Promise<ViewEditResult> => {
+          if (forceReadOnly) {
+            throw new Error('Cannot edit view because the database is read-only');
+          }
           const body = normalizeViewSelectSql(selectSql);
           await compileNativeViewSelect(body);
           const savepointName = createSavepointName('sp_edit_view');
@@ -1355,6 +1365,9 @@ export async function createNativeDatabaseConnection(
           expectedSql?: string,
           expectedTriggers?: readonly ViewTriggerDefinition[]
         ): Promise<ViewDefinition> => {
+          if (forceReadOnly) {
+            throw new Error('Cannot drop view because the database is read-only');
+          }
           const savepointName = createSavepointName('sp_drop_view');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
@@ -1388,7 +1401,8 @@ export async function createNativeDatabaseConnection(
           const result = await worker.call<NativeQueryResult>('queryNumeric', [
             transportQuery.sql,
             params,
-            transportQuery.transportColumns
+            transportQuery.transportColumns,
+            transportQuery.valueColumnCount
           ]);
 
           // txiki preserves SQLite int64 values as BigInt. The generated

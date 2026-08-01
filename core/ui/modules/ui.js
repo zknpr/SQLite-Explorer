@@ -62,6 +62,7 @@ export function updateToolbarButtons() {
     // Enable delete button if rows OR columns are selected
     if (btnDeleteRows) {
         btnDeleteRows.disabled = state.isReadOnly
+            || state.isGridReloading
             || !hasTable
             || (!hasRowSelection && !hasColumnSelection);
     }

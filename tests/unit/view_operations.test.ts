@@ -4,7 +4,10 @@ import { afterEach, describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import * as vscode from 'vscode';
 
-import { buildExactNumericTextQuery } from '../../src/core/integer-utils';
+import {
+    buildExactNumericTextQuery,
+    normalizeIntegerRowsForTransport
+} from '../../src/core/integer-utils';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import type { DatabaseOperations, ViewDefinition } from '../../src/core/types';
 import { normalizeViewSelectSql } from '../../src/core/view-utils';
@@ -419,6 +422,72 @@ describe('view operations', () => {
             assert.strictEqual(
                 await readScalar(engine, 'SELECT value FROM trigger_column_log'),
                 'new-a:old-a'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('preserves intrinsic NEW and OLD rowid aliases across a view edit', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE intrinsic_rowid_source (value TEXT); ' +
+                "INSERT INTO intrinsic_rowid_source VALUES ('before'); " +
+                'CREATE TABLE intrinsic_rowid_log (value TEXT); ' +
+                'CREATE VIEW intrinsic_rowid_view AS SELECT value FROM intrinsic_rowid_source; ' +
+                'CREATE TRIGGER intrinsic_rowid_update INSTEAD OF UPDATE ON intrinsic_rowid_view ' +
+                'BEGIN INSERT INTO intrinsic_rowid_log VALUES (' +
+                "NEW.rowid || ':' || OLD._rowid_ || ':' || OLD.oid); END"
+            );
+
+            const edit = await engine.editView(
+                'intrinsic_rowid_view',
+                'SELECT value || value AS value FROM intrinsic_rowid_source',
+                true
+            );
+            assert.deepStrictEqual(
+                edit.after.triggers.map(trigger => trigger.identifier),
+                ['intrinsic_rowid_update']
+            );
+
+            await engine.executeQuery('DROP VIEW main.intrinsic_rowid_view');
+            await engine.executeQuery(
+                'CREATE VIEW intrinsic_rowid_view AS SELECT value AS rowid FROM intrinsic_rowid_source; ' +
+                'CREATE TRIGGER projected_rowid_update INSTEAD OF UPDATE ON intrinsic_rowid_view ' +
+                'BEGIN INSERT INTO intrinsic_rowid_log VALUES (NEW.rowid); END'
+            );
+            const projectedRowidEdit = await engine.editView(
+                'intrinsic_rowid_view',
+                'SELECT value || value AS rowid FROM intrinsic_rowid_source',
+                true
+            );
+            assert.deepStrictEqual(
+                projectedRowidEdit.after.triggers.map(trigger => trigger.identifier),
+                ['projected_rowid_update']
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('keeps UPDATE OF rowid strict when rowid is not a projected view column', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE update_of_rowid_source (value TEXT); ' +
+                'CREATE VIEW update_of_rowid_view AS SELECT value FROM update_of_rowid_source; ' +
+                'CREATE TRIGGER update_of_rowid_trigger ' +
+                'INSTEAD OF UPDATE OF rowid ON update_of_rowid_view BEGIN SELECT 1; END'
+            );
+
+            await assert.rejects(
+                () => engine.editView(
+                    'update_of_rowid_view',
+                    'SELECT value || value AS value FROM update_of_rowid_source',
+                    true
+                ),
+                /update_of_rowid_trigger.*missing view column.*rowid/i
             );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
@@ -1094,13 +1163,78 @@ describe('view operations', () => {
             );
 
             assert.strictEqual(preview.rows[0][0], 9.652937795298495e282);
+            const sqliteText = preview.exactIntegerTexts?.[0]?.[0];
+            assert.strictEqual(typeof sqliteText, 'string');
+            assert.notStrictEqual(sqliteText, String(preview.rows[0][0]));
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('keeps exact numeric projection within SQLite column limits and degrades wide previews', async () => {
+        const fitting = buildExactNumericTextQuery('SELECT 1', 1000);
+        assert.strictEqual(fitting.valueColumnCount, 1000);
+        assert.strictEqual(fitting.transportColumns.length, 2000);
+
+        const wide = buildExactNumericTextQuery('SELECT 1', 1001);
+        assert.strictEqual(wide.valueColumnCount, undefined);
+        assert.strictEqual(wide.transportColumns.length, 1001);
+        assert.doesNotMatch(wide.sql, /__sqlite_explorer_numeric_text_/);
+
+        const fittingExpressions = Array.from({ length: 1000 }, (_, index) => (
+            index === 0 ? '9.652937795298495e282 AS c0' : `0 AS c${index}`
+        ));
+        const expressions = Array.from({ length: 1001 }, (_, index) => {
+            if (index === 0) return '9007199254740993 AS c0';
+            if (index === 1) return 'CAST(1 AS REAL) AS c1';
+            return `0 AS c${index}`;
+        });
+        const engine = await createEngine();
+        try {
+            const fittingPreview = await engine.previewViewDefinition(
+                'fitting_numeric_preview',
+                `SELECT ${fittingExpressions.join(', ')}`,
+                1,
+                'create'
+            );
+            assert.strictEqual(fittingPreview.headers.length, 1000);
+            const fittingExactText = fittingPreview.exactIntegerTexts?.[0]?.[0];
+            assert.strictEqual(typeof fittingExactText, 'string');
+            assert.notStrictEqual(
+                fittingExactText,
+                String(fittingPreview.rows[0][0]),
+                'the 2,000-column boundary must retain SQLite REAL text'
+            );
+
+            const preview = await engine.previewViewDefinition(
+                'wide_numeric_preview',
+                `SELECT ${expressions.join(', ')}`,
+                1,
+                'create'
+            );
+            assert.strictEqual(preview.headers.length, 1001);
+            assert.strictEqual(preview.rows[0].length, 1001);
+            assert.strictEqual(preview.rows[0][0], 9007199254740992);
+            assert.strictEqual(preview.exactIntegerTexts?.[0]?.[0], '9007199254740993');
             assert.strictEqual(
-                preview.exactIntegerTexts?.[0]?.[0],
-                '9.6529377952985e+282'
+                preview.exactIntegerTexts?.[0]?.[1],
+                undefined,
+                'ultra-wide results deliberately omit divergent REAL text companions'
             );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
         }
+    });
+
+    it('rejects null exact-numeric sidecar rows with the protocol validation error', () => {
+        assert.throws(
+            () => normalizeIntegerRowsForTransport(
+                [[1]],
+                undefined,
+                { 0: null } as any
+            ),
+            /Invalid exact numeric text row index: 0/
+        );
     });
 
     it('derives WASM numeric sidecars from one evaluation of random expressions', async () => {

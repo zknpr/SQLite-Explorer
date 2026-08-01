@@ -250,6 +250,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         if (!isSuperseded() || latestLoadHasNoTarget) {
             state.isLoadingData = false;
             state.isGridReloading = false;
+            updateToolbarButtons();
         }
     }
 }

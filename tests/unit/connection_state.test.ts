@@ -63,6 +63,44 @@ describe('viewer connection state', () => {
         assert.strictEqual(controls.btnAddRow.disabled, false);
         assert.strictEqual(controls.btnAddColumn.disabled, false);
         assert.strictEqual(controls.btnDeleteRows.disabled, false);
+
+        state.isGridReloading = true;
+        updateToolbarButtons();
+        assert.strictEqual(controls.btnDeleteRows.disabled, true);
+        state.isGridReloading = false;
+        updateToolbarButtons();
+        assert.strictEqual(controls.btnDeleteRows.disabled, false);
+    });
+
+    it('does not submit a stale toolbar deletion during a grid reload', async () => {
+        (globalThis as any).document = {
+            getElementById() { return null; },
+            querySelectorAll() { return []; }
+        };
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const crudModulePath = '../../core/ui/modules/crud.js';
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { submitDelete } = await import(crudModulePath);
+        const originalDeleteRows = backendApi.deleteRows;
+        let deleteCalls = 0;
+        backendApi.deleteRows = async () => { deleteCalls++; };
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.selectedRowIds = new Set([1]);
+        state.selectedColumns = new Set();
+        state.isGridReloading = true;
+
+        try {
+            await submitDelete();
+            assert.strictEqual(deleteCalls, 0);
+        } finally {
+            backendApi.deleteRows = originalDeleteRows;
+            state.selectedRowIds.clear();
+            state.selectedColumns.clear();
+            state.isGridReloading = false;
+        }
     });
 
     it('fails closed for disconnected or incomplete initialization envelopes', async () => {

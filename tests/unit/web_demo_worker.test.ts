@@ -21,6 +21,10 @@ const bundledWorkerPath = path.resolve(
     process.cwd(),
     'website/public/sqlite-viewer/worker.js'
 );
+const BUNDLED_SQLJS_SQLITE_VERSION = '3.49.1';
+const DIVERGENT_REAL_TEXT_BY_SQLJS_SQLITE_VERSION: Record<string, string> = {
+    '3.49.1': '9.6529377952985e+282'
+};
 
 let currentWorkerBundle: Promise<string> | undefined;
 
@@ -663,6 +667,15 @@ describe('web demo view worker', () => {
 
     it('returns authoritative SQLite text for divergent non-integral demo REALs', async () => {
         const worker = await createWorkerHarness();
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT sqlite_version()'),
+            BUNDLED_SQLJS_SQLITE_VERSION,
+            'the REAL text expectation below is pinned to the bundled SQLite version'
+        );
+        const expectedText = DIVERGENT_REAL_TEXT_BY_SQLJS_SQLITE_VERSION[
+            BUNDLED_SQLJS_SQLITE_VERSION
+        ];
+        assert.ok(expectedText, 'record the REAL rendering when bundled sql.js SQLite changes');
         const preview = await worker.invoke(
             'previewViewDefinition',
             'demo_divergent_real_preview',
@@ -674,8 +687,30 @@ describe('web demo view worker', () => {
         assert.strictEqual(preview.rows[0][0], 9.652937795298495e282);
         assert.strictEqual(
             preview.exactIntegerTexts[0][0],
-            '9.6529377952985e+282'
+            expectedText
         );
+    });
+
+    it('degrades exact REAL companions without failing a 1001-column demo preview', async () => {
+        const worker = await createWorkerHarness();
+        const expressions = Array.from({ length: 1001 }, (_, index) => {
+            if (index === 0) return '9007199254740993 AS c0';
+            if (index === 1) return 'CAST(1 AS REAL) AS c1';
+            return `0 AS c${index}`;
+        });
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'demo_wide_numeric_preview',
+            `SELECT ${expressions.join(', ')}`,
+            1,
+            'create'
+        );
+
+        assert.strictEqual(preview.headers.length, 1001);
+        assert.strictEqual(preview.rows[0].length, 1001);
+        assert.strictEqual(preview.rows[0][0], 9007199254740992);
+        assert.strictEqual(preview.exactIntegerTexts[0][0], '9007199254740993');
+        assert.strictEqual(preview.exactIntegerTexts[0][1], undefined);
     });
 
     it('derives demo numeric sidecars from one evaluation of random expressions', async () => {

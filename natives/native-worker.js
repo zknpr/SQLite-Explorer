@@ -30,6 +30,7 @@ let db = null;
 /** Map of prepared statements by ID */
 const statements = new Map();
 let stmtCounter = 0;
+let savepointCounter = 0;
 
 // ============================================================================
 // Message Protocol
@@ -253,16 +254,24 @@ function executeQuery(db, sql, params) {
 }
 
 /** Compact generated numeric metadata before crossing the V8 RPC boundary. */
-function compactExactNumericResult(result, transportColumns) {
-  if (!Array.isArray(transportColumns) || transportColumns.length < 2 || transportColumns.length % 2 !== 0) {
+function compactExactNumericResult(result, transportColumns, valueColumnCount) {
+  if (!Array.isArray(transportColumns) || transportColumns.length < 1) {
     throw new Error('Invalid exact numeric transport column list');
   }
-  const valueColumnCount = transportColumns.length / 2;
+  const hasRealTextSidecar = valueColumnCount !== undefined;
+  const logicalColumnCount = hasRealTextSidecar ? valueColumnCount : transportColumns.length;
+  if (
+    !Number.isInteger(logicalColumnCount) ||
+    logicalColumnCount < 1 ||
+    transportColumns.length !== logicalColumnCount * (hasRealTextSidecar ? 2 : 1)
+  ) {
+    throw new Error('Invalid exact numeric transport column list');
+  }
   const values = [];
   let exactIntegerTexts;
 
   if (result.values.length === 0) {
-    return { columns: transportColumns.slice(0, valueColumnCount), values, rowCount: 0 };
+    return { columns: transportColumns.slice(0, logicalColumnCount), values, rowCount: 0 };
   }
 
   const mapping = transportColumns.map(column => result.columns.indexOf(column));
@@ -273,9 +282,10 @@ function compactExactNumericResult(result, transportColumns) {
   for (let rowIndex = 0; rowIndex < result.values.length; rowIndex++) {
     const sourceRow = result.values[rowIndex];
     const orderedRow = mapping.map(index => sourceRow[index]);
-    values.push(orderedRow.slice(0, valueColumnCount));
-    for (let columnIndex = 0; columnIndex < valueColumnCount; columnIndex++) {
-      const exactText = orderedRow[valueColumnCount + columnIndex];
+    values.push(orderedRow.slice(0, logicalColumnCount));
+    if (!hasRealTextSidecar) continue;
+    for (let columnIndex = 0; columnIndex < logicalColumnCount; columnIndex++) {
+      const exactText = orderedRow[logicalColumnCount + columnIndex];
       if (exactText === null || exactText === undefined) continue;
       if (typeof exactText !== 'string') {
         throw new Error(`Exact numeric metadata at row ${rowIndex}, column ${columnIndex} is not text`);
@@ -288,7 +298,7 @@ function compactExactNumericResult(result, transportColumns) {
   }
 
   const compacted = {
-    columns: transportColumns.slice(0, valueColumnCount),
+    columns: transportColumns.slice(0, logicalColumnCount),
     values,
     rowCount: values.length
   };
@@ -381,7 +391,7 @@ function executeSingleStatement(db, markedSql, sql, params, requiredSuffix) {
  * checks below can only reject a result after SQLite returns. True interruption
  * remains deferred until the binding exposes a native cancellation primitive.
  */
-function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, limit, timeoutMs) {
+function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, valueColumnCount, limit, timeoutMs) {
   const validatedSql = assertSingleStatementPayload(db, markedSql, sql, requiredSuffix);
 
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
@@ -416,7 +426,8 @@ function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, limit,
 
   return compactExactNumericResult(
     { columns, values, rowCount: values.length },
-    columns
+    columns,
+    valueColumnCount
   );
 }
 
@@ -505,11 +516,12 @@ async function handleRequest(request) {
       }
 
       case "queryNumeric": {
-        const [sql, params, transportColumns] = args;
+        const [sql, params, transportColumns, valueColumnCount] = args;
         if (!db) throw new Error("Database not open");
         result = compactExactNumericResult(
           executeQuery(db, sql, params),
-          transportColumns
+          transportColumns,
+          valueColumnCount
         );
         break;
       }
@@ -525,7 +537,7 @@ async function handleRequest(request) {
       }
 
       case "queryBounded": {
-        const [markedSql, sql, requiredSuffix, columns, limit, timeoutMs] = args;
+        const [markedSql, sql, requiredSuffix, columns, valueColumnCount, limit, timeoutMs] = args;
         if (!db) throw new Error("Database not open");
         result = executeBoundedQuery(
           db,
@@ -533,6 +545,7 @@ async function handleRequest(request) {
           sql,
           requiredSuffix,
           columns,
+          valueColumnCount,
           limit,
           timeoutMs
         );
@@ -633,12 +646,14 @@ async function handleRequest(request) {
       }
 
       case "execBatch": {
-        // Execute a batch of statements in a transaction
+        // SAVEPOINT composes with host-side atomic read/write boundaries; a raw
+        // BEGIN here would fail when updateCellBatch is intentionally nested.
         // args: [items: { sql: string, params?: any[], paramsList?: any[][] }[]]
         const [items] = args;
         if (!db) throw new Error("Database not open");
 
-        db.exec("BEGIN TRANSACTION");
+        const savepointName = `sqlite_explorer_exec_batch_${++savepointCounter}`;
+        db.exec(`SAVEPOINT "${savepointName}"`);
         try {
           for (const item of items) {
              if (item.paramsList && item.paramsList.length > 0) {
@@ -656,10 +671,17 @@ async function handleRequest(request) {
                  executeStatement(db, item.sql, item.params);
              }
           }
-          db.exec("COMMIT");
+          db.exec(`RELEASE SAVEPOINT "${savepointName}"`);
           result = { success: true };
         } catch (err) {
-          try { db.exec("ROLLBACK"); } catch(e) {}
+          try {
+            db.exec(`ROLLBACK TO SAVEPOINT "${savepointName}"`);
+            db.exec(`RELEASE SAVEPOINT "${savepointName}"`);
+          } catch (rollbackErr) {
+            throw new Error(
+              `Batch failed (${String(err)}); savepoint cleanup failed (${String(rollbackErr)})`
+            );
+          }
           throw err;
         }
         break;

@@ -167,6 +167,9 @@ export function openDeleteModal() {
 }
 
 export async function submitDelete() {
+    // The confirmation modal can already be open when a replacement load
+    // starts. Never apply its stale row/column selection to the incoming grid.
+    if (state.isGridReloading) return;
     if (state.selectedColumns.size > 0) {
         await submitDeleteColumns();
     } else if (state.selectedRowIds.size > 0) {

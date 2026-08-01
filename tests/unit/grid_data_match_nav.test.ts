@@ -441,6 +441,7 @@ describe('grid data match cache', () => {
     });
 
     it('guards the old grid during a background data replacement', async () => {
+        const deleteButton = { disabled: false };
         const elements: Record<string, any> = {
             pageIndicator: { textContent: '' },
             btnFirst: { disabled: false },
@@ -448,7 +449,8 @@ describe('grid data match cache', () => {
             btnNext: { disabled: false },
             btnLast: { disabled: false },
             statusText: { textContent: '' },
-            filterMatchCounter: { textContent: '' }
+            filterMatchCounter: { textContent: '' },
+            btnDeleteRows: deleteButton
         };
         (globalThis as any).document = {
             getElementById(id: string) { return elements[id] ?? null; },
@@ -475,18 +477,26 @@ describe('grid data match cache', () => {
         state.isLoadingData = false;
         state.isGridReloading = false;
         state.editingCellInfo = { rowIdx: 0, colIdx: 0 };
+        state.isReadOnly = false;
+        state.selectedRowIds = new Set([7]);
+        state.selectedColumns = new Set();
 
         try {
             const pendingLoad = loadTableData(false, false);
             assert.strictEqual(state.isGridReloading, true);
             assert.strictEqual(state.isLoadingData, false, 'background load must not show spinner state');
+            assert.strictEqual(deleteButton.disabled, true);
             count.resolve(1);
             await pendingLoad;
             assert.strictEqual(state.isGridReloading, false);
+            assert.strictEqual(deleteButton.disabled, false);
         } finally {
             backendApi.fetchTableCount = originalFetchCount;
             backendApi.fetchTableData = originalFetchData;
             state.editingCellInfo = null;
+            state.selectedRowIds.clear();
+            state.selectedColumns.clear();
+            state.isReadOnly = false;
         }
     });
 

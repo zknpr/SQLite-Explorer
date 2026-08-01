@@ -6,9 +6,9 @@
  * This allows the viewer to work standalone in a browser.
  */
 
-import { RPC_TIMEOUT_MS } from './rpc-constants.js';
+import { RPC_TIMEOUT_MS, getRpcTimeoutMs } from './rpc-constants.js';
 
-export { RPC_TIMEOUT_MS };
+export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
 
 // Use parent window for RPC instead of VS Code API
 const parentWindow = window.parent;
@@ -220,12 +220,13 @@ export async function sendRpcRequest(method, args) {
     const serializedArgs = await serializeArgsAsync(args);
 
     return new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
+        const timeoutMs = getRpcTimeoutMs(method);
+        const timeoutId = timeoutMs === undefined ? undefined : setTimeout(() => {
             if (pendingRpcCalls.has(messageId)) {
                 pendingRpcCalls.delete(messageId);
                 reject(new Error(`RPC timeout: ${method}`));
             }
-        }, RPC_TIMEOUT_MS);
+        }, timeoutMs);
 
         pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
 
@@ -251,7 +252,7 @@ export function handleRpcResponse(message) {
 
     const pending = pendingRpcCalls.get(message.messageId);
     if (pending) {
-        clearTimeout(pending.timeoutId);
+        if (pending.timeoutId !== undefined) clearTimeout(pending.timeoutId);
         pendingRpcCalls.delete(message.messageId);
 
         if (message.success) {

@@ -11,6 +11,11 @@ import {
     NativeWorkerProcess
 } from '../../src/nativeWorker';
 
+const BUNDLED_TXIKI_SQLITE_VERSION = '3.50.1';
+const DIVERGENT_REAL_TEXT_BY_NATIVE_SQLITE_VERSION: Record<string, string> = {
+    '3.50.1': '9.6529377952985e+282'
+};
+
 const USER_VIEW_BODY = `SELECT
     o.id AS order_id,
     o.order_number,
@@ -87,7 +92,7 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             ]);
             const version = String(result.values[0]?.[0] ?? '');
             console.log(`[native smoke] SQLite version: ${version}`);
-            assert.strictEqual(version, '3.50.1');
+            assert.strictEqual(version, BUNDLED_TXIKI_SQLITE_VERSION);
         });
 
         await testContext.test('retains the boundary on multiline SQL and rejects a statement tail', async () => {
@@ -217,6 +222,12 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
         });
 
         await testContext.test('carries authoritative SQLite text for divergent native REALs', async () => {
+            // SQLite REAL-to-text rendering is version-sensitive; the assertion
+            // below is paired with the bundled version pinned at the lane start.
+            const expectedText = DIVERGENT_REAL_TEXT_BY_NATIVE_SQLITE_VERSION[
+                BUNDLED_TXIKI_SQLITE_VERSION
+            ];
+            assert.ok(expectedText, 'record the REAL rendering when the bundled SQLite version changes');
             const preview = await engine.previewViewDefinition(
                 'native_divergent_real_preview',
                 'SELECT 9.652937795298495e282 AS value',
@@ -227,7 +238,51 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.strictEqual(preview.rows[0][0], 9.652937795298495e282);
             assert.strictEqual(
                 preview.exactIntegerTexts?.[0]?.[0],
-                '9.6529377952985e+282'
+                expectedText
+            );
+        });
+
+        await testContext.test('degrades exact REAL companions without failing a 1001-column native preview', async () => {
+            const expressions = Array.from({ length: 1001 }, (_, index) => {
+                if (index === 0) return '9007199254740993 AS c0';
+                if (index === 1) return 'CAST(1 AS REAL) AS c1';
+                return `0 AS c${index}`;
+            });
+            const preview = await engine.previewViewDefinition(
+                'native_wide_numeric_preview',
+                `SELECT ${expressions.join(', ')}`,
+                1,
+                'create'
+            );
+
+            assert.strictEqual(preview.headers.length, 1001);
+            assert.strictEqual(preview.rows[0].length, 1001);
+            assert.strictEqual(preview.rows[0][0], 9007199254740992);
+            assert.strictEqual(preview.exactIntegerTexts?.[0]?.[0], '9007199254740993');
+            assert.strictEqual(preview.exactIntegerTexts?.[0]?.[1], undefined);
+        });
+
+        await testContext.test('nests native batch writes inside a host savepoint', async () => {
+            await engine.executeQuery(
+                "CREATE TABLE native_nested_batch (value TEXT); " +
+                "INSERT INTO native_nested_batch(value) VALUES ('before')"
+            );
+            await engine.executeQuery('SAVEPOINT native_smoke_outer_batch');
+            try {
+                await engine.updateCellBatch('native_nested_batch', [{
+                    rowId: 1,
+                    column: 'value',
+                    value: 'after'
+                }]);
+                await engine.executeQuery('RELEASE SAVEPOINT native_smoke_outer_batch');
+            } catch (error) {
+                await engine.executeQuery('ROLLBACK TO SAVEPOINT native_smoke_outer_batch');
+                await engine.executeQuery('RELEASE SAVEPOINT native_smoke_outer_batch');
+                throw error;
+            }
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM native_nested_batch'))[0].rows,
+                [['after']]
             );
         });
 

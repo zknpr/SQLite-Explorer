@@ -241,7 +241,10 @@ describe('HostBridge', () => {
         const baseline = createDeferred<any>();
         const baselineStarted = createDeferred<void>();
         const dbOps = {
-            executeQuery: mock.fn(async () => {
+            executeQuery: mock.fn(async (sql: string) => {
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['wr'], rows: [[0]] }];
+                }
                 baselineStarted.resolve();
                 return baseline.promise;
             }),
@@ -266,6 +269,175 @@ describe('HostBridge', () => {
         await assert.rejects(pending, /document was reloaded/i);
         assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('uses database-current batch values for JSON patches and undo history', async () => {
+        const sqlCalls: string[] = [];
+        const batchCalls: any[][] = [];
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => {
+                sqlCalls.push(sql);
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['wr'], rows: [[0]] }];
+                }
+                if (sql.startsWith('SELECT rowid')) {
+                    return [{
+                        headers: ['rowid', 'payload', 'label'],
+                        rows: [[7, '{"count":1,"concurrent":true}', 'database-current']]
+                    }];
+                }
+                return [];
+            }),
+            updateCellBatch: mock.fn(async (_table: string, updates: any[]) => {
+                batchCalls.push(updates);
+            })
+        };
+        const recordExternalModification = mock.fn();
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 3,
+            recordExternalModification
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        await bridge.updateCellBatch('items', [
+            {
+                rowId: 7,
+                column: 'payload',
+                value: '{"count":2,"concurrent":true}',
+                originalValue: '{"count":0}'
+            },
+            {
+                rowId: 7,
+                column: 'label',
+                value: 'after',
+                originalValue: 'caller-stale'
+            }
+        ], 'Authoritative batch');
+
+        assert.strictEqual(batchCalls.length, 1);
+        assert.deepStrictEqual(batchCalls[0], [
+            {
+                rowId: 7,
+                column: 'payload',
+                value: '{"count":2}',
+                originalValue: '{"count":1,"concurrent":true}',
+                operation: 'json_patch'
+            },
+            {
+                rowId: 7,
+                column: 'label',
+                value: 'after',
+                originalValue: 'database-current'
+            }
+        ]);
+        assert.ok(sqlCalls[1].startsWith('SAVEPOINT '));
+        assert.ok(sqlCalls[2].startsWith('SELECT rowid'));
+        assert.ok(sqlCalls.at(-1)?.startsWith('RELEASE SAVEPOINT '));
+
+        const modification = recordExternalModification.mock.calls[0].arguments[0] as any;
+        assert.deepStrictEqual(modification.affectedCells, [
+            {
+                rowId: 7,
+                columnName: 'payload',
+                newValue: '{"count":2}',
+                priorValue: '{"count":1,"concurrent":true}',
+                operation: 'json_patch'
+            },
+            {
+                rowId: 7,
+                columnName: 'label',
+                newValue: 'after',
+                priorValue: 'database-current',
+                operation: 'set'
+            }
+        ]);
+    });
+
+    it('rejects rowid-based cell edits for WITHOUT ROWID tables before a savepoint', async () => {
+        const dbOps = {
+            executeQuery: mock.fn(async (_sql: string) => [{ headers: ['wr'], rows: [[1]] }]),
+            updateCell: mock.fn(async () => {}),
+            updateCellBatch: mock.fn(async () => {})
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        await assert.rejects(
+            () => bridge.updateCell('rowidless', 1, 'value', 'after'),
+            /WITHOUT ROWID tables are not editable yet/
+        );
+        await assert.rejects(
+            () => bridge.updateCellBatch(
+                'rowidless',
+                [{ rowId: 1, column: 'value', value: 'after' }],
+                'Batch'
+            ),
+            /WITHOUT ROWID tables are not editable yet/
+        );
+
+        assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+        assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 0);
+        assert.strictEqual(
+            dbOps.executeQuery.mock.calls.some(call => String(call.arguments[0]).startsWith('SAVEPOINT ')),
+            false
+        );
+    });
+
+    it('does not roll a superseded batch savepoint back on the reloaded connection', async () => {
+        const sqlCalls: string[] = [];
+        let connectionGeneration = 11;
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => {
+                sqlCalls.push(sql);
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['wr'], rows: [[0]] }];
+                }
+                if (sql.startsWith('SELECT rowid')) {
+                    connectionGeneration++;
+                    return [{ headers: ['rowid', 'value'], rows: [[1, 'before']] }];
+                }
+                return [];
+            }),
+            updateCellBatch: mock.fn(async () => {
+                throw new Error('batch write must not reach a superseded connection');
+            })
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            get connectionGeneration() { return connectionGeneration; },
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        await assert.rejects(
+            () => bridge.updateCellBatch(
+                'items',
+                [{ rowId: 1, column: 'value', value: 'after' }],
+                'Batch'
+            ),
+            /document was reloaded/i
+        );
+
+        assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 0);
+        assert.strictEqual(
+            sqlCalls.some(sql => sql.startsWith('ROLLBACK TO SAVEPOINT ')),
+            false,
+            'the fresh connection must not receive rollback SQL for the old endpoint'
+        );
     });
 
     it('rejects a column deletion when reload supersedes its history capture', async () => {

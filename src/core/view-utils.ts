@@ -620,6 +620,7 @@ export function assertViewTriggersCompatibleWithColumns(
   columns: readonly string[]
 ): void {
   const availableColumns = new Set(columns.map(foldSqlIdentifier));
+  const intrinsicPseudoRowColumns = new Set(['rowid', '_rowid_', 'oid']);
 
   for (const trigger of triggers) {
     const parsed = parseStoredTriggerSql(trigger.sql);
@@ -651,7 +652,14 @@ export function assertViewTriggersCompatibleWithColumns(
       )) {
         continue;
       }
-      if (!availableColumns.has(foldSqlIdentifier(column.value))) {
+      const foldedColumn = foldSqlIdentifier(column.value);
+      // SQLite accepts intrinsic rowid aliases on NEW/OLD pseudo-rows even
+      // when they are not projected view columns. Keep UPDATE OF strict: its
+      // identifiers are event columns, not pseudo-row references.
+      if (intrinsicPseudoRowColumns.has(foldedColumn)) {
+        continue;
+      }
+      if (!availableColumns.has(foldedColumn)) {
         throwMissingTriggerColumn(
           trigger,
           column.value,

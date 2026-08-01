@@ -109,7 +109,7 @@ function installTimerHarness({ virtualTime = false } = {}) {
         },
         async run(delay: number) {
             if (virtualTime) now += delay;
-            await take(delay)();
+            return await take(delay)();
         },
         restore() {
             globalThis.setTimeout = originalSetTimeout;
@@ -469,8 +469,10 @@ describe('filter controls', () => {
             globalInput.value = 'broken draft';
             const { onFilterInput } = await import(gridActionsModulePath);
             onFilterInput({ target: globalInput, isComposing: false });
-            await timers.run(300);
+            const applied = await timers.run(300);
 
+            assert.strictEqual(applied, false, 'the failed load contract must reach the filter queue');
+            assert.strictEqual(state.lastGridLoadError, 'malformed filter predicate');
             assert.strictEqual(state.filterQuery, 'working');
             assert.deepStrictEqual(state.columnFilters, {});
             assert.deepStrictEqual(state.gridData, [['working row']]);

@@ -4,6 +4,17 @@ import { escapeIdentifier } from './sql-utils';
 const NUMERIC_SOURCE_ALIAS = '__sqlite_explorer_numeric_source';
 const NUMERIC_VALUE_PREFIX = '__sqlite_explorer_numeric_value_';
 const NUMERIC_TEXT_PREFIX = '__sqlite_explorer_numeric_text_';
+// Bundled SQLite engines use the default SQLITE_MAX_COLUMN value. Keep this
+// structural limit explicit so generated metadata can never make an otherwise
+// valid wide query fail with "too many columns in result set".
+const SQLITE_MAX_RESULT_COLUMNS = 2000;
+
+export interface ExactNumericTextQuery {
+  sql: string;
+  transportColumns: string[];
+  /** Present only when a second, SQLite-text companion exists per value. */
+  valueColumnCount?: number;
+}
 
 /**
  * Project each result value beside SQLite-generated text for every REAL.
@@ -15,7 +26,7 @@ const NUMERIC_TEXT_PREFIX = '__sqlite_explorer_numeric_text_';
 export function buildExactNumericTextQuery(
   sourceSql: string,
   columnCount: number
-): { sql: string; transportColumns: string[] } {
+): ExactNumericTextQuery {
   if (!Number.isInteger(columnCount) || columnCount < 1) {
     throw new Error(`Exact numeric text projection requires a positive column count, got ${columnCount}`);
   }
@@ -30,21 +41,34 @@ export function buildExactNumericTextQuery(
   );
   const quotedSource = escapeIdentifier(NUMERIC_SOURCE_ALIAS);
   const quotedValues = valueColumns.map(escapeIdentifier);
+  const includeRealTextSidecar = columnCount * 2 <= SQLITE_MAX_RESULT_COLUMNS;
   const exactTextExpressions = quotedValues.map((valueColumn, index) => (
     `CASE WHEN typeof(${valueColumn}) = 'real' ` +
     `THEN CAST(${valueColumn} AS TEXT) END AS ${escapeIdentifier(textColumns[index])}`
   ));
 
-  return {
+  const projectedColumns = includeRealTextSidecar
+    ? [...quotedValues, ...exactTextExpressions]
+    : quotedValues;
+  const transportColumns = includeRealTextSidecar
+    ? [...valueColumns, ...textColumns]
+    : valueColumns;
+
+  const result: ExactNumericTextQuery = {
     // OFFSET is a documented query-flattening barrier across older CTE-capable
     // SQLite 3.x releases. The resulting coroutine evaluates each source row
     // once before typeof/comparison/cast reference it in the outer query.
     sql:
       `WITH ${quotedSource} (${quotedValues.join(', ')}) AS (\n` +
       `SELECT * FROM (\n${sourceSql}\n) LIMIT -1 OFFSET 0\n)\n` +
-      `SELECT ${[...quotedValues, ...exactTextExpressions].join(', ')} FROM ${quotedSource}`,
-    transportColumns: [...valueColumns, ...textColumns]
+      `SELECT ${projectedColumns.join(', ')} FROM ${quotedSource}`,
+    transportColumns
   };
+  if (includeRealTextSidecar) result.valueColumnCount = columnCount;
+  // Unsafe INTEGERs still cross through value columns as BigInt and are
+  // normalized exactly. Ultra-wide results omit only divergent REAL text:
+  // evaluating the source twice would be incorrect for volatile expressions.
+  return result;
 }
 
 /**
@@ -105,7 +129,12 @@ export function normalizeIntegerRowsForTransport(
   if (transportedExactTexts) {
     for (const [rowIndexText, exactRow] of Object.entries(transportedExactTexts)) {
       const rowIndex = Number(rowIndexText);
-      if (!Number.isInteger(rowIndex) || rowIndex < 0 || typeof exactRow !== 'object') {
+      if (
+        !Number.isInteger(rowIndex) ||
+        rowIndex < 0 ||
+        exactRow === null ||
+        typeof exactRow !== 'object'
+      ) {
         throw new Error(`Invalid exact numeric text row index: ${rowIndexText}`);
       }
       for (const [columnIndexText, exactText] of Object.entries(exactRow)) {

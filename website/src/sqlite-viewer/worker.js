@@ -195,7 +195,7 @@ function querySingleStatement(sql) {
     }
     const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
       sourceRows,
-      headers.length
+      transportQuery.valueColumnCount
     );
     return { headers, rows, exactIntegerTexts };
   } finally {
@@ -553,7 +553,7 @@ async function fetchTableData(table, options = {}) {
 
   const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
     results[0].values,
-    headers.length
+    transportQuery.valueColumnCount
   );
   return {
     headers,

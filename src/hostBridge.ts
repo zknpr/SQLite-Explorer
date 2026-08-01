@@ -16,8 +16,9 @@ import { IsCursorIDE } from './helpers';
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
 import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition } from './core/types';
 import { generateMergePatch } from './core/json-utils';
-import { escapeIdentifier } from './core/sql-utils';
+import { escapeIdentifier, validateRowId } from './core/sql-utils';
 import { isViewDefinitionConflictError } from './core/view-utils';
+import { crypto } from './platform/cryptoShim';
 
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
@@ -81,6 +82,28 @@ export class HostBridge implements ToastService {
   }
 
   /**
+   * The grid currently identifies rows through SQLite's hidden rowid. A
+   * WITHOUT ROWID table needs a primary-key identity protocol end-to-end;
+   * reject it before opening a write savepoint until that post-release work
+   * is implemented, rather than leaking a raw "no such column: rowid" error.
+   */
+  private async assertTableSupportsRowIdEdits(
+    dbOps: ReturnType<HostBridge['ensureDatabaseInitialized']>,
+    table: string
+  ): Promise<void> {
+    const metadata = await dbOps.executeQuery(
+      `SELECT "wr" FROM pragma_table_list ` +
+      `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' LIMIT 1`,
+      [table]
+    );
+    if (Number(metadata[0]?.rows[0]?.[0]) === 1) {
+      throw new Error(vsc.l10n.t(
+        'WITHOUT ROWID tables are not editable yet. Primary-key identity editing is planned for a future release.'
+      ));
+    }
+  }
+
+  /**
    * Initialize the connection - returns metadata about the database connection.
    * Database operations (executeQuery, serializeDatabase, etc.) are exposed as separate methods
    * on HostBridge to avoid nested proxy issues.
@@ -138,6 +161,9 @@ export class HostBridge implements ToastService {
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
+
+    await this.assertTableSupportsRowIdEdits(dbOps, table);
+    this.assertConnectionGeneration(connectionGeneration);
 
     // The caller's original value may have been captured before asynchronous
     // work (notably reading a dropped BLOB). Read by stable row identity as
@@ -579,54 +605,104 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
-    // Ensure all updates try to generate patches for efficiency
-    const processedUpdates = updates.map(update => {
-      if (update.operation !== 'json_patch') {
-        const patch = this.tryGeneratePatch(update.value, update.originalValue);
-        if (patch) {
-          return {
-            ...update,
-            operation: 'json_patch' as const,
-            value: patch
-          };
-        }
-      }
-      return update;
-    });
+    if (updates.length === 0) return;
 
-    if (typeof dbOps.updateCellBatch === 'function') {
+    await this.assertTableSupportsRowIdEdits(dbOps, table);
+    this.assertConnectionGeneration(connectionGeneration);
+
+    // Keep the authoritative read and every write in one transaction. The
+    // backend batch implementation may use its own nested SAVEPOINT; unlike a
+    // raw BEGIN this composes safely with the host-owned snapshot boundary.
+    const savepointName = escapeIdentifier(
+      `sp_host_batch_${crypto.randomUUID().replace(/-/g, '')}`
+    );
+    await dbOps.executeQuery(`SAVEPOINT ${savepointName}`);
+
+    let processedUpdates: CellUpdate[] = [];
+    let historyCells: NonNullable<ModificationEntry['affectedCells']> = [];
+    try {
+      const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
+      const columns = [...new Set(updates.map(update => update.column))];
+      const placeholders = rowIds.map(() => '?').join(', ');
+      const current = await dbOps.executeQuery(
+        `SELECT rowid, ${columns.map(escapeIdentifier).join(', ')} ` +
+        `FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
+        rowIds
+      );
       this.assertConnectionGeneration(connectionGeneration);
-      await dbOps.updateCellBatch(table, processedUpdates);
-    } else {
-      // Fallback: execute updates sequentially to avoid IPC overload and N+1 concurrency,
-      // but wrapped in a SAVEPOINT to avoid implicit auto-commits after every DML statement.
-      const savepointName = `sp_batch_fallback_${Date.now()}`;
-      this.assertConnectionGeneration(connectionGeneration);
-      await dbOps.executeQuery(`SAVEPOINT ${savepointName}`);
-      try {
+
+      const currentValues = new Map<number, Map<string, CellValue>>();
+      for (const row of current[0]?.rows ?? []) {
+        const rowId = validateRowId(row[0] as RecordId);
+        const values = new Map<string, CellValue>();
+        columns.forEach((column, index) => values.set(column, row[index + 1]));
+        currentValues.set(rowId, values);
+      }
+
+      processedUpdates = updates.map(update => {
+        const rowId = validateRowId(update.rowId);
+        const row = currentValues.get(rowId);
+        if (!row) {
+          throw new Error(`Cannot update ${table}.${update.column}: row ${update.rowId} no longer exists`);
+        }
+        const priorValue = row.get(update.column);
+        const patch = update.operation === 'json_patch'
+          ? undefined
+          : this.tryGeneratePatch(update.value, priorValue);
+        const processed = patch
+          ? { ...update, originalValue: priorValue, operation: 'json_patch' as const, value: patch }
+          : { ...update, originalValue: priorValue };
+
+        historyCells.push({
+          rowId: update.rowId,
+          columnName: update.column,
+          newValue: processed.value,
+          priorValue,
+          operation: processed.operation ?? 'set'
+        });
+        return processed;
+      });
+
+      if (typeof dbOps.updateCellBatch === 'function') {
+        await dbOps.updateCellBatch(table, processedUpdates);
+      } else {
+        // Compatibility fallback for older backends. The outer SAVEPOINT keeps
+        // the sequential writes atomic without issuing a non-nestable BEGIN.
         for (const update of processedUpdates) {
-          let patch: string | undefined;
-          let val = update.value;
-
-          if (update.operation === 'json_patch') {
-            patch = update.value as string;
-            val = null;
-          }
-
-          this.assertConnectionGeneration(connectionGeneration);
-          await dbOps.updateCell(table, update.rowId, update.column, val, patch);
+          const patch = update.operation === 'json_patch'
+            ? String(update.value)
+            : undefined;
+          await dbOps.updateCell(
+            table,
+            update.rowId,
+            update.column,
+            patch === undefined ? update.value : null,
+            patch
+          );
         }
-        this.assertConnectionGeneration(connectionGeneration);
-        await dbOps.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
-      } catch (err) {
-        // A replacement endpoint cannot own this savepoint. Reload already
-        // discarded the old WASM connection, so do not send a misleading
-        // rollback to the fresh database.
-        if (this.isConnectionGenerationCurrent(connectionGeneration)) {
-          await dbOps.executeQuery(`ROLLBACK TO SAVEPOINT ${savepointName}`);
-        }
-        throw err;
       }
+
+      this.assertConnectionGeneration(connectionGeneration);
+      await dbOps.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
+      this.assertConnectionGeneration(connectionGeneration);
+    } catch (err) {
+      // A replacement endpoint cannot own this savepoint. Reload already
+      // discarded the old connection, so never send rollback SQL to the fresh
+      // database (the old endpoint will be disposed with its transaction).
+      if (this.isConnectionGenerationCurrent(connectionGeneration)) {
+        try {
+          await dbOps.executeQuery(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+          if (this.isConnectionGenerationCurrent(connectionGeneration)) {
+            await dbOps.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
+          }
+        } catch (rollbackErr) {
+          throw new AggregateError(
+            [err, rollbackErr],
+            'Batch update failed and its savepoint could not be rolled back cleanly'
+          );
+        }
+      }
+      throw err;
     }
 
     // Fire batch edit event
@@ -635,13 +711,7 @@ export class HostBridge implements ToastService {
       description: `Update ${updates.length} cells in ${table}`,
       modificationType: 'cell_update',
       targetTable: table,
-      affectedCells: processedUpdates.map(u => ({
-        rowId: u.rowId,
-        columnName: u.column,
-        newValue: u.value,
-        priorValue: u.originalValue,
-        operation: u.operation ?? 'set'
-      }))
+      affectedCells: historyCells
     });
   }
 

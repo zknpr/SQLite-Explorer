@@ -247,7 +247,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
       const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
         sourceRows,
-        headers.length
+        transportQuery.valueColumnCount
       );
       return { headers, rows, columns: headers, values: rows, exactIntegerTexts };
     } finally {
@@ -1489,7 +1489,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
         const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
           sourceRows,
-          headers.length
+          transportQuery.valueColumnCount
         );
         return {
             headers,

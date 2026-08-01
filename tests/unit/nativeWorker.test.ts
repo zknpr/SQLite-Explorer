@@ -49,7 +49,7 @@ function loadNativeBoundaryFunction(
     if (functionName === 'executeBoundedQuery') {
         dependencies.compactExactNumericResult = loadNativeWorkerFunction(
             'compactExactNumericResult',
-            ['result', 'transportColumns']
+            ['result', 'transportColumns', 'valueColumnCount']
         );
     }
     return loadNativeWorkerFunction(functionName, parameters, dependencies);
@@ -778,7 +778,7 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
-    it('rejects native validation and preview before DDL on a read-only connection', async () => {
+    it('rejects native view operations before reaching a read-only connection', async () => {
         const connection = await createRecordingConnection(
             undefined,
             undefined,
@@ -804,10 +804,22 @@ describe('createNativeDatabaseConnection', () => {
                 ),
                 /View preview is unavailable because the database is read-only/
             );
+            await assert.rejects(
+                connection.databaseOps.createView('read_only_create', 'SELECT 1'),
+                /Cannot create view because the database is read-only/
+            );
+            await assert.rejects(
+                connection.databaseOps.editView('read_only_edit', 'SELECT 2'),
+                /Cannot edit view because the database is read-only/
+            );
+            await assert.rejects(
+                connection.databaseOps.dropView('read_only_drop'),
+                /Cannot drop view because the database is read-only/
+            );
             assert.deepStrictEqual(
                 connection.calls.slice(callsBefore),
                 [],
-                'read-only validation and preview must not reach the native worker'
+                'read-only view operations must not reach the native worker'
             );
         } finally {
             connection.dispose();
@@ -861,17 +873,18 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
-    it('propagates the configured timeout through the native preview query', async () => {
-        const connection = await createRecordingConnection(call => {
+    it('leaves transport margin for the native preview timeout message', async () => {
+        const connection = await createRecordingConnection(async call => {
             if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA main.table_info')) {
                 return { result: { columns: ['cid', 'name'], values: [[0, 'value']] } };
             }
             if (call.method === 'queryBounded') {
-                assert.strictEqual(call.args[5], 25);
-                return { error: 'Query execution timed out after 25ms' };
+                assert.strictEqual(call.args[5], 10);
+                await new Promise(resolve => setTimeout(resolve, 30));
+                return { error: 'Query execution timed out after 10ms' };
             }
             return { result: { columns: [], values: [] } };
-        }, undefined, 25);
+        }, undefined, 10);
 
         try {
             await assert.rejects(
@@ -881,7 +894,16 @@ describe('createNativeDatabaseConnection', () => {
                     10,
                     'create'
                 ),
-                /Query execution timed out after 25ms/
+                (error: unknown) => {
+                    assert.ok(error instanceof Error);
+                    assert.match(error.message, /Query execution timed out after 10ms/);
+                    assert.strictEqual(
+                        error instanceof InvocationTimeoutError,
+                        false,
+                        'the worker timeout must arrive before the transport deadline'
+                    );
+                    return true;
+                }
             );
         } finally {
             connection.dispose();
@@ -1516,7 +1538,7 @@ describe('native querySingle worker handler', () => {
     it('checks elapsed time while reading a native preview row-by-row', () => {
         const executeBoundedQuery = loadNativeBoundaryFunction(
             'executeBoundedQuery',
-            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
+            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'valueColumnCount', 'limit', 'timeoutMs']
         );
         const boundary = '/*sqlite_explorer_boundary_test*/';
         let finalized = 0;
@@ -1548,6 +1570,7 @@ describe('native querySingle worker handler', () => {
                 'SELECT * FROM preview',
                 boundary,
                 ['value'],
+                undefined,
                 10,
                 5
             ),
@@ -1560,7 +1583,7 @@ describe('native querySingle worker handler', () => {
     it('reports a native preview timeout even when the query returns zero rows', () => {
         const executeBoundedQuery = loadNativeBoundaryFunction(
             'executeBoundedQuery',
-            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
+            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'valueColumnCount', 'limit', 'timeoutMs']
         );
         const boundary = '/*sqlite_explorer_boundary_test*/';
         let finalized = 0;
@@ -1588,6 +1611,7 @@ describe('native querySingle worker handler', () => {
                 'SELECT * FROM preview',
                 boundary,
                 ['value'],
+                undefined,
                 10,
                 5
             ),
@@ -1599,7 +1623,7 @@ describe('native querySingle worker handler', () => {
     it('executes a 100-row duplicate-alias preview only once', () => {
         const executeBoundedQuery = loadNativeBoundaryFunction(
             'executeBoundedQuery',
-            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
+            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'valueColumnCount', 'limit', 'timeoutMs']
         );
         const boundary = '/*sqlite_explorer_boundary_test*/';
         let dataPrepareCalls = 0;
@@ -1634,6 +1658,7 @@ describe('native querySingle worker handler', () => {
             'SELECT * FROM preview',
             boundary,
             ['value0', 'value1', 'exact0', 'exact1'],
+            2,
             100,
             5000
         );
@@ -1648,7 +1673,7 @@ describe('native querySingle worker handler', () => {
     it('compacts integral REAL metadata before returning a bounded native query', () => {
         const executeBoundedQuery = loadNativeBoundaryFunction(
             'executeBoundedQuery',
-            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
+            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'valueColumnCount', 'limit', 'timeoutMs']
         );
         const boundary = '/*sqlite_explorer_boundary_test*/';
         const database = {
@@ -1675,6 +1700,7 @@ describe('native querySingle worker handler', () => {
             'SELECT * FROM preview',
             boundary,
             ['value0', 'exact0'],
+            1,
             10,
             5000
         );
@@ -1686,7 +1712,7 @@ describe('native querySingle worker handler', () => {
     it('rejects divergent marked and executable bounded-query payloads before prepare', () => {
         const executeBoundedQuery = loadNativeBoundaryFunction(
             'executeBoundedQuery',
-            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
+            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'valueColumnCount', 'limit', 'timeoutMs']
         );
         const boundary = '/*sqlite_explorer_boundary_test*/';
         let prepareCalls = 0;
@@ -1704,6 +1730,7 @@ describe('native querySingle worker handler', () => {
                 'SELECT * FROM safe_preview;',
                 boundary,
                 ['value'],
+                undefined,
                 10,
                 5000
             ),
@@ -1830,7 +1857,7 @@ describe('native querySingle worker handler', () => {
     it('reports unavailable statement introspection for bounded-query boundaries', () => {
         const executeBoundedQuery = loadNativeBoundaryFunction(
             'executeBoundedQuery',
-            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'limit', 'timeoutMs']
+            ['db', 'markedSql', 'sql', 'requiredSuffix', 'columns', 'valueColumnCount', 'limit', 'timeoutMs']
         );
         const boundary = '/*sqlite_explorer_boundary_test*/';
         let finalized = false;
@@ -1850,6 +1877,7 @@ describe('native querySingle worker handler', () => {
                 'SELECT * FROM preview',
                 boundary,
                 ['value'],
+                undefined,
                 10,
                 5000
             ),
