@@ -352,7 +352,7 @@ export interface DatabaseOperations {
   ): Promise<ViewDefinition>;
 
   /** Update multiple cells in a batch */
-  updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
+  updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]>;
 
   /** Add a new column to a table */
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
@@ -391,6 +391,15 @@ export interface CellUpdate {
   value: CellValue;
   originalValue?: CellValue;
   operation?: CellUpdateOperation;
+}
+
+/** Authoritative before/after state captured by an atomic batch update. */
+export interface CellUpdateResult {
+  rowId: RecordId;
+  columnName: string;
+  priorValue?: CellValue;
+  newValue?: CellValue;
+  operation: CellUpdateOperation;
 }
 
 /**

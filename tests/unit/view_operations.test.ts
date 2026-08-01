@@ -1285,6 +1285,13 @@ describe('view operations', () => {
                 'higher'
             );
             await engine.redoModification(modification);
+            assert.strictEqual(
+                await readScalar(
+                    engine,
+                    "SELECT value FROM unsafe_rowids WHERE rowid = '9007199254740993'"
+                ),
+                'edited'
+            );
             await engine.deleteRows('unsafe_rowids', ['9007199254740993']);
             const survivors = await engine.executeQuery(
                 'SELECT CAST(rowid AS TEXT), value FROM unsafe_rowids ' +

@@ -147,6 +147,8 @@ describe('SQL Utils', () => {
     it('preserves full-precision decimal strings for unsafe SQLite rowids', () => {
       assert.strictEqual(validateRowId('9007199254740993'), '9007199254740993');
       assert.strictEqual(validateRowId('-9007199254740993'), '-9007199254740993');
+      assert.strictEqual(validateRowId('9223372036854775807'), '9223372036854775807');
+      assert.strictEqual(validateRowId('-9223372036854775808'), '-9223372036854775808');
       assert.deepStrictEqual(
         validateRowIds(['9007199254740992', '9007199254740993']),
         ['9007199254740992', '9007199254740993']

@@ -30,7 +30,7 @@ class MockDatabaseOperations implements DatabaseOperations {
         return { before: definition, after: definition };
     }
     async dropView(view: string) { return this.getViewDefinition(view); }
-    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {}
+    async updateCellBatch(table: string, updates: CellUpdate[]) { return []; }
     async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {}
     async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> { return { headers: [], rows: [] }; }
     async fetchTableCount(table: string, options: TableCountOptions): Promise<number> { return 0; }

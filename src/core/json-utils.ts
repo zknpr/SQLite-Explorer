@@ -7,7 +7,47 @@
  * SQLite's json_patch works this way.
  */
 
+import type { CellUpdateOperation, CellValue } from './types';
+
 const MAX_DEPTH = 1000;
+
+/**
+ * Derive the value and operation to store from the database value observed in
+ * the same transaction. Pre-built patches used by history replay are retained.
+ */
+export function prepareCellUpdateForStorage(
+    value: CellValue,
+    priorValue: CellValue | undefined,
+    requestedOperation: CellUpdateOperation = 'set'
+): { value: CellValue; operation: CellUpdateOperation } {
+    if (requestedOperation === 'json_patch') {
+        return { value, operation: 'json_patch' };
+    }
+    if (
+        typeof value !== 'string' ||
+        typeof priorValue !== 'string' ||
+        !(value.startsWith('{') || value.startsWith('[')) ||
+        !(priorValue.startsWith('{') || priorValue.startsWith('['))
+    ) {
+        return { value, operation: 'set' };
+    }
+    try {
+        const originalObject = JSON.parse(priorValue);
+        const newObject = JSON.parse(value);
+        if (
+            !originalObject || typeof originalObject !== 'object' || Array.isArray(originalObject) ||
+            !newObject || typeof newObject !== 'object' || Array.isArray(newObject)
+        ) {
+            return { value, operation: 'set' };
+        }
+        const patch = generateMergePatch(originalObject, newObject);
+        return patch === undefined
+            ? { value, operation: 'set' }
+            : { value: JSON.stringify(patch), operation: 'json_patch' };
+    } catch {
+        return { value, operation: 'set' };
+    }
+}
 
 export function generateMergePatch(original: unknown, modified: unknown, depth = 0): unknown {
     if (depth > MAX_DEPTH) {

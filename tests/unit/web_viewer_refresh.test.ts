@@ -98,6 +98,7 @@ it('clears and persists a displayed view selection before the demo refresh reloa
                         `,
                         './modules/web-api.js': `
                             export const backendApi = ${harness}.backendApi;
+                            export function isTrustedParentMessage() { return true; }
                             export function handleRpcResponse() {}
                             export function sendRpcResult(id, result) { ${harness}.sendRpcResult(id, result); }
                             export function sendRpcError(id, error) { ${harness}.sendRpcError(id, error); }

@@ -16,6 +16,7 @@ import type {
   ModificationEntry,
   DatabaseOperations,
   CellUpdate,
+  CellUpdateResult,
   TableQueryOptions,
   TableCountOptions,
   SchemaSnapshot,
@@ -29,7 +30,12 @@ import type {
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from '../../sql-utils';
 import { crypto } from '../../../platform/cryptoShim';
 import { buildSelectQuery, buildCountQuery } from '../../query-builder';
-import { applyMergePatch, computeJsonPatchUndo, parseJsonValueForPatching } from '../../json-utils';
+import {
+  applyMergePatch,
+  computeJsonPatchUndo,
+  parseJsonValueForPatching,
+  prepareCellUpdateForStorage
+} from '../../json-utils';
 import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
@@ -1330,8 +1336,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Update multiple cells in a batch.
    */
-  async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
-    if (updates.length === 0) return;
+  async updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> {
+    if (updates.length === 0) return [];
 
     // Use SAVEPOINT instead of BEGIN TRANSACTION so this method can be called
     // safely from within an outer transaction (e.g., undoColumnDrop).
@@ -1341,6 +1347,42 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const escapedTable = escapeIdentifier(table);
+      const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
+      const columns = [...new Set(updates.map(update => update.column))];
+      const placeholders = rowIds.map(() => '?').join(', ');
+      const current = await this.executeQuery(
+        `SELECT CAST(rowid AS TEXT), ${columns.map(escapeIdentifier).join(', ')} ` +
+        `FROM ${escapedTable} WHERE rowid IN (${placeholders})`,
+        rowIds
+      );
+      const currentValues = new Map<string, Map<string, CellValue>>();
+      for (const row of current[0]?.rows ?? []) {
+        const values = new Map<string, CellValue>();
+        columns.forEach((column, index) => values.set(column, row[index + 1]));
+        currentValues.set(String(validateRowId(row[0] as RecordId)), values);
+      }
+      const results: CellUpdateResult[] = [];
+      const processedUpdates = updates.map(update => {
+        const rowId = validateRowId(update.rowId);
+        const row = currentValues.get(String(rowId));
+        if (!row) {
+          throw new Error(`Cannot update ${table}.${update.column}: row ${update.rowId} no longer exists`);
+        }
+        const priorValue = row.get(update.column);
+        const prepared = prepareCellUpdateForStorage(
+          update.value,
+          priorValue,
+          update.operation ?? 'set'
+        );
+        results.push({
+          rowId,
+          columnName: update.column,
+          priorValue,
+          newValue: prepared.value,
+          operation: prepared.operation
+        });
+        return { ...update, rowId, value: prepared.value, operation: prepared.operation };
+      });
       // Group updates by column and operation type
       // Prepare statements one by one avoids full re-parse
 
@@ -1348,7 +1390,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       // Group by column.
 
       const updatesByColumn = new Map<string, CellUpdate[]>();
-      for (const update of updates) {
+      for (const update of processedUpdates) {
           const key = `${update.column}|${update.operation || 'set'}`;
           if (!updatesByColumn.has(key)) {
               updatesByColumn.set(key, []);
@@ -1434,6 +1476,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
 
       await this.executeQuery(`RELEASE ${savepointName}`);
+      return results;
     } catch (err) {
       await this.safeRollbackSavepoint(savepointName, 'updateCellBatch');
       throw err;

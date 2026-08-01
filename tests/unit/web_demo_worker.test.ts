@@ -1227,9 +1227,16 @@ describe('web demo view worker', () => {
             'SAVEPOINT outer_batch'
         );
 
-        await worker.invoke('updateCellBatch', 'nested_batch', [
+        const outcomes = await worker.invoke('updateCellBatch', 'nested_batch', [
             { rowId: 1, column: 'value', value: 'after' }
         ]);
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(outcomes)), [{
+            rowId: 1,
+            columnName: 'value',
+            priorValue: 'before',
+            newValue: 'after',
+            operation: 'set'
+        }]);
         await worker.invoke('runQuery', 'RELEASE outer_batch');
 
         assert.strictEqual(

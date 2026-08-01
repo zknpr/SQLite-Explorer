@@ -214,7 +214,7 @@ export async function exportTableCommand(
 
             const BATCH_SIZE = 5000;
             let offset = 0;
-            let lastId: CellValue = '-9223372036854775809';
+            let lastId: CellValue | undefined;
             let hasMore = true;
             let isFirstBatch = true;
             let rowCount = 0;
@@ -230,16 +230,27 @@ export async function exportTableCommand(
                     // We fetch rowid + user columns. rowid is prepended.
                     sql =
                       `SELECT CAST(rowid AS TEXT) AS rowid, ${queryColumns} ` +
-                      `FROM ${escapeIdentifier(tableName)} WHERE rowid > ?`;
-                    params.push(lastId);
+                      `FROM ${escapeIdentifier(tableName)}`;
+                    const predicates: string[] = [];
+
+                    // The first batch must not use an out-of-range sentinel: SQLite
+                    // coerces it to REAL, where it rounds to INT64_MIN and skips that row.
+                    if (lastId !== undefined) {
+                        predicates.push('rowid > ?');
+                        params.push(lastId);
+                    }
 
                     // Add rowIds filter if present
                     if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
                         const validIds = validateRowIds(_exportOptions.rowIds);
                         if (validIds.length > 0) {
-                            sql += ` AND rowid IN (${validIds.map(() => '?').join(',')})`;
+                            predicates.push(`rowid IN (${validIds.map(() => '?').join(',')})`);
                             params.push(...validIds);
                         }
+                    }
+
+                    if (predicates.length > 0) {
+                        sql += ` WHERE ${predicates.join(' AND ')}`;
                     }
 
                     sql += ` ORDER BY rowid ASC LIMIT ${BATCH_SIZE}`;

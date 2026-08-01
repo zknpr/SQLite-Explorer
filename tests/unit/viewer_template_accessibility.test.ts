@@ -86,6 +86,43 @@ describe('viewer template accessibility', () => {
         assert.match(hiddenRule, /overflow\s*:\s*hidden/i);
     });
 
+    it('exposes every modal as a labelled modal dialog', () => {
+        const template = readFileSync(
+            path.resolve(process.cwd(), 'core/ui/viewer.template.html'),
+            'utf8'
+        );
+        const modalLabels = new Map([
+            ['viewModal', 'viewModalTitle'],
+            ['addRowModal', 'addRowModalTitle'],
+            ['deleteModal', 'deleteModalTitle'],
+            ['createTableModal', 'createTableModalTitle'],
+            ['addColumnModal', 'addColumnModalTitle'],
+            ['exportModal', 'exportModalTitle'],
+            ['settingsModal', 'settingsModalTitle'],
+            ['cellPreviewModal', 'cellPreviewTitle'],
+            ['blob-inspector-modal', 'blobInspectorModalTitle']
+        ]);
+
+        for (const [modalId, titleId] of modalLabels) {
+            const modal = template.match(
+                new RegExp(`<[^>]+\\bid=["']${modalId}["'][^>]*>`, 'i')
+            )?.[0];
+            const title = template.match(
+                new RegExp(`<[^>]+\\bid=["']${titleId}["'][^>]*>`, 'i')
+            )?.[0];
+
+            assert.ok(modal, `${modalId} must exist`);
+            assert.match(modal, /\brole=["']dialog["']/i, `${modalId} must use dialog semantics`);
+            assert.match(modal, /\baria-modal=["']true["']/i, `${modalId} must be modal`);
+            assert.match(
+                modal,
+                new RegExp(`\\baria-labelledby=["']${titleId}["']`, 'i'),
+                `${modalId} must reference its visible title`
+            );
+            assert.ok(title, `${titleId} must label ${modalId}`);
+        }
+    });
+
     it('marks selection-dependent controls so click-away handling preserves the selection', () => {
         const template = readFileSync(
             path.resolve(process.cwd(), 'core/ui/viewer.template.html'),

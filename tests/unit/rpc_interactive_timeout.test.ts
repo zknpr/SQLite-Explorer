@@ -19,7 +19,8 @@ const webTargetOrigins: string[] = [];
             webTargetOrigins.push(targetOrigin);
         }
     },
-    location: { ancestorOrigins: [], origin: 'https://demo.sqlite-explorer.test' }
+    location: { ancestorOrigins: ['https://embedding.example'], origin: 'https://demo.sqlite-explorer.test' },
+    addEventListener() {}
 };
 
 after(() => {
@@ -106,18 +107,10 @@ it('keeps host-modal RPCs alive until their response in both transports', async 
     }
 });
 
-it('targets the embedding origin without ever falling back to a wildcard', async () => {
+it('targets the embedding origin without ever using a wildcard', async () => {
     const webApiModulePath = '../../core/ui/modules/web-api.js';
     const webApi = await import(webApiModulePath);
-    const location = (globalThis as any).window.location;
-
-    location.ancestorOrigins = ['https://embedding.example'];
     webApi.sendRpcResult('ancestor', { ok: true });
     assert.strictEqual(webTargetOrigins.at(-1), 'https://embedding.example');
-
-    location.ancestorOrigins = undefined;
-    location.origin = 'https://demo.sqlite-explorer.test';
-    webApi.sendRpcError('fallback', 'expected failure');
-    assert.strictEqual(webTargetOrigins.at(-1), 'https://demo.sqlite-explorer.test');
     assert.ok(!webTargetOrigins.includes('*'));
 });

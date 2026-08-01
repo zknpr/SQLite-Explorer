@@ -163,7 +163,8 @@
     </p>
 
     <!-- Create/Edit View Modal -->
-    <div class="modal-overlay hidden" id="viewModal">
+    <div class="modal-overlay hidden" id="viewModal" role="dialog" aria-modal="true"
+        aria-labelledby="viewModalTitle">
         <div class="modal-dialog modal-dialog-lg view-editor-dialog">
             <div class="modal-header">
                 <span class="modal-title" id="viewModalTitle">Create View</span>
@@ -201,10 +202,11 @@
     </div>
 
     <!-- Add Row Modal -->
-    <div class="modal-overlay hidden" id="addRowModal">
+    <div class="modal-overlay hidden" id="addRowModal" role="dialog" aria-modal="true"
+        aria-labelledby="addRowModalTitle">
         <div class="modal-dialog">
             <div class="modal-header">
-                <span class="modal-title">Add New Row</span>
+                <span class="modal-title" id="addRowModalTitle">Add New Row</span>
                 <button type="button" class="modal-close" data-modal="addRowModal">&times;</button>
             </div>
             <div class="modal-body" id="addRowForm"></div>
@@ -216,10 +218,11 @@
     </div>
 
     <!-- Delete Confirmation Modal -->
-    <div class="modal-overlay hidden" id="deleteModal">
+    <div class="modal-overlay hidden" id="deleteModal" role="dialog" aria-modal="true"
+        aria-labelledby="deleteModalTitle">
         <div class="modal-dialog">
             <div class="modal-header">
-                <span class="modal-title">Confirm Delete</span>
+                <span class="modal-title" id="deleteModalTitle">Confirm Delete</span>
                 <button type="button" class="modal-close" data-modal="deleteModal">&times;</button>
             </div>
             <div class="modal-body">
@@ -233,10 +236,11 @@
     </div>
 
     <!-- Create Table Modal -->
-    <div class="modal-overlay hidden" id="createTableModal">
+    <div class="modal-overlay hidden" id="createTableModal" role="dialog" aria-modal="true"
+        aria-labelledby="createTableModalTitle">
         <div class="modal-dialog modal-dialog-md">
             <div class="modal-header">
-                <span class="modal-title">Create New Table</span>
+                <span class="modal-title" id="createTableModalTitle">Create New Table</span>
                 <button type="button" class="modal-close" data-modal="createTableModal">&times;</button>
             </div>
             <div class="modal-body">
@@ -258,10 +262,11 @@
     </div>
 
     <!-- Add Column Modal -->
-    <div class="modal-overlay hidden" id="addColumnModal">
+    <div class="modal-overlay hidden" id="addColumnModal" role="dialog" aria-modal="true"
+        aria-labelledby="addColumnModalTitle">
         <div class="modal-dialog">
             <div class="modal-header">
-                <span class="modal-title">Add Column</span>
+                <span class="modal-title" id="addColumnModalTitle">Add Column</span>
                 <button type="button" class="modal-close" data-modal="addColumnModal">&times;</button>
             </div>
             <div class="modal-body">
@@ -292,10 +297,11 @@
     </div>
 
     <!-- Export Modal -->
-    <div class="modal-overlay hidden" id="exportModal">
+    <div class="modal-overlay hidden" id="exportModal" role="dialog" aria-modal="true"
+        aria-labelledby="exportModalTitle">
         <div class="modal-dialog">
             <div class="modal-header">
-                <span class="modal-title">Export Table</span>
+                <span class="modal-title" id="exportModalTitle">Export Table</span>
                 <button type="button" class="modal-close" data-modal="exportModal">&times;</button>
             </div>
             <div class="modal-body">
@@ -329,10 +335,11 @@
     </div>
 
     <!-- Settings Modal -->
-    <div class="modal-overlay hidden" id="settingsModal">
+    <div class="modal-overlay hidden" id="settingsModal" role="dialog" aria-modal="true"
+        aria-labelledby="settingsModalTitle">
         <div class="modal-dialog modal-dialog-lg">
             <div class="modal-header">
-                <span class="modal-title">Configuration</span>
+                <span class="modal-title" id="settingsModalTitle">Configuration</span>
                 <button type="button" class="modal-close" data-modal="settingsModal">&times;</button>
             </div>
             <div class="modal-body" id="pragmaSettingsContainer">
@@ -345,10 +352,11 @@
     </div>
 
     <!-- Cell Preview/Edit Modal - Floating window for viewing and editing large cell values -->
-    <div class="cell-preview-modal hidden" id="cellPreviewModal">
+    <div class="cell-preview-modal hidden" id="cellPreviewModal" role="dialog" aria-modal="true"
+        aria-labelledby="cellPreviewTitle">
         <div class="cell-preview-dialog">
             <div class="cell-preview-header">
-                <div class="cell-preview-title">
+                <div class="cell-preview-title" id="cellPreviewTitle">
                     <span>Column:</span>
                     <span class="cell-preview-column-name" id="cellPreviewColumnName"></span>
                     <span class="cell-preview-type-badge" id="cellPreviewTypeBadge"></span>
@@ -388,10 +396,11 @@
     </div>
 
     <!-- Blob Inspector Modal -->
-    <div id="blob-inspector-modal" class="modal-overlay hidden">
+    <div id="blob-inspector-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+        aria-labelledby="blobInspectorModalTitle">
         <div class="modal-dialog blob-inspector blob-inspector-dialog">
             <div class="modal-header">
-                <span class="modal-title">BLOB Inspector</span>
+                <span class="modal-title" id="blobInspectorModalTitle">BLOB Inspector</span>
                 <button type="button" class="modal-close" data-modal="blob-inspector-modal">&times;</button>
             </div>
             <div class="modal-body blob-inspector-body">

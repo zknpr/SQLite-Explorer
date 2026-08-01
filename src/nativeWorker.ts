@@ -27,6 +27,7 @@ import type {
   DatabaseInitResult,
   ModificationEntry,
   CellUpdate,
+  CellUpdateResult,
   TableQueryOptions,
   TableCountOptions,
   SchemaSnapshot,
@@ -43,7 +44,7 @@ import type {
 } from './core/types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
-import { computeJsonPatchUndo } from './core/json-utils';
+import { computeJsonPatchUndo, prepareCellUpdateForStorage } from './core/json-utils';
 import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
@@ -1680,14 +1681,54 @@ export async function createNativeDatabaseConnection(
         /**
          * Update multiple cells in a batch.
          */
-        updateCellBatch: async (table: string, updates: CellUpdate[]) => {
-          if (updates.length === 0) return;
+        updateCellBatch: async (table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> => {
+          if (updates.length === 0) return [];
 
           const batchItems: { sql: string; paramsList?: CellValue[][], params?: CellValue[] }[] = [];
           const escapedTable = escapeIdentifier(table);
+          const savepointName = createSavepointName('sp_update_batch');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+
+          try {
+          const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
+          const columns = [...new Set(updates.map(update => update.column))];
+          const placeholders = rowIds.map(() => '?').join(', ');
+          const current = await worker.call<NativeQueryResult>('query', [
+            `SELECT CAST(rowid AS TEXT), ${columns.map(escapeIdentifier).join(', ')} ` +
+            `FROM ${escapedTable} WHERE rowid IN (${placeholders})`,
+            rowIds
+          ]);
+          const currentValues = new Map<string, Map<string, CellValue>>();
+          for (const row of current.values ?? []) {
+            const values = new Map<string, CellValue>();
+            columns.forEach((column, index) => values.set(column, row[index + 1]));
+            currentValues.set(String(validateRowId(row[0] as RecordId)), values);
+          }
+          const results: CellUpdateResult[] = [];
+          const processedUpdates = updates.map(update => {
+            const rowId = validateRowId(update.rowId);
+            const row = currentValues.get(String(rowId));
+            if (!row) {
+              throw new Error(`Cannot update ${table}.${update.column}: row ${update.rowId} no longer exists`);
+            }
+            const priorValue = row.get(update.column);
+            const prepared = prepareCellUpdateForStorage(
+              update.value,
+              priorValue,
+              update.operation ?? 'set'
+            );
+            results.push({
+              rowId,
+              columnName: update.column,
+              priorValue,
+              newValue: prepared.value,
+              operation: prepared.operation
+            });
+            return { ...update, rowId, value: prepared.value, operation: prepared.operation };
+          });
 
           const updatesByColumn = new Map<string, CellUpdate[]>();
-          for (const update of updates) {
+          for (const update of processedUpdates) {
             const key = `${update.column}|${update.operation || 'set'}`;
             if (!updatesByColumn.has(key)) {
                 updatesByColumn.set(key, []);
@@ -1721,6 +1762,12 @@ export async function createNativeDatabaseConnection(
 
           if (batchItems.length > 0) {
             await worker.call('execBatch', [batchItems]);
+          }
+          await worker.call('run', [`RELEASE ${savepointName}`]);
+          return results;
+          } catch (err) {
+            await safeRollbackSavepoint(savepointName, 'updateCellBatch');
+            throw err;
           }
         },
 

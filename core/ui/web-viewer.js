@@ -6,7 +6,13 @@
  * in a browser iframe.
  */
 import { state, persistState } from './modules/state.js';
-import { handleRpcResponse, sendRpcResult, sendRpcError, backendApi } from './modules/web-api.js';
+import {
+    handleRpcResponse,
+    isTrustedParentMessage,
+    sendRpcResult,
+    sendRpcError,
+    backendApi
+} from './modules/web-api.js';
 import {
     initSidebar,
     refreshSchema
@@ -102,6 +108,7 @@ const webviewMethods = {
  */
 function initWebRpc() {
     window.addEventListener('message', event => {
+        if (!isTrustedParentMessage(event)) return;
         const envelope = event.data;
 
         // Handle RPC invocation from parent

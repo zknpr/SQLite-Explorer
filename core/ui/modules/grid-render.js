@@ -1,6 +1,6 @@
 import { state } from './state.js';
-import { formatCellValueAsText, appendHighlightedText, buildHighlightMatcher } from './utils.js';
-import { formatCellValueForActiveMatch } from './match-nav.js';
+import { formatCellValueAsText, appendHighlightedText } from './utils.js';
+import { buildCellHighlightMatcher, formatCellValueForActiveMatch } from './match-nav.js';
 import {
     getRowId,
     getCellValue,
@@ -190,10 +190,8 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
         rowId: getRowId(state.gridData[idx], idx)
     }));
 
-    // Precompute one highlight matcher per column (depends on the global filter +
-    // that column's filter, not on the row), so we don't rebuild a RegExp per cell.
-    const columnMatchers = orderedColumns.map(col =>
-        buildHighlightMatcher([state.filterQuery, state.columnFilters[col.name]])
+    const columnFilterValues = orderedColumns.map(col =>
+        [state.filterQuery, state.columnFilters[col.name]]
     );
 
     const fragment = document.createDocumentFragment();
@@ -244,12 +242,13 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
             const colWidth = state.columnWidths[col.name] || 120;
             const isActiveMatch = !!activeMatch && activeMatch.rowIdx === rowIdx && activeMatch.colIdx === originalColIdx;
             const visibleValue = getCellValueForDisplay(row, rowIdx, originalColIdx);
+            const exactIntegerText = getExactIntegerText(rowIdx, originalColIdx);
             const displayValue = isActiveMatch
                 ? formatCellValueForActiveMatch(
                     value,
                     col,
                     state.matchNav.term,
-                    getExactIntegerText(rowIdx, originalColIdx)
+                    exactIntegerText
                 )
                 : formatCellValueAsText(visibleValue, col.type, state.dateFormat, col.name);
 
@@ -276,7 +275,11 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
             textSpan.className = 'cell-text';
             // Use DOM text nodes (never innerHTML) for security (prevents XSS).
             // formatCellValueAsText returns unescaped text suitable for textContent/text nodes.
-            appendHighlightedText(textSpan, displayValue, columnMatchers[displayColIdx]);
+            appendHighlightedText(
+                textSpan,
+                displayValue,
+                buildCellHighlightMatcher(value, columnFilterValues[displayColIdx], exactIntegerText)
+            );
             td.appendChild(textSpan);
 
             if (hasContent) {

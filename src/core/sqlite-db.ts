@@ -17,6 +17,7 @@ import type {
   DatabaseInitConfig,
   DatabaseInitResult,
   CellUpdate,
+  CellUpdateResult,
   TableQueryOptions,
   TableCountOptions,
   SchemaSnapshot,
@@ -285,7 +286,7 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().dropView(view, expectedSql, expectedTriggers);
     },
 
-    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
+    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> {
       return requireEngine().updateCellBatch(table, updates);
     },
 

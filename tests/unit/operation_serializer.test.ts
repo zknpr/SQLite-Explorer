@@ -30,7 +30,7 @@ function createOperations(overrides: Partial<DatabaseOperations> = {}): Database
             after: { identifier: 'v', sql: 'CREATE VIEW v AS SELECT 2', selectSql: 'SELECT 2', triggers: [] }
         }),
         dropView: async () => ({ identifier: 'v', sql: 'CREATE VIEW v AS SELECT 1', selectSql: 'SELECT 1', triggers: [] }),
-        updateCellBatch: async () => {},
+        updateCellBatch: async () => [],
         addColumn: async () => {},
         fetchTableData: async () => ({
             headers: [],

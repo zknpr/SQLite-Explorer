@@ -164,6 +164,14 @@ export default function DemoClient() {
 
     const envelope = event.data;
 
+    if (envelope?.kind === 'sqlite-explorer-ready') {
+      event.source?.postMessage(
+        { kind: 'sqlite-explorer-origin' },
+        { targetOrigin: event.origin }
+      );
+      return;
+    }
+
     // Handle RPC requests from iframe
     if (envelope?.channel === 'rpc' && envelope.content?.kind === 'invoke') {
       const { messageId, targetMethod, payload } = envelope.content;
@@ -179,7 +187,7 @@ export default function DemoClient() {
             success: true,
             data: { connected: true, isReadOnly: false }
           }
-        }, { targetOrigin: window.location.origin });
+        }, { targetOrigin: event.origin });
         return;
       }
 
@@ -198,7 +206,7 @@ export default function DemoClient() {
               doubleClickBehavior: 'inline'
             }
           }
-        }, { targetOrigin: window.location.origin });
+        }, { targetOrigin: event.origin });
         return;
       }
 
@@ -226,7 +234,7 @@ export default function DemoClient() {
                 success: true,
                 data: { success: true }
               }
-            }, { targetOrigin: window.location.origin });
+            }, { targetOrigin: event.origin });
           })
           .catch((error) => {
             event.source?.postMessage({
@@ -237,7 +245,7 @@ export default function DemoClient() {
                 success: false,
                 errorMessage: error.message
               }
-            }, { targetOrigin: window.location.origin });
+            }, { targetOrigin: event.origin });
           });
         return;
       }
@@ -253,7 +261,7 @@ export default function DemoClient() {
               success: true,
               data: result
             }
-          }, { targetOrigin: window.location.origin });
+          }, { targetOrigin: event.origin });
         })
         .catch((error) => {
           event.source?.postMessage({
@@ -264,7 +272,7 @@ export default function DemoClient() {
               success: false,
               errorMessage: error.message
             }
-          }, { targetOrigin: window.location.origin });
+          }, { targetOrigin: event.origin });
         });
     }
   }, [callWorker]);

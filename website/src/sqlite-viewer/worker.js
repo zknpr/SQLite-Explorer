@@ -26,8 +26,9 @@ import {
   VIEW_TRIGGER_SCHEMA_QUERIES,
   normalizeViewSelectSql
 } from '../../../src/core/view-utils.ts';
-import { escapeLikePattern } from '../../../src/core/sql-utils.ts';
+import { escapeLikePattern, validateRowId } from '../../../src/core/sql-utils.ts';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
+import { prepareCellUpdateForStorage } from '../../../src/core/json-utils.ts';
 import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
@@ -1269,10 +1270,57 @@ async function updateCellBatch(table, updates) {
   const savepointName = createViewSavepointName('sp_update_cell_batch');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
-    for (const update of updates) {
-      await updateCell(table, update.rowId, update.column, update.value);
+    if (updates.length === 0) {
+      runSingleStatement(`RELEASE ${savepointName}`);
+      return [];
+    }
+    const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
+    const columns = [...new Set(updates.map(update => update.column))];
+    const placeholders = rowIds.map(() => '?').join(', ');
+    const escapedTable = escapeIdentifier(table);
+    const currentResult = db.exec(
+      `SELECT CAST(rowid AS TEXT), ${columns.map(escapeIdentifier).join(', ')} ` +
+      `FROM ${escapedTable} WHERE rowid IN (${placeholders})`,
+      rowIds,
+      { useBigInt: true }
+    )[0];
+    const currentValues = new Map();
+    for (const row of currentResult?.values ?? []) {
+      const values = new Map();
+      columns.forEach((column, index) => values.set(column, row[index + 1]));
+      currentValues.set(String(validateRowId(row[0])), values);
+    }
+    const results = [];
+    const processedUpdates = updates.map(update => {
+      const rowId = validateRowId(update.rowId);
+      const row = currentValues.get(String(rowId));
+      if (!row) {
+        throw new Error(`Cannot update ${table}.${update.column}: row ${update.rowId} no longer exists`);
+      }
+      const priorValue = row.get(update.column);
+      const prepared = prepareCellUpdateForStorage(
+        update.value,
+        priorValue,
+        update.operation ?? 'set'
+      );
+      results.push({
+        rowId,
+        columnName: update.column,
+        priorValue,
+        newValue: prepared.value,
+        operation: prepared.operation
+      });
+      return { ...update, rowId, value: prepared.value, operation: prepared.operation };
+    });
+    for (const update of processedUpdates) {
+      const escapedColumn = escapeIdentifier(update.column);
+      const sql = update.operation === 'json_patch'
+        ? `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`
+        : `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+      db.run(sql, [update.value, update.rowId]);
     }
     runSingleStatement(`RELEASE ${savepointName}`);
+    return results;
   } catch (e) {
     safeRollbackSavepoint(savepointName, 'updateCellBatch');
     throw e;

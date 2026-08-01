@@ -51,19 +51,37 @@ export function getPreferredMatchScope() {
     return null;
 }
 
-function getMatchingTextCandidate(value, term, exactIntegerText) {
+export function getCellMatchCandidates(value, exactIntegerText) {
     // NULL never satisfies LIKE, and SQLite compares BLOB bytes rather than the
     // UI's synthetic "[BLOB]" label. Neither display-only placeholder is a
     // searchable SQL representation, so do not offer it to local navigation.
     if (value === null || value === undefined || value instanceof Uint8Array) {
-        return null;
+        return [];
     }
 
     const rawText = truncateAtSqliteTextNul(value);
-    const candidates = exactIntegerText === undefined
+    return exactIntegerText === undefined
         ? [rawText]
         : [truncateAtSqliteTextNul(exactIntegerText)];
+}
+
+function getMatchingTextCandidate(value, term, exactIntegerText) {
+    const candidates = getCellMatchCandidates(value, exactIntegerText);
     return candidates.find(candidate => foldAsciiCase(candidate).includes(term)) ?? null;
+}
+
+/** Build a highlighter from only terms SQLite could match for this cell. */
+export function buildCellHighlightMatcher(value, filterValues, exactIntegerText) {
+    const candidates = getCellMatchCandidates(value, exactIntegerText);
+    if (candidates.length === 0) return null;
+
+    const matchingFilters = filterValues.filter(filterValue => {
+        const activeValue = getActiveFilterValue(filterValue);
+        if (activeValue === undefined) return false;
+        const foldedTerm = foldAsciiCase(activeValue);
+        return candidates.some(candidate => foldAsciiCase(candidate).includes(foldedTerm));
+    });
+    return buildHighlightMatcher(matchingFilters);
 }
 
 function excerptAroundMatch(text, term, maxLength = 100) {
@@ -142,7 +160,11 @@ function renderMatchCellText(cellEl, rowIdx, colIdx, term) {
         term,
         exactIntegerText
     );
-    const matcher = buildHighlightMatcher([state.filterQuery, state.columnFilters[col.name]]);
+    const matcher = buildCellHighlightMatcher(
+        value,
+        [state.filterQuery, state.columnFilters[col.name]],
+        exactIntegerText
+    );
     textSpan.replaceChildren();
     appendHighlightedText(textSpan, displayValue, matcher);
 }

@@ -620,7 +620,21 @@ describe('createNativeDatabaseConnection', () => {
     });
 
     it('replays batch json_patch cell redo through operation-aware updateCellBatch', async () => {
-        const connection = await createRecordingConnection();
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query' && String(call.args[0]).startsWith('SELECT CAST(rowid AS TEXT)')) {
+                return {
+                    result: {
+                        columns: ['rowid', 'payload', 'title'],
+                        values: [
+                            ['3', '{}', null],
+                            ['4', '{}', null],
+                            ['5', null, 'Old title']
+                        ]
+                    }
+                };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
 
         try {
             const firstPatch = JSON.stringify({ status: 'reviewed' });
@@ -638,9 +652,14 @@ describe('createNativeDatabaseConnection', () => {
                 ]
             });
 
-            assert.strictEqual(connection.calls.length, 1);
-            const call = connection.calls[0];
+            assert.strictEqual(connection.calls.length, 4);
+            assert.strictEqual(connection.calls[0].method, 'run');
+            assert.match(String(connection.calls[0].args[0]), /^SAVEPOINT /);
+            assert.strictEqual(connection.calls[1].method, 'query');
+            const call = connection.calls[2];
             assert.strictEqual(call.method, 'execBatch');
+            assert.strictEqual(connection.calls[3].method, 'run');
+            assert.match(String(connection.calls[3].args[0]), /^RELEASE /);
 
             const batch = call.args[0] as {
                 sql: string;

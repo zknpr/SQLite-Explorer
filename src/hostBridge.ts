@@ -15,10 +15,9 @@ import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
 import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition } from './core/types';
-import { generateMergePatch } from './core/json-utils';
+import { prepareCellUpdateForStorage } from './core/json-utils';
 import { escapeIdentifier, validateRowId, validateRowIds } from './core/sql-utils';
 import { isViewDefinitionConflictError } from './core/view-utils';
-import { crypto } from './platform/cryptoShim';
 
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
@@ -178,8 +177,8 @@ export class HostBridge implements ToastService {
       throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
     }
     const priorValue = currentRow[0];
-    const patch = this.tryGeneratePatch(value, priorValue);
-    const operation = patch ? 'json_patch' as const : 'set' as const;
+    const prepared = prepareCellUpdateForStorage(value, priorValue);
+    const patch = prepared.operation === 'json_patch' ? String(prepared.value) : undefined;
 
     this.assertConnectionGeneration(connectionGeneration);
 
@@ -200,8 +199,8 @@ export class HostBridge implements ToastService {
       targetTable: table,
       targetRowId: rowId,
       targetColumn: column,
-      newValue: patch ?? value,
-      operation,
+      newValue: prepared.value,
+      operation: prepared.operation,
       priorValue
     });
   }
@@ -369,7 +368,7 @@ export class HostBridge implements ToastService {
                 const colsData = columns.map(() => [] as { rowId: RecordId; value: CellValue }[]);
 
                 for (const r of rows) {
-                    const rowId = r[0] as RecordId;
+                    const rowId = validateRowId(r[0] as RecordId);
                     for (let i = 0; i < columns.length; i++) {
                         colsData[i].push({ rowId, value: r[i + 1] });
                     }
@@ -619,102 +618,8 @@ export class HostBridge implements ToastService {
     await this.assertTableSupportsRowIdEdits(dbOps, table);
     this.assertConnectionGeneration(connectionGeneration);
 
-    // Keep the authoritative read and every write in one transaction. The
-    // backend batch implementation may use its own nested SAVEPOINT; unlike a
-    // raw BEGIN this composes safely with the host-owned snapshot boundary.
-    const savepointName = escapeIdentifier(
-      `sp_host_batch_${crypto.randomUUID().replace(/-/g, '')}`
-    );
-    await dbOps.executeQuery(`SAVEPOINT ${savepointName}`);
-
-    let processedUpdates: CellUpdate[] = [];
-    let historyCells: NonNullable<ModificationEntry['affectedCells']> = [];
-    try {
-      const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
-      const columns = [...new Set(updates.map(update => update.column))];
-      const placeholders = rowIds.map(() => '?').join(', ');
-      const current = await dbOps.executeQuery(
-        `SELECT CAST(rowid AS TEXT) AS rowid, ${columns.map(escapeIdentifier).join(', ')} ` +
-        `FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
-        rowIds
-      );
-      this.assertConnectionGeneration(connectionGeneration);
-
-      const currentValues = new Map<RecordId, Map<string, CellValue>>();
-      for (const row of current[0]?.rows ?? []) {
-        const rowId = validateRowId(row[0] as RecordId);
-        const values = new Map<string, CellValue>();
-        columns.forEach((column, index) => values.set(column, row[index + 1]));
-        currentValues.set(rowId, values);
-      }
-
-      processedUpdates = updates.map(update => {
-        const rowId = validateRowId(update.rowId);
-        const row = currentValues.get(rowId);
-        if (!row) {
-          throw new Error(`Cannot update ${table}.${update.column}: row ${update.rowId} no longer exists`);
-        }
-        const priorValue = row.get(update.column);
-        const patch = update.operation === 'json_patch'
-          ? undefined
-          : this.tryGeneratePatch(update.value, priorValue);
-        const processed = patch
-          ? { ...update, originalValue: priorValue, operation: 'json_patch' as const, value: patch }
-          : { ...update, originalValue: priorValue };
-
-        historyCells.push({
-          rowId: update.rowId,
-          columnName: update.column,
-          newValue: processed.value,
-          priorValue,
-          operation: processed.operation ?? 'set'
-        });
-        return processed;
-      });
-
-      if (typeof dbOps.updateCellBatch === 'function') {
-        await dbOps.updateCellBatch(table, processedUpdates);
-      } else {
-        // Compatibility fallback for older backends. The outer SAVEPOINT keeps
-        // the sequential writes atomic without issuing a non-nestable BEGIN.
-        for (const update of processedUpdates) {
-          const patch = update.operation === 'json_patch'
-            ? String(update.value)
-            : undefined;
-          await dbOps.updateCell(
-            table,
-            update.rowId,
-            update.column,
-            patch === undefined ? update.value : null,
-            patch
-          );
-        }
-      }
-
-      this.assertConnectionGeneration(connectionGeneration);
-      await dbOps.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
-      this.assertConnectionGeneration(connectionGeneration);
-    } catch (err) {
-      // A replacement endpoint cannot own this savepoint. Reload already
-      // discarded the old connection, so never send rollback SQL to the fresh
-      // database (the old endpoint will be disposed with its transaction).
-      if (this.isConnectionGenerationCurrent(connectionGeneration)) {
-        try {
-          await dbOps.executeQuery(`ROLLBACK TO SAVEPOINT ${savepointName}`);
-          if (this.isConnectionGenerationCurrent(connectionGeneration)) {
-            await dbOps.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
-          }
-        } catch (rollbackErr) {
-          const rollbackMessage = rollbackErr instanceof Error
-            ? rollbackErr.message
-            : String(rollbackErr);
-          this.viewerProvider.outputChannel?.appendLine(
-            `[HostBridge] Failed to rollback batch update savepoint: ${rollbackMessage}`
-          );
-        }
-      }
-      throw err;
-    }
+    const historyCells = await dbOps.updateCellBatch(table, updates);
+    this.assertConnectionGeneration(connectionGeneration);
 
     // Fire batch edit event
     this.document.recordExternalModification({
@@ -1227,38 +1132,6 @@ export class HostBridge implements ToastService {
         }
         await vsc.workspace.fs.writeFile(uri, buffer);
     }
-  }
-
-  /**
-   * Attempt to generate a JSON merge patch between two cell values.
-   */
-  private tryGeneratePatch(value: CellValue, originalValue?: CellValue): string | undefined {
-    if (
-      typeof value === 'string' &&
-      typeof originalValue === 'string' &&
-      (value.startsWith('{') || value.startsWith('[')) &&
-      (originalValue.startsWith('{') || originalValue.startsWith('['))
-    ) {
-      try {
-        const originalObj = JSON.parse(originalValue);
-        const newObj = JSON.parse(value);
-
-        // Only patch if valid JSON objects (not arrays, primitives, null)
-        // SQLite json_patch merge behavior is specific to objects.
-        // RFC 7396 defines how arrays are replaced entirely.
-        if (originalObj && typeof originalObj === 'object' && !Array.isArray(originalObj) &&
-            newObj && typeof newObj === 'object' && !Array.isArray(newObj)) {
-
-            const patchObj = generateMergePatch(originalObj, newObj);
-            if (patchObj !== undefined) {
-                return JSON.stringify(patchObj);
-            }
-        }
-      } catch {
-        // Not valid JSON or parse error, ignore and do full update
-      }
-    }
-    return undefined;
   }
 
   /**

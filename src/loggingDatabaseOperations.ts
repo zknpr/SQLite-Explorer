@@ -14,6 +14,7 @@ import type {
     QueryResultSet,
     ModificationEntry,
     CellUpdate,
+    CellUpdateResult,
     TableQueryOptions,
     TableCountOptions,
     SchemaSnapshot,
@@ -261,7 +262,7 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         );
     }
 
-    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
+    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> {
         this.log(`Batch update ${updates.length} cells in ${table}`, true);
         return this.wrapped.updateCellBatch(table, updates);
     }

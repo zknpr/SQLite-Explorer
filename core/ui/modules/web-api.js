@@ -13,6 +13,42 @@ export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
 // Use parent window for RPC instead of VS Code API
 const parentWindow = window.parent;
 
+const ancestorOrigin = window.location.ancestorOrigins?.[0];
+let lockedParentOrigin = ancestorOrigin || null;
+let resolveParentOrigin;
+const parentOriginReady = lockedParentOrigin
+    ? Promise.resolve(lockedParentOrigin)
+    : new Promise(resolve => {
+        resolveParentOrigin = resolve;
+    });
+
+/**
+ * Accept messages only from the embedding window and lock Firefox-style
+ * cross-origin embeds to the browser-verified origin of their first handshake.
+ */
+export function isTrustedParentMessage(event) {
+    if (event.source !== parentWindow) return false;
+    if (lockedParentOrigin !== null) return event.origin === lockedParentOrigin;
+    if (event.data?.kind !== 'sqlite-explorer-origin' || !event.origin || event.origin === 'null') {
+        return false;
+    }
+    lockedParentOrigin = event.origin;
+    resolveParentOrigin?.(lockedParentOrigin);
+    resolveParentOrigin = undefined;
+    return true;
+}
+
+window.addEventListener?.('message', event => {
+    isTrustedParentMessage(event);
+});
+
+// ancestorOrigins is unavailable on Firefox. The initial ping carries no RPC
+// data; it only asks the parent to reply so subsequent messages can be locked
+// to event.origin. No payload-bearing message is ever sent to "*".
+if (lockedParentOrigin === null) {
+    parentWindow.postMessage({ kind: 'sqlite-explorer-ready' }, '*');
+}
+
 /**
  * No-op in web demo: VS Code state persistence is not available.
  * @returns {undefined}
@@ -33,9 +69,11 @@ export function saveVsCodeState(_stateObj) {
 let rpcMessageId = 0;
 const pendingRpcCalls = new Map();
 
-// Helper to determine target origin
-function getTargetOrigin() {
-    return window.location.ancestorOrigins?.[0] || window.location.origin;
+function requireTargetOrigin() {
+    if (lockedParentOrigin === null) {
+        throw new Error('The parent origin is not locked yet');
+    }
+    return lockedParentOrigin;
 }
 
 // ============================================================================
@@ -218,6 +256,7 @@ export async function sendRpcRequest(method, args) {
     // Serialize args asynchronously to handle Uint8Array without blocking UI
     // This is done before setting up the timeout to ensure encoding time is included
     const serializedArgs = await serializeArgsAsync(args);
+    const targetOrigin = await parentOriginReady;
 
     return new Promise((resolve, reject) => {
         const timeoutMs = getRpcTimeoutMs(method);
@@ -239,7 +278,7 @@ export async function sendRpcRequest(method, args) {
                 targetMethod: method,
                 payload: serializedArgs
             }
-        }, getTargetOrigin());
+        }, targetOrigin);
     });
 }
 
@@ -276,7 +315,7 @@ export function sendRpcResult(correlationId, result) {
         kind: 'result',
         correlationId,
         payload: result
-    }, getTargetOrigin());
+    }, requireTargetOrigin());
 }
 
 /**
@@ -289,7 +328,7 @@ export function sendRpcError(correlationId, errorText) {
         kind: 'result',
         correlationId,
         errorText
-    }, getTargetOrigin());
+    }, requireTargetOrigin());
 }
 
 // Backend API proxy

@@ -33,7 +33,8 @@ async function requirePostedMessageAfterTurn(index: number): Promise<any> {
             postedWaiters.delete(index);
         }
     },
-    location: { ancestorOrigins: [] },
+    location: { ancestorOrigins: ['https://embedding.example'] },
+    addEventListener() {},
     confirm(message: string) {
         confirmations.push(message);
         return confirmResult;

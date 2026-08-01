@@ -29,6 +29,7 @@ import type {
   DatabaseInitConfig,
   DatabaseInitResult,
   CellUpdate,
+  CellUpdateResult,
   ColumnDefinition,
   TableQueryOptions,
   TableCountOptions,
@@ -116,7 +117,7 @@ interface WorkerMethods {
     expectedSql?: string,
     expectedTriggers?: readonly ViewTriggerDefinition[]
   ): Promise<ViewDefinition>;
-  updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
+  updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
   fetchTableCount(table: string, options: TableCountOptions): Promise<number>;
