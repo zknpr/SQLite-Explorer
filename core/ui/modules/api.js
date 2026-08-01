@@ -25,7 +25,7 @@ export function saveVsCodeState(stateObj) {
 }
 
 // Default RPC timeout in milliseconds (60s to accommodate large blob operations)
-const RPC_TIMEOUT_MS = 60000;
+export const RPC_TIMEOUT_MS = 60000;
 
 // Message ID tracking
 let rpcMessageId = 0;

@@ -147,11 +147,23 @@ export function onCellInputBlur() {
     }, 100);
 }
 
+function resolveDisplayedCell(targetTable, rowId, columnName) {
+    if (state.selectedTable !== targetTable) return null;
+
+    const rowIdx = state.gridData.findIndex((row, index) => (
+        getRowId(row, index) === rowId
+    ));
+    const colIdx = state.tableColumns.findIndex(column => column.name === columnName);
+    return rowIdx >= 0 && colIdx >= 0 ? { rowIdx, colIdx } : null;
+}
+
 export async function saveCellEdit() {
     if (state.isSavingCell) return false;
     if (!state.editingCellInfo || !state.activeCellInput) return false;
 
-    const { rowIdx, colIdx, rowId, columnName, originalValue } = state.editingCellInfo;
+    const editSession = state.editingCellInfo;
+    const targetTable = state.selectedTable;
+    const { rowIdx, colIdx, rowId, columnName, originalValue } = editSession;
     const newValue = state.activeCellInput.value;
 
     const origStr = originalValue === null ? '' : String(originalValue);
@@ -183,28 +195,25 @@ export async function saveCellEdit() {
         state.isSavingCell = true;
         updateStatus('Saving...');
 
-        await backendApi.updateCell(state.selectedTable, validateRowId(rowId), columnName, valueToSave, originalValue);
+        await backendApi.updateCell(targetTable, validateRowId(rowId), columnName, valueToSave, originalValue);
 
         // A broadcast refresh can reorder gridData before this RPC resolves.
-        // Update the row by its stable SQLite identity, never by the stale DOM index.
-        const currentRowIdx = state.gridData.findIndex((row, index) => (
-            getRowId(row, index) === rowId
-        ));
-        const currentColIdx = state.tableColumns.findIndex(column => column.name === columnName);
-        if (currentRowIdx >= 0 && currentColIdx >= 0) {
-            state.gridData[currentRowIdx][currentColIdx + getRowDataOffset()] = valueToSave;
-            clearExactIntegerText(currentRowIdx, currentColIdx);
+        // Resolve by stable identity only if the original table is still
+        // displayed. Equal rowids/column names in another table are unrelated.
+        const currentCell = resolveDisplayedCell(targetTable, rowId, columnName);
+        if (currentCell) {
+            state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = valueToSave;
+            clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
         }
 
-        cleanupCellEdit();
+        if (state.editingCellInfo === editSession) cleanupCellEdit();
 
         // Update UI immediately (preserves scroll)
         // refreshContent RPC will handle final consistency check
-        if (currentRowIdx >= 0 && currentColIdx >= 0) {
-            updateCellDom(currentRowIdx, currentColIdx, valueToSave);
-        }
-        if (state.matchNav.scope !== null) resetMatchNav();
+        if (currentCell) updateCellDom(currentCell.rowIdx, currentCell.colIdx, valueToSave);
+        if (state.selectedTable !== targetTable) return true;
 
+        if (state.matchNav.scope !== null) resetMatchNav();
         state.selectedCells = [];
         state.lastSelectedCell = null;
         updateSelectionStates();
@@ -226,6 +235,7 @@ export async function saveCellEdit() {
 
 async function saveCellEditAndMove(direction) {
     if (!state.editingCellInfo) return;
+    const targetTable = state.selectedTable;
     const { rowIdx, colIdx, originalValue } = state.editingCellInfo;
     const submittedValue = state.activeCellInput?.value;
 
@@ -255,6 +265,7 @@ async function saveCellEditAndMove(direction) {
     }
 
     if (!await saveCellEdit()) return;
+    if (state.selectedTable !== targetTable) return;
     if (targetRowId === undefined || targetColumnName === undefined) return;
 
     const originalText = originalValue === null ? '' : String(originalValue);
@@ -442,7 +453,9 @@ export async function saveCellPreview() {
         return;
     }
 
-    const { rowIdx, colIdx, rowId, columnName, originalValue } = state.cellPreviewInfo;
+    const previewSession = state.cellPreviewInfo;
+    const targetTable = state.selectedTable;
+    const { rowIdx, colIdx, rowId, columnName, originalValue } = previewSession;
     const textarea = document.getElementById('cellPreviewTextarea');
     const newValue = textarea.value;
 
@@ -469,13 +482,20 @@ export async function saveCellPreview() {
 
     try {
         updateStatus('Saving...');
-        await backendApi.updateCell(state.selectedTable, validateRowId(rowId), columnName, valueToSave, originalValue);
+        await backendApi.updateCell(targetTable, validateRowId(rowId), columnName, valueToSave, originalValue);
 
-        state.gridData[rowIdx][colIdx + getRowDataOffset()] = valueToSave;
-        clearExactIntegerText(rowIdx, colIdx);
+        // A broadcast refresh can reorder both rows and columns while the RPC is
+        // pending. Resolve the preview target from its stable database identity
+        // before touching either the grid value or its exact-INTEGER sidecar.
+        const currentCell = resolveDisplayedCell(targetTable, rowId, columnName);
+        if (currentCell) {
+            state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = valueToSave;
+            clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
+        }
 
-        closeCellPreview();
-        updateCellDom(rowIdx, colIdx, valueToSave);
+        if (state.cellPreviewInfo === previewSession) closeCellPreview();
+        if (currentCell) updateCellDom(currentCell.rowIdx, currentCell.colIdx, valueToSave);
+        if (state.selectedTable !== targetTable) return;
         if (state.matchNav.scope !== null) resetMatchNav();
 
         state.selectedCells = [];

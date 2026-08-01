@@ -600,6 +600,26 @@ export async function createNativeDatabaseConnection(
         };
       };
 
+      /** Resolve one canonical installed-view snapshot for intent checks and column preservation. */
+      const resolveExistingViewForIntent = async (
+        view: string,
+        intent: ViewDefinitionIntent
+      ): Promise<{ storedSql: CellValue | undefined; columnListSql: string | undefined }> => {
+        const result = await worker.call<NativeQueryResult>('query', [
+          "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+          [view]
+        ]);
+        const row = result.values?.[0];
+        assertViewDefinitionIntent(view, row !== undefined, intent);
+        const storedSql = row?.[0];
+        return {
+          storedSql,
+          columnListSql: typeof storedSql === 'string'
+            ? extractViewColumnListSql(storedSql)
+            : undefined
+        };
+      };
+
       const queryNativeSingleStatement = async <T>(sql: string): Promise<T> => {
         const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
         return worker.call<T>('querySingle', [`${sql}\n${boundary}`, undefined, boundary]);
@@ -1115,16 +1135,8 @@ export async function createNativeDatabaseConnection(
             throw new Error('View validation is unavailable because the database is read-only');
           }
           const body = normalizeViewSelectSql(selectSql);
-          const existing = await worker.call<NativeQueryResult>('query', [
-            "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
-            [view]
-          ]);
-          const existingRow = existing.values?.[0];
-          const existingSql = existingRow?.[0];
-          assertViewDefinitionIntent(view, existingRow !== undefined, intent);
-          const columnListSql = typeof existingSql === 'string'
-            ? extractViewColumnListSql(existingSql)
-            : undefined;
+          const { storedSql: existingSql, columnListSql } =
+            await resolveExistingViewForIntent(view, intent);
           const savepointName = createSavepointName('sp_validate_view');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
@@ -1152,16 +1164,8 @@ export async function createNativeDatabaseConnection(
           }
           const body = normalizeViewSelectSql(selectSql);
           const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
-          const existing = await worker.call<NativeQueryResult>('query', [
-            "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
-            [view]
-          ]);
-          const existingRow = existing.values?.[0];
-          const existingSql = existingRow?.[0];
-          assertViewDefinitionIntent(view, existingRow !== undefined, intent);
-          const columnListSql = typeof existingSql === 'string'
-            ? extractViewColumnListSql(existingSql)
-            : undefined;
+          const { storedSql: existingSql, columnListSql } =
+            await resolveExistingViewForIntent(view, intent);
           // Native preview always needs DDL because the txiki row-object API
           // needs the disposable view's positional schema; consequently it is
           // explicitly refused read-only. WASM/demo can use a target-named CTE
@@ -1195,15 +1199,17 @@ export async function createNativeDatabaseConnection(
               columns,
               boundedLimit
             );
+            const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(result.values);
             await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
             await worker.call('run', [`RELEASE ${savepointName}`]);
             return {
               headers: columns,
-              rows: result.values,
+              rows,
               columns,
-              values: result.values,
+              values: rows,
               columnNames: columns,
-              records: result.values
+              records: rows,
+              exactIntegerTexts
             };
           } catch (err) {
             await safeRollbackSavepoint(savepointName, 'previewViewDefinition');

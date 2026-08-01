@@ -173,7 +173,7 @@ function compileSingleStatement(sql) {
 
 function querySingleStatement(sql) {
   const statement = prepareSingleStatement(sql);
-  const rows = [];
+  const sourceRows = [];
   const startedAt = Date.now();
   try {
     while (true) {
@@ -182,13 +182,24 @@ function querySingleStatement(sql) {
         throw new Error(`Query execution timed out after ${queryTimeout}ms`);
       }
       if (!hasRow) break;
-      rows.push(statement.get());
+      sourceRows.push(statement.get(null, { useBigInt: true }));
     }
     const headers = statement.getColumnNames();
-    return { headers, rows };
+    const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(sourceRows);
+    return { headers, rows, exactIntegerTexts };
   } finally {
     statement.free();
   }
+}
+
+function resolveGlobalFilterColumns(columns, globalFilterColumns) {
+  if (globalFilterColumns != null) return globalFilterColumns;
+
+  const fallbackColumns = columns ?? [];
+  // Only the leading rowid that this worker prepends for table identity is
+  // synthetic. An explicitly supplied list may legitimately name a declared
+  // column "rowid" and must be trusted verbatim.
+  return fallbackColumns[0] === 'rowid' ? fallbackColumns.slice(1) : fallbackColumns;
 }
 
 function safeRollbackViewSavepoint(savepointName, context) {
@@ -493,7 +504,7 @@ async function fetchTableData(table, options = {}) {
   const activeGlobalFilter = getActiveFilterValue(globalFilter);
   if (activeGlobalFilter !== undefined) {
     // Get column names to search
-    const searchCols = (globalFilterColumns ?? columns ?? []).filter(c => c !== 'rowid');
+    const searchCols = resolveGlobalFilterColumns(columns, globalFilterColumns);
     if (searchCols.length > 0) {
       const globalClauses = searchCols.map(c => {
         const safeCol = c.replace(/"/g, '""');
@@ -547,7 +558,7 @@ async function fetchTableCount(table, options = {}) {
     columns = [],
     filters = [],
     globalFilter = '',
-    globalFilterColumns = columns
+    globalFilterColumns = null
   } = options;
 
   const safeTable = table.replace(/"/g, '""');
@@ -572,7 +583,7 @@ async function fetchTableCount(table, options = {}) {
   // Global filter
   const activeGlobalFilter = getActiveFilterValue(globalFilter);
   if (activeGlobalFilter !== undefined) {
-    const searchCols = (globalFilterColumns ?? columns ?? []).filter(c => c !== 'rowid');
+    const searchCols = resolveGlobalFilterColumns(columns, globalFilterColumns);
     if (searchCols.length > 0) {
       const globalClauses = searchCols.map(c => {
         const safeCol = c.replace(/"/g, '""');

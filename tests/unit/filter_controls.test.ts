@@ -7,6 +7,7 @@ import { createDeferred } from './helpers/deferred';
 const stateModulePath = '../../core/ui/modules/state.js';
 const apiModulePath = '../../core/ui/modules/api.js';
 const gridActionsModulePath = '../../core/ui/modules/grid-actions.js';
+const gridDataModulePath = '../../core/ui/modules/grid-data.js';
 const gridEventsModulePath = '../../core/ui/modules/grid-events.js';
 const globalShortcutsModulePath = '../../core/ui/modules/global-shortcuts.js';
 const matchNavModulePath = '../../core/ui/modules/match-nav.js';
@@ -73,10 +74,14 @@ function createButton() {
     };
 }
 
-function installTimerHarness() {
+function installTimerHarness({ virtualTime = false } = {}) {
     const originalSetTimeout = globalThis.setTimeout;
     const originalClearTimeout = globalThis.clearTimeout;
+    const originalDateNow = Date.now;
     const timers = new Map<number, { delay: number; callback: () => any }>();
+    let now = originalDateNow();
+
+    if (virtualTime) Date.now = () => now;
 
     (globalThis as any).setTimeout = (callback: () => any, delay = 0) => {
         const id = fakeTimerId++;
@@ -99,14 +104,17 @@ function installTimerHarness() {
             return [...timers.values()].map(timer => timer.delay);
         },
         start(delay: number) {
+            if (virtualTime) now += delay;
             return Promise.resolve(take(delay)());
         },
         async run(delay: number) {
+            if (virtualTime) now += delay;
             await take(delay)();
         },
         restore() {
             globalThis.setTimeout = originalSetTimeout;
             globalThis.clearTimeout = originalClearTimeout;
+            Date.now = originalDateNow;
         }
     };
 }
@@ -334,8 +342,70 @@ describe('filter controls', () => {
         }
     });
 
-    it('stops retrying and reports when a grid reload guard never clears', async () => {
+    it('keeps a queued filter when a newer grid reload takes ownership after the legacy retry budget', async () => {
         const timers = installTimerHarness();
+        const { globalInput, elements } = installFilterDocument({ globalValue: 'needle' });
+        const state = await prepareState([{ name: 'value', type: 'TEXT' }]);
+        const { backendApi } = await import(apiModulePath);
+        const { loadTableData } = await import(gridDataModulePath);
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        const firstCount = createDeferred<number>();
+        const secondCount = createDeferred<number>();
+        let countCalls = 0;
+        backendApi.fetchTableCount = async () => {
+            countCalls++;
+            if (countCalls === 1) return firstCount.promise;
+            if (countCalls === 2) return secondCount.promise;
+            return 1;
+        };
+        backendApi.fetchTableData = async () => ({ rows: [['needle']] });
+        let firstLoad: Promise<unknown> | undefined;
+        let secondLoad: Promise<unknown> | undefined;
+
+        try {
+            firstLoad = loadTableData(false, false);
+            assert.strictEqual(state.isGridReloading, true);
+
+            const { onFilterInput } = await import(gridActionsModulePath);
+            onFilterInput({ target: globalInput, isComposing: false });
+            await timers.run(300);
+
+            // Exhaust all but the last slot in the former shared 100-attempt
+            // budget while the first load owns the guard.
+            for (let attempt = 0; attempt < 99; attempt++) {
+                await timers.run(50);
+            }
+
+            // A newer load owns a fresh wait window. The next retry must observe
+            // that owner instead of exhausting budget inherited from the old one.
+            secondLoad = loadTableData(false, false);
+            await timers.run(50);
+
+            assert.strictEqual(state.filterApplyPending, true);
+            assert.ok(timers.delays().includes(50));
+            assert.doesNotMatch(elements.statusText.textContent, /not applied|failed/i);
+
+            secondCount.resolve(1);
+            await secondLoad;
+            await timers.run(50);
+
+            assert.strictEqual(state.filterApplyPending, false);
+            assert.strictEqual(state.filterApplyTable, null);
+            assert.deepStrictEqual(state.gridData, [['needle']]);
+        } finally {
+            firstCount.resolve(1);
+            secondCount.resolve(1);
+            await firstLoad;
+            await secondLoad;
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
+            timers.restore();
+        }
+    });
+
+    it('bounds a stuck reload wait while retaining the filter draft for the next reload', async () => {
+        const timers = installTimerHarness({ virtualTime: true });
         const { globalInput, elements } = installFilterDocument({ globalValue: 'needle' });
         const state = await prepareState([{ name: 'value', type: 'TEXT' }]);
         state.isGridReloading = true;
@@ -346,17 +416,19 @@ describe('filter controls', () => {
             await timers.run(300);
 
             let retryCount = 0;
-            while (timers.delays().includes(50) && retryCount < 200) {
+            while (timers.delays().includes(50) && retryCount < 3000) {
                 await timers.run(50);
                 retryCount++;
             }
 
-            assert.ok(retryCount < 200, 'reload retries must have a finite bound');
+            assert.ok(retryCount < 3000, 'reload waiting must have a finite deadline');
             assert.deepStrictEqual(timers.delays(), []);
             assert.strictEqual(state.filterApplyPending, false);
             assert.strictEqual(state.filterApplyTable, null);
             assert.strictEqual(state.filterPendingAction, null);
-            assert.match(elements.statusText.textContent, /filter.*not applied.*still reloading/i);
+            assert.strictEqual(state.filterQuery, 'needle');
+            assert.strictEqual(globalInput.value, 'needle');
+            assert.match(elements.statusText.textContent, /filter draft.*next grid reload/i);
         } finally {
             timers.restore();
         }

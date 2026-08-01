@@ -481,6 +481,39 @@ describe('web demo view worker', () => {
         assert.strictEqual(count, 0);
     });
 
+    it('keeps a declared rowid column in demo data and count global filters', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE declared_rowid_filters (rowid TEXT); " +
+            "INSERT INTO declared_rowid_filters(rowid) VALUES ('needle'), ('other')"
+        );
+        const options = {
+            // Match the table-grid request shape: the first entry is its identity
+            // projection and globalFilterColumns is the displayed schema.
+            columns: ['rowid', 'rowid'],
+            globalFilterColumns: ['rowid'],
+            globalFilter: 'needle'
+        };
+
+        const data = await worker.invoke('fetchTableData', 'declared_rowid_filters', {
+            ...options,
+            limit: 100,
+            offset: 0
+        });
+        const count = await worker.invoke('fetchTableCount', 'declared_rowid_filters', {
+            columns: ['rowid'],
+            globalFilterColumns: ['rowid'],
+            globalFilter: 'needle'
+        });
+
+        assert.deepStrictEqual(
+            Array.from(data.rows, (row: unknown[]) => Array.from(row)),
+            [['needle', 'needle']]
+        );
+        assert.strictEqual(count, 1);
+    });
+
     it('returns exact unsafe INTEGER text alongside rounded demo grid values', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
@@ -499,6 +532,21 @@ describe('web demo view worker', () => {
 
         assert.strictEqual(data.rows[0][0], 9007199254740992);
         assert.strictEqual(data.exactIntegerTexts[0][0], '9007199254740993');
+    });
+
+    it('returns exact unsafe INTEGER text from demo view previews', async () => {
+        const worker = await createWorkerHarness();
+
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'unsafe_integer_preview',
+            'SELECT 9007199254740993 AS value',
+            10,
+            'create'
+        );
+
+        assert.strictEqual(preview.rows[0][0], 9007199254740992);
+        assert.strictEqual(preview.exactIntegerTexts[0][0], '9007199254740993');
     });
 
     it('uses the same narrowed global-filter columns for demo data and counts', async () => {

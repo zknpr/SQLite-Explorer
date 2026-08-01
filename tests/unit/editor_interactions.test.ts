@@ -57,6 +57,7 @@ describe('editor keyboard and grid selection interactions', () => {
         state.lastSelectedCell = null;
         state.tableColumns = [];
         state.gridData = [];
+        state.gridExactIntegerTexts = {};
         state.pinnedColumns.clear();
         state.pinnedRowIds.clear();
         state.selectedTable = null;
@@ -237,6 +238,105 @@ describe('editor keyboard and grid selection interactions', () => {
             assert.strictEqual(prevented, true);
             assert.strictEqual(textareaLookups, 0, 'the read-only guard must run before reading the draft');
             assert.strictEqual(updateCalls, 0);
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+        }
+    });
+
+    it('applies a delayed cell-preview save by row and column identity after a refresh reorders the grid', async () => {
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { saveCellPreview } = await import(editModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const update = createDeferred<void>();
+        const paintedCells: string[] = [];
+        const modal = { classList: createClassList() };
+        const textarea = { value: 'replacement' };
+        const cells = new Map<string, any>();
+        for (const id of ['cell-0-0', 'cell-0-1', 'cell-1-0', 'cell-1-1']) {
+            cells.set(id, {
+                classList: createClassList(),
+                textContent: '',
+                children: [] as any[],
+                appendChild(child: any) {
+                    this.children.push(child);
+                    if (child.className === 'cell-text') paintedCells.push(id);
+                }
+            });
+        }
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cellPreviewTextarea') return textarea;
+                if (id === 'cellPreviewModal') return modal;
+                if (id === 'statusText') return { textContent: '' };
+                return cells.get(id) ?? null;
+            },
+            querySelectorAll() { return []; },
+            querySelector() { return null; },
+            createElement() {
+                return {
+                    className: '',
+                    textContent: '',
+                    title: '',
+                    scrollWidth: 0,
+                    clientWidth: 0
+                };
+            }
+        };
+        backendApi.updateCell = async () => update.promise;
+        state.isReadOnly = false;
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [
+            { name: 'value', type: 'INTEGER', notnull: 0 },
+            { name: 'note', type: 'TEXT', notnull: 0 }
+        ];
+        state.gridData = [
+            [1, 9007199254740992, 'first note'],
+            [2, 9007199254740994, 'second note']
+        ];
+        state.gridExactIntegerTexts = {
+            0: { 1: '9007199254740993' },
+            1: { 1: '9007199254740995' }
+        };
+        state.cellPreviewInfo = {
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 1,
+            columnName: 'value',
+            originalValue: 9007199254740992
+        };
+
+        try {
+            const pendingSave = saveCellPreview();
+
+            // Mirror a broadcast refresh landing while the update RPC is pending:
+            // both row and column positions now identify different cells.
+            state.tableColumns = [
+                { name: 'note', type: 'TEXT', notnull: 0 },
+                { name: 'value', type: 'INTEGER', notnull: 0 }
+            ];
+            state.gridData = [
+                [2, 'second note', 9007199254740994],
+                [1, 'first note', 9007199254740992]
+            ];
+            state.gridExactIntegerTexts = {
+                0: { 2: '9007199254740995' },
+                1: { 2: '9007199254740993' }
+            };
+
+            update.resolve();
+            await pendingSave;
+
+            assert.deepStrictEqual(state.gridData, [
+                [2, 'second note', 9007199254740994],
+                [1, 'first note', 'replacement']
+            ]);
+            assert.deepStrictEqual(state.gridExactIntegerTexts, {
+                0: { 2: '9007199254740995' }
+            });
+            assert.deepStrictEqual(paintedCells, ['cell-1-1']);
         } finally {
             backendApi.updateCell = originalUpdateCell;
         }
@@ -594,6 +694,107 @@ describe('editor keyboard and grid selection interactions', () => {
             });
             assert.strictEqual(cell.classList.contains('active-match-cell'), false);
             assert.strictEqual(matchCounter.textContent, '');
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+        }
+    });
+
+    it('does not repaint matching row and column identities in a table selected during an inline save', async () => {
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { saveCellEdit } = await import(editModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const update = createDeferred<void>();
+        const updateCalls: unknown[][] = [];
+        const paintedValues: string[] = [];
+        const cell = {
+            textContent: '',
+            children: [] as any[],
+            classList: createClassList(['active-match-cell']),
+            appendChild(child: any) {
+                this.children.push(child);
+                if (child.className === 'cell-text') paintedValues.push(child.textContent);
+            }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cell-0-0') return cell;
+                if (id === 'statusText' || id === 'filterMatchCounter') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll(selector: string) {
+                return selector === '.active-match-cell' ? [cell] : [];
+            },
+            querySelector() { return null; },
+            createElement() {
+                return {
+                    className: '',
+                    textContent: '',
+                    title: '',
+                    scrollWidth: 0,
+                    clientWidth: 0
+                };
+            }
+        };
+        backendApi.updateCell = async (...args: unknown[]) => {
+            updateCalls.push(args);
+            return update.promise;
+        };
+        state.selectedTable = 'source_items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'value', type: 'TEXT', notnull: 0 }];
+        state.gridData = [[7, 'source value']];
+        state.gridExactIntegerTexts = {};
+        state.editingCellInfo = {
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 7,
+            columnName: 'value',
+            originalValue: 'source value'
+        };
+        state.activeCellInput = {
+            value: 'saved source value',
+            removeEventListener() {}
+        };
+
+        try {
+            const pendingSave = saveCellEdit();
+
+            // The newly selected table happens to expose the same rowid and
+            // column name, but it is not the update target.
+            state.selectedTable = 'target_items';
+            state.tableColumns = [{ name: 'value', type: 'INTEGER', notnull: 0 }];
+            state.gridData = [[7, 9007199254740992]];
+            state.gridExactIntegerTexts = { 0: { 1: '9007199254740993' } };
+            state.selectedCells = [{ rowIdx: 0, colIdx: 0, value: 9007199254740992 }];
+            state.matchNav = {
+                scope: 'value',
+                term: '993',
+                matches: [{ rowIdx: 0, colIdx: 0 }],
+                currentIndex: 0
+            };
+
+            update.resolve();
+            assert.strictEqual(await pendingSave, true);
+
+            assert.deepStrictEqual(updateCalls, [[
+                'source_items', 7, 'value', 'saved source value', 'source value'
+            ]]);
+            assert.deepStrictEqual(state.gridData, [[7, 9007199254740992]]);
+            assert.deepStrictEqual(state.gridExactIntegerTexts, {
+                0: { 1: '9007199254740993' }
+            });
+            assert.deepStrictEqual(state.selectedCells, [
+                { rowIdx: 0, colIdx: 0, value: 9007199254740992 }
+            ]);
+            assert.deepStrictEqual(state.matchNav, {
+                scope: 'value',
+                term: '993',
+                matches: [{ rowIdx: 0, colIdx: 0 }],
+                currentIndex: 0
+            });
+            assert.deepStrictEqual(paintedValues, []);
         } finally {
             backendApi.updateCell = originalUpdateCell;
         }

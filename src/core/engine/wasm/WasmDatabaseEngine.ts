@@ -204,21 +204,22 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    */
   private executeSingleQuery(sql: string): QueryResultSet {
     const statement = this.prepareSingleStatement(sql);
-    const rows: CellValue[][] = [];
+    const sourceRows: Array<Array<CellValue | bigint>> = [];
     const startedAt = Date.now();
     try {
       while (statement.step()) {
         if (Date.now() - startedAt > this.queryTimeout) {
           throw new Error(`Query execution timed out after ${this.queryTimeout}ms`);
         }
-        const row = statement.get();
+        const row = statement.get(null, { useBigInt: true });
         if (!row) {
           throw new Error('SQLite returned no row after a successful statement step');
         }
-        rows.push(row);
+        sourceRows.push(row);
       }
       const headers = statement.getColumnNames();
-      return { headers, rows, columns: headers, values: rows };
+      const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(sourceRows);
+      return { headers, rows, columns: headers, values: rows, exactIntegerTexts };
     } finally {
       statement.free();
     }

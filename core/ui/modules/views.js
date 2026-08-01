@@ -73,11 +73,12 @@ function renderPreview(result) {
     table.appendChild(thead);
 
     const tbody = document.createElement('tbody');
-    for (const row of rows) {
+    for (const [rowIndex, row] of rows.entries()) {
         const tr = document.createElement('tr');
-        for (const value of row) {
+        for (const [columnIndex, value] of row.entries()) {
             const td = document.createElement('td');
-            td.textContent = formatCellValueAsText(value);
+            td.textContent = result?.exactIntegerTexts?.[rowIndex]?.[columnIndex]
+                ?? formatCellValueAsText(value);
             tr.appendChild(td);
         }
         tbody.appendChild(tr);

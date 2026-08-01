@@ -496,11 +496,17 @@ export class HostBridge implements ToastService {
       throw new Error('Document is read-only');
     }
 
+    const current = await dbOps.getViewDefinition(view);
+    const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
+    const confirmationMessage = triggerNames
+      ? vsc.l10n.t(
+          'Drop view "{0}"? This will permanently drop its INSTEAD OF triggers: {1}',
+          view,
+          triggerNames
+        )
+      : vsc.l10n.t('Drop view "{0}"?', view);
     const answer = await vsc.window.showWarningMessage(
-      vsc.l10n.t(
-        'Drop view "{0}"? This also drops its INSTEAD OF triggers.',
-        view
-      ),
+      confirmationMessage,
       { modal: true },
       { title: vsc.l10n.t('Drop View'), value: true },
       { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }

@@ -70,7 +70,7 @@ function installViewDocument() {
             return elements[id] ?? null;
         },
         querySelectorAll() { return []; },
-        createElement() { return element({ appendChild() {} }); }
+        createElement() { return element(); }
     };
     return {
         elements,
@@ -483,6 +483,36 @@ describe('view modal concurrency', () => {
             oldPreview.resolve({ headers: ['value'], rows: [[1], [2]] });
             await staleRequest;
             assert.match(elements.viewValidationStatus.textContent, /Preview returned 1 row/);
+        } finally {
+            backendApi.previewViewDefinition = originalPreview;
+        }
+    });
+
+    it('renders exact unsafe INTEGER digits from the preview sidecar', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { initViews, openCreateViewModal } = await import(viewsModulePath);
+        const originalPreview = backendApi.previewViewDefinition;
+        backendApi.previewViewDefinition = async () => ({
+            headers: ['value'],
+            rows: [[9007199254740992]],
+            exactIntegerTexts: { 0: { 0: '9007199254740993' } }
+        });
+
+        try {
+            initViews();
+            openCreateViewModal();
+            elements.viewNameInput.value = 'unsafe_integer_preview';
+            elements.viewSelectSql.value = 'SELECT 9007199254740993 AS value';
+
+            await listener('btnPreviewView', 'click')();
+
+            const table = elements.viewPreview.children[0];
+            const tbody = table.children[1];
+            const cell = tbody.children[0].children[0];
+            assert.strictEqual(cell.textContent, '9007199254740993');
         } finally {
             backendApi.previewViewDefinition = originalPreview;
         }

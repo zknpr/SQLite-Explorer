@@ -749,6 +749,23 @@ describe('view operations', () => {
         }
     });
 
+    it('carries exact unsafe INTEGER text through WASM view previews', async () => {
+        const engine = await createEngine();
+        try {
+            const preview = await engine.previewViewDefinition(
+                'unsafe_integer_preview',
+                'SELECT 9007199254740993 AS value',
+                10,
+                'create'
+            );
+
+            assert.strictEqual(preview.rows[0][0], 9007199254740992);
+            assert.strictEqual(preview.exactIntegerTexts?.[0]?.[0], '9007199254740993');
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('previews an edit in the target-name context instead of resolving the old view', async () => {
         const engine = await createEngine();
         try {
@@ -1104,9 +1121,24 @@ describe('view operations', () => {
     });
 
     it('drops a view only after modal confirmation and records the reversible definition', async () => {
-        const before = createViewDefinition();
+        const before = createViewDefinition({
+            triggers: [
+                {
+                    identifier: 'active_users_insert',
+                    sql: 'CREATE TRIGGER active_users_insert INSTEAD OF INSERT ON active_users BEGIN SELECT 1; END'
+                },
+                {
+                    identifier: 'active_users_update',
+                    sql: 'CREATE TRIGGER active_users_update INSTEAD OF UPDATE ON active_users BEGIN SELECT 1; END'
+                }
+            ]
+        });
+        const getViewDefinition = mock.fn(async () => before);
         const dropView = mock.fn(async () => before);
-        const { bridge, recordExternalModification } = createHostBridge({ dropView });
+        const { bridge, recordExternalModification } = createHostBridge({
+            getViewDefinition,
+            dropView
+        });
         mock.method(vscode.l10n, 't', (message: string, ...args: unknown[]) => {
             let localized = message;
             args.forEach((arg, index) => {
@@ -1125,11 +1157,13 @@ describe('view operations', () => {
         assert.strictEqual(result, undefined);
         assert.strictEqual(warning.mock.callCount(), 1);
         assert.deepStrictEqual(warning.mock.calls[0].arguments, [
-            'localized:Drop view "active_users"? This also drops its INSTEAD OF triggers.',
+            'localized:Drop view "active_users"? This will permanently drop its INSTEAD OF triggers: active_users_insert, active_users_update',
             { modal: true },
             { title: 'localized:Drop View', value: true },
             { title: 'localized:Cancel', value: false, isCloseAffordance: true }
         ]);
+        assert.strictEqual(getViewDefinition.mock.callCount(), 1);
+        assert.deepStrictEqual(getViewDefinition.mock.calls[0].arguments, ['active_users']);
         assert.strictEqual(dropView.mock.callCount(), 1);
         assert.deepStrictEqual(recordExternalModification.mock.calls[0].arguments[0], {
             label: 'Drop View',
@@ -1141,13 +1175,19 @@ describe('view operations', () => {
     });
 
     it('does not drop a view when confirmation is dismissed', async () => {
-        const dropView = mock.fn(async () => createViewDefinition());
-        const { bridge, recordExternalModification } = createHostBridge({ dropView });
+        const before = createViewDefinition();
+        const getViewDefinition = mock.fn(async () => before);
+        const dropView = mock.fn(async () => before);
+        const { bridge, recordExternalModification } = createHostBridge({
+            getViewDefinition,
+            dropView
+        });
         mock.method(vscode.window, 'showWarningMessage', async () => undefined);
 
         const result = await bridge.dropView('active_users');
 
         assert.deepStrictEqual(result, { cancelled: true });
+        assert.strictEqual(getViewDefinition.mock.callCount(), 1);
         assert.strictEqual(dropView.mock.callCount(), 0);
         assert.strictEqual(recordExternalModification.mock.callCount(), 0);
     });

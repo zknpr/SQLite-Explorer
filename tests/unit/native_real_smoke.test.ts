@@ -170,6 +170,18 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.strictEqual(result.exactIntegerTexts?.[0]?.[0], '9007199254740993');
         });
 
+        await testContext.test('carries exact unsafe INTEGER text through native view previews', async () => {
+            const preview = await engine.previewViewDefinition(
+                'native_unsafe_integer_preview',
+                'SELECT 9007199254740993 AS value',
+                10,
+                'create'
+            );
+
+            assert.strictEqual(preview.rows[0][0], 9007199254740992);
+            assert.strictEqual(preview.exactIntegerTexts?.[0]?.[0], '9007199254740993');
+        });
+
         await testContext.test('validates and previews with a legal disposable view name', async () => {
             await engine.validateViewDefinition('preview_candidate', USER_VIEW_BODY, 'create');
             const preview = await engine.previewViewDefinition(

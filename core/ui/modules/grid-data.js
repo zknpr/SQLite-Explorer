@@ -47,11 +47,22 @@ export async function loadTableColumns() {
 // request never writes state, renders stale rows, shows a stale error, or clears
 // the loading flag out from under the in-flight one.
 let activeLoadToken = 0;
+let activeLoadStartedAt = 0;
+
+/**
+ * Identify the request that currently owns the interaction guard. Filter input
+ * retries use this to give each superseding load its own wait deadline.
+ */
+export function getGridReloadOwner() {
+    if (!state.isGridReloading) return null;
+    return { token: activeLoadToken, startedAt: activeLoadStartedAt };
+}
 
 export async function loadTableData(showSpinner = true, saveScrollPosition = true) {
     if (!state.selectedTable) return;
 
     const loadToken = ++activeLoadToken;
+    activeLoadStartedAt = Date.now();
     // Snapshot the target table/type for the whole request so an in-flight load
     // can't pair this table's columns with a table the user switched to mid-fetch
     // (which would SELECT the old columns against the new table and error out).

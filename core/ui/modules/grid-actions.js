@@ -1,5 +1,6 @@
 import { state, persistState } from './state.js';
-import { loadTableData } from './grid-data.js';
+import { RPC_TIMEOUT_MS } from './api.js';
+import { getGridReloadOwner, loadTableData } from './grid-data.js';
 import { renderDataGrid } from './grid-render.js';
 import { updateSelectionStates } from './grid-selection.js';
 import { updateStatus, updateToolbarButtons } from './ui.js';
@@ -15,7 +16,11 @@ import {
 
 const FILTER_DEBOUNCE_MS = 300;
 const FILTER_RELOAD_RETRY_MS = 50;
-const FILTER_RELOAD_RETRY_LIMIT = 100;
+// One grid load performs count and data RPCs sequentially, so its legitimate
+// lifetime can approach two RPC deadlines. A missing owner is an impossible
+// production state, but still gets a short fail-safe bound instead of spinning.
+const FILTER_RELOAD_OWNER_WAIT_MS = RPC_TIMEOUT_MS * 2;
+const FILTER_RELOAD_FALLBACK_WAIT_MS = 5000;
 
 function getColumnFilterInput(columnName) {
     return [...document.querySelectorAll('.column-filter')]
@@ -89,16 +94,27 @@ function focusFilterInput(scope) {
 function scheduleFilterApply(
     delay = FILTER_DEBOUNCE_MS,
     table = state.selectedTable,
-    reloadRetryCount = 0
+    reloadWait = null
 ) {
     clearFilterTimer();
     state.filterTimer = setTimeout(() => {
         state.filterTimer = null;
-        return processFilterQueue(table, reloadRetryCount);
+        return processFilterQueue(table, reloadWait);
     }, delay);
 }
 
-async function processFilterQueue(table = state.selectedTable, reloadRetryCount = 0) {
+function getReloadWait(owner, previousWait) {
+    const ownerToken = owner?.token ?? null;
+    if (previousWait?.ownerToken === ownerToken) return previousWait;
+    return {
+        ownerToken,
+        deadline: (owner?.startedAt ?? Date.now()) + (
+            owner ? FILTER_RELOAD_OWNER_WAIT_MS : FILTER_RELOAD_FALLBACK_WAIT_MS
+        )
+    };
+}
+
+async function processFilterQueue(table = state.selectedTable, reloadWait = null) {
     // A table switch resets the filter state. Never let an old debounce reload or
     // focus a different table's controls.
     if (table !== state.selectedTable) {
@@ -125,14 +141,15 @@ async function processFilterQueue(table = state.selectedTable, reloadRetryCount 
     // Queue behind the owner of the reload guard instead of starting a competing
     // request. Input events still update state immediately while we wait.
     if (state.isGridReloading) {
-        if (reloadRetryCount >= FILTER_RELOAD_RETRY_LIMIT) {
+        const nextReloadWait = getReloadWait(getGridReloadOwner(), reloadWait);
+        if (Date.now() >= nextReloadWait.deadline) {
             state.filterApplyPending = false;
             state.filterApplyTable = null;
             state.filterPendingAction = null;
-            updateStatus('Filter not applied because the grid is still reloading.');
+            updateStatus('Filter draft retained; it will apply on the next grid reload.');
             return false;
         }
-        scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table, reloadRetryCount + 1);
+        scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table, nextReloadWait);
         return undefined;
     }
 
@@ -148,7 +165,7 @@ async function processFilterQueue(table = state.selectedTable, reloadRetryCount 
             // owner releases the guard. A real query failure remains retryable by
             // the next input/Enter without an automatic error loop.
             if (result === undefined) {
-                scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table, reloadRetryCount + 1);
+                scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table);
             }
             return result;
         }

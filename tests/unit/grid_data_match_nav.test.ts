@@ -121,15 +121,20 @@ describe('grid data match cache', () => {
             renderedTable: state.renderedTable,
             tableColumns: state.tableColumns,
             gridData: state.gridData,
+            gridExactIntegerTexts: state.gridExactIntegerTexts,
             currentPageIndex: state.currentPageIndex,
             totalRecordCount: state.totalRecordCount,
+            totalPageCount: state.totalPageCount,
             rowsPerPage: state.rowsPerPage,
             columnFilters: state.columnFilters,
             filterQuery: state.filterQuery,
             isLoadingData: state.isLoadingData,
             isGridReloading: state.isGridReloading,
             editingCellInfo: state.editingCellInfo,
-            matchNav: state.matchNav
+            matchNav: {
+                ...state.matchNav,
+                matches: state.matchNav.matches.map((match: { rowIdx: number; colIdx: number }) => ({ ...match }))
+            }
         };
         const { operations } = await createDatabaseEngine({
             content: null,
@@ -208,13 +213,17 @@ describe('grid data match cache', () => {
             gridExactIntegerTexts: state.gridExactIntegerTexts,
             currentPageIndex: state.currentPageIndex,
             totalRecordCount: state.totalRecordCount,
+            totalPageCount: state.totalPageCount,
             rowsPerPage: state.rowsPerPage,
             columnFilters: state.columnFilters,
             filterQuery: state.filterQuery,
             isLoadingData: state.isLoadingData,
             isGridReloading: state.isGridReloading,
             editingCellInfo: state.editingCellInfo,
-            matchNav: state.matchNav
+            matchNav: {
+                ...state.matchNav,
+                matches: state.matchNav.matches.map((match: { rowIdx: number; colIdx: number }) => ({ ...match }))
+            }
         };
         const { operations } = await createDatabaseEngine({
             content: null,
