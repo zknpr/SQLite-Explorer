@@ -661,6 +661,23 @@ describe('web demo view worker', () => {
         assert.strictEqual(preview.exactIntegerTexts[0][0], '1.0');
     });
 
+    it('returns authoritative SQLite text for divergent non-integral demo REALs', async () => {
+        const worker = await createWorkerHarness();
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'demo_divergent_real_preview',
+            'SELECT 9.652937795298495e282 AS value',
+            10,
+            'create'
+        );
+
+        assert.strictEqual(preview.rows[0][0], 9.652937795298495e282);
+        assert.strictEqual(
+            preview.exactIntegerTexts[0][0],
+            '9.6529377952985e+282'
+        );
+    });
+
     it('derives demo numeric sidecars from one evaluation of random expressions', async () => {
         const worker = await createWorkerHarness();
         const preview = await worker.invoke(
@@ -1115,7 +1132,7 @@ describe('web demo view worker', () => {
             'CREATE TABLE demo_matching_trigger_log (value TEXT); ' +
             'CREATE VIEW demo_matching_trigger_view AS SELECT a FROM demo_matching_trigger_source; ' +
             'CREATE TRIGGER demo_matching_trigger_update ' +
-            'INSTEAD OF UPDATE ON demo_matching_trigger_view ' +
+            'INSTEAD OF UPDATE OF b ON demo_matching_trigger_view ' +
             'BEGIN INSERT INTO demo_matching_trigger_log VALUES (' +
             "NEW.[b] || ':' || OLD.\"b\" || ':NEW.a' /* OLD.a */); END"
         );

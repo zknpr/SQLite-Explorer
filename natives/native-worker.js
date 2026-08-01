@@ -280,6 +280,7 @@ function compactExactNumericResult(result, transportColumns) {
       if (typeof exactText !== 'string') {
         throw new Error(`Exact numeric metadata at row ${rowIndex}, column ${columnIndex} is not text`);
       }
+      if (exactText === String(orderedRow[columnIndex])) continue;
       exactIntegerTexts ??= {};
       exactIntegerTexts[rowIndex] ??= {};
       exactIntegerTexts[rowIndex][columnIndex] = exactText;

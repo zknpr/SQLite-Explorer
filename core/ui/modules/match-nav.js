@@ -2,7 +2,7 @@
  * Filter Match Navigation
  *
  * Lets the user press Enter in the global filter or a column filter to jump
- * between cells whose raw or full formatted text contains the active filter term,
+ * between cells whose SQLite-comparable raw or authoritative numeric text contains the active filter term,
  * cycling through them with a visible border + a "current / total" counter.
  */
 import { state } from './state.js';
@@ -51,82 +51,7 @@ export function getPreferredMatchScope() {
     return null;
 }
 
-function formatSqliteReal(significand, exponent, negative) {
-    // Normalize a rounded 15-digit significand across a power-of-ten boundary.
-    if (significand >= 1e15) {
-        significand /= 10;
-        exponent++;
-    } else if (significand < 1e14) {
-        significand *= 10;
-        exponent--;
-    }
-    const digits = String(Math.trunc(significand)).padStart(15, '0');
-    let body;
-
-    // SQLite's REAL-to-TEXT path uses its %!.15g shape: scientific notation
-    // below 1e-4 and at/above 1e15, a mandatory decimal point, and a signed
-    // exponent with at least two digits.
-    if (exponent < -4 || exponent >= 15) {
-        const fraction = digits.slice(1).replace(/0+$/, '') || '0';
-        const exponentSign = exponent < 0 ? '-' : '+';
-        body = `${digits[0]}.${fraction}e${exponentSign}${String(Math.abs(exponent)).padStart(2, '0')}`;
-    } else {
-        const decimalPosition = exponent + 1;
-        if (decimalPosition <= 0) {
-            body = `0.${'0'.repeat(-decimalPosition)}${digits}`;
-        } else if (decimalPosition >= digits.length) {
-            body = `${digits}${'0'.repeat(decimalPosition - digits.length)}.0`;
-        } else {
-            body = `${digits.slice(0, decimalPosition)}.${digits.slice(decimalPosition)}`;
-        }
-        body = body.replace(/0+$/, '');
-        if (body.endsWith('.')) body += '0';
-    }
-    return negative ? `-${body}` : body;
-}
-
-function sqliteNumericTextCandidates(value) {
-    if (!Number.isFinite(value)) return [];
-    if (value === 0) return ['0.0'];
-
-    const negative = value < 0;
-    const absolute = Math.abs(value);
-    const [mantissa, exponentText] = absolute.toExponential(14).split('e');
-    const exponent = Number(exponentText);
-    const candidates = new Set([
-        formatSqliteReal(Number(mantissa.replace('.', '')), exponent, negative)
-    ]);
-
-    // SQLite and JavaScript use independent binary-to-decimal algorithms. For
-    // doubles exactly adjacent to a 15-digit halfway case they can choose opposite
-    // last digits. Include both possible roundings only for that narrow case so
-    // navigation favors matching an SQL LIKE result over omitting one. String(value)
-    // remains a separate candidate because row RPC data does not retain whether an
-    // integer-valued Number came from SQLite INTEGER or REAL storage.
-    const [wideMantissa] = absolute.toExponential(16).split('e');
-    const wideDigits = wideMantissa.replace('.', '');
-    if (wideDigits[15] === '5') {
-        const lower = Number(wideDigits.slice(0, 15));
-        candidates.add(formatSqliteReal(lower, exponent, negative));
-        candidates.add(formatSqliteReal(lower + 1, exponent, negative));
-    }
-
-    return [...candidates];
-}
-
-function hasRealStorageSemantics(value, col) {
-    const declaredType = String(col?.type ?? '');
-    const hasRealAffinity = /REAL|FLOA|DOUB/i.test(declaredType);
-    const outsideSqliteIntegerRange = value < -9223372036854775808
-        || value > 9223372036854775807;
-
-    // RPC numbers do not carry SQLite's storage class. A fractional or out-of-
-    // range value must be REAL; for ambiguous integer-valued Numbers, only REAL
-    // affinity is enough evidence to add SQLite's decimal-form candidate.
-    return hasRealAffinity || !Number.isInteger(value) || outsideSqliteIntegerRange;
-}
-
-function getMatchingTextCandidate(value, col, term, exactIntegerText) {
+function getMatchingTextCandidate(value, term, exactIntegerText) {
     // NULL never satisfies LIKE, and SQLite compares BLOB bytes rather than the
     // UI's synthetic "[BLOB]" label. Neither display-only placeholder is a
     // searchable SQL representation, so do not offer it to local navigation.
@@ -138,9 +63,6 @@ function getMatchingTextCandidate(value, col, term, exactIntegerText) {
     const candidates = exactIntegerText === undefined
         ? [rawText]
         : [exactIntegerText, rawText];
-    if (typeof value === 'number' && hasRealStorageSemantics(value, col)) {
-        candidates.push(...sqliteNumericTextCandidates(value));
-    }
     return candidates.find(candidate => foldAsciiCase(candidate).includes(term)) ?? null;
 }
 
@@ -172,7 +94,7 @@ export function formatCellValueForActiveMatch(value, col, term, exactIntegerText
     if (!term) {
         return formatCellValueAsText(value, col.type, state.dateFormat, col.name);
     }
-    const candidate = getMatchingTextCandidate(value, col, term, exactIntegerText);
+    const candidate = getMatchingTextCandidate(value, term, exactIntegerText);
     return candidate === null
         ? formatCellValueAsText(value, col.type, state.dateFormat, col.name)
         : excerptAroundMatch(candidate, term);
@@ -196,7 +118,7 @@ function computeMatches(scope, term) {
         for (const { col, colIdx } of columnsToScan) {
             const value = getCellValue(row, colIdx);
             const exactIntegerText = getExactIntegerText(rowIdx, colIdx);
-            if (getMatchingTextCandidate(value, col, term, exactIntegerText) !== null) {
+            if (getMatchingTextCandidate(value, term, exactIntegerText) !== null) {
                 matches.push({ rowIdx, colIdx });
             }
         }

@@ -1392,8 +1392,8 @@ export async function createNativeDatabaseConnection(
           ]);
 
           // txiki preserves SQLite int64 values as BigInt. The generated
-          // companion columns also retain integral REAL text before V8 erases
-          // that storage-class distinction from the Number value.
+          // companion columns also retain authoritative REAL text before V8
+          // normalizes the storage class into a JavaScript Number.
           const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
             result.values,
             undefined,

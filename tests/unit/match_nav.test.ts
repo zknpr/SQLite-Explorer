@@ -456,7 +456,7 @@ describe('filter match navigation', () => {
         assert.strictEqual(children.map(child => child.textContent).join(''), 'abc\0needle');
     });
 
-    it('matches SQLite REAL text coercion for exponent and integer-valued numbers', async () => {
+    it('matches SQLite REAL text coercion from the authoritative sidecar', async () => {
         const cell = {
             classList: createClassList(),
             scrollIntoView() {}
@@ -479,16 +479,19 @@ describe('filter match navigation', () => {
         state.columnFilters = {};
 
         const cases = [
-            { value: 1e20, term: '1.0e+20' },
-            { value: 1e-7, term: '1.0e-07' },
-            { value: 1e-5, term: '1.0e-05' },
-            { value: 1, term: '1.0' },
-            // SQLite and JS choose opposite final digits for this halfway-adjacent
-            // binary64 value; the SQL-side rendering must remain navigable.
-            { value: -2.330004368663885e137, term: '-2.33000436866388e+137' }
+            { value: 1e20, sqliteText: '1.0e+20', term: '1.0e+20' },
+            { value: 1e-7, sqliteText: '1.0e-07', term: '1.0e-07' },
+            { value: 1e-5, sqliteText: '1.0e-05', term: '1.0e-05' },
+            { value: 1, sqliteText: '1.0', term: '1.0' },
+            {
+                value: 9.652937795298495e282,
+                sqliteText: '9.6529377952985e+282',
+                term: '85e'
+            }
         ];
         for (const testCase of cases) {
             state.gridData = [[testCase.value]];
+            state.gridExactIntegerTexts = { 0: { 0: testCase.sqliteText } };
             state.filterQuery = testCase.term;
             resetMatchNav();
 
@@ -500,6 +503,31 @@ describe('filter match navigation', () => {
                 `${testCase.value} should match SQLite text ${testCase.term}`
             );
         }
+    });
+
+    it('does not guess a divergent SQLite REAL representation without a sidecar', async () => {
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                return id === 'filterMatchCounter' ? { textContent: '' } : null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.selectedTableType = 'view';
+        state.tableColumns = [{ name: 'measurement', type: 'REAL' }];
+        state.gridData = [[1e20]];
+        state.gridExactIntegerTexts = {};
+        state.filterQuery = '1.0e+20';
+        state.columnFilters = {};
+        resetMatchNav();
+
+        navigateMatches(GLOBAL_MATCH_SCOPE);
+
+        assert.deepStrictEqual(state.matchNav.matches, []);
     });
 
     it('does not synthesize a REAL match candidate for INTEGER cells', async () => {

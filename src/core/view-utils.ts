@@ -123,9 +123,18 @@ function consumeQualifiedSqlIdentifier(tokens: readonly SqlToken[], index: numbe
   return index;
 }
 
-/** Return the schema explicitly named by a CREATE TRIGGER ON target, if any. */
-function extractTriggerTargetSchema(triggerSql: string): string | undefined {
+interface ParsedStoredTriggerSql {
+  tokens: SqlToken[];
+  targetSchema?: string;
+  updateOfColumns: SqlToken[];
+  referenceStartIndex: number;
+  bodyStartIndex: number;
+}
+
+/** Parse the structural header shared by trigger attribution and compatibility checks. */
+function parseStoredTriggerSql(triggerSql: string): ParsedStoredTriggerSql {
   const tokens = scanSqlTokens(triggerSql);
+  const updateOfColumns: SqlToken[] = [];
   let index = 0;
   const expectKeyword = (keyword: string) => {
     if (!isSqlKeyword(tokens[index], keyword)) {
@@ -156,9 +165,19 @@ function extractTriggerTargetSchema(triggerSql: string): string | undefined {
   } else if (isSqlKeyword(tokens[index], 'UPDATE')) {
     index++;
     if (isSqlKeyword(tokens[index], 'OF')) {
-      index = consumeSqlIdentifier(tokens, index + 1);
+      index++;
+      if (!isSqlIdentifierToken(tokens[index])) {
+        throw new Error('Expected an SQL identifier after UPDATE OF');
+      }
+      updateOfColumns.push(tokens[index]);
+      index = consumeSqlIdentifier(tokens, index);
       while (tokens[index]?.kind === 'symbol' && tokens[index].value === ',') {
-        index = consumeSqlIdentifier(tokens, index + 1);
+        index++;
+        if (!isSqlIdentifierToken(tokens[index])) {
+          throw new Error('Expected an SQL identifier in UPDATE OF column list');
+        }
+        updateOfColumns.push(tokens[index]);
+        index = consumeSqlIdentifier(tokens, index);
       }
     }
   } else {
@@ -168,9 +187,30 @@ function extractTriggerTargetSchema(triggerSql: string): string | undefined {
   expectKeyword('ON');
   const schemaToken = tokens[index];
   index = consumeSqlIdentifier(tokens, index);
-  if (tokens[index]?.kind !== 'symbol' || tokens[index].value !== '.') return undefined;
-  consumeSqlIdentifier(tokens, index + 1);
-  return schemaToken.value;
+  let targetSchema: string | undefined;
+  if (tokens[index]?.kind === 'symbol' && tokens[index].value === '.') {
+    targetSchema = schemaToken.value;
+    index = consumeSqlIdentifier(tokens, index + 1);
+  }
+  const referenceStartIndex = index;
+  const beginIndex = tokens.findIndex((token, tokenIndex) => (
+    tokenIndex >= index && isSqlKeyword(token, 'BEGIN')
+  ));
+  if (beginIndex < 0) {
+    throw new Error('Expected BEGIN in stored CREATE TRIGGER SQL');
+  }
+  return {
+    tokens,
+    targetSchema,
+    updateOfColumns,
+    referenceStartIndex,
+    bodyStartIndex: beginIndex + 1
+  };
+}
+
+/** Return the schema explicitly named by a CREATE TRIGGER ON target, if any. */
+function extractTriggerTargetSchema(triggerSql: string): string | undefined {
+  return parseStoredTriggerSql(triggerSql).targetSchema;
 }
 
 /** Qualify a persistent view so a same-named TEMP view cannot shadow DDL. */
@@ -375,6 +415,200 @@ export function buildCreateViewTriggerSql(trigger: ViewTriggerDefinition): strin
   return trigger.sql.replace(createTriggerPrefix, '$1TEMP $2');
 }
 
+interface TriggerReferenceScope {
+  parent?: number;
+  aliases: Set<string>;
+  hasAmbiguousSource: boolean;
+}
+
+interface TriggerReferenceScopeMap {
+  scopes: TriggerReferenceScope[];
+  tokenScopes: Array<number | undefined>;
+  matchingParentheses: Map<number, number>;
+}
+
+const SOURCE_ALIAS_STOP_KEYWORDS = new Set([
+  'AS', 'CROSS', 'END', 'EXCEPT', 'FULL', 'GROUP', 'HAVING', 'INDEXED',
+  'INNER', 'INTERSECT', 'JOIN', 'LEFT', 'LIMIT', 'NATURAL', 'NOT', 'OFFSET',
+  'ON', 'ORDER', 'OUTER', 'RETURNING', 'RIGHT', 'SET', 'UNION', 'USING',
+  'VALUES', 'WHERE', 'WINDOW'
+]);
+
+const FROM_CLAUSE_END_KEYWORDS = new Set([
+  'END', 'EXCEPT', 'GROUP', 'HAVING', 'INTERSECT', 'LIMIT', 'OFFSET', 'ON',
+  'ORDER', 'RETURNING', 'SET', 'UNION', 'USING', 'VALUES', 'WHERE', 'WINDOW'
+]);
+
+function createTriggerReferenceScope(
+  scopes: TriggerReferenceScope[],
+  parent?: number
+): number {
+  scopes.push({ parent, aliases: new Set(), hasAmbiguousSource: false });
+  return scopes.length - 1;
+}
+
+/** Assign every trigger expression token to a statement/parenthesis scope. */
+function buildTriggerReferenceScopes(parsed: ParsedStoredTriggerSql): TriggerReferenceScopeMap {
+  const { tokens, referenceStartIndex, bodyStartIndex } = parsed;
+  const scopes: TriggerReferenceScope[] = [];
+  const tokenScopes: Array<number | undefined> = new Array(tokens.length);
+  const matchingParentheses = new Map<number, number>();
+  const openParentheses: number[] = [];
+  let scopeStack = [createTriggerReferenceScope(scopes)];
+  let startNewStatement = false;
+
+  for (let index = referenceStartIndex; index < tokens.length; index++) {
+    if (index === bodyStartIndex || startNewStatement) {
+      scopeStack = [createTriggerReferenceScope(scopes)];
+      startNewStatement = false;
+    }
+
+    const token = tokens[index];
+    tokenScopes[index] = scopeStack[scopeStack.length - 1];
+    if (token.kind === 'symbol' && token.value === '(') {
+      openParentheses.push(index);
+      scopeStack.push(createTriggerReferenceScope(
+        scopes,
+        scopeStack[scopeStack.length - 1]
+      ));
+    } else if (token.kind === 'symbol' && token.value === ')') {
+      const openIndex = openParentheses.pop();
+      if (openIndex !== undefined) matchingParentheses.set(openIndex, index);
+      if (scopeStack.length > 1) scopeStack.pop();
+    } else if (token.kind === 'symbol' && token.value === ';' && scopeStack.length === 1) {
+      startNewStatement = true;
+    }
+  }
+
+  return { scopes, tokenScopes, matchingParentheses };
+}
+
+function addRelevantSourceAlias(scope: TriggerReferenceScope, alias: string | undefined): void {
+  if (alias && /^(?:NEW|OLD)$/i.test(alias)) {
+    scope.aliases.add(foldSqlIdentifier(alias));
+  }
+}
+
+/** Parse one FROM/JOIN source and register aliases that can shadow NEW or OLD. */
+function registerTriggerSourceAlias(
+  tokens: readonly SqlToken[],
+  startIndex: number,
+  scopeIndex: number,
+  scopeMap: TriggerReferenceScopeMap
+): number {
+  const scope = scopeMap.scopes[scopeIndex];
+  let index = startIndex;
+  let sourceName: string | undefined;
+
+  if (tokens[index]?.kind === 'symbol' && tokens[index].value === '(') {
+    const closeIndex = scopeMap.matchingParentheses.get(index);
+    if (closeIndex === undefined) {
+      scope.hasAmbiguousSource = true;
+      return index + 1;
+    }
+    index = closeIndex + 1;
+  } else if (isSqlIdentifierToken(tokens[index])) {
+    sourceName = tokens[index].value;
+    index++;
+    if (tokens[index]?.kind === 'symbol' && tokens[index].value === '.') {
+      if (!isSqlIdentifierToken(tokens[index + 1])) {
+        scope.hasAmbiguousSource = true;
+        return index + 1;
+      }
+      sourceName = tokens[index + 1].value;
+      index += 2;
+    }
+    if (tokens[index]?.kind === 'symbol' && tokens[index].value === '(') {
+      const closeIndex = scopeMap.matchingParentheses.get(index);
+      if (closeIndex === undefined) {
+        scope.hasAmbiguousSource = true;
+        return index + 1;
+      }
+      index = closeIndex + 1;
+    }
+  } else {
+    scope.hasAmbiguousSource = true;
+    return index + 1;
+  }
+
+  let alias: string | undefined;
+  if (isSqlKeyword(tokens[index], 'AS')) {
+    if (!isSqlIdentifierToken(tokens[index + 1])) {
+      scope.hasAmbiguousSource = true;
+      return index + 1;
+    }
+    alias = tokens[index + 1].value;
+    index += 2;
+  } else if (isSqlIdentifierToken(tokens[index])) {
+    const candidate = tokens[index];
+    const isClauseKeyword = candidate.kind === 'word'
+      && SOURCE_ALIAS_STOP_KEYWORDS.has(candidate.value.toUpperCase());
+    if (!isClauseKeyword) {
+      alias = candidate.value;
+      index++;
+    }
+  }
+
+  // Once an alias is present SQLite hides the source's original name.
+  addRelevantSourceAlias(scope, alias ?? sourceName);
+  return index;
+}
+
+function collectTriggerSourceAliases(
+  parsed: ParsedStoredTriggerSql,
+  scopeMap: TriggerReferenceScopeMap
+): void {
+  const inFromClause = new Map<number, boolean>();
+  for (let index = parsed.referenceStartIndex; index < parsed.tokens.length; index++) {
+    const token = parsed.tokens[index];
+    const scopeIndex = scopeMap.tokenScopes[index];
+    if (scopeIndex === undefined) continue;
+
+    if (isSqlKeyword(token, 'FROM') || isSqlKeyword(token, 'JOIN')) {
+      inFromClause.set(scopeIndex, true);
+      registerTriggerSourceAlias(parsed.tokens, index + 1, scopeIndex, scopeMap);
+      continue;
+    }
+    if (token.kind === 'word' && FROM_CLAUSE_END_KEYWORDS.has(token.value.toUpperCase())) {
+      inFromClause.set(scopeIndex, false);
+      continue;
+    }
+    if (token.kind === 'symbol' && token.value === ',' && inFromClause.get(scopeIndex)) {
+      registerTriggerSourceAlias(parsed.tokens, index + 1, scopeIndex, scopeMap);
+    }
+  }
+}
+
+function triggerQualifierResolvesToAlias(
+  qualifier: string,
+  scopeIndex: number | undefined,
+  scopes: readonly TriggerReferenceScope[]
+): boolean {
+  const foldedQualifier = foldSqlIdentifier(qualifier);
+  while (scopeIndex !== undefined) {
+    const scope = scopes[scopeIndex];
+    if (scope.aliases.has(foldedQualifier)) return true;
+    // This validation exists to prevent known-broken trigger replay, not to
+    // implement SQLite's entire name resolver. If a valid source form is not
+    // understood, accepting it avoids blocking a legitimate edit; SQLite still
+    // validates the stored trigger SQL and remains the final arbiter at fire time.
+    if (scope.hasAmbiguousSource) return true;
+    scopeIndex = scope.parent;
+  }
+  return false;
+}
+
+function throwMissingTriggerColumn(
+  trigger: ViewTriggerDefinition,
+  column: string,
+  reference: string
+): never {
+  throw new Error(
+    `Preserved trigger "${trigger.identifier}" references missing view column ` +
+    `"${column}" via ${reference}`
+  );
+}
+
 /**
  * Reject preserved triggers that would become unusable after a view edit.
  * SQLite accepts unresolved NEW/OLD columns in CREATE TRIGGER and defers the
@@ -388,8 +622,17 @@ export function assertViewTriggersCompatibleWithColumns(
   const availableColumns = new Set(columns.map(foldSqlIdentifier));
 
   for (const trigger of triggers) {
-    const tokens = scanSqlTokens(trigger.sql);
-    for (let index = 0; index + 2 < tokens.length; index++) {
+    const parsed = parseStoredTriggerSql(trigger.sql);
+    for (const column of parsed.updateOfColumns) {
+      if (!availableColumns.has(foldSqlIdentifier(column.value))) {
+        throwMissingTriggerColumn(trigger, column.value, `UPDATE OF ${column.value}`);
+      }
+    }
+
+    const scopeMap = buildTriggerReferenceScopes(parsed);
+    collectTriggerSourceAliases(parsed, scopeMap);
+    for (let index = parsed.referenceStartIndex; index + 2 < parsed.tokens.length; index++) {
+      const tokens = parsed.tokens;
       const qualifier = tokens[index];
       const separator = tokens[index + 1];
       const column = tokens[index + 2];
@@ -401,10 +644,18 @@ export function assertViewTriggersCompatibleWithColumns(
           || !isSqlIdentifierToken(column)) {
         continue;
       }
+      if (triggerQualifierResolvesToAlias(
+        qualifier.value,
+        scopeMap.tokenScopes[index],
+        scopeMap.scopes
+      )) {
+        continue;
+      }
       if (!availableColumns.has(foldSqlIdentifier(column.value))) {
-        throw new Error(
-          `Preserved trigger "${trigger.identifier}" references missing view column ` +
-          `"${column.value}" via ${qualifier.value.toUpperCase()}.${column.value}`
+        throwMissingTriggerColumn(
+          trigger,
+          column.value,
+          `${qualifier.value.toUpperCase()}.${column.value}`
         );
       }
     }

@@ -433,7 +433,7 @@ describe('view operations', () => {
                 "INSERT INTO matching_trigger_source VALUES ('old-a', 'old-b'); " +
                 'CREATE TABLE matching_trigger_log (value TEXT); ' +
                 'CREATE VIEW matching_trigger_view AS SELECT a FROM matching_trigger_source; ' +
-                'CREATE TRIGGER matching_trigger_update INSTEAD OF UPDATE ON matching_trigger_view ' +
+                'CREATE TRIGGER matching_trigger_update INSTEAD OF UPDATE OF b ON matching_trigger_view ' +
                 'BEGIN INSERT INTO matching_trigger_log VALUES (' +
                 "NEW.[b] || ':' || OLD.\"b\" || ':NEW.a' /* OLD.a */); END"
             );
@@ -448,6 +448,73 @@ describe('view operations', () => {
             assert.strictEqual(
                 await readScalar(engine, 'SELECT value FROM matching_trigger_log'),
                 'new-b:old-b:NEW.a'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('does not mistake trigger-body aliases named NEW or OLD for pseudo-rows', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                "CREATE TABLE trigger_alias_source (a TEXT, b TEXT); " +
+                "INSERT INTO trigger_alias_source VALUES ('old-a', 'old-b'); " +
+                'CREATE TABLE trigger_alias_log (value TEXT); ' +
+                'CREATE VIEW trigger_alias_view AS SELECT a FROM trigger_alias_source; ' +
+                'CREATE TRIGGER trigger_alias_update INSTEAD OF UPDATE ON trigger_alias_view ' +
+                'BEGIN ' +
+                "INSERT INTO trigger_alias_log SELECT \"new\".x FROM (SELECT 'as-alias' AS x) AS \"new\"; " +
+                "INSERT INTO trigger_alias_log SELECT old.x FROM (SELECT 'bare-alias' AS x) old; " +
+                'END'
+            );
+
+            await engine.editView(
+                'trigger_alias_view',
+                'SELECT b FROM trigger_alias_source',
+                true
+            );
+            await engine.executeQuery("UPDATE trigger_alias_view SET b = 'new-b'");
+
+            const values = await engine.executeQuery(
+                'SELECT value FROM trigger_alias_log ORDER BY rowid'
+            );
+            assert.deepStrictEqual(values[0].rows, [['as-alias'], ['bare-alias']]);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('rejects a preserved trigger whose UPDATE OF header names a removed column', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                "CREATE TABLE trigger_header_source (a TEXT, b TEXT); " +
+                "INSERT INTO trigger_header_source VALUES ('old-a', 'old-b'); " +
+                'CREATE TABLE trigger_header_log (value TEXT); ' +
+                'CREATE VIEW trigger_header_view AS SELECT a FROM trigger_header_source; ' +
+                'CREATE TRIGGER trigger_header_update ' +
+                'INSTEAD OF UPDATE OF a ON trigger_header_view ' +
+                "BEGIN INSERT INTO trigger_header_log VALUES ('fired'); END"
+            );
+
+            await assert.rejects(
+                () => engine.editView(
+                    'trigger_header_view',
+                    'SELECT b FROM trigger_header_source',
+                    true
+                ),
+                /trigger_header_update.*missing view column.*\ba\b/i
+            );
+
+            assert.strictEqual(
+                (await engine.getViewDefinition('trigger_header_view')).selectSql,
+                'SELECT a FROM trigger_header_source'
+            );
+            await engine.executeQuery("UPDATE trigger_header_view SET a = 'new-a'");
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM trigger_header_log'),
+                'fired'
             );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
@@ -1016,6 +1083,26 @@ describe('view operations', () => {
         }
     });
 
+    it('carries authoritative SQLite text for divergent non-integral REAL previews', async () => {
+        const engine = await createEngine();
+        try {
+            const preview = await engine.previewViewDefinition(
+                'divergent_real_preview',
+                'SELECT 9.652937795298495e282 AS value',
+                10,
+                'create'
+            );
+
+            assert.strictEqual(preview.rows[0][0], 9.652937795298495e282);
+            assert.strictEqual(
+                preview.exactIntegerTexts?.[0]?.[0],
+                '9.6529377952985e+282'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('derives WASM numeric sidecars from one evaluation of random expressions', async () => {
         const engine = await createEngine();
         try {
@@ -1041,7 +1128,9 @@ describe('view operations', () => {
 
     it('uses a pre-3.35-compatible flattening barrier for exact numeric text', async () => {
         const transportQuery = buildExactNumericTextQuery(
-            'SELECT CAST(random() % 1000000 AS REAL) AS value',
+            'WITH RECURSIVE sequence(n) AS (' +
+            'SELECT 1 UNION ALL SELECT n + 1 FROM sequence WHERE n < 64' +
+            ') SELECT CAST(random() % 1000000 AS REAL) AS value FROM sequence',
             1
         );
 
@@ -1050,12 +1139,13 @@ describe('view operations', () => {
 
         const engine = await createEngine();
         try {
-            const plan = await engine.executeQuery(`EXPLAIN QUERY PLAN ${transportQuery.sql}`);
-            const details = plan.flatMap(result => result.rows.map(row => String(row[3])));
-            assert.ok(
-                details.some(detail => /CO-ROUTINE __sqlite_explorer_numeric_source/i.test(detail)),
-                `expected a non-flattened numeric source, got: ${details.join('; ')}`
-            );
+            const [result] = await engine.executeQuery(transportQuery.sql);
+            assert.strictEqual(result.rows.length, 64);
+            for (const [value, exactText] of result.rows) {
+                assert.strictEqual(typeof value, 'number');
+                assert.strictEqual(typeof exactText, 'string');
+                assert.strictEqual(Number(exactText), value);
+            }
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
         }

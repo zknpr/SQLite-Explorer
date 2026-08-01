@@ -30,7 +30,7 @@ export type CellValue = string | number | bigint | null | Uint8Array;
 
 /**
  * Sparse exact SQLite text for numeric cells whose Number transport is lossy
- * (unsafe INTEGERs) or storage-class ambiguous (integral REALs).
+ * (unsafe INTEGERs) or whose REAL text differs from JavaScript formatting.
  */
 export type ExactIntegerTextMap = Record<number, Record<number, string>>;
 

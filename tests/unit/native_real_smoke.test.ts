@@ -216,6 +216,21 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.strictEqual(preview.exactIntegerTexts?.[0]?.[0], '1.0');
         });
 
+        await testContext.test('carries authoritative SQLite text for divergent native REALs', async () => {
+            const preview = await engine.previewViewDefinition(
+                'native_divergent_real_preview',
+                'SELECT 9.652937795298495e282 AS value',
+                10,
+                'create'
+            );
+
+            assert.strictEqual(preview.rows[0][0], 9.652937795298495e282);
+            assert.strictEqual(
+                preview.exactIntegerTexts?.[0]?.[0],
+                '9.6529377952985e+282'
+            );
+        });
+
         await testContext.test('derives native numeric sidecars from one random evaluation', async () => {
             const preview = await engine.previewViewDefinition(
                 'native_random_numeric_preview',
@@ -278,7 +293,7 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 'CREATE VIEW native_matching_trigger_view AS ' +
                 'SELECT a FROM native_matching_trigger_source; ' +
                 'CREATE TRIGGER native_matching_trigger_update ' +
-                'INSTEAD OF UPDATE ON native_matching_trigger_view ' +
+                'INSTEAD OF UPDATE OF b ON native_matching_trigger_view ' +
                 'BEGIN INSERT INTO native_matching_trigger_log VALUES (' +
                 "NEW.[b] || ':' || OLD.\"b\" || ':NEW.a' /* OLD.a */); END"
             );

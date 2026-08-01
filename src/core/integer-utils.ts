@@ -6,8 +6,9 @@ const NUMERIC_VALUE_PREFIX = '__sqlite_explorer_numeric_value_';
 const NUMERIC_TEXT_PREFIX = '__sqlite_explorer_numeric_text_';
 
 /**
- * Project each result value beside sparse SQLite-generated text for the one
- * numeric shape JavaScript cannot identify after transport: an integral REAL.
+ * Project each result value beside SQLite-generated text for every REAL.
+ * normalizeIntegerRowsForTransport keeps the sidecar sparse by retaining only
+ * representations that differ from the JavaScript value crossing the RPC.
  * Explicit CTE column aliases preserve duplicate result names and keep the
  * metadata positionally tied to the exact row/value it describes.
  */
@@ -31,7 +32,6 @@ export function buildExactNumericTextQuery(
   const quotedValues = valueColumns.map(escapeIdentifier);
   const exactTextExpressions = quotedValues.map((valueColumn, index) => (
     `CASE WHEN typeof(${valueColumn}) = 'real' ` +
-    `AND ${valueColumn} = CAST(${valueColumn} AS INTEGER) ` +
     `THEN CAST(${valueColumn} AS TEXT) END AS ${escapeIdentifier(textColumns[index])}`
   ));
 
@@ -50,9 +50,9 @@ export function buildExactNumericTextQuery(
 /**
  * Keep the existing number-based grid contract while retaining exact SQLite
  * numeric text where transport would otherwise lose meaning: unsafe int64
- * BigInts and integral REALs whose Number value is indistinguishable from an
- * INTEGER. The protocol field retains its legacy exactIntegerTexts name, but
- * the sparse string sidecar now covers both cases and remains JSON/RPC-safe.
+ * BigInts and REALs whose SQLite text differs from JavaScript's String(value).
+ * The protocol field retains its legacy exactIntegerTexts name, but the sparse
+ * string sidecar now covers both cases and remains JSON/RPC-safe.
  */
 export function normalizeIntegerRowsForTransport(
   sourceRows: readonly (readonly unknown[])[],
@@ -65,6 +65,42 @@ export function normalizeIntegerRowsForTransport(
     exactIntegerTexts[rowIndex] ??= {};
     exactIntegerTexts[rowIndex][columnIndex] = text;
   };
+
+  const rows = sourceRows.map((sourceRow, rowIndex) => {
+    const logicalColumnCount = valueColumnCount ?? sourceRow.length;
+    if (valueColumnCount !== undefined && sourceRow.length < valueColumnCount * 2) {
+      throw new Error(
+        `Exact numeric text row ${rowIndex} has ${sourceRow.length} values; ` +
+        `expected at least ${valueColumnCount * 2}`
+      );
+    }
+
+    return sourceRow.slice(0, logicalColumnCount).map((value, columnIndex) => {
+      let normalizedValue = value as CellValue | bigint;
+      if (typeof value === 'bigint') {
+        const numericValue = Number(value);
+        if (!Number.isSafeInteger(numericValue)) {
+          setExactText(rowIndex, columnIndex, value.toString());
+        }
+        normalizedValue = numericValue;
+      }
+
+      if (valueColumnCount !== undefined) {
+        const exactRealText = sourceRow[valueColumnCount + columnIndex];
+        if (exactRealText !== null && exactRealText !== undefined) {
+          if (typeof exactRealText !== 'string') {
+            throw new Error(
+              `Exact numeric text at row ${rowIndex}, column ${columnIndex} is not text`
+            );
+          }
+          if (exactRealText !== String(normalizedValue)) {
+            setExactText(rowIndex, columnIndex, exactRealText);
+          }
+        }
+      }
+      return normalizedValue as CellValue;
+    });
+  });
 
   if (transportedExactTexts) {
     for (const [rowIndexText, exactRow] of Object.entries(transportedExactTexts)) {
@@ -79,42 +115,18 @@ export function normalizeIntegerRowsForTransport(
             `Invalid exact numeric text entry at row ${rowIndexText}, column ${columnIndexText}`
           );
         }
-        setExactText(rowIndex, columnIndex, exactText);
+        const value = rows[rowIndex]?.[columnIndex];
+        if (value === undefined) {
+          throw new Error(
+            `Exact numeric text entry is outside row ${rowIndexText}, column ${columnIndexText}`
+          );
+        }
+        if (exactText !== String(value)) {
+          setExactText(rowIndex, columnIndex, exactText);
+        }
       }
     }
   }
-
-  const rows = sourceRows.map((sourceRow, rowIndex) => {
-    const logicalColumnCount = valueColumnCount ?? sourceRow.length;
-    if (valueColumnCount !== undefined && sourceRow.length < valueColumnCount * 2) {
-      throw new Error(
-        `Exact numeric text row ${rowIndex} has ${sourceRow.length} values; ` +
-        `expected at least ${valueColumnCount * 2}`
-      );
-    }
-
-    return sourceRow.slice(0, logicalColumnCount).map((value, columnIndex) => {
-      if (valueColumnCount !== undefined) {
-        const exactRealText = sourceRow[valueColumnCount + columnIndex];
-        if (exactRealText !== null && exactRealText !== undefined) {
-          if (typeof exactRealText !== 'string') {
-            throw new Error(
-              `Exact numeric text at row ${rowIndex}, column ${columnIndex} is not text`
-            );
-          }
-          setExactText(rowIndex, columnIndex, exactRealText);
-        }
-      }
-
-      if (typeof value !== 'bigint') return value as CellValue;
-
-      const numericValue = Number(value);
-      if (!Number.isSafeInteger(numericValue)) {
-        setExactText(rowIndex, columnIndex, value.toString());
-      }
-      return numericValue;
-    });
-  });
 
   return exactIntegerTexts ? { rows, exactIntegerTexts } : { rows };
 }
