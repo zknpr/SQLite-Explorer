@@ -153,6 +153,23 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             'CREATE TABLE order_items (id INTEGER PRIMARY KEY, order_id INTEGER, price REAL)'
         );
 
+        await testContext.test('carries exact unsafe INTEGER text through native table fetches', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_unsafe_integers (value INTEGER); ' +
+                'INSERT INTO native_unsafe_integers(value) VALUES (9007199254740993)'
+            );
+            const result = await engine.fetchTableData('native_unsafe_integers', {
+                columns: ['value'],
+                globalFilterColumns: ['value'],
+                globalFilter: '993',
+                limit: 10,
+                offset: 0
+            });
+
+            assert.strictEqual(result.rows[0][0], 9007199254740992);
+            assert.strictEqual(result.exactIntegerTexts?.[0]?.[0], '9007199254740993');
+        });
+
         await testContext.test('validates and previews with a legal disposable view name', async () => {
             await engine.validateViewDefinition('preview_candidate', USER_VIEW_BODY, 'create');
             const preview = await engine.previewViewDefinition(

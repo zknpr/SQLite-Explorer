@@ -174,6 +174,96 @@ describe('grid data match cache', () => {
         }
     });
 
+    it('carries exact unsafe INTEGER text from SQLite into match navigation', async () => {
+        const elements: Record<string, any> = {
+            pageIndicator: { textContent: '' },
+            btnFirst: { disabled: false },
+            btnPrev: { disabled: false },
+            btnNext: { disabled: false },
+            btnLast: { disabled: false },
+            statusText: { textContent: '' },
+            filterMatchCounter: { textContent: '' }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) { return elements[id] ?? null; },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const gridDataModulePath = '../../core/ui/modules/grid-data.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const sqliteModulePath = '../../src/core/sqlite-db';
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { loadTableData } = await import(gridDataModulePath);
+        const { GLOBAL_MATCH_SCOPE, navigateMatches } = await import(matchNavModulePath);
+        const { createDatabaseEngine } = await import(sqliteModulePath);
+        const originalState = {
+            selectedTable: state.selectedTable,
+            selectedTableType: state.selectedTableType,
+            renderedTable: state.renderedTable,
+            tableColumns: state.tableColumns,
+            gridData: state.gridData,
+            gridExactIntegerTexts: state.gridExactIntegerTexts,
+            currentPageIndex: state.currentPageIndex,
+            totalRecordCount: state.totalRecordCount,
+            rowsPerPage: state.rowsPerPage,
+            columnFilters: state.columnFilters,
+            filterQuery: state.filterQuery,
+            isLoadingData: state.isLoadingData,
+            isGridReloading: state.isGridReloading,
+            editingCellInfo: state.editingCellInfo,
+            matchNav: state.matchNav
+        };
+        const { operations } = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        await operations.executeQuery(
+            'CREATE TABLE unsafe_integer_filter_items (value INTEGER); ' +
+            'INSERT INTO unsafe_integer_filter_items(value) VALUES (9007199254740993)'
+        );
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        backendApi.fetchTableCount = (table: string, options: any) =>
+            operations.fetchTableCount(table, options);
+        backendApi.fetchTableData = (table: string, options: any) =>
+            operations.fetchTableData(table, options);
+
+        Object.assign(state, {
+            selectedTable: 'unsafe_integer_filter_items',
+            selectedTableType: 'table',
+            renderedTable: 'unsafe_integer_filter_items',
+            tableColumns: [{ name: 'value', type: 'INTEGER' }],
+            gridData: [],
+            gridExactIntegerTexts: {},
+            currentPageIndex: 0,
+            rowsPerPage: 500,
+            columnFilters: {},
+            filterQuery: '993',
+            isLoadingData: false,
+            isGridReloading: false,
+            editingCellInfo: { rowIdx: 0, colIdx: 0 }
+        });
+
+        try {
+            assert.strictEqual(await loadTableData(false, false), true);
+            navigateMatches(GLOBAL_MATCH_SCOPE);
+
+            assert.strictEqual(state.totalRecordCount, 1);
+            assert.strictEqual(state.gridData[0][1], 9007199254740992);
+            assert.strictEqual(state.gridExactIntegerTexts[0][1], '9007199254740993');
+            assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
+        } finally {
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
+            Object.assign(state, originalState);
+            (operations as any).shutdown?.();
+        }
+    });
+
     it('invalidates cached match coordinates after replacement data is applied', async () => {
         const activeCell = { classList: createClassList(['active-match-cell']) };
         const counter = { textContent: '1/1' };

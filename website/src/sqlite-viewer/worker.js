@@ -25,6 +25,7 @@ import {
 } from '../../../src/core/view-utils.ts';
 import { escapeLikePattern } from '../../../src/core/sql-utils.ts';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
+import { normalizeIntegerRowsForTransport } from '../../../src/core/integer-utils.ts';
 
 // ============================================================================
 // Configuration
@@ -518,15 +519,17 @@ async function fetchTableData(table, options = {}) {
   // Add pagination
   sql += ` LIMIT ${parseInt(limit, 10)} OFFSET ${parseInt(offset, 10)}`;
 
-  const results = db.exec(sql, params);
+  const results = db.exec(sql, params, { useBigInt: true });
 
   if (results.length === 0) {
     return { headers: [], rows: [] };
   }
 
+  const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(results[0].values);
   return {
     headers: results[0].columns,
-    rows: results[0].values
+    rows,
+    exactIntegerTexts
   };
 }
 

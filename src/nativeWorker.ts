@@ -43,6 +43,7 @@ import type {
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 import { computeJsonPatchUndo } from './core/json-utils';
+import { normalizeIntegerRowsForTransport } from './core/integer-utils';
 import { serializeOperations } from './core/operation-serializer';
 import { InvocationTimeoutError } from './core/rpc';
 import {
@@ -1293,11 +1294,14 @@ export async function createNativeDatabaseConnection(
           const result = await worker.call<NativeQueryResult>('query', [sql, params]);
 
           let headers = result.columns;
-          let rows = result.values;
+          // txiki preserves SQLite int64 values as BigInt over the V8 channel.
+          // Keep them exact through column reordering, then normalize once at
+          // the webview-facing boundary and attach the sparse text sidecar.
+          let sourceRows: unknown[][] = result.values;
 
           // Native worker returns columns based on Object.keys() which doesn't guarantee order.
           // Ensure the result matches the requested column order from options.columns.
-          if (options.columns && options.columns.length > 0 && headers && rows) {
+          if (options.columns && options.columns.length > 0 && headers && sourceRows) {
             const expected = options.columns;
 
             // Build map of lower-case header names to indices for robust matching
@@ -1325,17 +1329,20 @@ export async function createNativeDatabaseConnection(
             // Missing columns will be undefined/null
             if (mapping.some((idx: number | undefined) => idx !== undefined)) {
               headers = expected;
-              rows = rows.map((row: CellValue[]) => mapping.map((idx: number | undefined) =>
+              sourceRows = sourceRows.map((row: unknown[]) => mapping.map((idx: number | undefined) =>
                 idx !== undefined ? row[idx as number] : null
               ));
             }
           }
 
+          const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(sourceRows);
+
           return {
             headers: headers,
             rows: rows,
             columns: headers,
-            values: rows
+            values: rows,
+            exactIntegerTexts
           };
         },
 

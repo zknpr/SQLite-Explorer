@@ -481,6 +481,26 @@ describe('web demo view worker', () => {
         assert.strictEqual(count, 0);
     });
 
+    it('returns exact unsafe INTEGER text alongside rounded demo grid values', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE unsafe_integers (value INTEGER); ' +
+            'INSERT INTO unsafe_integers(value) VALUES (9007199254740993)'
+        );
+
+        const data = await worker.invoke('fetchTableData', 'unsafe_integers', {
+            columns: ['value'],
+            globalFilterColumns: ['value'],
+            globalFilter: '993',
+            limit: 100,
+            offset: 0
+        });
+
+        assert.strictEqual(data.rows[0][0], 9007199254740992);
+        assert.strictEqual(data.exactIntegerTexts[0][0], '9007199254740993');
+    });
+
     it('uses the same narrowed global-filter columns for demo data and counts', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

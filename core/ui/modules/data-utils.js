@@ -19,6 +19,17 @@ export function getCellValue(row, colIdx) {
     return row[colIdx + getRowDataOffset()];
 }
 
+export function getExactIntegerText(rowIdx, colIdx) {
+    return state.gridExactIntegerTexts?.[rowIdx]?.[colIdx + getRowDataOffset()];
+}
+
+export function clearExactIntegerText(rowIdx, colIdx) {
+    const exactRow = state.gridExactIntegerTexts?.[rowIdx];
+    if (!exactRow) return;
+    delete exactRow[colIdx + getRowDataOffset()];
+    if (Object.keys(exactRow).length === 0) delete state.gridExactIntegerTexts[rowIdx];
+}
+
 /** Return original column indices in the same pinned-first order as the grid. */
 export function getOrderedColumnIndices() {
     const pinned = [];

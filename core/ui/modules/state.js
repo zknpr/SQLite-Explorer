@@ -22,6 +22,9 @@ export const state = {
     filterQuery: '',
     selectedRowIds: new Set(),
     gridData: [],
+    // Sparse row/data-column exact text for SQLite INTEGERs outside JS's safe
+    // range. General grid values stay numbers for backward compatibility.
+    gridExactIntegerTexts: {},
 
     // Cell editing state
     editingCellInfo: null,

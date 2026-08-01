@@ -30,6 +30,7 @@ import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from
 import { crypto } from '../../../platform/cryptoShim';
 import { buildSelectQuery, buildCountQuery } from '../../query-builder';
 import { applyMergePatch, computeJsonPatchUndo, parseJsonValueForPatching } from '../../json-utils';
+import { normalizeIntegerRowsForTransport } from '../../integer-utils';
 import { getNodeFs } from '../../platform/fs';
 import {
   assertViewDefinitionSnapshotCurrent,
@@ -52,6 +53,10 @@ interface WasmPreparedStatement {
   run(params?: CellValue[]): void;
   bind(params?: CellValue[]): boolean;
   get(params?: CellValue[]): CellValue[] | undefined;
+  get(
+    params: CellValue[] | null | undefined,
+    config: { useBigInt: true }
+  ): Array<CellValue | bigint> | undefined;
   step(): boolean;
   reset(): void;
   free(): boolean;
@@ -1342,22 +1347,24 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     let stmt: WasmPreparedStatement | null = null;
     try {
         stmt = this.instance.prepare(sql, params);
-        const rows: CellValue[][] = [];
+        const sourceRows: Array<Array<CellValue | bigint>> = [];
 
         while (stmt.step()) {
             // We know a row exists because step() returned true
-            const row = stmt.get();
+            const row = stmt.get(null, { useBigInt: true });
             if (row) {
-                rows.push(row);
+                sourceRows.push(row);
             }
         }
 
         const headers = stmt.getColumnNames();
+        const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(sourceRows);
         return {
             headers,
             rows,
             columns: headers,
-            values: rows
+            values: rows,
+            exactIntegerTexts
         };
     } catch (err) {
         const errorDetail = err instanceof Error ? err.message : String(err);

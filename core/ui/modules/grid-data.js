@@ -162,6 +162,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         if (isSuperseded()) return; // superseded (newer load or table switch) during the fetch
 
         state.gridData = dataResult.rows || [];
+        state.gridExactIntegerTexts = dataResult.exactIntegerTexts || {};
         resetMatchNav();
 
         // When preserving scroll, re-capture the latest position right before

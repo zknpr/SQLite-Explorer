@@ -8,6 +8,7 @@
 import { state } from './state.js';
 import {
     getCellValue,
+    getExactIntegerText,
     getOrderedColumnIndices,
     getOrderedRowIndices
 } from './data-utils.js';
@@ -124,7 +125,7 @@ function hasRealStorageSemantics(value, col) {
     return hasRealAffinity || !Number.isInteger(value) || outsideSqliteIntegerRange;
 }
 
-function getMatchingTextCandidate(value, col, term) {
+function getMatchingTextCandidate(value, col, term, exactIntegerText) {
     const rawText = value === null || value === undefined || value instanceof Uint8Array
         ? ''
         : String(value);
@@ -135,7 +136,9 @@ function getMatchingTextCandidate(value, col, term) {
         col.name,
         false
     ));
-    const candidates = [rawText, formattedText];
+    const candidates = exactIntegerText === undefined
+        ? [rawText, formattedText]
+        : [exactIntegerText, rawText, formattedText];
     if (typeof value === 'number' && hasRealStorageSemantics(value, col)) {
         candidates.push(...sqliteNumericTextCandidates(value));
     }
@@ -166,11 +169,11 @@ function excerptAroundMatch(text, term, maxLength = 100) {
  * active navigation term using the exact raw/formatted/numeric candidate that
  * made the cell a match.
  */
-export function formatCellValueForActiveMatch(value, col, term) {
+export function formatCellValueForActiveMatch(value, col, term, exactIntegerText) {
     if (!term) {
         return formatCellValueAsText(value, col.type, state.dateFormat, col.name);
     }
-    const candidate = getMatchingTextCandidate(value, col, term);
+    const candidate = getMatchingTextCandidate(value, col, term, exactIntegerText);
     return candidate === null
         ? formatCellValueAsText(value, col.type, state.dateFormat, col.name)
         : excerptAroundMatch(candidate, term);
@@ -193,7 +196,8 @@ function computeMatches(scope, term) {
         const row = state.gridData[rowIdx];
         for (const { col, colIdx } of columnsToScan) {
             const value = getCellValue(row, colIdx);
-            if (getMatchingTextCandidate(value, col, term) !== null) {
+            const exactIntegerText = getExactIntegerText(rowIdx, colIdx);
+            if (getMatchingTextCandidate(value, col, term, exactIntegerText) !== null) {
                 matches.push({ rowIdx, colIdx });
             }
         }
@@ -209,8 +213,9 @@ function renderMatchCellText(cellEl, rowIdx, colIdx, term) {
     if (!textSpan || !row || !col || typeof textSpan.replaceChildren !== 'function') return;
 
     const value = getCellValue(row, colIdx);
+    const exactIntegerText = getExactIntegerText(rowIdx, colIdx);
     const displayValue = term
-        ? formatCellValueForActiveMatch(value, col, term)
+        ? formatCellValueForActiveMatch(value, col, term, exactIntegerText)
         : formatCellValueAsText(value, col.type, state.dateFormat, col.name);
     const matcher = buildHighlightMatcher([state.filterQuery, state.columnFilters[col.name]]);
     textSpan.replaceChildren();

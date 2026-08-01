@@ -10,6 +10,7 @@ import { loadTableData } from './grid-data.js';
 import {
     getRowDataOffset,
     getCellValue,
+    clearExactIntegerText,
     getRowId,
     getOrderedColumnIndices,
     getOrderedRowIndices
@@ -192,6 +193,7 @@ export async function saveCellEdit() {
         const currentColIdx = state.tableColumns.findIndex(column => column.name === columnName);
         if (currentRowIdx >= 0 && currentColIdx >= 0) {
             state.gridData[currentRowIdx][currentColIdx + getRowDataOffset()] = valueToSave;
+            clearExactIntegerText(currentRowIdx, currentColIdx);
         }
 
         cleanupCellEdit();
@@ -470,6 +472,7 @@ export async function saveCellPreview() {
         await backendApi.updateCell(state.selectedTable, validateRowId(rowId), columnName, valueToSave, originalValue);
 
         state.gridData[rowIdx][colIdx + getRowDataOffset()] = valueToSave;
+        clearExactIntegerText(rowIdx, colIdx);
 
         closeCellPreview();
         updateCellDom(rowIdx, colIdx, valueToSave);

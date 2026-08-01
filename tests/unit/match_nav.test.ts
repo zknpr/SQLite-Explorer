@@ -420,6 +420,74 @@ describe('filter match navigation', () => {
         assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 1 }]);
     });
 
+    it('uses exact transported text for an unsafe INTEGER match and highlight', async () => {
+        const textSpan = {
+            children: [] as any[],
+            replaceChildren(...children: any[]) { this.children = children; },
+            appendChild(child: any) { this.children.push(child); }
+        };
+        const cell = {
+            classList: createClassList(),
+            dataset: { rowidx: '0', colidx: '0' },
+            scrollIntoView() {},
+            querySelector(selector: string) {
+                return selector === '.cell-text' ? textSpan : null;
+            }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cell-0-0') return cell;
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll(selector: string) {
+                return selector === '.active-match-cell'
+                    && cell.classList.contains('active-match-cell') ? [cell] : [];
+            },
+            createTextNode(text: string) { return { textContent: text }; },
+            createElement(tag: string) {
+                return { tag, className: '', textContent: '' };
+            }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        const originalState = {
+            selectedTableType: state.selectedTableType,
+            tableColumns: state.tableColumns,
+            gridData: state.gridData,
+            gridExactIntegerTexts: state.gridExactIntegerTexts,
+            filterQuery: state.filterQuery,
+            columnFilters: state.columnFilters,
+            matchNav: state.matchNav
+        };
+
+        try {
+            state.selectedTableType = 'view';
+            state.tableColumns = [{ name: 'value', type: 'INTEGER' }];
+            // This is the rounded Number that the existing UI continues to render.
+            state.gridData = [[9007199254740992]];
+            state.gridExactIntegerTexts = { 0: { 0: '9007199254740993' } };
+            state.filterQuery = '993';
+            state.columnFilters = {};
+            resetMatchNav();
+
+            navigateMatches(GLOBAL_MATCH_SCOPE);
+
+            assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
+            const renderedText = textSpan.children.map(child => child.textContent).join('');
+            assert.strictEqual(renderedText, '9007199254740993');
+            assert.ok(textSpan.children.some(child => (
+                child.className === 'cell-highlight' && child.textContent === '993'
+            )));
+        } finally {
+            Object.assign(state, originalState);
+            resetMatchNav();
+        }
+    });
+
     it('does not navigate a match found only in the hidden table rowid', async () => {
         (globalThis as any).document = {
             getElementById(id: string) {

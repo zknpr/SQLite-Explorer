@@ -28,6 +28,9 @@ export interface CellContentType {
  */
 export type CellValue = string | number | null | Uint8Array;
 
+/** Exact decimal text for grid INTEGER cells whose int64 value is unsafe as a JS number. */
+export type ExactIntegerTextMap = Record<number, Record<number, string>>;
+
 /**
  * Unique identifier for a database row.
  * Can be numeric ROWID or string for compatibility.
@@ -51,6 +54,8 @@ export interface QueryResultSet {
   headers: string[];
   /** Row data as 2D array (primary naming) */
   rows: CellValue[][];
+  /** Sparse row/column sidecar for INTEGER values rounded by the number-based grid contract. */
+  exactIntegerTexts?: ExactIntegerTextMap;
   /** Column names - sql.js compatible alias for webview */
   columns?: string[];
   /** Row data - sql.js compatible alias for webview */
