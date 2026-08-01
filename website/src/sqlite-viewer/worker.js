@@ -13,6 +13,7 @@
 
 import {
   assertViewDefinitionSnapshotCurrent,
+  assertViewDefinitionStateCurrent,
   assertViewDefinitionIntent,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
@@ -860,14 +861,14 @@ async function createTable(table, columns) {
   db.run(`CREATE TABLE "${safeTable}" (${columnDefs})`);
 }
 
-async function readViewDefinition(view, allowUnparsed = false) {
+async function findViewDefinition(view, allowUnparsed = false) {
   if (!db) throw new Error('No database initialized');
   const viewResult = db.exec(
     "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
     [view]
   );
   const createSql = viewResult[0]?.values?.[0]?.[0];
-  if (typeof createSql !== 'string') throw new Error(`View not found: ${view}`);
+  if (typeof createSql !== 'string') return null;
 
   const triggerRows = VIEW_TRIGGER_SCHEMA_QUERIES.map(source => (
     db.exec(source.sql, [view])[0]?.values || []
@@ -890,6 +891,12 @@ async function readViewDefinition(view, allowUnparsed = false) {
     columnListSql,
     triggers
   };
+}
+
+async function readViewDefinition(view, allowUnparsed = false) {
+  const definition = await findViewDefinition(view, allowUnparsed);
+  if (!definition) throw new Error(`View not found: ${view}`);
+  return definition;
 }
 
 async function getViewDefinition(view) {
@@ -1044,19 +1051,111 @@ async function editView(
   }
 }
 
-async function dropView(view) {
+async function dropView(view, expectedSql, expectedTriggers) {
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('View deletion');
   const savepointName = createViewSavepointName('sp_drop_view');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     const before = await readViewDefinition(view, true);
+    assertViewDefinitionSnapshotCurrent(
+      expectedSql,
+      before.sql,
+      expectedTriggers,
+      before.triggers
+    );
     runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
     runSingleStatement(`RELEASE ${savepointName}`);
     return before;
   } catch (error) {
     safeRollbackViewSavepoint(savepointName, 'dropView');
     throw error;
+  }
+}
+
+async function applyViewHistoryState(view, expectedCurrent, replacement) {
+  assertWritableMutation('View history replay');
+  const savepointName = createViewSavepointName('sp_restore_view');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const current = await findViewDefinition(view, true);
+    assertViewDefinitionStateCurrent(expectedCurrent, current);
+    if (current) {
+      runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+    }
+    if (replacement) {
+      runSingleStatement(replacement.sql);
+      compileSingleStatement(
+        `EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(replacement.identifier)}`
+      );
+      for (const trigger of replacement.triggers) {
+        runSingleStatement(buildCreateViewTriggerSql(trigger));
+      }
+    }
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (error) {
+    safeRollbackViewSavepoint(savepointName, 'restoreViewDefinition');
+    throw error;
+  }
+}
+
+async function undoModification(modification) {
+  const { modificationType, targetTable, viewDefBefore, viewDefAfter } = modification;
+  if (!targetTable) return;
+  switch (modificationType) {
+    case 'view_create':
+      if (viewDefAfter) {
+        await applyViewHistoryState(targetTable, viewDefAfter, null);
+      } else {
+        console.warn('[DemoWorker] Skipping view undo: definition missing from history entry');
+      }
+      return;
+    case 'view_edit':
+      if (viewDefBefore && viewDefAfter) {
+        await applyViewHistoryState(targetTable, viewDefAfter, viewDefBefore);
+      } else {
+        console.warn('[DemoWorker] Skipping view undo: definition missing from history entry');
+      }
+      return;
+    case 'view_drop':
+      if (viewDefBefore) {
+        await applyViewHistoryState(targetTable, null, viewDefBefore);
+      } else {
+        console.warn('[DemoWorker] Skipping view undo: definition missing from history entry');
+      }
+      return;
+    default:
+      throw new Error(`Demo history replay does not support undoing ${String(modificationType)}`);
+  }
+}
+
+async function redoModification(modification) {
+  const { modificationType, targetTable, viewDefBefore, viewDefAfter } = modification;
+  if (!targetTable) return;
+  switch (modificationType) {
+    case 'view_create':
+      if (viewDefAfter) {
+        await applyViewHistoryState(targetTable, null, viewDefAfter);
+      } else {
+        console.warn('[DemoWorker] Skipping view redo: definition missing from history entry');
+      }
+      return;
+    case 'view_edit':
+      if (viewDefBefore && viewDefAfter) {
+        await applyViewHistoryState(targetTable, viewDefBefore, viewDefAfter);
+      } else {
+        console.warn('[DemoWorker] Skipping view redo: definition missing from history entry');
+      }
+      return;
+    case 'view_drop':
+      if (viewDefBefore) {
+        await applyViewHistoryState(targetTable, viewDefBefore, null);
+      } else {
+        console.warn('[DemoWorker] Skipping view redo: definition missing from history entry');
+      }
+      return;
+    default:
+      throw new Error(`Demo history replay does not support redoing ${String(modificationType)}`);
   }
 }
 
@@ -1175,6 +1274,8 @@ const methods = {
   createView,
   editView,
   dropView,
+  undoModification,
+  redoModification,
   updateCellBatch,
   addColumn,
   ping,

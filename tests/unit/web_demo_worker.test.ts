@@ -270,6 +270,89 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('rejects demo view-history undo and redo when the installed state changed', async () => {
+        const worker = await createWorkerHarness();
+        const before = await worker.invoke('createView', 'demo_history_cas', 'SELECT 1 AS value');
+        const edit = await worker.invoke(
+            'editView',
+            'demo_history_cas',
+            'SELECT 2 AS value',
+            true
+        );
+        const modification = {
+            description: 'Edit demo_history_cas',
+            modificationType: 'view_edit',
+            targetTable: 'demo_history_cas',
+            viewDefBefore: before,
+            viewDefAfter: edit.after
+        };
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE TRIGGER demo_history_undo_external ' +
+            'INSTEAD OF INSERT ON demo_history_cas BEGIN SELECT 1; END'
+        );
+        await assert.rejects(
+            worker.invoke('undoModification', modification),
+            /changed outside this editor/i
+        );
+        let current = await worker.invoke('getViewDefinition', 'demo_history_cas');
+        assert.strictEqual(current.selectSql, 'SELECT 2 AS value');
+        assert.deepStrictEqual(
+            Array.from(current.triggers, (trigger: any) => trigger.identifier),
+            ['demo_history_undo_external']
+        );
+
+        await worker.invoke('runQuery', 'DROP TRIGGER demo_history_undo_external');
+        await worker.invoke('undoModification', modification);
+        await worker.invoke(
+            'runQuery',
+            'CREATE TRIGGER demo_history_redo_external ' +
+            'INSTEAD OF UPDATE ON demo_history_cas BEGIN SELECT 2; END'
+        );
+        await assert.rejects(
+            worker.invoke('redoModification', modification),
+            /changed outside this editor/i
+        );
+        current = await worker.invoke('getViewDefinition', 'demo_history_cas');
+        assert.strictEqual(current.selectSql, 'SELECT 1 AS value');
+        assert.deepStrictEqual(
+            Array.from(current.triggers, (trigger: any) => trigger.identifier),
+            ['demo_history_redo_external']
+        );
+    });
+
+    it('rejects a demo drop whose confirmed trigger snapshot became stale', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('createView', 'demo_drop_cas', 'SELECT 1 AS value');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TRIGGER demo_drop_first ' +
+            'INSTEAD OF INSERT ON demo_drop_cas BEGIN SELECT 1; END'
+        );
+        const confirmed = await worker.invoke('getViewDefinition', 'demo_drop_cas');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TRIGGER demo_drop_second ' +
+            'INSTEAD OF UPDATE ON demo_drop_cas BEGIN SELECT 2; END'
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'dropView',
+                'demo_drop_cas',
+                confirmed.sql,
+                confirmed.triggers
+            ),
+            /changed outside this editor/i
+        );
+        const current = await worker.invoke('getViewDefinition', 'demo_drop_cas');
+        assert.deepStrictEqual(
+            Array.from(current.triggers, (trigger: any) => trigger.identifier),
+            ['demo_drop_first', 'demo_drop_second']
+        );
+    });
+
     it('previews an edited view through its preserved explicit column list', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

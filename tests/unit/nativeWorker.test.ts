@@ -1050,6 +1050,17 @@ FROM orders o`;
 
     it('rejects a stored view replay tail through the checked native path', async () => {
         const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryBatch') {
+                return {
+                    result: {
+                        results: [
+                            { columns: ['sql'], values: [] },
+                            { columns: ['name', 'sql'], values: [] },
+                            { columns: ['name', 'sql'], values: [] }
+                        ]
+                    }
+                };
+            }
             if (call.method === 'runSingle') {
                 return { error: 'Exactly one SQL statement is required' };
             }

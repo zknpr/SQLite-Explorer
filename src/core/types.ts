@@ -26,7 +26,7 @@ export interface CellContentType {
  * Represents any value that can be stored in a SQLite cell.
  * Includes text, integers, floats, binary data, and NULL.
  */
-export type CellValue = string | number | null | Uint8Array;
+export type CellValue = string | number | bigint | null | Uint8Array;
 
 /** Exact decimal text for grid INTEGER cells whose int64 value is unsafe as a JS number. */
 export type ExactIntegerTextMap = Record<number, Record<number, string>>;
@@ -335,8 +335,12 @@ export interface DatabaseOperations {
     expectedTriggers?: readonly ViewTriggerDefinition[]
   ): Promise<ViewEditResult>;
 
-  /** Drop a view and return the definition required to undo the operation. */
-  dropView(view: string): Promise<ViewDefinition>;
+  /** Drop a view and return its undo definition, optionally guarded by a confirmed snapshot. */
+  dropView(
+    view: string,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ): Promise<ViewDefinition>;
 
   /** Update multiple cells in a batch */
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;

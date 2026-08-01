@@ -305,6 +305,12 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             });
             this.#autoSaveIfNeeded();
         } catch (e) {
+            const restoredEntry = tracker.stepForward();
+            if (restoredEntry !== undoneEntry) {
+                GlobalOutputChannel?.appendLine(
+                  '[Undo] Failed to restore tracker position after database undo failed'
+                );
+            }
             const errorMessage = e instanceof Error ? e.message : String(e);
             GlobalOutputChannel?.appendLine(`[Undo] Failed: ${errorMessage}`);
             vsc.window.showErrorMessage(vsc.l10n.t('Undo failed: {0}', errorMessage));
@@ -324,6 +330,12 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             });
             this.#autoSaveIfNeeded();
         } catch (e) {
+             const restoredEntry = tracker.stepBack();
+             if (restoredEntry !== redoneEntry) {
+                 GlobalOutputChannel?.appendLine(
+                   '[Redo] Failed to restore tracker position after database redo failed'
+                 );
+             }
              const errorMessage = e instanceof Error ? e.message : String(e);
              GlobalOutputChannel?.appendLine(`[Redo] Failed: ${errorMessage}`);
              vsc.window.showErrorMessage(vsc.l10n.t('Redo failed: {0}', errorMessage));

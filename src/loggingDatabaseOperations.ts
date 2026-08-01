@@ -246,8 +246,19 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         );
     }
 
-    async dropView(view: string): Promise<ViewDefinition> {
-        return this.logAndDelegate(`DROP VIEW ${escapeIdentifier(view)}`, true, 'dropView', view);
+    async dropView(
+        view: string,
+        expectedSql?: string,
+        expectedTriggers?: readonly ViewTriggerDefinition[]
+    ): Promise<ViewDefinition> {
+        return this.logAndDelegate(
+            `DROP VIEW ${escapeIdentifier(view)}`,
+            true,
+            'dropView',
+            view,
+            expectedSql,
+            expectedTriggers
+        );
     }
 
     async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {

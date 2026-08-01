@@ -17,6 +17,7 @@ import type { DatabaseDocument, DocumentModification } from './databaseModel';
 import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition } from './core/types';
 import { generateMergePatch } from './core/json-utils';
 import { escapeIdentifier } from './core/sql-utils';
+import { isViewDefinitionConflictError } from './core/view-utils';
 
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
@@ -496,33 +497,47 @@ export class HostBridge implements ToastService {
       throw new Error('Document is read-only');
     }
 
-    const current = await dbOps.getViewDefinition(view);
-    const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
-    const confirmationMessage = triggerNames
-      ? vsc.l10n.t(
-          'Drop view "{0}"? This will permanently drop its INSTEAD OF triggers: {1}',
-          view,
-          triggerNames
-        )
-      : vsc.l10n.t('Drop view "{0}"?', view);
-    const answer = await vsc.window.showWarningMessage(
-      confirmationMessage,
-      { modal: true },
-      { title: vsc.l10n.t('Drop View'), value: true },
-      { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
-    );
-    if (!answer?.value) {
-      return { cancelled: true } as const;
-    }
+    while (true) {
+      const current = await dbOps.getViewDefinition(view);
+      const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
+      const confirmationMessage = triggerNames
+        ? vsc.l10n.t(
+            'Drop view "{0}"? This will permanently drop its INSTEAD OF triggers: {1}',
+            view,
+            triggerNames
+          )
+        : vsc.l10n.t('Drop view "{0}"?', view);
+      const answer = await vsc.window.showWarningMessage(
+        confirmationMessage,
+        { modal: true },
+        { title: vsc.l10n.t('Drop View'), value: true },
+        { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
+      );
+      if (!answer?.value) {
+        return { cancelled: true } as const;
+      }
 
-    const definition = await dbOps.dropView(view);
-    this.document.recordExternalModification({
-      label: 'Drop View',
-      description: `Drop view ${view}`,
-      modificationType: 'view_drop',
-      targetTable: view,
-      viewDefBefore: definition
-    });
+      try {
+        const definition = await dbOps.dropView(
+          view,
+          current.sql,
+          current.triggers
+        );
+        this.document.recordExternalModification({
+          label: 'Drop View',
+          description: `Drop view ${view}`,
+          modificationType: 'view_drop',
+          targetTable: view,
+          viewDefBefore: definition
+        });
+        return;
+      } catch (err) {
+        // Re-read and re-confirm so the dialog always names the exact trigger
+        // set guarded by the engine-side compare-and-swap.
+        if (isViewDefinitionConflictError(err)) continue;
+        throw err;
+      }
+    }
   }
 
   /**

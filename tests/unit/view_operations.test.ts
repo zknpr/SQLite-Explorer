@@ -1028,6 +1028,130 @@ describe('view operations', () => {
         }
     });
 
+    it('rejects view-edit undo and redo when only the installed trigger state changed', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.createView('history_trigger_cas', 'SELECT 1 AS value');
+            const edit = await engine.editView(
+                'history_trigger_cas',
+                'SELECT 2 AS value',
+                true
+            );
+            const modification = {
+                description: 'Edit history_trigger_cas',
+                modificationType: 'view_edit' as const,
+                targetTable: 'history_trigger_cas',
+                viewDefBefore: edit.before,
+                viewDefAfter: edit.after
+            };
+
+            await engine.executeQuery(
+                'CREATE TRIGGER history_undo_external ' +
+                'INSTEAD OF INSERT ON history_trigger_cas BEGIN SELECT 1; END'
+            );
+            await assert.rejects(
+                engine.undoModification(modification),
+                /changed outside this editor/i
+            );
+            let current = await engine.getViewDefinition('history_trigger_cas');
+            assert.strictEqual(current.selectSql, 'SELECT 2 AS value');
+            assert.deepStrictEqual(
+                current.triggers.map(trigger => trigger.identifier),
+                ['history_undo_external']
+            );
+
+            await engine.executeQuery('DROP TRIGGER history_undo_external');
+            await engine.undoModification(modification);
+            await engine.executeQuery(
+                'CREATE TRIGGER history_redo_external ' +
+                'INSTEAD OF UPDATE ON history_trigger_cas BEGIN SELECT 2; END'
+            );
+            await assert.rejects(
+                engine.redoModification(modification),
+                /changed outside this editor/i
+            );
+            current = await engine.getViewDefinition('history_trigger_cas');
+            assert.strictEqual(current.selectSql, 'SELECT 1 AS value');
+            assert.deepStrictEqual(
+                current.triggers.map(trigger => trigger.identifier),
+                ['history_redo_external']
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('rejects view create/drop history replay when the expected absent state changed', async () => {
+        const engine = await createEngine();
+        try {
+            const created = await engine.createView('history_create_cas', 'SELECT 1 AS value');
+            const createModification = {
+                description: 'Create history_create_cas',
+                modificationType: 'view_create' as const,
+                targetTable: 'history_create_cas',
+                viewDefAfter: created
+            };
+            await engine.executeQuery(
+                'DROP VIEW main.history_create_cas; ' +
+                'CREATE VIEW history_create_cas AS SELECT 9 AS value'
+            );
+            await assert.rejects(
+                engine.undoModification(createModification),
+                /changed outside this editor/i
+            );
+            assert.strictEqual(await readScalar(engine, 'SELECT value FROM history_create_cas'), 9);
+
+            await engine.createView('history_drop_cas', 'SELECT 3 AS value');
+            const dropped = await engine.dropView('history_drop_cas');
+            const dropModification = {
+                description: 'Drop history_drop_cas',
+                modificationType: 'view_drop' as const,
+                targetTable: 'history_drop_cas',
+                viewDefBefore: dropped
+            };
+            await engine.executeQuery('CREATE VIEW history_drop_cas AS SELECT 8 AS value');
+            await assert.rejects(
+                engine.undoModification(dropModification),
+                /changed outside this editor/i
+            );
+            assert.strictEqual(await readScalar(engine, 'SELECT value FROM history_drop_cas'), 8);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('rejects a drop whose confirmed trigger snapshot became stale', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.createView('drop_trigger_cas', 'SELECT 1 AS value');
+            await engine.executeQuery(
+                'CREATE TRIGGER drop_trigger_first ' +
+                'INSTEAD OF INSERT ON drop_trigger_cas BEGIN SELECT 1; END'
+            );
+            const confirmed = await engine.getViewDefinition('drop_trigger_cas');
+            await engine.executeQuery(
+                'CREATE TRIGGER drop_trigger_second ' +
+                'INSTEAD OF UPDATE ON drop_trigger_cas BEGIN SELECT 2; END'
+            );
+
+            await assert.rejects(
+                engine.dropView(
+                    'drop_trigger_cas',
+                    confirmed.sql,
+                    confirmed.triggers
+                ),
+                /changed outside this editor/i
+            );
+            const current = await engine.getViewDefinition('drop_trigger_cas');
+            assert.deepStrictEqual(
+                current.triggers.map(trigger => trigger.identifier),
+                ['drop_trigger_first', 'drop_trigger_second']
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('requires an explicit warning confirmation before an edit can discard triggers', async () => {
         const before = createViewDefinition({
             triggers: [{
@@ -1165,6 +1289,11 @@ describe('view operations', () => {
         assert.strictEqual(getViewDefinition.mock.callCount(), 1);
         assert.deepStrictEqual(getViewDefinition.mock.calls[0].arguments, ['active_users']);
         assert.strictEqual(dropView.mock.callCount(), 1);
+        assert.deepStrictEqual(dropView.mock.calls[0].arguments, [
+            'active_users',
+            before.sql,
+            before.triggers
+        ]);
         assert.deepStrictEqual(recordExternalModification.mock.calls[0].arguments[0], {
             label: 'Drop View',
             description: 'Drop view active_users',
@@ -1190,5 +1319,71 @@ describe('view operations', () => {
         assert.strictEqual(getViewDefinition.mock.callCount(), 1);
         assert.strictEqual(dropView.mock.callCount(), 0);
         assert.strictEqual(recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('re-confirms a drop when the view trigger snapshot changes during the dialog', async () => {
+        const first = createViewDefinition({
+            triggers: [{
+                identifier: 'active_users_insert',
+                sql: 'CREATE TRIGGER active_users_insert INSTEAD OF INSERT ON active_users BEGIN SELECT 1; END'
+            }]
+        });
+        const latest = createViewDefinition({
+            sql: 'CREATE VIEW "active_users" AS SELECT id, name, active FROM users',
+            selectSql: 'SELECT id, name, active FROM users',
+            triggers: [
+                ...first.triggers,
+                {
+                    identifier: 'active_users_update',
+                    sql: 'CREATE TRIGGER active_users_update INSTEAD OF UPDATE ON active_users BEGIN SELECT 2; END'
+                }
+            ]
+        });
+        let definitionReads = 0;
+        const getViewDefinition = mock.fn(async () => (
+            definitionReads++ === 0 ? first : latest
+        ));
+        let dropAttempts = 0;
+        const dropView = mock.fn(async () => {
+            if (dropAttempts++ === 0) {
+                throw new Error(
+                    'The view changed outside this editor. Reload before saving; the view was not modified.'
+                );
+            }
+            return latest;
+        });
+        const { bridge, recordExternalModification } = createHostBridge({
+            getViewDefinition,
+            dropView
+        });
+        mock.method(vscode.l10n, 't', (message: string, ...args: unknown[]) => {
+            let localized = message;
+            args.forEach((arg, index) => {
+                localized = localized.replace(`{${index}}`, String(arg));
+            });
+            return localized;
+        });
+        const warning = mock.method(
+            vscode.window,
+            'showWarningMessage',
+            async (...args: any[]) => args[2]
+        );
+
+        await bridge.dropView('active_users');
+
+        assert.strictEqual(warning.mock.callCount(), 2);
+        assert.match(String(warning.mock.calls[0].arguments[0]), /active_users_insert/);
+        assert.doesNotMatch(String(warning.mock.calls[0].arguments[0]), /active_users_update/);
+        assert.match(String(warning.mock.calls[1].arguments[0]), /active_users_insert/);
+        assert.match(String(warning.mock.calls[1].arguments[0]), /active_users_update/);
+        assert.deepStrictEqual(dropView.mock.calls.map(call => call.arguments), [
+            ['active_users', first.sql, first.triggers],
+            ['active_users', latest.sql, latest.triggers]
+        ]);
+        assert.strictEqual(recordExternalModification.mock.callCount(), 1);
+        assert.strictEqual(
+            recordExternalModification.mock.calls[0].arguments[0].viewDefBefore,
+            latest
+        );
     });
 });

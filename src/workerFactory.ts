@@ -111,7 +111,11 @@ interface WorkerMethods {
     expectedSql?: string,
     expectedTriggers?: readonly ViewTriggerDefinition[]
   ): Promise<ViewEditResult>;
-  dropView(view: string): Promise<ViewDefinition>;
+  dropView(
+    view: string,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ): Promise<ViewDefinition>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
@@ -431,8 +435,11 @@ async function createInProcessWasmDatabaseConnection(
           expectedSql,
           expectedTriggers
         ),
-        dropView: (view: string) =>
-          endpoint.dropView(view),
+        dropView: (
+          view: string,
+          expectedSql?: string,
+          expectedTriggers?: readonly ViewTriggerDefinition[]
+        ) => endpoint.dropView(view, expectedSql, expectedTriggers),
         updateCellBatch: (table: string, updates: CellUpdate[]) =>
           endpoint.updateCellBatch(table, updates),
         addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
@@ -671,8 +678,11 @@ async function createWorkerBackedWasmDatabaseConnection(
             expectedSql,
             expectedTriggers
           ),
-          dropView: (view: string) =>
-            workerProxy.dropView(view),
+          dropView: (
+            view: string,
+            expectedSql?: string,
+            expectedTriggers?: readonly ViewTriggerDefinition[]
+          ) => workerProxy.dropView(view, expectedSql, expectedTriggers),
           updateCellBatch: (table: string, updates: CellUpdate[]) => {
             // Wrap any Uint8Array values in updates for zero-copy transfer
             const wrappedUpdates = updates.map(u => ({

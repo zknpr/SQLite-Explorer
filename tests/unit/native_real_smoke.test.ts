@@ -528,6 +528,81 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             );
         });
 
+        await testContext.test('rejects stale native view-history undo and redo replay', async () => {
+            await engine.createView('native_history_cas', 'SELECT 1 AS value');
+            const edit = await engine.editView(
+                'native_history_cas',
+                'SELECT 2 AS value',
+                true
+            );
+            const modification = {
+                description: 'Edit native_history_cas',
+                modificationType: 'view_edit' as const,
+                targetTable: 'native_history_cas',
+                viewDefBefore: edit.before,
+                viewDefAfter: edit.after
+            };
+
+            await engine.executeQuery(
+                'CREATE TRIGGER native_history_undo_external ' +
+                'INSTEAD OF INSERT ON native_history_cas BEGIN SELECT 1; END'
+            );
+            await assert.rejects(
+                engine.undoModification(modification),
+                /changed outside this editor/i
+            );
+            let current = await engine.getViewDefinition('native_history_cas');
+            assert.strictEqual(current.selectSql, 'SELECT 2 AS value');
+            assert.deepStrictEqual(
+                current.triggers.map(trigger => trigger.identifier),
+                ['native_history_undo_external']
+            );
+
+            await engine.executeQuery('DROP TRIGGER native_history_undo_external');
+            await engine.undoModification(modification);
+            await engine.executeQuery(
+                'CREATE TRIGGER native_history_redo_external ' +
+                'INSTEAD OF UPDATE ON native_history_cas BEGIN SELECT 2; END'
+            );
+            await assert.rejects(
+                engine.redoModification(modification),
+                /changed outside this editor/i
+            );
+            current = await engine.getViewDefinition('native_history_cas');
+            assert.strictEqual(current.selectSql, 'SELECT 1 AS value');
+            assert.deepStrictEqual(
+                current.triggers.map(trigger => trigger.identifier),
+                ['native_history_redo_external']
+            );
+        });
+
+        await testContext.test('rejects a native drop whose confirmed triggers became stale', async () => {
+            await engine.createView('native_drop_cas', 'SELECT 1 AS value');
+            await engine.executeQuery(
+                'CREATE TRIGGER native_drop_first ' +
+                'INSTEAD OF INSERT ON native_drop_cas BEGIN SELECT 1; END'
+            );
+            const confirmed = await engine.getViewDefinition('native_drop_cas');
+            await engine.executeQuery(
+                'CREATE TRIGGER native_drop_second ' +
+                'INSTEAD OF UPDATE ON native_drop_cas BEGIN SELECT 2; END'
+            );
+
+            await assert.rejects(
+                engine.dropView(
+                    'native_drop_cas',
+                    confirmed.sql,
+                    confirmed.triggers
+                ),
+                /changed outside this editor/i
+            );
+            const current = await engine.getViewDefinition('native_drop_cas');
+            assert.deepStrictEqual(
+                current.triggers.map(trigger => trigger.identifier),
+                ['native_drop_first', 'native_drop_second']
+            );
+        });
+
         await testContext.test('preserves TEMP view triggers through native edit and history replay', async () => {
             await engine.executeQuery('CREATE TABLE native_temp_trigger_rows (value INTEGER)');
             await engine.executeQuery('CREATE TABLE native_temp_trigger_log (value INTEGER)');

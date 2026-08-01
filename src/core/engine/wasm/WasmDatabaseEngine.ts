@@ -34,6 +34,7 @@ import { normalizeIntegerRowsForTransport } from '../../integer-utils';
 import { getNodeFs } from '../../platform/fs';
 import {
   assertViewDefinitionSnapshotCurrent,
+  assertViewDefinitionStateCurrent,
   assertViewDefinitionIntent,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
@@ -389,13 +390,30 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         break;
 
       case 'view_create':
-        await this.dropViewIfExists(targetTable);
+        if (mod.viewDefAfter) {
+          await this.applyViewHistoryState(targetTable, mod.viewDefAfter, null);
+        } else {
+          this.logger(
+            'warn',
+            '[WasmDatabaseEngine] Skipping view undo: definition missing from history entry'
+          );
+        }
         break;
 
       case 'view_edit':
+        if (mod.viewDefBefore && mod.viewDefAfter) {
+          await this.applyViewHistoryState(targetTable, mod.viewDefAfter, mod.viewDefBefore);
+        } else {
+          this.logger(
+            'warn',
+            '[WasmDatabaseEngine] Skipping view undo: definition missing from history entry'
+          );
+        }
+        break;
+
       case 'view_drop':
         if (mod.viewDefBefore) {
-          await this.restoreViewDefinition(mod.viewDefBefore);
+          await this.applyViewHistoryState(targetTable, null, mod.viewDefBefore);
         } else {
           this.logger(
             'warn',
@@ -652,16 +670,46 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             break;
 
         case 'view_create':
-        case 'view_edit':
             if (mod.viewDefAfter) {
-                await this.restoreViewDefinition(mod.viewDefAfter);
+                await this.applyViewHistoryState(targetTable, null, mod.viewDefAfter);
             } else if (strict) {
-                throw new Error(`Cannot apply ${modificationType}: missing view definition`);
+                throw new Error('Cannot apply view_create: missing view definition');
+            } else {
+                this.logger(
+                  'warn',
+                  '[WasmDatabaseEngine] Skipping view redo: definition missing from history entry'
+                );
+            }
+            break;
+
+        case 'view_edit':
+            if (mod.viewDefBefore && mod.viewDefAfter) {
+                await this.applyViewHistoryState(
+                  targetTable,
+                  mod.viewDefBefore,
+                  mod.viewDefAfter
+                );
+            } else if (strict) {
+                throw new Error('Cannot apply view_edit: missing view definition');
+            } else {
+                this.logger(
+                  'warn',
+                  '[WasmDatabaseEngine] Skipping view redo: definition missing from history entry'
+                );
             }
             break;
 
         case 'view_drop':
-            await this.dropViewIfExists(targetTable);
+            if (mod.viewDefBefore) {
+                await this.applyViewHistoryState(targetTable, mod.viewDefBefore, null);
+            } else if (strict) {
+                throw new Error('Cannot apply view_drop: missing view definition');
+            } else {
+                this.logger(
+                  'warn',
+                  '[WasmDatabaseEngine] Skipping view redo: definition missing from history entry'
+                );
+            }
             break;
 
         default:
@@ -960,14 +1008,17 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /** Read a view and every INSTEAD OF trigger SQLite associates with it. */
-  private async readViewDefinition(view: string, allowUnparsed: boolean): Promise<ViewDefinition> {
+  private async findViewDefinition(
+    view: string,
+    allowUnparsed: boolean
+  ): Promise<ViewDefinition | null> {
     const viewResult = await this.executeQuery(
       "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
       [view]
     );
     const createSql = viewResult[0]?.rows[0]?.[0];
     if (typeof createSql !== 'string') {
-      throw new Error(`View not found: ${view}`);
+      return null;
     }
 
     const triggerRows: CellValue[][][] = [];
@@ -995,6 +1046,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       columnListSql,
       triggers
     };
+  }
+
+  private async readViewDefinition(view: string, allowUnparsed: boolean): Promise<ViewDefinition> {
+    const definition = await this.findViewDefinition(view, allowUnparsed);
+    if (!definition) throw new Error(`View not found: ${view}`);
+    return definition;
   }
 
   async getViewDefinition(view: string): Promise<ViewDefinition> {
@@ -1154,11 +1211,21 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
-  async dropView(view: string): Promise<ViewDefinition> {
+  async dropView(
+    view: string,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ): Promise<ViewDefinition> {
     const savepointName = this.createSavepointName('sp_drop_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const before = await this.readViewDefinition(view, true);
+      assertViewDefinitionSnapshotCurrent(
+        expectedSql,
+        before.sql,
+        expectedTriggers,
+        before.triggers
+      );
       this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
       await this.executeQuery(`RELEASE ${savepointName}`);
       return before;
@@ -1168,22 +1235,28 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
-  private async dropViewIfExists(view: string): Promise<void> {
-    this.runSingleStatement(`DROP VIEW IF EXISTS ${escapeMainViewIdentifier(view)}`);
-  }
-
-  /** Restore an exact tracked view state for undo, redo, and hot-exit replay. */
-  private async restoreViewDefinition(definition: ViewDefinition): Promise<void> {
+  /** Atomically apply one tracked view-state transition for undo, redo, or hot exit. */
+  private async applyViewHistoryState(
+    view: string,
+    expectedCurrent: ViewDefinition | null,
+    replacement: ViewDefinition | null
+  ): Promise<void> {
     const savepointName = this.createSavepointName('sp_restore_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
-      await this.dropViewIfExists(definition.identifier);
-      this.runSingleStatement(definition.sql);
-      this.compileSingleStatement(
-        `EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(definition.identifier)}`
-      );
-      for (const trigger of definition.triggers) {
-        this.runSingleStatement(buildCreateViewTriggerSql(trigger));
+      const current = await this.findViewDefinition(view, true);
+      assertViewDefinitionStateCurrent(expectedCurrent, current);
+      if (current) {
+        this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+      }
+      if (replacement) {
+        this.runSingleStatement(replacement.sql);
+        this.compileSingleStatement(
+          `EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(replacement.identifier)}`
+        );
+        for (const trigger of replacement.triggers) {
+          this.runSingleStatement(buildCreateViewTriggerSql(trigger));
+        }
       }
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (err) {

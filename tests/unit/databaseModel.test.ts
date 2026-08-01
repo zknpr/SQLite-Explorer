@@ -1102,7 +1102,11 @@ describe('DatabaseDocument hot-exit restore', () => {
             readOnlyMode: false
         });
         const engine = result.operations as DatabaseOperations & { shutdown?: () => void };
-        await engine.executeQuery("CREATE TABLE restored_items (id INTEGER PRIMARY KEY, name TEXT)");
+        await engine.executeQuery(
+            "CREATE TABLE restored_items (id INTEGER PRIMARY KEY, name TEXT, counter INTEGER)"
+        );
+        const unsafePriorValue = BigInt('9007199254740993');
+        const unsafeNewValue = BigInt('9007199254740995');
 
         const restoredEntries: LabeledModification[] = [
             {
@@ -1111,7 +1115,7 @@ describe('DatabaseDocument hot-exit restore', () => {
                 modificationType: 'row_insert',
                 targetTable: 'restored_items',
                 targetRowId: 1,
-                rowData: { id: 1, name: 'Draft' }
+                rowData: { id: 1, name: 'Draft', counter: unsafePriorValue }
             },
             {
                 label: 'Update Restored Item',
@@ -1122,6 +1126,16 @@ describe('DatabaseDocument hot-exit restore', () => {
                 targetColumn: 'name',
                 priorValue: 'Draft',
                 newValue: 'Recovered'
+            },
+            {
+                label: 'Update unsafe INTEGER',
+                description: 'Update restored unsafe INTEGER exactly',
+                modificationType: 'cell_update',
+                targetTable: 'restored_items',
+                targetRowId: 1,
+                targetColumn: 'counter',
+                priorValue: unsafePriorValue,
+                newValue: unsafeNewValue
             }
         ];
         const tracker = new ModificationTracker<LabeledModification>(100);
@@ -1187,12 +1201,12 @@ describe('DatabaseDocument hot-exit restore', () => {
             );
 
             const restoredRows = await engine.executeQuery(
-                "SELECT id, name FROM restored_items ORDER BY id"
+                "SELECT id, name, CAST(counter AS TEXT) FROM restored_items ORDER BY id"
             );
 
             assert.strictEqual(applyWasCalled, true);
-            assert.strictEqual(appliedModificationCount, 2);
-            assert.deepStrictEqual(restoredRows[0].rows, [[1, 'Recovered']]);
+            assert.strictEqual(appliedModificationCount, 3);
+            assert.deepStrictEqual(restoredRows[0].rows, [[1, 'Recovered', '9007199254740995']]);
         } finally {
             Object.defineProperty(mockVscode.workspace, 'fs', {
                 value: originalFs,
@@ -1363,6 +1377,7 @@ describe('DatabaseDocument undo/redo error handling', () => {
 
     it('should show error message when undoModification fails', async () => {
         let errorMessageShown = false;
+        let undoAttempts = 0;
         mockVscode.window.showErrorMessage = async (msg?: string) => {
             if (msg?.includes('Test Undo Error')) {
                 errorMessageShown = true;
@@ -1379,12 +1394,18 @@ describe('DatabaseDocument undo/redo error handling', () => {
         // Mock database operations to throw error on undo
         const dbOps = doc.databaseOperations;
         if(dbOps) {
-            dbOps.undoModification = () => Promise.reject(new Error("Test Undo Error"));
+            dbOps.undoModification = () => {
+                undoAttempts++;
+                return Promise.reject(new Error("Test Undo Error"));
+            };
         } else {
              // force override via any
              (doc as any).connectionState = {
                 databaseOps: {
-                    undoModification: () => Promise.reject(new Error("Test Undo Error")),
+                    undoModification: () => {
+                        undoAttempts++;
+                        return Promise.reject(new Error("Test Undo Error"));
+                    },
                     redoModification: () => Promise.resolve()
                 }
              };
@@ -1405,12 +1426,15 @@ describe('DatabaseDocument undo/redo error handling', () => {
         assert.ok(undoAction, 'Undo action should be emitted');
 
         await undoAction();
+        await undoAction();
 
         assert.strictEqual(errorMessageShown, true, 'Error message should be shown for failed undo');
+        assert.strictEqual(undoAttempts, 2, 'A failed undo must remain available for retry');
     });
 
     it('should show error message when redoModification fails', async () => {
         let errorMessageShown = false;
+        let redoAttempts = 0;
         mockVscode.window.showErrorMessage = async (msg?: string) => {
             if (msg?.includes('Test Redo Error')) {
                 errorMessageShown = true;
@@ -1424,12 +1448,18 @@ describe('DatabaseDocument undo/redo error handling', () => {
         // Mock database operations to throw error on redo
         const dbOps = doc.databaseOperations;
         if(dbOps) {
-             dbOps.redoModification = () => Promise.reject(new Error("Test Redo Error"));
+             dbOps.redoModification = () => {
+                 redoAttempts++;
+                 return Promise.reject(new Error("Test Redo Error"));
+             };
         } else {
             (doc as any).connectionState = {
                 databaseOps: {
                     undoModification: () => Promise.resolve(),
-                    redoModification: () => Promise.reject(new Error("Test Redo Error"))
+                    redoModification: () => {
+                        redoAttempts++;
+                        return Promise.reject(new Error("Test Redo Error"));
+                    }
                 }
              };
         }
@@ -1452,7 +1482,9 @@ describe('DatabaseDocument undo/redo error handling', () => {
 
         await undoAction!();
         await redoAction();
+        await redoAction();
 
         assert.strictEqual(errorMessageShown, true, 'Error message should be shown for failed redo');
+        assert.strictEqual(redoAttempts, 2, 'A failed redo must remain available for retry');
     });
 });

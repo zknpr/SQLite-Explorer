@@ -48,6 +48,7 @@ import { serializeOperations } from './core/operation-serializer';
 import { InvocationTimeoutError } from './core/rpc';
 import {
   assertViewDefinitionSnapshotCurrent,
+  assertViewDefinitionStateCurrent,
   assertViewDefinitionIntent,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
@@ -550,10 +551,10 @@ export async function createNativeDatabaseConnection(
         }
       };
 
-      const getNativeViewDefinition = async (
+      const findNativeViewDefinition = async (
         view: string,
         allowUnparsed: boolean = false
-      ): Promise<ViewDefinition> => {
+      ): Promise<ViewDefinition | null> => {
         const metadataQueries = [
           {
             sql: "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
@@ -572,7 +573,7 @@ export async function createNativeDatabaseConnection(
         const viewResult = metadata.results[0];
         const createSql = viewResult.values?.[0]?.[0];
         if (typeof createSql !== 'string') {
-          throw new Error(`View not found: ${view}`);
+          return null;
         }
 
         const triggers = mapViewTriggerRows(
@@ -598,6 +599,15 @@ export async function createNativeDatabaseConnection(
           columnListSql,
           triggers
         };
+      };
+
+      const getNativeViewDefinition = async (
+        view: string,
+        allowUnparsed: boolean = false
+      ): Promise<ViewDefinition> => {
+        const definition = await findNativeViewDefinition(view, allowUnparsed);
+        if (!definition) throw new Error(`View not found: ${view}`);
+        return definition;
       };
 
       /** Resolve one canonical installed-view snapshot for intent checks and column preservation. */
@@ -656,15 +666,25 @@ export async function createNativeDatabaseConnection(
         );
       };
 
-      const restoreNativeViewDefinition = async (definition: ViewDefinition): Promise<void> => {
+      const applyNativeViewHistoryState = async (
+        view: string,
+        expectedCurrent: ViewDefinition | null,
+        replacement: ViewDefinition | null
+      ): Promise<void> => {
         const savepointName = createSavepointName('sp_restore_view');
         await worker.call('run', [`SAVEPOINT ${savepointName}`]);
         try {
-          await worker.call('run', [`DROP VIEW IF EXISTS ${escapeMainViewIdentifier(definition.identifier)}`]);
-          await runNativeSingleStatement(definition.sql);
-          await compileNativeView(definition.identifier);
-          for (const trigger of definition.triggers) {
-            await runNativeSingleStatement(buildCreateViewTriggerSql(trigger));
+          const current = await findNativeViewDefinition(view, true);
+          assertViewDefinitionStateCurrent(expectedCurrent, current);
+          if (current) {
+            await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
+          }
+          if (replacement) {
+            await runNativeSingleStatement(replacement.sql);
+            await compileNativeView(replacement.identifier);
+            for (const trigger of replacement.triggers) {
+              await runNativeSingleStatement(buildCreateViewTriggerSql(trigger));
+            }
           }
           await worker.call('run', [`RELEASE ${savepointName}`]);
         } catch (err) {
@@ -835,13 +855,28 @@ export async function createNativeDatabaseConnection(
                 break;
 
             case 'view_create':
-                await worker.call('run', [`DROP VIEW IF EXISTS ${escapeMainViewIdentifier(targetTable)}`]);
+                if (mod.viewDefAfter) {
+                  await applyNativeViewHistoryState(targetTable, mod.viewDefAfter, null);
+                } else {
+                  outputChannel?.appendLine('[NativeWorker] Skipping view undo: definition missing from history entry');
+                }
                 break;
 
             case 'view_edit':
+                if (mod.viewDefBefore && mod.viewDefAfter) {
+                  await applyNativeViewHistoryState(
+                    targetTable,
+                    mod.viewDefAfter,
+                    mod.viewDefBefore
+                  );
+                } else {
+                  outputChannel?.appendLine('[NativeWorker] Skipping view undo: definition missing from history entry');
+                }
+                break;
+
             case 'view_drop':
                 if (mod.viewDefBefore) {
-                  await restoreNativeViewDefinition(mod.viewDefBefore);
+                  await applyNativeViewHistoryState(targetTable, null, mod.viewDefBefore);
                 } else {
                   outputChannel?.appendLine('[NativeWorker] Skipping view undo: definition missing from history entry');
                 }
@@ -915,16 +950,31 @@ export async function createNativeDatabaseConnection(
               break;
 
             case 'view_create':
-            case 'view_edit':
               if (mod.viewDefAfter) {
-                await restoreNativeViewDefinition(mod.viewDefAfter);
+                await applyNativeViewHistoryState(targetTable, null, mod.viewDefAfter);
+              } else {
+                outputChannel?.appendLine('[NativeWorker] Skipping view redo: definition missing from history entry');
+              }
+              break;
+
+            case 'view_edit':
+              if (mod.viewDefBefore && mod.viewDefAfter) {
+                await applyNativeViewHistoryState(
+                  targetTable,
+                  mod.viewDefBefore,
+                  mod.viewDefAfter
+                );
               } else {
                 outputChannel?.appendLine('[NativeWorker] Skipping view redo: definition missing from history entry');
               }
               break;
 
             case 'view_drop':
-              await worker.call('run', [`DROP VIEW IF EXISTS ${escapeMainViewIdentifier(targetTable)}`]);
+              if (mod.viewDefBefore) {
+                await applyNativeViewHistoryState(targetTable, mod.viewDefBefore, null);
+              } else {
+                outputChannel?.appendLine('[NativeWorker] Skipping view redo: definition missing from history entry');
+              }
               break;
           }
         },
@@ -1278,11 +1328,21 @@ export async function createNativeDatabaseConnection(
           }
         },
 
-        dropView: async (view: string): Promise<ViewDefinition> => {
+        dropView: async (
+          view: string,
+          expectedSql?: string,
+          expectedTriggers?: readonly ViewTriggerDefinition[]
+        ): Promise<ViewDefinition> => {
           const savepointName = createSavepointName('sp_drop_view');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
             const before = await getNativeViewDefinition(view, true);
+            assertViewDefinitionSnapshotCurrent(
+              expectedSql,
+              before.sql,
+              expectedTriggers,
+              before.triggers
+            );
             await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
             await worker.call('run', [`RELEASE ${savepointName}`]);
             return before;

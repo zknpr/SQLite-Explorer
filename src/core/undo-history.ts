@@ -8,18 +8,21 @@
 import type { LabeledModification } from './types';
 
 // ============================================================================
-// JSON Serialization Helpers for Binary Data
+// JSON Serialization Helpers for Non-JSON Cell Values
 // ============================================================================
 
 /**
- * JSON replacer function that handles Uint8Array serialization.
- * Converts Uint8Array to a special object format that can be restored.
+ * JSON replacer function that handles Uint8Array and BigInt serialization.
+ * Converts non-JSON cell values to marker objects that can be restored.
  *
  * IMPORTANT: Standard JSON.stringify corrupts Uint8Array by converting it
  * to an object like {"0": 1, "1": 2, ...} which loses the type information.
  * This replacer preserves the binary data as base64.
  */
 function binaryReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === 'bigint') {
+    return { __type: 'BigInt', text: value.toString() };
+  }
   if (value instanceof Uint8Array) {
     // Convert to base64 with a type marker for restoration
     // Use Buffer in Node.js environment for efficiency
@@ -37,13 +40,29 @@ function binaryReplacer(_key: string, value: unknown): unknown {
  */
 function binaryReviver(_key: string, value: unknown): unknown {
   if (value && typeof value === 'object' && '__type' in value) {
-    const typed = value as { __type: string; data: string };
-    if (typed.__type === 'Uint8Array' && typeof typed.data === 'string') {
+    const typed = value as { __type: string; data?: unknown; text?: unknown };
+    const keys = Object.keys(value);
+    if (
+      typed.__type === 'BigInt' &&
+      typeof typed.text === 'string' &&
+      keys.length === 2 &&
+      keys.includes('__type') &&
+      keys.includes('text')
+    ) {
+      return BigInt(typed.text);
+    }
+    if (
+      typed.__type === 'Uint8Array' &&
+      typeof typed.data === 'string' &&
+      keys.length === 2 &&
+      keys.includes('__type') &&
+      keys.includes('data')
+    ) {
       // Restore from base64
       if (typeof Buffer !== 'undefined') {
-        return new Uint8Array(Buffer.from(typed.data, 'base64'));
+        return new Uint8Array(Buffer.from(typed.data as string, 'base64'));
       } else {
-        const binary = atob(typed.data);
+        const binary = atob(typed.data as string);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) {
           bytes[i] = binary.charCodeAt(i);
@@ -75,7 +94,7 @@ function calculateSize(value: unknown): number {
 
     if (typeof current === 'boolean') {
       size += 4;
-    } else if (typeof current === 'number') {
+    } else if (typeof current === 'number' || typeof current === 'bigint') {
       size += 8;
     } else if (typeof current === 'string') {
       size += current.length * 2;
@@ -472,7 +491,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
 
   /**
    * Serialize tracker state for backup.
-   * Uses custom JSON replacer to properly handle Uint8Array binary data.
+   * Uses a custom JSON replacer for Uint8Array and BigInt cell values.
    *
    * @returns Binary representation of state
    */
@@ -483,14 +502,14 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
       futureStack: this.futureStack,
       revertOnRestore: this.revertOnRestore
     };
-    // Use binaryReplacer to properly serialize Uint8Array values
+    // Preserve every non-JSON SQLite value used by undo and hot-exit replay.
     const jsonStr = JSON.stringify(payload, binaryReplacer);
     return new TextEncoder().encode(jsonStr);
   }
 
   /**
    * Restore tracker from serialized state.
-   * Uses custom JSON reviver to properly restore Uint8Array binary data.
+   * Uses a custom JSON reviver to restore Uint8Array and BigInt cell values.
    *
    * @param data - Previously serialized state
    * @param maxEntries - Maximum capacity
@@ -503,7 +522,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     maxMemory?: number
   ): ModificationTracker<T> {
     const jsonStr = new TextDecoder().decode(data);
-    // Use binaryReviver to properly restore Uint8Array values
+    // Restore marker values before rebuilding tracker memory accounting.
     const payload = JSON.parse(jsonStr, binaryReviver);
 
     const tracker = new ModificationTracker<T>(maxEntries, maxMemory);

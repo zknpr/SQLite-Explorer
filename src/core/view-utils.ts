@@ -1,5 +1,10 @@
 import { escapeIdentifier } from './sql-utils';
-import type { CellValue, ViewDefinitionIntent, ViewTriggerDefinition } from './types';
+import type {
+  CellValue,
+  ViewDefinition,
+  ViewDefinitionIntent,
+  ViewTriggerDefinition
+} from './types';
 
 /** Canonical trigger sources, ordered by the schema in which they are replayed. */
 export const VIEW_TRIGGER_SCHEMA_QUERIES = [
@@ -298,8 +303,8 @@ export const VIEW_DEFINITION_CONFLICT_MESSAGE =
 
 /**
  * Enforce an optional compare-and-swap precondition for a stored CREATE VIEW.
- * Undefined means the caller did not load a snapshot (undo/redo and legacy RPC
- * callers); editor saves always supply the exact sqlite_schema.sql value.
+ * Undefined means a legacy caller did not load a snapshot. Editor saves and
+ * history replay supply the exact sqlite_schema.sql value and trigger set.
  */
 export function assertViewDefinitionSnapshotCurrent(
   expectedSql: string | undefined,
@@ -311,6 +316,23 @@ export function assertViewDefinitionSnapshotCurrent(
       || !isViewTriggerSnapshotCurrent(expectedTriggers, currentTriggers)) {
     throw new Error(VIEW_DEFINITION_CONFLICT_MESSAGE);
   }
+}
+
+/** Compare a complete installed view state, including the meaningful absence state. */
+export function assertViewDefinitionStateCurrent(
+  expected: ViewDefinition | null,
+  current: ViewDefinition | null
+): void {
+  if (expected === null || current === null) {
+    if (expected !== current) throw new Error(VIEW_DEFINITION_CONFLICT_MESSAGE);
+    return;
+  }
+  assertViewDefinitionSnapshotCurrent(
+    expected.sql,
+    current.sql,
+    expected.triggers,
+    current.triggers
+  );
 }
 
 /** Recognize the stable conflict after it crosses worker/webview RPC boundaries. */

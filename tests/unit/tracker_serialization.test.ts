@@ -79,6 +79,34 @@ describe('ModificationTracker Serialization', () => {
         assert.deepStrictEqual(restoredNewValue, new Uint8Array([10, 20, 30]));
     });
 
+    it('backs up and restores unsafe native INTEGER history values exactly', () => {
+        const tracker = new ModificationTracker<LabeledModification>();
+        const priorValue = BigInt('9007199254740993');
+        const newValue = BigInt('9007199254740995');
+        tracker.record({
+            label: 'Unsafe INTEGER update',
+            description: 'Update counters.value',
+            modificationType: 'cell_update',
+            targetTable: 'counters',
+            targetRowId: 1,
+            targetColumn: 'value',
+            priorValue,
+            newValue
+        });
+
+        const serialized = tracker.serialize();
+        const backupJson = new TextDecoder().decode(serialized);
+        assert.match(
+            backupJson,
+            /"priorValue":\{"__type":"BigInt","text":"9007199254740993"\}/
+        );
+
+        const restored = ModificationTracker.deserialize<LabeledModification>(serialized);
+        const restoredModification = restored.stepBack();
+        assert.strictEqual(restoredModification?.priorValue, priorValue);
+        assert.strictEqual(restoredModification?.newValue, newValue);
+    });
+
     it('should preserve checkpoint index', async () => {
         const tracker = new ModificationTracker<LabeledModification>();
         tracker.record({

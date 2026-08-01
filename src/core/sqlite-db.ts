@@ -277,8 +277,12 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       );
     },
 
-    async dropView(view: string) {
-      return requireEngine().dropView(view);
+    async dropView(
+      view: string,
+      expectedSql?: string,
+      expectedTriggers?: readonly ViewTriggerDefinition[]
+    ) {
+      return requireEngine().dropView(view, expectedSql, expectedTriggers);
     },
 
     async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
