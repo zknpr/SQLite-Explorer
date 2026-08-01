@@ -592,11 +592,17 @@ async function createWorkerBackedWasmDatabaseConnection(
         );
 
         // Create operations facade that routes to worker
-        // Helper: Wrap Uint8Array values in Transfer for zero-copy transfer to worker
-        // This significantly improves performance for blob operations by avoiding buffer copying
+        // Transfer a private copy. postMessage detaches transfer-list buffers, while
+        // HostBridge retains the caller-owned value for undo/redo and hot-exit.
+        // Copying once here preserves that history and keeps the worker crossing
+        // itself zero-copy.
         const wrapForTransfer = (value: CellValue): CellValue => {
           if (value instanceof Uint8Array && value.buffer) {
-            return new Transfer(value, [value.buffer]) as unknown as CellValue;
+            const transferableValue = value.slice();
+            return new Transfer(
+              transferableValue,
+              [transferableValue.buffer]
+            ) as unknown as CellValue;
           }
           return value;
         };
@@ -628,12 +634,12 @@ async function createWorkerBackedWasmDatabaseConnection(
             callWorkerAfterAbortCheck(signal, () => workerProxy.flushChanges()),
           discardModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
             callWorkerAfterAbortCheck(signal, () => workerProxy.discardModifications(mods)),
-          // Preserve JSON merge patches through worker RPC while still
-          // transferring Uint8Array cell values without copying.
+          // Preserve JSON merge patches through worker RPC while transferring
+          // a private Uint8Array copy (the host may retain the original in history).
           updateCell: (table: string, rowId: string | number, column: string, value: CellValue, patch?: string) =>
             workerProxy.updateCell(table, rowId, column, wrapForTransfer(value), patch),
           insertRow: (table: string, data: Record<string, CellValue>) => {
-            // Wrap any Uint8Array values in the data object for zero-copy transfer
+            // Retain caller-owned values because insert history records this object.
             const wrappedData: Record<string, CellValue> = {};
             for (const key of Object.keys(data)) {
               wrappedData[key] = wrapForTransfer(data[key]);
@@ -684,7 +690,7 @@ async function createWorkerBackedWasmDatabaseConnection(
             expectedTriggers?: readonly ViewTriggerDefinition[]
           ) => workerProxy.dropView(view, expectedSql, expectedTriggers),
           updateCellBatch: (table: string, updates: CellUpdate[]) => {
-            // Wrap any Uint8Array values in updates for zero-copy transfer
+            // Retain caller-owned values because batch history records these updates.
             const wrappedUpdates = updates.map(u => ({
               ...u,
               value: wrapForTransfer(u.value)

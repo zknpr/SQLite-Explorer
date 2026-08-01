@@ -42,7 +42,21 @@ Module.prototype.require = function(id: string) {
             return workerProxy;
           },
           DEFAULT_INVOCATION_TIMEOUT_MS,
-          Transfer: class Transfer {}
+          Transfer: class Transfer<T> {
+            value: T;
+            transferables: Transferable[];
+
+            constructor(value: T, transferables: Transferable[]) {
+              this.transferables = transferables;
+              // Model the point at which buildMethodProxy posts the payload:
+              // transferred buffers detach in the caller and arrive intact in
+              // the worker. Keeping this behavior in the mock catches facade
+              // code that accidentally transfers a history-owned buffer.
+              this.value = transferables.length > 0
+                ? structuredClone(value, { transfer: transferables })
+                : value;
+            }
+          }
         };
     }
     if (id.endsWith('platform/threadPool')) {
@@ -331,6 +345,84 @@ describe('workerFactory error path tests', () => {
     await pending!.catch(error => { caught = error; });
     assert.strictEqual(caught, cancellation);
     assert.strictEqual(applyCalls, 0);
+  });
+
+  it('keeps BLOB history bytes owned by the host while transferring mutation payloads', async () => {
+    let storedValue = new Uint8Array();
+    let insertedValue = new Uint8Array();
+    let batchValue = new Uint8Array();
+    let redoValue = new Uint8Array();
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false }),
+      updateCell: async (_table: string, _rowId: number, _column: string, transferred: any) => {
+        storedValue = transferred.value;
+      },
+      insertRow: async (_table: string, data: any) => {
+        insertedValue = data.payload.value;
+        return 2;
+      },
+      updateCellBatch: async (_table: string, updates: any[]) => {
+        batchValue = updates[0].value.value;
+      },
+      redoModification: async (modification: any) => {
+        redoValue = modification.newValue;
+      }
+    };
+
+    const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
+    const fileUri = {
+      scheme: 'file',
+      fsPath: '/test/db.sqlite',
+      path: '/test/db.sqlite'
+    } as any;
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
+    const blob = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+
+    await databaseOps.updateCell('items', 1, 'payload', blob);
+    assert.deepStrictEqual(storedValue, new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+    assert.deepStrictEqual(
+      blob,
+      new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+      'worker transfer must not detach the value retained for undo/redo history'
+    );
+
+    const insertedBlob = new Uint8Array([3, 4, 5]);
+    const insertedRow = { payload: insertedBlob };
+    await databaseOps.insertRow('items', insertedRow);
+    assert.deepStrictEqual(insertedValue, new Uint8Array([3, 4, 5]));
+    assert.deepStrictEqual(insertedRow.payload, new Uint8Array([3, 4, 5]));
+
+    const batchedBlob = new Uint8Array([6, 7, 8]);
+    const batch = [{ rowId: 2, column: 'payload', value: batchedBlob }];
+    await databaseOps.updateCellBatch('items', batch);
+    assert.deepStrictEqual(batchValue, new Uint8Array([6, 7, 8]));
+    assert.deepStrictEqual(batch[0].value, new Uint8Array([6, 7, 8]));
+
+    const modification = {
+      label: 'Update payload',
+      description: 'Update items.payload',
+      modificationType: 'cell_update' as const,
+      targetTable: 'items',
+      targetRowId: 1,
+      targetColumn: 'payload',
+      priorValue: new Uint8Array([1, 2]),
+      newValue: blob
+    };
+    const { ModificationTracker } = require('../../src/core/undo-history');
+    const tracker = new ModificationTracker(10);
+    tracker.record(modification);
+
+    await databaseOps.redoModification(modification);
+    assert.deepStrictEqual(redoValue, new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+
+    const restored = ModificationTracker.deserialize(tracker.serialize());
+    const restoredModification = restored.getUncommittedEntries()[0];
+    assert.deepStrictEqual(
+      restoredModification.newValue,
+      new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+      'hot-exit serialization must retain the transferred BLOB bytes'
+    );
   });
 
   it('waits for a delayed batch revert under a modification-scaled worker deadline', async () => {

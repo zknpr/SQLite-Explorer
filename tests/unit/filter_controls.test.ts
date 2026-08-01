@@ -123,6 +123,7 @@ function installFilterDocument(options: {
     globalValue?: string;
     columns?: Array<{ name: string; value: string }>;
     cells?: Map<string, any>;
+    hasRenderedGrid?: boolean;
 } = {}) {
     const globalInput = createInput(options.globalValue ?? '');
     const columnInputs = (options.columns ?? []).map(({ name, value }) => createInput(value, name));
@@ -148,7 +149,9 @@ function installFilterDocument(options: {
     const gridContainer = {
         scrollLeft: 0,
         scrollTop: 0,
-        querySelector() { return null; },
+        querySelector(selector: string) {
+            return selector === '.data-grid' && options.hasRenderedGrid ? {} : null;
+        },
         addEventListener(type: string, listener: (event: any) => any) {
             containerListeners.set(type, listener);
         }
@@ -196,6 +199,8 @@ async function prepareState(columns: Array<{ name: string; type: string }>) {
     state.filterApplyPending = false;
     state.filterApplyTable = null;
     state.filterPendingAction = null;
+    state.lastSuccessfulFilterState = null;
+    state.lastGridLoadError = null;
     return state;
 }
 
@@ -208,6 +213,8 @@ describe('filter controls', () => {
         state.filterApplyPending = false;
         state.filterApplyTable = null;
         state.filterPendingAction = null;
+        state.lastSuccessfulFilterState = null;
+        state.lastGridLoadError = null;
         state.selectedTable = null;
         state.gridData = [];
         state.tableColumns = [];
@@ -430,6 +437,55 @@ describe('filter controls', () => {
             assert.strictEqual(globalInput.value, 'needle');
             assert.match(elements.statusText.textContent, /filter draft.*next grid reload/i);
         } finally {
+            timers.restore();
+        }
+    });
+
+    it('reverts a failed filter to the last successful rows while keeping the draft editable', async () => {
+        const timers = installTimerHarness();
+        const { globalInput, elements } = installFilterDocument({
+            globalValue: 'working',
+            hasRenderedGrid: true
+        });
+        const state = await prepareState([{ name: 'value', type: 'TEXT' }]);
+        state.renderedTable = 'items';
+        state.filterQuery = 'working';
+        const { backendApi } = await import(apiModulePath);
+        const { loadTableData } = await import(gridDataModulePath);
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        let countCalls = 0;
+        backendApi.fetchTableCount = async () => {
+            countCalls++;
+            if (countCalls === 2) throw new Error('malformed filter predicate');
+            return 1;
+        };
+        backendApi.fetchTableData = async () => ({ rows: [['working row']] });
+
+        try {
+            assert.strictEqual(await loadTableData(false, false), true);
+            assert.deepStrictEqual(state.gridData, [['working row']]);
+
+            globalInput.value = 'broken draft';
+            const { onFilterInput } = await import(gridActionsModulePath);
+            onFilterInput({ target: globalInput, isComposing: false });
+            await timers.run(300);
+
+            assert.strictEqual(state.filterQuery, 'working');
+            assert.deepStrictEqual(state.columnFilters, {});
+            assert.deepStrictEqual(state.gridData, [['working row']]);
+            assert.strictEqual(globalInput.value, 'broken draft');
+            assert.match(elements.statusText.textContent, /filter failed.*reverted/i);
+            assert.strictEqual(state.filterApplyPending, false);
+            assert.strictEqual(state.filterApplyTable, null);
+            assert.strictEqual(
+                (elements.gridContainer as any).innerHTML,
+                undefined,
+                'a failed background filter must leave the successful grid mounted'
+            );
+        } finally {
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
             timers.restore();
         }
     });

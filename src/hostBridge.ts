@@ -63,6 +63,23 @@ export class HostBridge implements ToastService {
     return ops;
   }
 
+  private captureConnectionGeneration(): number {
+    return this.document.connectionGeneration;
+  }
+
+  private isConnectionGenerationCurrent(generation: number): boolean {
+    return generation === this.document.connectionGeneration;
+  }
+
+  /** Refuse a write whose read/confirmation phase belonged to an older database. */
+  private assertConnectionGeneration(generation: number): void {
+    if (!this.isConnectionGenerationCurrent(generation)) {
+      throw new Error(vsc.l10n.t(
+        'The document was reloaded while this operation was in progress. No changes were applied.'
+      ));
+    }
+  }
+
   /**
    * Initialize the connection - returns metadata about the database connection.
    * Database operations (executeQuery, serializeDatabase, etc.) are exposed as separate methods
@@ -115,6 +132,7 @@ export class HostBridge implements ToastService {
    */
   async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, _originalValue?: CellValue) {
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
 
     // Check if the document is read-only
     if (this.isReadOnly) {
@@ -136,6 +154,8 @@ export class HostBridge implements ToastService {
     const priorValue = currentRow[0];
     const patch = this.tryGeneratePatch(value, priorValue);
     const operation = patch ? 'json_patch' as const : 'set' as const;
+
+    this.assertConnectionGeneration(connectionGeneration);
 
     // Use specific method instead of generic exec
     // This allows the backend to handle safe SQL construction
@@ -196,6 +216,7 @@ export class HostBridge implements ToastService {
    */
   async deleteRows(table: string, rowIds: RecordId[]) {
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
@@ -239,6 +260,7 @@ export class HostBridge implements ToastService {
         console.warn('Failed to fetch rows for undo history:', e);
     }
 
+    this.assertConnectionGeneration(connectionGeneration);
     if ('deleteRows' in dbOps) {
       await dbOps.deleteRows(table, rowIds);
     } else {
@@ -266,6 +288,7 @@ export class HostBridge implements ToastService {
    */
   async deleteColumns(table: string, columns: string[]): Promise<{ cancelled: boolean } | void> {
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
@@ -345,6 +368,7 @@ export class HostBridge implements ToastService {
         // Proceed with deletion even if history capture fails, but warn
     }
 
+    this.assertConnectionGeneration(connectionGeneration);
     if ('deleteColumns' in dbOps) {
       // Pass dependent indexes to be dropped first if user confirmed
       await dbOps.deleteColumns(table, columns, dependentIndexes.length > 0 ? dependentIndexes : undefined);
@@ -443,6 +467,7 @@ export class HostBridge implements ToastService {
     expectedTriggers?: readonly ViewTriggerDefinition[]
   ) {
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
     if (this.isReadOnly) {
       throw new Error('Document is read-only');
     }
@@ -472,6 +497,7 @@ export class HostBridge implements ToastService {
       }
     }
 
+    this.assertConnectionGeneration(connectionGeneration);
     const result = await dbOps.editView(
       view,
       selectSql,
@@ -493,6 +519,7 @@ export class HostBridge implements ToastService {
   /** Drop a view only after a modal confirmation. */
   async dropView(view: string) {
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
     if (this.isReadOnly) {
       throw new Error('Document is read-only');
     }
@@ -518,6 +545,7 @@ export class HostBridge implements ToastService {
       }
 
       try {
+        this.assertConnectionGeneration(connectionGeneration);
         const definition = await dbOps.dropView(
           view,
           current.sql,
@@ -545,6 +573,7 @@ export class HostBridge implements ToastService {
    */
   async updateCellBatch(table: string, updates: CellUpdate[], label: string) {
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
@@ -566,11 +595,13 @@ export class HostBridge implements ToastService {
     });
 
     if (typeof dbOps.updateCellBatch === 'function') {
+      this.assertConnectionGeneration(connectionGeneration);
       await dbOps.updateCellBatch(table, processedUpdates);
     } else {
       // Fallback: execute updates sequentially to avoid IPC overload and N+1 concurrency,
       // but wrapped in a SAVEPOINT to avoid implicit auto-commits after every DML statement.
       const savepointName = `sp_batch_fallback_${Date.now()}`;
+      this.assertConnectionGeneration(connectionGeneration);
       await dbOps.executeQuery(`SAVEPOINT ${savepointName}`);
       try {
         for (const update of processedUpdates) {
@@ -582,11 +613,18 @@ export class HostBridge implements ToastService {
             val = null;
           }
 
+          this.assertConnectionGeneration(connectionGeneration);
           await dbOps.updateCell(table, update.rowId, update.column, val, patch);
         }
+        this.assertConnectionGeneration(connectionGeneration);
         await dbOps.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
       } catch (err) {
-        await dbOps.executeQuery(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+        // A replacement endpoint cannot own this savepoint. Reload already
+        // discarded the old WASM connection, so do not send a misleading
+        // rollback to the fresh database.
+        if (this.isConnectionGenerationCurrent(connectionGeneration)) {
+          await dbOps.executeQuery(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+        }
         throw err;
       }
     }

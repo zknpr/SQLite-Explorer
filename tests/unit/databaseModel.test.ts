@@ -883,6 +883,22 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         assert.deepStrictEqual(contentChanges, [{ invalidateAllViewDocuments: true }]);
     });
 
+    it('advances the connection generation as soon as Reload starts', async () => {
+        const engineKind = createDeferred<'native'>();
+        const doc = createDocBypassingFactory({ engineKind: engineKind.promise });
+
+        assert.strictEqual(doc.connectionGeneration, 0);
+        const pendingReload = doc.reloadFromDisk();
+        assert.strictEqual(
+            doc.connectionGeneration,
+            1,
+            'in-flight host mutations must observe Reload before its first await completes'
+        );
+
+        engineKind.resolve('native');
+        await pendingReload;
+    });
+
     it('preserves forced read-only, auto-commit, and SQL logging when reconnecting', async () => {
         const originalOps = { engineKind: Promise.resolve('wasm') };
         let freshQueryCalls = 0;

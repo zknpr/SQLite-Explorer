@@ -157,16 +157,39 @@ async function processFilterQueue(table = state.selectedTable, reloadWait = null
         state.filterApplyPending = false;
         const result = await loadTableData(false);
         if (result !== true) {
-            if (table === state.selectedTable && !state.filterApplyPending) {
-                state.filterApplyPending = true;
-                state.filterApplyTable = table;
+            // Text typed during the failed request is a distinct successor and
+            // should still be tried immediately against the retained grid.
+            if (result === false && state.filterApplyPending) {
+                clearFilterTimer();
+                return processFilterQueue(table);
             }
+
             // A superseded request has another load in progress; retry when that
-            // owner releases the guard. A real query failure remains retryable by
-            // the next input/Enter without an automatic error loop.
+            // owner releases the guard.
             if (result === undefined) {
+                if (table === state.selectedTable && !state.filterApplyPending) {
+                    state.filterApplyPending = true;
+                    state.filterApplyTable = table;
+                }
                 scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table);
+                return result;
             }
+
+            // A genuine query failure must not become the persisted/current
+            // predicate. Restore the filter identity paired with the grid that
+            // loadTableData deliberately kept mounted; the failed draft remains
+            // in the live input for correction and another debounce/Enter.
+            const successful = state.lastSuccessfulFilterState;
+            if (successful?.table === table) {
+                state.filterQuery = successful.filterQuery;
+                state.columnFilters = { ...successful.columnFilters };
+            }
+            state.filterApplyPending = false;
+            state.filterApplyTable = null;
+            state.filterPendingAction = null;
+            persistState();
+            const details = state.lastGridLoadError ? `: ${state.lastGridLoadError}` : '';
+            updateStatus(`Filter failed and was reverted${details}`);
             return result;
         }
         persistState();

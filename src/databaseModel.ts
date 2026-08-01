@@ -217,6 +217,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   readonly #modificationTracker: ModificationTracker<DocumentModification>;
   readonly #hostBridge: HostBridge;
   readonly #forceReadOnlyOnReconnect: boolean;
+  #connectionGeneration = 0;
 
   private constructor(
     readonly viewerProvider: DatabaseViewerProvider,
@@ -241,6 +242,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   get fileParts() { return getUriParts(this.uri); }
   get hostBridge() { return this.#hostBridge; }
   get documentKey() { return this.#documentKey; }
+  /** Monotonic barrier for host operations that span a database reload. */
+  get connectionGeneration() { return this.#connectionGeneration; }
 
   // ============================================================================
   // Event Emitters
@@ -516,6 +519,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
           // through the same bundle therefore waits behind the timed-out mutation
           // and gives this document a fresh handle to its post-mortem disk state.
           // Do not clean the tracker until that reconnect barrier has completed.
+          this.#connectionGeneration++;
           await this.#reconnectFromDisk();
           this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
         } else {
@@ -593,6 +597,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * Reload database from disk.
    */
   async reloadFromDisk(): Promise<DatabaseOperations> {
+    // Advance before the first await. Host mutations that already captured this
+    // document must not finish a preliminary read and then dispatch their write
+    // into the replacement worker endpoint.
+    this.#connectionGeneration++;
     const currentOps = this.databaseOperations;
     let reloadedOps = currentOps;
 

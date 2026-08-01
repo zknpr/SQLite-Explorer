@@ -68,6 +68,10 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     // (which would SELECT the old columns against the new table and error out).
     const requestedTable = state.selectedTable;
     const requestedTableType = state.selectedTableType;
+    const requestedFilterQuery = state.filterQuery;
+    const requestedColumnFilters = { ...state.columnFilters };
+    let keepExistingGridOnError = false;
+    state.lastGridLoadError = null;
     // This load is superseded if a newer load has started (token bumped) OR the
     // user has navigated to a different table. The selection check matters because
     // a table switch changes state.selectedTable synchronously but only starts its
@@ -93,6 +97,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // DOM and must not be left on screen. Cached once instead of re-querying below.
         const hasRenderedGrid = !!(container && container.querySelector('.data-grid'));
         const isSameTableGrid = hasRenderedGrid && state.renderedTable === state.selectedTable;
+        keepExistingGridOnError = !showSpinner && isSameTableGrid;
 
         // Only capture scroll position if the current table's grid is visible (not a
         // loading/error state, and not a different table's grid mid-switch). This
@@ -117,14 +122,14 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // Build query options
         const filters = [];
         // Column filters
-        for (const [colName, filterValue] of Object.entries(state.columnFilters)) {
+        for (const [colName, filterValue] of Object.entries(requestedColumnFilters)) {
             const activeFilterValue = getActiveFilterValue(filterValue);
             if (activeFilterValue !== undefined) {
                 filters.push({ column: colName, value: activeFilterValue });
             }
         }
 
-        const globalFilter = getActiveFilterValue(state.filterQuery);
+        const globalFilter = getActiveFilterValue(requestedFilterQuery);
 
         // Column names are needed both for the global-filter count and the data query.
         const columnNames = state.tableColumns.map(c => c.name);
@@ -141,11 +146,11 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // Get total count
         const totalRecordCount = await backendApi.fetchTableCount(requestedTable, countOptions);
         if (isSuperseded()) return; // a newer load started, or the user switched tables
-        state.totalRecordCount = totalRecordCount;
-        state.totalPageCount = Math.max(1, Math.ceil(state.totalRecordCount / state.rowsPerPage));
+        const totalPageCount = Math.max(1, Math.ceil(totalRecordCount / state.rowsPerPage));
+        let currentPageIndex = state.currentPageIndex;
 
-        if (state.currentPageIndex >= state.totalPageCount) {
-            state.currentPageIndex = Math.max(0, state.totalPageCount - 1);
+        if (currentPageIndex >= totalPageCount) {
+            currentPageIndex = Math.max(0, totalPageCount - 1);
         }
 
         // Get data
@@ -164,7 +169,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             orderBy: state.sortedColumn,
             orderDir: state.sortAscending ? 'ASC' : 'DESC',
             limit: state.rowsPerPage,
-            offset: state.currentPageIndex * state.rowsPerPage,
+            offset: currentPageIndex * state.rowsPerPage,
             filters,
             globalFilter
         };
@@ -172,8 +177,19 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         const dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
         if (isSuperseded()) return; // superseded (newer load or table switch) during the fetch
 
+        // Commit count, page, rows, and their filter identity together. A data
+        // query failure therefore leaves the prior successful grid coherent.
+        state.totalRecordCount = totalRecordCount;
+        state.totalPageCount = totalPageCount;
+        state.currentPageIndex = currentPageIndex;
         state.gridData = dataResult.rows || [];
         state.gridExactIntegerTexts = dataResult.exactIntegerTexts || {};
+        state.lastSuccessfulFilterState = {
+            table: requestedTable,
+            filterQuery: requestedFilterQuery,
+            columnFilters: requestedColumnFilters
+        };
+        state.lastGridLoadError = null;
         resetMatchNav();
 
         // When preserving scroll, re-capture the latest position right before
@@ -214,8 +230,12 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         console.error('Error loading data:', err);
         // Don't let a superseded load's error replace the current table's view.
         if (!isSuperseded()) {
-            updateStatus(`Error: ${err.message}`);
-            showErrorState(err.message);
+            const message = err instanceof Error ? err.message : String(err);
+            state.lastGridLoadError = message;
+            updateStatus(`Error: ${message}`);
+            // Background filters retain the last successful grid so the UI can
+            // roll back atomically instead of replacing it with an error panel.
+            if (!keepExistingGridOnError) showErrorState(message);
             return false; // the current load genuinely failed (lets callers retry)
         }
         // Superseded failure: a newer load owns the outcome — return undefined.

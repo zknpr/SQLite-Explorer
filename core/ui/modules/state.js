@@ -62,6 +62,11 @@ export const state = {
     filterApplyPending: false,
     filterApplyTable: null,
     filterPendingAction: null,
+    // The filter state paired with the currently retained successful grid.
+    // Draft input remains in the DOM on query failure while state rolls back
+    // to this snapshot, so refresh/persistence never adopts a failed predicate.
+    lastSuccessfulFilterState: null,
+    lastGridLoadError: null,
 
     // Pinned items
     pinnedColumns: new Set(),

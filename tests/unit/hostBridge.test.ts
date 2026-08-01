@@ -4,6 +4,7 @@ import { describe, it, mock, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { HostBridge } from '../../src/hostBridge';
 import * as vscode from 'vscode';
+import { createDeferred } from './helpers/deferred';
 
 describe('HostBridge', () => {
 
@@ -233,6 +234,70 @@ describe('HostBridge', () => {
         assert.strictEqual(dbOps.insertRow.mock.callCount(), 0);
         assert.strictEqual(dbOps.deleteRows.mock.callCount(), 0);
         assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 0);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('rejects a cell update when the document reloads while its undo baseline is loading', async () => {
+        const baseline = createDeferred<any>();
+        const baselineStarted = createDeferred<void>();
+        const dbOps = {
+            executeQuery: mock.fn(async () => {
+                baselineStarted.resolve();
+                return baseline.promise;
+            }),
+            updateCell: mock.fn(async () => {})
+        };
+        let connectionGeneration = 4;
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            get connectionGeneration() { return connectionGeneration; },
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        const pending = bridge.updateCell('items', 7, 'payload', 'after');
+        await baselineStarted.promise;
+        connectionGeneration++;
+        baseline.resolve([{ headers: ['payload'], rows: [['before']] }]);
+
+        await assert.rejects(pending, /document was reloaded/i);
+        assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('rejects a column deletion when reload supersedes its history capture', async () => {
+        const rows = createDeferred<any>();
+        const rowsStarted = createDeferred<void>();
+        const dbOps = {
+            findDependentIndexes: mock.fn(async () => []),
+            getTableInfo: mock.fn(async () => [{ identifier: 'payload', declaredType: 'BLOB' }]),
+            executeQuery: mock.fn(async () => {
+                rowsStarted.resolve();
+                return rows.promise;
+            }),
+            deleteColumns: mock.fn(async () => {})
+        };
+        let connectionGeneration = 8;
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            get connectionGeneration() { return connectionGeneration; },
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        const pending = bridge.deleteColumns('items', ['payload']);
+        await rowsStarted.promise;
+        connectionGeneration++;
+        rows.resolve([{ headers: ['rowid', 'payload'], rows: [[1, new Uint8Array([1])]] }]);
+
+        await assert.rejects(pending, /document was reloaded/i);
+        assert.strictEqual(dbOps.deleteColumns.mock.callCount(), 0);
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
