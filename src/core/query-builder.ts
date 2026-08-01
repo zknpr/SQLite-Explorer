@@ -18,7 +18,8 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
     limit,
     offset,
     filters = [],
-    globalFilter
+    globalFilter,
+    globalFilterColumns = columns
   } = options;
 
   const escapedTable = escapeIdentifier(table);
@@ -32,7 +33,11 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
   const whereClauses: string[] = [];
   const params: CellValue[] = [];
 
-  const { conditions, params: filterParams } = buildFilterConditions(filters, globalFilter, columns);
+  const { conditions, params: filterParams } = buildFilterConditions(
+    filters,
+    globalFilter,
+    globalFilterColumns
+  );
   whereClauses.push(...conditions);
   params.push(...filterParams);
 

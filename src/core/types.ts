@@ -392,6 +392,8 @@ export interface ColumnDefinition {
 
 export interface TableQueryOptions {
   columns?: string[];
+  /** Displayed columns eligible for the global filter, excluding identity-only SELECT fields. */
+  globalFilterColumns?: string[];
   orderBy?: string;
   orderDir?: 'ASC' | 'DESC';
   limit?: number;

@@ -420,6 +420,30 @@ describe('filter match navigation', () => {
         assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 1 }]);
     });
 
+    it('does not navigate a match found only in the hidden table rowid', async () => {
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                return id === 'filterMatchCounter' ? { textContent: '' } : null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.gridData = [[12, 'visible text']];
+        state.filterQuery = '12';
+        state.columnFilters = {};
+        resetMatchNav();
+
+        navigateMatches(GLOBAL_MATCH_SCOPE);
+
+        assert.deepStrictEqual(state.matchNav.matches, []);
+    });
+
     it('navigates matches in the same pinned-first order as the rendered grid', async () => {
         const focusedCells: string[] = [];
         const cells = new Map<string, any>();

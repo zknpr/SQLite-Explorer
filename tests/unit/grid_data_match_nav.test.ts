@@ -90,6 +90,78 @@ describe('grid data match cache', () => {
         }
     });
 
+    it('keeps data, count, and navigation aligned when only rowid matches', async () => {
+        const elements: Record<string, any> = {
+            pageIndicator: { textContent: '' },
+            btnFirst: { disabled: false },
+            btnPrev: { disabled: false },
+            btnNext: { disabled: false },
+            btnLast: { disabled: false },
+            statusText: { textContent: '' },
+            filterMatchCounter: { textContent: '' }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) { return elements[id] ?? null; },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const gridDataModulePath = '../../core/ui/modules/grid-data.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const sqliteModulePath = '../../src/core/sqlite-db';
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { loadTableData } = await import(gridDataModulePath);
+        const { GLOBAL_MATCH_SCOPE, navigateMatches } = await import(matchNavModulePath);
+        const { createDatabaseEngine } = await import(sqliteModulePath);
+        const { operations } = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        await operations.executeQuery(
+            "CREATE TABLE rowid_filter_items (value TEXT); " +
+            "INSERT INTO rowid_filter_items(rowid, value) VALUES (12, 'visible text')"
+        );
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        backendApi.fetchTableCount = (table: string, options: any) =>
+            operations.fetchTableCount(table, options);
+        backendApi.fetchTableData = (table: string, options: any) =>
+            operations.fetchTableData(table, options);
+        state.selectedTable = 'rowid_filter_items';
+        state.selectedTableType = 'table';
+        state.renderedTable = 'rowid_filter_items';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.gridData = [];
+        state.currentPageIndex = 0;
+        state.rowsPerPage = 500;
+        state.columnFilters = {};
+        state.filterQuery = '12';
+        state.isLoadingData = false;
+        state.isGridReloading = false;
+        state.editingCellInfo = { rowIdx: 0, colIdx: 0 };
+
+        try {
+            assert.strictEqual(await loadTableData(false, false), true);
+            navigateMatches(GLOBAL_MATCH_SCOPE);
+
+            assert.strictEqual(state.totalRecordCount, 0);
+            assert.deepStrictEqual(state.gridData, []);
+            assert.deepStrictEqual(state.matchNav.matches, []);
+        } finally {
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
+            state.selectedTable = null;
+            state.gridData = [];
+            state.editingCellInfo = null;
+            state.isLoadingData = false;
+            state.isGridReloading = false;
+            (operations as any).shutdown?.();
+        }
+    });
+
     it('invalidates cached match coordinates after replacement data is applied', async () => {
         const activeCell = { classList: createClassList(['active-match-cell']) };
         const counter = { textContent: '1/1' };

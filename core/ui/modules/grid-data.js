@@ -151,6 +151,9 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
         const queryOptions = {
             columns: queryColumns,
+            // rowid stays in SELECT for table identity, but users filter only
+            // the displayed schema columns scanned by match navigation.
+            globalFilterColumns: columnNames,
             orderBy: state.sortedColumn,
             orderDir: state.sortAscending ? 'ASC' : 'DESC',
             limit: state.rowsPerPage,

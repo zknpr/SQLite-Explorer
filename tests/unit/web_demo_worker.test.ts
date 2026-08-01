@@ -456,6 +456,29 @@ describe('web demo view worker', () => {
         assert.strictEqual(underscoreCount, 1);
     });
 
+    it('excludes the hidden rowid from demo data and count global filters', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE rowid_filters (value TEXT); " +
+            "INSERT INTO rowid_filters(rowid, value) VALUES (12, 'visible text')"
+        );
+
+        const data = await worker.invoke('fetchTableData', 'rowid_filters', {
+            columns: ['rowid', 'value'],
+            globalFilter: '12',
+            limit: 100,
+            offset: 0
+        });
+        const count = await worker.invoke('fetchTableCount', 'rowid_filters', {
+            columns: ['value'],
+            globalFilter: '12'
+        });
+
+        assert.deepStrictEqual(Array.from(data.rows), []);
+        assert.strictEqual(count, 0);
+    });
+
     it('treats whitespace-only filters as inactive but preserves padded terms', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

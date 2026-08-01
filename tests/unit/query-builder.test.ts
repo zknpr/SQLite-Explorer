@@ -54,6 +54,21 @@ describe('Query Builder', () => {
       assert.deepStrictEqual(params, ['%test%', '%test%']);
     });
 
+    it('keeps the synthetic rowid in SELECT but out of the global predicate', () => {
+      const options = {
+        columns: ['rowid', 'value'],
+        globalFilterColumns: ['value'],
+        globalFilter: '12'
+      };
+      const { sql, params } = buildSelectQuery('items', options);
+
+      assert.strictEqual(
+        sql,
+        'SELECT "rowid" AS "rowid", "value" FROM "items" WHERE ("value" LIKE ? ESCAPE \'\\\')'
+      );
+      assert.deepStrictEqual(params, ['%12%']);
+    });
+
     it('should handle global filter with default columns (edge case)', () => {
       // This documents current behavior where default ['*'] results in " * " LIKE ?
       const options = {
