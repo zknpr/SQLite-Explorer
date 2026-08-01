@@ -957,7 +957,9 @@ describe('createNativeDatabaseConnection', () => {
                 return {
                     result: {
                         results: queries.map(query => {
-                            if (query.sql.includes("type = 'view'")) {
+                            if (query.sql.startsWith(
+                                "SELECT sql FROM sqlite_schema WHERE type = 'view'"
+                            )) {
                                 return { columns: ['sql'], values: [[currentViewSql]] };
                             }
                             if (query.sql.includes("type = 'trigger'")) {
@@ -1229,7 +1231,9 @@ FROM orders o`;
                 return {
                     result: {
                         results: queries.map(query => {
-                            if (query.sql.includes("type = 'view'")) {
+                            if (query.sql.startsWith(
+                                "SELECT sql FROM sqlite_schema WHERE type = 'view'"
+                            )) {
                                 return { columns: ['sql'], values: [[currentViewSql]] };
                             }
                             if (query.sql.includes('sqlite_temp_schema')) {
@@ -1291,7 +1295,9 @@ FROM orders o`;
                 return {
                     result: {
                         results: queries.map(query => {
-                            if (query.sql.includes("type = 'view'")) {
+                            if (query.sql.startsWith(
+                                "SELECT sql FROM sqlite_schema WHERE type = 'view'"
+                            )) {
                                 return { columns: ['sql'], values: [[currentViewSql]] };
                             }
                             if (query.sql.includes('sqlite_temp_schema')) {

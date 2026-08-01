@@ -887,7 +887,7 @@ async function findViewDefinition(view, allowUnparsed = false) {
   if (typeof createSql !== 'string') return null;
 
   const triggerRows = VIEW_TRIGGER_SCHEMA_QUERIES.map(source => (
-    db.exec(source.sql, [view])[0]?.values || []
+    db.exec(source.sql, source.params(view))[0]?.values || []
   ));
   const triggers = mapViewTriggerRows(view, triggerRows);
 

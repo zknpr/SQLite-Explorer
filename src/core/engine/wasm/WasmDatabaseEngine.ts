@@ -1051,7 +1051,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
     const triggerRows: CellValue[][][] = [];
     for (const source of VIEW_TRIGGER_SCHEMA_QUERIES) {
-      const result = await this.executeQuery(source.sql, [view]);
+      const result = await this.executeQuery(source.sql, source.params(view));
       triggerRows.push(result[0]?.rows ?? []);
     }
     const triggers = mapViewTriggerRows(view, triggerRows);

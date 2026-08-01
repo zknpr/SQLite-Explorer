@@ -567,7 +567,7 @@ export async function createNativeDatabaseConnection(
           },
           ...VIEW_TRIGGER_SCHEMA_QUERIES.map(source => ({
             sql: source.sql,
-            params: [view]
+            params: source.params(view)
           }))
         ];
         const metadata = await worker.call<NativeQueryBatchResult>('queryBatch', [metadataQueries]);

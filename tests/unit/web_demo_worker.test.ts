@@ -1094,4 +1094,52 @@ describe('web demo view worker', () => {
             17
         );
     });
+
+    it('does not attribute a temp-shadow view trigger to the edited main view', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_shadow_trigger_main_rows (value INTEGER)');
+        await worker.invoke('runQuery', 'INSERT INTO demo_shadow_trigger_main_rows VALUES (3)');
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW demo_shadow_trigger_view AS ' +
+            'SELECT value FROM demo_shadow_trigger_main_rows'
+        );
+        await worker.invoke('runQuery', 'CREATE TEMP TABLE demo_shadow_trigger_temp_rows (value INTEGER)');
+        await worker.invoke('runQuery', 'INSERT INTO demo_shadow_trigger_temp_rows VALUES (7)');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP VIEW demo_shadow_trigger_view AS ' +
+            'SELECT value FROM demo_shadow_trigger_temp_rows'
+        );
+        await worker.invoke('runQuery', 'CREATE TEMP TABLE demo_shadow_trigger_log (value INTEGER)');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP TRIGGER demo_shadow_trigger_insert ' +
+            'INSTEAD OF INSERT ON demo_shadow_trigger_view ' +
+            'BEGIN INSERT INTO demo_shadow_trigger_log VALUES (NEW.value); END'
+        );
+
+        const edit = await worker.invoke(
+            'editView',
+            'demo_shadow_trigger_view',
+            'SELECT value * 2 AS value FROM demo_shadow_trigger_main_rows',
+            true
+        );
+
+        assert.deepStrictEqual(Array.from(edit.before.triggers), []);
+        assert.deepStrictEqual(Array.from(edit.after.triggers), []);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_shadow_trigger_view'),
+            6
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_shadow_trigger_view'),
+            7
+        );
+        await worker.invoke('runQuery', 'INSERT INTO demo_shadow_trigger_view VALUES (11)');
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_shadow_trigger_log'),
+            11
+        );
+    });
 });

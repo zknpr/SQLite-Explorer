@@ -311,7 +311,7 @@ describe('filter match navigation', () => {
         assert.strictEqual(cell.classList.contains('active-match-cell'), true);
     });
 
-    it('matches text that exists only in the formatted cell value', async () => {
+    it('does not match the display-only NULL placeholder', async () => {
         const cell = {
             classList: createClassList(),
             scrollIntoView() {}
@@ -338,8 +338,39 @@ describe('filter match navigation', () => {
 
         navigateMatches(GLOBAL_MATCH_SCOPE);
 
-        assert.deepStrictEqual(state.matchNav.matches, [{ rowIdx: 0, colIdx: 0 }]);
-        assert.strictEqual(cell.classList.contains('active-match-cell'), true);
+        assert.deepStrictEqual(state.matchNav.matches, []);
+        assert.strictEqual(cell.classList.contains('active-match-cell'), false);
+    });
+
+    it('does not match the display-only BLOB placeholder', async () => {
+        const cell = {
+            classList: createClassList(),
+            scrollIntoView() {}
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cell-0-0') return cell;
+                if (id === 'filterMatchCounter') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll() { return []; }
+        };
+
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const matchNavModulePath = '../../core/ui/modules/match-nav.js';
+        const { state } = await import(stateModulePath);
+        const { navigateMatches, resetMatchNav } = await import(matchNavModulePath);
+        state.tableColumns = [{ name: 'payload', type: 'BLOB' }];
+        state.gridData = [[new Uint8Array([0x42, 0x4c, 0x4f, 0x42])]];
+        state.dateFormat = 'raw';
+        state.filterQuery = 'blob';
+        state.columnFilters = {};
+        resetMatchNav();
+
+        navigateMatches(GLOBAL_MATCH_SCOPE);
+
+        assert.deepStrictEqual(state.matchNav.matches, []);
+        assert.strictEqual(cell.classList.contains('active-match-cell'), false);
     });
 
     it('matches SQLite REAL text coercion for exponent and integer-valued numbers', async () => {

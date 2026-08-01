@@ -10,10 +10,17 @@ import type {
 export const VIEW_TRIGGER_SCHEMA_QUERIES = [
   {
     sql: "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE ORDER BY rowid",
+    params: (view: string): CellValue[] => [view],
     temporary: false
   },
   {
-    sql: "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE ORDER BY rowid",
+    // A TEMP trigger may target a main view, but when a same-named TEMP view
+    // exists SQLite resolves the trigger association to that shadow instead.
+    // sqlite_temp_schema.tbl_name alone cannot distinguish the two cases.
+    sql: "SELECT name, sql FROM sqlite_temp_schema WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE " +
+      "AND NOT EXISTS (SELECT 1 FROM sqlite_temp_schema WHERE type = 'view' AND name = ? COLLATE NOCASE) " +
+      "ORDER BY rowid",
+    params: (view: string): CellValue[] => [view, view],
     temporary: true
   }
 ] as const;

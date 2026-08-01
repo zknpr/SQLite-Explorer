@@ -270,6 +270,57 @@ describe('view operations', () => {
         }
     });
 
+    it('does not attribute a temp-shadow view trigger to the main view during edit', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery('CREATE TABLE shadow_trigger_main_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO shadow_trigger_main_rows VALUES (3)');
+            await engine.executeQuery(
+                'CREATE VIEW shadow_trigger_view AS SELECT value FROM shadow_trigger_main_rows'
+            );
+            await engine.executeQuery('CREATE TEMP TABLE shadow_trigger_temp_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO shadow_trigger_temp_rows VALUES (7)');
+            await engine.executeQuery(
+                'CREATE TEMP VIEW shadow_trigger_view AS SELECT value FROM shadow_trigger_temp_rows'
+            );
+            await engine.executeQuery('CREATE TEMP TABLE shadow_trigger_log (value INTEGER)');
+            await engine.executeQuery(
+                'CREATE TEMP TRIGGER shadow_trigger_insert ' +
+                'INSTEAD OF INSERT ON shadow_trigger_view ' +
+                'BEGIN INSERT INTO shadow_trigger_log VALUES (NEW.value); END'
+            );
+
+            const edit = await engine.editView(
+                'shadow_trigger_view',
+                'SELECT value * 2 AS value FROM shadow_trigger_main_rows',
+                true
+            );
+
+            assert.deepStrictEqual(edit.before.triggers, []);
+            assert.deepStrictEqual(edit.after.triggers, []);
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM main.shadow_trigger_view'),
+                6
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM temp.shadow_trigger_view'),
+                7
+            );
+            assert.strictEqual(await readScalar(
+                engine,
+                "SELECT count(*) FROM sqlite_temp_schema " +
+                "WHERE type = 'trigger' AND name = 'shadow_trigger_insert'"
+            ), 1);
+            await engine.executeQuery('INSERT INTO shadow_trigger_view VALUES (11)');
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM shadow_trigger_log'),
+                11
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('preserves an explicit view column list when replacing its SELECT body', async () => {
         const engine = await createEngine();
         try {

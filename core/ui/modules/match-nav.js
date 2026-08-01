@@ -126,9 +126,14 @@ function hasRealStorageSemantics(value, col) {
 }
 
 function getMatchingTextCandidate(value, col, term, exactIntegerText) {
-    const rawText = value === null || value === undefined || value instanceof Uint8Array
-        ? ''
-        : String(value);
+    // NULL never satisfies LIKE, and SQLite compares BLOB bytes rather than the
+    // UI's synthetic "[BLOB]" label. Neither display-only placeholder is a
+    // searchable SQL representation, so do not offer it to local navigation.
+    if (value === null || value === undefined || value instanceof Uint8Array) {
+        return null;
+    }
+
+    const rawText = String(value);
     const formattedText = String(formatCellValueAsText(
         value,
         col.type,

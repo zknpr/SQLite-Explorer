@@ -682,6 +682,49 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             await engine.redoModification(modification);
             await assertTemporaryTriggerWorks(23);
         });
+
+        await testContext.test('keeps a temp-shadow view trigger separate from the edited main view', async () => {
+            await engine.executeQuery('CREATE TABLE native_shadow_trigger_main_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO native_shadow_trigger_main_rows VALUES (3)');
+            await engine.executeQuery(
+                'CREATE VIEW native_shadow_trigger_view AS ' +
+                'SELECT value FROM native_shadow_trigger_main_rows'
+            );
+            await engine.executeQuery('CREATE TEMP TABLE native_shadow_trigger_temp_rows (value INTEGER)');
+            await engine.executeQuery('INSERT INTO native_shadow_trigger_temp_rows VALUES (7)');
+            await engine.executeQuery(
+                'CREATE TEMP VIEW native_shadow_trigger_view AS ' +
+                'SELECT value FROM native_shadow_trigger_temp_rows'
+            );
+            await engine.executeQuery('CREATE TEMP TABLE native_shadow_trigger_log (value INTEGER)');
+            await engine.executeQuery(
+                'CREATE TEMP TRIGGER native_shadow_trigger_insert ' +
+                'INSTEAD OF INSERT ON native_shadow_trigger_view ' +
+                'BEGIN INSERT INTO native_shadow_trigger_log VALUES (NEW.value); END'
+            );
+
+            const edit = await engine.editView(
+                'native_shadow_trigger_view',
+                'SELECT value * 2 AS value FROM native_shadow_trigger_main_rows',
+                true
+            );
+
+            assert.deepStrictEqual(edit.before.triggers, []);
+            assert.deepStrictEqual(edit.after.triggers, []);
+            const mainRows = await engine.executeQuery(
+                'SELECT value FROM main.native_shadow_trigger_view'
+            );
+            const tempRows = await engine.executeQuery(
+                'SELECT value FROM temp.native_shadow_trigger_view'
+            );
+            assert.strictEqual(mainRows[0].rows[0][0], 6);
+            assert.strictEqual(tempRows[0].rows[0][0], 7);
+            await engine.executeQuery('INSERT INTO native_shadow_trigger_view VALUES (11)');
+            const logged = await engine.executeQuery(
+                'SELECT value FROM native_shadow_trigger_log'
+            );
+            assert.strictEqual(logged[0].rows[0][0], 11);
+        });
     } finally {
         rawWorker?.stop();
         bundle?.workerMethods[Symbol.dispose]();
