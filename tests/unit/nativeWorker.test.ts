@@ -930,23 +930,33 @@ describe('createNativeDatabaseConnection', () => {
             ) {
                 return { result: { columns: ['1'], values: [[1]] } };
             }
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [Array<{ sql: string; params: unknown[] }>];
+                return {
+                    result: {
+                        results: queries.map(query => {
+                            const columnIndices = Array.from(
+                                query.sql.matchAll(/AS "__sqlite_explorer_numeric_rowid_text_(\d+)"/g),
+                                match => Number(match[1])
+                            );
+                            const row = [
+                                1,
+                                ...columnIndices.map(columnIndex => {
+                                    if (columnIndex === 1) return '1.25000000000001';
+                                    if (columnIndex === 2) return '2.50000000000000';
+                                    return null;
+                                })
+                            ];
+                            return { columns: [], values: [row] };
+                        })
+                    }
+                };
+            }
             if (
                 call.method === 'query'
                 && String(call.args[0]).includes('__sqlite_explorer_numeric_rowid')
             ) {
-                const sql = String(call.args[0]);
-                const companionColumnCount = (
-                    sql.match(/AS "__sqlite_explorer_numeric_rowid_text_\d+"/g) ?? []
-                ).length;
-                const row: unknown[] = [
-                    1,
-                    ...Array.from({ length: companionColumnCount }, () => null)
-                ];
-                if (companionColumnCount > 1) {
-                    row[1] = '1.25000000000001';
-                    row[2] = '2.50000000000000';
-                }
-                return { result: { columns: [], values: [row] } };
+                throw new Error('native companions must use one queryBatch IPC call');
             }
             return { result: { columns: [], values: [] } };
         });
@@ -969,12 +979,17 @@ describe('createNativeDatabaseConnection', () => {
                 && /^SAVEPOINT "sp_numeric_snapshot_/.test(String(call.args[0]))
             ));
             const mainReadIndex = connection.calls.findIndex(call => call.method === 'queryNumeric');
-            const companionReadIndices = connection.calls
+            const authorityReadIndex = connection.calls.findIndex(call => (
+                call.method === 'query'
+                && String(call.args[0]).includes('pragma_table_list')
+            ));
+            const companionBatchIndices = connection.calls
                 .map((call, index) => ({ call, index }))
-                .filter(({ call }) => (
-                    call.method === 'query'
-                    && String(call.args[0]).includes('__sqlite_explorer_numeric_rowid')
-                ))
+                .filter(({ call }) => {
+                    if (call.method !== 'queryBatch') return false;
+                    const [queries] = call.args as [Array<{ sql: string }>];
+                    return queries.some(query => query.sql.includes('__sqlite_explorer_numeric_rowid'));
+                })
                 .map(({ index }) => index);
             const snapshotReleaseIndex = connection.calls.findIndex(call => (
                 call.method === 'run'
@@ -983,9 +998,10 @@ describe('createNativeDatabaseConnection', () => {
 
             assert.ok(snapshotSavepointIndex >= 0, 'wide native reads must open a snapshot savepoint');
             assert.ok(mainReadIndex > snapshotSavepointIndex);
-            assert.ok(companionReadIndices.length > 0);
-            assert.ok(companionReadIndices.every(index => index > mainReadIndex));
-            assert.ok(snapshotReleaseIndex > companionReadIndices.at(-1)!);
+            assert.ok(authorityReadIndex > mainReadIndex);
+            assert.deepStrictEqual(companionBatchIndices.length, 1);
+            assert.ok(companionBatchIndices[0] > authorityReadIndex);
+            assert.ok(snapshotReleaseIndex > companionBatchIndices[0]);
         } finally {
             connection.dispose();
         }
@@ -1008,11 +1024,14 @@ describe('createNativeDatabaseConnection', () => {
             ) {
                 return { result: { columns: ['1'], values: [[1]] } };
             }
+            if (call.method === 'queryBatch') {
+                throw new Error('companion read failed');
+            }
             if (
                 call.method === 'query'
                 && String(call.args[0]).includes('__sqlite_explorer_numeric_rowid')
             ) {
-                throw new Error('companion read failed');
+                throw new Error('native companions must use one queryBatch IPC call');
             }
             return { result: { changes: 1, lastInsertRowId: 1 } };
         });

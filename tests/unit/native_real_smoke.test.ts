@@ -175,12 +175,15 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                     await externalWriter.call('run', [
                         'UPDATE native_numeric_snapshot SET value = 2.5 WHERE rowid = 1'
                     ]);
-                    const companion = await activeRawWorker.call<{ values: unknown[][] }>('query', [
-                        'SELECT rowid, CAST(value AS TEXT) FROM native_numeric_snapshot WHERE rowid = 1'
-                    ]);
+                    const companionBatch = await activeRawWorker.call<{
+                        results: Array<{ values: unknown[][] }>;
+                    }>('queryBatch', [[{
+                        sql: 'SELECT rowid, CAST(value AS TEXT) FROM native_numeric_snapshot WHERE rowid = 1',
+                        params: []
+                    }]]);
 
                     assert.strictEqual(source.values[0][1], 1.25);
-                    assert.strictEqual(companion.values[0][1], '1.25');
+                    assert.strictEqual(companionBatch.results[0].values[0][1], '1.25');
                     await activeRawWorker.call('run', ['RELEASE native_numeric_snapshot_read']);
                 } catch (error) {
                     await activeRawWorker.call('run', [

@@ -893,15 +893,15 @@ async function deleteColumns(table, columns) {
   const safeTable = table.replace(/"/g, '""');
   const columnList = remainingColumns.map(c => `"${c.identifier.replace(/"/g, '""')}"`).join(', ');
 
-  // Use transaction to recreate table without deleted columns
-  db.run('BEGIN TRANSACTION');
+  const savepointName = createViewSavepointName('sp_delete_columns');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     db.run(`CREATE TABLE "_temp_${safeTable}" AS SELECT ${columnList} FROM "${safeTable}"`);
     db.run(`DROP TABLE "${safeTable}"`);
     db.run(`ALTER TABLE "_temp_${safeTable}" RENAME TO "${safeTable}"`);
-    db.run('COMMIT');
+    runSingleStatement(`RELEASE ${savepointName}`);
   } catch (e) {
-    db.run('ROLLBACK');
+    safeRollbackSavepoint(savepointName, 'deleteColumns');
     throw e;
   }
 }

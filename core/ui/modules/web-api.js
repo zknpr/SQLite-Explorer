@@ -35,7 +35,7 @@ const pendingRpcCalls = new Map();
 
 // Helper to determine target origin
 function getTargetOrigin() {
-    return window.location.ancestorOrigins?.[0] || '*';
+    return window.location.ancestorOrigins?.[0] || window.location.origin;
 }
 
 // ============================================================================

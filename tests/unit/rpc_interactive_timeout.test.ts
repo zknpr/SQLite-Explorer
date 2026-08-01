@@ -5,6 +5,7 @@ import assert from 'node:assert';
 
 const extensionMessages: any[] = [];
 const webMessages: any[] = [];
+const webTargetOrigins: string[] = [];
 
 (globalThis as any).acquireVsCodeApi = () => ({
     getState: () => undefined,
@@ -12,8 +13,13 @@ const webMessages: any[] = [];
     postMessage: (message: any) => extensionMessages.push(message)
 });
 (globalThis as any).window = {
-    parent: { postMessage: (message: any) => webMessages.push(message) },
-    location: { ancestorOrigins: [] }
+    parent: {
+        postMessage: (message: any, targetOrigin: string) => {
+            webMessages.push(message);
+            webTargetOrigins.push(targetOrigin);
+        }
+    },
+    location: { ancestorOrigins: [], origin: 'https://demo.sqlite-explorer.test' }
 };
 
 after(() => {
@@ -98,4 +104,20 @@ it('keeps host-modal RPCs alive until their response in both transports', async 
         globalThis.setTimeout = originalSetTimeout;
         globalThis.clearTimeout = originalClearTimeout;
     }
+});
+
+it('targets the embedding origin without ever falling back to a wildcard', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const webApi = await import(webApiModulePath);
+    const location = (globalThis as any).window.location;
+
+    location.ancestorOrigins = ['https://embedding.example'];
+    webApi.sendRpcResult('ancestor', { ok: true });
+    assert.strictEqual(webTargetOrigins.at(-1), 'https://embedding.example');
+
+    location.ancestorOrigins = undefined;
+    location.origin = 'https://demo.sqlite-explorer.test';
+    webApi.sendRpcError('fallback', 'expected failure');
+    assert.strictEqual(webTargetOrigins.at(-1), 'https://demo.sqlite-explorer.test');
+    assert.ok(!webTargetOrigins.includes('*'));
 });

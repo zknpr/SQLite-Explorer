@@ -1195,6 +1195,52 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('keeps the outer savepoint in control of a nested demo batch update', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE nested_batch_rollback (value TEXT); " +
+            "INSERT INTO nested_batch_rollback VALUES ('before'); " +
+            'SAVEPOINT outer_batch_rollback'
+        );
+
+        await worker.invoke('updateCellBatch', 'nested_batch_rollback', [
+            { rowId: 1, column: 'value', value: 'after' }
+        ]);
+        await worker.invoke(
+            'runQuery',
+            'ROLLBACK TO outer_batch_rollback; RELEASE outer_batch_rollback'
+        );
+
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM nested_batch_rollback WHERE rowid = 1'),
+            'before'
+        );
+    });
+
+    it('nests demo column deletion and lets the outer savepoint restore the schema', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE nested_delete (kept TEXT, removed TEXT); " +
+            "INSERT INTO nested_delete VALUES ('keep', 'restore'); " +
+            'SAVEPOINT outer_delete'
+        );
+
+        await worker.invoke('deleteColumns', 'nested_delete', ['removed']);
+        await worker.invoke('runQuery', 'ROLLBACK TO outer_delete; RELEASE outer_delete');
+
+        const schema = await worker.invoke('getTableInfo', 'nested_delete');
+        assert.deepStrictEqual(
+            Array.from(schema, (column: { identifier: string }) => column.identifier),
+            ['kept', 'removed']
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT removed FROM nested_delete'),
+            'restore'
+        );
+    });
+
     it('bounds preview stepping with the configured query timeout', async () => {
         let now = 0;
         const worker = await createWorkerHarness({

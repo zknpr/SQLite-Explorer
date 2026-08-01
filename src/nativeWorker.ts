@@ -1458,16 +1458,22 @@ export async function createNativeDatabaseConnection(
               canUseRowIdCompanions = authority.values.length > 0;
             }
             if (canUseRowIdCompanions) {
-              for (const query of buildRowIdExactRealTextQueries(
+              const companionQueries = buildRowIdExactRealTextQueries(
                 table,
                 columns,
                 result.values.map(row => row[0])
-              )) {
-                const companion = await worker.call<NativeQueryResult>('query', [
-                  query.sql,
-                  query.params
+              );
+              if (companionQueries.length > 0) {
+                const companionBatch = await worker.call<NativeQueryBatchResult>('queryBatch', [
+                  companionQueries.map(query => ({ sql: query.sql, params: query.params }))
                 ]);
-                companionResults.push({ query, rows: companion.values });
+                if (companionBatch.results?.length !== companionQueries.length) {
+                  throw new Error('Exact REAL companion fetch failed: queryBatch returned incomplete results');
+                }
+                companionResults.push(...companionQueries.map((query, index) => ({
+                  query,
+                  rows: companionBatch.results[index].values
+                })));
               }
             }
             const companionExactTexts = collectRowIdExactRealTexts(
