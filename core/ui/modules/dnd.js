@@ -4,7 +4,7 @@
 import { backendApi } from './api.js';
 import { updateStatus } from './ui.js';
 import { state } from './state.js';
-import { getRowId, getRowDataOffset } from './data-utils.js';
+import { clearExactIntegerText, getRowId, getRowDataOffset } from './data-utils.js';
 import { formatCellValueAsText } from './utils.js';
 import { renderDataGrid } from './grid.js';
 
@@ -35,6 +35,18 @@ let lastHighlightedCell = null;
 
 function onDragOver(e) {
     e.preventDefault();
+
+    // Don't offer a drop target while a grid reload is in flight: the cells under
+    // the cursor are stale and about to be replaced. Leave dropEffect unset so the
+    // cursor shows "no-drop", and clear any lingering highlight.
+    if (state.isReadOnly || state.isGridReloading) {
+        if (lastHighlightedCell) {
+            lastHighlightedCell.classList.remove('drag-over');
+            lastHighlightedCell = null;
+        }
+        return;
+    }
+
     e.dataTransfer.dropEffect = 'copy';
 
     const cell = e.target.closest('.data-cell');
@@ -64,15 +76,22 @@ async function onDrop(e) {
         lastHighlightedCell = null;
     }
 
+    // Ignore drops while a grid reload is in flight: the targeted cell belongs to
+    // the stale result set about to be replaced, so the upload would land on the
+    // wrong row/column once the new data renders.
+    if (state.isReadOnly || state.isGridReloading) return;
+
     const cell = e.target.closest('.data-cell');
     if (!cell || cell.classList.contains('row-number')) {
         return;
     }
+    const uploadTarget = captureUploadTarget(cell);
+    if (!uploadTarget) return;
 
     // Check for files
     if (e.dataTransfer.files.length > 0) {
         const file = e.dataTransfer.files[0];
-        await handleFileUpload(cell, file.name, file);
+        await handleFileUpload(uploadTarget, file.name, file);
         return;
     }
 
@@ -91,13 +110,34 @@ async function onDrop(e) {
             } catch (err) {
                 console.warn('Failed to parse name from URI', err);
             }
-            await handleUriUpload(cell, name, uri);
+            await handleUriUpload(uploadTarget, name, uri);
             return;
         }
     }
 }
 
-async function handleFileUpload(cell, fileName, fileBlob) {
+/** Capture the database identity represented by a DOM cell before any file I/O. */
+function captureUploadTarget(cell) {
+    if (state.isReadOnly || state.selectedTableType !== 'table' || !state.selectedTable) {
+        updateStatus('Cannot upload to a read-only document or view');
+        return null;
+    }
+
+    const rowIdx = parseInt(cell.dataset.rowidx, 10);
+    const colIdx = parseInt(cell.dataset.colidx, 10);
+    const row = state.gridData?.[rowIdx];
+    const column = state.tableColumns[colIdx];
+    if (!row || !column) return null;
+
+    return {
+        table: state.selectedTable,
+        rowId: getRowId(row, rowIdx),
+        columnName: column.name,
+        originalValue: row[colIdx + getRowDataOffset()]
+    };
+}
+
+async function handleFileUpload(uploadTarget, fileName, fileBlob) {
     // Early size check before reading file
     if (fileBlob.size > MAX_BLOB_SIZE_BYTES) {
         const sizeMB = (fileBlob.size / (1024 * 1024)).toFixed(1);
@@ -110,14 +150,14 @@ async function handleFileUpload(cell, fileName, fileBlob) {
         updateStatus(`Reading ${fileName}...`);
         const buffer = await readFileAsArrayBuffer(fileBlob);
         const uint8Array = new Uint8Array(buffer);
-        await uploadDataToCell(cell, fileName, uint8Array);
+        await uploadDataToCell(uploadTarget, fileName, uint8Array);
     } catch (err) {
         console.error('File read failed:', err);
         updateStatus(`File read failed: ${err.message}`);
     }
 }
 
-async function handleUriUpload(cell, fileName, uri) {
+async function handleUriUpload(uploadTarget, fileName, uri) {
     try {
         updateStatus(`Fetching ${fileName}...`);
         const result = await backendApi.readWorkspaceFileUri(uri);
@@ -134,14 +174,14 @@ async function handleUriUpload(cell, fileName, uri) {
              throw new Error('Received invalid data format from backend');
         }
 
-        await uploadDataToCell(cell, fileName, uint8Array);
+        await uploadDataToCell(uploadTarget, fileName, uint8Array);
     } catch (err) {
         console.error('URI upload failed:', err);
         updateStatus(`Upload failed: ${err.message}`);
     }
 }
 
-async function uploadDataToCell(cell, fileName, uint8Array) {
+async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
     // Prevent concurrent uploads
     if (isUploading) {
         updateStatus('Upload already in progress...');
@@ -156,18 +196,12 @@ async function uploadDataToCell(cell, fileName, uint8Array) {
         return;
     }
 
-    const rowIdx = parseInt(cell.dataset.rowidx, 10);
-    const colIdx = parseInt(cell.dataset.colidx, 10);
-
-    if (!state.gridData) return;
-    const row = state.gridData[rowIdx];
-    if (!row) return;
-
-    const rowId = getRowId(row, rowIdx);
-    const column = state.tableColumns[colIdx];
-
-    if (state.selectedTableType !== 'table') {
-        updateStatus('Cannot upload to a view');
+    // File/URI reads are asynchronous. Never reinterpret the original DOM
+    // indices against a table selected while that read was in flight.
+    if (state.isReadOnly
+        || state.selectedTableType !== 'table'
+        || state.selectedTable !== uploadTarget.table) {
+        updateStatus('Upload cancelled because the selected table changed');
         return;
     }
 
@@ -178,22 +212,32 @@ async function uploadDataToCell(cell, fileName, uint8Array) {
     try {
         updateStatus(`Uploading ${fileName} (${formatBytes(uint8Array.byteLength)})...`);
 
-        // Get original value for undo
-        const originalValue = row[colIdx + getRowDataOffset()];
-
         await backendApi.updateCell(
-            state.selectedTable,
-            rowId,
-            column.name,
+            uploadTarget.table,
+            uploadTarget.rowId,
+            uploadTarget.columnName,
             uint8Array,
-            originalValue
+            uploadTarget.originalValue
         );
 
-        // Update local state
-        state.gridData[rowIdx][colIdx + getRowDataOffset()] = uint8Array;
-
-        // Update DOM
-        updateCellDom(cell, uint8Array);
+        // A background refresh may reorder rows or columns while the write is
+        // in flight. Resolve the current UI position only after the stable
+        // database identity has been written, and never paint another table.
+        if (state.selectedTable === uploadTarget.table
+            && state.selectedTableType === 'table') {
+            const currentRowIdx = state.gridData.findIndex((row, index) => (
+                getRowId(row, index) === uploadTarget.rowId
+            ));
+            const currentColIdx = state.tableColumns.findIndex(column => (
+                column.name === uploadTarget.columnName
+            ));
+            if (currentRowIdx >= 0 && currentColIdx >= 0) {
+                state.gridData[currentRowIdx][currentColIdx + getRowDataOffset()] = uint8Array;
+                clearExactIntegerText(currentRowIdx, currentColIdx);
+                const currentCell = document.getElementById(`cell-${currentRowIdx}-${currentColIdx}`);
+                if (currentCell) updateCellDom(currentCell, uint8Array);
+            }
+        }
         updateStatus(`Uploaded ${fileName}`);
     } catch (err) {
         console.error('Upload failed:', err);

@@ -14,9 +14,10 @@ import { ConfigurationSection, ExtensionId, SidebarLeft, SidebarRight, UriScheme
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions } from './core/types';
-import { generateMergePatch } from './core/json-utils';
-import { escapeIdentifier } from './core/sql-utils';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition } from './core/types';
+import { prepareCellUpdateForStorage } from './core/json-utils';
+import { escapeIdentifier, validateRowId, validateRowIds } from './core/sql-utils';
+import { isViewDefinitionConflictError } from './core/view-utils';
 
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
@@ -60,6 +61,45 @@ export class HostBridge implements ToastService {
       throw new Error("Database not initialized");
     }
     return ops;
+  }
+
+  private captureConnectionGeneration(): number {
+    return this.document.connectionGeneration;
+  }
+
+  private isConnectionGenerationCurrent(generation: number): boolean {
+    return generation === this.document.connectionGeneration;
+  }
+
+  /** Refuse a write whose read/confirmation phase belonged to an older database. */
+  private assertConnectionGeneration(generation: number): void {
+    if (!this.isConnectionGenerationCurrent(generation)) {
+      throw new Error(vsc.l10n.t(
+        'The document was reloaded while this operation was in progress. No changes were applied.'
+      ));
+    }
+  }
+
+  /**
+   * The grid currently identifies rows through SQLite's hidden rowid. A
+   * WITHOUT ROWID table needs a primary-key identity protocol end-to-end;
+   * reject it before opening a write savepoint until that post-release work
+   * is implemented, rather than leaking a raw "no such column: rowid" error.
+   */
+  private async assertTableSupportsRowIdEdits(
+    dbOps: ReturnType<HostBridge['ensureDatabaseInitialized']>,
+    table: string
+  ): Promise<void> {
+    const metadata = await dbOps.executeQuery(
+      `SELECT "wr" FROM pragma_table_list ` +
+      `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' LIMIT 1`,
+      [table]
+    );
+    if (Number(metadata[0]?.rows[0]?.[0]) === 1) {
+      throw new Error(vsc.l10n.t(
+        'WITHOUT ROWID tables are not editable yet. Primary-key identity editing is planned for a future release.'
+      ));
+    }
   }
 
   /**
@@ -112,16 +152,35 @@ export class HostBridge implements ToastService {
   /**
    * Update a single cell value.
    */
-  async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, originalValue?: CellValue) {
+  async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, _originalValue?: CellValue) {
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
 
     // Check if the document is read-only
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
 
-    const patch = this.tryGeneratePatch(value, originalValue);
-    const operation = patch ? 'json_patch' as const : 'set' as const;
+    await this.assertTableSupportsRowIdEdits(dbOps, table);
+    this.assertConnectionGeneration(connectionGeneration);
+
+    // The caller's original value may have been captured before asynchronous
+    // work (notably reading a dropped BLOB). Read by stable row identity as
+    // close to the write as possible so undo and JSON patches are based on the
+    // database value that this update actually replaces.
+    const current = await dbOps.executeQuery(
+      `SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} WHERE rowid = ? LIMIT 1`,
+      [rowId]
+    );
+    const currentRow = current[0]?.rows[0];
+    if (!currentRow) {
+      throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+    }
+    const priorValue = currentRow[0];
+    const prepared = prepareCellUpdateForStorage(value, priorValue);
+    const patch = prepared.operation === 'json_patch' ? String(prepared.value) : undefined;
+
+    this.assertConnectionGeneration(connectionGeneration);
 
     // Use specific method instead of generic exec
     // This allows the backend to handle safe SQL construction
@@ -140,9 +199,9 @@ export class HostBridge implements ToastService {
       targetTable: table,
       targetRowId: rowId,
       targetColumn: column,
-      newValue: patch ?? value,
-      operation,
-      priorValue: originalValue
+      newValue: prepared.value,
+      operation: prepared.operation,
+      priorValue
     });
   }
 
@@ -182,6 +241,7 @@ export class HostBridge implements ToastService {
    */
   async deleteRows(table: string, rowIds: RecordId[]) {
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
@@ -190,12 +250,14 @@ export class HostBridge implements ToastService {
     // Capture row data before deletion for undo
     let deletedRowsData: { rowId: RecordId; row: Record<string, CellValue> }[] = [];
     try {
-        const validIds = rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+        const validIds = validateRowIds(rowIds);
         if (validIds.length > 0) {
             const placeholders = validIds.map(() => '?').join(', ');
             // We select rowid to map back correctly, though we already have IDs.
             // Using * to get all columns.
-            const sql = `SELECT rowid, * FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`;
+            const sql =
+                `SELECT CAST(rowid AS TEXT) AS rowid, * FROM ${escapeIdentifier(table)} ` +
+                `WHERE rowid IN (${placeholders})`;
             const result = await dbOps.executeQuery(sql, validIds);
 
             if (result && result.length > 0 && result[0].rows) {
@@ -205,7 +267,7 @@ export class HostBridge implements ToastService {
                 deletedRowsData = rows.map(r => {
                     const rowData: Record<string, CellValue> = {};
                     // First col is rowid because we asked for it
-                    const rId = r[0] as number;
+                    const rId = validateRowId(r[0] as RecordId);
                   
 
                     for (let i = 0; i < headers.length; i++) {
@@ -225,6 +287,7 @@ export class HostBridge implements ToastService {
         console.warn('Failed to fetch rows for undo history:', e);
     }
 
+    this.assertConnectionGeneration(connectionGeneration);
     if ('deleteRows' in dbOps) {
       await dbOps.deleteRows(table, rowIds);
     } else {
@@ -252,6 +315,7 @@ export class HostBridge implements ToastService {
    */
   async deleteColumns(table: string, columns: string[]): Promise<{ cancelled: boolean } | void> {
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
@@ -294,7 +358,9 @@ export class HostBridge implements ToastService {
         // Fetch data for all columns in a single query to avoid N+1 query overhead
         if (columns.length > 0) {
             const escapedCols = columns.map(col => escapeIdentifier(col)).join(', ');
-            const sql = `SELECT rowid, ${escapedCols} FROM ${escapeIdentifier(table)}`;
+            const sql =
+                `SELECT CAST(rowid AS TEXT) AS rowid, ${escapedCols} ` +
+                `FROM ${escapeIdentifier(table)}`;
             const result = await dbOps.executeQuery(sql);
 
             if (result && result.length > 0 && result[0].rows) {
@@ -302,7 +368,7 @@ export class HostBridge implements ToastService {
                 const colsData = columns.map(() => [] as { rowId: RecordId; value: CellValue }[]);
 
                 for (const r of rows) {
-                    const rowId = r[0] as RecordId;
+                    const rowId = validateRowId(r[0] as RecordId);
                     for (let i = 0; i < columns.length; i++) {
                         colsData[i].push({ rowId, value: r[i + 1] });
                     }
@@ -331,6 +397,7 @@ export class HostBridge implements ToastService {
         // Proceed with deletion even if history capture fails, but warn
     }
 
+    this.assertConnectionGeneration(connectionGeneration);
     if ('deleteColumns' in dbOps) {
       // Pass dependent indexes to be dropped first if user confirmed
       await dbOps.deleteColumns(table, columns, dependentIndexes.length > 0 ? dependentIndexes : undefined);
@@ -375,56 +442,184 @@ export class HostBridge implements ToastService {
     });
   }
 
+  /** Read the editable SELECT body and attached INSTEAD OF triggers for a view. */
+  async getViewDefinition(view: string) {
+    return this.ensureDatabaseInitialized().getViewDefinition(view);
+  }
+
+  /** Ask SQLite to compile a proposed view definition without changing the schema. */
+  async validateViewDefinition(
+    view: string,
+    selectSql: string,
+    intent: ViewDefinitionIntent = 'edit'
+  ) {
+    return this.ensureDatabaseInitialized().validateViewDefinition(view, selectSql, intent);
+  }
+
+  /** Return a bounded preview for a proposed view definition. */
+  async previewViewDefinition(
+    view: string,
+    selectSql: string,
+    limit: number = 50,
+    intent: ViewDefinitionIntent = 'edit'
+  ) {
+    return this.ensureDatabaseInitialized().previewViewDefinition(view, selectSql, limit, intent);
+  }
+
+  /** Create a view and record enough state for save, undo, and redo. */
+  async createView(view: string, selectSql: string) {
+    const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
+    if (this.isReadOnly) {
+      throw new Error('Document is read-only');
+    }
+
+    this.assertConnectionGeneration(connectionGeneration);
+    const definition = await dbOps.createView(view, selectSql);
+    this.assertConnectionGeneration(connectionGeneration);
+    this.document.recordExternalModification({
+      label: 'Create View',
+      description: `Create view ${view}`,
+      modificationType: 'view_create',
+      targetTable: view,
+      viewDefAfter: definition
+    });
+    return definition;
+  }
+
+  /**
+   * Atomically replace a view. Trigger preservation is the default; discarding
+   * attached triggers requires a separate modal confirmation.
+   */
+  async editView(
+    view: string,
+    selectSql: string,
+    preserveTriggers: boolean = true,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ) {
+    const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
+    if (this.isReadOnly) {
+      throw new Error('Document is read-only');
+    }
+
+    let triggerSnapshot = expectedTriggers;
+    if (!preserveTriggers) {
+      const current = await dbOps.getViewDefinition(view);
+      // Direct callers may not already hold a modal/editor snapshot. Capture
+      // the exact trigger state shown in this confirmation so the engine can
+      // reject a trigger added or changed while the dialog is open.
+      triggerSnapshot ??= current.triggers;
+      if (current.triggers.length > 0) {
+        const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
+        const answer = await vsc.window.showWarningMessage(
+          vsc.l10n.t(
+            'Editing view "{0}" without preserving triggers will permanently drop: {1}',
+            view,
+            triggerNames
+          ),
+          { modal: true },
+          { title: vsc.l10n.t('Edit and Drop Triggers'), value: true },
+          { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
+        );
+        if (!answer?.value) {
+          return { cancelled: true } as const;
+        }
+      }
+    }
+
+    this.assertConnectionGeneration(connectionGeneration);
+    const result = await dbOps.editView(
+      view,
+      selectSql,
+      preserveTriggers,
+      expectedSql,
+      triggerSnapshot
+    );
+    this.assertConnectionGeneration(connectionGeneration);
+    this.document.recordExternalModification({
+      label: 'Edit View',
+      description: `Edit view ${view}`,
+      modificationType: 'view_edit',
+      targetTable: view,
+      viewDefBefore: result.before,
+      viewDefAfter: result.after
+    });
+    return result;
+  }
+
+  /** Drop a view only after a modal confirmation. */
+  async dropView(view: string) {
+    const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
+    if (this.isReadOnly) {
+      throw new Error('Document is read-only');
+    }
+
+    while (true) {
+      const current = await dbOps.getViewDefinition(view);
+      const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
+      const confirmationMessage = triggerNames
+        ? vsc.l10n.t(
+            'Drop view "{0}"? This will permanently drop its INSTEAD OF triggers: {1}',
+            view,
+            triggerNames
+          )
+        : vsc.l10n.t('Drop view "{0}"?', view);
+      const answer = await vsc.window.showWarningMessage(
+        confirmationMessage,
+        { modal: true },
+        { title: vsc.l10n.t('Drop View'), value: true },
+        { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
+      );
+      if (!answer?.value) {
+        return { cancelled: true } as const;
+      }
+
+      try {
+        this.assertConnectionGeneration(connectionGeneration);
+        const definition = await dbOps.dropView(
+          view,
+          current.sql,
+          current.triggers
+        );
+        this.assertConnectionGeneration(connectionGeneration);
+        this.document.recordExternalModification({
+          label: 'Drop View',
+          description: `Drop view ${view}`,
+          modificationType: 'view_drop',
+          targetTable: view,
+          viewDefBefore: definition
+        });
+        return;
+      } catch (err) {
+        // Re-read and re-confirm so the dialog always names the exact trigger
+        // set guarded by the engine-side compare-and-swap.
+        if (isViewDefinitionConflictError(err)) continue;
+        throw err;
+      }
+    }
+  }
+
   /**
    * Update multiple cells in batch.
    */
   async updateCellBatch(table: string, updates: CellUpdate[], label: string) {
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
 
-    // Ensure all updates try to generate patches for efficiency
-    const processedUpdates = updates.map(update => {
-      if (update.operation !== 'json_patch') {
-        const patch = this.tryGeneratePatch(update.value, update.originalValue);
-        if (patch) {
-          return {
-            ...update,
-            operation: 'json_patch' as const,
-            value: patch
-          };
-        }
-      }
-      return update;
-    });
+    if (updates.length === 0) return;
 
-    if (typeof dbOps.updateCellBatch === 'function') {
-      await dbOps.updateCellBatch(table, processedUpdates);
-    } else {
-      // Fallback: execute updates sequentially to avoid IPC overload and N+1 concurrency,
-      // but wrapped in a SAVEPOINT to avoid implicit auto-commits after every DML statement.
-      const savepointName = `sp_batch_fallback_${Date.now()}`;
-      await dbOps.executeQuery(`SAVEPOINT ${savepointName}`);
-      try {
-        for (const update of processedUpdates) {
-          let patch: string | undefined;
-          let val = update.value;
+    await this.assertTableSupportsRowIdEdits(dbOps, table);
+    this.assertConnectionGeneration(connectionGeneration);
 
-          if (update.operation === 'json_patch') {
-            patch = update.value as string;
-            val = null;
-          }
-
-          await dbOps.updateCell(table, update.rowId, update.column, val, patch);
-        }
-        await dbOps.executeQuery(`RELEASE SAVEPOINT ${savepointName}`);
-      } catch (err) {
-        await dbOps.executeQuery(`ROLLBACK TO SAVEPOINT ${savepointName}`);
-        throw err;
-      }
-    }
+    const historyCells = await dbOps.updateCellBatch(table, updates);
+    this.assertConnectionGeneration(connectionGeneration);
 
     // Fire batch edit event
     this.document.recordExternalModification({
@@ -432,13 +627,7 @@ export class HostBridge implements ToastService {
       description: `Update ${updates.length} cells in ${table}`,
       modificationType: 'cell_update',
       targetTable: table,
-      affectedCells: processedUpdates.map(u => ({
-        rowId: u.rowId,
-        columnName: u.column,
-        newValue: u.value,
-        priorValue: u.originalValue,
-        operation: u.operation ?? 'set'
-      }))
+      affectedCells: historyCells
     });
   }
 
@@ -624,14 +813,19 @@ export class HostBridge implements ToastService {
   /**
    * Refresh the database from disk.
    *
-   * @returns The refreshed database operations
+   * @returns Refreshed connection capabilities for immediate webview gating
    */
   async refreshFile() {
     const { document } = this;
     if (document.uri.scheme !== 'untitled') {
-      return document.reloadFromDisk();
+      await document.reloadFromDisk();
+      return {
+        connected: true,
+        filename: document.fileParts.filename,
+        readOnly: this.isReadOnly
+      };
     }
-    throw new Error("Document not found in webviews");
+    throw new Error(vsc.l10n.t('Reload is unavailable for untitled databases'));
   }
 
 
@@ -734,6 +928,32 @@ export class HostBridge implements ToastService {
 
       await vsc.commands.executeCommand('vscode.open', cellUri, vsc.ViewColumn.Two);
     }
+  }
+
+  /** Open a view's SELECT body in the writable virtual filesystem as SQL. */
+  async openViewEditor(view: string, webviewId?: string) {
+    if (this.isReadOnly) {
+      throw new Error('Document is read-only');
+    }
+
+    const { document } = this;
+    if (document.uri.scheme === 'untitled') {
+      throw new Error(vsc.l10n.t(
+        'The external view editor is unavailable for untitled databases'
+      ));
+    }
+
+    const docKey = await document.documentKey;
+    const uriPath = [docKey, view, '-', '__view__.sql', 'definition.sql']
+      .map(part => encodeURIComponent(part))
+      .join('/');
+    const viewUri = vsc.Uri.from({
+      scheme: UriScheme,
+      path: `/${uriPath}`,
+      query: webviewId ? `webview-id=${encodeURIComponent(webviewId)}` : ''
+    });
+
+    await vsc.commands.executeCommand('vscode.open', viewUri, vsc.ViewColumn.Two);
   }
 
   /**
@@ -912,38 +1132,6 @@ export class HostBridge implements ToastService {
         }
         await vsc.workspace.fs.writeFile(uri, buffer);
     }
-  }
-
-  /**
-   * Attempt to generate a JSON merge patch between two cell values.
-   */
-  private tryGeneratePatch(value: CellValue, originalValue?: CellValue): string | undefined {
-    if (
-      typeof value === 'string' &&
-      typeof originalValue === 'string' &&
-      (value.startsWith('{') || value.startsWith('[')) &&
-      (originalValue.startsWith('{') || originalValue.startsWith('['))
-    ) {
-      try {
-        const originalObj = JSON.parse(originalValue);
-        const newObj = JSON.parse(value);
-
-        // Only patch if valid JSON objects (not arrays, primitives, null)
-        // SQLite json_patch merge behavior is specific to objects.
-        // RFC 7396 defines how arrays are replaced entirely.
-        if (originalObj && typeof originalObj === 'object' && !Array.isArray(originalObj) &&
-            newObj && typeof newObj === 'object' && !Array.isArray(newObj)) {
-
-            const patchObj = generateMergePatch(originalObj, newObj);
-            if (patchObj !== undefined) {
-                return JSON.stringify(patchObj);
-            }
-        }
-      } catch {
-        // Not valid JSON or parse error, ignore and do full update
-      }
-    }
-    return undefined;
   }
 
   /**

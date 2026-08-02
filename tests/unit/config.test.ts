@@ -40,4 +40,19 @@ describe('getQueryTimeout', () => {
     configStore.set('queryTimeout', 60000);
     assert.strictEqual(getQueryTimeout(), 60000);
   });
+
+  it('clamps hand-edited values below the configuration schema minimum', () => {
+    configStore.set('queryTimeout', 0);
+    assert.strictEqual(getQueryTimeout(), 1000);
+  });
+
+  it('uses the default for a non-numeric hand-edited value', () => {
+    configStore.set('queryTimeout', 'not-a-number');
+    assert.strictEqual(getQueryTimeout(), 30000);
+  });
+
+  it('uses the default for a non-finite hand-edited value', () => {
+    configStore.set('queryTimeout', Number.POSITIVE_INFINITY);
+    assert.strictEqual(getQueryTimeout(), 30000);
+  });
 });

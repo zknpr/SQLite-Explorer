@@ -5,8 +5,14 @@
  * instead of VS Code API. This enables the viewer to run standalone
  * in a browser iframe.
  */
-import { state } from './modules/state.js';
-import { handleRpcResponse, sendRpcResult, sendRpcError, backendApi } from './modules/web-api.js';
+import { state, persistState } from './modules/state.js';
+import {
+    handleRpcResponse,
+    isTrustedParentMessage,
+    sendRpcResult,
+    sendRpcError,
+    backendApi
+} from './modules/web-api.js';
 import {
     initSidebar,
     refreshSchema
@@ -16,8 +22,7 @@ import {
 } from './modules/export.js';
 
 import {
-    initCrud,
-    submitDelete
+    initCrud
 } from './modules/crud.js';
 import {
     updateStatus,
@@ -29,26 +34,24 @@ import {
     initModals
 } from './modules/modals.js';
 import {
+    clearSelection,
+    loadTableColumns,
     loadTableData,
-    onSelectAllClick,
     initGridInteraction,
-    initGridControls,
-    clearSelection
+    initGridControls
 } from './modules/grid.js';
 import {
     initEdit
 } from './modules/edit.js';
-import {
-    copyCellsToClipboard,
-    copySelectedRowsToClipboard,
-    clearSelectedCellValues
-} from './modules/clipboard.js';
 import {
     initSettings
 } from './modules/settings.js';
 import {
     initDragAndDrop
 } from './modules/dnd.js';
+import { initViews } from './modules/views.js';
+import { applyConnectionResult } from './modules/connection-state.js';
+import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
 
 // ============================================================================
 // Web-specific RPC initialization
@@ -58,17 +61,31 @@ import {
  * Methods that can be called by the parent window.
  */
 const webviewMethods = {
-    async refreshContent(filename) {
+    async refreshContent(filename, connectionResult) {
+        if (connectionResult) {
+            applyConnectionResult(connectionResult);
+        }
         if (state.isDbConnected) {
+            // A broadcast view refresh may change projection and row order.
+            // Clear positional state before the first await so controls cannot
+            // target cells from the previous result while schema reloads.
+            if (state.selectedTable && state.selectedTableType === 'view') {
+                clearSelection();
+                persistState();
+            }
+
             await refreshSchema();
             const tableExists = state.schemaCache.tables.some(t => t.name === state.selectedTable) ||
                                 state.schemaCache.views.some(v => v.name === state.selectedTable);
             if (!tableExists && state.selectedTable) {
+                clearSelection();
                 state.selectedTable = null;
                 state.selectedTableType = null;
                 document.getElementById('tableNameLabel').textContent = 'No table selected';
                 showEmptyState();
+                persistState();
             } else if (state.selectedTable) {
+                await loadTableColumns();
                 await loadTableData(false);
             }
         }
@@ -91,6 +108,7 @@ const webviewMethods = {
  */
 function initWebRpc() {
     window.addEventListener('message', event => {
+        if (!isTrustedParentMessage(event)) return;
         const envelope = event.data;
 
         // Handle RPC invocation from parent
@@ -142,6 +160,7 @@ async function initializeApp() {
         initGridInteraction();
         initSidebarResize();
         initDragAndDrop();
+        initViews();
 
         // Hide VS Code-specific buttons
         const vscodeBtn = document.getElementById('openInVsCodeBtn');
@@ -151,7 +170,9 @@ async function initializeApp() {
 
         // Initialize connection - parent window handles this
         const result = await backendApi.initialize();
-        state.isDbConnected = true;
+        if (!applyConnectionResult(result)) {
+            throw new Error('Failed to connect to database');
+        }
 
         // Test connection
         await backendApi.ping();
@@ -162,54 +183,7 @@ async function initializeApp() {
         updateStatus('Ready');
         showEmptyState();
 
-        // Global shortcuts
-        document.addEventListener('keydown', async (event) => {
-            // Escape
-            if (event.key === 'Escape') {
-                if (!state.editingCellInfo && !document.querySelector('.modal-overlay:not(.hidden)')) {
-                    clearSelection();
-                }
-            }
-
-            // Cmd+C / Ctrl+C
-            if ((event.metaKey || event.ctrlKey) && event.key === 'c') {
-                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT') return;
-
-                if (state.selectedCells.length > 0) {
-                    event.preventDefault();
-                    await copyCellsToClipboard();
-                } else if (state.selectedRowIds.size > 0) {
-                    event.preventDefault();
-                    await copySelectedRowsToClipboard();
-                }
-            }
-
-            // Cmd+A / Ctrl+A
-            if ((event.metaKey || event.ctrlKey) && event.key === 'a') {
-                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT') return;
-
-                if (state.selectedTable) {
-                    event.preventDefault();
-                    onSelectAllClick(event);
-                }
-            }
-
-            // Delete / Backspace
-            if ((event.metaKey || event.ctrlKey) && (event.key === 'Delete' || event.key === 'Backspace')) {
-                if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
-
-                if (state.selectedTable && state.selectedTableType === 'table') {
-                    event.preventDefault();
-                    if (state.selectedColumns.size > 0) {
-                        await submitDelete();
-                    } else if (state.selectedRowIds.size > 0) {
-                        await submitDelete();
-                    } else if (state.selectedCells.length > 0) {
-                        await clearSelectedCellValues();
-                    }
-                }
-            }
-        });
+        setupGlobalShortcuts();
 
     } catch (err) {
         console.error('Init error:', err);

@@ -17,18 +17,22 @@ import type {
   DatabaseInitConfig,
   DatabaseInitResult,
   CellUpdate,
+  CellUpdateResult,
   TableQueryOptions,
   TableCountOptions,
   SchemaSnapshot,
   ColumnMetadata,
   ColumnDefinition,
-  ModificationEntry
+  ModificationEntry,
+  ViewDefinitionIntent,
+  ViewTriggerDefinition
 } from './types';
 import { getNodeFs } from './platform/fs';
 import {
   WasmDatabaseEngine,
   type WasmDatabaseInstance,
-  type WasmEngineModule
+  type WasmEngineModule,
+  type WasmEngineLogHandler
 } from './engine/wasm/WasmDatabaseEngine';
 
 export { WasmDatabaseEngine } from './engine/wasm/WasmDatabaseEngine';
@@ -45,7 +49,8 @@ export { getNodeFs } from './platform/fs';
  * @returns Database operations handle and read-only flag
  */
 export async function createDatabaseEngine(
-  config: DatabaseInitConfig
+  config: DatabaseInitConfig,
+  logger?: WasmEngineLogHandler
 ): Promise<DatabaseInitResult> {
   // Dynamically load sql.js module
   const loadEngine = (await import('sql.js')).default;
@@ -101,7 +106,12 @@ export async function createDatabaseEngine(
     wasmInstance = new SqlJsModule.Database();
   }
 
-  const engine = new WasmDatabaseEngine(wasmInstance, config.queryTimeout);
+  const engine = new WasmDatabaseEngine(
+    wasmInstance,
+    config.queryTimeout,
+    config.readOnlyMode ?? false,
+    logger
+  );
 
   return {
     operations: engine,
@@ -119,7 +129,7 @@ export async function createDatabaseEngine(
  * This factory creates an object with methods that can be exposed
  * to the extension host via the IPC module.
  */
-export function createWorkerEndpoint() {
+export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
   let activeEngine: WasmDatabaseEngine | null = null;
 
   function requireEngine(): WasmDatabaseEngine {
@@ -144,7 +154,7 @@ export function createWorkerEndpoint() {
         activeEngine.shutdown();
       }
 
-      const result = await createDatabaseEngine(config);
+      const result = await createDatabaseEngine(config, logger);
       activeEngine = result.operations as WasmDatabaseEngine;
 
       // Return value is primarily used for isReadOnly flag.
@@ -227,7 +237,56 @@ export function createWorkerEndpoint() {
       return requireEngine().createTable(table, columns);
     },
 
-    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
+    async getViewDefinition(view: string) {
+      return requireEngine().getViewDefinition(view);
+    },
+
+    async validateViewDefinition(
+      view: string,
+      selectSql: string,
+      intent?: ViewDefinitionIntent
+    ): Promise<void> {
+      return requireEngine().validateViewDefinition(view, selectSql, intent);
+    },
+
+    async previewViewDefinition(
+      view: string,
+      selectSql: string,
+      limit?: number,
+      intent?: ViewDefinitionIntent
+    ) {
+      return requireEngine().previewViewDefinition(view, selectSql, limit, intent);
+    },
+
+    async createView(view: string, selectSql: string) {
+      return requireEngine().createView(view, selectSql);
+    },
+
+    async editView(
+      view: string,
+      selectSql: string,
+      preserveTriggers?: boolean,
+      expectedSql?: string,
+      expectedTriggers?: readonly ViewTriggerDefinition[]
+    ) {
+      return requireEngine().editView(
+        view,
+        selectSql,
+        preserveTriggers,
+        expectedSql,
+        expectedTriggers
+      );
+    },
+
+    async dropView(
+      view: string,
+      expectedSql?: string,
+      expectedTriggers?: readonly ViewTriggerDefinition[]
+    ) {
+      return requireEngine().dropView(view, expectedSql, expectedTriggers);
+    },
+
+    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> {
       return requireEngine().updateCellBatch(table, updates);
     },
 

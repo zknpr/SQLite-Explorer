@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.6.0
+
+### Features
+
+- **Create, edit, and drop views from the sidebar.** The Views section now has a Create View action, and each view row has inline Edit and Drop actions. Editing opens the view's SELECT body in a real VS Code editor tab as a writable `.sql` document (native SQL syntax highlighting); the web demo falls back to an in-webview modal editor. Definitions can be validated (compiled by SQLite itself, without executing) and previewed (bounded sample) before saving. Because SQLite has no `CREATE OR REPLACE VIEW`, edits atomically drop and recreate the view inside a SAVEPOINT — an invalid definition rolls back leaving the original view untouched. `INSTEAD OF` triggers and explicit view column lists are preserved and recreated by default; choosing to discard triggers requires an explicit confirmation listing what would be lost, as does dropping a view. Create, edit, and drop all participate in undo/redo, and the sidebar refreshes after every change. (#510)
+- **Tri-state column sorting.** Clicking a column header now cycles none → ascending → descending → none, instead of toggling between ascending and descending with no way back to the natural row order. (#501)
+- **Filter match highlighting.** Grid cells highlight the matching substrings of the active filter, built from DOM text nodes and `<mark>` elements (never HTML injection), with duplicate terms deduplicated and longer terms matched first so overlapping terms don't shadow each other. (#499)
+- **Enter navigates filter matches.** With a filter active, Enter jumps to the next matching cell and Shift+Enter to the previous one, scrolling the match into view. Composition (IME) input is respected, a failed filter application restores the previous term, and navigation is suppressed when a newer load superseded the one that produced the matches. (#500)
+
+### Fixes
+
+- **No more grid flicker on refresh.** Reloading the same table (after an edit, undo, or filter change) previously unmounted the grid and showed the loading spinner, flashing the UI on every refresh. The grid now stays mounted during same-table refetches; the spinner only appears on a real table switch. Overlapping loads are serialized with a request token so a stale response can never render over a newer one, and a dedicated reload guard blocks the full stale-grid interaction surface (cell click/double-click/keyboard/scroll, the global select-all and delete shortcuts, and BLOB drag-and-drop) in both the extension webview and the web demo. (#498)
+
+### Security
+
+- **View DDL is hardened by construction.** The new view operations escape every identifier, parameterize all schema lookups, compile user SQL through a single-statement `EXPLAIN` in a SELECT-only context (trailing statements cannot execute; DML cannot hide in a subquery), clamp preview sizes engine-side, and run every schema change inside a SAVEPOINT that rolls back on failure. Destructive confirmations (drop view, discard triggers) run in the extension host, outside the webview's reach.
+
+### Dependencies
+
+- Extension dev-dependencies: `tsx` 4.22.4 → 4.23.1, `@types/node` → 26.1.2, plus transitive security refreshes (`js-yaml`, `fast-uri`, `linkify-it`, `brace-expansion`, `form-data`, `markdown-it`). Nothing in the shipped `.vsix` was affected.
+- Website: `next` 16.2.7 → 16.2.12 (security) with `sharp` → 0.35.3 forced via override (`next` still defaults to a vulnerable `sharp` line), `react`/`react-dom` 19.2.8, `eslint` 10.8.0, `tailwindcss` + `@tailwindcss/postcss` 4.3.3, `eslint-config-next` 16.2.12, `lucide-react` 1.28.0, `@types/node` 26.1.2.
+
 ## 1.5.3
 
 ### Fixes

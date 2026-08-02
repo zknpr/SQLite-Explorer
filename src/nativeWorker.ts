@@ -27,6 +27,7 @@ import type {
   DatabaseInitResult,
   ModificationEntry,
   CellUpdate,
+  CellUpdateResult,
   TableQueryOptions,
   TableCountOptions,
   SchemaSnapshot,
@@ -34,18 +35,67 @@ import type {
   ColumnDefinition,
   TableMetadata,
   ViewMetadata,
-  IndexMetadata
+  IndexMetadata,
+  ViewDefinition,
+  ViewDefinitionIntent,
+  ViewEditResult,
+  ViewTriggerDefinition,
+  ExactIntegerTextMap
 } from './core/types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
-import { computeJsonPatchUndo } from './core/json-utils';
+import { computeJsonPatchUndo, prepareCellUpdateForStorage } from './core/json-utils';
+import {
+  buildExactNumericTextQuery,
+  buildRowIdExactRealTextQueries,
+  collectRowIdExactRealTexts,
+  hasUnsafeBigIntAtColumn,
+  normalizeIntegerRowsForTransport,
+  ROWID_TABLE_AUTHORITY_SQL
+} from './core/integer-utils';
 import { serializeOperations } from './core/operation-serializer';
+import { InvocationTimeoutError } from './core/rpc';
+import {
+  assertViewDefinitionSnapshotCurrent,
+  assertViewDefinitionStateCurrent,
+  assertViewDefinitionIntent,
+  assertViewTriggerSnapshotIsMutationSafe,
+  assertViewTriggersCompatibleWithColumns,
+  buildCreateViewTriggerSql,
+  buildCreateViewSql,
+  extractViewColumnListSql,
+  extractViewSelectSql,
+  escapeMainViewIdentifier,
+  mapViewTriggerRows,
+  VIEW_TRIGGER_SCHEMA_QUERIES,
+  normalizeViewSelectSql
+} from './core/view-utils';
+import { crypto } from './platform/cryptoShim';
+import { DEFAULT_QUERY_TIMEOUT_MS } from './config';
 
 // ============================================================================
 // Utility Functions
 // ============================================================================
 
 // Utility functions moved to src/core/sql-utils.ts
+
+function mergeExactIntegerTextMaps(
+  companionTexts: ExactIntegerTextMap | undefined,
+  nativeTexts: ExactIntegerTextMap | undefined
+): ExactIntegerTextMap | undefined {
+  if (!companionTexts) return nativeTexts;
+  if (!nativeTexts) return companionTexts;
+
+  const merged: ExactIntegerTextMap = {};
+  for (const source of [companionTexts, nativeTexts]) {
+    for (const [rowIndex, columns] of Object.entries(source)) {
+      const numericRowIndex = Number(rowIndex);
+      merged[numericRowIndex] ??= {};
+      Object.assign(merged[numericRowIndex], columns);
+    }
+  }
+  return merged;
+}
 
 /**
  * Build a minimal env block for the txiki-js child process.
@@ -90,7 +140,10 @@ const HEADER_SIZE = 4;
 const INIT_TIMEOUT = 10000;
 
 /** Timeout for individual queries (ms) */
-const QUERY_TIMEOUT = 30000;
+const QUERY_TIMEOUT = DEFAULT_QUERY_TIMEOUT_MS;
+
+/** Let a bounded worker query report its own precise timeout before RPC expires. */
+const BOUNDED_QUERY_TRANSPORT_MARGIN_MS = 2000;
 
 // ============================================================================
 // Platform Detection
@@ -269,7 +322,7 @@ export class NativeWorkerProcess {
    * @param args - Arguments to pass
    * @returns Promise resolving to the result
    */
-  async call<T>(method: string, args: unknown[] = []): Promise<T> {
+  async call<T>(method: string, args: unknown[] = [], timeoutMs: number = QUERY_TIMEOUT): Promise<T> {
     if (!this.process || !this.process.stdin) {
       throw new Error('Native worker not running');
     }
@@ -279,8 +332,13 @@ export class NativeWorkerProcess {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(id);
-        reject(new Error(`Request ${method} timed out`));
-      }, QUERY_TIMEOUT);
+        reject(new InvocationTimeoutError(
+          method,
+          method === 'queryBounded'
+            ? `Query execution timed out after ${timeoutMs}ms`
+            : `Request ${method} timed out`
+        ));
+      }, timeoutMs);
 
       this.pendingRequests.set(id, {
         resolve: resolve as (value: unknown) => void,
@@ -396,6 +454,7 @@ interface NativeQueryResult {
   columns: string[];
   values: CellValue[][];
   rowCount?: number;
+  exactIntegerTexts?: ExactIntegerTextMap;
 }
 
 interface NativeQueryBatchResult {
@@ -442,11 +501,14 @@ export async function isNativeAvailable(extensionPath: string): Promise<boolean>
  *
  * @param extensionUri - Extension installation directory URI
  * @param _reporter - Optional telemetry reporter
+ * @param outputChannel - Optional extension output channel for worker diagnostics
  * @returns Connection bundle with native worker
  */
 export async function createNativeDatabaseConnection(
   extensionUri: vsc.Uri,
-  _reporter?: TelemetryReporter
+  _reporter?: TelemetryReporter,
+  outputChannel?: vsc.OutputChannel | null,
+  queryTimeout: number = DEFAULT_QUERY_TIMEOUT_MS
 ): Promise<DatabaseConnectionBundle> {
   const extensionPath = extensionUri.fsPath;
   const binaryPath = await getNativeBinaryPath(extensionPath);
@@ -508,6 +570,189 @@ export async function createNativeDatabaseConnection(
       // Public mutating operations are wrapped below with a per-connection
       // promise-chain lock. The raw implementation is used for internal
       // facade-to-facade calls so composite operations do not deadlock.
+      const createSavepointName = (prefix: string): string => (
+        escapeIdentifier(`${prefix}_${crypto.randomUUID().replace(/-/g, '')}`)
+      );
+
+      const safeRollbackSavepoint = async (savepointName: string, context: string): Promise<void> => {
+        try {
+          await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
+          await worker.call('run', [`RELEASE ${savepointName}`]);
+        } catch (rollbackErr) {
+          const message = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+          outputChannel?.appendLine(`[NativeWorker] Failed to rollback native savepoint (${context}): ${message}`);
+        }
+      };
+
+      const findNativeViewDefinition = async (
+        view: string,
+        allowUnparsed: boolean = false
+      ): Promise<ViewDefinition | null> => {
+        const metadataQueries = [
+          {
+            sql: "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+            params: [view]
+          },
+          ...VIEW_TRIGGER_SCHEMA_QUERIES.map(source => ({
+            sql: source.sql,
+            params: source.params(view)
+          }))
+        ];
+        const metadata = await worker.call<NativeQueryBatchResult>('queryBatch', [metadataQueries]);
+        if (!metadata?.results || metadata.results.length < metadataQueries.length) {
+          throw new Error('View definition fetch failed: queryBatch returned incomplete results');
+        }
+
+        const viewResult = metadata.results[0];
+        const createSql = viewResult.values?.[0]?.[0];
+        if (typeof createSql !== 'string') {
+          return null;
+        }
+
+        const { triggers, ambiguousTemporaryTriggerNames } = mapViewTriggerRows(
+          view,
+          VIEW_TRIGGER_SCHEMA_QUERIES.map((_, index) => (
+            metadata.results[index + 1].values ?? []
+          ))
+        );
+
+        let selectSql: string;
+        let columnListSql: string | undefined;
+        try {
+          selectSql = extractViewSelectSql(createSql);
+          columnListSql = extractViewColumnListSql(createSql);
+        } catch (err) {
+          if (!allowUnparsed) throw err;
+          selectSql = '';
+        }
+        return {
+          identifier: view,
+          sql: createSql,
+          selectSql,
+          columnListSql,
+          triggers,
+          ...(ambiguousTemporaryTriggerNames.length > 0
+            ? { ambiguousTemporaryTriggerNames }
+            : {})
+        };
+      };
+
+      const getNativeViewDefinition = async (
+        view: string,
+        allowUnparsed: boolean = false
+      ): Promise<ViewDefinition> => {
+        const definition = await findNativeViewDefinition(view, allowUnparsed);
+        if (!definition) throw new Error(`View not found: ${view}`);
+        return definition;
+      };
+
+      /** Resolve one canonical installed-view snapshot for intent checks and column preservation. */
+      const resolveExistingViewForIntent = async (
+        view: string,
+        intent: ViewDefinitionIntent
+      ): Promise<{ storedSql: CellValue | undefined; columnListSql: string | undefined }> => {
+        const result = await worker.call<NativeQueryResult>('query', [
+          "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+          [view]
+        ]);
+        const row = result.values?.[0];
+        assertViewDefinitionIntent(view, row !== undefined, intent);
+        const storedSql = row?.[0];
+        return {
+          storedSql,
+          columnListSql: typeof storedSql === 'string'
+            ? extractViewColumnListSql(storedSql)
+            : undefined
+        };
+      };
+
+      const getNativeColumnNames = async (
+        table: string,
+        qualifyMain: boolean = false
+      ): Promise<string[]> => {
+        const pragma = qualifyMain ? 'PRAGMA main.table_info' : 'PRAGMA table_info';
+        const info = await worker.call<NativeQueryResult>('query', [
+          `${pragma}(${escapeIdentifier(table)})`
+        ]);
+        const nameIndex = info.columns.indexOf('name');
+        if (nameIndex < 0 && (info.values?.length ?? 0) > 0) {
+          throw new Error('SQLite returned table metadata without a column name field');
+        }
+        return (info.values ?? []).map(row => {
+          const name = row[nameIndex];
+          if (typeof name !== 'string') {
+            throw new Error('SQLite returned invalid column metadata');
+          }
+          return name;
+        });
+      };
+
+      const queryNativeSingleStatement = async <T>(sql: string): Promise<T> => {
+        const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
+        return worker.call<T>('querySingle', [`${sql}\n${boundary}`, undefined, boundary]);
+      };
+
+      const runNativeSingleStatement = async (sql: string, params?: CellValue[]): Promise<void> => {
+        const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
+        await worker.call('runSingle', [`${sql}\n${boundary}`, sql, params, boundary]);
+      };
+
+      const queryNativeBoundedStatement = async (
+        sql: string,
+        columns: string[],
+        limit: number
+      ): Promise<NativeQueryResult> => {
+        const transportQuery = buildExactNumericTextQuery(sql, columns.length);
+        const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
+        return worker.call<NativeQueryResult>('queryBounded', [
+          `${transportQuery.sql}\n${boundary}`,
+          transportQuery.sql,
+          boundary,
+          transportQuery.transportColumns,
+          transportQuery.valueColumnCount,
+          limit,
+          queryTimeout
+        ], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS);
+      };
+
+      const compileNativeViewSelect = async (selectSql: string): Promise<void> => {
+        await queryNativeSingleStatement(`EXPLAIN SELECT * FROM (${selectSql}\n) LIMIT 0`);
+      };
+
+      const compileNativeView = async (view: string): Promise<void> => {
+        await queryNativeSingleStatement(
+          `EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`
+        );
+      };
+
+      const applyNativeViewHistoryState = async (
+        view: string,
+        expectedCurrent: ViewDefinition | null,
+        replacement: ViewDefinition | null
+      ): Promise<void> => {
+        const savepointName = createSavepointName('sp_restore_view');
+        await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+        try {
+          const current = await findNativeViewDefinition(view, true);
+          if (current) assertViewTriggerSnapshotIsMutationSafe(current);
+          assertViewDefinitionStateCurrent(expectedCurrent, current);
+          if (current) {
+            await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
+          }
+          if (replacement) {
+            await runNativeSingleStatement(replacement.sql);
+            await compileNativeView(replacement.identifier);
+            for (const trigger of replacement.triggers) {
+              await runNativeSingleStatement(buildCreateViewTriggerSql(trigger));
+            }
+          }
+          await worker.call('run', [`RELEASE ${savepointName}`]);
+        } catch (err) {
+          await safeRollbackSavepoint(savepointName, 'restoreViewDefinition');
+          throw err;
+        }
+      };
+
       const rawOperations: DatabaseOperations = {
         engineKind: Promise.resolve('native'),
 
@@ -624,7 +869,10 @@ export async function createNativeDatabaseConnection(
 
             case 'row_insert':
               if (targetRowId !== undefined) {
-                await worker.call('run', [`DELETE FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`, [Number(targetRowId)]]);
+                await worker.call('run', [
+                  `DELETE FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`,
+                  [validateRowId(targetRowId)]
+                ]);
               }
               break;
 
@@ -655,7 +903,7 @@ export async function createNativeDatabaseConnection(
                         for (const { rowId, value } of col.data) {
                             batch.push({
                                 sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`,
-                                params: [value, Number(rowId)]
+                                params: [value, validateRowId(rowId)]
                             });
                         }
                     }
@@ -667,6 +915,34 @@ export async function createNativeDatabaseConnection(
 
             case 'table_create':
                 await worker.call('run', [`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`]);
+                break;
+
+            case 'view_create':
+                if (mod.viewDefAfter) {
+                  await applyNativeViewHistoryState(targetTable, mod.viewDefAfter, null);
+                } else {
+                  outputChannel?.appendLine('[NativeWorker] Skipping view undo: definition missing from history entry');
+                }
+                break;
+
+            case 'view_edit':
+                if (mod.viewDefBefore && mod.viewDefAfter) {
+                  await applyNativeViewHistoryState(
+                    targetTable,
+                    mod.viewDefAfter,
+                    mod.viewDefBefore
+                  );
+                } else {
+                  outputChannel?.appendLine('[NativeWorker] Skipping view undo: definition missing from history entry');
+                }
+                break;
+
+            case 'view_drop':
+                if (mod.viewDefBefore) {
+                  await applyNativeViewHistoryState(targetTable, null, mod.viewDefBefore);
+                } else {
+                  outputChannel?.appendLine('[NativeWorker] Skipping view undo: definition missing from history entry');
+                }
                 break;
           }
         },
@@ -733,6 +1009,34 @@ export async function createNativeDatabaseConnection(
             case 'table_create':
               if (tableDef && tableDef.columns) {
                 await rawOperations.createTable(targetTable, tableDef.columns);
+              }
+              break;
+
+            case 'view_create':
+              if (mod.viewDefAfter) {
+                await applyNativeViewHistoryState(targetTable, null, mod.viewDefAfter);
+              } else {
+                outputChannel?.appendLine('[NativeWorker] Skipping view redo: definition missing from history entry');
+              }
+              break;
+
+            case 'view_edit':
+              if (mod.viewDefBefore && mod.viewDefAfter) {
+                await applyNativeViewHistoryState(
+                  targetTable,
+                  mod.viewDefBefore,
+                  mod.viewDefAfter
+                );
+              } else {
+                outputChannel?.appendLine('[NativeWorker] Skipping view redo: definition missing from history entry');
+              }
+              break;
+
+            case 'view_drop':
+              if (mod.viewDefBefore) {
+                await applyNativeViewHistoryState(targetTable, mod.viewDefBefore, null);
+              } else {
+                outputChannel?.appendLine('[NativeWorker] Skipping view redo: definition missing from history entry');
               }
               break;
           }
@@ -933,58 +1237,285 @@ export async function createNativeDatabaseConnection(
           await worker.call('run', [sql]);
         },
 
+        getViewDefinition: getNativeViewDefinition,
+
+        validateViewDefinition: async (
+          view: string,
+          selectSql: string,
+          intent: ViewDefinitionIntent = 'edit'
+        ) => {
+          if (forceReadOnly) {
+            throw new Error('View validation is unavailable because the database is read-only');
+          }
+          const body = normalizeViewSelectSql(selectSql);
+          const { storedSql: existingSql, columnListSql } =
+            await resolveExistingViewForIntent(view, intent);
+          const savepointName = createSavepointName('sp_validate_view');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            if (typeof existingSql === 'string') {
+              await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
+            }
+            await runNativeSingleStatement(buildCreateViewSql(view, body, columnListSql));
+            await compileNativeView(view);
+            await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+          } catch (err) {
+            await safeRollbackSavepoint(savepointName, 'validateViewDefinition');
+            throw err;
+          }
+        },
+
+        previewViewDefinition: async (
+          view: string,
+          selectSql: string,
+          limit: number = 50,
+          intent: ViewDefinitionIntent = 'edit'
+        ) => {
+          if (forceReadOnly) {
+            throw new Error('View preview is unavailable because the database is read-only');
+          }
+          const body = normalizeViewSelectSql(selectSql);
+          const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
+          const { storedSql: existingSql, columnListSql } =
+            await resolveExistingViewForIntent(view, intent);
+          // Native preview always needs DDL because the txiki row-object API
+          // needs the disposable view's positional schema; consequently it is
+          // explicitly refused read-only. WASM/demo can use a target-named CTE
+          // only as their read-only fallback. Replace the real target name here
+          // so even schema-qualified self-references cannot resolve the old view.
+          const savepointName = createSavepointName('sp_preview_view');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            if (typeof existingSql === 'string') {
+              await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
+            }
+            await runNativeSingleStatement(
+              buildCreateViewSql(view, body, columnListSql)
+            );
+            await compileNativeView(view);
+            const columns = await getNativeColumnNames(view, true);
+            const result = await queryNativeBoundedStatement(
+              `SELECT * FROM ${escapeMainViewIdentifier(view)}`,
+              columns,
+              boundedLimit
+            );
+            const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+              result.values,
+              undefined,
+              result.exactIntegerTexts
+            );
+            await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return {
+              headers: columns,
+              rows,
+              columns,
+              values: rows,
+              columnNames: columns,
+              records: rows,
+              exactIntegerTexts
+            };
+          } catch (err) {
+            await safeRollbackSavepoint(savepointName, 'previewViewDefinition');
+            throw err;
+          }
+        },
+
+        createView: async (view: string, selectSql: string): Promise<ViewDefinition> => {
+          if (forceReadOnly) {
+            throw new Error('View creation is unavailable because the database is read-only');
+          }
+          const body = normalizeViewSelectSql(selectSql);
+          await compileNativeViewSelect(body);
+          const savepointName = createSavepointName('sp_create_view');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            await runNativeSingleStatement(buildCreateViewSql(view, body));
+            await compileNativeView(view);
+            const definition = await getNativeViewDefinition(view);
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return definition;
+          } catch (err) {
+            await safeRollbackSavepoint(savepointName, 'createView');
+            throw err;
+          }
+        },
+
+        editView: async (
+          view: string,
+          selectSql: string,
+          preserveTriggers: boolean = true,
+          expectedSql?: string,
+          expectedTriggers?: readonly ViewTriggerDefinition[]
+        ): Promise<ViewEditResult> => {
+          if (forceReadOnly) {
+            throw new Error('View editing is unavailable because the database is read-only');
+          }
+          const body = normalizeViewSelectSql(selectSql);
+          await compileNativeViewSelect(body);
+          const savepointName = createSavepointName('sp_edit_view');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            const before = await getNativeViewDefinition(view);
+            assertViewTriggerSnapshotIsMutationSafe(before);
+            assertViewDefinitionSnapshotCurrent(
+              expectedSql,
+              before.sql,
+              expectedTriggers,
+              before.triggers
+            );
+            await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
+            await runNativeSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
+            await compileNativeView(view);
+            if (preserveTriggers) {
+              const columns = await getNativeColumnNames(view, true);
+              assertViewTriggersCompatibleWithColumns(before.triggers, columns);
+              for (const trigger of before.triggers) {
+                await runNativeSingleStatement(buildCreateViewTriggerSql(trigger));
+              }
+            }
+            const after = await getNativeViewDefinition(view);
+            // Only the native transport accepts duplicate validated/executable
+            // SQL payloads, so only this engine needs a post-edit comparison to
+            // detect transport divergence before releasing the savepoint.
+            if (after.selectSql !== body) {
+              throw new Error(
+                'Native SQLite stored a view definition different from the submitted SQL; the replacement was rolled back'
+              );
+            }
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return { before, after };
+          } catch (err) {
+            await safeRollbackSavepoint(savepointName, 'editView');
+            throw err;
+          }
+        },
+
+        dropView: async (
+          view: string,
+          expectedSql?: string,
+          expectedTriggers?: readonly ViewTriggerDefinition[]
+        ): Promise<ViewDefinition> => {
+          if (forceReadOnly) {
+            throw new Error('View deletion is unavailable because the database is read-only');
+          }
+          const savepointName = createSavepointName('sp_drop_view');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            const before = await getNativeViewDefinition(view, true);
+            assertViewTriggerSnapshotIsMutationSafe(before);
+            assertViewDefinitionSnapshotCurrent(
+              expectedSql,
+              before.sql,
+              expectedTriggers,
+              before.triggers
+            );
+            await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return before;
+          } catch (err) {
+            await safeRollbackSavepoint(savepointName, 'dropView');
+            throw err;
+          }
+        },
+
         /**
          * Fetch table data.
          */
         fetchTableData: async (table: string, options: TableQueryOptions) => {
-          const { sql, params } = buildSelectQuery(table, options);
-          const result = await worker.call<NativeQueryResult>('query', [sql, params]);
-
-          let headers = result.columns;
-          let rows = result.values;
-
-          // Native worker returns columns based on Object.keys() which doesn't guarantee order.
-          // Ensure the result matches the requested column order from options.columns.
-          if (options.columns && options.columns.length > 0 && headers && rows) {
-            const expected = options.columns;
-
-            // Build map of lower-case header names to indices for robust matching
-            // Prioritize exact match, then case-insensitive
-            const headerIndexMap = new Map<string, number>();
-            headers.forEach((h: string, i: number) => {
-                headerIndexMap.set(h, i);
-                headerIndexMap.set(h.toLowerCase(), i);
-                // Also handle potentially quoted headers (though unlikely) by stripping quotes
-                const unquoted = h.replace(/^['"`]|['"`]$/g, '');
-                if (unquoted !== h) {
-                  headerIndexMap.set(unquoted, i);
-                  headerIndexMap.set(unquoted.toLowerCase(), i);
-                }
-            });
-
-            // Map expected columns to their indices in the result
-            const mapping = expected.map((c: string) => {
-                let idx = headerIndexMap.get(c);
-                if (idx === undefined) idx = headerIndexMap.get(c.toLowerCase());
-                return idx;
-            });
-
-            // If we found at least some columns, we attempt to reconstruct the row
-            // Missing columns will be undefined/null
-            if (mapping.some((idx: number | undefined) => idx !== undefined)) {
-              headers = expected;
-              rows = rows.map((row: CellValue[]) => mapping.map((idx: number | undefined) =>
-                idx !== undefined ? row[idx as number] : null
-              ));
-            }
+          let columns = options.columns;
+          if (!columns || (columns.length === 1 && columns[0] === '*')) {
+            columns = await getNativeColumnNames(table);
+          }
+          const queryOptions = { ...options, columns };
+          const { sql, params } = buildSelectQuery(table, queryOptions);
+          const transportQuery = buildExactNumericTextQuery(sql, columns.length);
+          const hasRowIdShape = columns[0]?.toLowerCase() === 'rowid';
+          const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
+            && hasRowIdShape;
+          const snapshotName = hasRowIdShape
+            ? createSavepointName('sp_numeric_snapshot')
+            : undefined;
+          if (snapshotName) {
+            // Unlike the private WASM databases, the native file can receive a
+            // WAL commit from another process between RPCs. The first read below
+            // fixes one SQLite snapshot for both values and companion text.
+            await worker.call('run', [`SAVEPOINT ${snapshotName}`]);
           }
 
-          return {
-            headers: headers,
-            rows: rows,
-            columns: headers,
-            values: rows
-          };
+          try {
+            let isRowIdTable = false;
+            if (hasRowIdShape) {
+              // This authority read fixes the WAL snapshot before the main data
+              // read, so both exact identities and any companion text describe
+              // one committed database state.
+              const authority = await worker.call<NativeQueryResult>('query', [
+                ROWID_TABLE_AUTHORITY_SQL,
+                [table]
+              ]);
+              isRowIdTable = authority.values.length > 0;
+            }
+            const result = await worker.call<NativeQueryResult>('queryNumeric', [
+              transportQuery.sql,
+              params,
+              transportQuery.transportColumns,
+              transportQuery.valueColumnCount
+            ]);
+
+            const companionResults = [];
+            if (isRowIdTable && needsRowIdCompanions && result.values.length > 0) {
+              const companionQueries = buildRowIdExactRealTextQueries(
+                table,
+                columns,
+                result.values.map(row => row[0])
+              );
+              if (companionQueries.length > 0) {
+                const companionBatch = await worker.call<NativeQueryBatchResult>('queryBatch', [
+                  companionQueries.map(query => ({ sql: query.sql, params: query.params }))
+                ]);
+                if (companionBatch.results?.length !== companionQueries.length) {
+                  throw new Error('Exact REAL companion fetch failed: queryBatch returned incomplete results');
+                }
+                companionResults.push(...companionQueries.map((query, index) => ({
+                  query,
+                  rows: companionBatch.results[index].values
+                })));
+              }
+            }
+            const companionExactTexts = collectRowIdExactRealTexts(
+              result.values,
+              companionResults
+            );
+            const needsExactRowIdIdentity = isRowIdTable
+              && hasUnsafeBigIntAtColumn(result.values, 0);
+
+            // txiki preserves SQLite int64 values as BigInt. The generated
+            // companion columns also retain authoritative REAL text before V8
+            // normalizes the storage class into a JavaScript Number.
+            const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+              result.values,
+              undefined,
+              mergeExactIntegerTextMaps(companionExactTexts, result.exactIntegerTexts),
+              needsExactRowIdIdentity ? 0 : undefined
+            );
+
+            if (snapshotName) {
+              await worker.call('run', [`RELEASE ${snapshotName}`]);
+            }
+            return {
+              headers: columns,
+              rows: rows,
+              columns,
+              values: rows,
+              exactIntegerTexts
+            };
+          } catch (err) {
+            if (snapshotName) {
+              await safeRollbackSavepoint(snapshotName, 'fetchTableData numeric snapshot');
+            }
+            throw err;
+          }
         },
 
         /**
@@ -1150,14 +1681,54 @@ export async function createNativeDatabaseConnection(
         /**
          * Update multiple cells in a batch.
          */
-        updateCellBatch: async (table: string, updates: CellUpdate[]) => {
-          if (updates.length === 0) return;
+        updateCellBatch: async (table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> => {
+          if (updates.length === 0) return [];
 
           const batchItems: { sql: string; paramsList?: CellValue[][], params?: CellValue[] }[] = [];
           const escapedTable = escapeIdentifier(table);
+          const savepointName = createSavepointName('sp_update_batch');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+
+          try {
+          const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
+          const columns = [...new Set(updates.map(update => update.column))];
+          const placeholders = rowIds.map(() => '?').join(', ');
+          const current = await worker.call<NativeQueryResult>('query', [
+            `SELECT CAST(rowid AS TEXT), ${columns.map(escapeIdentifier).join(', ')} ` +
+            `FROM ${escapedTable} WHERE rowid IN (${placeholders})`,
+            rowIds
+          ]);
+          const currentValues = new Map<string, Map<string, CellValue>>();
+          for (const row of current.values ?? []) {
+            const values = new Map<string, CellValue>();
+            columns.forEach((column, index) => values.set(column, row[index + 1]));
+            currentValues.set(String(validateRowId(row[0] as RecordId)), values);
+          }
+          const results: CellUpdateResult[] = [];
+          const processedUpdates = updates.map(update => {
+            const rowId = validateRowId(update.rowId);
+            const row = currentValues.get(String(rowId));
+            if (!row) {
+              throw new Error(`Cannot update ${table}.${update.column}: row ${update.rowId} no longer exists`);
+            }
+            const priorValue = row.get(update.column);
+            const prepared = prepareCellUpdateForStorage(
+              update.value,
+              priorValue,
+              update.operation ?? 'set'
+            );
+            results.push({
+              rowId,
+              columnName: update.column,
+              priorValue,
+              newValue: prepared.value,
+              operation: prepared.operation
+            });
+            return { ...update, rowId, value: prepared.value, operation: prepared.operation };
+          });
 
           const updatesByColumn = new Map<string, CellUpdate[]>();
-          for (const update of updates) {
+          for (const update of processedUpdates) {
             const key = `${update.column}|${update.operation || 'set'}`;
             if (!updatesByColumn.has(key)) {
                 updatesByColumn.set(key, []);
@@ -1191,6 +1762,12 @@ export async function createNativeDatabaseConnection(
 
           if (batchItems.length > 0) {
             await worker.call('execBatch', [batchItems]);
+          }
+          await worker.call('run', [`RELEASE ${savepointName}`]);
+          return results;
+          } catch (err) {
+            await safeRollbackSavepoint(savepointName, 'updateCellBatch');
+            throw err;
           }
         },
 

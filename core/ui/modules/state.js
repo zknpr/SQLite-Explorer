@@ -5,8 +5,13 @@ import { saveVsCodeState } from './api.js';
 
 export const state = {
     isDbConnected: false,
+    isReadOnly: false,
     selectedTable: null,
     selectedTableType: 'table',
+    // Name of the table whose grid is currently rendered on screen. Lets
+    // loadTableData tell a same-table refetch (keep the grid, no flicker) apart
+    // from a table switch (show the spinner instead of the previous table's rows).
+    renderedTable: null,
     currentPageIndex: 0,
     rowsPerPage: 500,
     totalRecordCount: 0,
@@ -15,15 +20,23 @@ export const state = {
     sortedColumn: null,
     sortAscending: true,
     filterQuery: '',
-    filterTimer: null,
     selectedRowIds: new Set(),
     gridData: [],
+    // Sparse row/data-column exact text for SQLite INTEGERs outside JS's safe
+    // range. General grid values stay numbers for backward compatibility.
+    gridExactIntegerTexts: {},
 
     // Cell editing state
     editingCellInfo: null,
     activeCellInput: null,
     isSavingCell: false,
     isLoadingData: false,
+    // Dedicated guard for "a grid data reload is in flight", owned solely by
+    // loadTableData. Kept separate from isLoadingData (which BLOB uploads also set)
+    // so the grid-interaction guards can't be cleared by an unrelated upload. The
+    // grid event handlers and the global delete/select-all shortcuts key on this to
+    // avoid acting on rows that are about to be replaced.
+    isGridReloading: false,
     lastDoubleClickTime: 0,
     isTransitioningEdit: false,
     transitionLockTimeout: null,
@@ -42,6 +55,18 @@ export const state = {
 
     // Column filters
     columnFilters: {},
+    // Filter drafts are copied from every visible input before asynchronous work.
+    // A single debounce queue prevents overlapping reloads while preserving text
+    // typed into the still-visible header during an in-flight replacement.
+    filterTimer: null,
+    filterApplyPending: false,
+    filterApplyTable: null,
+    filterPendingAction: null,
+    // The filter state paired with the currently retained successful grid.
+    // Draft input remains in the DOM on query failure while state rolls back
+    // to this snapshot, so refresh/persistence never adopts a failed predicate.
+    lastSuccessfulFilterState: null,
+    lastGridLoadError: null,
 
     // Pinned items
     pinnedColumns: new Set(),
@@ -65,7 +90,15 @@ export const state = {
 
     // Settings
     dateFormat: 'raw', // 'raw', 'local', 'iso', 'relative'
-    cellEditBehavior: 'inline' // 'inline', 'modal', 'vscode'
+    cellEditBehavior: 'inline', // 'inline', 'modal', 'vscode'
+
+    // Filter match navigation (Enter-to-jump on global/column filters)
+    matchNav: {
+        scope: null,       // GLOBAL_MATCH_SCOPE Symbol or a column name
+        term: null,        // the ASCII-folded term the cached matches were computed for
+        matches: [],       // [{ rowIdx, colIdx }] in row/column order
+        currentIndex: -1
+    }
 };
 
 /**

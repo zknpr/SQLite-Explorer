@@ -23,6 +23,7 @@ import { GlobalOutputChannel } from './main';
 
 import { ModificationTracker } from './core/undo-history';
 import { reconcileRestoredDatabase, revertDatabaseToSaved } from './core/restore-reconciler';
+import { isInvocationTimeoutError } from './core/rpc';
 import type { LabeledModification, DatabaseOperations } from './core/types';
 import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
 
@@ -34,6 +35,15 @@ import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
  * Modification entry with display label.
  */
 export type DocumentModification = LabeledModification;
+
+/** Database content change, optionally tied to the history entry just applied. */
+export interface DocumentContentChange {
+  readonly modification?: DocumentModification;
+  /** Whether history applied the entry forward or restored its prior state. */
+  readonly modificationDirection?: 'forward' | 'undo';
+  /** The whole live database was replaced, so every open schema document is stale. */
+  readonly invalidateAllViewDocuments?: boolean;
+}
 
 // ============================================================================
 // Environment Detection
@@ -83,6 +93,17 @@ function getMaxUndoMemory(): number {
   return config.get<number>('maxUndoMemory', DEFAULT_MAX_UNDO_MEMORY);
 }
 
+/** Apply the document's SQL logging decorator consistently across reconnects. */
+function withSqlLogging(
+  databaseOps: DatabaseOperations,
+  filename: string,
+  outputChannel: vsc.OutputChannel | null | undefined
+): DatabaseOperations {
+  return outputChannel
+    ? new LoggingDatabaseOperations(databaseOps, filename, outputChannel)
+    : databaseOps;
+}
+
 // ============================================================================
 // Document Class
 // ============================================================================
@@ -111,7 +132,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     cancellation?: vsc.CancellationToken
   ): Promise<DatabaseDocument> {
     const { reporter, isVerified, context: { extensionUri } } = viewerProvider;
-    let { forceReadOnly } = viewerProvider;
+    const configuredForceReadOnly = viewerProvider.forceReadOnly ?? false;
+    let forceReadOnlyOnReconnect = configuredForceReadOnly;
 
     // Use WebAssembly-based worker for database operations
     const connectionFactory = createDatabaseConnection;
@@ -126,20 +148,13 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const result = await connectionBundle.establishConnection(
       fileUri,
       filename,
-      forceReadOnly,
+      configuredForceReadOnly,
       autoCommit
     );
     databaseOps = result.databaseOps;
-    forceReadOnly = result.isReadOnly;
+    let isReadOnly = result.isReadOnly ?? configuredForceReadOnly;
 
-    // Wrap with logger if output channel is available
-    if (viewerProvider.outputChannel) {
-      databaseOps = new LoggingDatabaseOperations(
-        databaseOps,
-        filename,
-        viewerProvider.outputChannel
-      );
-    }
+    databaseOps = withSqlLogging(databaseOps, filename, viewerProvider.outputChannel);
 
     // Restore modification history from backup
     let tracker: ModificationTracker<DocumentModification> | null = null;
@@ -172,7 +187,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             )
           }
         );
-        forceReadOnly = true;
+        isReadOnly = true;
+        // This is a safety downgrade, not a transient capability such as a WAL
+        // observed by the browser backend. Persist it separately so every later
+        // reconnect remains forced read-only.
+        forceReadOnlyOnReconnect = true;
       }
     }
 
@@ -181,10 +200,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       fileUri,
       tracker,
       autoCommit,
-      { databaseOps, isReadOnly: forceReadOnly },
+      { databaseOps, isReadOnly },
       connectionBundle.workerMethods,
       connectionBundle.establishConnection.bind(connectionBundle),
-      reporter
+      reporter,
+      forceReadOnlyOnReconnect
     );
   }
 
@@ -196,6 +216,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   // Private state
   readonly #modificationTracker: ModificationTracker<DocumentModification>;
   readonly #hostBridge: HostBridge;
+  readonly #forceReadOnlyOnReconnect: boolean;
+  #connectionGeneration = 0;
 
   private constructor(
     readonly viewerProvider: DatabaseViewerProvider,
@@ -205,9 +227,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     private connectionState: { databaseOps: DatabaseOperations; isReadOnly?: boolean },
     private readonly workerMethods: DatabaseConnectionBundle['workerMethods'],
     private readonly establishConnection: DatabaseConnectionBundle['establishConnection'],
-    private readonly reporter?: TelemetryReporter
+    private readonly reporter?: TelemetryReporter,
+    forceReadOnlyOnReconnect: boolean = viewerProvider.forceReadOnly ?? false
   ) {
     super();
+    this.#forceReadOnlyOnReconnect = forceReadOnlyOnReconnect;
     this.#modificationTracker = tracker ?? new ModificationTracker<DocumentModification>(MODIFICATION_LIMIT, getMaxUndoMemory());
     this.#hostBridge = new HostBridge(viewerProvider, this);
     this.#documentKey = generateDatabaseDocumentKey(this.uri);
@@ -218,6 +242,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   get fileParts() { return getUriParts(this.uri); }
   get hostBridge() { return this.#hostBridge; }
   get documentKey() { return this.#documentKey; }
+  /** Monotonic barrier for host operations that span a database reload. */
+  get connectionGeneration() { return this.#connectionGeneration; }
 
   // ============================================================================
   // Event Emitters
@@ -226,7 +252,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   readonly #disposeEmitter = this._register(new vsc.EventEmitter<void>());
   readonly onDidDispose = this.#disposeEmitter.event;
 
-  readonly #contentChangeEmitter = this._register(new vsc.EventEmitter<{}>());
+  readonly #contentChangeEmitter = this._register(new vsc.EventEmitter<DocumentContentChange>());
   readonly onDidChangeContent = this.#contentChangeEmitter.event;
 
   readonly #modificationEmitter = this._register(
@@ -246,8 +272,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const key = await this.#documentKey;
     DocumentRegistry.delete(key);
     this.workerMethods[Symbol.dispose]();
-    super.dispose();
+    // Consumers must see disposal before the registered emitter itself is
+    // disposed by the base class, otherwise their cleanup callbacks never run.
     this.#disposeEmitter.fire();
+    super.dispose();
   }
 
   // ============================================================================
@@ -274,9 +302,18 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         }
         try {
             await this.databaseOperations.undoModification(undoneEntry);
-            this.#contentChangeEmitter.fire({});
+            this.#contentChangeEmitter.fire({
+              modification: undoneEntry,
+              modificationDirection: 'undo'
+            });
             this.#autoSaveIfNeeded();
         } catch (e) {
+            const restoredEntry = tracker.stepForward();
+            if (restoredEntry !== undoneEntry) {
+                GlobalOutputChannel?.appendLine(
+                  '[Undo] Failed to restore tracker position after database undo failed'
+                );
+            }
             const errorMessage = e instanceof Error ? e.message : String(e);
             GlobalOutputChannel?.appendLine(`[Undo] Failed: ${errorMessage}`);
             vsc.window.showErrorMessage(vsc.l10n.t('Undo failed: {0}', errorMessage));
@@ -290,9 +327,18 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         }
         try {
             await this.databaseOperations.redoModification(redoneEntry);
-            this.#contentChangeEmitter.fire({});
+            this.#contentChangeEmitter.fire({
+              modification: redoneEntry,
+              modificationDirection: 'forward'
+            });
             this.#autoSaveIfNeeded();
         } catch (e) {
+             const restoredEntry = tracker.stepBack();
+             if (restoredEntry !== redoneEntry) {
+                 GlobalOutputChannel?.appendLine(
+                   '[Redo] Failed to restore tracker position after database redo failed'
+                 );
+             }
              const errorMessage = e instanceof Error ? e.message : String(e);
              GlobalOutputChannel?.appendLine(`[Redo] Failed: ${errorMessage}`);
              vsc.window.showErrorMessage(vsc.l10n.t('Redo failed: {0}', errorMessage));
@@ -308,7 +354,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   recordExternalModification(modification: DocumentModification): void {
     this.recordModification(modification);
-    this.#contentChangeEmitter.fire({});
+    this.#contentChangeEmitter.fire({
+      modification,
+      modificationDirection: 'forward'
+    });
   }
 
   // ============================================================================
@@ -446,12 +495,49 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   async revert(cancellation: vsc.CancellationToken): Promise<void> {
     await this.ensureWritable();
-    await revertDatabaseToSaved(
-      this.databaseOperations,
-      this.#modificationTracker,
-      cancelTokenToAbortSignal(cancellation)
-    );
-    this.#contentChangeEmitter.fire({});
+    let invalidatedByRecoveryReload = false;
+    try {
+      await revertDatabaseToSaved(
+        this.databaseOperations,
+        this.#modificationTracker,
+        cancelTokenToAbortSignal(cancellation)
+      );
+    } catch (error) {
+      if (!isInvocationTimeoutError(error)) throw error;
+
+      // The worker may still be mutating after a host-side timeout. Queue a
+      // fresh connection behind it and only reconcile history after the active
+      // database has been reopened, preventing the tracker from describing an
+      // unknown intermediate database state.
+      GlobalOutputChannel?.appendLine(
+        `[Revert recovery] ${error.message}; the document state may be inconsistent. Reloading from disk.`
+      );
+      try {
+        const engineKind = await this.databaseOperations.engineKind;
+        if (engineKind === 'native') {
+          // Native requests are processed serially by the txiki worker. Reopening
+          // through the same bundle therefore waits behind the timed-out mutation
+          // and gives this document a fresh handle to its post-mortem disk state.
+          // Do not clean the tracker until that reconnect barrier has completed.
+          this.#connectionGeneration++;
+          await this.#reconnectFromDisk();
+          this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
+        } else {
+          await this.reloadFromDisk();
+        }
+        this.#modificationTracker.rollbackToCheckpoint();
+        invalidatedByRecoveryReload = true;
+      } catch (reloadError) {
+        const details = reloadError instanceof Error ? reloadError.message : String(reloadError);
+        throw new Error(
+          `File Revert timed out and the document state may be inconsistent. Automatic reload failed: ${details}`,
+          { cause: error }
+        );
+      }
+    }
+    if (!invalidatedByRecoveryReload) {
+      this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
+    }
     this.#autoSaveIfNeeded();
   }
 
@@ -511,21 +597,43 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * Reload database from disk.
    */
   async reloadFromDisk(): Promise<DatabaseOperations> {
+    // Advance before the first await. Host mutations that already captured this
+    // document must not finish a preliminary read and then dispatch their write
+    // into the replacement worker endpoint.
+    this.#connectionGeneration++;
     const currentOps = this.databaseOperations;
+    let reloadedOps = currentOps;
 
     if ((await currentOps.engineKind) === 'wasm') {
-      const result = await this.establishConnection(
-        this.uri,
-        this.fileParts.filename
-      );
-      this.connectionState = {
-        databaseOps: result.databaseOps,
-        isReadOnly: result.isReadOnly
-      };
-      return result.databaseOps;
+      reloadedOps = await this.#reconnectFromDisk();
     }
 
-    return currentOps;
+    // File Revert and sidebar Reload both replace the database's externally
+    // observable contents. Invalidate every open virtual view definition so
+    // VS Code re-reads its SQL and mtime from the active engine.
+    this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
+    return reloadedOps;
+  }
+
+  /** Replace the active engine handle with a newly opened connection to this file. */
+  async #reconnectFromDisk(): Promise<DatabaseOperations> {
+    const filename = this.fileParts.filename;
+    const result = await this.establishConnection(
+      this.uri,
+      filename,
+      this.#forceReadOnlyOnReconnect,
+      this.autoCommitEnabled
+    );
+    const databaseOps = withSqlLogging(
+      result.databaseOps,
+      filename,
+      this.viewerProvider.outputChannel
+    );
+    this.connectionState = {
+      databaseOps,
+      isReadOnly: this.#forceReadOnlyOnReconnect || !!result.isReadOnly
+    };
+    return databaseOps;
   }
 
   // ============================================================================

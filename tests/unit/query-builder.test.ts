@@ -54,6 +54,21 @@ describe('Query Builder', () => {
       assert.deepStrictEqual(params, ['%test%', '%test%']);
     });
 
+    it('keeps the synthetic rowid in SELECT but out of the global predicate', () => {
+      const options = {
+        columns: ['rowid', 'value'],
+        globalFilterColumns: ['value'],
+        globalFilter: '12'
+      };
+      const { sql, params } = buildSelectQuery('items', options);
+
+      assert.strictEqual(
+        sql,
+        'SELECT "rowid" AS "rowid", "value" FROM "items" WHERE ("value" LIKE ? ESCAPE \'\\\')'
+      );
+      assert.deepStrictEqual(params, ['%12%']);
+    });
+
     it('should handle global filter with default columns (edge case)', () => {
       // This documents current behavior where default ['*'] results in " * " LIKE ?
       const options = {
@@ -74,6 +89,23 @@ describe('Query Builder', () => {
       assert.strictEqual(sql, 'SELECT  FROM "products"');
       assert.deepStrictEqual(params, []);
     });
+
+    it('skips whitespace-only filters while preserving padded nonblank values', () => {
+      const inactive = buildSelectQuery('products', {
+        columns: ['name'],
+        filters: [{ column: 'name', value: '   ' }],
+        globalFilter: '\t '
+      });
+      assert.strictEqual(inactive.sql, 'SELECT "name" FROM "products"');
+      assert.deepStrictEqual(inactive.params, []);
+
+      const padded = buildSelectQuery('products', {
+        columns: ['name'],
+        filters: [{ column: 'name', value: ' needle ' }],
+        globalFilter: ' global '
+      });
+      assert.deepStrictEqual(padded.params, ['% needle %', '% global %']);
+    });
   });
 
   describe('buildCountQuery', () => {
@@ -93,6 +125,20 @@ describe('Query Builder', () => {
       assert.deepStrictEqual(params, ['%test%', '%test%']);
     });
 
+    it('uses the explicitly narrowed global-filter columns for counts', () => {
+      const { sql, params } = buildCountQuery('products', {
+        columns: ['visible', 'hidden'],
+        globalFilterColumns: ['visible'],
+        globalFilter: 'needle'
+      });
+
+      assert.strictEqual(
+        sql,
+        'SELECT COUNT(*) as count FROM "products" WHERE ("visible" LIKE ? ESCAPE \'\\\')'
+      );
+      assert.deepStrictEqual(params, ['%needle%']);
+    });
+
     it('should handle global filter with empty columns (safe behavior)', () => {
       const options = {
         columns: [],
@@ -101,6 +147,22 @@ describe('Query Builder', () => {
       const { sql, params } = buildCountQuery('products', options);
       assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM "products"');
       assert.deepStrictEqual(params, []);
+    });
+
+    it('uses the same whitespace policy for count queries', () => {
+      const inactive = buildCountQuery('products', {
+        columns: ['name'],
+        filters: [{ column: 'name', value: '   ' }],
+        globalFilter: '\n'
+      });
+      assert.strictEqual(inactive.sql, 'SELECT COUNT(*) as count FROM "products"');
+      assert.deepStrictEqual(inactive.params, []);
+
+      const padded = buildCountQuery('products', {
+        columns: ['name'],
+        globalFilter: ' needle '
+      });
+      assert.deepStrictEqual(padded.params, ['% needle %']);
     });
   });
 });

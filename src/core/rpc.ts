@@ -82,7 +82,65 @@ export interface PendingInvocation {
 /**
  * Default timeout for remote invocations (60 seconds to accommodate large blob operations).
  */
-const INVOCATION_TIMEOUT_MS = 60000;
+export const DEFAULT_INVOCATION_TIMEOUT_MS = 60000;
+
+/** A host-side RPC deadline expired before the remote endpoint replied. */
+export class InvocationTimeoutError extends Error {
+  constructor(
+    readonly methodName: string,
+    message: string = `Invocation timeout: ${methodName}`
+  ) {
+    super(message);
+    this.name = 'InvocationTimeoutError';
+  }
+}
+
+// Error objects do not retain their prototype when flattened through the
+// worker response's text-only fault field. Only this private, structured prefix
+// may restore timeout identity; ordinary messages that happen to mention a
+// timeout remain ordinary Error instances.
+const INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX = '\u001eSQLiteExplorerInvocationTimeout:';
+
+export function isInvocationTimeoutError(error: unknown): error is InvocationTimeoutError {
+  if (error instanceof InvocationTimeoutError) return true;
+  if (typeof error !== 'object' || error === null) return false;
+  const markedError = error as { name?: unknown; methodName?: unknown };
+  return markedError.name === 'InvocationTimeoutError'
+    && typeof markedError.methodName === 'string';
+}
+
+function serializeInvocationError(error: unknown): string {
+  if (!isInvocationTimeoutError(error)) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX + JSON.stringify({
+    methodName: error.methodName,
+    message
+  });
+}
+
+function deserializeInvocationError(errorText: string): Error {
+  if (!errorText.startsWith(INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX)) {
+    return new Error(errorText);
+  }
+
+  try {
+    const payload = JSON.parse(errorText.slice(INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX.length));
+    if (typeof payload?.methodName === 'string' && typeof payload?.message === 'string') {
+      return new InvocationTimeoutError(payload.methodName, payload.message);
+    }
+  } catch {
+    // A malformed marker is an ordinary remote failure, never timeout recovery.
+  }
+  return new Error(errorText);
+}
+
+/** Resolve a deadline from the method and its structured-clone-ready arguments. */
+export type InvocationTimeoutPolicy = number | ((
+  methodName: string,
+  parameters: readonly unknown[]
+) => number);
 
 // ============================================================================
 // Proxy Factory
@@ -115,13 +173,13 @@ export type ProxyWithPendingInvocations<T> = T & {
  *
  * @param dispatcher - Function to send messages to remote context
  * @param methodNames - List of method names to expose on proxy
- * @param timeoutMs - Timeout for each invocation (default 30s)
+ * @param timeoutPolicy - Fixed or per-invocation timeout (default 60s)
  * @returns Proxy object with specified methods
  */
 export function buildMethodProxy<T extends object>(
   dispatcher: MessageDispatcher,
-  methodNames: string[],
-  timeoutMs: number = INVOCATION_TIMEOUT_MS
+  methodNames: readonly Extract<keyof T, string>[],
+  timeoutPolicy: InvocationTimeoutPolicy = DEFAULT_INVOCATION_TIMEOUT_MS
 ): ProxyWithPendingInvocations<T> {
   // Each proxy gets its own isolated pending invocations map to prevent
   // cross-connection correlation ID collisions when multiple workers are active.
@@ -165,11 +223,19 @@ export function buildMethodProxy<T extends object>(
         const transferList: Transferable[] = [];
         const cleanParameters = parameters.map(p => extractTransferables(p, transferList));
 
+        const timeoutMs = typeof timeoutPolicy === 'function'
+          ? timeoutPolicy(methodName, cleanParameters)
+          : timeoutPolicy;
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+          reject(new Error(`Invalid invocation timeout for ${methodName}: ${String(timeoutMs)}`));
+          return;
+        }
+
         // Set up expiration timer
         const expirationTimer = setTimeout(() => {
           if (pendingInvocations.has(correlationId)) {
             pendingInvocations.delete(correlationId);
-            reject(new Error(`Invocation timeout: ${methodName}`));
+            reject(new InvocationTimeoutError(methodName));
           }
         }, timeoutMs);
 
@@ -300,7 +366,7 @@ export function processProtocolMessage(
         sendResponse({
           kind: 'result',
           correlationId,
-          errorText: err instanceof Error ? err.message : String(err)
+          errorText: serializeInvocationError(err)
         });
       });
 
@@ -326,7 +392,7 @@ export function processProtocolMessage(
       pendingInvocations.delete(correlationId);
 
       if (errorText) {
-        pending.onFault(new Error(errorText));
+        pending.onFault(deserializeInvocationError(errorText));
       } else {
         pending.onComplete(payload);
       }
@@ -359,8 +425,9 @@ export interface WorkerPort {
  */
 export function connectWorkerPort<T extends object>(
   port: WorkerPort,
-  methodNames: string[],
-  onLog?: LogHandler
+  methodNames: readonly Extract<keyof T, string>[],
+  onLog?: LogHandler,
+  timeoutPolicy: InvocationTimeoutPolicy = DEFAULT_INVOCATION_TIMEOUT_MS
 ): T {
   const dispatcher: MessageDispatcher = (envelope, transfer) => {
     // Check if port supports transfer list (Browser/Node worker compatible)
@@ -378,7 +445,7 @@ export function connectWorkerPort<T extends object>(
     }
   };
 
-  const proxy = buildMethodProxy<T>(dispatcher, methodNames);
+  const proxy = buildMethodProxy<T>(dispatcher, methodNames, timeoutPolicy);
 
   // Extract the per-proxy pending invocations map so response messages are routed
   // to the correct proxy instance (each worker gets its own isolated map).

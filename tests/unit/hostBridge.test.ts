@@ -4,6 +4,9 @@ import { describe, it, mock, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { HostBridge } from '../../src/hostBridge';
 import * as vscode from 'vscode';
+import { createDeferred } from './helpers/deferred';
+import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+import { serializeOperations } from '../../src/core/operation-serializer';
 
 describe('HostBridge', () => {
 
@@ -121,6 +124,47 @@ describe('HostBridge', () => {
         assert.ok(uri.path.endsWith('.txt'), `Path should end with .txt, got ${uri.path}`);
     });
 
+    it('opens a view definition as a writable SQL virtual document', async () => {
+        const executeCommandMock = mock.method(vscode.commands, 'executeCommand', async () => {});
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key')
+        };
+        const mockProvider = { webviews: new Map(), context: {} };
+        const bridge = new HostBridge(mockProvider as any, mockDocument as any);
+
+        await bridge.openViewEditor('active users', 'wv1');
+
+        const args = executeCommandMock.mock.calls[0].arguments;
+        assert.strictEqual(args[0], 'vscode.open');
+        assert.ok(args[1].path.includes('active%20users'));
+        assert.ok(args[1].path.includes('__view__.sql'));
+        assert.ok(args[1].path.endsWith('definition.sql'));
+        assert.strictEqual(args[2], vscode.ViewColumn.Two);
+    });
+
+    it('reports that the external view editor is unavailable for untitled databases', async () => {
+        const executeCommandMock = mock.method(vscode.commands, 'executeCommand', async () => {});
+        const originalTranslate = vscode.l10n.t;
+        const mockDocument = {
+            uri: { scheme: 'untitled' },
+            documentKey: Promise.resolve('test-key')
+        };
+        const mockProvider = { webviews: new Map(), context: {} };
+        const bridge = new HostBridge(mockProvider as any, mockDocument as any);
+
+        (vscode.l10n as any).t = (message: string) => `localized:${message}`;
+        try {
+            await assert.rejects(
+                () => bridge.openViewEditor('active_users', 'wv1'),
+                /localized:The external view editor is unavailable for untitled databases/
+            );
+            assert.strictEqual(executeCommandMock.mock.callCount(), 0);
+        } finally {
+            (vscode.l10n as any).t = originalTranslate;
+        }
+    });
+
     it('should catch and log error if fetch rows for undo history fails in deleteRows', async () => {
         const consoleWarnMock = mock.method(console, 'warn', () => {});
         const error = new Error('Database disconnected');
@@ -193,6 +237,614 @@ describe('HostBridge', () => {
         assert.strictEqual(dbOps.deleteRows.mock.callCount(), 0);
         assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 0);
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('does not record a created view after Reload supersedes its connection', async () => {
+        const definition = {
+            identifier: 'created_view',
+            sql: 'CREATE VIEW created_view AS SELECT 1 AS value',
+            selectSql: 'SELECT 1 AS value',
+            triggers: []
+        };
+        let connectionGeneration = 7;
+        const createStarted = createDeferred<void>();
+        const createResult = createDeferred<typeof definition>();
+        const dbOps = {
+            createView: mock.fn(async () => {
+                createStarted.resolve();
+                return createResult.promise;
+            })
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            get connectionGeneration() { return connectionGeneration; },
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        const pending = bridge.createView('created_view', 'SELECT 1 AS value');
+        await createStarted.promise;
+        connectionGeneration++;
+        createResult.resolve(definition);
+
+        await assert.rejects(pending, /document was reloaded/i);
+        assert.strictEqual(dbOps.createView.mock.callCount(), 1);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('does not record an edited view after Reload supersedes its connection', async () => {
+        const before = {
+            identifier: 'edited_view',
+            sql: 'CREATE VIEW edited_view AS SELECT 1 AS value',
+            selectSql: 'SELECT 1 AS value',
+            triggers: []
+        };
+        const after = {
+            ...before,
+            sql: 'CREATE VIEW edited_view AS SELECT 2 AS value',
+            selectSql: 'SELECT 2 AS value'
+        };
+        let connectionGeneration = 8;
+        const editStarted = createDeferred<void>();
+        const editResult = createDeferred<{ before: typeof before; after: typeof after }>();
+        const dbOps = {
+            editView: mock.fn(async () => {
+                editStarted.resolve();
+                return editResult.promise;
+            })
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            get connectionGeneration() { return connectionGeneration; },
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        const pending = bridge.editView('edited_view', 'SELECT 2 AS value');
+        await editStarted.promise;
+        connectionGeneration++;
+        editResult.resolve({ before, after });
+
+        await assert.rejects(pending, /document was reloaded/i);
+        assert.strictEqual(dbOps.editView.mock.callCount(), 1);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('does not record a dropped view after Reload supersedes its connection', async () => {
+        const definition = {
+            identifier: 'dropped_view',
+            sql: 'CREATE VIEW dropped_view AS SELECT 1 AS value',
+            selectSql: 'SELECT 1 AS value',
+            triggers: []
+        };
+        let connectionGeneration = 9;
+        const dropStarted = createDeferred<void>();
+        const dropResult = createDeferred<typeof definition>();
+        const dbOps = {
+            getViewDefinition: mock.fn(async () => definition),
+            dropView: mock.fn(async () => {
+                dropStarted.resolve();
+                return dropResult.promise;
+            })
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            get connectionGeneration() { return connectionGeneration; },
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+        mock.method(vscode.window, 'showWarningMessage', async () => ({ title: 'Drop View', value: true }));
+
+        const pending = bridge.dropView('dropped_view');
+        await dropStarted.promise;
+        connectionGeneration++;
+        dropResult.resolve(definition);
+
+        await assert.rejects(pending, /document was reloaded/i);
+        assert.strictEqual(dbOps.dropView.mock.callCount(), 1);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('rejects a cell update when the document reloads while its undo baseline is loading', async () => {
+        const baseline = createDeferred<any>();
+        const baselineStarted = createDeferred<void>();
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => {
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['wr'], rows: [[0]] }];
+                }
+                baselineStarted.resolve();
+                return baseline.promise;
+            }),
+            updateCell: mock.fn(async () => {})
+        };
+        let connectionGeneration = 4;
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            get connectionGeneration() { return connectionGeneration; },
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        const pending = bridge.updateCell('items', 7, 'payload', 'after');
+        await baselineStarted.promise;
+        connectionGeneration++;
+        baseline.resolve([{ headers: ['payload'], rows: [['before']] }]);
+
+        await assert.rejects(pending, /document was reloaded/i);
+        assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('uses database-current batch values for JSON patches and undo history', async () => {
+        const sqlCalls: string[] = [];
+        const batchCalls: any[][] = [];
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => {
+                sqlCalls.push(sql);
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['wr'], rows: [[0]] }];
+                }
+                if (sql.startsWith('SELECT CAST(rowid AS TEXT)')) {
+                    return [{
+                        headers: ['rowid', 'payload', 'label'],
+                        rows: [[7, '{"count":1,"concurrent":true}', 'database-current']]
+                    }];
+                }
+                return [];
+            }),
+            updateCellBatch: mock.fn(async (_table: string, updates: any[]) => {
+                batchCalls.push(updates);
+                return [
+                    {
+                        rowId: 7,
+                        columnName: 'payload',
+                        newValue: '{"count":2}',
+                        priorValue: '{"count":1,"concurrent":true}',
+                        operation: 'json_patch'
+                    },
+                    {
+                        rowId: 7,
+                        columnName: 'label',
+                        newValue: 'after',
+                        priorValue: 'database-current',
+                        operation: 'set'
+                    }
+                ];
+            })
+        };
+        const recordExternalModification = mock.fn();
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 3,
+            recordExternalModification
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        await bridge.updateCellBatch('items', [
+            {
+                rowId: 7,
+                column: 'payload',
+                value: '{"count":2,"concurrent":true}',
+                originalValue: '{"count":0}'
+            },
+            {
+                rowId: 7,
+                column: 'label',
+                value: 'after',
+                originalValue: 'caller-stale'
+            }
+        ], 'Authoritative batch');
+
+        assert.strictEqual(batchCalls.length, 1);
+        assert.deepStrictEqual(batchCalls[0], [
+            {
+                rowId: 7,
+                column: 'payload',
+                value: '{"count":2,"concurrent":true}',
+                originalValue: '{"count":0}'
+            },
+            {
+                rowId: 7,
+                column: 'label',
+                value: 'after',
+                originalValue: 'caller-stale'
+            }
+        ]);
+        assert.deepStrictEqual(
+            sqlCalls.filter(sql => !sql.includes('pragma_table_list')),
+            [],
+            'the host must not split the engine-owned batch transaction across RPC calls'
+        );
+
+        const modification = recordExternalModification.mock.calls[0].arguments[0] as any;
+        assert.deepStrictEqual(modification.affectedCells, [
+            {
+                rowId: 7,
+                columnName: 'payload',
+                newValue: '{"count":2}',
+                priorValue: '{"count":1,"concurrent":true}',
+                operation: 'json_patch'
+            },
+            {
+                rowId: 7,
+                columnName: 'label',
+                newValue: 'after',
+                priorValue: 'database-current',
+                operation: 'set'
+            }
+        ]);
+    });
+
+    it('does not lose an interleaved single edit when an atomic batch rolls back', async () => {
+        const database = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+        const raw = database.operations as WasmDatabaseEngine;
+        const operations = serializeOperations(raw);
+        const batchRejectedAtFacade = createDeferred<void>();
+        const releaseBatchRejection = createDeferred<void>();
+        const dbOps = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'updateCellBatch') {
+                    return async (...args: any[]) => {
+                        try {
+                            return await (target.updateCellBatch as any)(...args);
+                        } catch (error) {
+                            // Expose the exact old-host window: the engine has
+                            // rolled back, but HostBridge has not yet rolled back
+                            // its independently issued outer savepoint.
+                            batchRejectedAtFacade.resolve();
+                            await releaseBatchRejection.promise;
+                            throw error;
+                        }
+                    };
+                }
+                return Reflect.get(target, property, receiver);
+            }
+        });
+        const recordExternalModification = mock.fn();
+        const document = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification
+        };
+        const provider = { webviews: new Map(), context: {}, isReadOnly: false };
+        const batchBridge = new HostBridge(provider as any, document as any);
+        const singleBridge = new HostBridge(provider as any, document as any);
+
+        try {
+            await raw.executeQuery('CREATE TABLE concurrent_batch (value TEXT UNIQUE)');
+            await raw.executeQuery("INSERT INTO concurrent_batch(rowid, value) VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+
+            const batch = batchBridge.updateCellBatch('concurrent_batch', [
+                { rowId: 1, column: 'value', value: 'x' },
+                { rowId: 2, column: 'value', value: 'x' }
+            ], 'Conflicting batch');
+            await batchRejectedAtFacade.promise;
+            const single = singleBridge.updateCell('concurrent_batch', 3, 'value', 'single');
+            await single;
+            releaseBatchRejection.resolve();
+
+            await assert.rejects(batch, /UNIQUE constraint failed/);
+            const rows = await operations.executeQuery(
+                'SELECT rowid, value FROM concurrent_batch ORDER BY rowid'
+            );
+            assert.deepStrictEqual(rows[0].rows, [[1, 'a'], [2, 'b'], [3, 'single']]);
+        } finally {
+            raw.shutdown();
+        }
+    });
+
+    it('serializes overlapping batches without crossing their savepoints', async () => {
+        const database = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+        const raw = database.operations as WasmDatabaseEngine;
+        const firstSavepointStarted = createDeferred<void>();
+        const releaseFirstSavepoint = createDeferred<void>();
+        const originalExecuteQuery = raw.executeQuery.bind(raw);
+        let paused = false;
+        raw.executeQuery = async (sql: string, params?: any[]) => {
+            const result = await originalExecuteQuery(sql, params);
+            if (!paused && /^SAVEPOINT "sp_update_batch_/.test(sql)) {
+                paused = true;
+                firstSavepointStarted.resolve();
+                await releaseFirstSavepoint.promise;
+            }
+            return result;
+        };
+        const operations = serializeOperations(raw);
+        const document = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: operations,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification: mock.fn()
+        };
+        const provider = { webviews: new Map(), context: {}, isReadOnly: false };
+        const firstBridge = new HostBridge(provider as any, document as any);
+        const secondBridge = new HostBridge(provider as any, document as any);
+
+        try {
+            await raw.executeQuery('CREATE TABLE overlapping_batches (value TEXT UNIQUE)');
+            await raw.executeQuery("INSERT INTO overlapping_batches(rowid, value) VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+
+            const first = firstBridge.updateCellBatch('overlapping_batches', [
+                { rowId: 1, column: 'value', value: 'x' },
+                { rowId: 2, column: 'value', value: 'x' }
+            ], 'First batch');
+            await firstSavepointStarted.promise;
+            const second = secondBridge.updateCellBatch('overlapping_batches', [
+                { rowId: 3, column: 'value', value: 'second' }
+            ], 'Second batch');
+            releaseFirstSavepoint.resolve();
+
+            await assert.rejects(first, /UNIQUE constraint failed/);
+            await second;
+            const rows = await operations.executeQuery(
+                'SELECT rowid, value FROM overlapping_batches ORDER BY rowid'
+            );
+            assert.deepStrictEqual(rows[0].rows, [[1, 'a'], [2, 'b'], [3, 'second']]);
+        } finally {
+            raw.shutdown();
+        }
+    });
+
+    it('rejects rowid-based cell edits for WITHOUT ROWID tables before a savepoint', async () => {
+        const dbOps = {
+            executeQuery: mock.fn(async (_sql: string) => [{ headers: ['wr'], rows: [[1]] }]),
+            updateCell: mock.fn(async () => {}),
+            updateCellBatch: mock.fn(async () => {})
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        await assert.rejects(
+            () => bridge.updateCell('rowidless', 1, 'value', 'after'),
+            /WITHOUT ROWID tables are not editable yet/
+        );
+        await assert.rejects(
+            () => bridge.updateCellBatch(
+                'rowidless',
+                [{ rowId: 1, column: 'value', value: 'after' }],
+                'Batch'
+            ),
+            /WITHOUT ROWID tables are not editable yet/
+        );
+
+        assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+        assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 0);
+        assert.strictEqual(
+            dbOps.executeQuery.mock.calls.some(call => String(call.arguments[0]).startsWith('SAVEPOINT ')),
+            false
+        );
+    });
+
+    it('does not record an atomic batch after Reload supersedes its connection', async () => {
+        const sqlCalls: string[] = [];
+        let connectionGeneration = 11;
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => {
+                sqlCalls.push(sql);
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['wr'], rows: [[0]] }];
+                }
+                return [];
+            }),
+            updateCellBatch: mock.fn(async () => {
+                connectionGeneration++;
+                return [{
+                    rowId: 1,
+                    columnName: 'value',
+                    priorValue: 'before',
+                    newValue: 'after',
+                    operation: 'set' as const
+                }];
+            })
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            get connectionGeneration() { return connectionGeneration; },
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        await assert.rejects(
+            () => bridge.updateCellBatch(
+                'items',
+                [{ rowId: 1, column: 'value', value: 'after' }],
+                'Batch'
+            ),
+            /document was reloaded/i
+        );
+
+        assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 1);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+        assert.strictEqual(
+            sqlCalls.some(sql => sql.startsWith('ROLLBACK TO SAVEPOINT ')),
+            false,
+            'the fresh connection must not receive rollback SQL for the old endpoint'
+        );
+    });
+
+    it('preserves an atomic engine batch error without recording history', async () => {
+        const writeError = new Error('batch write failed');
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => {
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['wr'], rows: [[0]] }];
+                }
+                return [];
+            }),
+            updateCellBatch: mock.fn(async () => {
+                throw writeError;
+            })
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        await assert.rejects(
+            bridge.updateCellBatch(
+                'items',
+                [{ rowId: 1, column: 'value', value: 'after' }],
+                'Batch'
+            ),
+            error => {
+                assert.strictEqual(error, writeError);
+                return true;
+            }
+        );
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('rejects a column deletion when reload supersedes its history capture', async () => {
+        const rows = createDeferred<any>();
+        const rowsStarted = createDeferred<void>();
+        const dbOps = {
+            findDependentIndexes: mock.fn(async () => []),
+            getTableInfo: mock.fn(async () => [{ identifier: 'payload', declaredType: 'BLOB' }]),
+            executeQuery: mock.fn(async () => {
+                rowsStarted.resolve();
+                return rows.promise;
+            }),
+            deleteColumns: mock.fn(async () => {})
+        };
+        let connectionGeneration = 8;
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            get connectionGeneration() { return connectionGeneration; },
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        const pending = bridge.deleteColumns('items', ['payload']);
+        await rowsStarted.promise;
+        connectionGeneration++;
+        rows.resolve([{ headers: ['rowid', 'payload'], rows: [[1, new Uint8Array([1])]] }]);
+
+        await assert.rejects(pending, /document was reloaded/i);
+        assert.strictEqual(dbOps.deleteColumns.mock.callCount(), 0);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('canonicalizes rowids captured for column-drop history', async () => {
+        const dbOps = {
+            findDependentIndexes: mock.fn(async () => []),
+            getTableInfo: mock.fn(async () => [{ identifier: 'payload', declaredType: 'TEXT' }]),
+            executeQuery: mock.fn(async () => [{
+                headers: ['rowid', 'payload'],
+                rows: [
+                    ['7', 'safe'],
+                    ['9007199254740993', 'unsafe']
+                ]
+            }]),
+            deleteColumns: mock.fn(async () => {})
+        };
+        const recordExternalModification = mock.fn();
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification
+        };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            mockDocument as any
+        );
+
+        await bridge.deleteColumns('items', ['payload']);
+
+        const modification = recordExternalModification.mock.calls[0].arguments[0] as any;
+        assert.deepStrictEqual(modification.deletedColumns[0].data, [
+            { rowId: 7, value: 'safe' },
+            { rowId: '9007199254740993', value: 'unsafe' }
+        ]);
+    });
+
+    it('returns refreshed connection capabilities after reloading from disk', async () => {
+        let readOnlyMode = false;
+        const reloadFromDisk = mock.fn(async () => {
+            readOnlyMode = true;
+        });
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            fileParts: { filename: 'test.db' },
+            get isReadOnlyMode() { return readOnlyMode; },
+            reloadFromDisk
+        };
+        const mockProvider = {
+            webviews: new Map(),
+            context: {},
+            isReadOnly: false
+        };
+        const bridge = new HostBridge(mockProvider as any, mockDocument as any);
+
+        const result = await bridge.refreshFile();
+
+        assert.strictEqual(reloadFromDisk.mock.callCount(), 1);
+        assert.deepStrictEqual(result, {
+            connected: true,
+            filename: 'test.db',
+            readOnly: true
+        });
+    });
+
+    it('reports that reload is unavailable for untitled databases', async () => {
+        const reloadFromDisk = mock.fn(async () => {});
+        const mockDocument = {
+            uri: { scheme: 'untitled' },
+            reloadFromDisk
+        };
+        const mockProvider = {
+            webviews: new Map(),
+            context: {},
+            isReadOnly: false
+        };
+        const bridge = new HostBridge(mockProvider as any, mockDocument as any);
+
+        await assert.rejects(
+            () => bridge.refreshFile(),
+            /Reload is unavailable for untitled databases/
+        );
+        assert.strictEqual(reloadFromDisk.mock.callCount(), 0);
     });
 
     it('should catch and log error if fetch columns for undo history fails in deleteColumns', async () => {

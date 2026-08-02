@@ -43,12 +43,13 @@ export const Title = 'SQLite Explorer';
 // Copilot integration
 export const CopilotChatId = 'github.copilot-chat';
 
+/** Default query timeout in milliseconds (30 seconds). */
+export const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+const MIN_QUERY_TIMEOUT_MS = 1000;
+
 // ============================================================================
 // Configuration Accessors
 // ============================================================================
-
-/** Default query timeout in milliseconds (30 seconds) */
-const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 
 /**
  * Retrieve maximum file size from user configuration.
@@ -68,5 +69,11 @@ export function getMaximumFileSizeBytes(): number {
  */
 export function getQueryTimeout(): number {
   const config = vsc.workspace.getConfiguration(ConfigurationSection);
-  return config.get<number>('queryTimeout', DEFAULT_QUERY_TIMEOUT_MS);
+  const configuredValue = config.get<unknown>('queryTimeout', DEFAULT_QUERY_TIMEOUT_MS);
+  // Settings can be hand-edited or supplied by another configuration provider,
+  // so do not let an invalid runtime value turn every query deadline into NaN.
+  if (typeof configuredValue !== 'number' || !Number.isFinite(configuredValue)) {
+    return DEFAULT_QUERY_TIMEOUT_MS;
+  }
+  return Math.max(MIN_QUERY_TIMEOUT_MS, configuredValue);
 }

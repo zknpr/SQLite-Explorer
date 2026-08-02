@@ -6,6 +6,7 @@ import { exportToJson, exportToCsv, exportToSql, exportTableCommand, getFormatHe
 import { CellValue } from '../../src/core/types';
 import { mockVscode } from './mocks/vscode';
 import { DocumentRegistry } from '../../src/documentRegistry';
+import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 
 describe('exportToJson', () => {
     it('should export basic types correctly', () => {
@@ -132,6 +133,56 @@ describe('exportToSql', () => {
 });
 
 describe('exportTableCommand Fallback', () => {
+    it('exports the minimum signed-int64 rowid in the first keyset batch', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery('CREATE TABLE export_min_rowid (value TEXT)');
+        await operations.executeQuery(
+            'INSERT INTO export_min_rowid(rowid, value) VALUES (?, ?)',
+            ['-9223372036854775808', 'minimum']
+        );
+
+        const uri = mockVscode.Uri.file('/test/export-min.csv');
+        const originalShowSaveDialog = mockVscode.window.showSaveDialog;
+        mockVscode.window.showSaveDialog = async (): Promise<any> => uri;
+        const fs = require('fs');
+        const originalCreateWriteStream = fs.createWriteStream;
+        let exported = '';
+
+        DocumentRegistry.set('export-min', {
+            uri: mockVscode.Uri.parse('vscode-sqlite://export-min.db'),
+            databaseOperations: operations
+        } as any);
+
+        try {
+            fs.createWriteStream = () => ({
+                write: (chunk: string) => { exported += chunk; },
+                end: () => {}
+            });
+
+            await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'export_min_rowid', uri: 'vscode-sqlite://export-min.db' },
+                ['value'],
+                undefined,
+                undefined,
+                { format: 'csv' }
+            );
+
+            assert.strictEqual(exported, 'value\nminimum');
+        } finally {
+            fs.createWriteStream = originalCreateWriteStream;
+            mockVscode.window.showSaveDialog = originalShowSaveDialog;
+            DocumentRegistry.delete('export-min');
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('should use fallback memory export if stream write fails', async () => {
         const docUri = mockVscode.Uri.parse('vscode-sqlite://test.db');
         const uri = mockVscode.Uri.file('/test/export.csv');

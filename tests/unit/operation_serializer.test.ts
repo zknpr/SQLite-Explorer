@@ -2,16 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { serializeOperations } from '../../src/core/operation-serializer';
 import type { DatabaseOperations, QueryResultSet } from '../../src/core/types';
-
-function createDeferred<T>() {
-    let resolve!: (value: T) => void;
-    let reject!: (reason?: unknown) => void;
-    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-        resolve = resolvePromise;
-        reject = rejectPromise;
-    });
-    return { promise, resolve, reject };
-}
+import { createDeferred } from './helpers/deferred';
 
 function createOperations(overrides: Partial<DatabaseOperations> = {}): DatabaseOperations {
     const operations: DatabaseOperations = {
@@ -30,7 +21,16 @@ function createOperations(overrides: Partial<DatabaseOperations> = {}): Database
         deleteColumns: async () => {},
         findDependentIndexes: async () => [],
         createTable: async () => {},
-        updateCellBatch: async () => {},
+        getViewDefinition: async () => ({ identifier: 'v', sql: 'CREATE VIEW v AS SELECT 1', selectSql: 'SELECT 1', triggers: [] }),
+        validateViewDefinition: async () => {},
+        previewViewDefinition: async () => ({ headers: [], rows: [] }),
+        createView: async () => ({ identifier: 'v', sql: 'CREATE VIEW v AS SELECT 1', selectSql: 'SELECT 1', triggers: [] }),
+        editView: async () => ({
+            before: { identifier: 'v', sql: 'CREATE VIEW v AS SELECT 1', selectSql: 'SELECT 1', triggers: [] },
+            after: { identifier: 'v', sql: 'CREATE VIEW v AS SELECT 2', selectSql: 'SELECT 2', triggers: [] }
+        }),
+        dropView: async () => ({ identifier: 'v', sql: 'CREATE VIEW v AS SELECT 1', selectSql: 'SELECT 1', triggers: [] }),
+        updateCellBatch: async () => [],
         addColumn: async () => {},
         fetchTableData: async () => ({
             headers: [],

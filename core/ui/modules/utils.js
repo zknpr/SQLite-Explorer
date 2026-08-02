@@ -1,6 +1,7 @@
 /**
  * Utility Functions
  */
+import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 
 /**
  * Escape HTML special characters to prevent XSS attacks.
@@ -16,14 +17,112 @@ export function escapeHtml(str) {
 }
 
 /**
+ * Escape a string for safe use inside a RegExp pattern.
+ */
+function escapeRegExp(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Fold only ASCII uppercase letters, matching SQLite LIKE's default
+ * case-insensitive range without conflating distinct non-ASCII characters.
+ */
+export function foldAsciiCase(str) {
+    return String(str).replace(/[A-Z]/g, char => char.toLowerCase());
+}
+
+/** SQLite's built-in LIKE treats the first NUL as the end of a TEXT value. */
+export function truncateAtSqliteTextNul(value) {
+    const text = String(value);
+    const nulIndex = text.indexOf('\0');
+    return nulIndex < 0 ? text : text.slice(0, nulIndex);
+}
+
+function escapeAsciiCaseInsensitiveRegExp(str) {
+    return escapeRegExp(str).replace(/[A-Za-z]/g, char => {
+        const lower = foldAsciiCase(char);
+        return `[${lower}${lower.toUpperCase()}]`;
+    });
+}
+
+/**
+ * Build a reusable SQLite-compatible ASCII-case-insensitive RegExp that matches
+ * any of the given filter terms, or null when there are no active terms. Compile
+ * this once per column and reuse it across cells rather than rebuilding per cell.
+ *
+ * Terms are de-duplicated and sorted longest-first: regex alternation matches
+ * the first listed alternative that fits, so without this a shorter term that is
+ * a prefix of a longer one (e.g. "cat" vs "category") would shadow the longer
+ * match and only highlight the prefix.
+ */
+export function buildHighlightMatcher(terms) {
+    const seen = new Set();
+    for (const t of terms) {
+        const term = getActiveFilterValue(t);
+        if (term !== undefined) seen.add(term);
+    }
+    if (seen.size === 0) return null;
+    const ordered = [...seen].sort((a, b) => b.length - a.length);
+    return new RegExp(`(${ordered.map(escapeAsciiCaseInsensitiveRegExp).join('|')})`, 'g');
+}
+
+/**
+ * Append text to a parent element, wrapping matches of a precompiled `matcher`
+ * (from buildHighlightMatcher) in <mark class="cell-highlight"> spans. Uses DOM
+ * text nodes (never innerHTML) so untrusted cell content can never be interpreted
+ * as markup. When `matcher` is null, the text is appended verbatim (fast path).
+ */
+export function appendHighlightedText(parentEl, text, matcher) {
+    if (!matcher) {
+        parentEl.appendChild(document.createTextNode(text));
+        return;
+    }
+
+    // Match only the prefix SQLite LIKE can inspect. Preserve the suffix for
+    // display, but never mark text that SQL could not have matched.
+    const searchableText = truncateAtSqliteTextNul(text);
+    const displaySuffix = text.slice(searchableText.length);
+
+    // The matcher is shared across cells; reset its state before scanning.
+    matcher.lastIndex = 0;
+    let lastIndex = 0;
+    let match;
+    while ((match = matcher.exec(searchableText)) !== null) {
+        if (match.index > lastIndex) {
+            parentEl.appendChild(document.createTextNode(searchableText.slice(lastIndex, match.index)));
+        }
+        const mark = document.createElement('mark');
+        mark.className = 'cell-highlight';
+        mark.textContent = match[0];
+        parentEl.appendChild(mark);
+        lastIndex = match.index + match[0].length;
+        if (match[0].length === 0) matcher.lastIndex++; // guard against zero-length matches
+    }
+    if (lastIndex < searchableText.length) {
+        parentEl.appendChild(document.createTextNode(searchableText.slice(lastIndex)));
+    }
+    if (displaySuffix) {
+        parentEl.appendChild(document.createTextNode(displaySuffix));
+    }
+}
+
+/**
  * Validate and sanitize a rowid for use in SQL queries.
  */
 export function validateRowId(rowId) {
-    const num = Number(rowId);
-    if (!Number.isFinite(num)) {
+    if (typeof rowId === 'number') {
+        if (!Number.isSafeInteger(rowId)) throw new Error(`Invalid rowid: ${rowId}`);
+        return rowId;
+    }
+    if (typeof rowId !== 'string' || !/^[+-]?\d+$/.test(rowId.trim())) {
         throw new Error(`Invalid rowid: ${rowId}`);
     }
-    return num;
+    const exact = BigInt(rowId.trim());
+    if (exact < -9223372036854775808n || exact > 9223372036854775807n) {
+        throw new Error(`Invalid rowid: ${rowId}`);
+    }
+    const num = Number(exact);
+    return Number.isSafeInteger(num) ? num : exact.toString();
 }
 
 /**
@@ -61,7 +160,13 @@ export function formatCellValue(value, columnType = null, dateFormat = 'raw', co
  * Format a cell value for display as plain text (no HTML escaping).
  * Use this when setting textContent.
  */
-export function formatCellValueAsText(value, columnType = null, dateFormat = 'raw', columnName = null) {
+export function formatCellValueAsText(
+    value,
+    columnType = null,
+    dateFormat = 'raw',
+    columnName = null,
+    truncateLongText = true
+) {
     // Handle null and undefined as NULL display
     if (value === null || value === undefined) return 'NULL';
     if (value instanceof Uint8Array) return '[BLOB]';
@@ -75,7 +180,7 @@ export function formatCellValueAsText(value, columnType = null, dateFormat = 'ra
         }
     }
 
-    if (typeof value === 'string' && value.length > 100) {
+    if (truncateLongText && typeof value === 'string' && value.length > 100) {
         return value.substring(0, 100) + '...';
     }
     return String(value);

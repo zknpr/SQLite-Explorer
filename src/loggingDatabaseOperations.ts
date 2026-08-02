@@ -14,11 +14,16 @@ import type {
     QueryResultSet,
     ModificationEntry,
     CellUpdate,
+    CellUpdateResult,
     TableQueryOptions,
     TableCountOptions,
     SchemaSnapshot,
     ColumnMetadata,
-    ColumnDefinition
+    ColumnDefinition,
+    ViewDefinition,
+    ViewDefinitionIntent,
+    ViewEditResult,
+    ViewTriggerDefinition
 } from './core/types';
 import { escapeIdentifier } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -177,7 +182,87 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.createTable(table, columns);
     }
 
-    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
+    async getViewDefinition(view: string): Promise<ViewDefinition> {
+        return this.logAndDelegate(`Reading view ${escapeIdentifier(view)}`, false, 'getViewDefinition', view);
+    }
+
+    async validateViewDefinition(
+        view: string,
+        selectSql: string,
+        intent?: ViewDefinitionIntent
+    ): Promise<void> {
+        return this.logAndDelegate(
+            `Validating view ${escapeIdentifier(view)}`,
+            false,
+            'validateViewDefinition',
+            view,
+            selectSql,
+            intent
+        );
+    }
+
+    async previewViewDefinition(
+        view: string,
+        selectSql: string,
+        limit?: number,
+        intent?: ViewDefinitionIntent
+    ): Promise<QueryResultSet> {
+        return this.logAndDelegate(
+            `Previewing view ${escapeIdentifier(view)}`,
+            false,
+            'previewViewDefinition',
+            view,
+            selectSql,
+            limit,
+            intent
+        );
+    }
+
+    async createView(view: string, selectSql: string): Promise<ViewDefinition> {
+        return this.logAndDelegate(
+            `CREATE VIEW ${escapeIdentifier(view)} AS ${this.sanitizeValue(selectSql)}`,
+            true,
+            'createView',
+            view,
+            selectSql
+        );
+    }
+
+    async editView(
+        view: string,
+        selectSql: string,
+        preserveTriggers?: boolean,
+        expectedSql?: string,
+        expectedTriggers?: readonly ViewTriggerDefinition[]
+    ): Promise<ViewEditResult> {
+        return this.logAndDelegate(
+            `Replacing view ${escapeIdentifier(view)} with ${this.sanitizeValue(selectSql)} (preserve triggers: ${preserveTriggers !== false})`,
+            true,
+            'editView',
+            view,
+            selectSql,
+            preserveTriggers,
+            expectedSql,
+            expectedTriggers
+        );
+    }
+
+    async dropView(
+        view: string,
+        expectedSql?: string,
+        expectedTriggers?: readonly ViewTriggerDefinition[]
+    ): Promise<ViewDefinition> {
+        return this.logAndDelegate(
+            `DROP VIEW ${escapeIdentifier(view)}`,
+            true,
+            'dropView',
+            view,
+            expectedSql,
+            expectedTriggers
+        );
+    }
+
+    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> {
         this.log(`Batch update ${updates.length} cells in ${table}`, true);
         return this.wrapped.updateCellBatch(table, updates);
     }

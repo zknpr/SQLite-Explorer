@@ -14,8 +14,7 @@ import {
 } from './modules/export.js';
 
 import {
-    initCrud,
-    submitDelete
+    initCrud
 } from './modules/crud.js';
 import {
     updateStatus,
@@ -29,25 +28,21 @@ import {
 import {
     loadTableData,
     loadTableColumns,
-    onSelectAllClick,
     initGridInteraction,
-    initGridControls,
-    clearSelection
+    initGridControls
 } from './modules/grid.js';
 import {
     initEdit
 } from './modules/edit.js';
-import {
-    copyCellsToClipboard,
-    copySelectedRowsToClipboard,
-    clearSelectedCellValues
-} from './modules/clipboard.js';
 import {
     initSettings
 } from './modules/settings.js';
 import {
     initDragAndDrop
 } from './modules/dnd.js';
+import { initViews } from './modules/views.js';
+import { applyConnectionResult } from './modules/connection-state.js';
+import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
 
 // Initialize RPC system
 initRpc();
@@ -63,17 +58,16 @@ function initializeModules() {
     initGridInteraction();
     initSidebarResize();
     initDragAndDrop();
+    initViews();
 }
 
 async function connectAndLoadSchema() {
     updateStatus('Connecting to database...');
 
     const result = await backendApi.initialize();
-    if (!result || !result.connected) {
+    if (!applyConnectionResult(result)) {
         throw new Error('Failed to connect to database');
     }
-
-    state.isDbConnected = true;
 
     // Test connection
     await backendApi.ping();
@@ -115,6 +109,8 @@ async function restoreSavedState() {
         // Restore global filter input value
         const filterInput = document.getElementById('filterInput');
         if (filterInput) filterInput.value = state.filterQuery;
+        const clearFilterButton = document.getElementById('btnClearFilter');
+        if (clearFilterButton) clearFilterButton.hidden = state.filterQuery.length === 0;
 
         // Restore date format dropdown
         const dateFormatSelect = document.getElementById('dateFormatSelect');
@@ -158,59 +154,6 @@ function applyVsCodeSettings() {
             state.cellEditBehavior = vscodeEnv.dataset.cellEditBehavior;
         }
     }
-}
-
-function setupGlobalShortcuts() {
-    document.addEventListener('keydown', async (event) => {
-        // Undo / Redo - Handled natively by VS Code for Custom Editors
-
-        // Escape
-        if (event.key === 'Escape') {
-            if (!state.editingCellInfo && !document.querySelector('.modal-overlay:not(.hidden)')) {
-                clearSelection();
-            }
-        }
-
-        // Cmd+C / Ctrl+C
-        if ((event.metaKey || event.ctrlKey) && event.key === 'c') {
-            if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
-
-            if (state.selectedCells.length > 0) {
-                event.preventDefault();
-                await copyCellsToClipboard();
-            } else if (state.selectedRowIds.size > 0) {
-                event.preventDefault();
-                await copySelectedRowsToClipboard();
-            }
-        }
-
-        // Cmd+A / Ctrl+A
-        if ((event.metaKey || event.ctrlKey) && event.key === 'a') {
-            if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
-
-            if (state.selectedTable) {
-                event.preventDefault();
-                onSelectAllClick(event);
-            }
-        }
-
-        // Delete / Backspace
-        if ((event.metaKey || event.ctrlKey) && (event.key === 'Delete' || event.key === 'Backspace')) {
-            if (state.editingCellInfo || document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
-
-            if (state.selectedTable && state.selectedTableType === 'table') {
-                event.preventDefault();
-                // Priority: Columns -> Rows -> Cells (Clear)
-                if (state.selectedColumns.size > 0) {
-                    await submitDelete();
-                } else if (state.selectedRowIds.size > 0) {
-                    await submitDelete();
-                } else if (state.selectedCells.length > 0) {
-                    await clearSelectedCellValues();
-                }
-            }
-        }
-    });
 }
 
 // Main initialization

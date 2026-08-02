@@ -6,8 +6,48 @@
  * This allows the viewer to work standalone in a browser.
  */
 
+import { RPC_TIMEOUT_MS, getRpcTimeoutMs } from './rpc-constants.js';
+
+export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
+
 // Use parent window for RPC instead of VS Code API
 const parentWindow = window.parent;
+
+const ancestorOrigin = window.location.ancestorOrigins?.[0];
+let lockedParentOrigin = ancestorOrigin || null;
+let resolveParentOrigin;
+const parentOriginReady = lockedParentOrigin
+    ? Promise.resolve(lockedParentOrigin)
+    : new Promise(resolve => {
+        resolveParentOrigin = resolve;
+    });
+
+/**
+ * Accept messages only from the embedding window and lock Firefox-style
+ * cross-origin embeds to the browser-verified origin of their first handshake.
+ */
+export function isTrustedParentMessage(event) {
+    if (event.source !== parentWindow) return false;
+    if (lockedParentOrigin !== null) return event.origin === lockedParentOrigin;
+    if (event.data?.kind !== 'sqlite-explorer-origin' || !event.origin || event.origin === 'null') {
+        return false;
+    }
+    lockedParentOrigin = event.origin;
+    resolveParentOrigin?.(lockedParentOrigin);
+    resolveParentOrigin = undefined;
+    return true;
+}
+
+window.addEventListener?.('message', event => {
+    isTrustedParentMessage(event);
+});
+
+// ancestorOrigins is unavailable on Firefox. The initial ping carries no RPC
+// data; it only asks the parent to reply so subsequent messages can be locked
+// to event.origin. No payload-bearing message is ever sent to "*".
+if (lockedParentOrigin === null) {
+    parentWindow.postMessage({ kind: 'sqlite-explorer-ready' }, '*');
+}
 
 /**
  * No-op in web demo: VS Code state persistence is not available.
@@ -25,16 +65,15 @@ export function saveVsCodeState(_stateObj) {
     // No VS Code API available in web demo
 }
 
-// Default RPC timeout in milliseconds (60s to accommodate large blob operations)
-const RPC_TIMEOUT_MS = 60000;
-
 // Message ID tracking
 let rpcMessageId = 0;
 const pendingRpcCalls = new Map();
 
-// Helper to determine target origin
-function getTargetOrigin() {
-    return window.location.ancestorOrigins?.[0] || '*';
+function requireTargetOrigin() {
+    if (lockedParentOrigin === null) {
+        throw new Error('The parent origin is not locked yet');
+    }
+    return lockedParentOrigin;
 }
 
 // ============================================================================
@@ -217,14 +256,16 @@ export async function sendRpcRequest(method, args) {
     // Serialize args asynchronously to handle Uint8Array without blocking UI
     // This is done before setting up the timeout to ensure encoding time is included
     const serializedArgs = await serializeArgsAsync(args);
+    const targetOrigin = await parentOriginReady;
 
     return new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
+        const timeoutMs = getRpcTimeoutMs(method);
+        const timeoutId = timeoutMs === undefined ? undefined : setTimeout(() => {
             if (pendingRpcCalls.has(messageId)) {
                 pendingRpcCalls.delete(messageId);
                 reject(new Error(`RPC timeout: ${method}`));
             }
-        }, RPC_TIMEOUT_MS);
+        }, timeoutMs);
 
         pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
 
@@ -237,7 +278,7 @@ export async function sendRpcRequest(method, args) {
                 targetMethod: method,
                 payload: serializedArgs
             }
-        }, getTargetOrigin());
+        }, targetOrigin);
     });
 }
 
@@ -250,7 +291,7 @@ export function handleRpcResponse(message) {
 
     const pending = pendingRpcCalls.get(message.messageId);
     if (pending) {
-        clearTimeout(pending.timeoutId);
+        if (pending.timeoutId !== undefined) clearTimeout(pending.timeoutId);
         pendingRpcCalls.delete(message.messageId);
 
         if (message.success) {
@@ -274,7 +315,7 @@ export function sendRpcResult(correlationId, result) {
         kind: 'result',
         correlationId,
         payload: result
-    }, getTargetOrigin());
+    }, requireTargetOrigin());
 }
 
 /**
@@ -287,7 +328,7 @@ export function sendRpcError(correlationId, errorText) {
         kind: 'result',
         correlationId,
         errorText
-    }, getTargetOrigin());
+    }, requireTargetOrigin());
 }
 
 // Backend API proxy
@@ -306,6 +347,49 @@ export const backendApi = {
     deleteRows: (table, rowIds) => sendRpcRequest('deleteRows', [table, rowIds]),
     deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),
     createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
+    getViewDefinition: (view) => sendRpcRequest('getViewDefinition', [view]),
+    validateViewDefinition: (view, selectSql, intent) =>
+        sendRpcRequest('validateViewDefinition', [view, selectSql, intent]),
+    previewViewDefinition: (view, selectSql, limit, intent) =>
+        sendRpcRequest('previewViewDefinition', [view, selectSql, limit, intent]),
+    createView: (view, selectSql) => sendRpcRequest('createView', [view, selectSql]),
+    editView: async (view, selectSql, preserveTriggers, expectedSql, expectedTriggers) => {
+        let triggerSnapshot = expectedTriggers;
+        if (!preserveTriggers) {
+            const current = await sendRpcRequest('getViewDefinition', [view]);
+            // Bind the mutation to the exact trigger set shown in this dialog;
+            // the worker rechecks it atomically inside the edit savepoint.
+            triggerSnapshot ??= current.triggers ?? [];
+            if (current.triggers?.length > 0) {
+                const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
+                if (!window.confirm(
+                    `Editing view "${view}" without preserving triggers will permanently drop ` +
+                    `these INSTEAD OF triggers: ${triggerNames}. Continue?`
+                )) {
+                    return { cancelled: true };
+                }
+            }
+        }
+        return sendRpcRequest('editView', [
+            view,
+            selectSql,
+            preserveTriggers,
+            expectedSql,
+            triggerSnapshot
+        ]);
+    },
+    dropView: async (view) => {
+        const current = await sendRpcRequest('getViewDefinition', [view]);
+        const triggerSnapshot = current.triggers ?? [];
+        const triggerNames = triggerSnapshot.map(trigger => trigger.identifier).join(', ');
+        const message = triggerNames
+            ? `Drop view "${view}"? This will permanently drop its INSTEAD OF triggers: ${triggerNames}.`
+            : `Drop view "${view}"?`;
+        if (!window.confirm(message)) {
+            return { cancelled: true };
+        }
+        return sendRpcRequest('dropView', [view, current.sql, triggerSnapshot]);
+    },
     updateCellBatch: (table, updates, label) => sendRpcRequest('updateCellBatch', [table, updates, label]),
     addColumn: (table, column, type, defaultValue) => sendRpcRequest('addColumn', [table, column, type, defaultValue]),
     fetchTableData: (table, options) => sendRpcRequest('fetchTableData', [table, options]),
@@ -320,6 +404,7 @@ export const backendApi = {
 
     // VS Code specific - disabled in web mode
     openCellEditor: () => Promise.resolve({ success: false, message: 'Not available in web mode' }),
+    openViewEditor: () => Promise.resolve({ success: false, message: 'Not available in web mode' }),
     readWorkspaceFileUri: () => Promise.resolve(null),
     triggerUndo: () => Promise.resolve(),
     triggerRedo: () => Promise.resolve(),

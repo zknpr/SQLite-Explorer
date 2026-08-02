@@ -116,7 +116,10 @@ export function escapeLikePattern(pattern: string, escapeChar: string = '\\'): s
  * @param rowId - The row ID to validate
  * @returns The validated integer row ID
  */
-export function validateRowId(rowId: RecordId): number {
+const SQLITE_MIN_ROWID = -9223372036854775808n;
+const SQLITE_MAX_ROWID = 9223372036854775807n;
+
+export function validateRowId(rowId: RecordId | bigint): RecordId {
   // Only strings, numbers, and bigints are valid rowid inputs. RecordId is typed
   // string | number, but this runs against untyped runtime values (RPC payloads,
   // persisted history state), where null/boolean/array would otherwise sail
@@ -126,19 +129,28 @@ export function validateRowId(rowId: RecordId): number {
   if (inputType !== 'string' && inputType !== 'number' && inputType !== 'bigint') {
     throw new Error(`Invalid rowid: ${rowId}`);
   }
-  // For string inputs, require a canonical integer form (optional sign + digits).
+  // For string inputs, require an integer form (optional sign + digits).
   // This rejects '', '   ', '123.45' and '1e3' up front — none are valid rowids,
   // even though Number() would happily turn them into 0 / 123.45 / 1000.
-  if (typeof rowId === 'string' && !/^[+-]?\d+$/.test(rowId.trim())) {
+  if (typeof rowId === 'number') {
+    if (!Number.isSafeInteger(rowId)) throw new Error(`Invalid rowid: ${rowId}`);
+    return rowId;
+  }
+
+  const text = typeof rowId === 'string' ? rowId.trim() : rowId.toString();
+  if (!/^[+-]?\d+$/.test(text)) {
     throw new Error(`Invalid rowid: ${rowId}`);
   }
-  const num = Number(rowId);
-  // Require a safe integer: rejects NaN, Infinity, fractional numbers, and
-  // values outside ±(2^53-1) that cannot be represented exactly as a JS number.
-  if (!Number.isSafeInteger(num)) {
+  const exact = BigInt(text);
+  if (exact < SQLITE_MIN_ROWID || exact > SQLITE_MAX_ROWID) {
     throw new Error(`Invalid rowid: ${rowId}`);
   }
-  return num;
+
+  const num = Number(exact);
+  // Preserve normal rowids as numbers for protocol compatibility. Decimal
+  // strings outside the safe range stay strings so SQLite INTEGER affinity can
+  // bind their full int64 identity without a lossy JavaScript conversion.
+  return Number.isSafeInteger(num) ? num : exact.toString();
 }
 
 /**
@@ -147,6 +159,6 @@ export function validateRowId(rowId: RecordId): number {
  * @param rowIds - The array of row IDs to validate
  * @returns An array of validated numeric row IDs
  */
-export function validateRowIds(rowIds: RecordId[]): number[] {
+export function validateRowIds(rowIds: RecordId[]): RecordId[] {
   return rowIds.map(validateRowId);
 }

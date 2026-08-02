@@ -3,6 +3,10 @@
  * Handles outgoing RPC requests to the extension host.
  */
 
+import { RPC_TIMEOUT_MS, getRpcTimeoutMs } from './rpc-constants.js';
+
+export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
+
 const vscodeApi = typeof acquireVsCodeApi !== 'undefined' ? acquireVsCodeApi() : null;
 
 /**
@@ -23,9 +27,6 @@ export function saveVsCodeState(stateObj) {
         vscodeApi.setState(stateObj);
     }
 }
-
-// Default RPC timeout in milliseconds (60s to accommodate large blob operations)
-const RPC_TIMEOUT_MS = 60000;
 
 // Message ID tracking
 let rpcMessageId = 0;
@@ -210,12 +211,13 @@ export async function sendRpcRequest(method, args) {
     const serializedArgs = await serializeArgsAsync(args);
 
     return new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
+        const timeoutMs = getRpcTimeoutMs(method);
+        const timeoutId = timeoutMs === undefined ? undefined : setTimeout(() => {
             if (pendingRpcCalls.has(messageId)) {
                 pendingRpcCalls.delete(messageId);
                 reject(new Error(`RPC timeout: ${method}`));
             }
-        }, RPC_TIMEOUT_MS);
+        }, timeoutMs);
 
         pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
 
@@ -244,7 +246,7 @@ export function handleRpcResponse(message) {
 
     const pending = pendingRpcCalls.get(message.messageId);
     if (pending) {
-        clearTimeout(pending.timeoutId);
+        if (pending.timeoutId !== undefined) clearTimeout(pending.timeoutId);
         pendingRpcCalls.delete(message.messageId);
 
         if (message.success) {
@@ -298,6 +300,21 @@ export const backendApi = {
     deleteRows: (table, rowIds) => sendRpcRequest('deleteRows', [table, rowIds]),
     deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),
     createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
+    getViewDefinition: (view) => sendRpcRequest('getViewDefinition', [view]),
+    validateViewDefinition: (view, selectSql, intent) =>
+        sendRpcRequest('validateViewDefinition', [view, selectSql, intent]),
+    previewViewDefinition: (view, selectSql, limit, intent) =>
+        sendRpcRequest('previewViewDefinition', [view, selectSql, limit, intent]),
+    createView: (view, selectSql) => sendRpcRequest('createView', [view, selectSql]),
+    editView: (view, selectSql, preserveTriggers, expectedSql, expectedTriggers) =>
+        sendRpcRequest('editView', [
+            view,
+            selectSql,
+            preserveTriggers,
+            expectedSql,
+            expectedTriggers
+        ]),
+    dropView: (view) => sendRpcRequest('dropView', [view]),
     updateCellBatch: (table, updates, label) => sendRpcRequest('updateCellBatch', [table, updates, label]),
     addColumn: (table, column, type, defaultValue) => sendRpcRequest('addColumn', [table, column, type, defaultValue]),
     fetchTableData: (table, options) => sendRpcRequest('fetchTableData', [table, options]),
@@ -310,6 +327,7 @@ export const backendApi = {
     updateExtensionSetting: (key, value) => sendRpcRequest('updateExtensionSetting', [key, value]),
     ping: () => sendRpcRequest('ping', []),
     openCellEditor: (params, rowId, colName, colTypes, options) => sendRpcRequest('openCellEditor', [params, rowId, colName, colTypes, options]),
+    openViewEditor: (view, webviewId) => sendRpcRequest('openViewEditor', [view, webviewId]),
     readWorkspaceFileUri: (uri) => sendRpcRequest('readWorkspaceFileUri', [uri]),
     saveFile: (filename, data) => sendRpcRequest('saveFile', [filename, data]),
     selectFile: () => sendRpcRequest('selectFile', []),

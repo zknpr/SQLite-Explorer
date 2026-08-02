@@ -4,6 +4,7 @@
 import { backendApi } from './api.js';
 import { updateStatus } from './ui.js';
 import { closeModal } from './modals.js';
+import { state } from './state.js';
 
 export function initSettings() {
     const container = document.getElementById('pragmaSettingsContainer');
@@ -91,6 +92,9 @@ function renderPragmaForm(pragmas, settings) {
     };
 
     const appendField = (labelStr, control, descStr) => {
+        if (control.className?.includes('setting-pragma')) {
+            control.disabled = state.isReadOnly;
+        }
         const div = document.createElement('div');
         div.className = 'form-field';
 

@@ -5,9 +5,21 @@ import { state } from './state.js';
 import { backendApi } from './api.js';
 import { validateRowId, formatCellValueAsText } from './utils.js';
 import { updateStatus } from './ui.js';
-import { updateSelectionStates, clearSelection } from './grid.js';
-import { getRowDataOffset, getCellValue } from './data-utils.js';
+import { updateSelectionStates, clearSelection } from './grid-selection.js';
+import { loadTableData } from './grid-data.js';
+import {
+    getRowDataOffset,
+    getCellValue,
+    getCellValueForDisplay,
+    clearExactIntegerText,
+    getRowId,
+    getOrderedColumnIndices,
+    getOrderedRowIndices
+} from './data-utils.js';
 import { BlobInspector } from './blob-inspector.js';
+import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
+import { revealGridCell } from './grid-reveal.js';
+import { resetMatchNav } from './match-nav.js';
 
 let blobInspector;
 
@@ -22,6 +34,9 @@ export function initEdit() {
     document.getElementById('openInVsCodeBtn')?.addEventListener('click', openCellInVsCode);
     document.getElementById('btnCancelCellPreview')?.addEventListener('click', closeCellPreview);
     document.getElementById('cellPreviewSaveBtn')?.addEventListener('click', saveCellPreview);
+    const previewTextarea = document.getElementById('cellPreviewTextarea');
+    previewTextarea?.addEventListener('keydown', onCellPreviewKeydown);
+    previewTextarea?.addEventListener('blur', () => resetTextareaTabFocusEscape(previewTextarea));
 }
 
 // ================================================================
@@ -29,7 +44,7 @@ export function initEdit() {
 // ================================================================
 
 export function startCellEdit(rowIdx, colIdx, rowId) {
-    if (state.selectedTableType !== 'table') {
+    if (state.isReadOnly || state.selectedTableType !== 'table') {
         updateStatus('Views are read-only');
         return;
     }
@@ -48,6 +63,10 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
     // Find the cell element
     const cellEl = document.getElementById(`cell-${rowIdx}-${colIdx}`);
     if (!cellEl) return;
+
+    // Browser focus scrolling ignores sticky grid overlays; reveal the cell in
+    // the unpinned viewport before replacing it with the inline textarea.
+    revealGridCell(cellEl);
 
     const row = state.gridData[rowIdx];
     const value = getCellValue(row, colIdx);
@@ -78,11 +97,12 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
         colIdx,
         rowId,
         columnName: column.name,
-        originalValue: value
+        originalValue: value,
+        originalText: String(getCellValueForDisplay(row, rowIdx, colIdx) ?? '')
     };
 
     // Replace cell content with input
-    const currentText = value === null ? '' : String(value);
+    const currentText = state.editingCellInfo.originalText;
 
     cellEl.innerHTML = '';
     cellEl.classList.add('editing');
@@ -107,8 +127,11 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
     setTimeout(() => { state.isTransitioningEdit = false; }, 100);
 }
 
-export function onCellInputKeydown(event) {
-    if (event.key === 'Enter' && !event.shiftKey) {
+export async function onCellInputKeydown(event) {
+    if (event.key === 'Tab') {
+        event.preventDefault();
+        await saveCellEditAndMove(event.shiftKey ? -1 : 1);
+    } else if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
         saveCellEdit();
     } else if (event.key === 'Escape') {
@@ -126,20 +149,32 @@ export function onCellInputBlur() {
     }, 100);
 }
 
-export async function saveCellEdit() {
-    if (state.isSavingCell) return;
-    if (!state.editingCellInfo || !state.activeCellInput) return;
+function resolveDisplayedCell(targetTable, rowId, columnName) {
+    if (state.selectedTable !== targetTable) return null;
 
-    const { rowIdx, colIdx, rowId, columnName, originalValue } = state.editingCellInfo;
+    const rowIdx = state.gridData.findIndex((row, index) => (
+        getRowId(row, index) === rowId
+    ));
+    const colIdx = state.tableColumns.findIndex(column => column.name === columnName);
+    return rowIdx >= 0 && colIdx >= 0 ? { rowIdx, colIdx } : null;
+}
+
+export async function saveCellEdit() {
+    if (state.isSavingCell) return false;
+    if (!state.editingCellInfo || !state.activeCellInput) return false;
+
+    const editSession = state.editingCellInfo;
+    const targetTable = state.selectedTable;
+    const { rowIdx, colIdx, rowId, columnName, originalValue, originalText } = editSession;
     const newValue = state.activeCellInput.value;
 
-    const origStr = originalValue === null ? '' : String(originalValue);
+    const origStr = originalText ?? (originalValue === null ? '' : String(originalValue));
     if (newValue === origStr) {
         cancelCellEdit();
         state.selectedCells = [];
         state.lastSelectedCell = null;
         updateSelectionStates();
-        return;
+        return true;
     }
 
     const column = state.tableColumns[colIdx];
@@ -162,22 +197,31 @@ export async function saveCellEdit() {
         state.isSavingCell = true;
         updateStatus('Saving...');
 
-        await backendApi.updateCell(state.selectedTable, validateRowId(rowId), columnName, valueToSave, originalValue);
+        await backendApi.updateCell(targetTable, validateRowId(rowId), columnName, valueToSave, originalValue);
 
-        // Update local grid data
-        state.gridData[rowIdx][colIdx + getRowDataOffset()] = valueToSave;
+        // A broadcast refresh can reorder gridData before this RPC resolves.
+        // Resolve by stable identity only if the original table is still
+        // displayed. Equal rowids/column names in another table are unrelated.
+        const currentCell = resolveDisplayedCell(targetTable, rowId, columnName);
+        if (currentCell) {
+            state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = valueToSave;
+            clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
+        }
 
-        cleanupCellEdit();
+        if (state.editingCellInfo === editSession) cleanupCellEdit();
 
         // Update UI immediately (preserves scroll)
         // refreshContent RPC will handle final consistency check
-        updateCellDom(rowIdx, colIdx, valueToSave);
+        if (currentCell) updateCellDom(currentCell.rowIdx, currentCell.colIdx, valueToSave);
+        if (state.selectedTable !== targetTable) return true;
 
+        if (state.matchNav.scope !== null) resetMatchNav();
         state.selectedCells = [];
         state.lastSelectedCell = null;
         updateSelectionStates();
 
         updateStatus('Saved');
+        return true;
 
     } catch (err) {
         console.error('Save failed:', err);
@@ -185,9 +229,64 @@ export async function saveCellEdit() {
         let errorMessage = err.message || String(err);
         // ... error message formatting ...
         updateStatus(`Save failed: ${errorMessage}`);
+        return false;
     } finally {
         state.isSavingCell = false;
     }
+}
+
+async function saveCellEditAndMove(direction) {
+    if (!state.editingCellInfo) return;
+    const targetTable = state.selectedTable;
+    const { rowIdx, colIdx, originalValue, originalText } = state.editingCellInfo;
+    const submittedValue = state.activeCellInput?.value;
+
+    // Pin traversal to the pre-commit rendered ordering. A sort/filter-changing
+    // update may reorder gridData while the old DOM remains mounted, so indices
+    // captured after the RPC would identify a different row.
+    const orderedRowIndices = getOrderedRowIndices();
+    const orderedColumnIndices = getOrderedColumnIndices();
+    const rowCount = orderedRowIndices.length;
+    const columnCount = orderedColumnIndices.length;
+    const cellCount = rowCount * columnCount;
+    const renderedRowIdx = orderedRowIndices.indexOf(rowIdx);
+    const renderedColIdx = orderedColumnIndices.indexOf(colIdx);
+    let targetRowId;
+    let targetColumnName;
+    if (cellCount > 0 && renderedRowIdx >= 0 && renderedColIdx >= 0) {
+        const currentIndex = renderedRowIdx * columnCount + renderedColIdx;
+        const nextIndex = (currentIndex + direction + cellCount) % cellCount;
+        const targetRowIdx = orderedRowIndices[Math.floor(nextIndex / columnCount)];
+        const targetColIdx = orderedColumnIndices[nextIndex % columnCount];
+        const targetRow = state.gridData[targetRowIdx];
+        const targetColumn = state.tableColumns[targetColIdx];
+        if (targetRow && targetColumn) {
+            targetRowId = getRowId(targetRow, targetRowIdx);
+            targetColumnName = targetColumn.name;
+        }
+    }
+
+    if (!await saveCellEdit()) return;
+    if (state.selectedTable !== targetTable) return;
+    if (targetRowId === undefined || targetColumnName === undefined) return;
+
+    const submittedOriginalText = originalText
+        ?? (originalValue === null ? '' : String(originalValue));
+    if (submittedValue !== submittedOriginalText) {
+        // recordExternalModification posts refreshContent before the update RPC
+        // response, but that broadcast is not awaited. Start an authoritative
+        // post-commit reload after the editor is cleaned up; its load token
+        // supersedes any still-running broadcast refresh and it renders the row
+        // indices that startCellEdit will use below.
+        if (await loadTableData(false) !== true) return;
+    }
+
+    const nextRowIdx = state.gridData.findIndex((row, index) => (
+        getRowId(row, index) === targetRowId
+    ));
+    const nextColIdx = state.tableColumns.findIndex(column => column.name === targetColumnName);
+    if (nextRowIdx < 0 || nextColIdx < 0) return;
+    startCellEdit(nextRowIdx, nextColIdx, targetRowId);
 }
 
 export function cancelCellEdit() {
@@ -215,7 +314,7 @@ function cleanupCellEdit() {
 export async function openCellInVsCode() {
     if (!state.cellPreviewInfo) return;
 
-    const { rowIdx, colIdx, rowId, columnName, originalValue } = state.cellPreviewInfo;
+    const { rowIdx, colIdx, rowId, columnName, originalValue, originalText } = state.cellPreviewInfo;
     const column = state.tableColumns[colIdx];
 
     // We get the webview id from dataset if available or assume 'default'
@@ -232,7 +331,7 @@ export async function openCellInVsCode() {
             columnName,
             {}, // colTypes
             {
-                value: originalValue,
+                value: originalText ?? originalValue,
                 type: { type: column.type }, // Pass column type
                 webviewId,
                 rowCount: state.gridData.length
@@ -266,18 +365,21 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
         return;
     }
 
+    const originalText = String(getCellValueForDisplay(row, rowIdx, colIdx) ?? '');
     state.cellPreviewInfo = {
         rowIdx,
         colIdx,
         rowId,
         columnName: column.name,
-        originalValue: value
+        originalValue: value,
+        originalText
     };
 
     const modal = document.getElementById('cellPreviewModal');
     const columnNameEl = document.getElementById('cellPreviewColumnName');
     const typeBadgeEl = document.getElementById('cellPreviewTypeBadge');
     const textarea = document.getElementById('cellPreviewTextarea');
+    resetTextareaTabFocusEscape(textarea);
     const readonlyBadgeEl = document.getElementById('cellPreviewReadonlyBadge');
     const saveBtnEl = document.getElementById('cellPreviewSaveBtn');
     const wrapBtnEl = document.getElementById('wrapTextBtn');
@@ -291,12 +393,12 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     } else if (value instanceof Uint8Array) {
         displayValue = '[BLOB: ' + Array.from(value).map(b => b.toString(16).padStart(2, '0')).join(' ') + ']';
     } else {
-        displayValue = String(value);
+        displayValue = originalText;
     }
 
     textarea.value = displayValue;
 
-    const isReadonly = state.selectedTableType !== 'table';
+    const isReadonly = state.isReadOnly || state.selectedTableType !== 'table';
     textarea.readOnly = isReadonly;
     if (isReadonly) {
         textarea.classList.add('readonly');
@@ -319,16 +421,17 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
 
     // Attach listener for char count
     textarea.oninput = updateCellPreviewCharCount;
-    // Keydown listener for shortcuts
-    textarea.onkeydown = (e) => {
-        if (e.key === 'Escape') {
-            e.preventDefault();
-            closeCellPreview();
-        } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-            e.preventDefault();
-            saveCellPreview();
-        }
-    };
+}
+
+export function onCellPreviewKeydown(event) {
+    if (handleTextareaTab(event)) return;
+    if (event.key === 'Escape') {
+        event.preventDefault();
+        closeCellPreview();
+    } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        saveCellPreview();
+    }
 }
 
 function updateCellPreviewCharCount() {
@@ -345,17 +448,23 @@ export function closeCellPreview() {
 }
 
 export async function saveCellPreview() {
+    if (state.isReadOnly) {
+        updateStatus('Document is read-only');
+        return;
+    }
     if (!state.cellPreviewInfo) return;
     if (state.selectedTableType !== 'table') {
         updateStatus('Views are read-only');
         return;
     }
 
-    const { rowIdx, colIdx, rowId, columnName, originalValue } = state.cellPreviewInfo;
+    const previewSession = state.cellPreviewInfo;
+    const targetTable = state.selectedTable;
+    const { rowIdx, colIdx, rowId, columnName, originalValue, originalText } = previewSession;
     const textarea = document.getElementById('cellPreviewTextarea');
     const newValue = textarea.value;
 
-    const origStr = originalValue === null ? '' : String(originalValue);
+    const origStr = originalText ?? (originalValue === null ? '' : String(originalValue));
     if (newValue === origStr) {
         closeCellPreview();
         state.selectedCells = [];
@@ -378,12 +487,21 @@ export async function saveCellPreview() {
 
     try {
         updateStatus('Saving...');
-        await backendApi.updateCell(state.selectedTable, validateRowId(rowId), columnName, valueToSave, originalValue);
+        await backendApi.updateCell(targetTable, validateRowId(rowId), columnName, valueToSave, originalValue);
 
-        state.gridData[rowIdx][colIdx + getRowDataOffset()] = valueToSave;
+        // A broadcast refresh can reorder both rows and columns while the RPC is
+        // pending. Resolve the preview target from its stable database identity
+        // before touching either the grid value or its exact-INTEGER sidecar.
+        const currentCell = resolveDisplayedCell(targetTable, rowId, columnName);
+        if (currentCell) {
+            state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = valueToSave;
+            clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
+        }
 
-        closeCellPreview();
-        updateCellDom(rowIdx, colIdx, valueToSave);
+        if (state.cellPreviewInfo === previewSession) closeCellPreview();
+        if (currentCell) updateCellDom(currentCell.rowIdx, currentCell.colIdx, valueToSave);
+        if (state.selectedTable !== targetTable) return;
+        if (state.matchNav.scope !== null) resetMatchNav();
 
         state.selectedCells = [];
         state.lastSelectedCell = null;
@@ -441,7 +559,9 @@ function updateCellDom(rowIdx, colIdx, value) {
     }
 
     const col = state.tableColumns[colIdx];
-    const displayValue = formatCellValueAsText(value, col?.type, state.dateFormat, col?.name);
+    const row = state.gridData[rowIdx];
+    const visibleValue = row ? getCellValueForDisplay(row, rowIdx, colIdx) : value;
+    const displayValue = formatCellValueAsText(visibleValue, col?.type, state.dateFormat, col?.name);
     const hasContent = value !== null && value !== undefined && !(value instanceof Uint8Array);
 
     // Use DOM creation with textContent for XSS prevention (defense-in-depth)

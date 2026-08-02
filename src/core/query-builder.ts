@@ -4,6 +4,7 @@
  * Constructs safe SQL queries for read operations.
  */
 import { escapeIdentifier, escapeLikePattern } from './sql-utils';
+import { getActiveFilterValue } from './filter-utils';
 import type { CellValue, TableQueryOptions, TableCountOptions } from './types';
 
 /**
@@ -17,7 +18,8 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
     limit,
     offset,
     filters = [],
-    globalFilter
+    globalFilter,
+    globalFilterColumns = columns
   } = options;
 
   const escapedTable = escapeIdentifier(table);
@@ -31,7 +33,11 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
   const whereClauses: string[] = [];
   const params: CellValue[] = [];
 
-  const { conditions, params: filterParams } = buildFilterConditions(filters, globalFilter, columns);
+  const { conditions, params: filterParams } = buildFilterConditions(
+    filters,
+    globalFilter,
+    globalFilterColumns
+  );
   whereClauses.push(...conditions);
   params.push(...filterParams);
 
@@ -58,14 +64,23 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
  * Build a COUNT query from options.
  */
 export function buildCountQuery(table: string, options: TableCountOptions): { sql: string; params: CellValue[] } {
-  const { columns = [], filters = [], globalFilter } = options;
+  const {
+    columns = [],
+    globalFilterColumns = columns,
+    filters = [],
+    globalFilter
+  } = options;
 
   const escapedTable = escapeIdentifier(table);
   let sql = `SELECT COUNT(*) as count FROM ${escapedTable}`;
   const whereClauses: string[] = [];
   const params: CellValue[] = [];
 
-  const { conditions, params: filterParams } = buildFilterConditions(filters, globalFilter, columns);
+  const { conditions, params: filterParams } = buildFilterConditions(
+    filters,
+    globalFilter,
+    globalFilterColumns
+  );
   whereClauses.push(...conditions);
   params.push(...filterParams);
 
@@ -89,21 +104,23 @@ function buildFilterConditions(
 
   // Column filters
   for (const filter of filters) {
-    if (filter.value) {
+    const filterValue = getActiveFilterValue(filter.value);
+    if (filterValue !== undefined) {
       conditions.push(`${escapeIdentifier(filter.column)} LIKE ? ESCAPE '\\'`);
-      params.push(`%${escapeLikePattern(filter.value)}%`);
+      params.push(`%${escapeLikePattern(filterValue)}%`);
     }
   }
 
   // Global filter
-  if (globalFilter && searchColumns.length > 0) {
+  const activeGlobalFilter = getActiveFilterValue(globalFilter);
+  if (activeGlobalFilter !== undefined && searchColumns.length > 0) {
     const globalConditions = searchColumns
       .map(col => `${escapeIdentifier(col)} LIKE ? ESCAPE '\\'`)
       .join(' OR ');
 
     conditions.push(`(${globalConditions})`);
     for (let i = 0; i < searchColumns.length; i++) {
-      params.push(`%${escapeLikePattern(globalFilter)}%`);
+      params.push(`%${escapeLikePattern(activeGlobalFilter)}%`);
     }
   }
 

@@ -16,6 +16,7 @@ import { polyfillNode } from "esbuild-plugin-polyfill-node";
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
+import { createHash } from 'node:crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -208,6 +209,39 @@ const compileBrowserWorker = () =>
   });
 
 /**
+ * Bundle the standalone website worker from its authored source. The source
+ * imports the canonical TypeScript view helpers, preventing parser drift.
+ */
+const webDemoWorkerSourcePath = resolve('website', 'src', 'sqlite-viewer', 'worker.js');
+
+const bundleWebDemoWorker = async () => {
+  const outfile = resolve('website', 'public', 'sqlite-viewer', 'worker.js');
+  const result = await esbuild.build({
+    entryPoints: [webDemoWorkerSourcePath],
+    outfile,
+    bundle: true,
+    platform: 'browser',
+    format: 'iife',
+    target: 'es2020',
+    // This tracked artifact must be byte-stable regardless of the extension's
+    // development build mode.
+    minify: true,
+    write: false,
+  });
+  if (result.outputFiles.length !== 1) {
+    throw new Error(`Expected one standalone website worker output, received ${result.outputFiles.length}`);
+  }
+  const bundledSource = result.outputFiles[0].text;
+  // Hash the complete generated bundle, not just its entry point. Any imported
+  // helper change therefore changes the marker checked by the unit harness.
+  const digest = createHash('sha256').update(bundledSource).digest('hex');
+  fs.writeFileSync(
+    outfile,
+    `/*! sqlite-viewer-bundle-sha256:${digest} */\n${bundledSource}`
+  );
+};
+
+/**
  * Copy assets to output directory.
  * Ensures the webview HTML and WASM files are available.
  */
@@ -286,10 +320,13 @@ const bundleWebview = async () => {
     }
   }
 
-  // Bundle: replace placeholders with actual content
+  // Bundle: replace placeholders with actual content.
+  // Use function replacers so literal "$&"/"$1"-style sequences inside the
+  // bundled JS/CSS (e.g. regex replacement strings) aren't reinterpreted as
+  // String.replace() substitution patterns.
   const bundled = template
-    .replace('<!--STYLES-->', finalCss)
-    .replace('<!--SCRIPTS-->', finalJs);
+    .replace('<!--STYLES-->', () => finalCss)
+    .replace('<!--SCRIPTS-->', () => finalJs);
 
   // Write the bundled HTML
   fs.writeFileSync(outputPath, bundled, 'utf-8');
@@ -379,9 +416,9 @@ const bundleWebDemoViewer = async () => {
   const codiconLink = '<link rel="stylesheet" href="https://unpkg.com/@vscode/codicons@0.0.44/dist/codicon.css" integrity="sha384-sVpT0iPTciRIsuV1JVtIodkJ0guQ/8vFWf8PaazFqcSmJfWptKd00bCziqfui3Ir" crossorigin="anonymous">';
 
   const bundled = template
-    .replace('<!--HEAD-->', codiconLink)
-    .replace('<!--STYLES-->', finalCss)
-    .replace('<!--SCRIPTS-->', finalJs)
+    .replace('<!--HEAD-->', () => codiconLink)
+    .replace('<!--STYLES-->', () => finalCss)
+    .replace('<!--SCRIPTS-->', () => finalJs)
     .replace('nonce="<!--NONCE-->"', ''); // Remove nonce for static web demo
 
   // Write the bundled HTML
@@ -400,7 +437,8 @@ const validateBuildOutputs = () => {
     'out/worker.cjs',
     'out/worker-browser.js',
     'assets/sqlite3.wasm',
-    'core/ui/viewer.html'
+    'core/ui/viewer.html',
+    'website/public/sqlite-viewer/worker.js'
   ];
 
   const missingFiles = requiredFiles.filter(file => !fs.existsSync(resolve(file)));
@@ -420,6 +458,7 @@ const compileExt = async (target) => {
     { name: 'compileBrowserMain', fn: compileBrowserMain },
     { name: 'compileNodeWorker', fn: compileNodeWorker },
     { name: 'compileBrowserWorker', fn: compileBrowserWorker },
+    { name: 'bundleWebDemoWorker', fn: bundleWebDemoWorker },
     { name: 'copyAssets', fn: copyAssets },
     { name: 'bundleWebview', fn: bundleWebview },
     { name: 'bundleWebDemoViewer', fn: bundleWebDemoViewer },

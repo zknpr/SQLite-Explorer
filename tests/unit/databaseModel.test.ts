@@ -6,9 +6,11 @@ import fs from 'node:fs';
 import Module from 'node:module';
 import esbuild from 'esbuild';
 import { mockVscode } from './mocks/vscode';
+import { createDeferred } from './helpers/deferred';
 import { ModificationTracker } from '../../src/core/undo-history';
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
-import type { DatabaseOperations, LabeledModification } from '../../src/core/types';
+import { NativeWorkerProcess } from '../../src/nativeWorker';
+import type { DatabaseOperations, LabeledModification, ModificationEntry } from '../../src/core/types';
 
 const databaseModelPath = path.resolve(__dirname, '../../src/databaseModel.ts');
 const databaseModelSource = fs.readFileSync(databaseModelPath, 'utf8');
@@ -280,23 +282,33 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         };
     };
 
-    const createDocBypassingFactory = (dbOps: any, uri: any = createFileUri('/test/db.sqlite')) => {
+    const createDocBypassingFactory = (
+        dbOps: any,
+        uri: any = createFileUri('/test/db.sqlite'),
+        establishConnection: (...args: any[]) => any = async () => {},
+        options: {
+            forceReadOnly?: boolean;
+            autoCommitEnabled?: boolean;
+            outputChannel?: { appendLine(message: string): void };
+            initialReadOnly?: boolean;
+        } = {}
+    ) => {
         const mockViewerProvider = {
             reporter: {},
             isVerified: true,
             context: { extensionUri: createFileUri('/ext') },
-            forceReadOnly: false,
-            outputChannel: undefined
+            forceReadOnly: options.forceReadOnly ?? false,
+            outputChannel: options.outputChannel
         };
 
         return new (DatabaseDocument as any)(
             mockViewerProvider,
             uri,
             null, // tracker
-            false, // autoCommitEnabled
-            { databaseOps: dbOps, isReadOnly: false },
+            options.autoCommitEnabled ?? false,
+            { databaseOps: dbOps, isReadOnly: options.initialReadOnly ?? false },
             { [Symbol.dispose]: () => {} }, // workerMethods
-            async () => {}, // establishConnection
+            establishConnection,
             {} // reporter
         );
     };
@@ -801,6 +813,301 @@ describe('DatabaseDocument save/saveAs fallback', () => {
 
         assert.deepStrictEqual(discardedModifications, [firstModification]);
     });
+
+    it('identifies view mutations on content changes from edits, undo, and redo', async () => {
+        const applied: unknown[] = [];
+        const modification = {
+            label: 'Edit View',
+            description: 'Edit report view',
+            modificationType: 'view_edit' as const,
+            targetTable: 'report_view'
+        };
+        const dbOps = {
+            undoModification: async (entry: unknown) => assert.strictEqual(entry, modification),
+            redoModification: async (entry: unknown) => assert.strictEqual(entry, modification)
+        };
+        const doc = createDocBypassingFactory(dbOps);
+        let undo: (() => Promise<void>) | undefined;
+        let redo: (() => Promise<void>) | undefined;
+        doc.onDidChangeContent((event: any) => applied.push({
+            modification: event.modification,
+            direction: event.modificationDirection
+        }));
+        doc.onDidChange((event: any) => {
+            undo = event.undo;
+            redo = event.redo;
+        });
+
+        doc.recordExternalModification(modification);
+        await undo!();
+        await redo!();
+
+        assert.deepStrictEqual(applied, [
+            { modification, direction: 'forward' },
+            { modification, direction: 'undo' },
+            { modification, direction: 'forward' }
+        ]);
+    });
+
+    it('invalidates every open view document after File Revert', async () => {
+        const doc = createDocBypassingFactory({});
+        const contentChanges: unknown[] = [];
+        doc.onDidChangeContent((event: unknown) => contentChanges.push(event));
+
+        await doc.revert(undefined);
+
+        assert.deepStrictEqual(contentChanges, [{ invalidateAllViewDocuments: true }]);
+    });
+
+    it('replaces connection capabilities and invalidates view documents after Reload', async () => {
+        const originalOps = { engineKind: Promise.resolve('wasm') };
+        const replacementOps = { engineKind: Promise.resolve('wasm') };
+        const connectionCalls: unknown[][] = [];
+        const doc = createDocBypassingFactory(
+            originalOps,
+            createFileUri('/test/db.sqlite'),
+            async (...args: unknown[]) => {
+                connectionCalls.push(args);
+                return { databaseOps: replacementOps, isReadOnly: true };
+            }
+        );
+        const contentChanges: unknown[] = [];
+        doc.onDidChangeContent((event: unknown) => contentChanges.push(event));
+
+        const reloaded = await doc.reloadFromDisk();
+
+        assert.strictEqual(reloaded, replacementOps);
+        assert.strictEqual(doc.databaseOperations, replacementOps);
+        assert.strictEqual(doc.isReadOnlyMode, true);
+        assert.strictEqual(connectionCalls.length, 1);
+        assert.deepStrictEqual(contentChanges, [{ invalidateAllViewDocuments: true }]);
+    });
+
+    it('advances the connection generation as soon as Reload starts', async () => {
+        const engineKind = createDeferred<'native'>();
+        const doc = createDocBypassingFactory({ engineKind: engineKind.promise });
+
+        assert.strictEqual(doc.connectionGeneration, 0);
+        const pendingReload = doc.reloadFromDisk();
+        assert.strictEqual(
+            doc.connectionGeneration,
+            1,
+            'in-flight host mutations must observe Reload before its first await completes'
+        );
+
+        engineKind.resolve('native');
+        await pendingReload;
+    });
+
+    it('preserves forced read-only, auto-commit, and SQL logging when reconnecting', async () => {
+        const originalOps = { engineKind: Promise.resolve('wasm') };
+        let freshQueryCalls = 0;
+        const freshOps = {
+            engineKind: Promise.resolve('wasm'),
+            executeQuery: async () => {
+                freshQueryCalls++;
+                return [{ headers: ['value'], rows: [[1]] }];
+            }
+        };
+        const connectionCalls: unknown[][] = [];
+        const loggedLines: string[] = [];
+        const doc = createDocBypassingFactory(
+            originalOps,
+            mockVscode.Uri.file('/test/reconnect.db'),
+            async (...args: unknown[]) => {
+                connectionCalls.push(args);
+                return { databaseOps: freshOps, isReadOnly: true };
+            },
+            {
+                forceReadOnly: true,
+                autoCommitEnabled: true,
+                outputChannel: { appendLine: message => loggedLines.push(message) }
+            }
+        );
+
+        const reloaded = await doc.reloadFromDisk();
+        const queryResult = await reloaded.executeQuery('SELECT 1');
+
+        assert.deepStrictEqual(connectionCalls, [[
+            doc.uri,
+            'reconnect.db',
+            true,
+            true
+        ]]);
+        assert.strictEqual(doc.isReadOnlyMode, true);
+        assert.deepStrictEqual(queryResult[0].rows, [[1]]);
+        assert.strictEqual(freshQueryCalls, 1);
+        assert.strictEqual(loggedLines.length, 1);
+        assert.match(loggedLines[0], /\[reconnect\.db\] SELECT 1/);
+    });
+
+    it('force-reloads saved bytes and rolls history back after a revert RPC timeout', async () => {
+        const { InvocationTimeoutError } = require('../../src/core/rpc');
+        const replacementOps = { engineKind: Promise.resolve('wasm') };
+        let discardCalls = 0;
+        const timedOutOps = {
+            engineKind: Promise.resolve('wasm'),
+            discardModifications: async () => {
+                discardCalls++;
+                throw new InvocationTimeoutError('discardModifications');
+            }
+        };
+        const doc = createDocBypassingFactory(
+            timedOutOps,
+            createFileUri('/test/db.sqlite'),
+            async () => ({ databaseOps: replacementOps, isReadOnly: false })
+        );
+        doc.recordModification({
+            label: 'Update Cell',
+            description: 'Update items.value',
+            modificationType: 'cell_update',
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'value',
+            priorValue: 'before',
+            newValue: 'after'
+        });
+        const contentChanges: unknown[] = [];
+        doc.onDidChangeContent((event: unknown) => contentChanges.push(event));
+        let backupContent: Uint8Array | undefined;
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (_uri: unknown, content: Uint8Array) => {
+                    backupContent = content;
+                }
+            },
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            await doc.revert(undefined);
+            await doc.backup(createUri('vscode-userdata', '/backups/test.db'), undefined);
+
+            assert.strictEqual(discardCalls, 1);
+            assert.strictEqual(doc.databaseOperations, replacementOps);
+            assert.deepStrictEqual(contentChanges, [{ invalidateAllViewDocuments: true }]);
+            assert.ok(backupContent);
+            const restoredTracker = ModificationTracker.deserialize(backupContent);
+            assert.strictEqual(restoredTracker.hasUncommittedChanges(), false);
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+
+    it('reconnects a native database before rolling history back after a revert RPC timeout', async () => {
+        const reconnectStarted = createDeferred<void>();
+        const reconnectMayFinish = createDeferred<void>();
+        const freshNativeOps = { engineKind: Promise.resolve('native') };
+        let reconnectCalls = 0;
+        const timedOutWorker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        (timedOutWorker as any).process = {
+            stdin: { write: () => true },
+            kill: () => {}
+        };
+        const timedOutNativeOps = {
+            engineKind: Promise.resolve('native'),
+            executeQuery: async () => [],
+            discardModifications: () => timedOutWorker.call('discardModifications', [], 1)
+        };
+        const doc = createDocBypassingFactory(
+            timedOutNativeOps,
+            createFileUri('/test/native.db'),
+            async () => {
+                reconnectCalls++;
+                reconnectStarted.resolve(undefined);
+                await reconnectMayFinish.promise;
+                return { databaseOps: freshNativeOps, isReadOnly: false };
+            }
+        );
+        const savedModification = {
+            label: 'Saved Update',
+            description: 'Update saved row',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'value',
+            priorValue: 'before-save',
+            newValue: 'saved'
+        };
+        const unsavedModification = {
+            label: 'Unsaved Update',
+            description: 'Update unsaved row',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 2,
+            targetColumn: 'value',
+            priorValue: 'before-draft',
+            newValue: 'draft'
+        };
+        doc.recordModification(savedModification);
+        await doc.save();
+        doc.recordModification(unsavedModification);
+
+        let backupContent: Uint8Array | undefined;
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (_uri: unknown, content: Uint8Array) => {
+                    backupContent = content;
+                }
+            },
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            const pendingRevert = doc.revert(undefined);
+            await reconnectStarted.promise;
+
+            assert.strictEqual(reconnectCalls, 1, 'native recovery must open a fresh connection');
+            await doc.backup(createUri('vscode-userdata', '/backups/native-before-reconnect.db'), undefined);
+            assert.ok(backupContent);
+            assert.strictEqual(
+                ModificationTracker.deserialize(backupContent).hasUncommittedChanges(),
+                true,
+                'history must stay dirty until the fresh native connection is ready'
+            );
+
+            reconnectMayFinish.resolve();
+            await pendingRevert;
+            assert.strictEqual(doc.databaseOperations, freshNativeOps);
+
+            backupContent = undefined;
+            await doc.backup(createUri('vscode-userdata', '/backups/native-after-reconnect.db'), undefined);
+            assert.ok(backupContent);
+            assert.strictEqual(
+                ModificationTracker.deserialize(backupContent).hasUncommittedChanges(),
+                false,
+                'history may be rolled back only after native reconnection completes'
+            );
+        } finally {
+            reconnectMayFinish.resolve();
+            timedOutWorker.stop();
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+
+    it('notifies document-disposal subscribers before emitter teardown', async () => {
+        const doc = createDocBypassingFactory({});
+        let disposalNotifications = 0;
+        doc.onDidDispose(() => { disposalNotifications++; });
+
+        await doc.dispose();
+
+        assert.strictEqual(disposalNotifications, 1);
+    });
 });
 
 describe('DatabaseDocument hot-exit restore', () => {
@@ -811,7 +1118,11 @@ describe('DatabaseDocument hot-exit restore', () => {
             readOnlyMode: false
         });
         const engine = result.operations as DatabaseOperations & { shutdown?: () => void };
-        await engine.executeQuery("CREATE TABLE restored_items (id INTEGER PRIMARY KEY, name TEXT)");
+        await engine.executeQuery(
+            "CREATE TABLE restored_items (id INTEGER PRIMARY KEY, name TEXT, counter INTEGER)"
+        );
+        const unsafePriorValue = BigInt('9007199254740993');
+        const unsafeNewValue = BigInt('9007199254740995');
 
         const restoredEntries: LabeledModification[] = [
             {
@@ -820,7 +1131,7 @@ describe('DatabaseDocument hot-exit restore', () => {
                 modificationType: 'row_insert',
                 targetTable: 'restored_items',
                 targetRowId: 1,
-                rowData: { id: 1, name: 'Draft' }
+                rowData: { id: 1, name: 'Draft', counter: unsafePriorValue }
             },
             {
                 label: 'Update Restored Item',
@@ -831,6 +1142,16 @@ describe('DatabaseDocument hot-exit restore', () => {
                 targetColumn: 'name',
                 priorValue: 'Draft',
                 newValue: 'Recovered'
+            },
+            {
+                label: 'Update unsafe INTEGER',
+                description: 'Update restored unsafe INTEGER exactly',
+                modificationType: 'cell_update',
+                targetTable: 'restored_items',
+                targetRowId: 1,
+                targetColumn: 'counter',
+                priorValue: unsafePriorValue,
+                newValue: unsafeNewValue
             }
         ];
         const tracker = new ModificationTracker<LabeledModification>(100);
@@ -841,10 +1162,34 @@ describe('DatabaseDocument hot-exit restore', () => {
         const backupData = tracker.serialize();
         let applyWasCalled = false;
         let appliedModificationCount = 0;
+        let appliedModifications: ModificationEntry[] = [];
+        let rawBigIntBindObserved = false;
+        const wasmInstance = (engine as unknown as {
+            instance: {
+                iterateStatements(sql: string): Iterable<{
+                    bind(params?: unknown[]): boolean;
+                }>;
+            };
+        }).instance;
+        const originalIterateStatements = wasmInstance.iterateStatements.bind(wasmInstance);
+        wasmInstance.iterateStatements = function* (sql: string) {
+            for (const statement of originalIterateStatements(sql)) {
+                const originalBind = statement.bind.bind(statement);
+                statement.bind = (params?: unknown[]) => {
+                    if (params?.some(value => typeof value === 'bigint')) {
+                        rawBigIntBindObserved = true;
+                        throw new Error('BigInt reached the sql.js binding boundary');
+                    }
+                    return originalBind(params);
+                };
+                yield statement;
+            }
+        };
         const originalApplyModifications = engine.applyModifications.bind(engine);
         engine.applyModifications = async (mods, signal) => {
             applyWasCalled = true;
             appliedModificationCount = mods.length;
+            appliedModifications = mods;
             return originalApplyModifications(mods, signal);
         };
 
@@ -896,12 +1241,28 @@ describe('DatabaseDocument hot-exit restore', () => {
             );
 
             const restoredRows = await engine.executeQuery(
-                "SELECT id, name FROM restored_items ORDER BY id"
+                "SELECT id, name, CAST(counter AS TEXT) FROM restored_items ORDER BY id"
             );
 
+            assert.strictEqual(
+                rawBigIntBindObserved,
+                false,
+                'hot-exit replay must normalize BigInt before binding through sql.js'
+            );
             assert.strictEqual(applyWasCalled, true);
-            assert.strictEqual(appliedModificationCount, 2);
-            assert.deepStrictEqual(restoredRows[0].rows, [[1, 'Recovered']]);
+            assert.strictEqual(appliedModificationCount, 3);
+            assert.deepStrictEqual(restoredRows[0].rows, [[1, 'Recovered', '9007199254740995']]);
+
+            await engine.undoModification(appliedModifications[2]);
+            const undoneCounter = await engine.executeQuery(
+                'SELECT CAST(counter AS TEXT) FROM restored_items WHERE id = 1'
+            );
+            assert.deepStrictEqual(undoneCounter[0].rows, [['9007199254740993']]);
+            assert.strictEqual(
+                rawBigIntBindObserved,
+                false,
+                'unsafe INTEGER priorValue must also be normalized before sql.js undo binding'
+            );
         } finally {
             Object.defineProperty(mockVscode.workspace, 'fs', {
                 value: originalFs,
@@ -915,6 +1276,94 @@ describe('DatabaseDocument hot-exit restore', () => {
             }
             delete moduleCache[databaseModelModulePath];
             engine.shutdown?.();
+        }
+    });
+
+    it('keeps a failed hot-exit restore read-only across a later reconnect', async () => {
+        const tracker = new ModificationTracker<LabeledModification>(100);
+        tracker.record({
+            label: 'Restore draft',
+            description: 'Restore draft value',
+            modificationType: 'cell_update',
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'value',
+            priorValue: 'saved',
+            newValue: 'draft'
+        });
+        const backupData = tracker.serialize();
+        const restoreOps = {
+            engineKind: Promise.resolve('wasm' as const),
+            applyModifications: async () => { throw new Error('restore failed'); }
+        };
+        const reconnectedOps = { engineKind: Promise.resolve('wasm' as const) };
+        const connectionCalls: unknown[][] = [];
+        const originalFs = mockVscode.workspace.fs;
+        const originalShowErrorMessage = mockVscode.window.showErrorMessage;
+        const moduleCache = require('module')._cache;
+        const workerFactoryPath = require.resolve('../../src/workerFactory');
+        const originalWorkerFactoryCacheEntry = moduleCache[workerFactoryPath];
+        const databaseModelModulePath = require.resolve('../../src/databaseModel');
+
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: { ...originalFs, readFile: async () => backupData },
+            writable: true,
+            configurable: true
+        });
+        mockVscode.window.showErrorMessage = async () => undefined;
+        moduleCache[workerFactoryPath] = {
+            id: workerFactoryPath,
+            filename: workerFactoryPath,
+            loaded: true,
+            exports: {
+                createDatabaseConnection: async () => ({
+                    establishConnection: async (...args: unknown[]) => {
+                        connectionCalls.push(args);
+                        return connectionCalls.length === 1
+                            ? { databaseOps: restoreOps, isReadOnly: false }
+                            : { databaseOps: reconnectedOps, isReadOnly: true };
+                    },
+                    workerMethods: { [Symbol.dispose]: () => {} }
+                })
+            }
+        };
+        delete moduleCache[databaseModelModulePath];
+
+        try {
+            const { DatabaseDocument } = require('../../src/databaseModel');
+            const doc = await DatabaseDocument.create(
+                {
+                    reporter: undefined,
+                    isVerified: true,
+                    context: { extensionUri: mockVscode.Uri.file('/ext') },
+                    forceReadOnly: false,
+                    outputChannel: undefined
+                },
+                mockVscode.Uri.file('/test/failed-restore.db'),
+                { backupId: 'vscode-userdata:///backup/failed-restore.db' }
+            );
+
+            assert.strictEqual(doc.isReadOnlyMode, true);
+            await doc.reloadFromDisk();
+            assert.strictEqual(connectionCalls.length, 2);
+            assert.strictEqual(
+                connectionCalls[1][2],
+                true,
+                'the reconnect must retain the safety downgrade from failed restore'
+            );
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+            mockVscode.window.showErrorMessage = originalShowErrorMessage;
+            if (originalWorkerFactoryCacheEntry) {
+                moduleCache[workerFactoryPath] = originalWorkerFactoryCacheEntry;
+            } else {
+                delete moduleCache[workerFactoryPath];
+            }
+            delete moduleCache[databaseModelModulePath];
         }
     });
 });
@@ -984,6 +1433,7 @@ describe('DatabaseDocument undo/redo error handling', () => {
 
     it('should show error message when undoModification fails', async () => {
         let errorMessageShown = false;
+        let undoAttempts = 0;
         mockVscode.window.showErrorMessage = async (msg?: string) => {
             if (msg?.includes('Test Undo Error')) {
                 errorMessageShown = true;
@@ -1000,12 +1450,18 @@ describe('DatabaseDocument undo/redo error handling', () => {
         // Mock database operations to throw error on undo
         const dbOps = doc.databaseOperations;
         if(dbOps) {
-            dbOps.undoModification = () => Promise.reject(new Error("Test Undo Error"));
+            dbOps.undoModification = () => {
+                undoAttempts++;
+                return Promise.reject(new Error("Test Undo Error"));
+            };
         } else {
              // force override via any
              (doc as any).connectionState = {
                 databaseOps: {
-                    undoModification: () => Promise.reject(new Error("Test Undo Error")),
+                    undoModification: () => {
+                        undoAttempts++;
+                        return Promise.reject(new Error("Test Undo Error"));
+                    },
                     redoModification: () => Promise.resolve()
                 }
              };
@@ -1026,12 +1482,15 @@ describe('DatabaseDocument undo/redo error handling', () => {
         assert.ok(undoAction, 'Undo action should be emitted');
 
         await undoAction();
+        await undoAction();
 
         assert.strictEqual(errorMessageShown, true, 'Error message should be shown for failed undo');
+        assert.strictEqual(undoAttempts, 2, 'A failed undo must remain available for retry');
     });
 
     it('should show error message when redoModification fails', async () => {
         let errorMessageShown = false;
+        let redoAttempts = 0;
         mockVscode.window.showErrorMessage = async (msg?: string) => {
             if (msg?.includes('Test Redo Error')) {
                 errorMessageShown = true;
@@ -1045,12 +1504,18 @@ describe('DatabaseDocument undo/redo error handling', () => {
         // Mock database operations to throw error on redo
         const dbOps = doc.databaseOperations;
         if(dbOps) {
-             dbOps.redoModification = () => Promise.reject(new Error("Test Redo Error"));
+             dbOps.redoModification = () => {
+                 redoAttempts++;
+                 return Promise.reject(new Error("Test Redo Error"));
+             };
         } else {
             (doc as any).connectionState = {
                 databaseOps: {
                     undoModification: () => Promise.resolve(),
-                    redoModification: () => Promise.reject(new Error("Test Redo Error"))
+                    redoModification: () => {
+                        redoAttempts++;
+                        return Promise.reject(new Error("Test Redo Error"));
+                    }
                 }
              };
         }
@@ -1073,7 +1538,9 @@ describe('DatabaseDocument undo/redo error handling', () => {
 
         await undoAction!();
         await redoAction();
+        await redoAction();
 
         assert.strictEqual(errorMessageShown, true, 'Error message should be shown for failed redo');
+        assert.strictEqual(redoAttempts, 2, 'A failed redo must remain available for retry');
     });
 });

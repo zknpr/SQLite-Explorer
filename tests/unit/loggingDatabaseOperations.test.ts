@@ -21,7 +21,16 @@ class MockDatabaseOperations implements DatabaseOperations {
     async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {}
     async findDependentIndexes(table: string, columns: string[]): Promise<string[]> { return []; }
     async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {}
-    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {}
+    async getViewDefinition(view: string) { return { identifier: view, sql: `CREATE VIEW ${view} AS SELECT 1`, selectSql: 'SELECT 1', triggers: [] }; }
+    async validateViewDefinition(view: string, selectSql: string): Promise<void> {}
+    async previewViewDefinition(view: string, selectSql: string, limit?: number): Promise<QueryResultSet> { return { headers: [], rows: [] }; }
+    async createView(view: string, selectSql: string) { return { identifier: view, sql: `CREATE VIEW ${view} AS SELECT 1`, selectSql: 'SELECT 1', triggers: [] }; }
+    async editView(view: string, selectSql: string) {
+        const definition = { identifier: view, sql: `CREATE VIEW ${view} AS SELECT 1`, selectSql: 'SELECT 1', triggers: [] };
+        return { before: definition, after: definition };
+    }
+    async dropView(view: string) { return this.getViewDefinition(view); }
+    async updateCellBatch(table: string, updates: CellUpdate[]) { return []; }
     async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {}
     async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> { return { headers: [], rows: [] }; }
     async fetchTableCount(table: string, options: TableCountOptions): Promise<number> { return 0; }
@@ -166,6 +175,34 @@ describe('LoggingDatabaseOperations', () => {
         it('should mask SSN patterns', async () => {
             await logger.executeQuery("SELECT '123-45-6789'");
             assert.ok(mockChannel.lines[0].includes('***-**-****'));
+        });
+    });
+
+    describe('view definition logging', () => {
+        it('logs a sanitized and masked CREATE VIEW definition', async () => {
+            const selectSql = `SELECT 'user@example.com' AS email, '${'z'.repeat(120)}' AS padding`;
+
+            await logger.createView('customer view', selectSql);
+
+            const line = mockChannel.lines[0];
+            assert.match(line, /CREATE VIEW "customer view" AS/);
+            assert.ok(line.includes('***@***.***'));
+            assert.ok(line.includes('...[TRUNCATED]'));
+            assert.ok(!line.includes('user@example.com'));
+            assert.ok(!line.includes('[definition]'));
+        });
+
+        it('logs a sanitized and masked replacement definition', async () => {
+            const selectSql = `SELECT 'user@example.com' AS email, '${'z'.repeat(120)}' AS padding`;
+
+            await logger.editView('customer view', selectSql, false);
+
+            const line = mockChannel.lines[0];
+            assert.match(line, /Replacing view "customer view" with/);
+            assert.ok(line.includes('***@***.***'));
+            assert.ok(line.includes('...[TRUNCATED]'));
+            assert.ok(line.includes('(preserve triggers: false)'));
+            assert.ok(!line.includes('user@example.com'));
         });
     });
 });

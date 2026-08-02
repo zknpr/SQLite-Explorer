@@ -1,6 +1,14 @@
 import { state } from './state.js';
-import { escapeHtml, formatCellValueAsText } from './utils.js';
-import { getRowId, getCellValue } from './data-utils.js';
+import { formatCellValueAsText, appendHighlightedText } from './utils.js';
+import { buildCellHighlightMatcher, formatCellValueForActiveMatch } from './match-nav.js';
+import {
+    getRowId,
+    getCellValue,
+    getCellValueForDisplay,
+    getExactIntegerText,
+    getOrderedColumnIndices,
+    getOrderedRowIndices
+} from './data-utils.js';
 import { syncSelectionDOM } from './grid-selection.js';
 
 function createEmptyView() {
@@ -32,7 +40,13 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
         background: 'var(--bg-secondary)'
     });
     rowNumTh.title = 'Click to select all rows';
-    rowNumTh.innerHTML = '<div class="header-content"><div class="header-top header-top-center">#</div></div>';
+    const rowHeaderContent = document.createElement('div');
+    rowHeaderContent.className = 'header-content';
+    const rowHeaderTop = document.createElement('div');
+    rowHeaderTop.className = 'header-top header-top-center';
+    rowHeaderTop.textContent = '#';
+    rowHeaderContent.appendChild(rowHeaderTop);
+    rowNumTh.appendChild(rowHeaderContent);
     headerTr.appendChild(rowNumTh);
 
     for (const col of orderedColumns) {
@@ -56,27 +70,93 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
         }
         th.dataset.column = col.name;
 
-        const safeColName = escapeHtml(col.name);
-        const safeFilterValue = escapeHtml(filterValue);
-        const sortIndicator = isSorted ? `<span class="sort-indicator">${state.sortAscending ? '▲' : '▼'}</span>` : '';
-        const keyIcon = col.isPrimaryKey ? '<span class="key-icon codicon codicon-key" title="Primary Key"></span>' : '';
         const pinClass = isPinned ? 'pinned' : '';
         const pinTitle = isPinned ? 'Unpin column' : 'Pin column';
+        const matchCounterText = state.matchNav.scope === col.name && state.matchNav.matches.length > 0
+            ? `${state.matchNav.currentIndex + 1}/${state.matchNav.matches.length}`
+            : '';
 
-        th.innerHTML = `
-            <div class="header-content">
-                <div class="header-top">
-                    ${keyIcon}<span class="header-text">${safeColName}${sortIndicator}</span>
-                    <span class="select-column-icon codicon codicon-selection" title="Select entire column"></span>
-                    <span class="pin-icon codicon codicon-pin ${pinClass}" title="${pinTitle}"></span>
-                </div>
-                <div class="header-bottom">
-                    <input type="text" class="column-filter" data-column="${safeColName}" value="${safeFilterValue}" placeholder="Filter...">
-                    <button class="filter-apply-btn" title="Apply filter (Enter)"><span class="codicon codicon-search"></span></button>
-                </div>
-            </div>
-            <div class="resize-handle"></div>
-        `;
+        const headerContent = document.createElement('div');
+        headerContent.className = 'header-content';
+        const headerTop = document.createElement('div');
+        headerTop.className = 'header-top';
+
+        if (col.isPrimaryKey) {
+            const keyIcon = document.createElement('span');
+            keyIcon.className = 'key-icon codicon codicon-key';
+            keyIcon.title = 'Primary Key';
+            headerTop.appendChild(keyIcon);
+        }
+
+        const headerText = document.createElement('span');
+        headerText.className = 'header-text';
+        headerText.textContent = col.name;
+        headerTop.appendChild(headerText);
+
+        if (isSorted) {
+            const sortIndicator = document.createElement('span');
+            sortIndicator.className = 'sort-indicator';
+            sortIndicator.textContent = state.sortAscending ? '▲' : '▼';
+            headerTop.appendChild(sortIndicator);
+        }
+
+        const selectColumnIcon = document.createElement('span');
+        selectColumnIcon.className = 'select-column-icon codicon codicon-selection';
+        selectColumnIcon.title = 'Select entire column';
+        headerTop.appendChild(selectColumnIcon);
+
+        const pinIcon = document.createElement('span');
+        pinIcon.className = `pin-icon codicon codicon-pin ${pinClass}`;
+        pinIcon.title = pinTitle;
+        headerTop.appendChild(pinIcon);
+        headerContent.appendChild(headerTop);
+
+        const headerBottom = document.createElement('div');
+        headerBottom.className = 'header-bottom';
+        const filterWrap = document.createElement('div');
+        filterWrap.className = 'column-filter-wrap';
+        const filterInput = document.createElement('input');
+        filterInput.type = 'text';
+        filterInput.className = 'column-filter';
+        filterInput.dataset.column = col.name;
+        filterInput.value = filterValue;
+        filterInput.placeholder = 'Filter...';
+        filterInput.ariaLabel = `Filter column ${col.name}`;
+        filterWrap.appendChild(filterInput);
+
+        const clearFilterButton = document.createElement('button');
+        clearFilterButton.type = 'button';
+        clearFilterButton.className = 'filter-clear-btn';
+        clearFilterButton.dataset.column = col.name;
+        clearFilterButton.ariaLabel = `Clear filter for ${col.name}`;
+        clearFilterButton.title = `Clear filter for ${col.name}`;
+        clearFilterButton.hidden = filterValue.length === 0;
+        const clearIcon = document.createElement('span');
+        clearIcon.className = 'codicon codicon-close';
+        clearFilterButton.appendChild(clearIcon);
+        filterWrap.appendChild(clearFilterButton);
+
+        const matchCounter = document.createElement('span');
+        matchCounter.className = 'column-filter-counter';
+        matchCounter.dataset.column = col.name;
+        matchCounter.textContent = matchCounterText;
+        filterWrap.appendChild(matchCounter);
+        headerBottom.appendChild(filterWrap);
+
+        const applyFilterButton = document.createElement('button');
+        applyFilterButton.type = 'button';
+        applyFilterButton.className = 'filter-apply-btn';
+        applyFilterButton.title = 'Apply filter — Enter: next match, Shift+Enter: previous';
+        const searchIcon = document.createElement('span');
+        searchIcon.className = 'codicon codicon-search';
+        applyFilterButton.appendChild(searchIcon);
+        headerBottom.appendChild(applyFilterButton);
+        headerContent.appendChild(headerBottom);
+        th.appendChild(headerContent);
+
+        const resizeHandle = document.createElement('div');
+        resizeHandle.className = 'resize-handle';
+        th.appendChild(resizeHandle);
         headerTr.appendChild(th);
     }
     thead.appendChild(headerTr);
@@ -85,6 +165,10 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
 
 function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, rowNumWidth, headerHeight, rowHeight, selectedCellKeys, hasActiveFilters) {
     const tbody = document.createElement('tbody');
+
+    const activeMatch = state.matchNav.currentIndex >= 0
+        ? state.matchNav.matches[state.matchNav.currentIndex]
+        : null;
 
     // Pinned rows logic
     const pinnedRowsList = [];
@@ -101,10 +185,14 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
         pinnedRowOffsets.set(pinnedRowsList[i].rowId, topOffset);
     }
 
-    const orderedRowIndices = [
-        ...state.gridData.map((row, idx) => ({ idx, rowId: getRowId(row, idx) })).filter(r => state.pinnedRowIds.has(r.rowId)),
-        ...state.gridData.map((row, idx) => ({ idx, rowId: getRowId(row, idx) })).filter(r => !state.pinnedRowIds.has(r.rowId))
-    ];
+    const orderedRowIndices = getOrderedRowIndices().map(idx => ({
+        idx,
+        rowId: getRowId(state.gridData[idx], idx)
+    }));
+
+    const columnFilterValues = orderedColumns.map(col =>
+        [state.filterQuery, state.columnFilters[col.name]]
+    );
 
     const fragment = document.createDocumentFragment();
 
@@ -147,16 +235,26 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
             const col = orderedColumns[displayColIdx];
             const originalColIdx = columnIndexMap.get(col.name);
             const value = getCellValue(row, originalColIdx);
-            const displayValue = formatCellValueAsText(value, col.type, state.dateFormat, col.name);
             const isNull = value === null || value === undefined;
             const isCellSelected = selectedCellKeys.has(`${rowIdx},${originalColIdx}`);
             const isColPinned = state.pinnedColumns.has(col.name);
             const hasContent = !isNull && !(value instanceof Uint8Array);
             const colWidth = state.columnWidths[col.name] || 120;
+            const isActiveMatch = !!activeMatch && activeMatch.rowIdx === rowIdx && activeMatch.colIdx === originalColIdx;
+            const visibleValue = getCellValueForDisplay(row, rowIdx, originalColIdx);
+            const exactIntegerText = getExactIntegerText(rowIdx, originalColIdx);
+            const displayValue = isActiveMatch
+                ? formatCellValueForActiveMatch(
+                    value,
+                    col,
+                    state.matchNav.term,
+                    exactIntegerText
+                )
+                : formatCellValueAsText(visibleValue, col.type, state.dateFormat, col.name);
 
             const td = document.createElement('td');
             td.id = `cell-${rowIdx}-${originalColIdx}`;
-            td.className = `data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''}`;
+            td.className = `data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''} ${isActiveMatch ? 'active-match-cell' : ''}`;
             td.dataset.rowidx = rowIdx;
             td.dataset.colidx = originalColIdx;
 
@@ -175,9 +273,13 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
 
             const textSpan = document.createElement('span');
             textSpan.className = 'cell-text';
-            // Use textContent for security (prevents XSS).
-            // formatCellValueAsText returns unescaped text suitable for textContent.
-            textSpan.textContent = displayValue;
+            // Use DOM text nodes (never innerHTML) for security (prevents XSS).
+            // formatCellValueAsText returns unescaped text suitable for textContent/text nodes.
+            appendHighlightedText(
+                textSpan,
+                displayValue,
+                buildCellHighlightMatcher(value, columnFilterValues[displayColIdx], exactIntegerText)
+            );
             td.appendChild(textSpan);
 
             if (hasContent) {
@@ -202,7 +304,7 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
             padding: '20px',
             color: 'var(--text-secondary)'
         });
-        td.textContent = 'No rows match the current filter. Modify or clear filters above.';
+        td.textContent = 'No rows match the current filter.';
         tr.appendChild(td);
         fragment.appendChild(tr);
     }
@@ -263,10 +365,7 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     }
 
     // Reorder columns: pinned first
-    const orderedColumns = [
-        ...state.tableColumns.filter(col => state.pinnedColumns.has(col.name)),
-        ...state.tableColumns.filter(col => !state.pinnedColumns.has(col.name))
-    ];
+    const orderedColumns = getOrderedColumnIndices().map(index => state.tableColumns[index]);
 
     // Pinned column offsets
     const pinnedColumnOffsets = new Map();

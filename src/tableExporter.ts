@@ -10,7 +10,7 @@ import type { TelemetryReporter } from '@vscode/extension-telemetry';
 import type { CellValue, DbParams, ExportOptions } from './core/types';
 import type { DatabaseDocument } from './databaseModel';
 import { DocumentRegistry } from './documentRegistry';
-import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
+import { escapeIdentifier, cellValueToSql, validateRowIds } from './core/sql-utils';
 import { getNodeFs } from './core/sqlite-db';
 
 /**
@@ -214,7 +214,7 @@ export async function exportTableCommand(
 
             const BATCH_SIZE = 5000;
             let offset = 0;
-            let lastId = Number.MIN_SAFE_INTEGER;
+            let lastId: CellValue | undefined;
             let hasMore = true;
             let isFirstBatch = true;
             let rowCount = 0;
@@ -228,16 +228,29 @@ export async function exportTableCommand(
                 if (useRowId) {
                     // Keyset pagination: fast O(1)
                     // We fetch rowid + user columns. rowid is prepended.
-                    sql = `SELECT rowid, ${queryColumns} FROM ${escapeIdentifier(tableName)} WHERE rowid > ?`;
-                    params.push(lastId);
+                    sql =
+                      `SELECT CAST(rowid AS TEXT) AS rowid, ${queryColumns} ` +
+                      `FROM ${escapeIdentifier(tableName)}`;
+                    const predicates: string[] = [];
+
+                    // The first batch must not use an out-of-range sentinel: SQLite
+                    // coerces it to REAL, where it rounds to INT64_MIN and skips that row.
+                    if (lastId !== undefined) {
+                        predicates.push('rowid > ?');
+                        params.push(lastId);
+                    }
 
                     // Add rowIds filter if present
                     if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-                        const validIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+                        const validIds = validateRowIds(_exportOptions.rowIds);
                         if (validIds.length > 0) {
-                            sql += ` AND rowid IN (${validIds.map(() => '?').join(',')})`;
+                            predicates.push(`rowid IN (${validIds.map(() => '?').join(',')})`);
                             params.push(...validIds);
                         }
+                    }
+
+                    if (predicates.length > 0) {
+                        sql += ` WHERE ${predicates.join(' AND ')}`;
                     }
 
                     sql += ` ORDER BY rowid ASC LIMIT ${BATCH_SIZE}`;
@@ -262,7 +275,7 @@ export async function exportTableCommand(
                 if (useRowId) {
                     const lastRow = rows[rows.length - 1];
                     // rowid is the first column because we requested `SELECT rowid, ...`
-                    lastId = Number(lastRow[0]);
+                    lastId = lastRow[0];
                 } else {
                     offset += rows.length;
                 }
@@ -309,7 +322,7 @@ export async function exportTableCommand(
 
     // Filter by row IDs if provided
     if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-        const rowIds = _exportOptions.rowIds.map(id => Number(id)).filter(n => !isNaN(n));
+        const rowIds = validateRowIds(_exportOptions.rowIds);
         if (rowIds.length > 0) {
             const placeholders = rowIds.map(() => '?').join(', ');
             sql += ` WHERE rowid IN (${placeholders})`;

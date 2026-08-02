@@ -83,7 +83,7 @@ export class BlobInspector {
         const downloadBtn = document.getElementById('blob-download-btn');
 
         if (replaceBtn) {
-            replaceBtn.disabled = uploading;
+            replaceBtn.disabled = state.isReadOnly || uploading;
             replaceBtn.textContent = uploading ? 'Uploading...' : 'Replace';
         }
         if (downloadBtn) {
@@ -93,7 +93,7 @@ export class BlobInspector {
 
     async handleReplace() {
         // Prevent concurrent uploads
-        if (this.isUploading) return;
+        if (state.isReadOnly || this.isUploading) return;
 
         try {
             // Check fileOperations setting to determine behavior
@@ -156,7 +156,7 @@ export class BlobInspector {
 
     async uploadFile(file) {
         if (!this.currentRowId || !this.currentColName) return;
-        if (this.isUploading) return;
+        if (state.isReadOnly || this.isUploading) return;
 
         this.setUploadState(true);
 

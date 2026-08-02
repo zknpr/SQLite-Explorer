@@ -1,25 +1,283 @@
 import { state, persistState } from './state.js';
-import { loadTableData } from './grid-data.js';
+import { RPC_TIMEOUT_MS } from './rpc-constants.js';
+import { getGridReloadOwner, loadTableData } from './grid-data.js';
 import { renderDataGrid } from './grid-render.js';
 import { updateSelectionStates } from './grid-selection.js';
-import { updateToolbarButtons } from './ui.js';
+import { updateStatus, updateToolbarButtons } from './ui.js';
 import { updateBatchSidebar } from './sidebar.js';
-import { getRowId, getCellValue } from './data-utils.js';
+import { getRowId, getCellValue, getCellValueForDisplay } from './data-utils.js';
 import { openCellPreview, startCellEdit, openCellInVsCode } from './edit.js';
+import {
+    GLOBAL_MATCH_SCOPE,
+    getPreferredMatchScope,
+    navigateMatches,
+    resetMatchNav
+} from './match-nav.js';
 
-export function onFilterChange() {
-    clearTimeout(state.filterTimer);
+const FILTER_DEBOUNCE_MS = 300;
+const FILTER_RELOAD_RETRY_MS = 50;
+// One grid load performs count and data RPCs sequentially, so its legitimate
+// lifetime can approach two RPC deadlines. A missing owner is an impossible
+// production state, but still gets a short fail-safe bound instead of spinning.
+const FILTER_RELOAD_OWNER_WAIT_MS = RPC_TIMEOUT_MS * 2;
+const FILTER_RELOAD_FALLBACK_WAIT_MS = 5000;
+
+function getColumnFilterInput(columnName) {
+    return [...document.querySelectorAll('.column-filter')]
+        .find(input => input.dataset.column === columnName) || null;
+}
+
+function updateFilterClearButton(input) {
+    if (!input) return;
+    const isGlobal = input === document.getElementById('filterInput');
+    const button = isGlobal
+        ? document.getElementById('btnClearFilter')
+        : input.closest?.('.column-filter-wrap')?.querySelector?.('.filter-clear-btn');
+    if (button) button.hidden = input.value.length === 0;
+}
+
+function markFilterDraftChanged() {
+    state.currentPageIndex = 0;
+    state.filterApplyPending = true;
+    state.filterApplyTable = state.selectedTable;
+    // A newer draft supersedes navigation requested for older text.
+    state.filterPendingAction = null;
+    resetMatchNav();
+}
+
+/**
+ * Capture every live filter input as one coherent draft. This must happen
+ * synchronously in the input event, before a reload can rebuild the header.
+ */
+export function syncFilterInputsToState() {
+    let changed = false;
+    const globalInput = document.getElementById('filterInput');
+    if (globalInput) {
+        updateFilterClearButton(globalInput);
+        if (state.filterQuery !== globalInput.value) {
+            state.filterQuery = globalInput.value;
+            changed = true;
+        }
+    }
+
+    document.querySelectorAll('.column-filter').forEach(input => {
+        const columnName = input.dataset.column;
+        if (columnName === undefined) return;
+        updateFilterClearButton(input);
+        const previous = state.columnFilters[columnName] || '';
+        if (previous === input.value) return;
+        if (input.value === '') delete state.columnFilters[columnName];
+        else state.columnFilters[columnName] = input.value;
+        changed = true;
+    });
+
+    if (changed) markFilterDraftChanged();
+    return changed;
+}
+
+function clearFilterTimer() {
+    if (state.filterTimer !== null) {
+        clearTimeout(state.filterTimer);
+        state.filterTimer = null;
+    }
+}
+
+function focusFilterInput(scope) {
+    const input = scope === GLOBAL_MATCH_SCOPE
+        ? document.getElementById('filterInput')
+        : getColumnFilterInput(scope);
+    if (!input) return;
+    input.focus();
+    input.setSelectionRange?.(input.value.length, input.value.length);
+}
+
+function scheduleFilterApply(
+    delay = FILTER_DEBOUNCE_MS,
+    table = state.selectedTable,
+    reloadWait = null
+) {
+    clearFilterTimer();
     state.filterTimer = setTimeout(() => {
-        state.filterQuery = document.getElementById('filterInput').value;
-        state.currentPageIndex = 0;
-        loadTableData();
+        state.filterTimer = null;
+        return processFilterQueue(table, reloadWait);
+    }, delay);
+}
+
+function getReloadWait(owner, previousWait) {
+    const ownerToken = owner?.token ?? null;
+    if (previousWait?.ownerToken === ownerToken) return previousWait;
+    return {
+        ownerToken,
+        deadline: (owner?.startedAt ?? Date.now()) + (
+            owner ? FILTER_RELOAD_OWNER_WAIT_MS : FILTER_RELOAD_FALLBACK_WAIT_MS
+        )
+    };
+}
+
+async function processFilterQueue(table = state.selectedTable, reloadWait = null) {
+    // A table switch resets the filter state. Never let an old debounce reload or
+    // focus a different table's controls.
+    if (table !== state.selectedTable) {
+        if (state.filterApplyTable === table) {
+            state.filterApplyPending = false;
+            state.filterApplyTable = null;
+        }
+        if (state.filterPendingAction?.table === table) state.filterPendingAction = null;
+        return;
+    }
+
+    if (!table) {
+        state.filterApplyPending = false;
+        state.filterApplyTable = null;
+        const action = state.filterPendingAction;
+        state.filterPendingAction = null;
+        if (action?.focusScope !== null && action?.focusScope !== undefined) {
+            focusFilterInput(action.focusScope);
+        }
         persistState();
-    }, 300);
+        return false;
+    }
+
+    // Queue behind the owner of the reload guard instead of starting a competing
+    // request. Input events still update state immediately while we wait.
+    if (state.isGridReloading) {
+        const nextReloadWait = getReloadWait(getGridReloadOwner(), reloadWait);
+        if (Date.now() >= nextReloadWait.deadline) {
+            state.filterApplyPending = false;
+            state.filterApplyTable = null;
+            state.filterPendingAction = null;
+            updateStatus('Filter draft retained; it will apply on the next grid reload.');
+            return false;
+        }
+        scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table, nextReloadWait);
+        return undefined;
+    }
+
+    if (state.filterApplyPending) {
+        state.filterApplyPending = false;
+        const result = await loadTableData(false);
+        if (result !== true) {
+            // Text typed during the failed request is a distinct successor and
+            // should still be tried immediately against the retained grid.
+            if (result === false && state.filterApplyPending) {
+                clearFilterTimer();
+                return processFilterQueue(table);
+            }
+
+            // A superseded request has another load in progress; retry when that
+            // owner releases the guard.
+            if (result === undefined) {
+                if (table === state.selectedTable && !state.filterApplyPending) {
+                    state.filterApplyPending = true;
+                    state.filterApplyTable = table;
+                }
+                scheduleFilterApply(FILTER_RELOAD_RETRY_MS, table);
+                return result;
+            }
+
+            // A genuine query failure must not become the persisted/current
+            // predicate. Restore the filter identity paired with the grid that
+            // loadTableData deliberately kept mounted; the failed draft remains
+            // in the live input for correction and another debounce/Enter.
+            const successful = state.lastSuccessfulFilterState;
+            if (successful?.table === table) {
+                state.filterQuery = successful.filterQuery;
+                state.columnFilters = { ...successful.columnFilters };
+            }
+            state.filterApplyPending = false;
+            state.filterApplyTable = null;
+            state.filterPendingAction = null;
+            persistState();
+            const details = state.lastGridLoadError ? `: ${state.lastGridLoadError}` : '';
+            updateStatus(`Filter failed and was reverted${details}`);
+            return result;
+        }
+        persistState();
+    }
+
+    // Text typed during the fetch scheduled a later application. The first load
+    // rebuilt the header from the latest captured draft but returned rows for its
+    // older snapshot. Start the successor immediately so that mismatch is never
+    // left interactive for the remainder of the debounce window.
+    if (state.filterApplyPending) {
+        const pendingAction = state.filterPendingAction;
+        if (pendingAction?.table === table && pendingAction.focusScope !== null) {
+            focusFilterInput(pendingAction.focusScope);
+        }
+        clearFilterTimer();
+        return processFilterQueue(table);
+    }
+
+    state.filterApplyTable = null;
+    const action = state.filterPendingAction;
+    if (!action || action.table !== table) return true;
+    state.filterPendingAction = null;
+    if (action.focusScope !== null) focusFilterInput(action.focusScope);
+    if (action.navigate) navigateMatches(action.scope, action.direction);
+    return true;
+}
+
+function requestFilterAction({ scope, direction = 1, navigate = true, focusScope = scope }) {
+    clearFilterTimer();
+    state.filterPendingAction = {
+        table: state.selectedTable,
+        scope,
+        direction,
+        navigate,
+        focusScope
+    };
+    return processFilterQueue(state.selectedTable);
+}
+
+function scopeForInput(input) {
+    if (input === document.getElementById('filterInput')) return GLOBAL_MATCH_SCOPE;
+    return input?.dataset?.column ?? null;
+}
+
+/** Capture a draft on every keystroke and debounce its data reload. */
+export function onFilterInput(event) {
+    const changed = syncFilterInputsToState();
+    if (changed) {
+        const focusScope = scopeForInput(event.target);
+        state.filterPendingAction = {
+            table: state.selectedTable,
+            scope: focusScope,
+            direction: 1,
+            navigate: false,
+            focusScope
+        };
+    }
+
+    // Do not submit a partially composed IME value. compositionend is wired to
+    // this same handler and starts the normal debounce.
+    if (event.isComposing) {
+        clearFilterTimer();
+        return;
+    }
+    if (state.filterApplyPending) scheduleFilterApply();
+}
+
+export async function applyGlobalFilter(direction = 1) {
+    const input = document.getElementById('filterInput');
+    if (!input) return;
+    syncFilterInputsToState();
+    return requestFilterAction({ scope: GLOBAL_MATCH_SCOPE, direction });
+}
+
+export function onFilterEnter(event) {
+    // Enter jumps to the next match, Shift+Enter to the previous one. Ignore the
+    // Enter that confirms an IME composition candidate (isComposing) so we don't
+    // submit the filter / preventDefault before the composed text is committed.
+    if (event.key === 'Enter' && !event.isComposing) {
+        event.preventDefault();
+        return applyGlobalFilter(event.shiftKey ? -1 : 1);
+    }
 }
 
 export function onPageSizeChange() {
     state.rowsPerPage = parseInt(document.getElementById('pageSizeSelect').value, 10);
     state.currentPageIndex = 0;
+    resetMatchNav();
     loadTableData();
     persistState();
 }
@@ -28,6 +286,9 @@ export function onDateFormatChange() {
     const select = document.getElementById('dateFormatSelect');
     if (select) {
         state.dateFormat = select.value;
+        // Cached matches were computed against the previous formatted text, so they
+        // (and the highlighted active cell) are stale once the format changes.
+        resetMatchNav();
         renderDataGrid();
         persistState();
     }
@@ -37,34 +298,77 @@ export function goToPage(pageIndex) {
     if (pageIndex >= 0 && pageIndex < state.totalPageCount) {
         state.currentPageIndex = pageIndex;
         state.scrollPosition = { top: 0, left: 0 };
+        resetMatchNav();
         loadTableData(true, false);
     }
 }
 
 export function onColumnSort(columnName) {
-    if (state.sortedColumn === columnName) {
-        state.sortAscending = !state.sortAscending;
-    } else {
+    // Cycle through three states on repeated clicks of the same column:
+    // none (original order) -> ascending -> descending -> none ...
+    if (state.sortedColumn !== columnName) {
         state.sortedColumn = columnName;
         state.sortAscending = true;
+    } else if (state.sortAscending) {
+        state.sortAscending = false;
+    } else {
+        // Back to the original, unsorted order.
+        state.sortedColumn = null;
+        state.sortAscending = true;
     }
+    resetMatchNav();
     loadTableData();
     persistState();
 }
 
-export function applyColumnFilter(columnName) {
-    const input = document.querySelector(`.column-filter[data-column="${columnName}"]`);
-    if (input) {
-        state.columnFilters[columnName] = input.value;
-        state.currentPageIndex = 0;
-        loadTableData();
-    }
+export async function applyColumnFilter(columnName, direction = 1) {
+    const input = getColumnFilterInput(columnName);
+    if (!input) return;
+    syncFilterInputsToState();
+    return requestFilterAction({ scope: columnName, direction });
 }
 
 export function onColumnFilterKeydown(event, columnName) {
-    if (event.key === 'Enter') {
-        applyColumnFilter(columnName);
+    // Enter jumps to the next match, Shift+Enter to the previous one. Ignore the
+    // IME composition-confirm Enter (isComposing) so CJK input isn't broken.
+    if (event.key === 'Enter' && !event.isComposing) {
+        event.preventDefault();
+        return applyColumnFilter(columnName, event.shiftKey ? -1 : 1);
     }
+}
+
+/** Apply/navigate the currently active filter from a non-editor grid cell. */
+export function applyCurrentFilter(direction = 1) {
+    syncFilterInputsToState();
+    const scope = getPreferredMatchScope();
+    if (scope === null) return null;
+    return requestFilterAction({ scope, direction });
+}
+
+export function clearGlobalFilter() {
+    const input = document.getElementById('filterInput');
+    if (!input) return;
+    input.value = '';
+    syncFilterInputsToState();
+    focusFilterInput(GLOBAL_MATCH_SCOPE);
+    return requestFilterAction({
+        scope: GLOBAL_MATCH_SCOPE,
+        navigate: false,
+        focusScope: GLOBAL_MATCH_SCOPE
+    });
+}
+
+export function clearColumnFilter(columnName) {
+    const input = getColumnFilterInput(columnName);
+    if (!input) return;
+    input.value = '';
+    syncFilterInputsToState();
+    focusFilterInput(columnName);
+    return requestFilterAction({
+        scope: columnName,
+        navigate: false,
+        focusScope: columnName
+    });
 }
 
 // Column Selection
@@ -192,6 +496,7 @@ export function toggleColumnPin(event, columnName) {
     } else {
         state.pinnedColumns.add(columnName);
     }
+    resetMatchNav();
     renderDataGrid();
     persistState();
 }
@@ -204,6 +509,7 @@ export function toggleRowPin(event, rowId) {
     } else {
         state.pinnedRowIds.add(rowId);
     }
+    resetMatchNav();
     renderDataGrid();
     persistState();
 }
@@ -457,7 +763,8 @@ export function onCellDoubleClick(event, rowIdx, colIdx, rowId) {
             colIdx,
             rowId,
             columnName: column.name,
-            originalValue: value
+            originalValue: value,
+            originalText: String(getCellValueForDisplay(row, rowIdx, colIdx) ?? '')
         };
         openCellInVsCode();
 

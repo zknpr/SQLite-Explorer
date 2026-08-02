@@ -26,7 +26,13 @@ export interface CellContentType {
  * Represents any value that can be stored in a SQLite cell.
  * Includes text, integers, floats, binary data, and NULL.
  */
-export type CellValue = string | number | null | Uint8Array;
+export type CellValue = string | number | bigint | null | Uint8Array;
+
+/**
+ * Sparse exact SQLite text for numeric cells whose Number transport is lossy
+ * (unsafe INTEGERs) or whose REAL text differs from JavaScript formatting.
+ */
+export type ExactIntegerTextMap = Record<number, Record<number, string>>;
 
 /**
  * Unique identifier for a database row.
@@ -51,6 +57,8 @@ export interface QueryResultSet {
   headers: string[];
   /** Row data as 2D array (primary naming) */
   rows: CellValue[][];
+  /** Sparse row/column sidecar for numeric text lost by the number-based grid contract. */
+  exactIntegerTexts?: ExactIntegerTextMap;
   /** Column names - sql.js compatible alias for webview */
   columns?: string[];
   /** Row data - sql.js compatible alias for webview */
@@ -98,6 +106,53 @@ export interface ViewMetadata {
 }
 
 /**
+ * SQL definition for an INSTEAD OF trigger attached to a view.
+ */
+export interface ViewTriggerDefinition {
+  /** Trigger name */
+  identifier: string;
+  /** Original CREATE TRIGGER statement from sqlite_schema */
+  sql: string;
+  /** True when the trigger belongs to the connection-local temp schema. */
+  temporary?: boolean;
+}
+
+/**
+ * Complete definition needed to recreate a view without losing its triggers.
+ */
+export interface ViewDefinition {
+  /** View name */
+  identifier: string;
+  /** Original CREATE VIEW statement from sqlite_schema */
+  sql: string;
+  /** SELECT body editable by the user */
+  selectSql: string;
+  /** Verbatim explicit output column-list SQL, including parentheses. */
+  columnListSql?: string;
+  /** Legacy reconstructed output names retained for serialized history compatibility. */
+  columns?: string[];
+  /** INSTEAD OF triggers owned by the view */
+  triggers: ViewTriggerDefinition[];
+  /**
+   * Unqualified TEMP trigger candidates whose historical target cannot be
+   * recovered while a same-named TEMP view shadows this main-schema view.
+   * Browsing remains available, but destructive view mutations must reject.
+   */
+  ambiguousTemporaryTriggerNames?: string[];
+}
+
+/** Whether validation/preview is for a new view or an existing replacement. */
+export type ViewDefinitionIntent = 'create' | 'edit';
+
+/**
+ * Atomic view replacement result used by undo/redo tracking.
+ */
+export interface ViewEditResult {
+  before: ViewDefinition;
+  after: ViewDefinition;
+}
+
+/**
  * Index metadata for schema display.
  */
 export interface IndexMetadata {
@@ -133,7 +188,10 @@ export type ModificationType =
   | 'table_create'
   | 'column_add'
   | 'column_drop'
-  | 'table_drop';
+  | 'table_drop'
+  | 'view_create'
+  | 'view_edit'
+  | 'view_drop';
 
 /**
  * How a cell value should be applied when replaying a cell update.
@@ -189,6 +247,10 @@ export interface ModificationEntry {
   }[];
   /** Indexes dropped before a column_drop; missing values from older backups mean none. */
   droppedIndexes?: string[];
+  /** View definition before an edit/drop. */
+  viewDefBefore?: ViewDefinition;
+  /** View definition after a create/edit. */
+  viewDefAfter?: ViewDefinition;
 }
 
 /**
@@ -252,8 +314,45 @@ export interface DatabaseOperations {
   /** Create a new table */
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
 
+  /** Read a view and the INSTEAD OF triggers that must survive replacement. */
+  getViewDefinition(view: string): Promise<ViewDefinition>;
+
+  /** Compile a proposed SELECT body without changing the schema. */
+  validateViewDefinition(
+    view: string,
+    selectSql: string,
+    intent?: ViewDefinitionIntent
+  ): Promise<void>;
+
+  /** Compile and execute a bounded preview of a proposed SELECT body. */
+  previewViewDefinition(
+    view: string,
+    selectSql: string,
+    limit?: number,
+    intent?: ViewDefinitionIntent
+  ): Promise<QueryResultSet>;
+
+  /** Create a view from a SELECT body. */
+  createView(view: string, selectSql: string): Promise<ViewDefinition>;
+
+  /** Atomically replace a view, optionally guarded by its expected stored definition. */
+  editView(
+    view: string,
+    selectSql: string,
+    preserveTriggers?: boolean,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ): Promise<ViewEditResult>;
+
+  /** Drop a view and return its undo definition, optionally guarded by a confirmed snapshot. */
+  dropView(
+    view: string,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ): Promise<ViewDefinition>;
+
   /** Update multiple cells in a batch */
-  updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
+  updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]>;
 
   /** Add a new column to a table */
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
@@ -294,6 +393,15 @@ export interface CellUpdate {
   operation?: CellUpdateOperation;
 }
 
+/** Authoritative before/after state captured by an atomic batch update. */
+export interface CellUpdateResult {
+  rowId: RecordId;
+  columnName: string;
+  priorValue?: CellValue;
+  newValue?: CellValue;
+  operation: CellUpdateOperation;
+}
+
 /**
  * Definition for a new column when creating a table.
  */
@@ -311,6 +419,8 @@ export interface ColumnDefinition {
 
 export interface TableQueryOptions {
   columns?: string[];
+  /** Displayed columns eligible for the global filter, excluding identity-only SELECT fields. */
+  globalFilterColumns?: string[];
   orderBy?: string;
   orderDir?: 'ASC' | 'DESC';
   limit?: number;
@@ -324,6 +434,8 @@ export interface TableQueryOptions {
 
 export interface TableCountOptions {
   columns?: string[];
+  /** Displayed columns eligible for the global filter, matching TableQueryOptions. */
+  globalFilterColumns?: string[];
   filters?: {
     column: string;
     value: string;

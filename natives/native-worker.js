@@ -30,6 +30,7 @@ let db = null;
 /** Map of prepared statements by ID */
 const statements = new Map();
 let stmtCounter = 0;
+let savepointCounter = 0;
 
 // ============================================================================
 // Message Protocol
@@ -252,6 +253,184 @@ function executeQuery(db, sql, params) {
   };
 }
 
+/** Compact generated numeric metadata before crossing the V8 RPC boundary. */
+function compactExactNumericResult(result, transportColumns, valueColumnCount) {
+  if (!Array.isArray(transportColumns) || transportColumns.length < 1) {
+    throw new Error('Invalid exact numeric transport column list');
+  }
+  const hasRealTextSidecar = valueColumnCount !== undefined;
+  const logicalColumnCount = hasRealTextSidecar ? valueColumnCount : transportColumns.length;
+  if (
+    !Number.isInteger(logicalColumnCount) ||
+    logicalColumnCount < 1 ||
+    transportColumns.length !== logicalColumnCount * (hasRealTextSidecar ? 2 : 1)
+  ) {
+    throw new Error('Invalid exact numeric transport column list');
+  }
+  const values = [];
+  let exactIntegerTexts;
+
+  if (result.values.length === 0) {
+    return { columns: transportColumns.slice(0, logicalColumnCount), values, rowCount: 0 };
+  }
+
+  const mapping = transportColumns.map(column => result.columns.indexOf(column));
+  if (mapping.some(index => index < 0)) {
+    throw new Error('Native query result omitted exact numeric transport metadata');
+  }
+
+  for (let rowIndex = 0; rowIndex < result.values.length; rowIndex++) {
+    const sourceRow = result.values[rowIndex];
+    const orderedRow = mapping.map(index => sourceRow[index]);
+    values.push(orderedRow.slice(0, logicalColumnCount));
+    if (!hasRealTextSidecar) continue;
+    for (let columnIndex = 0; columnIndex < logicalColumnCount; columnIndex++) {
+      const exactText = orderedRow[logicalColumnCount + columnIndex];
+      if (exactText === null || exactText === undefined) continue;
+      if (typeof exactText !== 'string') {
+        throw new Error(`Exact numeric metadata at row ${rowIndex}, column ${columnIndex} is not text`);
+      }
+      if (exactText === String(orderedRow[columnIndex])) continue;
+      exactIntegerTexts ??= {};
+      exactIntegerTexts[rowIndex] ??= {};
+      exactIntegerTexts[rowIndex][columnIndex] = exactText;
+    }
+  }
+
+  const compacted = {
+    columns: transportColumns.slice(0, logicalColumnCount),
+    values,
+    rowCount: values.length
+  };
+  if (exactIntegerTexts) compacted.exactIntegerTexts = exactIntegerTexts;
+  return compacted;
+}
+
+/** Execute one prepared query only after SQLite proves it consumed the boundary. */
+function executeSingleQuery(db, sql, params, requiredSuffix) {
+  const stmt = db.prepare(sql);
+  let rows = [];
+  try {
+    const preparedSql = typeof stmt.toString === 'function' ? stmt.toString().trimEnd() : '';
+    if (!requiredSuffix || !preparedSql.endsWith(requiredSuffix)) {
+      throw new Error('Exactly one SQL statement is required');
+    }
+
+    if (typeof stmt.all === 'function') {
+      rows = params && params.length > 0 ? stmt.all(...params) : stmt.all();
+    } else {
+      if (params && params.length > 0 && typeof stmt.bind === 'function') {
+        stmt.bind(...params);
+      }
+      for (const row of stmt) rows.push(row);
+    }
+  } finally {
+    if (typeof stmt.finalize === 'function') stmt.finalize();
+  }
+
+  const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+  return {
+    columns,
+    values: rows.map(row => columns.map(column => row[column])),
+    rowCount: rows.length
+  };
+}
+
+/** Validate one marked payload and return the exact executable SQL it contains. */
+function assertSingleStatementPayload(db, markedSql, sql, requiredSuffix) {
+  const marker = requiredSuffix ? `\n${requiredSuffix}` : '';
+  if (!marker || !markedSql.endsWith(marker)) {
+    throw new Error('Exactly one SQL statement is required');
+  }
+
+  // Do not validate one RPC string and execute another. Besides weakening the
+  // statement-boundary guarantee, any transport divergence would make SQLite
+  // store SQL different from the definition the host compiled. Derive the
+  // executable bytes from the boundary-checked payload and use the duplicate
+  // argument only as an integrity assertion for protocol compatibility.
+  const validatedSql = markedSql.slice(0, -marker.length);
+  if (validatedSql !== sql) {
+    throw new Error('Single-statement SQL payload mismatch');
+  }
+
+  const validationStmt = db.prepare(markedSql);
+  try {
+    if (
+      typeof validationStmt.toString !== 'function' ||
+      validationStmt.toString === Object.prototype.toString
+    ) {
+      throw new Error('Statement introspection unavailable');
+    }
+    const introspectedSql = validationStmt.toString();
+    if (typeof introspectedSql !== 'string') {
+      throw new Error('Statement introspection unavailable');
+    }
+    const preparedSql = introspectedSql.trimEnd();
+    if (!requiredSuffix || !preparedSql.endsWith(requiredSuffix)) {
+      throw new Error('Exactly one SQL statement is required');
+    }
+  } finally {
+    if (typeof validationStmt.finalize === 'function') validationStmt.finalize();
+  }
+  return validatedSql;
+}
+
+/** Execute one mutation only after the marked SQL proves it has no tail. */
+function executeSingleStatement(db, markedSql, sql, params, requiredSuffix) {
+  const validatedSql = assertSingleStatementPayload(db, markedSql, sql, requiredSuffix);
+  return executeStatement(db, validatedSql, params);
+}
+
+/**
+ * Read a generated SELECT with a best-effort elapsed-time bound. The bundled
+ * txiki SQLite Database exposes only close/exec/prepare/inTransaction/
+ * transaction/loadExtension; it has no sqlite3_interrupt or progress-handler
+ * API, and Statement exposes all()/run() but no stepping API. Consequently
+ * stmt.all() blocks the child event loop: the parent RPC deadline can reject
+ * its promise, but neither it nor a queued rollback can preempt this call. The
+ * checks below can only reject a result after SQLite returns. True interruption
+ * remains deferred until the binding exposes a native cancellation primitive.
+ */
+function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, valueColumnCount, limit, timeoutMs) {
+  const validatedSql = assertSingleStatementPayload(db, markedSql, sql, requiredSuffix);
+
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    throw new Error('Preview row limit must be an integer between 1 and 100');
+  }
+
+  const values = [];
+  const startedAt = Date.now();
+  const stmt = db.prepare(`${validatedSql}\nLIMIT ${limit}`);
+  try {
+    // The disposable preview view gives duplicate aliases stable positional
+    // schema names (for example x and x:1), so row objects can be projected in
+    // PRAGMA order without re-running the SELECT for each OFFSET. txiki's
+    // statement API exposes all() but no step/iterator API, so SQLite executes
+    // once and the elapsed bound is checked while serializing each returned row.
+    const rows = stmt.all();
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+    }
+    for (const row of rows) {
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+      }
+      values.push(columns.map(column => row[column]));
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+      }
+    }
+  } finally {
+    if (typeof stmt.finalize === 'function') stmt.finalize();
+  }
+
+  return compactExactNumericResult(
+    { columns, values, rowCount: values.length },
+    columns,
+    valueColumnCount
+  );
+}
+
 /**
  * Handle incoming RPC request.
  *
@@ -333,6 +512,43 @@ async function handleRequest(request) {
 
         result = executeQuery(db, sql, params);
         console.error("[native-worker] query complete");
+        break;
+      }
+
+      case "queryNumeric": {
+        const [sql, params, transportColumns, valueColumnCount] = args;
+        if (!db) throw new Error("Database not open");
+        result = compactExactNumericResult(
+          executeQuery(db, sql, params),
+          transportColumns,
+          valueColumnCount
+        );
+        break;
+      }
+
+      case "querySingle": {
+        // The caller appends an unpredictable comment suffix. SQLite's own
+        // parser must retain it in the prepared statement or a tail escaped
+        // the wrapper and this request is rejected before anything is stepped.
+        const [sql, params, requiredSuffix] = args;
+        if (!db) throw new Error("Database not open");
+        result = executeSingleQuery(db, sql, params, requiredSuffix);
+        break;
+      }
+
+      case "queryBounded": {
+        const [markedSql, sql, requiredSuffix, columns, valueColumnCount, limit, timeoutMs] = args;
+        if (!db) throw new Error("Database not open");
+        result = executeBoundedQuery(
+          db,
+          markedSql,
+          sql,
+          requiredSuffix,
+          columns,
+          valueColumnCount,
+          limit,
+          timeoutMs
+        );
         break;
       }
 
@@ -422,13 +638,22 @@ async function handleRequest(request) {
         break;
       }
 
+      case "runSingle": {
+        const [markedSql, sql, params, requiredSuffix] = args;
+        if (!db) throw new Error("Database not open");
+        result = executeSingleStatement(db, markedSql, sql, params, requiredSuffix);
+        break;
+      }
+
       case "execBatch": {
-        // Execute a batch of statements in a transaction
+        // SAVEPOINT composes with host-side atomic read/write boundaries; a raw
+        // BEGIN here would fail when updateCellBatch is intentionally nested.
         // args: [items: { sql: string, params?: any[], paramsList?: any[][] }[]]
         const [items] = args;
         if (!db) throw new Error("Database not open");
 
-        db.exec("BEGIN TRANSACTION");
+        const savepointName = `sqlite_explorer_exec_batch_${++savepointCounter}`;
+        db.exec(`SAVEPOINT "${savepointName}"`);
         try {
           for (const item of items) {
              if (item.paramsList && item.paramsList.length > 0) {
@@ -446,10 +671,17 @@ async function handleRequest(request) {
                  executeStatement(db, item.sql, item.params);
              }
           }
-          db.exec("COMMIT");
+          db.exec(`RELEASE SAVEPOINT "${savepointName}"`);
           result = { success: true };
         } catch (err) {
-          try { db.exec("ROLLBACK"); } catch(e) {}
+          try {
+            db.exec(`ROLLBACK TO SAVEPOINT "${savepointName}"`);
+            db.exec(`RELEASE SAVEPOINT "${savepointName}"`);
+          } catch (rollbackErr) {
+            throw new Error(
+              `Batch failed (${String(err)}); savepoint cleanup failed (${String(rollbackErr)})`
+            );
+          }
           throw err;
         }
         break;

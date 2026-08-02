@@ -1,48 +1,64 @@
 /**
  * RPC Communication Layer
  */
-import { state } from './state.js';
-import { loadTableData, loadTableColumns } from './grid.js';
+import { state, persistState } from './state.js';
+import { clearSelection, loadTableData, loadTableColumns } from './grid.js';
 import { refreshSchema } from './sidebar.js';
 import { handleRpcResponse, sendRpcResult, sendRpcError } from './api.js';
+import { applyConnectionResult } from './connection-state.js';
 
 export { backendApi } from './api.js';
 
 /**
  * Methods called by the extension host.
  */
-const webviewMethods = {
-    async refreshContent(filename) {
-        if (state.isDbConnected) {
-            // Refresh schema to reflect added/removed tables or views
-            await refreshSchema();
-
-            // Validate if selected table still exists
-            const tableExists = state.schemaCache.tables.some(t => t.name === state.selectedTable) ||
-                                state.schemaCache.views.some(v => v.name === state.selectedTable);
-
-            if (!tableExists && state.selectedTable) {
-                // Table was deleted (e.g. undo create table)
-                state.selectedTable = null;
-                state.selectedTableType = null;
-                // Show empty state
-                document.getElementById('tableNameLabel').textContent = 'No table selected';
-                document.getElementById('gridContainer').innerHTML = `
-                    <div class="empty-view">
-                        <span class="empty-icon codicon codicon-database"></span>
-                        <span class="empty-title">Select a table</span>
-                        <span class="empty-desc">Choose a table from the sidebar to view data</span>
-                    </div>
-                `;
-            } else if (state.selectedTable) {
-                // Refresh columns to reflect added/removed columns
-                await loadTableColumns();
-                // Refresh data to reflect row changes
-                await loadTableData(false);
-            }
+export async function refreshContent(filename, connectionResult) {
+    if (connectionResult) {
+        applyConnectionResult(connectionResult);
+    }
+    if (state.isDbConnected) {
+        // A broadcast view refresh may replace its projection and row order.
+        // Clear positional state before any async reload so another webview's
+        // edit cannot leave this panel's controls targeting unrelated cells.
+        if (state.selectedTable && state.selectedTableType === 'view') {
+            clearSelection();
+            persistState();
         }
-        return { success: true };
-    },
+
+        // Refresh schema to reflect added/removed tables or views
+        await refreshSchema();
+
+        // Validate if selected table still exists
+        const tableExists = state.schemaCache.tables.some(t => t.name === state.selectedTable) ||
+                            state.schemaCache.views.some(v => v.name === state.selectedTable);
+
+        if (!tableExists && state.selectedTable) {
+            // Table was deleted (e.g. undo create table)
+            clearSelection();
+            state.selectedTable = null;
+            state.selectedTableType = null;
+            // Show empty state
+            document.getElementById('tableNameLabel').textContent = 'No table selected';
+            document.getElementById('gridContainer').innerHTML = `
+                <div class="empty-view">
+                    <span class="empty-icon codicon codicon-database"></span>
+                    <span class="empty-title">Select a table</span>
+                    <span class="empty-desc">Choose a table from the sidebar to view data</span>
+                </div>
+            `;
+            persistState();
+        } else if (state.selectedTable) {
+            // Refresh columns to reflect added/removed columns
+            await loadTableColumns();
+            // Refresh data to reflect row changes
+            await loadTableData(false);
+        }
+    }
+    return { success: true };
+}
+
+const webviewMethods = {
+    refreshContent,
 
     async updateColorScheme(scheme) {
         document.documentElement.style.colorScheme = scheme;

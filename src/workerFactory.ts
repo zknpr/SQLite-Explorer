@@ -14,7 +14,11 @@ import type { TelemetryReporter } from '@vscode/extension-telemetry';
 import * as vsc from 'vscode';
 import path from 'path';
 
-import { connectWorkerPort, Transfer } from './core/rpc';
+import {
+  connectWorkerPort,
+  DEFAULT_INVOCATION_TIMEOUT_MS,
+  Transfer
+} from './core/rpc';
 import { serializeOperations } from './core/operation-serializer';
 import { GlobalOutputChannel } from './main';
 import type {
@@ -25,11 +29,16 @@ import type {
   DatabaseInitConfig,
   DatabaseInitResult,
   CellUpdate,
+  CellUpdateResult,
   ColumnDefinition,
   TableQueryOptions,
   TableCountOptions,
   SchemaSnapshot,
-  ColumnMetadata
+  ColumnMetadata,
+  ViewDefinition,
+  ViewDefinitionIntent,
+  ViewEditResult,
+  ViewTriggerDefinition
 } from './core/types';
 
 import { Worker } from './platform/threadPool';
@@ -59,6 +68,10 @@ if (!import.meta.env?.VSCODE_BROWSER_EXT) {
 
 /**
  * Methods exposed by the database worker.
+ *
+ * Keep every parameter structured-cloneable. AbortSignal is deliberately not
+ * part of this RPC contract: worker_threads clones it into a plain object, so
+ * cancellation is checked in the host facade before dispatch instead.
  */
 interface WorkerMethods {
   initializeDatabase(
@@ -67,6 +80,11 @@ interface WorkerMethods {
   ): Promise<DatabaseInitResult>;
   runQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]>;
   exportDatabase(): Promise<Uint8Array>;
+  applyModifications(mods: ModificationEntry[]): Promise<void>;
+  undoModification(mod: ModificationEntry): Promise<void>;
+  redoModification(mod: ModificationEntry): Promise<void>;
+  flushChanges(): Promise<void>;
+  discardModifications(mods: ModificationEntry[]): Promise<void>;
   updateCell(table: string, rowId: string | number, column: string, value: CellValue, patch?: string): Promise<void>;
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
@@ -74,7 +92,32 @@ interface WorkerMethods {
   deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
-  updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
+  getViewDefinition(view: string): Promise<ViewDefinition>;
+  validateViewDefinition(
+    view: string,
+    selectSql: string,
+    intent?: ViewDefinitionIntent
+  ): Promise<void>;
+  previewViewDefinition(
+    view: string,
+    selectSql: string,
+    limit?: number,
+    intent?: ViewDefinitionIntent
+  ): Promise<QueryResultSet>;
+  createView(view: string, selectSql: string): Promise<ViewDefinition>;
+  editView(
+    view: string,
+    selectSql: string,
+    preserveTriggers?: boolean,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ): Promise<ViewEditResult>;
+  dropView(
+    view: string,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ): Promise<ViewDefinition>;
+  updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
   fetchTableCount(table: string, options: TableCountOptions): Promise<number>;
@@ -84,6 +127,117 @@ interface WorkerMethods {
   setPragma(pragma: string, value: CellValue): Promise<void>;
   ping(): Promise<boolean>;
   writeToFile(path: string): Promise<void>;
+}
+
+const WORKER_METHOD_NAMES = [
+  'initializeDatabase',
+  'runQuery',
+  'exportDatabase',
+  'applyModifications',
+  'undoModification',
+  'redoModification',
+  'flushChanges',
+  'discardModifications',
+  'updateCell',
+  'insertRow',
+  'insertRowBatch',
+  'deleteRows',
+  'deleteColumns',
+  'findDependentIndexes',
+  'createTable',
+  'getViewDefinition',
+  'validateViewDefinition',
+  'previewViewDefinition',
+  'createView',
+  'editView',
+  'dropView',
+  'updateCellBatch',
+  'addColumn',
+  'fetchTableData',
+  'fetchTableCount',
+  'fetchSchema',
+  'getTableInfo',
+  'getPragmas',
+  'setPragma',
+  'ping',
+  'writeToFile'
+] as const satisfies ReadonlyArray<keyof WorkerMethods>;
+
+type MissingWorkerMethod = Exclude<keyof WorkerMethods, typeof WORKER_METHOD_NAMES[number]>;
+const COMPLETE_WORKER_METHOD_NAMES: [MissingWorkerMethod] extends [never]
+  ? typeof WORKER_METHOD_NAMES
+  : never = WORKER_METHOD_NAMES;
+
+type WorkerLogLevel = 'log' | 'warn' | 'error';
+
+function formatWorkerLogArgument(value: unknown): string {
+  if (value instanceof Error) return value.message;
+  if (typeof value === 'string') return value;
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? String(value) : serialized;
+  } catch {
+    // Logging must not mask the database failure it is trying to report.
+    return String(value);
+  }
+}
+
+function forwardWorkerLog(level: WorkerLogLevel, args: unknown[]): void {
+  const text = args.map(formatWorkerLogArgument).join(' ');
+  if (GlobalOutputChannel) {
+    GlobalOutputChannel.appendLine(`[Worker/${level}] ${text}`);
+  } else {
+    console[level]('[Worker]', ...args);
+  }
+}
+
+/**
+ * History batches execute entries serially in the worker, while one undo/redo
+ * entry can carry several payload arrays that each add replay work. Scale the
+ * host RPC deadline with the explicit work units so healthy history operations
+ * do not time out merely because one invocation contains many steps.
+ */
+// Past ten base intervals, fail into DatabaseDocument's reconnect/reload
+// recovery instead of letting a hung worker invocation survive the session.
+const MAX_HISTORY_INVOCATION_TIMEOUT_MS = 10 * DEFAULT_INVOCATION_TIMEOUT_MS;
+
+/** Count the payload arrays that make a single history replay scale with stored work. */
+function getModificationWorkUnits(modification: ModificationEntry | undefined): number {
+  const scaledPayloads = [
+    modification?.affectedCells,
+    modification?.deletedRows,
+    modification?.affectedRowIds,
+    modification?.deletedColumns,
+    modification?.droppedIndexes,
+    modification?.viewDefBefore?.triggers,
+    modification?.viewDefAfter?.triggers
+  ];
+  const workUnits = scaledPayloads.reduce(
+    (total, payload) => total + (payload?.length ?? 0),
+    0
+  );
+  return Math.max(1, workUnits);
+}
+
+function getWorkerInvocationTimeout(
+  methodName: string,
+  parameters: readonly unknown[]
+): number {
+  let workUnits: number;
+  if (methodName === 'applyModifications' || methodName === 'discardModifications') {
+    const modifications = parameters[0];
+    workUnits = Array.isArray(modifications) ? Math.max(1, modifications.length) : 1;
+  } else if (methodName === 'undoModification' || methodName === 'redoModification') {
+    const modification = parameters[0] as ModificationEntry | undefined;
+    workUnits = getModificationWorkUnits(modification);
+  } else {
+    return DEFAULT_INVOCATION_TIMEOUT_MS;
+  }
+
+  return Math.min(
+    MAX_HISTORY_INVOCATION_TIMEOUT_MS,
+    DEFAULT_INVOCATION_TIMEOUT_MS * workUnits
+  );
 }
 
 // ============================================================================
@@ -115,7 +269,12 @@ export async function createDatabaseConnection(
     if (await nativeSupport.isNativeAvailable(extensionPath)) {
       try {
         GlobalOutputChannel?.appendLine('[SQLite Explorer] Using native SQLite backend');
-        const nativeBundle = await nativeSupport.createNativeDatabaseConnection(extensionUri, _reporter);
+        const nativeBundle = await nativeSupport.createNativeDatabaseConnection(
+          extensionUri,
+          _reporter,
+          GlobalOutputChannel,
+          getQueryTimeout()
+        );
 
         // Wrap the native bundle to provide fallback to WASM if file open fails
         // This handles cases where native SQLite can't access a specific file
@@ -187,7 +346,11 @@ async function createWasmDatabaseConnection(
 async function createInProcessWasmDatabaseConnection(
   extensionUri: vsc.Uri
 ): Promise<DatabaseConnectionBundle> {
-  const endpoint = createWorkerEndpoint();
+  // The browser endpoint has no RPC worker envelope to carry engine warnings,
+  // so bridge the same logger directly to the extension output channel.
+  const endpoint = createWorkerEndpoint((level, ...args) => {
+    forwardWorkerLog(level, args);
+  });
 
   return {
     workerMethods: {
@@ -269,6 +432,39 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.findDependentIndexes(table, columns),
         createTable: (table: string, columns: ColumnDefinition[]) =>
           endpoint.createTable(table, columns),
+        getViewDefinition: (view: string) =>
+          endpoint.getViewDefinition(view),
+        validateViewDefinition: (
+          view: string,
+          selectSql: string,
+          intent?: ViewDefinitionIntent
+        ) => endpoint.validateViewDefinition(view, selectSql, intent),
+        previewViewDefinition: (
+          view: string,
+          selectSql: string,
+          limit?: number,
+          intent?: ViewDefinitionIntent
+        ) => endpoint.previewViewDefinition(view, selectSql, limit, intent),
+        createView: (view: string, selectSql: string) =>
+          endpoint.createView(view, selectSql),
+        editView: (
+          view: string,
+          selectSql: string,
+          preserveTriggers?: boolean,
+          expectedSql?: string,
+          expectedTriggers?: readonly ViewTriggerDefinition[]
+        ) => endpoint.editView(
+          view,
+          selectSql,
+          preserveTriggers,
+          expectedSql,
+          expectedTriggers
+        ),
+        dropView: (
+          view: string,
+          expectedSql?: string,
+          expectedTriggers?: readonly ViewTriggerDefinition[]
+        ) => endpoint.dropView(view, expectedSql, expectedTriggers),
         updateCellBatch: (table: string, updates: CellUpdate[]) =>
           endpoint.updateCellBatch(table, updates),
         addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
@@ -315,15 +511,6 @@ async function createWorkerBackedWasmDatabaseConnection(
   // Create IPC proxy for Node.js worker communication
   // Route worker log messages to the VS Code output channel for visibility.
   // Falls back to console if no output channel is available (e.g., during tests).
-  const logHandler = (level: 'log' | 'warn' | 'error', args: unknown[]) => {
-    const text = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
-    if (GlobalOutputChannel) {
-      GlobalOutputChannel.appendLine(`[Worker/${level}] ${text}`);
-    } else {
-      console[level]('[Worker]', ...args);
-    }
-  };
-
   const workerProxy = connectWorkerPort<WorkerMethods>(
     {
       postMessage: (data: unknown, transfer?: Transferable[]) => {
@@ -340,8 +527,9 @@ async function createWorkerBackedWasmDatabaseConnection(
           .on(event, handler);
       }
     },
-    ['initializeDatabase', 'runQuery', 'exportDatabase', 'updateCell', 'insertRow', 'insertRowBatch', 'deleteRows', 'deleteColumns', 'findDependentIndexes', 'createTable', 'updateCellBatch', 'addColumn', 'fetchTableData', 'fetchTableCount', 'fetchSchema', 'getTableInfo', 'getPragmas', 'setPragma', 'ping', 'writeToFile'],
-    logHandler
+    COMPLETE_WORKER_METHOD_NAMES,
+    forwardWorkerLog,
+    getWorkerInvocationTimeout
   );
 
   // Termination handler
@@ -429,13 +617,31 @@ async function createWorkerBackedWasmDatabaseConnection(
         );
 
         // Create operations facade that routes to worker
-        // Helper: Wrap Uint8Array values in Transfer for zero-copy transfer to worker
-        // This significantly improves performance for blob operations by avoiding buffer copying
+        // Transfer a private copy. postMessage detaches transfer-list buffers, while
+        // HostBridge retains the caller-owned value for undo/redo and hot-exit.
+        // Copying once here preserves that history and keeps the worker crossing
+        // itself zero-copy.
         const wrapForTransfer = (value: CellValue): CellValue => {
           if (value instanceof Uint8Array && value.buffer) {
-            return new Transfer(value, [value.buffer]) as unknown as CellValue;
+            const transferableValue = value.slice();
+            return new Transfer(
+              transferableValue,
+              [transferableValue.buffer]
+            ) as unknown as CellValue;
           }
           return value;
+        };
+
+        // AbortSignal cannot cross worker_threads RPC without losing its
+        // prototype. Preserve cancellation that was already requested, but do
+        // not serialize the signal. Mid-operation cancellation will require a
+        // dedicated cancel message and worker-local AbortController.
+        const callWorkerAfterAbortCheck = async <T>(
+          signal: AbortSignal | undefined,
+          call: () => Promise<T>
+        ): Promise<T> => {
+          signal?.throwIfAborted();
+          return call();
         };
 
         const operationsFacade: DatabaseOperations = {
@@ -443,17 +649,22 @@ async function createWorkerBackedWasmDatabaseConnection(
           executeQuery: (sql: string, params?: CellValue[]) =>
             workerProxy.runQuery(sql, params),
           serializeDatabase: () => workerProxy.exportDatabase(),
-          applyModifications: async () => {},
-          undoModification: async () => {},
-          redoModification: async () => {},
-          flushChanges: async () => {},
-          discardModifications: async () => {},
-          // Preserve JSON merge patches through worker RPC while still
-          // transferring Uint8Array cell values without copying.
+          applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
+            callWorkerAfterAbortCheck(signal, () => workerProxy.applyModifications(mods)),
+          undoModification: (mod: ModificationEntry) =>
+            workerProxy.undoModification(mod),
+          redoModification: (mod: ModificationEntry) =>
+            workerProxy.redoModification(mod),
+          flushChanges: (signal?: AbortSignal) =>
+            callWorkerAfterAbortCheck(signal, () => workerProxy.flushChanges()),
+          discardModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
+            callWorkerAfterAbortCheck(signal, () => workerProxy.discardModifications(mods)),
+          // Preserve JSON merge patches through worker RPC while transferring
+          // a private Uint8Array copy (the host may retain the original in history).
           updateCell: (table: string, rowId: string | number, column: string, value: CellValue, patch?: string) =>
             workerProxy.updateCell(table, rowId, column, wrapForTransfer(value), patch),
           insertRow: (table: string, data: Record<string, CellValue>) => {
-            // Wrap any Uint8Array values in the data object for zero-copy transfer
+            // Retain caller-owned values because insert history records this object.
             const wrappedData: Record<string, CellValue> = {};
             for (const key of Object.keys(data)) {
               wrappedData[key] = wrapForTransfer(data[key]);
@@ -470,8 +681,41 @@ async function createWorkerBackedWasmDatabaseConnection(
             workerProxy.findDependentIndexes(table, columns),
           createTable: (table: string, columns: ColumnDefinition[]) =>
             workerProxy.createTable(table, columns),
+          getViewDefinition: (view: string) =>
+            workerProxy.getViewDefinition(view),
+          validateViewDefinition: (
+            view: string,
+            selectSql: string,
+            intent?: ViewDefinitionIntent
+          ) => workerProxy.validateViewDefinition(view, selectSql, intent),
+          previewViewDefinition: (
+            view: string,
+            selectSql: string,
+            limit?: number,
+            intent?: ViewDefinitionIntent
+          ) => workerProxy.previewViewDefinition(view, selectSql, limit, intent),
+          createView: (view: string, selectSql: string) =>
+            workerProxy.createView(view, selectSql),
+          editView: (
+            view: string,
+            selectSql: string,
+            preserveTriggers?: boolean,
+            expectedSql?: string,
+            expectedTriggers?: readonly ViewTriggerDefinition[]
+          ) => workerProxy.editView(
+            view,
+            selectSql,
+            preserveTriggers,
+            expectedSql,
+            expectedTriggers
+          ),
+          dropView: (
+            view: string,
+            expectedSql?: string,
+            expectedTriggers?: readonly ViewTriggerDefinition[]
+          ) => workerProxy.dropView(view, expectedSql, expectedTriggers),
           updateCellBatch: (table: string, updates: CellUpdate[]) => {
-            // Wrap any Uint8Array values in updates for zero-copy transfer
+            // Retain caller-owned values because batch history records these updates.
             const wrappedUpdates = updates.map(u => ({
               ...u,
               value: wrapForTransfer(u.value)

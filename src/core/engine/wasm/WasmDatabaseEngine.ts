@@ -16,35 +16,75 @@ import type {
   ModificationEntry,
   DatabaseOperations,
   CellUpdate,
+  CellUpdateResult,
   TableQueryOptions,
   TableCountOptions,
   SchemaSnapshot,
   ColumnMetadata,
-  ColumnDefinition
+  ColumnDefinition,
+  ViewDefinition,
+  ViewDefinitionIntent,
+  ViewEditResult,
+  ViewTriggerDefinition
 } from '../../types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from '../../sql-utils';
 import { crypto } from '../../../platform/cryptoShim';
 import { buildSelectQuery, buildCountQuery } from '../../query-builder';
-import { applyMergePatch, computeJsonPatchUndo, parseJsonValueForPatching } from '../../json-utils';
+import {
+  applyMergePatch,
+  computeJsonPatchUndo,
+  parseJsonValueForPatching,
+  prepareCellUpdateForStorage
+} from '../../json-utils';
+import {
+  buildExactNumericTextQuery,
+  buildRowIdExactRealTextQueries,
+  collectRowIdExactRealTexts,
+  hasUnsafeBigIntAtColumn,
+  normalizeIntegerRowsForTransport,
+  ROWID_TABLE_AUTHORITY_SQL
+} from '../../integer-utils';
 import { getNodeFs } from '../../platform/fs';
+import {
+  assertViewDefinitionSnapshotCurrent,
+  assertViewDefinitionStateCurrent,
+  assertViewDefinitionIntent,
+  assertViewTriggerSnapshotIsMutationSafe,
+  assertViewTriggersCompatibleWithColumns,
+  buildCreateViewTriggerSql,
+  buildCreateViewSql,
+  extractViewColumnListSql,
+  extractViewSelectSql,
+  escapeMainViewIdentifier,
+  mapViewTriggerRows,
+  VIEW_TRIGGER_SCHEMA_QUERIES,
+  normalizeViewSelectSql
+} from '../../view-utils';
 
 // ============================================================================
 // Internal sql.js Types
 // ============================================================================
 
+type WasmBindValue = Exclude<CellValue, bigint>;
+
 interface WasmPreparedStatement {
-  run(params?: CellValue[]): void;
-  bind(params?: CellValue[]): boolean;
-  get(params?: CellValue[]): CellValue[] | undefined;
+  run(params?: WasmBindValue[]): void;
+  bind(params?: WasmBindValue[]): boolean;
+  get(params?: WasmBindValue[]): CellValue[] | undefined;
+  get(
+    params: WasmBindValue[] | null | undefined,
+    config: { useBigInt: true }
+  ): Array<CellValue | bigint> | undefined;
   step(): boolean;
   reset(): void;
   free(): boolean;
   getColumnNames(): string[];
+  getSQL(): string;
 }
 
 export interface WasmDatabaseInstance {
-  exec(sql: string, params?: CellValue[]): Array<{ columns: string[]; values: CellValue[][] }>;
-  prepare(sql: string, params?: CellValue[]): WasmPreparedStatement;
+  exec(sql: string, params?: WasmBindValue[]): Array<{ columns: string[]; values: CellValue[][] }>;
+  prepare(sql: string, params?: WasmBindValue[]): WasmPreparedStatement;
   iterateStatements(sql: string): Iterable<WasmPreparedStatement>;
   export(): Uint8Array;
   close(): void;
@@ -52,6 +92,27 @@ export interface WasmDatabaseInstance {
 
 export interface WasmEngineModule {
   Database: new (data?: ArrayLike<number>) => WasmDatabaseInstance;
+}
+
+export type WasmEngineLogHandler = (
+  level: 'log' | 'warn' | 'error',
+  ...args: unknown[]
+) => void;
+
+interface ExistingViewForIntent {
+  storedSql: CellValue | undefined;
+  columnListSql: string | undefined;
+}
+
+/**
+ * sql.js does not expose a native int64 bind; its current BigInt branch binds
+ * decimal text internally. Perform that conversion at our boundary so history
+ * replay remains exact without depending on an undocumented binder detail.
+ */
+function normalizeWasmBindParams(
+  params?: readonly CellValue[]
+): WasmBindValue[] | undefined {
+  return params?.map(value => typeof value === 'bigint' ? value.toString() : value);
 }
 
 // ============================================================================
@@ -66,13 +127,28 @@ const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 export class WasmDatabaseEngine implements DatabaseOperations {
   private readonly instance: WasmDatabaseInstance;
   private readonly queryTimeout: number;
+  private readonly readOnlyMode: boolean;
+  private readonly logger: WasmEngineLogHandler;
   /** Whether SQLite's json_patch() function is available (JSON1 extension). */
   private readonly hasJsonPatch: boolean;
   readonly engineKind = Promise.resolve('wasm' as const);
 
-  constructor(instance: WasmDatabaseInstance, timeoutMs: number = DEFAULT_QUERY_TIMEOUT_MS) {
+  constructor(
+    instance: WasmDatabaseInstance,
+    timeoutMs: number = DEFAULT_QUERY_TIMEOUT_MS,
+    readOnlyMode: boolean = false,
+    logger?: WasmEngineLogHandler
+  ) {
     this.instance = instance;
     this.queryTimeout = timeoutMs;
+    this.readOnlyMode = readOnlyMode;
+    this.logger = logger ?? ((level, ...args) => console[level](...args));
+
+    if (this.readOnlyMode) {
+      // Public mutation methods fail early with operation-specific messages,
+      // while SQLite itself blocks any overlooked or newly added write path.
+      instance.exec('PRAGMA query_only = ON');
+    }
 
     // Probe for json_patch() availability at construction time.
     // json_patch() is part of the JSON1 extension, which is included in most
@@ -94,7 +170,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     try {
       await this.executeQuery('ROLLBACK');
     } catch (rollbackErr) {
-      console.warn(`Failed to rollback (${context}):`, rollbackErr);
+      this.logger('warn', `Failed to rollback (${context}):`, rollbackErr);
     }
   }
 
@@ -113,7 +189,80 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       await this.executeQuery(`ROLLBACK TO ${savepointName}`);
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (rollbackErr) {
-      console.warn(`Failed to rollback savepoint (${context}):`, rollbackErr);
+      this.logger('warn', `Failed to rollback savepoint (${context}):`, rollbackErr);
+    }
+  }
+
+  /** Prepare only when SQLite proves the statement consumed our generated suffix. */
+  private prepareSingleStatement(sql: string): WasmPreparedStatement {
+    const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
+    const statement = this.instance.prepare(`${sql}\n${boundary}`);
+    if (!statement.getSQL().trimEnd().endsWith(boundary)) {
+      statement.free();
+      throw new Error('Exactly one SQL statement is required');
+    }
+    return statement;
+  }
+
+  /** Execute exactly the checked prepared statement, never a trailing statement. */
+  private runSingleStatement(sql: string): void {
+    // Validate with the boundary comment, then execute the original SQL so a
+    // CREATE statement does not persist our private marker in sqlite_schema.
+    this.compileSingleStatement(sql);
+    const statement = this.instance.prepare(sql);
+    try {
+      statement.run();
+    } finally {
+      statement.free();
+    }
+  }
+
+  /** Compile a statement through SQLite without retaining or executing it. */
+  private compileSingleStatement(sql: string): void {
+    const statement = this.prepareSingleStatement(sql);
+    statement.free();
+  }
+
+  /** Compile the body in a SELECT-only context and reject trailing statements. */
+  private compileViewSelect(selectSql: string): void {
+    this.compileSingleStatement(`EXPLAIN SELECT * FROM (${selectSql}\n) LIMIT 0`);
+  }
+
+  /**
+   * Read a generated preview SELECT with a best-effort elapsed-time bound. The
+   * bundled sql.js API and WebAssembly exports expose neither sqlite3_interrupt
+   * nor sqlite3_progress_handler. Because statement.step() synchronously owns
+   * this worker thread, a queued host message cannot preempt an expensive first
+   * row. The checks below reject after a step returns, while the worker RPC
+   * deadline only bounds how long the host waits. True in-worker interruption is
+   * deferred until sql.js exposes an interrupt or progress-handler hook.
+   */
+  private executeSingleQuery(sql: string): QueryResultSet {
+    const sourceStatement = this.prepareSingleStatement(sql);
+    const headers = sourceStatement.getColumnNames();
+    sourceStatement.free();
+    const transportQuery = buildExactNumericTextQuery(sql, headers.length);
+    const statement = this.prepareSingleStatement(transportQuery.sql);
+    const sourceRows: Array<Array<CellValue | bigint>> = [];
+    const startedAt = Date.now();
+    try {
+      while (statement.step()) {
+        if (Date.now() - startedAt > this.queryTimeout) {
+          throw new Error(`Query execution timed out after ${this.queryTimeout}ms`);
+        }
+        const row = statement.get(null, { useBigInt: true });
+        if (!row) {
+          throw new Error('SQLite returned no row after a successful statement step');
+        }
+        sourceRows.push(row);
+      }
+      const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+        sourceRows,
+        transportQuery.valueColumnCount
+      );
+      return { headers, rows, columns: headers, values: rows, exactIntegerTexts };
+    } finally {
+      statement.free();
     }
   }
 
@@ -156,7 +305,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
         // Bind parameters only to the first statement to match exec behavior
         if (isFirstStatement && params && params.length > 0) {
-          stmt.bind(params);
+          stmt.bind(normalizeWasmBindParams(params));
         }
         isFirstStatement = false;
 
@@ -195,7 +344,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         try {
           currentStmt.free();
         } catch (freeErr) {
-          console.warn('Failed to free statement on error:', freeErr);
+          this.logger('warn', 'Failed to free statement on error:', freeErr);
         }
       }
       const errorDetail = err instanceof Error ? err.message : String(err);
@@ -278,6 +427,39 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
       case 'table_create':
         await this.undoTableCreate(targetTable);
+        break;
+
+      case 'view_create':
+        if (mod.viewDefAfter) {
+          await this.applyViewHistoryState(targetTable, mod.viewDefAfter, null);
+        } else {
+          this.logger(
+            'warn',
+            '[WasmDatabaseEngine] Skipping view undo: definition missing from history entry'
+          );
+        }
+        break;
+
+      case 'view_edit':
+        if (mod.viewDefBefore && mod.viewDefAfter) {
+          await this.applyViewHistoryState(targetTable, mod.viewDefAfter, mod.viewDefBefore);
+        } else {
+          this.logger(
+            'warn',
+            '[WasmDatabaseEngine] Skipping view undo: definition missing from history entry'
+          );
+        }
+        break;
+
+      case 'view_drop':
+        if (mod.viewDefBefore) {
+          await this.applyViewHistoryState(targetTable, null, mod.viewDefBefore);
+        } else {
+          this.logger(
+            'warn',
+            '[WasmDatabaseEngine] Skipping view undo: definition missing from history entry'
+          );
+        }
         break;
     }
   }
@@ -391,10 +573,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         // e.g. UPDATE table SET col1 = ?, col2 = ? WHERE rowid = ?
 
         // First, transform the data into a row-centric map
-        const rowUpdates = new Map<number, Record<string, CellValue | null>>();
+        const rowUpdates = new Map<RecordId, Record<string, CellValue | null>>();
         for (const col of deletedColumns) {
           for (const cell of col.data) {
-            const rId = Number(cell.rowId);
+            const rId = validateRowId(cell.rowId);
             let rowObj = rowUpdates.get(rId);
             if (!rowObj) {
               rowObj = {};
@@ -413,7 +595,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             for (const [rId, rowObj] of rowUpdates.entries()) {
               const params: CellValue[] = deletedColumns.map(c => rowObj[c.name] ?? null);
               params.push(rId);
-              stmt.run(params);
+              stmt.run(normalizeWasmBindParams(params));
             }
           } finally {
             stmt.free();
@@ -524,6 +706,49 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         case 'table_drop':
             if (strict) {
                 throw new Error('Cannot apply table_drop: forward replay is not supported');
+            }
+            break;
+
+        case 'view_create':
+            if (mod.viewDefAfter) {
+                await this.applyViewHistoryState(targetTable, null, mod.viewDefAfter);
+            } else if (strict) {
+                throw new Error('Cannot apply view_create: missing view definition');
+            } else {
+                this.logger(
+                  'warn',
+                  '[WasmDatabaseEngine] Skipping view redo: definition missing from history entry'
+                );
+            }
+            break;
+
+        case 'view_edit':
+            if (mod.viewDefBefore && mod.viewDefAfter) {
+                await this.applyViewHistoryState(
+                  targetTable,
+                  mod.viewDefBefore,
+                  mod.viewDefAfter
+                );
+            } else if (strict) {
+                throw new Error('Cannot apply view_edit: missing view definition');
+            } else {
+                this.logger(
+                  'warn',
+                  '[WasmDatabaseEngine] Skipping view redo: definition missing from history entry'
+                );
+            }
+            break;
+
+        case 'view_drop':
+            if (mod.viewDefBefore) {
+                await this.applyViewHistoryState(targetTable, mod.viewDefBefore, null);
+            } else if (strict) {
+                throw new Error('Cannot apply view_drop: missing view definition');
+            } else {
+                this.logger(
+                  'warn',
+                  '[WasmDatabaseEngine] Skipping view redo: definition missing from history entry'
+                );
             }
             break;
 
@@ -673,7 +898,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           const stmt = this.instance.prepare(sql);
           try {
             for (const params of data) {
-              stmt.run(params);
+              stmt.run(normalizeWasmBindParams(params));
             }
           } finally {
             stmt.free();
@@ -822,11 +1047,297 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(sql);
   }
 
+  /** Read a view and every INSTEAD OF trigger SQLite associates with it. */
+  private async findViewDefinition(
+    view: string,
+    allowUnparsed: boolean
+  ): Promise<ViewDefinition | null> {
+    const viewResult = await this.executeQuery(
+      "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+      [view]
+    );
+    const createSql = viewResult[0]?.rows[0]?.[0];
+    if (typeof createSql !== 'string') {
+      return null;
+    }
+
+    const triggerRows: CellValue[][][] = [];
+    for (const source of VIEW_TRIGGER_SCHEMA_QUERIES) {
+      const result = await this.executeQuery(source.sql, source.params(view));
+      triggerRows.push(result[0]?.rows ?? []);
+    }
+    const { triggers, ambiguousTemporaryTriggerNames } = mapViewTriggerRows(
+      view,
+      triggerRows
+    );
+
+    let selectSql: string;
+    let columnListSql: string | undefined;
+    try {
+      selectSql = extractViewSelectSql(createSql);
+      columnListSql = extractViewColumnListSql(createSql);
+    } catch (err) {
+      if (!allowUnparsed) throw err;
+      // Dropping depends only on the schema object name. Preserve opaque raw SQL
+      // for history and let SQLite remain authoritative if it is replayed.
+      selectSql = '';
+    }
+    return {
+      identifier: view,
+      sql: createSql,
+      selectSql,
+      columnListSql,
+      triggers,
+      ...(ambiguousTemporaryTriggerNames.length > 0
+        ? { ambiguousTemporaryTriggerNames }
+        : {})
+    };
+  }
+
+  private async readViewDefinition(view: string, allowUnparsed: boolean): Promise<ViewDefinition> {
+    const definition = await this.findViewDefinition(view, allowUnparsed);
+    if (!definition) throw new Error(`View not found: ${view}`);
+    return definition;
+  }
+
+  async getViewDefinition(view: string): Promise<ViewDefinition> {
+    return this.readViewDefinition(view, false);
+  }
+
+  /** Resolve the installed view state once so validate and preview enforce identical intent rules. */
+  private async resolveExistingViewForIntent(
+    view: string,
+    intent: ViewDefinitionIntent
+  ): Promise<ExistingViewForIntent> {
+    const result = await this.executeQuery(
+      "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+      [view]
+    );
+    const row = result[0]?.rows[0];
+    assertViewDefinitionIntent(view, row !== undefined, intent);
+    const storedSql = row?.[0];
+    return {
+      storedSql,
+      columnListSql: typeof storedSql === 'string'
+        ? extractViewColumnListSql(storedSql)
+        : undefined
+    };
+  }
+
+  async validateViewDefinition(
+    view: string,
+    selectSql: string,
+    intent: ViewDefinitionIntent = 'edit'
+  ): Promise<void> {
+    if (this.readOnlyMode) {
+      throw new Error('View validation is unavailable because the database is read-only');
+    }
+    const body = normalizeViewSelectSql(selectSql);
+    const { storedSql: existingSql, columnListSql } =
+      await this.resolveExistingViewForIntent(view, intent);
+    const savepointName = this.createSavepointName('sp_validate_view');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      if (typeof existingSql === 'string') {
+        this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+      }
+      this.runSingleStatement(buildCreateViewSql(view, body, columnListSql));
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
+      // Successful validation is deliberately non-mutating.
+      await this.executeQuery(`ROLLBACK TO ${savepointName}`);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'validateViewDefinition');
+      throw err;
+    }
+  }
+
+  async previewViewDefinition(
+    view: string,
+    selectSql: string,
+    limit: number = 50,
+    intent: ViewDefinitionIntent = 'edit'
+  ): Promise<QueryResultSet> {
+    const body = normalizeViewSelectSql(selectSql);
+    const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
+    const { storedSql: existingSql, columnListSql } =
+      await this.resolveExistingViewForIntent(view, intent);
+
+    if (this.readOnlyMode) {
+      // Read-only documents cannot run disposable schema DDL. A target-named
+      // CTE still shadows ordinary unqualified references to the installed
+      // view and preserves explicit output names; writable previews below use
+      // the exact CREATE VIEW context and also catch schema-qualified cycles.
+      const previewSource = escapeIdentifier(view);
+      if (columnListSql) {
+        return this.executeSingleQuery(
+          `WITH ${previewSource} ${columnListSql} AS (${body}\n) ` +
+          `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`
+        );
+      }
+      return this.executeSingleQuery(
+        `WITH ${previewSource} AS (${body}\n) ` +
+        `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`
+      );
+    }
+
+    const savepointName = this.createSavepointName('sp_preview_view');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      if (typeof existingSql === 'string') {
+        this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+      }
+      this.runSingleStatement(buildCreateViewSql(view, body, columnListSql));
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
+      const result = this.executeSingleQuery(
+        `SELECT * FROM ${escapeMainViewIdentifier(view)} LIMIT ${boundedLimit}`
+      );
+      await this.executeQuery(`ROLLBACK TO ${savepointName}`);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return result;
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'previewViewDefinition');
+      throw err;
+    }
+  }
+
+  async createView(view: string, selectSql: string): Promise<ViewDefinition> {
+    this.assertWritableMutation('View creation');
+    const body = normalizeViewSelectSql(selectSql);
+    this.compileViewSelect(body);
+    const savepointName = this.createSavepointName('sp_create_view');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      this.runSingleStatement(buildCreateViewSql(view, body));
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
+      const definition = await this.getViewDefinition(view);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return definition;
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'createView');
+      throw err;
+    }
+  }
+
+  async editView(
+    view: string,
+    selectSql: string,
+    preserveTriggers: boolean = true,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ): Promise<ViewEditResult> {
+    this.assertWritableMutation('View editing');
+    const body = normalizeViewSelectSql(selectSql);
+    this.compileViewSelect(body);
+    const savepointName = this.createSavepointName('sp_edit_view');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      // Read and compare after opening the savepoint. That read transaction
+      // prevents a stale editor snapshot from being silently overwritten even
+      // when another connection races between the UI check and this mutation.
+      const before = await this.getViewDefinition(view);
+      assertViewTriggerSnapshotIsMutationSafe(before);
+      assertViewDefinitionSnapshotCurrent(
+        expectedSql,
+        before.sql,
+        expectedTriggers,
+        before.triggers
+      );
+      this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+      this.runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
+      this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
+      if (preserveTriggers) {
+        const columnResult = await this.executeQuery(
+          `PRAGMA main.table_info(${escapeIdentifier(view)})`
+        );
+        const columns = (columnResult[0]?.rows ?? []).map(row => {
+          if (typeof row[1] !== 'string') {
+            throw new Error(`SQLite returned invalid column metadata for view ${view}`);
+          }
+          return row[1];
+        });
+        assertViewTriggersCompatibleWithColumns(before.triggers, columns);
+        for (const trigger of before.triggers) {
+          this.runSingleStatement(buildCreateViewTriggerSql(trigger));
+        }
+      }
+      const after = await this.getViewDefinition(view);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return { before, after };
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'editView');
+      throw err;
+    }
+  }
+
+  async dropView(
+    view: string,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ): Promise<ViewDefinition> {
+    this.assertWritableMutation('View deletion');
+    const savepointName = this.createSavepointName('sp_drop_view');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      const before = await this.readViewDefinition(view, true);
+      assertViewTriggerSnapshotIsMutationSafe(before);
+      assertViewDefinitionSnapshotCurrent(
+        expectedSql,
+        before.sql,
+        expectedTriggers,
+        before.triggers
+      );
+      this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return before;
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'dropView');
+      throw err;
+    }
+  }
+
+  private assertWritableMutation(operation: string): void {
+    if (this.readOnlyMode) {
+      throw new Error(`${operation} is unavailable because the database is read-only`);
+    }
+  }
+
+  /** Atomically apply one tracked view-state transition for undo, redo, or hot exit. */
+  private async applyViewHistoryState(
+    view: string,
+    expectedCurrent: ViewDefinition | null,
+    replacement: ViewDefinition | null
+  ): Promise<void> {
+    const savepointName = this.createSavepointName('sp_restore_view');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      const current = await this.findViewDefinition(view, true);
+      if (current) assertViewTriggerSnapshotIsMutationSafe(current);
+      assertViewDefinitionStateCurrent(expectedCurrent, current);
+      if (current) {
+        this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+      }
+      if (replacement) {
+        this.runSingleStatement(replacement.sql);
+        this.compileSingleStatement(
+          `EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(replacement.identifier)}`
+        );
+        for (const trigger of replacement.triggers) {
+          this.runSingleStatement(buildCreateViewTriggerSql(trigger));
+        }
+      }
+      await this.executeQuery(`RELEASE ${savepointName}`);
+    } catch (err) {
+      await this.safeRollbackSavepoint(savepointName, 'restoreViewDefinition');
+      throw err;
+    }
+  }
+
   /**
    * Update multiple cells in a batch.
    */
-  async updateCellBatch(table: string, updates: CellUpdate[]): Promise<void> {
-    if (updates.length === 0) return;
+  async updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> {
+    if (updates.length === 0) return [];
 
     // Use SAVEPOINT instead of BEGIN TRANSACTION so this method can be called
     // safely from within an outer transaction (e.g., undoColumnDrop).
@@ -836,6 +1347,42 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const escapedTable = escapeIdentifier(table);
+      const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
+      const columns = [...new Set(updates.map(update => update.column))];
+      const placeholders = rowIds.map(() => '?').join(', ');
+      const current = await this.executeQuery(
+        `SELECT CAST(rowid AS TEXT), ${columns.map(escapeIdentifier).join(', ')} ` +
+        `FROM ${escapedTable} WHERE rowid IN (${placeholders})`,
+        rowIds
+      );
+      const currentValues = new Map<string, Map<string, CellValue>>();
+      for (const row of current[0]?.rows ?? []) {
+        const values = new Map<string, CellValue>();
+        columns.forEach((column, index) => values.set(column, row[index + 1]));
+        currentValues.set(String(validateRowId(row[0] as RecordId)), values);
+      }
+      const results: CellUpdateResult[] = [];
+      const processedUpdates = updates.map(update => {
+        const rowId = validateRowId(update.rowId);
+        const row = currentValues.get(String(rowId));
+        if (!row) {
+          throw new Error(`Cannot update ${table}.${update.column}: row ${update.rowId} no longer exists`);
+        }
+        const priorValue = row.get(update.column);
+        const prepared = prepareCellUpdateForStorage(
+          update.value,
+          priorValue,
+          update.operation ?? 'set'
+        );
+        results.push({
+          rowId,
+          columnName: update.column,
+          priorValue,
+          newValue: prepared.value,
+          operation: prepared.operation
+        });
+        return { ...update, rowId, value: prepared.value, operation: prepared.operation };
+      });
       // Group updates by column and operation type
       // Prepare statements one by one avoids full re-parse
 
@@ -843,7 +1390,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       // Group by column.
 
       const updatesByColumn = new Map<string, CellUpdate[]>();
-      for (const update of updates) {
+      for (const update of processedUpdates) {
           const key = `${update.column}|${update.operation || 'set'}`;
           if (!updatesByColumn.has(key)) {
               updatesByColumn.set(key, []);
@@ -886,7 +1433,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                      const patchStr = typeof update.value === 'string'
                        ? update.value
                        : JSON.stringify(update.value);
-                     stmt.run([patchStr, rowIdNum]);
+                     stmt.run(normalizeWasmBindParams([patchStr, rowIdNum]));
 
                   } else if (op === 'json_patch') {
                      // JS fallback: read current value, apply patch, write back
@@ -916,10 +1463,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                      const newValueObj = applyMergePatch(currentObj, patchObj);
                      const newValueStr = JSON.stringify(newValueObj);
 
-                     stmt.run([newValueStr, rowIdNum]);
+                     stmt.run(normalizeWasmBindParams([newValueStr, rowIdNum]));
                   } else {
                       // Standard update
-                      stmt.run([update.value, rowIdNum]);
+                      stmt.run(normalizeWasmBindParams([update.value, rowIdNum]));
                   }
               }
           } finally {
@@ -929,6 +1476,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
 
       await this.executeQuery(`RELEASE ${savepointName}`);
+      return results;
     } catch (err) {
       await this.safeRollbackSavepoint(savepointName, 'updateCellBatch');
       throw err;
@@ -975,30 +1523,89 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
     // Use prepare/step/get to avoid overhead of exec() which builds intermediate objects
     // and to allow for potentially better memory management in the future
+    let headerStmt: WasmPreparedStatement | null = null;
     let stmt: WasmPreparedStatement | null = null;
     try {
-        stmt = this.instance.prepare(sql, params);
-        const rows: CellValue[][] = [];
+        const bindParams = normalizeWasmBindParams(params);
+        headerStmt = this.instance.prepare(sql, bindParams);
+        const headers = headerStmt.getColumnNames();
+        headerStmt.free();
+        headerStmt = null;
+
+        const transportQuery = buildExactNumericTextQuery(sql, headers.length);
+        stmt = this.instance.prepare(transportQuery.sql, bindParams);
+        const sourceRows: Array<Array<CellValue | bigint>> = [];
 
         while (stmt.step()) {
             // We know a row exists because step() returned true
-            const row = stmt.get();
+            const row = stmt.get(null, { useBigInt: true });
             if (row) {
-                rows.push(row);
+                sourceRows.push(row);
             }
         }
 
-        const headers = stmt.getColumnNames();
+        const companionResults = [];
+        let isRowIdTable = false;
+        const hasRowIdShape = headers[0]?.toLowerCase() === 'rowid';
+        const needsExactRowIdIdentity = hasRowIdShape
+          && hasUnsafeBigIntAtColumn(sourceRows, 0);
+        const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
+          && hasRowIdShape;
+        // This engine owns a private in-memory copy, so no external process can
+        // commit between the source read and this authority/companion work.
+        if (
+          (needsRowIdCompanions || needsExactRowIdIdentity)
+          && sourceRows.length > 0
+        ) {
+          const authority = await this.executeQuery(ROWID_TABLE_AUTHORITY_SQL, [table]);
+          isRowIdTable = (authority[0]?.rows.length ?? 0) > 0;
+        }
+        if (isRowIdTable && needsRowIdCompanions) {
+          for (const query of buildRowIdExactRealTextQueries(
+            table,
+            headers,
+            sourceRows.map(row => row[0])
+          )) {
+            let companionStmt: WasmPreparedStatement | null = null;
+            try {
+              companionStmt = this.instance.prepare(
+                query.sql,
+                normalizeWasmBindParams(query.params)
+              );
+              const companionRows: Array<Array<CellValue | bigint>> = [];
+              while (companionStmt.step()) {
+                const row = companionStmt.get(null, { useBigInt: true });
+                if (row) companionRows.push(row);
+              }
+              companionResults.push({ query, rows: companionRows });
+            } finally {
+              if (companionStmt) companionStmt.free();
+            }
+          }
+        }
+        const companionExactTexts = collectRowIdExactRealTexts(
+          sourceRows,
+          companionResults
+        );
+
+        const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+          sourceRows,
+          transportQuery.valueColumnCount,
+          companionExactTexts,
+          isRowIdTable && needsExactRowIdIdentity ? 0 : undefined
+        );
         return {
             headers,
             rows,
             columns: headers,
-            values: rows
+            values: rows,
+            exactIntegerTexts
         };
     } catch (err) {
         const errorDetail = err instanceof Error ? err.message : String(err);
         throw new Error(`Fetch failed: ${errorDetail}`);
     } finally {
+        if (headerStmt) headerStmt.free();
         if (stmt) stmt.free();
     }
   }

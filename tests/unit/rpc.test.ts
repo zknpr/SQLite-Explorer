@@ -1,6 +1,14 @@
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert';
-import { processProtocolMessage, buildMethodProxy, connectWorkerPort, WorkerPort, Transfer } from '../../src/core/rpc';
+import {
+  processProtocolMessage,
+  buildMethodProxy,
+  connectWorkerPort,
+  WorkerPort,
+  Transfer,
+  InvocationTimeoutError,
+  isInvocationTimeoutError
+} from '../../src/core/rpc';
 
 describe('RPC', () => {
   describe('processProtocolMessage', () => {
@@ -148,6 +156,50 @@ describe('RPC', () => {
       assert.strictEqual(transfer.length, 1);
       assert.strictEqual(transfer[0], buffer);
     });
+  });
+
+  it('preserves invocation-timeout identity across a worker response', async () => {
+    let invocation: unknown;
+    const proxy = buildMethodProxy<{ revert: () => Promise<void> }>(
+      envelope => { invocation = envelope; },
+      ['revert']
+    );
+    const pending = proxy.revert();
+    const response = await new Promise<unknown>(resolve => {
+      processProtocolMessage(
+        invocation,
+        {
+          revert() {
+            throw new InvocationTimeoutError('discardModifications', 'worker history timed out');
+          }
+        },
+        resolve as any
+      );
+    });
+
+    processProtocolMessage(
+      response,
+      undefined,
+      undefined,
+      undefined,
+      proxy.__pendingInvocations
+    );
+
+    await assert.rejects(pending, error => {
+      if (!(error instanceof InvocationTimeoutError)) return false;
+      const timeoutError: InvocationTimeoutError = error;
+      assert.strictEqual(isInvocationTimeoutError(timeoutError), true);
+      assert.strictEqual(timeoutError.methodName, 'discardModifications');
+      assert.strictEqual(timeoutError.message, 'worker history timed out');
+      return true;
+    });
+  });
+
+  it('does not infer timeout recovery from ordinary error text', () => {
+    assert.strictEqual(
+      isInvocationTimeoutError(new Error('Request discardModifications timed out')),
+      false
+    );
   });
 
   describe('connectWorkerPort', () => {
