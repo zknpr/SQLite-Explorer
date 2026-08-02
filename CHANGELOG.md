@@ -8,14 +8,26 @@
 - **Tri-state column sorting.** Clicking a column header now cycles none → ascending → descending → none, instead of toggling between ascending and descending with no way back to the natural row order. (#501)
 - **Filter match highlighting.** Grid cells highlight the matching substrings of the active filter, built from DOM text nodes and `<mark>` elements (never HTML injection), with duplicate terms deduplicated and longer terms matched first so overlapping terms don't shadow each other. (#499)
 - **Enter navigates filter matches.** With a filter active, Enter jumps to the next matching cell and Shift+Enter to the previous one, scrolling the match into view. Composition (IME) input is respected, a failed filter application restores the previous term, and navigation is suppressed when a newer load superseded the one that produced the matches. (#500)
+- **Clearer filter controls.** Every column filter has a clear (×) button, Escape dismisses the match cursor, filters apply as you type without losing focus, and edits across several filters are preserved when any one of them is applied.
+- **Big numbers are exact everywhere.** 64-bit integers beyond JavaScript's safe range no longer get silently rounded (e.g. 9007199254740993 shown as …992): they now display, copy, edit, filter, navigate, and export with their exact database value — including in the "edit in VS Code" round-trip, where saving an unchanged cell leaves the stored value untouched. Row identity uses the exact value too, so edits and deletes always land on the intended row.
+- **Very wide tables load.** Tables and views with more than a thousand columns now open and browse normally instead of failing with an engine error.
 
 ### Fixes
 
+- **Highlighting matches what your filter actually matched.** Match highlights and counts now follow SQLite's own matching: placeholders like NULL or [BLOB] no longer light up as false matches, and a match hidden behind pinned rows or columns scrolls fully into view instead of slipping underneath them.
+- **Editing polish.** Clicking away from a cell clears its highlight, Shift+Click range selection no longer triggers stray text selection, and Tab indents inside the view editor instead of jumping focus to the buttons.
+- **Concurrent editing is safe.** Two editor panels on the same database can work simultaneously without a failed change in one silently undoing the other's work, and reloading the database mid-operation can no longer record changes that never made it into the file.
+- **Dialogs left open no longer misfire.** Leaving a confirmation, file picker, or export dialog open for more than a minute previously reported a timeout while the action could still run afterwards; interactive dialogs now simply wait for you.
+- **Read-only databases are fully protected.** Every write path — cells, rows, columns, views, settings — refuses cleanly with a clear message, in the extension, the native engine, and the web demo alike.
+- **Tables without rowids get a clear message.** Editing WITHOUT ROWID tables isn't supported yet; instead of a cryptic SQL error you now get an explicit explanation.
+- **Exports include every row.** Fixed an edge case where the row with the very lowest rowid could be skipped in streamed exports, and large exports no longer abort on a fixed timeout.
+- **Screen readers announce dialogs properly.** All modal dialogs now expose standard dialog semantics and keep focus contained.
 - **No more grid flicker on refresh.** Reloading the same table (after an edit, undo, or filter change) previously unmounted the grid and showed the loading spinner, flashing the UI on every refresh. The grid now stays mounted during same-table refetches; the spinner only appears on a real table switch. Overlapping loads are serialized with a request token so a stale response can never render over a newer one, and a dedicated reload guard blocks the full stale-grid interaction surface (cell click/double-click/keyboard/scroll, the global select-all and delete shortcuts, and BLOB drag-and-drop) in both the extension webview and the web demo. (#498)
 
 ### Security
 
 - **View DDL is hardened by construction.** The new view operations escape every identifier, parameterize all schema lookups, compile user SQL through a single-statement `EXPLAIN` in a SELECT-only context (trailing statements cannot execute; DML cannot hide in a subquery), clamp preview sizes engine-side, and run every schema change inside a SAVEPOINT that rolls back on failure. Destructive confirmations (drop view, discard triggers) run in the extension host, outside the webview's reach.
+- **Web demo messaging locked down.** The demo viewer only exchanges database content with its verified embedding page — never a wildcard target — while cross-origin embedding keeps working, including on Firefox. Demo PRAGMA values are validated with the same rules as the extension.
 
 ### Dependencies
 
