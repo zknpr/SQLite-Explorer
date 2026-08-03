@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import { createDeferred } from './helpers/deferred';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { serializeOperations } from '../../src/core/operation-serializer';
+import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
 
 describe('HostBridge', () => {
 
@@ -124,6 +125,34 @@ describe('HostBridge', () => {
         assert.ok(uri.path.endsWith('.txt'), `Path should end with .txt, got ${uri.path}`);
     });
 
+    it('encodes a BLOB composite primary-key identity into one cell URI segment', async () => {
+        const executeCommandMock = mock.method(vscode.commands, 'executeCommand', async () => {});
+        const identity = encodePrimaryKeyRecordId(
+            [
+                { identifier: 'space', declaredType: 'BLOB', position: 1 },
+                { identifier: 'key', declaredType: 'TEXT', position: 2 }
+            ],
+            [new Uint8Array([0, 47, 255]), 'item/one']
+        );
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key')
+        } as any);
+
+        await bridge.openCellEditor(
+            { table: 'items', name: 'db' },
+            identity,
+            'value',
+            {},
+            { value: 'payload' }
+        );
+
+        const uri = executeCommandMock.mock.calls[0].arguments[1] as vscode.Uri;
+        const pathSegments = uri.path.split('/').filter(Boolean).map(decodeURIComponent);
+        assert.strictEqual(pathSegments[3], identity);
+        assert.strictEqual(pathSegments.length, 5);
+    });
+
     it('opens a view definition as a writable SQL virtual document', async () => {
         const executeCommandMock = mock.method(vscode.commands, 'executeCommand', async () => {});
         const mockDocument = {
@@ -165,7 +194,7 @@ describe('HostBridge', () => {
         }
     });
 
-    it('should catch and log error if fetch rows for undo history fails in deleteRows', async () => {
+    it('propagates a row-history read failure without deleting or recording history', async () => {
         const consoleWarnMock = mock.method(console, 'warn', () => {});
         const error = new Error('Database disconnected');
         const dbOps = {
@@ -181,15 +210,10 @@ describe('HostBridge', () => {
         const bridge = new HostBridge(mockProvider as any, mockDocument as any);
         (bridge as any).ensureDatabaseInitialized = () => dbOps as any;
 
-        await bridge.deleteRows('table1', [1]);
-
-        assert.strictEqual(consoleWarnMock.mock.callCount(), 1);
-        assert.deepStrictEqual(consoleWarnMock.mock.calls[0].arguments, [
-            'Failed to fetch rows for undo history:',
-            error
-        ]);
-
-        assert.strictEqual(dbOps.deleteRows.mock.callCount(), 1);
+        await assert.rejects(bridge.deleteRows('table1', [1]), error);
+        assert.strictEqual(consoleWarnMock.mock.callCount(), 0);
+        assert.strictEqual(dbOps.deleteRows.mock.callCount(), 0);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
     it('treats connection-level read-only documents as read-only for web mutators', async () => {
@@ -606,41 +630,57 @@ describe('HostBridge', () => {
         }
     });
 
-    it('rejects rowid-based cell edits for WITHOUT ROWID tables before a savepoint', async () => {
-        const dbOps = {
-            executeQuery: mock.fn(async (_sql: string) => [{ headers: ['wr'], rows: [[1]] }]),
-            updateCell: mock.fn(async () => {}),
-            updateCellBatch: mock.fn(async () => {})
-        };
-        const mockDocument = {
-            uri: vscode.Uri.parse('file:///test.db'),
-            documentKey: Promise.resolve('test-key'),
-            databaseOperations: dbOps,
-            isReadOnlyMode: false,
-            connectionGeneration: 1,
-            recordExternalModification: mock.fn()
-        };
-        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+    it('records single and batch edits for WITHOUT ROWID tables instead of rejecting them', async () => {
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const dbOps = result.operations!;
+        const recordExternalModification = mock.fn();
+        try {
+            await dbOps.executeQuery(
+                "CREATE TABLE rowidless (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID; " +
+                "INSERT INTO rowidless VALUES ('alpha', 'before')"
+            );
+            const page = await dbOps.fetchTableData('rowidless', {
+                columns: ['rowid', 'key', 'value'],
+                limit: 10,
+                offset: 0
+            });
+            const identity = page.rows[0][0] as string;
+            const mockDocument = {
+                uri: vscode.Uri.parse('file:///test.db'),
+                documentKey: Promise.resolve('test-key'),
+                databaseOperations: dbOps,
+                isReadOnlyMode: false,
+                connectionGeneration: 1,
+                recordExternalModification
+            };
+            const bridge = new HostBridge(
+                { webviews: new Map(), context: {} } as any,
+                mockDocument as any
+            );
 
-        await assert.rejects(
-            () => bridge.updateCell('rowidless', 1, 'value', 'after'),
-            /WITHOUT ROWID tables are not editable yet/
-        );
-        await assert.rejects(
-            () => bridge.updateCellBatch(
+            await bridge.updateCell('rowidless', identity, 'value', 'after');
+            const batchOutcomes = await bridge.updateCellBatch(
                 'rowidless',
-                [{ rowId: 1, column: 'value', value: 'after' }],
+                [{ rowId: identity, column: 'key', value: 'beta' }],
                 'Batch'
-            ),
-            /WITHOUT ROWID tables are not editable yet/
-        );
+            );
 
-        assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
-        assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 0);
-        assert.strictEqual(
-            dbOps.executeQuery.mock.calls.some(call => String(call.arguments[0]).startsWith('SAVEPOINT ')),
-            false
-        );
+            assert.deepStrictEqual(
+                (await dbOps.executeQuery('SELECT key, value FROM rowidless'))[0].rows,
+                [['beta', 'after']]
+            );
+            assert.ok(batchOutcomes);
+            assert.strictEqual(batchOutcomes.length, 1);
+            assert.strictEqual(batchOutcomes[0].rowId, identity);
+            assert.notStrictEqual(batchOutcomes[0].newRowId, identity);
+            assert.strictEqual(recordExternalModification.mock.callCount(), 2);
+            assert.doesNotMatch(
+                JSON.stringify(recordExternalModification.mock.calls),
+                /WITHOUT ROWID tables are not editable yet/
+            );
+        } finally {
+            (dbOps as WasmDatabaseEngine).shutdown();
+        }
     });
 
     it('does not record an atomic batch after Reload supersedes its connection', async () => {

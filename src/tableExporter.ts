@@ -7,11 +7,15 @@
 
 import * as vsc from 'vscode';
 import type { TelemetryReporter } from '@vscode/extension-telemetry';
-import type { CellValue, DbParams, ExportOptions } from './core/types';
+import type { CellValue, DbParams, ExportOptions, RecordId, TableIdentity } from './core/types';
 import type { DatabaseDocument } from './databaseModel';
 import { DocumentRegistry } from './documentRegistry';
-import { escapeIdentifier, cellValueToSql, validateRowIds } from './core/sql-utils';
+import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
 import { getNodeFs } from './core/sqlite-db';
+import {
+  buildRecordIdentitiesPredicate,
+  isPrimaryKeyRecordId
+} from './core/row-identity';
 
 /**
  * Minimal writable sink consumed by the streaming exporters. Satisfied by Node's
@@ -196,6 +200,25 @@ export async function exportTableCommand(
       queryColumns = columns.map(escapeIdentifier).join(', ');
     }
 
+    let tableIdentity: TableIdentity | undefined;
+    if (typeof document.databaseOperations.fetchSchema === 'function') {
+      const schema = await document.databaseOperations.fetchSchema();
+      tableIdentity = schema.tables.find(table => table.identifier === tableName)?.identity;
+    }
+    const requestedRowIds = (_exportOptions?.rowIds ?? []) as RecordId[];
+    const containsPrimaryKeyIds = requestedRowIds.some(isPrimaryKeyRecordId);
+    if (containsPrimaryKeyIds && !requestedRowIds.every(isPrimaryKeyRecordId)) {
+      throw new Error('Cannot mix rowid and primary-key row identities');
+    }
+    if (containsPrimaryKeyIds && tableIdentity?.kind !== 'primaryKey') {
+      throw new Error(`Cannot export selected rows: ${tableName} has no declared primary-key identity`);
+    }
+    const selectedRowsPredicate = requestedRowIds.length > 0
+      ? buildRecordIdentitiesPredicate(
+          requestedRowIds,
+          tableIdentity ?? { kind: 'rowid' }
+        )
+      : undefined;
 
     const fs = isLocalFile ? getNodeFs() : undefined;
     if (fs) {
@@ -204,12 +227,14 @@ export async function exportTableCommand(
             const stream = fs.createWriteStream(uri.fsPath, { encoding: 'utf-8' });
 
             // Check if we can use rowid pagination
-            let useRowId = false;
-            try {
-                await document.databaseOperations.executeQuery(`SELECT rowid FROM ${escapeIdentifier(tableName)} LIMIT 1`);
-                useRowId = true;
-            } catch (e) {
-                // Fallback to offset pagination
+            let useRowId = tableIdentity?.kind === 'rowid';
+            if (tableIdentity === undefined) {
+                try {
+                    await document.databaseOperations.executeQuery(`SELECT rowid FROM ${escapeIdentifier(tableName)} LIMIT 1`);
+                    useRowId = true;
+                } catch (e) {
+                    // Legacy operation stubs may not expose schema identity; retain the compatibility probe.
+                }
             }
 
             const BATCH_SIZE = 5000;
@@ -240,13 +265,9 @@ export async function exportTableCommand(
                         params.push(lastId);
                     }
 
-                    // Add rowIds filter if present
-                    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-                        const validIds = validateRowIds(_exportOptions.rowIds);
-                        if (validIds.length > 0) {
-                            predicates.push(`rowid IN (${validIds.map(() => '?').join(',')})`);
-                            params.push(...validIds);
-                        }
+                    if (selectedRowsPredicate) {
+                        predicates.push(`(${selectedRowsPredicate.sql})`);
+                        params.push(...selectedRowsPredicate.params);
                     }
 
                     if (predicates.length > 0) {
@@ -257,7 +278,15 @@ export async function exportTableCommand(
                 } else {
                     // Offset pagination: O(N) but compatible with WITHOUT ROWID tables
                     sql = `SELECT ${queryColumns} FROM ${escapeIdentifier(tableName)}`;
-
+                    if (selectedRowsPredicate) {
+                        sql += ` WHERE ${selectedRowsPredicate.sql}`;
+                        params.push(...selectedRowsPredicate.params);
+                    }
+                    if (tableIdentity?.kind === 'primaryKey') {
+                        sql += ` ORDER BY ${tableIdentity.columns
+                          .map(column => `${escapeIdentifier(column.identifier)} ASC`)
+                          .join(', ')}`;
+                    }
                     sql += ` LIMIT ${BATCH_SIZE} OFFSET ${offset}`;
                 }
 
@@ -321,13 +350,14 @@ export async function exportTableCommand(
     const params: CellValue[] = [];
 
     // Filter by row IDs if provided
-    if (_exportOptions?.rowIds && _exportOptions.rowIds.length > 0) {
-        const rowIds = validateRowIds(_exportOptions.rowIds);
-        if (rowIds.length > 0) {
-            const placeholders = rowIds.map(() => '?').join(', ');
-            sql += ` WHERE rowid IN (${placeholders})`;
-            params.push(...rowIds);
-        }
+    if (selectedRowsPredicate) {
+        sql += ` WHERE ${selectedRowsPredicate.sql}`;
+        params.push(...selectedRowsPredicate.params);
+    }
+    if (tableIdentity?.kind === 'primaryKey') {
+        sql += ` ORDER BY ${tableIdentity.columns
+          .map(column => `${escapeIdentifier(column.identifier)} ASC`)
+          .join(', ')}`;
     }
 
     const result = await document.databaseOperations.executeQuery(sql, params);

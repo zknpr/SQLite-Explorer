@@ -64,6 +64,18 @@ describe('prepareBatchUpdates', () => {
     assert.strictEqual(u.column, 'id');
     assert.strictEqual(u.originalValue, 5);
   });
+  it('keeps an unsafe WITHOUT ROWID INTEGER key exact in batch edits', () => {
+    const primaryKeyColumns: BatchColumnDef[] = [
+      { name: 'id', type: 'INTEGER', isPrimaryKey: true }
+    ];
+    const [u] = prepareBatchUpdates(
+      [cell(0, 0, '9007199254740992')],
+      new Map([[0, input('9007199254740993')]]),
+      primaryKeyColumns,
+      true
+    );
+    assert.strictEqual(u.value, '9007199254740993');
+  });
   it('coerces REAL columns', () => {
     const [u] = prepareBatchUpdates([cell(0, 2, 1)], new Map([[2, input('3.14')]]), columns);
     assert.strictEqual(u.value, 3.14);

@@ -1,6 +1,11 @@
 import { backendApi } from './api.js';
 import { state } from './state.js';
-import { getRowDataOffset } from './data-utils.js';
+import {
+    clearExactIntegerText,
+    getRowDataOffset,
+    remapDisplayedRowIdentity,
+    resolveDisplayedCell
+} from './data-utils.js';
 import { updateStatus } from './ui.js';
 
 
@@ -158,6 +163,13 @@ export class BlobInspector {
         if (!this.currentRowId || !this.currentColName) return;
         if (state.isReadOnly || this.isUploading) return;
 
+        const targetTable = state.selectedTable;
+        const targetRowId = this.currentRowId;
+        const targetColumn = this.currentColName;
+        const targetCell = this.currentCellInfo;
+        const originalValue = this.currentData;
+        if (!targetTable || !targetCell) return;
+
         this.setUploadState(true);
 
         try {
@@ -180,24 +192,41 @@ export class BlobInspector {
                 updateStatus(`Uploading ${file.name}...`);
             }
 
-            const { rowIdx, colIdx } = this.currentCellInfo;
-            const originalValue = this.currentData;
+            if (
+                state.selectedTable !== targetTable
+                || this.currentRowId !== targetRowId
+                || this.currentColName !== targetColumn
+            ) {
+                throw new Error('BLOB replacement cancelled because the selected cell changed');
+            }
+            const { rowIdx, colIdx } = targetCell;
 
-            await backendApi.updateCell(
-                state.selectedTable,
-                this.currentRowId,
-                this.currentColName,
+            const updatedRowId = await backendApi.updateCell(
+                targetTable,
+                targetRowId,
+                targetColumn,
                 uint8Array,
                 originalValue
             );
 
-            // Update Local State
-            if (state.gridData && state.gridData[rowIdx]) {
-                state.gridData[rowIdx][colIdx + getRowDataOffset()] = uint8Array;
+            const currentCell = resolveDisplayedCell(targetTable, targetRowId, targetColumn)
+                ?? (updatedRowId !== undefined
+                    ? resolveDisplayedCell(targetTable, updatedRowId, targetColumn)
+                    : null);
+            remapDisplayedRowIdentity(targetTable, targetRowId, updatedRowId, currentCell);
+            if (currentCell) {
+                state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = uint8Array;
+                clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
             }
 
             // Update Inspector UI
-            this.inspect(uint8Array, this.currentRowId, this.currentColName, rowIdx, colIdx);
+            this.inspect(
+                uint8Array,
+                updatedRowId ?? targetRowId,
+                targetColumn,
+                currentCell?.rowIdx ?? rowIdx,
+                currentCell?.colIdx ?? colIdx
+            );
 
             updateStatus(`Replaced with ${file.name}`);
 

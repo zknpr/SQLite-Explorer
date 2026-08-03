@@ -8,6 +8,7 @@ export const state = {
     isReadOnly: false,
     selectedTable: null,
     selectedTableType: 'table',
+    selectedTableIdentity: null,
     // Name of the table whose grid is currently rendered on screen. Lets
     // loadTableData tell a same-table refetch (keep the grid, no flicker) apart
     // from a table switch (show the spinner instead of the previous table's rows).

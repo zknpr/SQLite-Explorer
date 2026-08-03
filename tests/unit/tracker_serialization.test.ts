@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { ModificationTracker } from '../../src/core/undo-history';
 import { LabeledModification } from '../../src/core/types';
+import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
 
 describe('ModificationTracker Serialization', () => {
 
@@ -105,6 +106,44 @@ describe('ModificationTracker Serialization', () => {
         const restoredModification = restored.stepBack();
         assert.strictEqual(restoredModification?.priorValue, priorValue);
         assert.strictEqual(restoredModification?.newValue, newValue);
+    });
+
+    it('preserves old and new composite primary-key identities in cell history', () => {
+        const columns = [
+            { identifier: 'space', declaredType: 'BLOB', position: 1 },
+            { identifier: 'sequence', declaredType: 'INTEGER', position: 2 }
+        ];
+        const oldRowId = encodePrimaryKeyRecordId(
+            columns,
+            [new Uint8Array([0, 47, 255]), 9007199254740993n]
+        );
+        const newRowId = encodePrimaryKeyRecordId(
+            columns,
+            [new Uint8Array([0, 47, 255]), 9007199254740994n]
+        );
+        const tracker = new ModificationTracker<LabeledModification>();
+        tracker.record({
+            label: 'PK edit',
+            description: 'Change sequence',
+            modificationType: 'cell_update',
+            targetTable: 'items',
+            affectedCells: [{
+                rowId: oldRowId,
+                newRowId,
+                columnName: 'sequence',
+                priorValue: '9007199254740993',
+                newValue: '9007199254740994'
+            }]
+        });
+
+        const restored = ModificationTracker.deserialize<LabeledModification>(tracker.serialize());
+        assert.deepStrictEqual(restored.stepBack()?.affectedCells, [{
+            rowId: oldRowId,
+            newRowId,
+            columnName: 'sequence',
+            priorValue: '9007199254740993',
+            newValue: '9007199254740994'
+        }]);
     });
 
     it('should preserve checkpoint index', async () => {

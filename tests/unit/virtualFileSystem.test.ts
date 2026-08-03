@@ -404,6 +404,127 @@ describe('SQLiteFileSystemProvider', () => {
             }
         });
 
+        it('round-trips a BLOB composite primary-key identity through a cell URI', async () => {
+            const engineResult = await createDatabaseEngine({
+                content: null,
+                maxSize: 0,
+                readOnlyMode: false
+            });
+            const engine = engineResult.operations!;
+            await engine.executeQuery(
+                'CREATE TABLE uri_identity (' +
+                'space BLOB, key TEXT, value TEXT, PRIMARY KEY (space, key)' +
+                ') WITHOUT ROWID'
+            );
+            const identity = await engine.insertRow('uri_identity', {
+                space: new Uint8Array([0, 47, 255]),
+                key: 'item/one',
+                value: 'before'
+            });
+            const document = setupMockDocument(docKey, engine);
+            const uri = vscode.Uri.from({
+                scheme: 'vscode-sqlite',
+                path: '/' + [docKey, 'uri_identity', 'group', String(identity), 'value.txt']
+                    .map(part => encodeURIComponent(part))
+                    .join('/')
+            });
+
+            try {
+                assert.strictEqual(
+                    new TextDecoder().decode(await provider.readFile(uri)),
+                    'before'
+                );
+                await provider.writeFile(
+                    uri,
+                    new TextEncoder().encode('after'),
+                    { create: false, overwrite: true }
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'SELECT hex(space), key, value FROM uri_identity'
+                    ))[0].rows,
+                    [['002FFF', 'item/one', 'after']]
+                );
+                const modification = (document.recordExternalModification as any)
+                    .mock.calls[0].arguments[0];
+                assert.strictEqual(modification.targetRowId, identity);
+                assert.strictEqual(modification.newTargetRowId, identity);
+                assert.strictEqual(modification.priorValue, 'before');
+                await engine.undoModification(modification);
+                assert.strictEqual(
+                    (await engine.executeQuery('SELECT value FROM uri_identity'))[0].rows[0][0],
+                    'before'
+                );
+                await engine.redoModification(modification);
+                assert.strictEqual(
+                    (await engine.executeQuery('SELECT value FROM uri_identity'))[0].rows[0][0],
+                    'after'
+                );
+            } finally {
+                (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+
+        it('keeps unsafe INTEGER primary-key history exact when the external editor changes identity', async () => {
+            const engineResult = await createDatabaseEngine({
+                content: null,
+                maxSize: 0,
+                readOnlyMode: false
+            });
+            const engine = engineResult.operations!;
+            await engine.executeQuery(
+                'CREATE TABLE uri_int64_identity (' +
+                'id INTEGER PRIMARY KEY, value TEXT' +
+                ') WITHOUT ROWID'
+            );
+            const identity = await engine.insertRow('uri_int64_identity', {
+                id: '9007199254740993',
+                value: 'payload'
+            });
+            const document = setupMockDocument(docKey, engine);
+            const uri = vscode.Uri.from({
+                scheme: 'vscode-sqlite',
+                path: '/' + [docKey, 'uri_int64_identity', 'group', String(identity), 'id.txt']
+                    .map(part => encodeURIComponent(part))
+                    .join('/')
+            });
+
+            try {
+                await provider.writeFile(
+                    uri,
+                    new TextEncoder().encode('9007199254740994'),
+                    { create: false, overwrite: true }
+                );
+                const modification = (document.recordExternalModification as any)
+                    .mock.calls[0].arguments[0];
+                assert.strictEqual(modification.priorValue, '9007199254740993');
+                assert.notStrictEqual(modification.newTargetRowId, identity);
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'SELECT CAST(id AS TEXT), value FROM uri_int64_identity'
+                    ))[0].rows,
+                    [['9007199254740994', 'payload']]
+                );
+
+                await engine.undoModification(modification);
+                assert.strictEqual(
+                    (await engine.executeQuery(
+                        'SELECT CAST(id AS TEXT) FROM uri_int64_identity'
+                    ))[0].rows[0][0],
+                    '9007199254740993'
+                );
+                await engine.redoModification(modification);
+                assert.strictEqual(
+                    (await engine.executeQuery(
+                        'SELECT CAST(id AS TEXT) FROM uri_int64_identity'
+                    ))[0].rows[0][0],
+                    '9007199254740994'
+                );
+            } finally {
+                (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+
         it('should write binary content if not valid UTF-8', async () => {
             const dbOps = {
                 updateCell: mock.fn(async () => {})

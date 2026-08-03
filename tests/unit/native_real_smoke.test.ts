@@ -272,6 +272,57 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             ]);
         });
 
+        await testContext.test('edits and replays a WITHOUT ROWID primary-key identity', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_without_rowid (' +
+                'tenant TEXT, sequence INTEGER, value TEXT, ' +
+                'PRIMARY KEY (tenant, sequence)' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_without_rowid VALUES " +
+                "('north', 9007199254740993, 'before')"
+            );
+            const page = await engine.fetchTableData('native_without_rowid', {
+                columns: ['rowid', 'tenant', 'sequence', 'value'],
+                limit: 10,
+                offset: 0
+            });
+            const oldIdentity = page.rows[0][0] as string;
+            assert.match(oldIdentity, /^pk:/);
+
+            const affectedCells = await engine.updateCellBatch('native_without_rowid', [
+                { rowId: oldIdentity, column: 'tenant', value: 'south' },
+                { rowId: oldIdentity, column: 'value', value: 'after' }
+            ]);
+            assert.ok(affectedCells[0].newRowId);
+            const modification = {
+                description: 'Native WITHOUT ROWID edit',
+                modificationType: 'cell_update' as const,
+                targetTable: 'native_without_rowid',
+                affectedCells
+            };
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT tenant, CAST(sequence AS TEXT), value FROM native_without_rowid'
+                ))[0].rows,
+                [['south', '9007199254740993', 'after']]
+            );
+
+            await engine.undoModification(modification);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT tenant, CAST(sequence AS TEXT), value FROM native_without_rowid'
+                ))[0].rows,
+                [['north', '9007199254740993', 'before']]
+            );
+            await engine.redoModification(modification);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT tenant, CAST(sequence AS TEXT), value FROM native_without_rowid'
+                ))[0].rows,
+                [['south', '9007199254740993', 'after']]
+            );
+        });
+
         await testContext.test('carries exact unsafe INTEGER text through native view previews', async () => {
             const preview = await engine.previewViewDefinition(
                 'native_unsafe_integer_preview',

@@ -683,6 +683,85 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('edits and deletes rows through WITHOUT ROWID primary-key identities', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_without_rowid (' +
+            'tenant TEXT, sequence INTEGER, value TEXT, ' +
+            'PRIMARY KEY (tenant, sequence)' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_without_rowid VALUES " +
+            "('north', 9007199254740993, 'before')"
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_without_rowid', {
+            columns: ['rowid', 'tenant', 'sequence', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        const oldIdentity = page.rows[0][0];
+        assert.match(oldIdentity, /^pk:/);
+        assert.strictEqual(page.exactIntegerTexts[0][2], '9007199254740993');
+
+        const outcomes = await worker.invoke('updateCellBatch', 'demo_without_rowid', [
+            { rowId: oldIdentity, column: 'tenant', value: 'south' },
+            { rowId: oldIdentity, column: 'value', value: 'after' }
+        ]);
+        const newIdentity = outcomes[0].newRowId;
+        assert.ok(newIdentity);
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT tenant, CAST(sequence AS TEXT), value FROM demo_without_rowid'
+            ))[0].rows,
+            [['south', '9007199254740993', 'after']]
+        );
+
+        const updateModification = {
+            modificationType: 'cell_update',
+            targetTable: 'demo_without_rowid',
+            affectedCells: outcomes
+        };
+        await worker.invoke('undoModification', updateModification);
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT tenant, CAST(sequence AS TEXT), value FROM demo_without_rowid'
+            ))[0].rows,
+            [['north', '9007199254740993', 'before']]
+        );
+        await worker.invoke('redoModification', updateModification);
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT tenant, CAST(sequence AS TEXT), value FROM demo_without_rowid'
+            ))[0].rows,
+            [['south', '9007199254740993', 'after']]
+        );
+
+        const deletedRows = await worker.invoke('deleteRows', 'demo_without_rowid', [newIdentity]);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM demo_without_rowid'),
+            0
+        );
+        const deleteModification = {
+            modificationType: 'row_delete',
+            targetTable: 'demo_without_rowid',
+            affectedRowIds: [newIdentity],
+            deletedRows
+        };
+        await worker.invoke('undoModification', deleteModification);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM demo_without_rowid'),
+            1
+        );
+        await worker.invoke('redoModification', deleteModification);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM demo_without_rowid'),
+            0
+        );
+    });
+
     it('returns exact unsafe INTEGER text from demo view previews', async () => {
         const worker = await createWorkerHarness();
 

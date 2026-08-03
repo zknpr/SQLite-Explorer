@@ -12,6 +12,7 @@ export interface BatchSelectedCell {
 export interface BatchColumnDef {
   name: string;
   type?: string;
+  isPrimaryKey?: boolean;
 }
 
 /** Minimal shape of a batch-field <input> (real element or test stand-in). */
@@ -46,5 +47,6 @@ export function summarizeColumnValue(values: Iterable<unknown>): string;
 export function prepareBatchUpdates(
   selectedCells: BatchSelectedCell[],
   inputsByCol: Map<number, BatchInputLike>,
-  tableColumns: BatchColumnDef[]
+  tableColumns: BatchColumnDef[],
+  usesDeclaredPrimaryKey?: boolean
 ): PreparedBatchUpdate[];

@@ -11,6 +11,7 @@ import type {
     DatabaseOperations,
     CellValue,
     RecordId,
+    DeletedRow,
     QueryResultSet,
     ModificationEntry,
     CellUpdate,
@@ -120,7 +121,7 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.logAndDelegate(`Discarding ${mods.length} modifications`, true, 'discardModifications', mods, signal);
     }
 
-    async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<void> {
+    async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<RecordId | void> {
         // Reconstruct SQL for logging
         let sql;
         if (patch) {
@@ -152,7 +153,7 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.insertRowBatch(table, rows);
     }
 
-    async deleteRows(table: string, rowIds: RecordId[]): Promise<void> {
+    async deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void> {
         const sql = `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${rowIds.join(', ')})`;
         this.log(sql, true);
         return this.wrapped.deleteRows(table, rowIds);

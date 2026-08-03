@@ -2,6 +2,10 @@
  * Utility Functions
  */
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
+import {
+    decodePrimaryKeyRecordId,
+    isPrimaryKeyRecordId
+} from '../../../src/core/row-identity.ts';
 
 /**
  * Escape HTML special characters to prevent XSS attacks.
@@ -110,6 +114,10 @@ export function appendHighlightedText(parentEl, text, matcher) {
  * Validate and sanitize a rowid for use in SQL queries.
  */
 export function validateRowId(rowId) {
+    if (isPrimaryKeyRecordId(rowId)) {
+        decodePrimaryKeyRecordId(rowId);
+        return rowId;
+    }
     if (typeof rowId === 'number') {
         if (!Number.isSafeInteger(rowId)) throw new Error(`Invalid rowid: ${rowId}`);
         return rowId;
@@ -123,6 +131,29 @@ export function validateRowId(rowId) {
     }
     const num = Number(exact);
     return Number.isSafeInteger(num) ? num : exact.toString();
+}
+
+/** Preserve decimal text when a declared PK INTEGER cannot survive a JS number round-trip. */
+export function parseGridInputValue(value, column, usesDeclaredPrimaryKey = false) {
+    const declaredType = (column?.type ?? '').toUpperCase();
+    if (
+        usesDeclaredPrimaryKey
+        && column?.isPrimaryKey
+        && /(CHAR|CLOB|TEXT)/.test(declaredType)
+    ) {
+        return value;
+    }
+    const numericValue = Number(value);
+    if (
+        usesDeclaredPrimaryKey
+        && column?.isPrimaryKey
+        && /INT/.test(declaredType)
+        && /^[+-]?\d+$/.test(value.trim())
+        && !Number.isSafeInteger(numericValue)
+    ) {
+        return value.trim();
+    }
+    return numericValue;
 }
 
 /**

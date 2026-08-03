@@ -4,7 +4,13 @@
 import { backendApi } from './api.js';
 import { updateStatus } from './ui.js';
 import { state } from './state.js';
-import { clearExactIntegerText, getRowId, getRowDataOffset } from './data-utils.js';
+import {
+    clearExactIntegerText,
+    getRowId,
+    getRowDataOffset,
+    remapDisplayedRowIdentity,
+    resolveDisplayedCell
+} from './data-utils.js';
 import { formatCellValueAsText } from './utils.js';
 import { renderDataGrid } from './grid.js';
 
@@ -212,7 +218,7 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
     try {
         updateStatus(`Uploading ${fileName} (${formatBytes(uint8Array.byteLength)})...`);
 
-        await backendApi.updateCell(
+        const updatedRowId = await backendApi.updateCell(
             uploadTarget.table,
             uploadTarget.rowId,
             uploadTarget.columnName,
@@ -225,17 +231,30 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
         // database identity has been written, and never paint another table.
         if (state.selectedTable === uploadTarget.table
             && state.selectedTableType === 'table') {
-            const currentRowIdx = state.gridData.findIndex((row, index) => (
-                getRowId(row, index) === uploadTarget.rowId
-            ));
-            const currentColIdx = state.tableColumns.findIndex(column => (
-                column.name === uploadTarget.columnName
-            ));
-            if (currentRowIdx >= 0 && currentColIdx >= 0) {
-                state.gridData[currentRowIdx][currentColIdx + getRowDataOffset()] = uint8Array;
-                clearExactIntegerText(currentRowIdx, currentColIdx);
-                const currentCell = document.getElementById(`cell-${currentRowIdx}-${currentColIdx}`);
-                if (currentCell) updateCellDom(currentCell, uint8Array);
+            const currentCell = resolveDisplayedCell(
+                uploadTarget.table,
+                uploadTarget.rowId,
+                uploadTarget.columnName
+            ) ?? (updatedRowId !== undefined
+                ? resolveDisplayedCell(
+                    uploadTarget.table,
+                    updatedRowId,
+                    uploadTarget.columnName
+                )
+                : null);
+            remapDisplayedRowIdentity(
+                uploadTarget.table,
+                uploadTarget.rowId,
+                updatedRowId,
+                currentCell
+            );
+            if (currentCell) {
+                state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = uint8Array;
+                clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
+                const cellElement = document.getElementById(
+                    `cell-${currentCell.rowIdx}-${currentCell.colIdx}`
+                );
+                if (cellElement) updateCellDom(cellElement, uint8Array);
             }
         }
         updateStatus(`Uploaded ${fileName}`);

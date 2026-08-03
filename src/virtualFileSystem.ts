@@ -2,6 +2,11 @@ import * as vsc from 'vscode';
 import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier, validateRowId } from './core/sql-utils';
 import {
+    buildRecordIdentityPredicate,
+    isPrimaryKeyRecordId,
+    primaryKeyColumnsFromTableInfo
+} from './core/row-identity';
+import {
     isViewDefinitionConflictError,
     isViewDefinitionSnapshotCurrent,
     isViewTriggerSnapshotCurrent
@@ -13,7 +18,13 @@ import type {
     DocumentContentChange,
     DocumentModification
 } from './databaseModel';
-import type { ViewDefinition, ViewEditResult, ViewTriggerDefinition } from './core/types';
+import type {
+    RecordId,
+    TableIdentity,
+    ViewDefinition,
+    ViewEditResult,
+    ViewTriggerDefinition
+} from './core/types';
 
 interface ViewDocumentMetadata {
     ctime: number;
@@ -55,6 +66,26 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
     constructor() {
         this.onDidChangeFile = this._emitter.event;
+    }
+
+    private async resolveTableIdentity(
+        document: DatabaseDocument,
+        table: string
+    ): Promise<TableIdentity> {
+        const metadata = await document.databaseOperations.executeQuery(
+            `SELECT "wr" FROM pragma_table_list ` +
+            `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' LIMIT 1`,
+            [table]
+        );
+        if ((metadata[0]?.rows.length ?? 0) === 0) throw new Error(`Table not found: ${table}`);
+        if (Number(metadata[0].rows[0][0]) !== 1) return { kind: 'rowid' };
+        const columns = primaryKeyColumnsFromTableInfo(
+            await document.databaseOperations.getTableInfo(table)
+        );
+        if (columns.length === 0) {
+            throw new Error(`WITHOUT ROWID table ${table} has no declared primary key`);
+        }
+        return { kind: 'primaryKey', columns };
     }
 
     watch(uri: vsc.Uri, options: { recursive: boolean; excludes: string[] }): vsc.Disposable {
@@ -157,9 +188,15 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             }
 
             const colName = column;
-            let validatedRowId;
+            let rowPredicate: ReturnType<typeof buildRecordIdentityPredicate>;
             try {
-                validatedRowId = validateRowId(rowId);
+                if (isPrimaryKeyRecordId(rowId)) {
+                    const identity = await this.resolveTableIdentity(document, table);
+                    rowPredicate = buildRecordIdentityPredicate(rowId, identity);
+                } else {
+                    const validatedRowId = validateRowId(rowId);
+                    rowPredicate = { sql: 'rowid = ?', params: [validatedRowId] };
+                }
             } catch {
                 return new TextEncoder().encode(`Invalid Row ID: ${rowId}`);
             }
@@ -172,8 +209,8 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 `SELECT ${escapedColumn}, ` +
                 `CASE WHEN typeof(${escapedColumn}) IN ('integer', 'real') ` +
                 `THEN CAST(${escapedColumn} AS TEXT) END ` +
-                `FROM ${escapeIdentifier(table)} WHERE rowid = ?`;
-            const result = await document.databaseOperations.executeQuery(query, [validatedRowId]);
+                `FROM ${escapeIdentifier(table)} WHERE ${rowPredicate.sql}`;
+            const result = await document.databaseOperations.executeQuery(query, rowPredicate.params);
 
             const value = result?.[0]?.rows?.[0]?.[0];
             const exactNumericText = result?.[0]?.rows?.[0]?.[1];
@@ -307,9 +344,17 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         }
 
         try {
-            let validatedRowId;
+            let validatedRowId: RecordId;
+            let rowPredicate: ReturnType<typeof buildRecordIdentityPredicate>;
             try {
-                validatedRowId = validateRowId(rowId);
+                if (isPrimaryKeyRecordId(rowId)) {
+                    const identity = await this.resolveTableIdentity(document, table);
+                    rowPredicate = buildRecordIdentityPredicate(rowId, identity);
+                    validatedRowId = rowId;
+                } else {
+                    validatedRowId = validateRowId(rowId);
+                    rowPredicate = { sql: 'rowid = ?', params: [validatedRowId] };
+                }
             } catch {
                 throw vsc.FileSystemError.Unavailable('Invalid Row ID');
             }
@@ -329,7 +374,29 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 // Keep as Uint8Array, treating as BLOB
             }
 
-            await document.databaseOperations.updateCell(table, validatedRowId, column, value);
+            let priorValue: import('./core/types').CellValue | undefined;
+            if (isPrimaryKeyRecordId(validatedRowId)) {
+                const previous = await document.databaseOperations.executeQuery(
+                    `SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} ` +
+                    `WHERE ${rowPredicate.sql} LIMIT 2`,
+                    rowPredicate.params
+                );
+                if (previous[0]?.rows.length !== 1) {
+                    throw new Error(`Cannot update ${table}.${column}: row identity no longer exists`);
+                }
+                const keyColumnIndex = rowPredicate.primaryKey?.columns.indexOf(column) ?? -1;
+                priorValue = keyColumnIndex >= 0
+                    ? rowPredicate.primaryKey!.values[keyColumnIndex]
+                    : previous[0].rows[0][0];
+            }
+
+            const updatedRowId = await document.databaseOperations.updateCell(
+                table,
+                validatedRowId,
+                column,
+                value
+            );
+            const newTargetRowId = updatedRowId ?? validatedRowId;
 
             // Trigger refresh
             document.recordExternalModification({
@@ -338,7 +405,9 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 modificationType: 'cell_update',
                 targetTable: table,
                 targetRowId: validatedRowId,
+                ...(isPrimaryKeyRecordId(validatedRowId) ? { newTargetRowId } : {}),
                 targetColumn: column,
+                ...(isPrimaryKeyRecordId(validatedRowId) ? { priorValue } : {}),
                 newValue: value
             });
 

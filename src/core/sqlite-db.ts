@@ -13,6 +13,7 @@
 import type {
   CellValue,
   RecordId,
+  DeletedRow,
   QueryResultSet,
   DatabaseInitConfig,
   DatabaseInitResult,
@@ -207,7 +208,7 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().discardModifications(mods, signal);
     },
 
-    async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<void> {
+    async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<RecordId | void> {
       // Forward the optional JSON merge patch so browser/in-process cell edits
       // can update the current document instead of replacing it with stale data.
       return requireEngine().updateCell(table, rowId, column, value, patch);
@@ -221,7 +222,7 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().insertRowBatch(table, rows);
     },
 
-    async deleteRows(table: string, rowIds: RecordId[]): Promise<void> {
+    async deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void> {
       return requireEngine().deleteRows(table, rowIds);
     },
 

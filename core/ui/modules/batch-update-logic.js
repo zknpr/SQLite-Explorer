@@ -55,7 +55,12 @@ export function summarizeColumnValue(values) {
  * batch form's rules: skip cells left blank (unless explicitly NULL), tag
  * json_patch operations, and coerce numeric column types.
  */
-export function prepareBatchUpdates(selectedCells, inputsByCol, tableColumns) {
+export function prepareBatchUpdates(
+    selectedCells,
+    inputsByCol,
+    tableColumns,
+    usesDeclaredPrimaryKey = false
+) {
     const updates = [];
     for (const cell of selectedCells) {
         const input = inputsByCol.get(cell.colIdx);
@@ -86,7 +91,14 @@ export function prepareBatchUpdates(selectedCells, inputsByCol, tableColumns) {
             const colType = (colDef.type || '').toUpperCase();
             if ((colType === 'INTEGER' || colType === 'REAL' || colType === 'NUMERIC')
                 && !isNaN(Number(value)) && value.trim() !== '') {
-                finalValue = Number(value);
+                const numericValue = Number(value);
+                finalValue = usesDeclaredPrimaryKey
+                    && colDef.isPrimaryKey
+                    && colType === 'INTEGER'
+                    && /^[+-]?\d+$/.test(value.trim())
+                    && !Number.isSafeInteger(numericValue)
+                    ? value.trim()
+                    : numericValue;
             }
         }
 

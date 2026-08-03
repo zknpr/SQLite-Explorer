@@ -40,6 +40,18 @@ export type ExactIntegerTextMap = Record<number, Record<number, string>>;
  */
 export type RecordId = string | number;
 
+/** One declared member of a WITHOUT ROWID table's ordered primary key. */
+export interface PrimaryKeyColumn {
+  identifier: string;
+  declaredType: string;
+  position: number;
+}
+
+/** The database identity mechanism for rows in one table. */
+export type TableIdentity =
+  | { kind: 'rowid' }
+  | { kind: 'primaryKey'; columns: PrimaryKeyColumn[] };
+
 // ============================================================================
 // Query Types
 // ============================================================================
@@ -95,6 +107,8 @@ export interface TableMetadata {
   identifier: string;
   /** Number of columns */
   columnCount?: number;
+  /** Declared identity captured while loading the schema. */
+  identity?: TableIdentity;
 }
 
 /**
@@ -210,6 +224,8 @@ export interface ModificationEntry {
   targetTable?: string;
   /** Affected row ID */
   targetRowId?: RecordId;
+  /** Row identity after a primary-key cell update. */
+  newTargetRowId?: RecordId;
   /** Affected column name */
   targetColumn?: string;
   /** Value before modification */
@@ -225,6 +241,8 @@ export interface ModificationEntry {
   /** Multiple affected cells (for batch updates) */
   affectedCells?: {
     rowId: RecordId;
+    /** Row identity after this update; omitted for legacy and unchanged identities. */
+    newRowId?: RecordId;
     columnName: string;
     priorValue?: CellValue;
     newValue?: CellValue;
@@ -294,7 +312,7 @@ export interface DatabaseOperations {
   discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
 
   /** Update a single cell value */
-  updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<void>;
+  updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<RecordId | void>;
 
   /** Insert a new row */
   insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined>;
@@ -303,7 +321,7 @@ export interface DatabaseOperations {
   insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
 
   /** Delete rows by ID */
-  deleteRows(table: string, rowIds: RecordId[]): Promise<void>;
+  deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void>;
 
   /** Delete columns by name */
   deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
@@ -396,10 +414,18 @@ export interface CellUpdate {
 /** Authoritative before/after state captured by an atomic batch update. */
 export interface CellUpdateResult {
   rowId: RecordId;
+  /** Identity to use after the update when a PK member changed. */
+  newRowId?: RecordId;
   columnName: string;
   priorValue?: CellValue;
   newValue?: CellValue;
   operation: CellUpdateOperation;
+}
+
+/** Full row state captured atomically before deletion. */
+export interface DeletedRow {
+  rowId: RecordId;
+  row: Record<string, CellValue>;
 }
 
 /**
@@ -422,6 +448,8 @@ export interface TableQueryOptions {
   /** Displayed columns eligible for the global filter, excluding identity-only SELECT fields. */
   globalFilterColumns?: string[];
   orderBy?: string;
+  /** Internal stable ordering for identities composed from more than one column. */
+  orderByColumns?: string[];
   orderDir?: 'ASC' | 'DESC';
   limit?: number;
   offset?: number;
@@ -472,7 +500,7 @@ export interface ExportOptions {
   /** Include table name in SQL output */
   includeTableName?: boolean;
   /** Specific row IDs to export */
-  rowIds?: (string | number)[];
+  rowIds?: RecordId[];
 }
 
 // ============================================================================

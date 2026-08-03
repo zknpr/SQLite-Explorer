@@ -28,7 +28,19 @@ import {
 } from '../../../src/core/view-utils.ts';
 import { escapeLikePattern, validateRowId } from '../../../src/core/sql-utils.ts';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
-import { prepareCellUpdateForStorage } from '../../../src/core/json-utils.ts';
+import {
+  applyMergePatch,
+  computeJsonPatchUndo,
+  parseJsonValueForPatching,
+  prepareCellUpdateForStorage
+} from '../../../src/core/json-utils.ts';
+import {
+  buildRecordIdentitiesPredicate,
+  buildRecordIdentityPredicate,
+  encodePrimaryKeyRecordId,
+  isPrimaryKeyRecordId,
+  primaryKeyColumnsFromTableInfo
+} from '../../../src/core/row-identity.ts';
 import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
@@ -175,6 +187,10 @@ function runSingleStatement(sql) {
   } finally {
     statement.free();
   }
+}
+
+function normalizeBindParams(params) {
+  return params?.map(value => typeof value === 'bigint' ? value.toString() : value);
 }
 
 function compileSingleStatement(sql) {
@@ -348,23 +364,27 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
   if (!table) throw new Error('No table specified');
 
   const { format = 'csv', header = true, includeTableName = true, rowIds = null } = exportOptions;
-  const safeTable = table.replace(/"/g, '""');
-
   // Build column list
   const columnList = columns && columns.length > 0
-    ? columns.map(c => `"${c.replace(/"/g, '""')}"`).join(', ')
+    ? columns.map(escapeIdentifier).join(', ')
     : '*';
 
   // Build query
-  let sql = `SELECT ${columnList} FROM "${safeTable}"`;
+  let sql = `SELECT ${columnList} FROM ${escapeIdentifier(table)}`;
+  let params = [];
 
   // Filter by rowIds if specified
   if (rowIds && rowIds.length > 0) {
-    const placeholders = rowIds.map(() => '?').join(', ');
-    sql += ` WHERE rowid IN (${placeholders})`;
+    const identity = await resolveTableIdentity(table);
+    if (rowIds.some(isPrimaryKeyRecordId) && !rowIds.every(isPrimaryKeyRecordId)) {
+      throw new Error('Cannot mix rowid and primary-key row identities');
+    }
+    const predicate = buildRecordIdentitiesPredicate(rowIds, identity);
+    sql += ` WHERE ${predicate.sql}`;
+    params = predicate.params;
   }
 
-  const results = db.exec(sql, rowIds || []);
+  const results = db.exec(sql, params);
 
   if (results.length === 0) {
     return { content: '', filename: `${table}.${format}`, mimeType: 'text/plain' };
@@ -468,6 +488,51 @@ function exportToSql(table, headers, rows, includeTableName) {
   return statements.join('\n');
 }
 
+async function findTableIdentity(table) {
+  const metadata = db.exec(
+    `SELECT "wr" FROM pragma_table_list ` +
+    `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' LIMIT 1`,
+    [table]
+  );
+  if ((metadata[0]?.values.length ?? 0) === 0) return undefined;
+  if (Number(metadata[0].values[0][0]) !== 1) return { kind: 'rowid' };
+  const columns = primaryKeyColumnsFromTableInfo(await getTableInfo(table));
+  if (columns.length === 0) {
+    throw new Error(`WITHOUT ROWID table ${table} has no declared primary key`);
+  }
+  return { kind: 'primaryKey', columns };
+}
+
+async function resolveTableIdentity(table) {
+  const identity = await findTableIdentity(table);
+  if (!identity) throw new Error(`Table not found: ${table}`);
+  return identity;
+}
+
+function readPrimaryKeyRecordId(table, identity, predicate) {
+  const result = db.exec(
+    `SELECT ${identity.columns.map(column => escapeIdentifier(column.identifier)).join(', ')} ` +
+    `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
+    normalizeBindParams(predicate.params),
+    { useBigInt: true }
+  );
+  const rows = result[0]?.values ?? [];
+  if (rows.length !== 1) {
+    throw new Error(
+      rows.length === 0
+        ? `Updated row in ${table} no longer exists`
+        : `Primary-key identity for ${table} matched more than one row`
+    );
+  }
+  return encodePrimaryKeyRecordId(identity.columns, rows[0]);
+}
+
+function applyJsonPatchValue(currentValue, patch) {
+  const currentObject = parseJsonValueForPatching(currentValue, 'updateCellBatch');
+  const patchObject = typeof patch === 'string' ? JSON.parse(patch) : patch;
+  return JSON.stringify(applyMergePatch(currentObject, patchObject));
+}
+
 /**
  * Fetch table data with pagination and filtering.
  *
@@ -489,17 +554,35 @@ async function fetchTableData(table, options = {}) {
     globalFilterColumns = null
   } = options;
 
-  const safeTable = table.replace(/"/g, '""');
+  let projectionColumns = columns;
+  let effectiveOrderBy = orderBy;
+  let identityOrderBy = null;
+  let primaryKeyContext;
+  if (columns?.[0]?.toLowerCase() === 'rowid') {
+    const identity = await findTableIdentity(table);
+    if (identity?.kind === 'primaryKey') {
+      const visibleColumns = columns.slice(1);
+      const hiddenPrimaryKeyColumns = identity.columns
+        .map(column => column.identifier)
+        .filter(column => !visibleColumns.includes(column));
+      projectionColumns = [...visibleColumns, ...hiddenPrimaryKeyColumns];
+      primaryKeyContext = { identity, visibleColumns };
+      if (effectiveOrderBy?.toLowerCase() === 'rowid') {
+        effectiveOrderBy = null;
+        identityOrderBy = identity.columns.map(column => column.identifier);
+      }
+    }
+  }
 
   // Build column list - if columns specified, use them; otherwise SELECT *
   let columnList;
-  if (columns && columns.length > 0) {
-    columnList = columns.map(c => `"${c.replace(/"/g, '""')}"`).join(', ');
+  if (projectionColumns && projectionColumns.length > 0) {
+    columnList = projectionColumns.map(escapeIdentifier).join(', ');
   } else {
     columnList = '*';
   }
 
-  let sql = `SELECT ${columnList} FROM "${safeTable}"`;
+  let sql = `SELECT ${columnList} FROM ${escapeIdentifier(table)}`;
 
   // Build WHERE clause from filters array and globalFilter
   const whereClauses = [];
@@ -510,8 +593,7 @@ async function fetchTableData(table, options = {}) {
     for (const f of filters) {
       const filterValue = getActiveFilterValue(f.value);
       if (f.column && filterValue !== undefined) {
-        const safeCol = f.column.replace(/"/g, '""');
-        whereClauses.push(`"${safeCol}" LIKE ? ESCAPE '\\'`);
+        whereClauses.push(`${escapeIdentifier(f.column)} LIKE ? ESCAPE '\\'`);
         params.push(`%${escapeLikePattern(filterValue)}%`);
       }
     }
@@ -523,10 +605,9 @@ async function fetchTableData(table, options = {}) {
     // Get column names to search
     const searchCols = resolveGlobalFilterColumns(columns, globalFilterColumns);
     if (searchCols.length > 0) {
-      const globalClauses = searchCols.map(c => {
-        const safeCol = c.replace(/"/g, '""');
-        return `"${safeCol}" LIKE ? ESCAPE '\\'`;
-      });
+      const globalClauses = searchCols.map(c => (
+        `${escapeIdentifier(c)} LIKE ? ESCAPE '\\'`
+      ));
       whereClauses.push(`(${globalClauses.join(' OR ')})`);
       // Add the global filter parameter for each column in the OR clause
       for (let i = 0; i < searchCols.length; i++) {
@@ -540,8 +621,12 @@ async function fetchTableData(table, options = {}) {
   }
 
   // Add ordering
-  if (orderBy) {
-    sql += ` ORDER BY "${orderBy.replace(/"/g, '""')}" ${orderDir === 'DESC' ? 'DESC' : 'ASC'}`;
+  const orderedColumns = identityOrderBy ?? (effectiveOrderBy ? [effectiveOrderBy] : []);
+  if (orderedColumns.length > 0) {
+    const direction = orderDir === 'DESC' ? 'DESC' : 'ASC';
+    sql += ` ORDER BY ${orderedColumns
+      .map(column => `${escapeIdentifier(column)} ${direction}`)
+      .join(', ')}`;
   }
 
   // Add pagination
@@ -553,11 +638,7 @@ async function fetchTableData(table, options = {}) {
   const transportQuery = buildExactNumericTextQuery(sql, headers.length);
   const results = db.exec(transportQuery.sql, params, { useBigInt: true });
 
-  if (results.length === 0) {
-    return { headers, rows: [] };
-  }
-
-  const sourceRows = results[0].values;
+  const sourceRows = results[0]?.values ?? [];
   const companionResults = [];
   let isRowIdTable = false;
   const hasRowIdShape = headers[0]?.toLowerCase() === 'rowid';
@@ -591,6 +672,40 @@ async function fetchTableData(table, options = {}) {
     companionExactTexts,
     isRowIdTable && needsExactRowIdIdentity ? 0 : undefined
   );
+  if (primaryKeyContext) {
+    const primaryKeyIndices = primaryKeyContext.identity.columns.map(column => {
+      const index = headers.indexOf(column.identifier);
+      if (index < 0) {
+        throw new Error(`Primary-key column missing from table fetch: ${column.identifier}`);
+      }
+      return index;
+    });
+    const visibleColumnCount = primaryKeyContext.visibleColumns.length;
+    const identities = sourceRows.map(row => encodePrimaryKeyRecordId(
+      primaryKeyContext.identity.columns,
+      primaryKeyIndices.map(index => row[index])
+    ));
+    let shiftedExactIntegerTexts;
+    if (exactIntegerTexts) {
+      for (const [rowIndexText, exactRow] of Object.entries(exactIntegerTexts)) {
+        for (const [columnIndexText, exactText] of Object.entries(exactRow)) {
+          const columnIndex = Number(columnIndexText);
+          if (columnIndex >= visibleColumnCount) continue;
+          shiftedExactIntegerTexts ??= {};
+          shiftedExactIntegerTexts[Number(rowIndexText)] ??= {};
+          shiftedExactIntegerTexts[Number(rowIndexText)][columnIndex + 1] = exactText;
+        }
+      }
+    }
+    return {
+      headers: ['rowid', ...primaryKeyContext.visibleColumns],
+      rows: rows.map((row, index) => [
+        identities[index],
+        ...row.slice(0, visibleColumnCount)
+      ]),
+      exactIntegerTexts: shiftedExactIntegerTexts
+    };
+  }
   return {
     headers,
     rows,
@@ -615,8 +730,7 @@ async function fetchTableCount(table, options = {}) {
     globalFilterColumns = null
   } = options;
 
-  const safeTable = table.replace(/"/g, '""');
-  let sql = `SELECT COUNT(*) FROM "${safeTable}"`;
+  let sql = `SELECT COUNT(*) FROM ${escapeIdentifier(table)}`;
 
   // Build WHERE clause from filters array and globalFilter
   const whereClauses = [];
@@ -627,8 +741,7 @@ async function fetchTableCount(table, options = {}) {
     for (const f of filters) {
       const filterValue = getActiveFilterValue(f.value);
       if (f.column && filterValue !== undefined) {
-        const safeCol = f.column.replace(/"/g, '""');
-        whereClauses.push(`"${safeCol}" LIKE ? ESCAPE '\\'`);
+        whereClauses.push(`${escapeIdentifier(f.column)} LIKE ? ESCAPE '\\'`);
         params.push(`%${escapeLikePattern(filterValue)}%`);
       }
     }
@@ -639,10 +752,9 @@ async function fetchTableCount(table, options = {}) {
   if (activeGlobalFilter !== undefined) {
     const searchCols = resolveGlobalFilterColumns(columns, globalFilterColumns);
     if (searchCols.length > 0) {
-      const globalClauses = searchCols.map(c => {
-        const safeCol = c.replace(/"/g, '""');
-        return `"${safeCol}" LIKE ? ESCAPE '\\'`;
-      });
+      const globalClauses = searchCols.map(c => (
+        `${escapeIdentifier(c)} LIKE ? ESCAPE '\\'`
+      ));
       whereClauses.push(`(${globalClauses.join(' OR ')})`);
       // Add the global filter parameter for each column in the OR clause
       for (let i = 0; i < searchCols.length; i++) {
@@ -679,7 +791,10 @@ async function fetchSchema() {
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
     ORDER BY name
   `);
-  const tables = (tablesResult[0]?.values || []).map(row => ({ identifier: row[0] }));
+  const tables = await Promise.all((tablesResult[0]?.values || []).map(async row => ({
+    identifier: row[0],
+    identity: await resolveTableIdentity(row[0])
+  })));
 
   // Get views
   const viewsResult = db.exec(`
@@ -817,13 +932,21 @@ async function updateCell(table, rowId, column, value) {
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Cell updates');
 
-  const safeTable = table.replace(/"/g, '""');
-  const safeColumn = column.replace(/"/g, '""');
+  if (isPrimaryKeyRecordId(rowId)) {
+    const outcomes = await updateCellBatch(table, [{
+      rowId,
+      column,
+      value,
+      operation: 'set'
+    }]);
+    return outcomes[0]?.newRowId ?? rowId;
+  }
 
   db.run(
-    `UPDATE "${safeTable}" SET "${safeColumn}" = ? WHERE rowid = ?`,
+    `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`,
     [value, rowId]
   );
+  return validateRowId(rowId);
 }
 
 /**
@@ -837,21 +960,57 @@ async function insertRow(table, data) {
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Row insertion');
 
-  const safeTable = table.replace(/"/g, '""');
   const columns = Object.keys(data);
   const values = Object.values(data);
+  const identity = await resolveTableIdentity(table);
+
+  let insertSql;
 
   if (columns.length === 0) {
-    db.run(`INSERT INTO "${safeTable}" DEFAULT VALUES`);
+    insertSql = `INSERT INTO ${escapeIdentifier(table)} DEFAULT VALUES`;
   } else {
-    const columnList = columns.map(c => `"${c.replace(/"/g, '""')}"`).join(', ');
+    const columnList = columns.map(escapeIdentifier).join(', ');
     const placeholders = columns.map(() => '?').join(', ');
 
-    db.run(
-      `INSERT INTO "${safeTable}" (${columnList}) VALUES (${placeholders})`,
-      values
-    );
+    insertSql = `INSERT INTO ${escapeIdentifier(table)} (${columnList}) VALUES (${placeholders})`;
   }
+
+  if (identity.kind === 'primaryKey') {
+    const savepointName = createViewSavepointName('sp_insert_pk_row');
+    runSingleStatement(`SAVEPOINT ${savepointName}`);
+    try {
+      const statement = db.prepare(
+        `${insertSql} RETURNING ` +
+        identity.columns.map(column => escapeIdentifier(column.identifier)).join(', '),
+        normalizeBindParams(values)
+      );
+      let row;
+      try {
+        if (!statement.step()) {
+          throw new Error(`Insert into ${table} did not return a primary-key identity`);
+        }
+        row = statement.get(null, { useBigInt: true });
+        if (!row || statement.step()) {
+          throw new Error(`Insert into ${table} did not return exactly one primary-key identity`);
+        }
+      } finally {
+        statement.free();
+      }
+      const candidateId = encodePrimaryKeyRecordId(identity.columns, row);
+      const rowId = readPrimaryKeyRecordId(
+        table,
+        identity,
+        buildRecordIdentityPredicate(candidateId, identity)
+      );
+      runSingleStatement(`RELEASE ${savepointName}`);
+      return rowId;
+    } catch (error) {
+      safeRollbackSavepoint(savepointName, 'insertPrimaryKeyRow');
+      throw error;
+    }
+  }
+
+  db.run(insertSql, normalizeBindParams(values));
 
   // Get last inserted row ID
   const result = db.exec('SELECT last_insert_rowid()');
@@ -868,11 +1027,58 @@ async function deleteRows(table, rowIds) {
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Row deletion');
 
-  const safeTable = table.replace(/"/g, '""');
+  if (rowIds.length === 0) return [];
+
+  if (rowIds.some(isPrimaryKeyRecordId)) {
+    if (!rowIds.every(isPrimaryKeyRecordId)) {
+      throw new Error('Cannot mix rowid and primary-key row identities');
+    }
+    const identity = await resolveTableIdentity(table);
+    if (identity.kind !== 'primaryKey') {
+      throw new Error(`Primary-key identity cannot target rowid table ${table}`);
+    }
+    const predicate = buildRecordIdentitiesPredicate(rowIds, identity);
+    const savepointName = createViewSavepointName('sp_delete_pk_rows');
+    runSingleStatement(`SAVEPOINT ${savepointName}`);
+    try {
+      const current = db.exec(
+        `SELECT * FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+        normalizeBindParams(predicate.params),
+        { useBigInt: true }
+      )[0];
+      const headers = current?.columns ?? [];
+      const rows = current?.values ?? [];
+      const primaryKeyIndices = identity.columns.map(column => {
+        const index = headers.indexOf(column.identifier);
+        if (index < 0) throw new Error(`Primary-key column missing from ${table}: ${column.identifier}`);
+        return index;
+      });
+      const deletedRows = rows.map(row => ({
+        rowId: encodePrimaryKeyRecordId(
+          identity.columns,
+          primaryKeyIndices.map(index => row[index])
+        ),
+        row: Object.fromEntries(headers.map((header, index) => [header, row[index]]))
+      }));
+      if (deletedRows.length !== rowIds.length) {
+        throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
+      }
+      db.run(
+        `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+        normalizeBindParams(predicate.params)
+      );
+      runSingleStatement(`RELEASE ${savepointName}`);
+      return deletedRows;
+    } catch (error) {
+      safeRollbackSavepoint(savepointName, 'deletePrimaryKeyRows');
+      throw error;
+    }
+  }
+
   const placeholders = rowIds.map(() => '?').join(', ');
 
   db.run(
-    `DELETE FROM "${safeTable}" WHERE rowid IN (${placeholders})`,
+    `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
     rowIds
   );
 }
@@ -1198,9 +1404,74 @@ async function applyViewHistoryState(view, expectedCurrent, replacement) {
 }
 
 async function undoModification(modification) {
-  const { modificationType, targetTable, viewDefBefore, viewDefAfter } = modification;
+  const {
+    modificationType,
+    targetTable,
+    viewDefBefore,
+    viewDefAfter,
+    affectedCells,
+    targetRowId,
+    newTargetRowId,
+    targetColumn,
+    priorValue,
+    newValue,
+    operation,
+    deletedRows
+  } = modification;
   if (!targetTable) return;
   switch (modificationType) {
+    case 'cell_update': {
+      const cells = affectedCells ?? (targetRowId !== undefined && targetColumn
+        ? [{
+            rowId: targetRowId,
+            newRowId: newTargetRowId,
+            columnName: targetColumn,
+            priorValue,
+            newValue,
+            operation
+          }]
+        : []);
+      const updates = [];
+      for (const cell of cells) {
+        const currentRowId = cell.newRowId ?? cell.rowId;
+        let value = cell.priorValue ?? null;
+        if (cell.operation === 'json_patch') {
+          const identity = isPrimaryKeyRecordId(currentRowId)
+            ? await resolveTableIdentity(targetTable)
+            : { kind: 'rowid' };
+          const predicate = buildRecordIdentityPredicate(currentRowId, identity);
+          const current = db.exec(
+            `SELECT ${escapeIdentifier(cell.columnName)} FROM ${escapeIdentifier(targetTable)} ` +
+            `WHERE ${predicate.sql}`,
+            normalizeBindParams(predicate.params)
+          );
+          const currentValue = current[0]?.values[0]?.[0] ?? null;
+          const plan = computeJsonPatchUndo(currentValue, cell.newValue, cell.priorValue);
+          if (plan.kind === 'restore') value = plan.value;
+        }
+        updates.push({ rowId: currentRowId, column: cell.columnName, value });
+      }
+      await updateCellBatch(targetTable, updates);
+      return;
+    }
+    case 'row_insert':
+      if (targetRowId !== undefined) await deleteRows(targetTable, [targetRowId]);
+      return;
+    case 'row_delete': {
+      if (!deletedRows || deletedRows.length === 0) return;
+      const savepointName = createViewSavepointName('sp_restore_deleted_rows');
+      runSingleStatement(`SAVEPOINT ${savepointName}`);
+      try {
+        for (const deletedRow of deletedRows) {
+          await insertRow(targetTable, deletedRow.row);
+        }
+        runSingleStatement(`RELEASE ${savepointName}`);
+      } catch (error) {
+        safeRollbackSavepoint(savepointName, 'restoreDeletedRows');
+        throw error;
+      }
+      return;
+    }
     case 'view_create':
       if (viewDefAfter) {
         await applyViewHistoryState(targetTable, viewDefAfter, null);
@@ -1228,9 +1499,48 @@ async function undoModification(modification) {
 }
 
 async function redoModification(modification) {
-  const { modificationType, targetTable, viewDefBefore, viewDefAfter } = modification;
+  const {
+    modificationType,
+    targetTable,
+    viewDefBefore,
+    viewDefAfter,
+    affectedCells,
+    targetRowId,
+    targetColumn,
+    newValue,
+    operation,
+    rowData,
+    affectedRowIds
+  } = modification;
   if (!targetTable) return;
   switch (modificationType) {
+    case 'cell_update': {
+      const updates = affectedCells?.map(cell => ({
+        rowId: cell.rowId,
+        column: cell.columnName,
+        value: cell.newValue ?? null,
+        operation: cell.operation ?? 'set'
+      })) ?? (targetRowId !== undefined && targetColumn
+        ? [{
+            rowId: targetRowId,
+            column: targetColumn,
+            value: newValue ?? null,
+            operation: operation ?? 'set'
+          }]
+        : []);
+      await updateCellBatch(targetTable, updates);
+      return;
+    }
+    case 'row_insert': {
+      const dataToInsert = targetRowId !== undefined && !isPrimaryKeyRecordId(targetRowId)
+        ? { rowid: targetRowId, ...(rowData ?? {}) }
+        : (rowData ?? {});
+      await insertRow(targetTable, dataToInsert);
+      return;
+    }
+    case 'row_delete':
+      await deleteRows(targetTable, affectedRowIds ?? []);
+      return;
     case 'view_create':
       if (viewDefAfter) {
         await applyViewHistoryState(targetTable, null, viewDefAfter);
@@ -1267,13 +1577,103 @@ async function updateCellBatch(table, updates) {
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Batch cell updates');
 
+  if (updates.length === 0) return [];
+
+  if (updates.some(update => isPrimaryKeyRecordId(update.rowId))) {
+    if (!updates.every(update => isPrimaryKeyRecordId(update.rowId))) {
+      throw new Error('Cannot mix rowid and primary-key row identities');
+    }
+    const identity = await resolveTableIdentity(table);
+    if (identity.kind !== 'primaryKey') {
+      throw new Error(`Primary-key identity cannot target rowid table ${table}`);
+    }
+
+    const savepointName = createViewSavepointName('sp_update_pk_batch');
+    runSingleStatement(`SAVEPOINT ${savepointName}`);
+    try {
+      const updatesByRow = new Map();
+      for (const update of updates) {
+        const rowUpdates = updatesByRow.get(update.rowId) ?? [];
+        rowUpdates.push(update);
+        updatesByRow.set(update.rowId, rowUpdates);
+      }
+
+      const results = [];
+      for (const [rowId, rowUpdates] of updatesByRow) {
+        const oldPredicate = buildRecordIdentityPredicate(rowId, identity);
+        const columns = [...new Set(rowUpdates.map(update => update.column))];
+        if (columns.length !== rowUpdates.length) {
+          throw new Error(`Batch update for ${table} contains the same column more than once`);
+        }
+        const current = db.exec(
+          `SELECT ${columns.map(escapeIdentifier).join(', ')} ` +
+          `FROM ${escapeIdentifier(table)} WHERE ${oldPredicate.sql} LIMIT 2`,
+          normalizeBindParams(oldPredicate.params),
+          { useBigInt: true }
+        )[0];
+        if ((current?.values.length ?? 0) !== 1) {
+          throw new Error(`Cannot update ${table}: row identity no longer exists`);
+        }
+
+        const preparedUpdates = rowUpdates.map((update, index) => {
+          const priorValue = current.values[0][index];
+          const prepared = prepareCellUpdateForStorage(
+            update.value,
+            priorValue,
+            update.operation ?? 'set'
+          );
+          const storedValue = prepared.operation === 'json_patch'
+            ? applyJsonPatchValue(priorValue, prepared.value)
+            : prepared.value;
+          return { update, priorValue, prepared, storedValue };
+        });
+        const setClause = preparedUpdates.map(({ update }) => (
+          `${escapeIdentifier(update.column)} = ?`
+        )).join(', ');
+        db.run(
+          `UPDATE ${escapeIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
+          normalizeBindParams([
+            ...preparedUpdates.map(update => update.storedValue),
+            ...oldPredicate.params
+          ])
+        );
+
+        const candidateValues = [...oldPredicate.primaryKey.values];
+        for (const preparedUpdate of preparedUpdates) {
+          const keyIndex = identity.columns.findIndex(
+            keyColumn => keyColumn.identifier === preparedUpdate.update.column
+          );
+          if (keyIndex >= 0) candidateValues[keyIndex] = preparedUpdate.storedValue;
+        }
+        const candidateId = encodePrimaryKeyRecordId(identity.columns, candidateValues);
+        const newRowId = readPrimaryKeyRecordId(
+          table,
+          identity,
+          buildRecordIdentityPredicate(candidateId, identity)
+        );
+        for (const preparedUpdate of preparedUpdates) {
+          results.push({
+            rowId,
+            newRowId,
+            columnName: preparedUpdate.update.column,
+            priorValue: preparedUpdate.priorValue,
+            newValue: preparedUpdate.prepared.value,
+            operation: preparedUpdate.prepared.operation
+          });
+        }
+      }
+
+      runSingleStatement(`RELEASE ${savepointName}`);
+      return results;
+    } catch (error) {
+      safeRollbackSavepoint(savepointName, 'updatePrimaryKeyCellBatch');
+      throw error;
+    }
+  }
+
   const savepointName = createViewSavepointName('sp_update_cell_batch');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
-    if (updates.length === 0) {
-      runSingleStatement(`RELEASE ${savepointName}`);
-      return [];
-    }
     const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
     const columns = [...new Set(updates.map(update => update.column))];
     const placeholders = rowIds.map(() => '?').join(', ');
@@ -1317,7 +1717,7 @@ async function updateCellBatch(table, updates) {
       const sql = update.operation === 'json_patch'
         ? `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`
         : `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
-      db.run(sql, [update.value, update.rowId]);
+      db.run(sql, normalizeBindParams([update.value, update.rowId]));
     }
     runSingleStatement(`RELEASE ${savepointName}`);
     return results;

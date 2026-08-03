@@ -3,7 +3,7 @@
  */
 import { state } from './state.js';
 import { backendApi } from './api.js';
-import { validateRowId, formatCellValueAsText } from './utils.js';
+import { validateRowId, formatCellValueAsText, parseGridInputValue } from './utils.js';
 import { updateStatus } from './ui.js';
 import { updateSelectionStates, clearSelection } from './grid-selection.js';
 import { loadTableData } from './grid-data.js';
@@ -13,6 +13,8 @@ import {
     getCellValueForDisplay,
     clearExactIntegerText,
     getRowId,
+    resolveDisplayedCell,
+    remapDisplayedRowIdentity,
     getOrderedColumnIndices,
     getOrderedRowIndices
 } from './data-utils.js';
@@ -149,16 +151,6 @@ export function onCellInputBlur() {
     }, 100);
 }
 
-function resolveDisplayedCell(targetTable, rowId, columnName) {
-    if (state.selectedTable !== targetTable) return null;
-
-    const rowIdx = state.gridData.findIndex((row, index) => (
-        getRowId(row, index) === rowId
-    ));
-    const colIdx = state.tableColumns.findIndex(column => column.name === columnName);
-    return rowIdx >= 0 && colIdx >= 0 ? { rowIdx, colIdx } : null;
-}
-
 export async function saveCellEdit() {
     if (state.isSavingCell) return false;
     if (!state.editingCellInfo || !state.activeCellInput) return false;
@@ -188,7 +180,11 @@ export async function saveCellEdit() {
             valueToSave = null;
         }
     } else if (!isNaN(Number(newValue)) && newValue.trim() !== '') {
-        valueToSave = Number(newValue);
+        valueToSave = parseGridInputValue(
+            newValue,
+            column,
+            state.selectedTableIdentity?.kind === 'primaryKey'
+        );
     } else {
         valueToSave = newValue;
     }
@@ -197,12 +193,23 @@ export async function saveCellEdit() {
         state.isSavingCell = true;
         updateStatus('Saving...');
 
-        await backendApi.updateCell(targetTable, validateRowId(rowId), columnName, valueToSave, originalValue);
+        const updatedRowId = await backendApi.updateCell(
+            targetTable,
+            validateRowId(rowId),
+            columnName,
+            valueToSave,
+            originalValue
+        );
 
         // A broadcast refresh can reorder gridData before this RPC resolves.
         // Resolve by stable identity only if the original table is still
         // displayed. Equal rowids/column names in another table are unrelated.
-        const currentCell = resolveDisplayedCell(targetTable, rowId, columnName);
+        const currentCell = resolveDisplayedCell(targetTable, rowId, columnName)
+            ?? (updatedRowId !== undefined
+                ? resolveDisplayedCell(targetTable, updatedRowId, columnName)
+                : null);
+        remapDisplayedRowIdentity(targetTable, rowId, updatedRowId, currentCell);
+        editSession.updatedRowId = updatedRowId;
         if (currentCell) {
             state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = valueToSave;
             clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
@@ -237,8 +244,9 @@ export async function saveCellEdit() {
 
 async function saveCellEditAndMove(direction) {
     if (!state.editingCellInfo) return;
+    const editSession = state.editingCellInfo;
     const targetTable = state.selectedTable;
-    const { rowIdx, colIdx, originalValue, originalText } = state.editingCellInfo;
+    const { rowIdx, colIdx, originalValue, originalText } = editSession;
     const submittedValue = state.activeCellInput?.value;
 
     // Pin traversal to the pre-commit rendered ordering. A sort/filter-changing
@@ -268,6 +276,9 @@ async function saveCellEditAndMove(direction) {
 
     if (!await saveCellEdit()) return;
     if (state.selectedTable !== targetTable) return;
+    if (targetRowId === editSession.rowId && editSession.updatedRowId !== undefined) {
+        targetRowId = editSession.updatedRowId;
+    }
     if (targetRowId === undefined || targetColumnName === undefined) return;
 
     const submittedOriginalText = originalText
@@ -480,19 +491,33 @@ export async function saveCellPreview() {
     if (newValue === '') {
         valueToSave = isNotNull ? '' : null;
     } else if (!isNaN(Number(newValue)) && newValue.trim() !== '') {
-        valueToSave = Number(newValue);
+        valueToSave = parseGridInputValue(
+            newValue,
+            column,
+            state.selectedTableIdentity?.kind === 'primaryKey'
+        );
     } else {
         valueToSave = newValue;
     }
 
     try {
         updateStatus('Saving...');
-        await backendApi.updateCell(targetTable, validateRowId(rowId), columnName, valueToSave, originalValue);
+        const updatedRowId = await backendApi.updateCell(
+            targetTable,
+            validateRowId(rowId),
+            columnName,
+            valueToSave,
+            originalValue
+        );
 
         // A broadcast refresh can reorder both rows and columns while the RPC is
         // pending. Resolve the preview target from its stable database identity
         // before touching either the grid value or its exact-INTEGER sidecar.
-        const currentCell = resolveDisplayedCell(targetTable, rowId, columnName);
+        const currentCell = resolveDisplayedCell(targetTable, rowId, columnName)
+            ?? (updatedRowId !== undefined
+                ? resolveDisplayedCell(targetTable, updatedRowId, columnName)
+                : null);
+        remapDisplayedRowIdentity(targetTable, rowId, updatedRowId, currentCell);
         if (currentCell) {
             state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = valueToSave;
             clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);

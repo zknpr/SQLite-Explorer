@@ -23,6 +23,8 @@ import { serializeOperations } from './core/operation-serializer';
 import { GlobalOutputChannel } from './main';
 import type {
   CellValue,
+  RecordId,
+  DeletedRow,
   QueryResultSet,
   ModificationEntry,
   DatabaseOperations,
@@ -85,10 +87,10 @@ interface WorkerMethods {
   redoModification(mod: ModificationEntry): Promise<void>;
   flushChanges(): Promise<void>;
   discardModifications(mods: ModificationEntry[]): Promise<void>;
-  updateCell(table: string, rowId: string | number, column: string, value: CellValue, patch?: string): Promise<void>;
-  insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
+  updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<RecordId | void>;
+  insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined>;
   insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
-  deleteRows(table: string, rowIds: (string | number)[]): Promise<void>;
+  deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void>;
   deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
@@ -418,13 +420,13 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.discardModifications(mods, signal),
         // Preserve JSON merge patches when the browser facade calls the
         // in-process endpoint directly.
-        updateCell: (table: string, rowId: string | number, column: string, value: CellValue, patch?: string) =>
+        updateCell: (table: string, rowId: RecordId, column: string, value: CellValue, patch?: string) =>
           endpoint.updateCell(table, rowId, column, value, patch),
         insertRow: (table: string, data: Record<string, CellValue>) =>
           endpoint.insertRow(table, data),
         insertRowBatch: (table: string, rows: Record<string, CellValue>[]) =>
           endpoint.insertRowBatch(table, rows),
-        deleteRows: (table: string, rowIds: (string | number)[]) =>
+        deleteRows: (table: string, rowIds: RecordId[]) =>
           endpoint.deleteRows(table, rowIds),
         deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
           endpoint.deleteColumns(table, columns, dropDependentIndexes),
@@ -661,7 +663,7 @@ async function createWorkerBackedWasmDatabaseConnection(
             callWorkerAfterAbortCheck(signal, () => workerProxy.discardModifications(mods)),
           // Preserve JSON merge patches through worker RPC while transferring
           // a private Uint8Array copy (the host may retain the original in history).
-          updateCell: (table: string, rowId: string | number, column: string, value: CellValue, patch?: string) =>
+          updateCell: (table: string, rowId: RecordId, column: string, value: CellValue, patch?: string) =>
             workerProxy.updateCell(table, rowId, column, wrapForTransfer(value), patch),
           insertRow: (table: string, data: Record<string, CellValue>) => {
             // Retain caller-owned values because insert history records this object.
@@ -673,7 +675,7 @@ async function createWorkerBackedWasmDatabaseConnection(
           },
           insertRowBatch: (table: string, rows: Record<string, CellValue>[]) =>
             workerProxy.insertRowBatch(table, rows),
-          deleteRows: (table: string, rowIds: (string | number)[]) =>
+          deleteRows: (table: string, rowIds: RecordId[]) =>
             workerProxy.deleteRows(table, rowIds),
           deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
             workerProxy.deleteColumns(table, columns, dropDependentIndexes),

@@ -37,6 +37,7 @@ export async function refreshContent(filename, connectionResult) {
             clearSelection();
             state.selectedTable = null;
             state.selectedTableType = null;
+            state.selectedTableIdentity = null;
             // Show empty state
             document.getElementById('tableNameLabel').textContent = 'No table selected';
             document.getElementById('gridContainer').innerHTML = `
