@@ -71,6 +71,7 @@ import {
   escapeMainViewIdentifier,
   mapViewTriggerRows,
   VIEW_TRIGGER_SCHEMA_QUERIES,
+  normalizeViewDefinitionError,
   normalizeViewSelectSql
 } from '../../view-utils';
 
@@ -1559,7 +1560,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (err) {
       await this.safeRollbackSavepoint(savepointName, 'validateViewDefinition');
-      throw err;
+      throw normalizeViewDefinitionError(err, view, body);
     }
   }
 
@@ -1612,7 +1613,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       return result;
     } catch (err) {
       await this.safeRollbackSavepoint(savepointName, 'previewViewDefinition');
-      throw err;
+      throw normalizeViewDefinitionError(err, view, body);
     }
   }
 

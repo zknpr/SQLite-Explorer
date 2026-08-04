@@ -363,6 +363,155 @@ export function normalizeViewSelectSql(selectSql: string): string {
   return trimmed;
 }
 
+const VIEW_SOURCE_CLAUSE_END_KEYWORDS = new Set([
+  'EXCEPT', 'GROUP', 'HAVING', 'INTERSECT', 'LIMIT', 'OFFSET', 'ON', 'ORDER',
+  'RETURNING', 'UNION', 'USING', 'VALUES', 'WHERE', 'WINDOW'
+]);
+
+interface ViewSourceReference {
+  schema?: string;
+  identifier: string;
+}
+
+/** Read one direct table/view source without treating expressions as references. */
+function readViewSourceReference(
+  tokens: readonly SqlToken[],
+  startIndex: number
+): ViewSourceReference | undefined {
+  const first = tokens[startIndex];
+  if (!isSqlIdentifierToken(first)) return undefined;
+  if (tokens[startIndex + 1]?.kind === 'symbol' && tokens[startIndex + 1].value === '.') {
+    const identifier = tokens[startIndex + 2];
+    if (!isSqlIdentifierToken(identifier)) return undefined;
+    if (tokens[startIndex + 3]?.kind === 'symbol' && tokens[startIndex + 3].value === '(') {
+      return undefined;
+    }
+    return { schema: first.value, identifier: identifier.value };
+  }
+  if (tokens[startIndex + 1]?.kind === 'symbol' && tokens[startIndex + 1].value === '(') {
+    return undefined;
+  }
+  return { identifier: first.value };
+}
+
+function skipParenthesizedTokens(
+  tokens: readonly SqlToken[],
+  startIndex: number
+): number | undefined {
+  if (tokens[startIndex]?.kind !== 'symbol' || tokens[startIndex].value !== '(') {
+    return undefined;
+  }
+  let depth = 0;
+  for (let index = startIndex; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token.kind !== 'symbol') continue;
+    if (token.value === '(') depth++;
+    if (token.value === ')' && --depth === 0) return index + 1;
+  }
+  return undefined;
+}
+
+/** Conservatively recognize CTE declarations that shadow an unqualified target name. */
+function definesTargetNamedCte(tokens: readonly SqlToken[], target: string): boolean {
+  for (let index = 0; index < tokens.length; index++) {
+    if (!isSqlKeyword(tokens[index], 'WITH')) continue;
+    let cursor = index + 1;
+    if (isSqlKeyword(tokens[cursor], 'RECURSIVE')) cursor++;
+
+    while (isSqlIdentifierToken(tokens[cursor])) {
+      const cteName = foldSqlIdentifier(tokens[cursor].value);
+      cursor++;
+      if (tokens[cursor]?.kind === 'symbol' && tokens[cursor].value === '(') {
+        const afterColumns = skipParenthesizedTokens(tokens, cursor);
+        if (afterColumns === undefined) break;
+        cursor = afterColumns;
+      }
+      if (!isSqlKeyword(tokens[cursor], 'AS')) break;
+      cursor++;
+      if (isSqlKeyword(tokens[cursor], 'NOT')) cursor++;
+      if (isSqlKeyword(tokens[cursor], 'MATERIALIZED')) cursor++;
+      const afterBody = skipParenthesizedTokens(tokens, cursor);
+      if (afterBody === undefined) break;
+      if (cteName === target) return true;
+      cursor = afterBody;
+      if (tokens[cursor]?.kind !== 'symbol' || tokens[cursor].value !== ',') break;
+      cursor++;
+    }
+  }
+  return false;
+}
+
+/**
+ * Detect a direct target source in any SELECT scope. Requiring FROM/JOIN source
+ * position keeps target-looking strings, comments, expressions, and aliases
+ * from turning an unrelated SQLite logic error into a circular-reference error.
+ */
+function viewDefinitionReferencesTarget(view: string, selectSql: string): boolean {
+  const target = foldSqlIdentifier(view);
+  const tokens = scanSqlTokens(selectSql);
+  const targetIsCte = definesTargetNamedCte(tokens, target);
+  const inFromClause = new Map<number, boolean>();
+  let depth = 0;
+
+  const matchesTarget = (startIndex: number): boolean => {
+    const reference = readViewSourceReference(tokens, startIndex);
+    if (!reference || foldSqlIdentifier(reference.identifier) !== target) return false;
+    if (reference.schema === undefined) return !targetIsCte;
+    return foldSqlIdentifier(reference.schema) === 'main';
+  };
+
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token.kind === 'symbol' && token.value === '(') {
+      depth++;
+      inFromClause.set(depth, false);
+      continue;
+    }
+    if (token.kind === 'symbol' && token.value === ')') {
+      inFromClause.delete(depth);
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (isSqlKeyword(token, 'FROM')) {
+      inFromClause.set(depth, true);
+      if (matchesTarget(index + 1)) return true;
+      continue;
+    }
+    if (isSqlKeyword(token, 'JOIN')) {
+      inFromClause.set(depth, true);
+      if (matchesTarget(index + 1)) return true;
+      continue;
+    }
+    if (token.kind === 'word'
+        && VIEW_SOURCE_CLAUSE_END_KEYWORDS.has(token.value.toUpperCase())) {
+      inFromClause.set(depth, false);
+      continue;
+    }
+    if (token.kind === 'symbol' && token.value === ',' && inFromClause.get(depth)) {
+      if (matchesTarget(index + 1)) return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Restore a stable circular-reference error when newer SQLite versions collapse
+ * that specific diagnostic to the otherwise unactionable "SQL logic error".
+ */
+export function normalizeViewDefinitionError(
+  error: unknown,
+  view: string,
+  selectSql: string
+): unknown {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!/\bSQL logic error\s*$/i.test(message)
+      || !viewDefinitionReferencesTarget(view, selectSql)) {
+    return error;
+  }
+  return new Error(`Circular view reference: view "${view}" references itself`, { cause: error });
+}
+
 interface ViewSqlParts {
   selectStart: number;
   columnListSql?: string;

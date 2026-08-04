@@ -85,6 +85,7 @@ import {
   escapeMainViewIdentifier,
   mapViewTriggerRows,
   VIEW_TRIGGER_SCHEMA_QUERIES,
+  normalizeViewDefinitionError,
   normalizeViewSelectSql
 } from './core/view-utils';
 import { crypto } from './platform/cryptoShim';
@@ -1649,7 +1650,7 @@ export async function createNativeDatabaseConnection(
             await worker.call('run', [`RELEASE ${savepointName}`]);
           } catch (err) {
             await safeRollbackSavepoint(savepointName, 'validateViewDefinition');
-            throw err;
+            throw normalizeViewDefinitionError(err, view, body);
           }
         },
 
@@ -1687,7 +1688,7 @@ export async function createNativeDatabaseConnection(
             await worker.call('run', [`RELEASE ${savepointName}`]);
           } catch (err) {
             await safeRollbackSavepoint(savepointName, 'previewViewDefinition');
-            throw err;
+            throw normalizeViewDefinitionError(err, view, body);
           }
 
           // The disposable view is needed only to validate CREATE VIEW context

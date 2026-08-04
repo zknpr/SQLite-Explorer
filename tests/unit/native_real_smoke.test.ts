@@ -13,9 +13,9 @@ import {
 import { cancelTokenToAbortSignal } from '../../src/core/cancellation-utils';
 import { InvocationTimeoutError } from '../../src/core/rpc';
 
-const BUNDLED_TXIKI_SQLITE_VERSION = '3.50.1';
+const BUNDLED_TXIKI_SQLITE_VERSION = '3.51.2';
 const DIVERGENT_REAL_TEXT_BY_NATIVE_SQLITE_VERSION: Record<string, string> = {
-    '3.50.1': '9.6529377952985e+282'
+    '3.51.2': '9.6529377952985e+282'
 };
 
 const USER_VIEW_BODY = `SELECT
