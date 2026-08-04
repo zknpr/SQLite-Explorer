@@ -252,17 +252,21 @@ const copyAssets = async () => {
     fs.mkdirSync(assetsDir, { recursive: true });
   }
 
-  // Copy sql.js WASM from node_modules if present
-  try {
-    const wasmSrc = resolve('node_modules', 'sql.js', 'dist', 'sql-wasm.wasm');
-    const wasmDst = resolve(assetsDir, 'sqlite3.wasm');
-    if (fs.existsSync(wasmSrc) && !fs.existsSync(wasmDst)) {
-      fs.copyFileSync(wasmSrc, wasmDst);
-      console.log('Copied sql.js WASM to assets/');
-    }
-  } catch (err) {
-    console.warn('Could not copy sql.js WASM:', err.message);
-  }
+  // Always refresh from the pinned fork. A stale stock asset is incompatible
+  // with the vendored glue and would otherwise fail only when the worker boots.
+  const wasmSrc = resolve('vendor', 'sql.js', 'sql-wasm.wasm');
+  const wasmDst = resolve(assetsDir, 'sqlite3.wasm');
+  fs.copyFileSync(wasmSrc, wasmDst);
+  console.log('Copied vendored sql.js WASM to assets/');
+
+  const demoAssetsDir = resolve('website', 'public', 'sqlite-viewer');
+  fs.mkdirSync(demoAssetsDir, { recursive: true });
+  fs.copyFileSync(
+    resolve('vendor', 'sql.js', 'sql-wasm.js'),
+    resolve(demoAssetsDir, 'sql-wasm.js')
+  );
+  fs.copyFileSync(wasmSrc, resolve(demoAssetsDir, 'sql-wasm.wasm'));
+  console.log('Copied vendored sql.js runtime to website/public/sqlite-viewer/');
 };
 
 /**
@@ -438,7 +442,9 @@ const validateBuildOutputs = () => {
     'out/worker-browser.js',
     'assets/sqlite3.wasm',
     'core/ui/viewer.html',
-    'website/public/sqlite-viewer/worker.js'
+    'website/public/sqlite-viewer/worker.js',
+    'website/public/sqlite-viewer/sql-wasm.js',
+    'website/public/sqlite-viewer/sql-wasm.wasm'
   ];
 
   const missingFiles = requiredFiles.filter(file => !fs.existsSync(resolve(file)));

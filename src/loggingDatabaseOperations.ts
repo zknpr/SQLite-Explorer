@@ -90,11 +90,15 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         this.outputChannel.appendLine(`${timestamp} ${type} [${this.filename}] ${safeMessage}`);
     }
 
-    async executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> {
+    async executeQuery(
+        sql: string,
+        params?: CellValue[],
+        signal?: AbortSignal
+    ): Promise<QueryResultSet[]> {
         const isWrite = /^(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|BEGIN|COMMIT|ROLLBACK)/i.test(sql.trim());
         const paramStr = params && params.length > 0 ? ` -- params: [${params.map(p => this.sanitizeValue(p)).join(', ')}]` : '';
         this.log(`${sql}${paramStr}`, isWrite);
-        return this.wrapped.executeQuery(sql, params);
+        return this.wrapped.executeQuery(sql, params, signal);
     }
 
     async serializeDatabase(): Promise<Uint8Array> {
@@ -206,7 +210,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         view: string,
         selectSql: string,
         limit?: number,
-        intent?: ViewDefinitionIntent
+        intent?: ViewDefinitionIntent,
+        signal?: AbortSignal
     ): Promise<QueryResultSet> {
         return this.logAndDelegate(
             `Previewing view ${escapeIdentifier(view)}`,
@@ -215,7 +220,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
             view,
             selectSql,
             limit,
-            intent
+            intent,
+            signal
         );
     }
 

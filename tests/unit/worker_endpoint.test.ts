@@ -26,7 +26,7 @@ describe('Worker Endpoint', () => {
 
     beforeEach(() => {
         endpoint = createWorkerEndpoint();
-        wasmBinary = fs.readFileSync('./node_modules/sql.js/dist/sql-wasm.wasm');
+        wasmBinary = fs.readFileSync('./vendor/sql.js/sql-wasm.wasm');
     });
 
     it('should throw Error if database is not initialized', async () => {

@@ -33,7 +33,7 @@ async function runBenchmark() {
     console.log('Starting Index Drop Benchmark (Hygienic)...');
 
     try {
-        const wasmBinary = fs.readFileSync(path.resolve(__dirname, '../../node_modules/sql.js/dist/sql-wasm.wasm'));
+        const wasmBinary = fs.readFileSync(path.resolve(__dirname, '../../vendor/sql.js/sql-wasm.wasm'));
         const engineResult = await createDatabaseEngine({ wasmBinary } as any);
         const db = engineResult.operations as WasmDatabaseEngine;
 

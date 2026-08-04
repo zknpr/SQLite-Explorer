@@ -347,6 +347,54 @@ describe('workerFactory error path tests', () => {
     assert.strictEqual(applyCalls, 0);
   });
 
+  it('preempts desktop WASM queries through a host-owned shared flag', async () => {
+    let cancellationFlag: Int32Array | undefined;
+    let releaseWorker: (() => void) | undefined;
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false }),
+      runQuery: async (
+        _sql: string,
+        _params?: unknown[],
+        receivedFlag?: Int32Array
+      ) => {
+        cancellationFlag = receivedFlag;
+        await new Promise<void>(resolve => { releaseWorker = resolve; });
+        return [];
+      }
+    };
+
+    const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
+    const fileUri = {
+      scheme: 'file',
+      fsPath: '/test/db.sqlite',
+      path: '/test/db.sqlite'
+    } as any;
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
+    const controller = new AbortController();
+    const cancellation = new Error('cancelled while worker query was running');
+    const pending = databaseOps.executeQuery(
+      'SELECT long_running_query()',
+      [],
+      controller.signal
+    );
+    await Promise.resolve();
+
+    try {
+      assert.ok(cancellationFlag, 'desktop facade did not pass a cancellation flag');
+      assert.ok(cancellationFlag.buffer instanceof SharedArrayBuffer);
+      assert.strictEqual(Atomics.load(cancellationFlag, 0), 0);
+      controller.abort(cancellation);
+      assert.strictEqual(Atomics.load(cancellationFlag, 0), 1);
+    } finally {
+      releaseWorker?.();
+    }
+
+    let caught: unknown;
+    await pending.catch((error: unknown) => { caught = error; });
+    assert.strictEqual(caught, cancellation);
+  });
+
   it('keeps BLOB history bytes owned by the host while transferring mutation payloads', async () => {
     let storedValue = new Uint8Array();
     let insertedValue = new Uint8Array();

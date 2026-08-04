@@ -59,6 +59,40 @@ const SAMPLE_DATABASES = [
   }
 ];
 
+const CANCELLATION_PARAMETER_INDEX: Readonly<Record<string, number>> = {
+  runQuery: 2,
+  previewViewDefinition: 4
+};
+
+function createSharedCancellationFlag(signal?: AbortSignal) {
+  // Browsers expose SharedArrayBuffer to this page only when cross-origin
+  // isolation is active. Otherwise the worker retains its SQLite deadline but
+  // cannot observe a host cancellation while synchronous WASM owns the thread.
+  if (
+    !signal ||
+    globalThis.crossOriginIsolated !== true ||
+    typeof SharedArrayBuffer !== 'function'
+  ) {
+    return undefined;
+  }
+
+  let flag: Int32Array;
+  try {
+    flag = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  } catch {
+    return undefined;
+  }
+
+  const markCancelled = () => Atomics.store(flag, 0, 1);
+  if (signal.aborted) markCancelled();
+  else signal.addEventListener('abort', markCancelled, { once: true });
+
+  return {
+    flag,
+    dispose: () => signal.removeEventListener('abort', markCancelled)
+  };
+}
+
 // ============================================================================
 // Demo Page Component
 // ============================================================================
@@ -114,6 +148,8 @@ export default function DemoClient() {
     reject: (error: Error) => void;
   }>>(new Map());
 
+  const activePreviewController = useRef<AbortController | null>(null);
+
   /**
    * Message ID counter for RPC calls.
    */
@@ -131,8 +167,21 @@ export default function DemoClient() {
   /**
    * Send an RPC request to the worker and wait for response.
    */
-  const callWorker = useCallback((method: string, args: unknown[]): Promise<unknown> => {
-    return new Promise((resolve, reject) => {
+  const callWorker = useCallback((
+    method: string,
+    args: unknown[],
+    signal?: AbortSignal
+  ): Promise<unknown> => {
+    signal?.throwIfAborted();
+    const sharedCancellation = createSharedCancellationFlag(signal);
+    const workerArgs = [...args];
+    const cancellationIndex = CANCELLATION_PARAMETER_INDEX[method];
+    if (sharedCancellation && cancellationIndex !== undefined) {
+      while (workerArgs.length < cancellationIndex) workerArgs.push(undefined);
+      workerArgs[cancellationIndex] = sharedCancellation.flag;
+    }
+
+    const invocation = new Promise<unknown>((resolve, reject) => {
       if (!workerRef.current) {
         reject(new Error('Worker not initialized'));
         return;
@@ -147,12 +196,22 @@ export default function DemoClient() {
           kind: 'invoke',
           messageId,
           targetMethod: method,
-          payload: args
+          payload: workerArgs
         }
       };
 
       workerRef.current.postMessage(message);
     });
+    return invocation.then(
+      result => {
+        signal?.throwIfAborted();
+        return result;
+      },
+      error => {
+        signal?.throwIfAborted();
+        throw error;
+      }
+    ).finally(() => sharedCancellation?.dispose());
   }, []);
 
   /**
@@ -251,7 +310,17 @@ export default function DemoClient() {
       }
 
       // Forward all other calls to worker
-      callWorker(targetMethod as string, payload as unknown[] || [])
+      let previewController: AbortController | undefined;
+      if (targetMethod === 'previewViewDefinition') {
+        activePreviewController.current?.abort();
+        previewController = new AbortController();
+        activePreviewController.current = previewController;
+      }
+      callWorker(
+        targetMethod as string,
+        payload as unknown[] || [],
+        previewController?.signal
+      )
         .then((result) => {
           event.source?.postMessage({
             channel: 'rpc',
@@ -273,6 +342,11 @@ export default function DemoClient() {
               errorMessage: error.message
             }
           }, { targetOrigin: event.origin });
+        })
+        .finally(() => {
+          if (activePreviewController.current === previewController) {
+            activePreviewController.current = null;
+          }
         });
     }
   }, [callWorker]);
@@ -292,6 +366,8 @@ export default function DemoClient() {
       window.removeEventListener('message', handleIframeMessage);
 
       // Cleanup worker on unmount
+      activePreviewController.current?.abort();
+      activePreviewController.current = null;
       if (workerRef.current) {
         workerRef.current.terminate();
         workerRef.current = null;
@@ -304,6 +380,8 @@ export default function DemoClient() {
    */
   const initializeWorker = useCallback(async (binary: Uint8Array, filename: string) => {
     // Terminate existing worker
+    activePreviewController.current?.abort();
+    activePreviewController.current = null;
     if (workerRef.current) {
       workerRef.current.terminate();
     }
@@ -336,13 +414,13 @@ export default function DemoClient() {
     };
 
     // Wait for worker to be ready, then initialize database
-    // The worker loads sql.js WASM from CDN automatically
+    // The worker resolves the self-hosted sql.js runtime beside worker.js.
     try {
       await callWorker('initializeDatabase', [
         filename,
         {
           content: binary
-          // wasmBinary is loaded from CDN by the worker
+          // wasmBinary is loaded from the self-hosted runtime by the worker.
         }
       ]);
 
@@ -473,6 +551,8 @@ export default function DemoClient() {
    * Close the current database and return to upload UI.
    */
   const handleClose = useCallback(() => {
+    activePreviewController.current?.abort();
+    activePreviewController.current = null;
     if (workerRef.current) {
       workerRef.current.terminate();
       workerRef.current = null;

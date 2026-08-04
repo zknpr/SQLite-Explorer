@@ -291,7 +291,11 @@ export interface DatabaseOperations {
   readonly engineKind: Promise<'wasm' | 'native'>;
 
   /** Execute SQL query */
-  executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]>;
+  executeQuery(
+    sql: string,
+    params?: CellValue[],
+    signal?: AbortSignal
+  ): Promise<QueryResultSet[]>;
 
   /** Export database to binary */
   serializeDatabase(): Promise<Uint8Array>;
@@ -347,7 +351,8 @@ export interface DatabaseOperations {
     view: string,
     selectSql: string,
     limit?: number,
-    intent?: ViewDefinitionIntent
+    intent?: ViewDefinitionIntent,
+    signal?: AbortSignal
   ): Promise<QueryResultSet>;
 
   /** Create a view from a SELECT body. */

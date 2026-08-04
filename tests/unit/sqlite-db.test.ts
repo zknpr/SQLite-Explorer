@@ -228,6 +228,7 @@ describe('WasmDatabaseEngine', () => {
 
       // Mock the WASM Database instance
       const mockDb = {
+        progress_handler: () => {},
         iterateStatements: (sql: string) => {
           return [{
             bind: () => {},
@@ -273,48 +274,39 @@ describe('WasmDatabaseEngine', () => {
       }
     });
 
-    it('should timeout long running queries', async () => {
-      // Create a specific engine instance with a short timeout
+    it('interrupts a long-running statement before its first row is produced', async () => {
       const result = await createDatabaseEngine({
         content: null,
         maxSize: 0,
         readOnlyMode: false,
-        queryTimeout: 100 // 100ms timeout
+        queryTimeout: 20
       });
       const timeoutEngine = result.operations!;
-
-      await timeoutEngine.executeQuery("CREATE TABLE timeout_test (id INTEGER PRIMARY KEY, value TEXT)");
-      await timeoutEngine.insertRow('timeout_test', { id: 1, value: 'test1' });
-      await timeoutEngine.insertRow('timeout_test', { id: 2, value: 'test2' });
-
-      const originalDateNow = Date.now;
-      let callCount = 0;
+      const startedAt = performance.now();
 
       try {
-        Date.now = () => {
-          // First call establishes startTime, subsequent calls simulate elapsed time
-          if (callCount === 0) {
-            callCount++;
-            return 1000;
-          }
-          callCount++;
-          // Return a time far in the future to trigger timeout
-          return 1000 + 200;
-        };
-
-        // This query will hit the while(stmt.step()) loop
         await assert.rejects(
-          async () => {
-            await timeoutEngine!.executeQuery("SELECT * FROM timeout_test");
-          },
-          (err: any) => {
-            assert.strictEqual(err.message, "Query failed: Query execution timed out after 100ms");
+          timeoutEngine.executeQuery(
+            'WITH RECURSIVE counter(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+            ') SELECT sum(value) FROM counter'
+          ),
+          (err: Error) => {
+            assert.strictEqual(
+              err.message,
+              'Query failed: Query execution timed out after 20ms'
+            );
             return true;
           }
         );
       } finally {
-        Date.now = originalDateNow;
+        (timeoutEngine as WasmDatabaseEngine).shutdown();
       }
+
+      assert.ok(
+        performance.now() - startedAt < 500,
+        'recursive CTE completed before timeout rejection instead of being interrupted'
+      );
     });
   });
 });

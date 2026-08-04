@@ -33,7 +33,8 @@ import {
   WasmDatabaseEngine,
   type WasmDatabaseInstance,
   type WasmEngineModule,
-  type WasmEngineLogHandler
+  type WasmEngineLogHandler,
+  type WasmQueryCancellation
 } from './engine/wasm/WasmDatabaseEngine';
 
 export { WasmDatabaseEngine } from './engine/wasm/WasmDatabaseEngine';
@@ -53,8 +54,9 @@ export async function createDatabaseEngine(
   config: DatabaseInitConfig,
   logger?: WasmEngineLogHandler
 ): Promise<DatabaseInitResult> {
-  // Dynamically load sql.js module
-  const loadEngine = (await import('sql.js')).default;
+  // Load the pinned fork directly so source tests and both esbuild worker
+  // targets cannot silently resolve the stock npm runtime.
+  const loadEngine = (await import('../../vendor/sql.js/sql-wasm.js')).default;
 
   // Configure WASM loading
   const engineConfig: Record<string, unknown> = {};
@@ -172,8 +174,12 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
      * @param params - Bound parameters
      * @returns Query result sets
      */
-    async runQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> {
-      return requireEngine().executeQuery(sql, params);
+    async runQuery(
+      sql: string,
+      params?: CellValue[],
+      cancellation?: WasmQueryCancellation
+    ): Promise<QueryResultSet[]> {
+      return requireEngine().executeQuery(sql, params, cancellation);
     },
 
     /**
@@ -254,9 +260,16 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       view: string,
       selectSql: string,
       limit?: number,
-      intent?: ViewDefinitionIntent
+      intent?: ViewDefinitionIntent,
+      cancellation?: WasmQueryCancellation
     ) {
-      return requireEngine().previewViewDefinition(view, selectSql, limit, intent);
+      return requireEngine().previewViewDefinition(
+        view,
+        selectSql,
+        limit,
+        intent,
+        cancellation
+      );
     },
 
     async createView(view: string, selectSql: string) {

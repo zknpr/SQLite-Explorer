@@ -99,6 +99,8 @@ export interface WasmDatabaseInstance {
   exec(sql: string, params?: WasmBindValue[]): Array<{ columns: string[]; values: CellValue[][] }>;
   prepare(sql: string, params?: WasmBindValue[]): WasmPreparedStatement;
   iterateStatements(sql: string): Iterable<WasmPreparedStatement>;
+  progress_handler(nOps?: number | null, callback?: (() => unknown) | null): void;
+  interrupt(): void;
   export(): Uint8Array;
   close(): void;
 }
@@ -111,6 +113,8 @@ export type WasmEngineLogHandler = (
   level: 'log' | 'warn' | 'error',
   ...args: unknown[]
 ) => void;
+
+export type WasmQueryCancellation = AbortSignal | Int32Array;
 
 interface ExistingViewForIntent {
   storedSql: CellValue | undefined;
@@ -147,6 +151,7 @@ function wasmBindPlaceholder(value: CellValue): string {
  * Default query timeout in milliseconds (30 seconds).
  */
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+const PROGRESS_HANDLER_INTERVAL = 1000;
 
 export class WasmDatabaseEngine implements DatabaseOperations {
   private readonly instance: WasmDatabaseInstance;
@@ -253,41 +258,86 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /**
-   * Read a generated preview SELECT with a best-effort elapsed-time bound. The
-   * bundled sql.js API and WebAssembly exports expose neither sqlite3_interrupt
-   * nor sqlite3_progress_handler. Because statement.step() synchronously owns
-   * this worker thread, a queued host message cannot preempt an expensive first
-   * row. The checks below reject after a step returns, while the worker RPC
-   * deadline only bounds how long the host waits. True in-worker interruption is
-   * deferred until sql.js exposes an interrupt or progress-handler hook.
+   * Run synchronous SQLite work with a real VM deadline and optional cooperative
+   * cancellation. The handler is connection-global, so every registration is
+   * paired with an unconditional clear before another engine operation can run.
    */
-  private executeSingleQuery(sql: string): QueryResultSet {
-    const sourceStatement = this.prepareSingleStatement(sql);
-    const headers = sourceStatement.getColumnNames();
-    sourceStatement.free();
-    const transportQuery = buildExactNumericTextQuery(sql, headers.length);
-    const statement = this.prepareSingleStatement(transportQuery.sql);
-    const sourceRows: Array<Array<CellValue | bigint>> = [];
-    const startedAt = Date.now();
-    try {
-      while (statement.step()) {
-        if (Date.now() - startedAt > this.queryTimeout) {
-          throw new Error(`Query execution timed out after ${this.queryTimeout}ms`);
-        }
-        const row = statement.get(null, { useBigInt: true });
-        if (!row) {
-          throw new Error('SQLite returned no row after a successful statement step');
-        }
-        sourceRows.push(row);
+  private executeWithProgressHandler<T>(
+    operation: () => T,
+    cancellation?: WasmQueryCancellation
+  ): T {
+    const isCancelled = (): boolean => {
+      if (!cancellation) return false;
+      if ('aborted' in cancellation) return cancellation.aborted;
+      return cancellation.length > 0 && Atomics.load(cancellation, 0) !== 0;
+    };
+    const throwCancellation = (): never => {
+      if (cancellation && 'aborted' in cancellation) {
+        cancellation.throwIfAborted();
       }
-      const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
-        sourceRows,
-        transportQuery.valueColumnCount
-      );
-      return { headers, rows, columns: headers, values: rows, exactIntegerTexts };
+      const error = new Error('Query execution cancelled');
+      error.name = 'AbortError';
+      throw error;
+    };
+
+    if (isCancelled()) throwCancellation();
+
+    const deadline = Date.now() + this.queryTimeout;
+    let termination: 'timeout' | 'cancelled' | undefined;
+    this.instance.progress_handler(PROGRESS_HANDLER_INTERVAL, () => {
+      if (isCancelled()) {
+        termination = 'cancelled';
+        return true;
+      }
+      if (Date.now() >= deadline) {
+        termination = 'timeout';
+        return true;
+      }
+      return false;
+    });
+
+    try {
+      return operation();
+    } catch (error) {
+      if (termination === 'timeout') {
+        throw new Error(`Query execution timed out after ${this.queryTimeout}ms`);
+      }
+      if (termination === 'cancelled' || isCancelled()) throwCancellation();
+      throw error;
     } finally {
-      statement.free();
+      this.instance.progress_handler(null);
     }
+  }
+
+  /** Read a generated preview SELECT under the configured VM deadline. */
+  private executeSingleQuery(
+    sql: string,
+    cancellation?: WasmQueryCancellation
+  ): QueryResultSet {
+    return this.executeWithProgressHandler(() => {
+      const sourceStatement = this.prepareSingleStatement(sql);
+      const headers = sourceStatement.getColumnNames();
+      sourceStatement.free();
+      const transportQuery = buildExactNumericTextQuery(sql, headers.length);
+      const statement = this.prepareSingleStatement(transportQuery.sql);
+      const sourceRows: Array<Array<CellValue | bigint>> = [];
+      try {
+        while (statement.step()) {
+          const row = statement.get(null, { useBigInt: true });
+          if (!row) {
+            throw new Error('SQLite returned no row after a successful statement step');
+          }
+          sourceRows.push(row);
+        }
+        const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+          sourceRows,
+          transportQuery.valueColumnCount
+        );
+        return { headers, rows, columns: headers, values: rows, exactIntegerTexts };
+      } finally {
+        statement.free();
+      }
+    }, cancellation);
   }
 
   /**
@@ -315,67 +365,69 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * @param params - Optional bound parameters
    * @returns Array of result sets in sql.js format
    */
-  async executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> {
-    const startTime = Date.now();
+  async executeQuery(
+    sql: string,
+    params?: CellValue[],
+    cancellation?: WasmQueryCancellation
+  ): Promise<QueryResultSet[]> {
     const results: QueryResultSet[] = [];
-    let currentStmt: WasmPreparedStatement | null = null;
+    const executionState: { currentStmt?: WasmPreparedStatement } = {};
 
     try {
-      const iterator = this.instance.iterateStatements(sql);
-      let isFirstStatement = true;
+      return this.executeWithProgressHandler(() => {
+        const iterator = this.instance.iterateStatements(sql);
+        let isFirstStatement = true;
 
-      for (const stmt of iterator) {
-        currentStmt = stmt;
+        for (const stmt of iterator) {
+          executionState.currentStmt = stmt;
 
-        // Bind parameters only to the first statement to match exec behavior
-        if (isFirstStatement && params && params.length > 0) {
-          stmt.bind(normalizeWasmBindParams(params));
-        }
-        isFirstStatement = false;
-
-        const rows: CellValue[][] = [];
-
-        while (stmt.step()) {
-          // Check timeout during row iteration
-          if (Date.now() - startTime > this.queryTimeout) {
-            stmt.free();
-            currentStmt = null; // Prevent double-free in catch block
-            throw new Error(`Query execution timed out after ${this.queryTimeout}ms`);
+          // Bind parameters only to the first statement to match exec behavior
+          if (isFirstStatement && params && params.length > 0) {
+            stmt.bind(normalizeWasmBindParams(params));
           }
-          const row = stmt.get();
-          if (row) {
-            rows.push(row);
+          isFirstStatement = false;
+
+          const rows: CellValue[][] = [];
+
+          while (stmt.step()) {
+            const row = stmt.get();
+            if (row) {
+              rows.push(row);
+            }
           }
-        }
 
-        const columns = stmt.getColumnNames();
-        // Only include results that have columns (matching exec behavior)
-        if (columns.length > 0) {
-          results.push({
-            columns,
-            values: rows,
-            headers: columns,
-            rows
-          });
-        }
+          const columns = stmt.getColumnNames();
+          // Only include results that have columns (matching exec behavior)
+          if (columns.length > 0) {
+            results.push({
+              columns,
+              values: rows,
+              headers: columns,
+              rows
+            });
+          }
 
-        // iterateStatements handles freeing - clear reference
-        currentStmt = null;
-      }
+          // iterateStatements handles freeing - clear reference
+          executionState.currentStmt = undefined;
+        }
+        return results;
+      }, cancellation);
     } catch (err) {
       // Ensure current statement is freed if iteration was interrupted
-      if (currentStmt) {
+      const interruptedStmt = executionState.currentStmt;
+      if (interruptedStmt) {
         try {
-          currentStmt.free();
+          interruptedStmt.free();
         } catch (freeErr) {
           this.logger('warn', 'Failed to free statement on error:', freeErr);
         }
       }
+      if (cancellation && 'aborted' in cancellation && cancellation.aborted) {
+        cancellation.throwIfAborted();
+      }
       const errorDetail = err instanceof Error ? err.message : String(err);
       throw new Error(`Query failed: ${errorDetail}`);
     }
-
-    return results;
   }
 
   /**
@@ -1515,7 +1567,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     view: string,
     selectSql: string,
     limit: number = 50,
-    intent: ViewDefinitionIntent = 'edit'
+    intent: ViewDefinitionIntent = 'edit',
+    cancellation?: WasmQueryCancellation
   ): Promise<QueryResultSet> {
     const body = normalizeViewSelectSql(selectSql);
     const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
@@ -1531,12 +1584,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       if (columnListSql) {
         return this.executeSingleQuery(
           `WITH ${previewSource} ${columnListSql} AS (${body}\n) ` +
-          `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`
+          `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`,
+          cancellation
         );
       }
       return this.executeSingleQuery(
         `WITH ${previewSource} AS (${body}\n) ` +
-        `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`
+        `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`,
+        cancellation
       );
     }
 
@@ -1549,7 +1604,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       this.runSingleStatement(buildCreateViewSql(view, body, columnListSql));
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
       const result = this.executeSingleQuery(
-        `SELECT * FROM ${escapeMainViewIdentifier(view)} LIMIT ${boundedLimit}`
+        `SELECT * FROM ${escapeMainViewIdentifier(view)} LIMIT ${boundedLimit}`,
+        cancellation
       );
       await this.executeQuery(`ROLLBACK TO ${savepointName}`);
       await this.executeQuery(`RELEASE ${savepointName}`);

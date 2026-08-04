@@ -10,6 +10,54 @@ import { serializeOperations } from '../../src/core/operation-serializer';
 import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
 
 describe('HostBridge', () => {
+    it('cancels a superseded view preview', async () => {
+        const signals: Array<AbortSignal | undefined> = [];
+        let releaseFirstPreview: (() => void) | undefined;
+        const previewResult = { headers: ['value'], rows: [[1]] };
+        const databaseOperations = {
+            previewViewDefinition: async (
+                _view: string,
+                _selectSql: string,
+                _limit?: number,
+                _intent?: string,
+                signal?: AbortSignal
+            ) => {
+                signals.push(signal);
+                if (signals.length === 1) {
+                    await new Promise<void>(resolve => { releaseFirstPreview = resolve; });
+                }
+                return previewResult;
+            }
+        };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            { databaseOperations } as any
+        );
+        const firstPreview = bridge.previewViewDefinition(
+            'first_preview',
+            'SELECT 1',
+            50,
+            'create'
+        );
+        await Promise.resolve();
+
+        try {
+            await bridge.previewViewDefinition(
+                'second_preview',
+                'SELECT 2',
+                50,
+                'create'
+            );
+            assert.ok(signals[0], 'first preview did not receive an AbortSignal');
+            assert.strictEqual(signals[0].aborted, true);
+            assert.ok(signals[1], 'second preview did not receive an AbortSignal');
+            assert.strictEqual(signals[1].aborted, false);
+        } finally {
+            releaseFirstPreview?.();
+        }
+        await firstPreview;
+    });
+
 
     afterEach(() => {
         mock.reset();

@@ -48,6 +48,8 @@ interface ToastService {
  * They provide access to VS Code APIs and extension functionality.
  */
 export class HostBridge implements ToastService {
+  private activePreviewController: AbortController | undefined;
+
   constructor(
     private readonly viewerProvider: DatabaseEditorProvider | DatabaseViewerProvider,
     private readonly document: DatabaseDocument,
@@ -492,7 +494,22 @@ export class HostBridge implements ToastService {
     limit: number = 50,
     intent: ViewDefinitionIntent = 'edit'
   ) {
-    return this.ensureDatabaseInitialized().previewViewDefinition(view, selectSql, limit, intent);
+    this.activePreviewController?.abort();
+    const controller = new AbortController();
+    this.activePreviewController = controller;
+    try {
+      return await this.ensureDatabaseInitialized().previewViewDefinition(
+        view,
+        selectSql,
+        limit,
+        intent,
+        controller.signal
+      );
+    } finally {
+      if (this.activePreviewController === controller) {
+        this.activePreviewController = undefined;
+      }
+    }
   }
 
   /** Create a view and record enough state for save, undo, and redo. */

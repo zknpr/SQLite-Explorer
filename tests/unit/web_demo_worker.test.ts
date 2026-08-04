@@ -6,8 +6,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createHash, webcrypto } from 'node:crypto';
 import path from 'node:path';
 import vm from 'node:vm';
+import { Worker as NodeWorker } from 'node:worker_threads';
 import esbuild from 'esbuild';
-import initSqlJs from 'sql.js';
+import initSqlJs from '../../vendor/sql.js/sql-wasm.js';
 
 interface WorkerHarness {
     invoke(method: string, ...payload: unknown[]): Promise<any>;
@@ -109,7 +110,10 @@ async function createWorkerHarness(options: {
         importScripts(url: string) { options.onImportScripts?.(url); },
         console: { log() {}, warn() {}, error() {} },
         Uint8Array,
+        Int32Array,
         ArrayBuffer,
+        SharedArrayBuffer,
+        Atomics,
         DataView,
         crypto: webcrypto,
         TextEncoder,
@@ -164,7 +168,7 @@ async function workerScalar(worker: WorkerHarness, sql: string): Promise<unknown
 }
 
 describe('web demo view worker', () => {
-    it('loads the package-aligned sql.js release from the CDN fallback', async () => {
+    it('loads the patched sql.js release from self-hosted files', async () => {
         const importedUrls: string[] = [];
         let wasmUrl = '';
 
@@ -178,11 +182,11 @@ describe('web demo view worker', () => {
         });
 
         assert.deepStrictEqual(importedUrls, [
-            'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.14.1/sql-wasm.js'
+            './sql-wasm.js'
         ]);
         assert.strictEqual(
             wasmUrl,
-            'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.14.1/sql-wasm.wasm'
+            './sql-wasm.wasm'
         );
     });
 
@@ -1664,26 +1668,77 @@ describe('web demo view worker', () => {
         );
     });
 
-    it('bounds preview stepping with the configured query timeout', async () => {
-        let now = 0;
+    it('interrupts a long-running preview before its first row is produced', async () => {
         const worker = await createWorkerHarness({
-            queryTimeout: 5,
-            now: () => {
-                now += 10;
-                return now;
-            }
+            queryTimeout: 20
         });
+        const startedAt = performance.now();
 
         await assert.rejects(
             worker.invoke(
                 'previewViewDefinition',
                 'slow_preview',
-                'SELECT 1 AS value',
+                'WITH RECURSIVE counter(value) AS (' +
+                'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+                ') SELECT sum(value) AS value FROM counter',
                 10,
                 'create'
             ),
-            /Query execution timed out after 5ms/
+            /Query execution timed out after 20ms/
         );
+        assert.ok(
+            performance.now() - startedAt < 500,
+            'demo preview completed before timeout rejection instead of being interrupted'
+        );
+    });
+
+    it('interrupts a long-running ad hoc query at the configured deadline', async () => {
+        const worker = await createWorkerHarness({ queryTimeout: 20 });
+        const startedAt = performance.now();
+
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                'WITH RECURSIVE counter(value) AS (' +
+                'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+                ') SELECT sum(value) FROM counter'
+            ),
+            /Query execution timed out after 20ms/
+        );
+        assert.ok(performance.now() - startedAt < 500);
+    });
+
+    it('preempts a running query through a shared cancellation flag', async () => {
+        const worker = await createWorkerHarness({ queryTimeout: 200 });
+        const cancellationFlag = new Int32Array(
+            new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)
+        );
+        const flagSetter = new NodeWorker(
+            `const { parentPort, workerData } = require('node:worker_threads');
+             setTimeout(() => {
+               Atomics.store(workerData, 0, 1);
+               parentPort.postMessage('cancelled');
+             }, 20);`,
+            { eval: true, workerData: cancellationFlag }
+        );
+        const startedAt = performance.now();
+
+        try {
+            await assert.rejects(
+                worker.invoke(
+                    'runQuery',
+                    'WITH RECURSIVE counter(value) AS (' +
+                    'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+                    ') SELECT sum(value) FROM counter',
+                    [],
+                    cancellationFlag
+                ),
+                /Query execution cancelled/
+            );
+            assert.ok(performance.now() - startedAt < 150);
+        } finally {
+            await flagSetter.terminate();
+        }
     });
 
     it('drops a view whose stored SQL cannot be extracted for editing', async () => {

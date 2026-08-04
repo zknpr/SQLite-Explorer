@@ -4,12 +4,12 @@ import { performance } from 'perf_hooks';
 
 async function runBenchmark() {
     // We need to pass the wasm binary to createDatabaseEngine
-    const wasmPath = './node_modules/sql.js/dist/sql-wasm.wasm';
+    const wasmPath = './vendor/sql.js/sql-wasm.wasm';
     let wasmBinary: Buffer;
     try {
         wasmBinary = fs.readFileSync(wasmPath);
     } catch (e) {
-        console.error("Could not read wasm binary. Please ensure sql.js is installed.");
+        console.error("Could not read the vendored sql.js WASM binary.");
         process.exit(1);
     }
 

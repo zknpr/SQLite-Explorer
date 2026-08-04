@@ -47,6 +47,7 @@ import { Worker } from './platform/threadPool';
 import type { DatabaseConnectionBundle } from './connectionTypes';
 import { getMaximumFileSizeBytes, getQueryTimeout } from './config';
 import { createWorkerEndpoint } from './core/sqlite-db';
+import { createSharedCancellationFlag } from './core/cancellation-utils';
 
 // Native worker support (only in Node.js environment)
 let nativeSupport: {
@@ -72,15 +73,20 @@ if (!import.meta.env?.VSCODE_BROWSER_EXT) {
  * Methods exposed by the database worker.
  *
  * Keep every parameter structured-cloneable. AbortSignal is deliberately not
- * part of this RPC contract: worker_threads clones it into a plain object, so
- * cancellation is checked in the host facade before dispatch instead.
+ * part of this RPC contract: worker_threads clones it into a plain object.
+ * Bounded query paths mirror it into a probed shared flag; other cancellable
+ * operations retain their existing host-side pre-dispatch check.
  */
 interface WorkerMethods {
   initializeDatabase(
     filename: string,
     config: DatabaseInitConfig
   ): Promise<DatabaseInitResult>;
-  runQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]>;
+  runQuery(
+    sql: string,
+    params?: CellValue[],
+    cancellationFlag?: Int32Array
+  ): Promise<QueryResultSet[]>;
   exportDatabase(): Promise<Uint8Array>;
   applyModifications(mods: ModificationEntry[]): Promise<void>;
   undoModification(mod: ModificationEntry): Promise<void>;
@@ -104,7 +110,8 @@ interface WorkerMethods {
     view: string,
     selectSql: string,
     limit?: number,
-    intent?: ViewDefinitionIntent
+    intent?: ViewDefinitionIntent,
+    cancellationFlag?: Int32Array
   ): Promise<QueryResultSet>;
   createView(view: string, selectSql: string): Promise<ViewDefinition>;
   editView(
@@ -190,6 +197,25 @@ function forwardWorkerLog(level: WorkerLogLevel, args: unknown[]): void {
     GlobalOutputChannel.appendLine(`[Worker/${level}] ${text}`);
   } else {
     console[level]('[Worker]', ...args);
+  }
+}
+
+/** Keep AbortSignal host-local while exposing its state to synchronous worker code. */
+async function callWorkerWithCancellation<T>(
+  signal: AbortSignal,
+  call: (cancellationFlag?: Int32Array) => Promise<T>
+): Promise<T> {
+  signal.throwIfAborted();
+  const sharedCancellation = createSharedCancellationFlag(signal);
+  try {
+    const result = await call(sharedCancellation?.flag);
+    signal.throwIfAborted();
+    return result;
+  } catch (error) {
+    if (signal.aborted) signal.throwIfAborted();
+    throw error;
+  } finally {
+    sharedCancellation?.dispose();
   }
 }
 
@@ -405,8 +431,8 @@ async function createInProcessWasmDatabaseConnection(
 
       const operationsFacade: DatabaseOperations = {
         engineKind: Promise.resolve('wasm'),
-        executeQuery: (sql: string, params?: CellValue[]) =>
-          endpoint.runQuery(sql, params),
+        executeQuery: (sql: string, params?: CellValue[], signal?: AbortSignal) =>
+          endpoint.runQuery(sql, params, signal),
         serializeDatabase: () => endpoint.exportDatabase(),
         applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
           endpoint.applyModifications(mods, signal),
@@ -445,8 +471,9 @@ async function createInProcessWasmDatabaseConnection(
           view: string,
           selectSql: string,
           limit?: number,
-          intent?: ViewDefinitionIntent
-        ) => endpoint.previewViewDefinition(view, selectSql, limit, intent),
+          intent?: ViewDefinitionIntent,
+          signal?: AbortSignal
+        ) => endpoint.previewViewDefinition(view, selectSql, limit, intent, signal),
         createView: (view: string, selectSql: string) =>
           endpoint.createView(view, selectSql),
         editView: (
@@ -635,9 +662,8 @@ async function createWorkerBackedWasmDatabaseConnection(
         };
 
         // AbortSignal cannot cross worker_threads RPC without losing its
-        // prototype. Preserve cancellation that was already requested, but do
-        // not serialize the signal. Mid-operation cancellation will require a
-        // dedicated cancel message and worker-local AbortController.
+        // prototype. Mutation replays retain their existing pre-dispatch check;
+        // bounded queries use callWorkerWithCancellation's shared flag instead.
         const callWorkerAfterAbortCheck = async <T>(
           signal: AbortSignal | undefined,
           call: () => Promise<T>
@@ -648,8 +674,14 @@ async function createWorkerBackedWasmDatabaseConnection(
 
         const operationsFacade: DatabaseOperations = {
           engineKind: Promise.resolve('wasm'),
-          executeQuery: (sql: string, params?: CellValue[]) =>
-            workerProxy.runQuery(sql, params),
+          executeQuery: (sql: string, params?: CellValue[], signal?: AbortSignal) => (
+            signal
+              ? callWorkerWithCancellation(
+                  signal,
+                  cancellationFlag => workerProxy.runQuery(sql, params, cancellationFlag)
+                )
+              : workerProxy.runQuery(sql, params)
+          ),
           serializeDatabase: () => workerProxy.exportDatabase(),
           applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
             callWorkerAfterAbortCheck(signal, () => workerProxy.applyModifications(mods)),
@@ -694,8 +726,22 @@ async function createWorkerBackedWasmDatabaseConnection(
             view: string,
             selectSql: string,
             limit?: number,
-            intent?: ViewDefinitionIntent
-          ) => workerProxy.previewViewDefinition(view, selectSql, limit, intent),
+            intent?: ViewDefinitionIntent,
+            signal?: AbortSignal
+          ) => (
+            signal
+              ? callWorkerWithCancellation(
+                  signal,
+                  cancellationFlag => workerProxy.previewViewDefinition(
+                    view,
+                    selectSql,
+                    limit,
+                    intent,
+                    cancellationFlag
+                  )
+                )
+              : workerProxy.previewViewDefinition(view, selectSql, limit, intent)
+          ),
           createView: (view: string, selectSql: string) =>
             workerProxy.createView(view, selectSql),
           editView: (

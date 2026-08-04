@@ -6,7 +6,7 @@
  * using the same RPC protocol as the VS Code extension.
  *
  * Architecture:
- * - Loads sql.js from CDN (sql-wasm.js + sql-wasm.wasm)
+ * - Loads the repository-pinned sql.js fork from self-hosted public assets
  * - Handles RPC messages for database operations
  * - All SQL execution happens in this worker
  */
@@ -57,11 +57,10 @@ import {
 // Configuration
 // ============================================================================
 
-/** Package-aligned sql.js CDN base shared by the loader and WASM resolver. */
-const SQL_JS_VERSION = '1.14.1';
-const SQL_JS_CDN_BASE = `https://cdnjs.cloudflare.com/ajax/libs/sql.js/${SQL_JS_VERSION}`;
-const SQL_JS_CDN = `${SQL_JS_CDN_BASE}/sql-wasm.js`;
+const SQL_JS_GLUE_URL = './sql-wasm.js';
+const SQL_JS_WASM_URL = './sql-wasm.wasm';
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+const PROGRESS_HANDLER_INTERVAL = 1000;
 
 // ============================================================================
 // State
@@ -86,14 +85,14 @@ let readOnlyMode = false;
 // ============================================================================
 
 /**
- * Load sql.js from CDN using importScripts.
+ * Load the self-hosted sql.js glue using importScripts.
  * This populates the global `initSqlJs` function.
  */
 async function loadSqlJs() {
   if (SQL) return SQL;
 
   // Import the sql.js script
-  importScripts(SQL_JS_CDN);
+  importScripts(SQL_JS_GLUE_URL);
 
   // Initialize sql.js with WASM binary
   // The WASM file will be provided via initializeDatabase call
@@ -211,31 +210,69 @@ function compileSingleStatement(sql) {
   statement.free();
 }
 
-function querySingleStatement(sql) {
-  const sourceStatement = prepareSingleStatement(sql);
-  const headers = sourceStatement.getColumnNames();
-  sourceStatement.free();
-  const transportQuery = buildExactNumericTextQuery(sql, headers.length);
-  const statement = prepareSingleStatement(transportQuery.sql);
-  const sourceRows = [];
-  const startedAt = Date.now();
-  try {
-    while (true) {
-      const hasRow = statement.step();
-      if (Date.now() - startedAt > queryTimeout) {
-        throw new Error(`Query execution timed out after ${queryTimeout}ms`);
-      }
-      if (!hasRow) break;
-      sourceRows.push(statement.get(null, { useBigInt: true }));
-    }
-    const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
-      sourceRows,
-      transportQuery.valueColumnCount
-    );
-    return { headers, rows, exactIntegerTexts };
-  } finally {
-    statement.free();
+function executeWithProgressHandler(operation, cancellationFlag) {
+  if (cancellationFlag !== undefined) {
+    const hasSharedBuffer = typeof SharedArrayBuffer === 'function' &&
+      cancellationFlag instanceof Int32Array &&
+      cancellationFlag.length > 0 &&
+      cancellationFlag.buffer instanceof SharedArrayBuffer;
+    if (!hasSharedBuffer) throw new Error('Invalid query cancellation flag');
   }
+  const isCancelled = () => cancellationFlag !== undefined &&
+    Atomics.load(cancellationFlag, 0) !== 0;
+  const throwCancellation = () => {
+    const error = new Error('Query execution cancelled');
+    error.name = 'AbortError';
+    throw error;
+  };
+  if (isCancelled()) throwCancellation();
+
+  const deadline = Date.now() + queryTimeout;
+  let termination;
+  db.progress_handler(PROGRESS_HANDLER_INTERVAL, () => {
+    if (isCancelled()) {
+      termination = 'cancelled';
+      return true;
+    }
+    if (Date.now() < deadline) return false;
+    termination = 'timeout';
+    return true;
+  });
+
+  try {
+    return operation();
+  } catch (error) {
+    if (termination === 'timeout') {
+      throw new Error(`Query execution timed out after ${queryTimeout}ms`);
+    }
+    if (termination === 'cancelled' || isCancelled()) throwCancellation();
+    throw error;
+  } finally {
+    db.progress_handler(null);
+  }
+}
+
+function querySingleStatement(sql, cancellationFlag) {
+  return executeWithProgressHandler(() => {
+    const sourceStatement = prepareSingleStatement(sql);
+    const headers = sourceStatement.getColumnNames();
+    sourceStatement.free();
+    const transportQuery = buildExactNumericTextQuery(sql, headers.length);
+    const statement = prepareSingleStatement(transportQuery.sql);
+    const sourceRows = [];
+    try {
+      while (statement.step()) {
+        sourceRows.push(statement.get(null, { useBigInt: true }));
+      }
+      const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+        sourceRows,
+        transportQuery.valueColumnCount
+      );
+      return { headers, rows, exactIntegerTexts };
+    } finally {
+      statement.free();
+    }
+  }, cancellationFlag);
 }
 
 function resolveGlobalFilterColumns(columns, globalFilterColumns) {
@@ -285,15 +322,14 @@ async function initializeDatabase(filename, config) {
   // Initialize sql.js with WASM
   if (!SQL) {
     // Load sql.js script
-    importScripts(SQL_JS_CDN);
+    importScripts(SQL_JS_GLUE_URL);
 
     // Initialize with WASM binary if provided
     const sqlConfig = {};
     if (config.wasmBinary) {
       sqlConfig.wasmBinary = config.wasmBinary;
     } else {
-      // Default to CDN WASM
-      sqlConfig.locateFile = (file) => `${SQL_JS_CDN_BASE}/${file}`;
+      sqlConfig.locateFile = () => SQL_JS_WASM_URL;
     }
 
     SQL = await self.initSqlJs(sqlConfig);
@@ -326,7 +362,7 @@ async function initializeDatabase(filename, config) {
  * @param {Array} [params] - Bound parameters
  * @returns {Promise<Array>} Array of result sets
  */
-async function runQuery(sql, params = []) {
+async function runQuery(sql, params = [], cancellationFlag) {
   if (!db) throw new Error('No database initialized');
   if (readOnlyMode) {
     // This low-level test/debug RPC accepts arbitrary SQL, so there is no safe
@@ -335,7 +371,10 @@ async function runQuery(sql, params = []) {
   }
 
   try {
-    const results = db.exec(sql, params);
+    const results = executeWithProgressHandler(
+      () => db.exec(sql, params),
+      cancellationFlag
+    );
 
     // Convert to our result format
     return results.map(result => ({
@@ -1310,7 +1349,13 @@ async function validateViewDefinition(view, selectSql, intent = 'edit') {
   }
 }
 
-async function previewViewDefinition(view, selectSql, limit = 50, intent = 'edit') {
+async function previewViewDefinition(
+  view,
+  selectSql,
+  limit = 50,
+  intent = 'edit',
+  cancellationFlag
+) {
   if (!db) throw new Error('No database initialized');
   const body = normalizeViewSelectSql(selectSql);
   const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
@@ -1325,12 +1370,14 @@ async function previewViewDefinition(view, selectSql, limit = 50, intent = 'edit
     if (columnListSql) {
       return querySingleStatement(
         `WITH ${previewSource} ${columnListSql} AS (${body}\n) ` +
-        `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`
+        `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`,
+        cancellationFlag
       );
     }
     return querySingleStatement(
       `WITH ${previewSource} AS (${body}\n) ` +
-      `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`
+      `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`,
+      cancellationFlag
     );
   }
 
@@ -1343,7 +1390,8 @@ async function previewViewDefinition(view, selectSql, limit = 50, intent = 'edit
     runSingleStatement(buildCreateViewSql(view, body, columnListSql));
     compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
     const result = querySingleStatement(
-      `SELECT * FROM ${escapeMainViewIdentifier(view)} LIMIT ${boundedLimit}`
+      `SELECT * FROM ${escapeMainViewIdentifier(view)} LIMIT ${boundedLimit}`,
+      cancellationFlag
     );
     runSingleStatement(`ROLLBACK TO ${savepointName}`);
     runSingleStatement(`RELEASE ${savepointName}`);
