@@ -88,6 +88,9 @@ const SQL_JS_GLUE_URL = './sql-wasm.js';
 const SQL_JS_WASM_URL = './sql-wasm.wasm';
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 const PROGRESS_HANDLER_INTERVAL = 1000;
+const WEB_DEMO_EXPORT_MAX_BYTES = 16 * 1024 * 1024;
+const WEB_DEMO_EXPORT_CHUNK_CHARS = 64 * 1024;
+const WEB_DEMO_EXPORT_LIMIT_DESCRIPTION = '16 MiB (16,777,216 bytes)';
 // RPC payloads cannot forge this Symbol; only in-worker history restoration
 // may bypass the new-value policy for a value that already existed.
 const HISTORY_REPLAY_EDIT_TOKEN = Symbol('history-replay-edit');
@@ -646,14 +649,18 @@ async function exportDatabase(_name) {
 
 /**
  * Export a table to various formats (CSV, JSON, SQL).
- * For web demo, returns the data which the parent page will download.
+ * The worker RPC is request/response only: it cannot progressively transfer a
+ * download. Keep the honest bounded fallback explicit by refusing a worst-case
+ * source/output estimate above 16 MiB, then return small assembly chunks rather
+ * than one monolithic string. The desktop extension owns genuinely streamed
+ * exports.
  *
  * @param {Object} dbParams - Database parameters with 'table' property
  * @param {Array<string>} columns - Columns to export
  * @param {Object} _dbOptions - Database options (unused)
  * @param {Object} _tableStore - Table store (unused)
  * @param {Object} exportOptions - Export options including 'format'
- * @returns {Promise<Object>} Export result with content and filename
+ * @returns {Promise<Object>} Export result with contentChunks and filename
  */
 async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOptions = {}) {
   if (!db) throw new Error('No database initialized');
@@ -662,6 +669,9 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
   if (!table) throw new Error('No table specified');
 
   const { format = 'csv', header = true, includeTableName = true, rowIds = null } = exportOptions;
+  if (!['csv', 'json', 'sql', 'excel'].includes(format)) {
+    throw new Error(`Unsupported export format: ${format}`);
+  }
   // Build column list
   const columnList = columns && columns.length > 0
     ? columns.map(escapeIdentifier).join(', ')
@@ -669,6 +679,7 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
 
   // Build query
   let sql = `SELECT ${columnList} FROM ${escapeIdentifier(table)}`;
+  let whereSql = '';
   let params = [];
 
   // Filter by rowIds if specified
@@ -678,53 +689,169 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
       throw new Error('Cannot mix rowid and primary-key row identities');
     }
     const predicate = buildRecordIdentitiesPredicate(rowIds, identity);
-    sql += ` WHERE ${predicate.sql}`;
+    whereSql = ` WHERE ${predicate.sql}`;
+    sql += whereSql;
     params = predicate.params;
   }
+
+  const selectedColumns = columns && columns.length > 0
+    ? columns
+    : getExportProjectionColumns(table);
+  assertWebDemoExportWithinLimit(table, selectedColumns, whereSql, params);
 
   const results = db.exec(sql, params);
 
   if (results.length === 0) {
-    return { content: '', filename: `${table}.${format}`, mimeType: 'text/plain' };
+    return { contentChunks: [], filename: `${table}.${format}`, mimeType: 'text/plain' };
   }
 
   const headers = results[0].columns;
   const rows = results[0].values;
 
-  let content = '';
+  const output = new WebDemoExportChunkCollector();
   let mimeType = 'text/plain';
   let filename = `${table}.${format}`;
 
   switch (format) {
     case 'csv':
-      content = exportToCsv(headers, rows, header);
+      exportToCsv(headers, rows, header, output);
       mimeType = 'text/csv';
       break;
     case 'json':
-      content = exportToJson(headers, rows);
+      exportToJson(headers, rows, output);
       mimeType = 'application/json';
       break;
     case 'sql':
-      content = exportToSql(table, headers, rows, includeTableName);
+      exportToSql(table, headers, rows, includeTableName, output);
       mimeType = 'text/sql';
       break;
     case 'excel':
       // For Excel, just use CSV format (Excel can open CSV)
-      content = exportToCsv(headers, rows, header);
+      exportToCsv(headers, rows, header, output);
       mimeType = 'text/csv';
       filename = `${table}.csv`;
       break;
-    default:
-      throw new Error(`Unsupported export format: ${format}`);
   }
 
-  return { content, filename, mimeType };
+  return { contentChunks: output.finish(), filename, mimeType };
+}
+
+function webDemoExportLimitError() {
+  return new Error(
+    `Web demo exports are limited to ${WEB_DEMO_EXPORT_LIMIT_DESCRIPTION} because ` +
+    'the worker RPC cannot stream downloads; use the desktop extension for larger exports.'
+  );
+}
+
+function getExportProjectionColumns(table) {
+  const statement = db.prepare(`SELECT * FROM ${escapeIdentifier(table)} LIMIT 0`);
+  try {
+    return statement.getColumnNames();
+  } finally {
+    statement.free();
+  }
+}
+
+function assertWebDemoExportWithinLimit(table, columns, whereSql, params) {
+  const estimateCells = columns.map(column => {
+    const identifier = escapeIdentifier(column);
+    return `CASE typeof(${identifier}) ` +
+      `WHEN 'text' THEN length(CAST(${identifier} AS BLOB)) * 6 + 64 ` +
+      `WHEN 'blob' THEN length(${identifier}) + 64 ELSE 64 END`;
+  }).join(' + ') || '0';
+  const result = db.exec(
+    `SELECT COUNT(*), COALESCE(SUM(${estimateCells}), 0) ` +
+    `FROM ${escapeIdentifier(table)}${whereSql}`,
+    params
+  );
+  const row = result[0]?.values?.[0] ?? [0, 0];
+  const rowCount = Number(row[0]);
+  const estimatedBytes = Number(row[1]) + rowCount * 128 + 1024;
+  if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes > WEB_DEMO_EXPORT_MAX_BYTES) {
+    throw webDemoExportLimitError();
+  }
+}
+
+function utf8ByteLength(value) {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        bytes += 4;
+        index++;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+class WebDemoExportChunkCollector {
+  constructor() {
+    this.chunks = [];
+    this.pending = '';
+    this.outputBytes = 0;
+  }
+
+  append(value) {
+    this.outputBytes += utf8ByteLength(value);
+    if (!Number.isSafeInteger(this.outputBytes) || this.outputBytes > WEB_DEMO_EXPORT_MAX_BYTES) {
+      throw webDemoExportLimitError();
+    }
+
+    let offset = 0;
+    while (offset < value.length) {
+      let take = Math.min(
+        WEB_DEMO_EXPORT_CHUNK_CHARS - this.pending.length,
+        value.length - offset
+      );
+      const boundary = offset + take;
+      if (
+        boundary < value.length &&
+        take > 0 &&
+        value.charCodeAt(boundary - 1) >= 0xd800 &&
+        value.charCodeAt(boundary - 1) <= 0xdbff &&
+        value.charCodeAt(boundary) >= 0xdc00 &&
+        value.charCodeAt(boundary) <= 0xdfff
+      ) {
+        take--;
+      }
+      if (take === 0) {
+        this.flush();
+        continue;
+      }
+      this.pending += value.slice(offset, offset + take);
+      offset += take;
+      if (this.pending.length >= WEB_DEMO_EXPORT_CHUNK_CHARS) this.flush();
+    }
+  }
+
+  flush() {
+    if (this.pending.length > 0) {
+      this.chunks.push(this.pending);
+      this.pending = '';
+    }
+  }
+
+  finish() {
+    this.flush();
+    return this.chunks;
+  }
 }
 
 /**
  * Convert data to CSV format.
  */
-function exportToCsv(headers, rows, includeHeader) {
+function exportToCsv(headers, rows, includeHeader, output) {
   const escapeCell = (val) => {
     if (val === null || val === undefined) return '';
     if (val instanceof Uint8Array) return '[BLOB]';
@@ -736,21 +863,27 @@ function exportToCsv(headers, rows, includeHeader) {
     return str;
   };
 
-  const lines = [];
+  let wroteLine = false;
+  const writeLine = cells => {
+    if (wroteLine) output.append('\n');
+    output.append(cells.map(escapeCell).join(','));
+    wroteLine = true;
+  };
   if (includeHeader) {
-    lines.push(headers.map(escapeCell).join(','));
+    writeLine(headers);
   }
   for (const row of rows) {
-    lines.push(row.map(escapeCell).join(','));
+    writeLine(row);
   }
-  return lines.join('\n');
 }
 
 /**
  * Convert data to JSON format.
  */
-function exportToJson(headers, rows) {
-  const data = rows.map(row => {
+function exportToJson(headers, rows, output) {
+  output.append('[');
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+    const row = rows[rowIndex];
     const obj = {};
     for (let i = 0; i < headers.length; i++) {
       let val = row[i];
@@ -759,15 +892,16 @@ function exportToJson(headers, rows) {
       }
       obj[headers[i]] = val;
     }
-    return obj;
-  });
-  return JSON.stringify(data, null, 2);
+    output.append(rowIndex === 0 ? '\n' : ',\n');
+    output.append(JSON.stringify(obj, null, 2).replace(/^/gm, '  '));
+  }
+  output.append(rows.length === 0 ? ']' : '\n]');
 }
 
 /**
  * Convert data to SQL INSERT statements.
  */
-function exportToSql(table, headers, rows, includeTableName) {
+function exportToSql(table, headers, rows, includeTableName, output) {
   const tableName = includeTableName ? `"${table.replace(/"/g, '""')}"` : '"table_name"';
   const columnList = headers.map(h => `"${h.replace(/"/g, '""')}"`).join(', ');
 
@@ -778,12 +912,11 @@ function exportToSql(table, headers, rows, includeTableName) {
     return `'${String(val).replace(/'/g, "''")}'`;
   };
 
-  const statements = rows.map(row => {
+  rows.forEach((row, rowIndex) => {
     const values = row.map(escapeValue).join(', ');
-    return `INSERT INTO ${tableName} (${columnList}) VALUES (${values});`;
+    if (rowIndex > 0) output.append('\n');
+    output.append(`INSERT INTO ${tableName} (${columnList}) VALUES (${values});`);
   });
-
-  return statements.join('\n');
 }
 
 async function findTableIdentity(table) {

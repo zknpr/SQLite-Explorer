@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
+import { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import * as vscode from 'vscode';
 
@@ -536,13 +537,17 @@ async function probeCellSaveUndo(options: ProbeOptions): Promise<Record<string, 
   }
 }
 
-async function probeExportJson(options: ProbeOptions): Promise<Record<string, unknown>> {
+async function probeExport(
+  options: ProbeOptions,
+  format: 'json' | 'sql'
+): Promise<Record<string, unknown>> {
   const before = memorySnapshot();
   const startedAt = performance.now();
   return withNative(options.fixture, true, async operations => {
     const require = createRequire(import.meta.url);
     const nodeFs = require('node:fs') as typeof import('node:fs');
     const originalCreateWriteStream = nodeFs.createWriteStream;
+    const originalRename = nodeFs.promises.rename;
     const originalShowSaveDialog = (vscode.window as any).showSaveDialog;
     const originalShowInformationMessage = (vscode.window as any).showInformationMessage;
     const originalShowErrorMessage = (vscode.window as any).showErrorMessage;
@@ -550,6 +555,11 @@ async function probeExportJson(options: ProbeOptions): Promise<Record<string, un
     const documentUri = vscode.Uri.file(options.fixture);
     let largestWriteChars = 0;
     let totalWriteChars = 0;
+    let outputPrefix = '';
+    let outputSuffix = '';
+    let streamClosed = false;
+    let renameObserved = false;
+    let renameAfterClose = false;
     let exportError = '';
 
     DocumentRegistry.set(documentKey, {
@@ -557,16 +567,27 @@ async function probeExportJson(options: ProbeOptions): Promise<Record<string, un
       databaseOperations: operations
     } as any);
     try {
-      (nodeFs as any).createWriteStream = () => ({
-        write(chunk: string) {
-          largestWriteChars = Math.max(largestWriteChars, chunk.length);
-          totalWriteChars += chunk.length;
-          return true;
-        },
-        end() {}
-      });
+      (nodeFs as any).createWriteStream = () => {
+        const sink = new Writable({
+          decodeStrings: false,
+          write(chunk: string | Buffer, _encoding, callback) {
+            const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+            largestWriteChars = Math.max(largestWriteChars, text.length);
+            totalWriteChars += text.length;
+            outputPrefix = (outputPrefix + text).slice(0, 256);
+            outputSuffix = (outputSuffix + text).slice(-256);
+            callback();
+          }
+        });
+        sink.once('close', () => { streamClosed = true; });
+        return sink;
+      };
+      (nodeFs.promises as any).rename = async () => {
+        renameObserved = true;
+        renameAfterClose = streamClosed;
+      };
       (vscode.window as any).showSaveDialog = async () => vscode.Uri.file(
-        path.join(options.scratchRoot, 'large-cell-export.json')
+        path.join(options.scratchRoot, `large-cell-export.${format}`)
       );
       (vscode.window as any).showInformationMessage = async () => undefined;
       (vscode.window as any).showErrorMessage = async (message: string) => {
@@ -581,27 +602,43 @@ async function probeExportJson(options: ProbeOptions): Promise<Record<string, un
         ['payload'],
         undefined,
         undefined,
-        { format: 'json', rowIds: [1] }
+        { format, rowIds: [1] }
       );
 
       if (exportError) throw new Error(exportError);
+      const after = memorySnapshot();
       return {
         mode: options.mode,
+        format,
         rawCellBytes: options.sizeBytes,
         largestWriteChars,
         totalWriteChars,
+        outputPrefix,
+        outputSuffix,
+        renameObserved,
+        renameAfterClose,
+        maxRssBytes: after.maxRssBytes,
         elapsedMs: performance.now() - startedAt,
         memoryBefore: before,
-        memoryAfter: memorySnapshot()
+        memoryAfter: after
       };
     } finally {
       (nodeFs as any).createWriteStream = originalCreateWriteStream;
+      (nodeFs.promises as any).rename = originalRename;
       (vscode.window as any).showSaveDialog = originalShowSaveDialog;
       (vscode.window as any).showInformationMessage = originalShowInformationMessage;
       (vscode.window as any).showErrorMessage = originalShowErrorMessage;
       DocumentRegistry.delete(documentKey);
     }
   });
+}
+
+async function probeExportJson(options: ProbeOptions): Promise<Record<string, unknown>> {
+  return probeExport(options, 'json');
+}
+
+async function probeExportSql(options: ProbeOptions): Promise<Record<string, unknown>> {
+  return probeExport(options, 'sql');
 }
 
 async function probeWebDemoResponse(options: ProbeOptions): Promise<Record<string, unknown>> {
@@ -668,6 +705,7 @@ async function main(): Promise<void> {
     'vfs-read': probeVfsRead,
     'cell-save-undo': probeCellSaveUndo,
     'export-json': probeExportJson,
+    'export-sql': probeExportSql,
     'web-demo-response': probeWebDemoResponse
   };
   const handler = handlers[options.mode];

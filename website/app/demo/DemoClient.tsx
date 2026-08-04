@@ -325,9 +325,13 @@ export default function DemoClient() {
       if (targetMethod === 'exportTable') {
         callWorker(targetMethod, deserializedPayload)
           .then((result) => {
-            const exportResult = result as { content: string; filename: string; mimeType: string };
-            // Trigger download
-            const blob = new Blob([exportResult.content], { type: exportResult.mimeType });
+            const exportResult = result as {
+              contentChunks: string[];
+              filename: string;
+              mimeType: string;
+            };
+            // This is bounded chunk assembly, not progressive worker streaming.
+            const blob = new Blob(exportResult.contentChunks, { type: exportResult.mimeType });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;

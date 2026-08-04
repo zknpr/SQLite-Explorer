@@ -23,6 +23,7 @@ const MAX_GRID_RESPONSE_CHARS = 2 * MIB;
 const MAX_GRID_PROBE_RSS_BYTES = 384 * MIB;
 const MAX_STAGE_B_SURFACE_RSS_BYTES = 384 * MIB;
 const MAX_STAGE_D_EDIT_RSS_BYTES = 384 * MIB;
+const MAX_STAGE_E_EXPORT_RSS_BYTES = 384 * MIB;
 const MAX_INSPECTOR_PREVIEW_BYTES = 64 * 1024;
 const MAX_SINGLE_OUTPUT_CHUNK = MIB;
 const READ_WINDOW_BYTES = 64 * 1024;
@@ -168,17 +169,6 @@ function diagnose(t: TestContext, result: ProbeResult): void {
   t.diagnostic(JSON.stringify(result));
 }
 
-function knownFailure(
-  name: string,
-  reason: string,
-  body: (t: TestContext) => Promise<void>
-): void {
-  const options = RUN_LARGE_CELL_TESTS
-    ? { todo: reason, timeout: 300_000 }
-    : { skip: `set SQLITE_EXPLORER_RUN_LARGE_CELL_TESTS=1 to run the ${SIZE_MIB} MiB probes` };
-  test(name, options, body);
-}
-
 function stageCTest(
   name: string,
   body: (t: TestContext) => Promise<void>
@@ -191,6 +181,17 @@ function stageCTest(
 }
 
 function stageDTest(
+  name: string,
+  body: (t: TestContext) => Promise<void>
+): void {
+  test(name, {
+    skip: !RUN_LARGE_CELL_TESTS
+      && `set SQLITE_EXPLORER_RUN_LARGE_CELL_TESTS=1 to run the ${SIZE_MIB} MiB probes`,
+    timeout: 300_000
+  }, body);
+}
+
+function stageETest(
   name: string,
   body: (t: TestContext) => Promise<void>
 ): void {
@@ -361,16 +362,37 @@ describe('very large single-cell behavior (opt-in)', () => {
     }
   );
 
-  knownFailure(
-    'streaming JSON export never writes a cell-sized formatted chunk',
-    'table export batches rows but still materializes and formats each complete cell',
-    async t => {
-      const result = await runProbe('export-json', { kind: 'blob', heapMib: 2048 });
-      diagnose(t, result);
-      assert.equal(result.failureStage, undefined);
-      assert.ok(Number(result.largestWriteChars) <= MAX_SINGLE_OUTPUT_CHUNK);
-    }
-  );
+  for (const format of ['json', 'sql'] as const) {
+    stageETest(
+      `streaming ${format.toUpperCase()} export keeps a ${SIZE_MIB} MiB BLOB and RSS bounded`,
+      async t => {
+        const result = await runProbe(`export-${format}`, {
+          kind: 'blob',
+          heapMib: 768,
+          timeoutMs: 300_000
+        });
+        diagnose(t, result);
+        assert.equal(result.failureStage, undefined);
+        assert.equal(result.format, format);
+        assert.equal(result.rawCellBytes, EXPECTED_CELL_BYTES);
+        assert.ok(Number(result.totalWriteChars) > EXPECTED_CELL_BYTES);
+        assert.ok(Number(result.largestWriteChars) <= MAX_SINGLE_OUTPUT_CHUNK);
+        assert.equal(result.renameObserved, true);
+        assert.equal(result.renameAfterClose, true);
+        assert.ok(Number(result.maxRssBytes) <= MAX_STAGE_E_EXPORT_RSS_BYTES);
+        if (format === 'json') {
+          assert.match(String(result.outputPrefix), /^\[\n  \{\n    "payload": "/);
+          assert.match(String(result.outputSuffix), /"\n  \}\n\]$/);
+        } else {
+          assert.match(
+            String(result.outputPrefix),
+            /^INSERT INTO "large_cells" \("payload"\) VALUES \(X'/
+          );
+          assert.match(String(result.outputSuffix), /'\);$/);
+        }
+      }
+    );
+  }
 
   stageCTest(
     'web demo rejects a raw oversized worker BLOB before forwarding it to the iframe',

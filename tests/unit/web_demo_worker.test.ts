@@ -177,6 +177,120 @@ async function workerScalar(worker: WorkerHarness, sql: string): Promise<unknown
 }
 
 describe('web demo view worker', () => {
+    it('returns bounded exports as chunks while preserving CSV, JSON, and SQL bytes', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_stage_e_export (id INTEGER, note TEXT, payload BLOB)'
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_stage_e_export VALUES (?, ?, ?), (?, ?, ?)',
+            [
+                1,
+                'comma, "quote"\nline',
+                new Uint8Array([1, 2, 3]),
+                2,
+                null,
+                new Uint8Array()
+            ]
+        );
+        const invokeExport = (format: string, options: Record<string, unknown> = {}) => worker.invoke(
+            'exportTable',
+            { table: 'demo_stage_e_export' },
+            ['id', 'note', 'payload'],
+            {},
+            {},
+            { format, ...options }
+        );
+
+        const csv = await invokeExport('csv');
+        assert.strictEqual('content' in csv, false);
+        assert.ok(Array.isArray(csv.contentChunks));
+        assert.strictEqual(
+            Array.from(csv.contentChunks).join(''),
+            'id,note,payload\n' +
+            '1,"comma, ""quote""\nline",[BLOB]\n' +
+            '2,,[BLOB]'
+        );
+
+        const json = await invokeExport('json');
+        assert.strictEqual('content' in json, false);
+        assert.strictEqual(
+            Array.from(json.contentChunks).join(''),
+            JSON.stringify([
+                { id: 1, note: 'comma, "quote"\nline', payload: '[BLOB: 3 bytes]' },
+                { id: 2, note: null, payload: '[BLOB: 0 bytes]' }
+            ], null, 2)
+        );
+
+        const sql = await invokeExport('sql', { includeTableName: false });
+        assert.strictEqual('content' in sql, false);
+        assert.strictEqual(
+            Array.from(sql.contentChunks).join(''),
+            'INSERT INTO "table_name" ("id", "note", "payload") VALUES ' +
+            '(1, \'comma, "quote"\nline\', NULL);\n' +
+            'INSERT INTO "table_name" ("id", "note", "payload") VALUES (2, NULL, NULL);'
+        );
+    });
+
+    it('splits bounded web-demo output into assembly chunks instead of one response string', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_stage_e_chunks (value TEXT)');
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_stage_e_chunks VALUES (?)',
+            ['x'.repeat(160 * 1024)]
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_stage_e_chunks' },
+            ['value'],
+            {},
+            {},
+            { format: 'json' }
+        );
+
+        assert.strictEqual('content' in exported, false);
+        assert.ok(exported.contentChunks.length > 1);
+        assert.ok(Array.from(exported.contentChunks).every(
+            (chunk: unknown) => typeof chunk === 'string' && chunk.length <= 64 * 1024
+        ));
+        assert.strictEqual(
+            JSON.parse(Array.from(exported.contentChunks).join(''))[0].value.length,
+            160 * 1024
+        );
+    });
+
+    it('refuses oversized web-demo exports before fetching whole cell content', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (_kind, sql) => observedSql.push(sql)
+        });
+        await worker.invoke('runQuery', 'CREATE TABLE demo_stage_e_cap (payload BLOB)');
+        await worker.invoke(
+            'runQuery',
+            `INSERT INTO demo_stage_e_cap VALUES (zeroblob(${16 * 1024 * 1024 + 1}))`
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'exportTable',
+                { table: 'demo_stage_e_cap' },
+                ['payload'],
+                {},
+                {},
+                { format: 'json' }
+            ),
+            /limited to 16 MiB \(16,777,216 bytes\).*worker RPC cannot stream downloads/i
+        );
+        assert.ok(
+            observedSql.every(sql => !/^SELECT\s+"payload"\s+FROM\s+"demo_stage_e_cap"/i.test(sql)),
+            `oversized export fetched the whole cell: ${observedSql.join('\n')}`
+        );
+    });
+
     it('enforces typed new-value limits and guarded oversized replacement', async () => {
         const observedSql: string[] = [];
         const worker = await createWorkerHarness({

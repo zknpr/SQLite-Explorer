@@ -2,11 +2,690 @@
 import './vscode_mock_setup'; // Must be first
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { exportToJson, exportToCsv, exportToSql, exportTableCommand, getFormatHelper } from '../../src/tableExporter';
-import { CellValue } from '../../src/core/types';
+import * as fsPromises from 'node:fs/promises';
+import * as path from 'node:path';
+import {
+    exportToJson,
+    exportToCsv,
+    exportToSql,
+    exportTableCommand,
+    EXPORT_CELL_CHUNK_BYTES,
+    getFormatHelper,
+    streamTableExport
+} from '../../src/tableExporter';
+import { CellValue, DatabaseOperations, ExportOptions } from '../../src/core/types';
 import { mockVscode } from './mocks/vscode';
 import { DocumentRegistry } from '../../src/documentRegistry';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+
+async function collectStreamingExport(
+    operations: DatabaseOperations,
+    table: string,
+    columns: string[],
+    options: ExportOptions
+): Promise<{ content: string; chunks: string[]; rowCount: number }> {
+    const chunks: string[] = [];
+    const rowCount = await streamTableExport(
+        operations,
+        table,
+        columns,
+        options,
+        {
+            write: async (chunk: string) => {
+                chunks.push(chunk);
+            }
+        }
+    );
+    return { content: chunks.join(''), chunks, rowCount };
+}
+
+describe('streamTableExport golden parity', () => {
+    it('preserves bounded CSV, JSON, and SQL bytes including options and NUL text', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_golden (' +
+            'id INTEGER, name TEXT, note TEXT, payload BLOB, nul TEXT, nullable)'
+        );
+        await operations.executeQuery(
+            'INSERT INTO stage_e_golden VALUES (?, ?, ?, ?, CAST(? AS TEXT), ?), ' +
+            '(?, ?, ?, ?, ?, ?)',
+            [
+                1,
+                'Alice',
+                'comma, "quote"\nline',
+                new Uint8Array([0, 1, 2, 253, 254, 255]),
+                new TextEncoder().encode('before\0after'),
+                null,
+                2,
+                "O'Reilly 😀",
+                'plain',
+                new Uint8Array(),
+                'ok',
+                3.5
+            ]
+        );
+        const columns = ['id', 'name', 'note', 'payload', 'nul', 'nullable'];
+        const boundedRows: CellValue[][] = [
+            [
+                1,
+                'Alice',
+                'comma, "quote"\nline',
+                new Uint8Array([0, 1, 2, 253, 254, 255]),
+                'before\0after',
+                null
+            ],
+            [2, "O'Reilly 😀", 'plain', new Uint8Array(), 'ok', 3.5]
+        ];
+
+        try {
+            const csv = await collectStreamingExport(
+                operations,
+                'stage_e_golden',
+                columns,
+                { format: 'csv', header: true }
+            );
+            assert.strictEqual(csv.rowCount, 2);
+            assert.strictEqual(csv.content, exportToCsv(columns, boundedRows, true));
+            assert.strictEqual(
+                csv.content,
+                'id,name,note,payload,nul,nullable\n' +
+                '1,Alice,"comma, ""quote""\nline",[BLOB],before\0after,\n' +
+                "2,O'Reilly 😀,plain,[BLOB],ok,3.5"
+            );
+
+            const csvWithoutHeader = await collectStreamingExport(
+                operations,
+                'stage_e_golden',
+                columns,
+                { format: 'csv', header: false }
+            );
+            assert.strictEqual(
+                csvWithoutHeader.content,
+                exportToCsv(columns, boundedRows, false)
+            );
+            assert.strictEqual(
+                csvWithoutHeader.content,
+                '1,Alice,"comma, ""quote""\nline",[BLOB],before\0after,\n' +
+                "2,O'Reilly 😀,plain,[BLOB],ok,3.5"
+            );
+
+            const json = await collectStreamingExport(
+                operations,
+                'stage_e_golden',
+                columns,
+                { format: 'json' }
+            );
+            assert.strictEqual(json.content, exportToJson(columns, boundedRows));
+            assert.strictEqual(
+                json.content,
+                '[\n' +
+                '  {\n' +
+                '    "id": 1,\n' +
+                '    "name": "Alice",\n' +
+                '    "note": "comma, \\"quote\\"\\nline",\n' +
+                '    "payload": "AAEC/f7/",\n' +
+                '    "nul": "before\\u0000after",\n' +
+                '    "nullable": null\n' +
+                '  },\n' +
+                '  {\n' +
+                '    "id": 2,\n' +
+                '    "name": "O\'Reilly 😀",\n' +
+                '    "note": "plain",\n' +
+                '    "payload": "",\n' +
+                '    "nul": "ok",\n' +
+                '    "nullable": 3.5\n' +
+                '  }\n' +
+                ']'
+            );
+
+            const sql = await collectStreamingExport(
+                operations,
+                'stage_e_golden',
+                columns,
+                { format: 'sql', includeTableName: true }
+            );
+            assert.strictEqual(
+                sql.content,
+                exportToSql('stage_e_golden', columns, boundedRows, true)
+            );
+            assert.strictEqual(
+                sql.content,
+                'INSERT INTO "stage_e_golden" ("id", "name", "note", "payload", "nul", "nullable") ' +
+                'VALUES (1, \'Alice\', \'comma, "quote"\nline\', X\'000102fdfeff\', ' +
+                'CAST(X\'6265666f7265006166746572\' AS TEXT), NULL);\n' +
+                'INSERT INTO "stage_e_golden" ("id", "name", "note", "payload", "nul", "nullable") ' +
+                'VALUES (2, \'O\'\'Reilly 😀\', \'plain\', X\'\', \'ok\', 3.5);'
+            );
+
+            const sqlWithoutTableName = await collectStreamingExport(
+                operations,
+                'stage_e_golden',
+                ['id'],
+                { format: 'sql', includeTableName: false }
+            );
+            assert.strictEqual(
+                sqlWithoutTableName.content,
+                exportToSql('stage_e_golden', ['id'], [[1], [2]], false)
+            );
+            assert.strictEqual(
+                sqlWithoutTableName.content,
+                'INSERT INTO table_name ("id") VALUES (1);\n' +
+                'INSERT INTO table_name ("id") VALUES (2);'
+            );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('matches legacy JSON key ordering and __proto__ handling', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_json_keys ("__proto__" TEXT, "1" TEXT, normal TEXT)'
+        );
+        await operations.executeQuery(
+            'INSERT INTO stage_e_json_keys VALUES (?, ?, ?)',
+            ['ignored-by-legacy-object', 'integer-key', 'normal-value']
+        );
+        const columns = ['normal', '__proto__', '1', 'normal'];
+
+        try {
+            const exported = await collectStreamingExport(
+                operations,
+                'stage_e_json_keys',
+                columns,
+                { format: 'json' }
+            );
+            assert.strictEqual(
+                exported.content,
+                exportToJson(
+                    columns,
+                    [[
+                        'normal-value',
+                        'ignored-by-legacy-object',
+                        'integer-key',
+                        'normal-value'
+                    ]]
+                )
+            );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+});
+
+describe('streamTableExport cell boundaries', () => {
+    it('keeps JSON base64 and escaped UTF-8 text correct across cell chunk seams', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        const blob = new Uint8Array(EXPORT_CELL_CHUNK_BYTES + 5);
+        for (let index = 0; index < blob.length; index++) blob[index] = index % 251;
+        // The first byte of the emoji lands at the end of one source window, so
+        // both the TextDecoder carry and the incremental JSON escaper are live.
+        const text = 'a'.repeat(EXPORT_CELL_CHUNK_BYTES - 1) + '😀"\\\nend';
+        await operations.executeQuery('CREATE TABLE stage_e_json (payload BLOB, text_value TEXT)');
+        await operations.executeQuery('INSERT INTO stage_e_json VALUES (?, ?)', [blob, text]);
+
+        try {
+            const exported = await collectStreamingExport(
+                operations,
+                'stage_e_json',
+                ['payload', 'text_value'],
+                { format: 'json' }
+            );
+            assert.strictEqual(
+                exported.content,
+                JSON.stringify([{
+                    payload: Buffer.from(blob).toString('base64'),
+                    text_value: text
+                }], null, 2)
+            );
+            assert.ok(
+                exported.chunks.every(chunk => chunk.length <= 1024 * 1024),
+                'no individual JSON emission may grow to a cell-sized string'
+            );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('keeps SQL BLOB hex and NUL-to-UTF-8-hex output correct across chunk seams', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        const blob = new Uint8Array(EXPORT_CELL_CHUNK_BYTES + 7);
+        for (let index = 0; index < blob.length; index++) blob[index] = (index * 17) % 256;
+        const text = 'z'.repeat(EXPORT_CELL_CHUNK_BYTES - 1) + '\0😀tail';
+        await operations.executeQuery('CREATE TABLE stage_e_sql (payload BLOB, text_value TEXT)');
+        await operations.executeQuery(
+            'INSERT INTO stage_e_sql VALUES (?, CAST(? AS TEXT))',
+            [blob, new TextEncoder().encode(text)]
+        );
+
+        try {
+            const exported = await collectStreamingExport(
+                operations,
+                'stage_e_sql',
+                ['payload', 'text_value'],
+                { format: 'sql' }
+            );
+            assert.strictEqual(
+                exported.content,
+                exportToSql('stage_e_sql', ['payload', 'text_value'], [[blob, text]])
+            );
+            assert.ok(
+                exported.chunks.every(chunk => chunk.length <= 1024 * 1024),
+                'no individual SQL hex emission may grow to a cell-sized string'
+            );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('exports CSV BLOB placeholders without returning or opening BLOB content', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        const blob = new Uint8Array(EXPORT_CELL_CHUNK_BYTES * 2);
+        blob.fill(0x42);
+        await operations.executeQuery('CREATE TABLE stage_e_csv (id INTEGER, payload BLOB)');
+        await operations.executeQuery('INSERT INTO stage_e_csv VALUES (?, ?)', [1, blob]);
+        await operations.executeQuery(
+            'CREATE VIEW stage_e_csv_view AS SELECT id, payload FROM stage_e_csv'
+        );
+
+        const guardedOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'executeQuery') {
+                    return async (...args: Parameters<DatabaseOperations['executeQuery']>) => {
+                        const result = await target.executeQuery(...args);
+                        for (const resultSet of result) {
+                            for (const row of resultSet.rows) {
+                                assert.ok(
+                                    row.every(value => !(value instanceof Uint8Array)),
+                                    'CSV row enumeration returned BLOB bytes'
+                                );
+                            }
+                        }
+                        return result;
+                    };
+                }
+                if (property === 'openCellReadSession') {
+                    return async (cellTarget: Parameters<DatabaseOperations['openCellReadSession']>[0]) => {
+                        assert.notStrictEqual(
+                            cellTarget.column,
+                            'payload',
+                            'CSV opened a BLOB content session'
+                        );
+                        return target.openCellReadSession(cellTarget);
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+
+        try {
+            const exported = await collectStreamingExport(
+                guardedOperations,
+                'stage_e_csv',
+                ['id', 'payload'],
+                { format: 'csv' }
+            );
+            assert.strictEqual(exported.content, 'id,payload\n1,[BLOB]');
+
+            const viewExported = await collectStreamingExport(
+                guardedOperations,
+                'stage_e_csv_view',
+                ['id', 'payload'],
+                { format: 'csv' }
+            );
+            assert.strictEqual(viewExported.content, 'id,payload\n1,[BLOB]');
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('awaits each sink emission before producing the next chunk', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery('CREATE TABLE stage_e_backpressure (value TEXT)');
+        await operations.executeQuery("INSERT INTO stage_e_backpressure VALUES ('one'), ('two')");
+        let writeInFlight = false;
+        const chunks: string[] = [];
+
+        try {
+            const rowCount = await streamTableExport(
+                operations,
+                'stage_e_backpressure',
+                ['value'],
+                { format: 'json' },
+                {
+                    write: async chunk => {
+                        assert.strictEqual(writeInFlight, false, 'sink writes overlapped');
+                        writeInFlight = true;
+                        await new Promise(resolve => setImmediate(resolve));
+                        chunks.push(chunk);
+                        writeInFlight = false;
+                    }
+                }
+            );
+            assert.strictEqual(rowCount, 2);
+            assert.strictEqual(chunks.join(''), JSON.stringify([{ value: 'one' }, { value: 'two' }], null, 2));
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('refuses selected-row export when the source has no stable row identity', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery('CREATE TABLE stage_e_view_source (value TEXT)');
+        await operations.executeQuery("INSERT INTO stage_e_view_source VALUES ('one')");
+        await operations.executeQuery(
+            'CREATE VIEW stage_e_unstable_view AS SELECT value FROM stage_e_view_source'
+        );
+
+        try {
+            await assert.rejects(
+                collectStreamingExport(
+                    operations,
+                    'stage_e_unstable_view',
+                    ['value'],
+                    { format: 'json', rowIds: [1] }
+                ),
+                /has no stable row identity/
+            );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+});
+
+describe('exportTableCommand atomic streaming', () => {
+    it('writes a sibling temp and renames it only after the stream has finished', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery('CREATE TABLE stage_e_atomic (payload BLOB)');
+        await operations.executeQuery(
+            'INSERT INTO stage_e_atomic VALUES (?)',
+            [new Uint8Array([1, 2, 3, 4])]
+        );
+
+        const scratch = await fsPromises.mkdtemp(path.join(process.cwd(), '.stage-e-export-test-'));
+        const finalPath = path.join(scratch, 'atomic.json');
+        const documentUri = mockVscode.Uri.parse('vscode-sqlite://stage-e-atomic.db');
+        const originalShowSaveDialog = mockVscode.window.showSaveDialog;
+        const nodeFs = require('node:fs') as typeof import('node:fs');
+        const originalRename = nodeFs.promises.rename;
+        let observedRename: { from: string; to: string } | undefined;
+        DocumentRegistry.set('stage-e-atomic', {
+            uri: documentUri,
+            databaseOperations: operations
+        } as any);
+
+        try {
+            mockVscode.window.showSaveDialog = async (): Promise<any> => mockVscode.Uri.file(finalPath);
+            nodeFs.promises.rename = async (from, to) => {
+                observedRename = { from: String(from), to: String(to) };
+                return originalRename(from, to);
+            };
+
+            await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'stage_e_atomic', uri: documentUri.toString() },
+                ['payload'],
+                undefined,
+                undefined,
+                { format: 'json' }
+            );
+
+            assert.ok(observedRename, 'the completed temp file was not renamed');
+            assert.strictEqual(observedRename.to, finalPath);
+            assert.strictEqual(path.dirname(observedRename.from), scratch);
+            assert.notStrictEqual(observedRename.from, finalPath);
+            assert.strictEqual(
+                await fsPromises.readFile(finalPath, 'utf8'),
+                JSON.stringify([{ payload: 'AQIDBA==' }], null, 2)
+            );
+            assert.deepStrictEqual(await fsPromises.readdir(scratch), ['atomic.json']);
+        } finally {
+            nodeFs.promises.rename = originalRename;
+            mockVscode.window.showSaveDialog = originalShowSaveDialog;
+            DocumentRegistry.delete('stage-e-atomic');
+            (operations as WasmDatabaseEngine).shutdown();
+            await fsPromises.rm(scratch, { recursive: true, force: true });
+        }
+    });
+
+    it('cancels between oversized-cell chunks and removes every partial file', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        const blob = new Uint8Array(EXPORT_CELL_CHUNK_BYTES * 3);
+        blob.fill(0x5a);
+        await operations.executeQuery('CREATE TABLE stage_e_cancel (payload BLOB)');
+        await operations.executeQuery('INSERT INTO stage_e_cancel VALUES (?)', [blob]);
+
+        let cancelled = false;
+        const cancellableOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'readCellChunk') {
+                    return async (...args: Parameters<DatabaseOperations['readCellChunk']>) => {
+                        const chunk = await target.readCellChunk(...args);
+                        cancelled = true;
+                        return chunk;
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+        const scratch = await fsPromises.mkdtemp(path.join(process.cwd(), '.stage-e-export-test-'));
+        const finalPath = path.join(scratch, 'cancelled.json');
+        const documentUri = mockVscode.Uri.parse('vscode-sqlite://stage-e-cancel.db');
+        const originalShowSaveDialog = mockVscode.window.showSaveDialog;
+        const originalWithProgress = mockVscode.window.withProgress;
+        DocumentRegistry.set('stage-e-cancel', {
+            uri: documentUri,
+            databaseOperations: cancellableOperations
+        } as any);
+
+        try {
+            mockVscode.window.showSaveDialog = async (): Promise<any> => mockVscode.Uri.file(finalPath);
+            mockVscode.window.withProgress = async (_options: unknown, task: Function): Promise<any> => task(
+                { report: () => {} },
+                {
+                    get isCancellationRequested() { return cancelled; },
+                    onCancellationRequested: () => ({ dispose: () => {} })
+                }
+            );
+
+            await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'stage_e_cancel', uri: documentUri.toString() },
+                ['payload'],
+                undefined,
+                undefined,
+                { format: 'json' }
+            );
+
+            assert.strictEqual(cancelled, true, 'the oversized cell never reached the chunk loop');
+            await assert.rejects(fsPromises.stat(finalPath), (error: any) => error?.code === 'ENOENT');
+            assert.deepStrictEqual(await fsPromises.readdir(scratch), []);
+        } finally {
+            mockVscode.window.showSaveDialog = originalShowSaveDialog;
+            mockVscode.window.withProgress = originalWithProgress;
+            DocumentRegistry.delete('stage-e-cancel');
+            (operations as WasmDatabaseEngine).shutdown();
+            await fsPromises.rm(scratch, { recursive: true, force: true });
+        }
+    });
+
+    it('uses a capped sibling-temp workspace.fs write for non-local destinations', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery('CREATE TABLE stage_e_remote (value TEXT)');
+        await operations.executeQuery("INSERT INTO stage_e_remote VALUES ('remote')");
+        const documentUri = mockVscode.Uri.parse('vscode-sqlite://stage-e-remote.db');
+        const destination = {
+            ...mockVscode.Uri.file('/remote/export.json'),
+            scheme: 'vscode-remote',
+            toString: () => 'vscode-remote:///remote/export.json'
+        };
+        const originalShowSaveDialog = mockVscode.window.showSaveDialog;
+        const originalWriteFile = mockVscode.workspace.fs.writeFile;
+        const originalRename = mockVscode.workspace.fs.rename;
+        const originalDelete = mockVscode.workspace.fs.delete;
+        let tempUri: any;
+        let written: Uint8Array = new Uint8Array();
+        let renamed: { from: any; to: any } | undefined;
+        DocumentRegistry.set('stage-e-remote', {
+            uri: documentUri,
+            databaseOperations: operations
+        } as any);
+
+        try {
+            mockVscode.window.showSaveDialog = async (): Promise<any> => destination;
+            mockVscode.workspace.fs.writeFile = async (uri: any, bytes: Uint8Array) => {
+                tempUri = uri;
+                written = bytes;
+            };
+            mockVscode.workspace.fs.rename = async (from: any, to: any) => {
+                renamed = { from, to };
+            };
+            mockVscode.workspace.fs.delete = async () => {
+                throw new Error('successful non-local export must not delete its completed temp');
+            };
+
+            await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'stage_e_remote', uri: documentUri.toString() },
+                ['value'],
+                undefined,
+                undefined,
+                { format: 'json' }
+            );
+
+            assert.ok(tempUri, 'workspace.fs did not receive a sibling temp write');
+            assert.notStrictEqual(tempUri.toString(), destination.toString());
+            assert.strictEqual(new TextDecoder().decode(written), JSON.stringify([{ value: 'remote' }], null, 2));
+            assert.ok(renamed, 'workspace.fs temp was not renamed');
+            assert.strictEqual(renamed.from, tempUri);
+            assert.strictEqual(renamed.to, destination);
+        } finally {
+            mockVscode.window.showSaveDialog = originalShowSaveDialog;
+            mockVscode.workspace.fs.writeFile = originalWriteFile;
+            mockVscode.workspace.fs.rename = originalRename;
+            mockVscode.workspace.fs.delete = originalDelete;
+            DocumentRegistry.delete('stage-e-remote');
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('refuses output above the precise non-local memory cap before workspace.fs writes', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        // Base64 expands this source beyond the 16 MiB UTF-8 output cap.
+        const blob = new Uint8Array(12 * 1024 * 1024 + 3);
+        blob.fill(0x41);
+        await operations.executeQuery('CREATE TABLE stage_e_remote_cap (payload BLOB)');
+        await operations.executeQuery('INSERT INTO stage_e_remote_cap VALUES (?)', [blob]);
+        const documentUri = mockVscode.Uri.parse('vscode-sqlite://stage-e-remote-cap.db');
+        const destination = {
+            ...mockVscode.Uri.file('/remote/export.json'),
+            scheme: 'vscode-remote',
+            toString: () => 'vscode-remote:///remote/export.json'
+        };
+        const originalShowSaveDialog = mockVscode.window.showSaveDialog;
+        const originalShowErrorMessage = mockVscode.window.showErrorMessage;
+        const originalWriteFile = mockVscode.workspace.fs.writeFile;
+        const originalConsoleError = console.error;
+        let writeCalled = false;
+        let errorMessage = '';
+        DocumentRegistry.set('stage-e-remote-cap', {
+            uri: documentUri,
+            databaseOperations: operations
+        } as any);
+
+        try {
+            mockVscode.window.showSaveDialog = async (): Promise<any> => destination;
+            mockVscode.workspace.fs.writeFile = async () => {
+                writeCalled = true;
+            };
+            mockVscode.window.showErrorMessage = async (message: string): Promise<any> => {
+                errorMessage = message;
+            };
+            console.error = () => {};
+
+            await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'stage_e_remote_cap', uri: documentUri.toString() },
+                ['payload'],
+                undefined,
+                undefined,
+                { format: 'json' }
+            );
+
+            assert.strictEqual(writeCalled, false);
+            assert.match(errorMessage, /16 MiB \(16,777,216 bytes\)/);
+            assert.match(errorMessage, /workspace\.fs has no streaming write API/);
+        } finally {
+            mockVscode.window.showSaveDialog = originalShowSaveDialog;
+            mockVscode.window.showErrorMessage = originalShowErrorMessage;
+            mockVscode.workspace.fs.writeFile = originalWriteFile;
+            console.error = originalConsoleError;
+            DocumentRegistry.delete('stage-e-remote-cap');
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+});
 
 describe('exportToJson', () => {
     it('should export basic types correctly', () => {
@@ -132,7 +811,7 @@ describe('exportToSql', () => {
     });
 });
 
-describe('exportTableCommand Fallback', () => {
+describe('exportTableCommand compatibility and failures', () => {
     it('exports the minimum signed-int64 rowid in the first keyset batch', async () => {
         const database = await createDatabaseEngine({
             content: null,
@@ -146,12 +825,11 @@ describe('exportTableCommand Fallback', () => {
             ['-9223372036854775808', 'minimum']
         );
 
-        const uri = mockVscode.Uri.file('/test/export-min.csv');
+        const scratch = await fsPromises.mkdtemp(path.join(process.cwd(), '.stage-e-export-test-'));
+        const finalPath = path.join(scratch, 'export-min.csv');
+        const uri = mockVscode.Uri.file(finalPath);
         const originalShowSaveDialog = mockVscode.window.showSaveDialog;
         mockVscode.window.showSaveDialog = async (): Promise<any> => uri;
-        const fs = require('fs');
-        const originalCreateWriteStream = fs.createWriteStream;
-        let exported = '';
 
         DocumentRegistry.set('export-min', {
             uri: mockVscode.Uri.parse('vscode-sqlite://export-min.db'),
@@ -159,11 +837,6 @@ describe('exportTableCommand Fallback', () => {
         } as any);
 
         try {
-            fs.createWriteStream = () => ({
-                write: (chunk: string) => { exported += chunk; },
-                end: () => {}
-            });
-
             await exportTableCommand(
                 {} as any,
                 undefined,
@@ -174,12 +847,12 @@ describe('exportTableCommand Fallback', () => {
                 { format: 'csv' }
             );
 
-            assert.strictEqual(exported, 'value\nminimum');
+            assert.strictEqual(await fsPromises.readFile(finalPath, 'utf8'), 'value\nminimum');
         } finally {
-            fs.createWriteStream = originalCreateWriteStream;
             mockVscode.window.showSaveDialog = originalShowSaveDialog;
             DocumentRegistry.delete('export-min');
             (operations as WasmDatabaseEngine).shutdown();
+            await fsPromises.rm(scratch, { recursive: true, force: true });
         }
     });
 
@@ -203,22 +876,17 @@ describe('exportTableCommand Fallback', () => {
         });
         const selectedId = fetched.rows.find(row => row[1] === 'one')![0] as string;
 
-        const uri = mockVscode.Uri.file('/test/export-pk.csv');
+        const scratch = await fsPromises.mkdtemp(path.join(process.cwd(), '.stage-e-export-test-'));
+        const finalPath = path.join(scratch, 'export-pk.csv');
+        const uri = mockVscode.Uri.file(finalPath);
         const originalShowSaveDialog = mockVscode.window.showSaveDialog;
         mockVscode.window.showSaveDialog = async (): Promise<any> => uri;
-        const fs = require('fs');
-        const originalCreateWriteStream = fs.createWriteStream;
-        let exported = '';
         DocumentRegistry.set('export-pk', {
             uri: mockVscode.Uri.parse('vscode-sqlite://export-pk.db'),
             databaseOperations: operations
         } as any);
 
         try {
-            fs.createWriteStream = () => ({
-                write: (chunk: string) => { exported += chunk; },
-                end: () => {}
-            });
             await exportTableCommand(
                 {} as any,
                 undefined,
@@ -229,70 +897,46 @@ describe('exportTableCommand Fallback', () => {
                 { format: 'csv', rowIds: [selectedId] }
             );
 
+            const exported = await fsPromises.readFile(finalPath, 'utf8');
             assert.match(exported, /selected/);
             assert.doesNotMatch(exported, /excluded/);
         } finally {
-            fs.createWriteStream = originalCreateWriteStream;
             mockVscode.window.showSaveDialog = originalShowSaveDialog;
             DocumentRegistry.delete('export-pk');
             (operations as WasmDatabaseEngine).shutdown();
+            await fsPromises.rm(scratch, { recursive: true, force: true });
         }
     });
 
-    it('should use fallback memory export if stream write fails', async () => {
+    it('does not fall back to whole-memory workspace.fs after a local stream-open failure', async () => {
         const docUri = mockVscode.Uri.parse('vscode-sqlite://test.db');
-        const uri = mockVscode.Uri.file('/test/export.csv');
-
-        mockVscode.window.showSaveDialog = async (): Promise<any> => uri;
-
+        const uri = mockVscode.Uri.file(path.join(process.cwd(), 'stage-e-open-failure.csv'));
+        const originalShowSaveDialog = mockVscode.window.showSaveDialog;
+        const originalShowErrorMessage = mockVscode.window.showErrorMessage;
+        const originalWriteFile = mockVscode.workspace.fs.writeFile;
         let fileWritten = false;
         mockVscode.workspace.fs.writeFile = async () => {
             fileWritten = true;
         };
-
-        // Ensure stream fails without attempting to open file to prevent ENOENT.
-        // `getNodeFs()` returns `undefined` inside tests (mocked environment).
-        // Since `getNodeFs()` is used if it's a file, we can bypass fs entirely
-        // and force the `try...catch` fallback simply by letting `fs.createWriteStream` fail,
-        // or by making `fs` unavailable. However, in our test `getNodeFs()` will resolve to the real `fs`.
-        // To avoid an `ENOENT` on `fs.createWriteStream`, we mock `fs` directly or just throw error earlier.
-
-        const executeQueryCalls: string[] = [];
-        const dbOperations = {
-            executeQuery: async (sql: string) => {
-                executeQueryCalls.push(sql);
-
-                // For the fallback non-paginated query, return dummy data
-                return [{
-                    headers: ['id', 'name'],
-                    rows: [[1, 'Alice'], [2, 'Bob']],
-                    columns: ['id', 'name'],
-                    values: [[1, 'Alice'], [2, 'Bob']]
-                }];
-            }
+        let errorMessage = '';
+        mockVscode.window.showSaveDialog = async (): Promise<any> => uri;
+        mockVscode.window.showErrorMessage = async (message: string): Promise<any> => {
+            errorMessage = message;
         };
-
         const doc = {
             uri: docUri,
-            databaseOperations: dbOperations
+            databaseOperations: {}
         };
         DocumentRegistry.set('test', doc as any);
 
         const fs = require('fs');
         const originalCreateWriteStream = fs.createWriteStream;
-
-        const originalConsoleWarn = console.warn;
-        let warnCalled = false;
+        const originalConsoleError = console.error;
         try {
             fs.createWriteStream = () => {
                 throw new Error('Simulated stream failure');
             };
-
-            console.warn = (msg, e) => {
-                if (msg === 'Native stream write failed, falling back to memory') {
-                    warnCalled = true;
-                }
-            };
+            console.error = () => {};
 
             await exportTableCommand(
                 {} as any,
@@ -304,99 +948,14 @@ describe('exportTableCommand Fallback', () => {
                 { format: 'csv' }
             );
 
-            assert.strictEqual(warnCalled, true, 'Should have logged fallback warning');
-            assert.strictEqual(fileWritten, true, 'Should have written file using fallback workspace.fs');
-
-            const expectedQuery = 'SELECT "id", "name" FROM "test_table"';
-            assert.ok(executeQueryCalls.includes(expectedQuery), `Expected query to be executed: ${expectedQuery}`);
-
+            assert.strictEqual(fileWritten, false, 'local failures must not trigger an accumulating fallback');
+            assert.strictEqual(errorMessage, 'Export failed: Simulated stream failure');
         } finally {
             fs.createWriteStream = originalCreateWriteStream;
-            console.warn = originalConsoleWarn;
-            DocumentRegistry.delete('test');
-        }
-    });
-
-    it('should fall back to memory export if stream write fails during chunking', async () => {
-        const docUri = mockVscode.Uri.parse('vscode-sqlite://test.db');
-        const uri = mockVscode.Uri.file('/test/export.csv');
-
-        mockVscode.window.showSaveDialog = async (): Promise<any> => uri;
-
-        let fileWritten = false;
-        mockVscode.workspace.fs.writeFile = async () => {
-            fileWritten = true;
-        };
-
-        let chunkQueryExecuted = false;
-        const executeQueryCalls: string[] = [];
-        const dbOperations = {
-            executeQuery: async (sql: string) => {
-                executeQueryCalls.push(sql);
-                if (sql.includes('LIMIT 5000')) {
-                    chunkQueryExecuted = true;
-                    return [{
-                        headers: ['id', 'name'],
-                        rows: [[1, 'Alice'], [2, 'Bob']],
-                        columns: ['id', 'name'],
-                        values: [[1, 'Alice'], [2, 'Bob']]
-                    }];
-                }
-
-                return [{
-                    headers: ['id', 'name'],
-                    rows: [[1, 'Alice'], [2, 'Bob']],
-                    columns: ['id', 'name'],
-                    values: [[1, 'Alice'], [2, 'Bob']]
-                }];
-            }
-        };
-
-        const doc = {
-            uri: docUri,
-            databaseOperations: dbOperations
-        };
-        DocumentRegistry.set('test', doc as any);
-
-        const fs = require('fs');
-        const originalCreateWriteStream = fs.createWriteStream;
-
-        const originalConsoleWarn = console.warn;
-        let warnCalled = false;
-        try {
-            fs.createWriteStream = () => {
-                return {
-                    write: () => { throw new Error('Simulated write failure during chunking'); },
-                    end: () => {}
-                };
-            };
-
-            console.warn = (msg, e) => {
-                if (msg === 'Native stream write failed, falling back to memory') {
-                    warnCalled = true;
-                }
-            };
-
-            await exportTableCommand(
-                {} as any,
-                undefined,
-                { table: 'test_table', uri: 'vscode-sqlite://test.db' },
-                ['id', 'name'],
-                undefined,
-                undefined,
-                { format: 'csv' }
-            );
-
-            assert.strictEqual(warnCalled, true, 'Should have logged fallback warning');
-            assert.strictEqual(fileWritten, true, 'Should have written file using fallback workspace.fs');
-            assert.strictEqual(chunkQueryExecuted, true, 'Should have attempted the chunk query before failing');
-
-            const expectedQuery = 'SELECT "id", "name" FROM "test_table"';
-            assert.ok(executeQueryCalls.includes(expectedQuery), `Expected query to be executed: ${expectedQuery}`);
-
-        } finally {
-            fs.createWriteStream = originalCreateWriteStream;
-            console.warn = originalConsoleWarn;
+            console.error = originalConsoleError;
+            mockVscode.window.showSaveDialog = originalShowSaveDialog;
+            mockVscode.window.showErrorMessage = originalShowErrorMessage;
+            mockVscode.workspace.fs.writeFile = originalWriteFile;
             DocumentRegistry.delete('test');
         }
     });
@@ -436,7 +995,9 @@ describe('exportTableCommand Fallback', () => {
 
     it('should catch and show error when export fails', async () => {
         const docUri = mockVscode.Uri.parse('vscode-sqlite://test.db');
-        const uri = mockVscode.Uri.file('/test/export.csv');
+        const scratch = await fsPromises.mkdtemp(path.join(process.cwd(), '.stage-e-export-test-'));
+        const finalPath = path.join(scratch, 'export.csv');
+        const uri = mockVscode.Uri.file(finalPath);
 
         let errorMessageShown = '';
         const originalShowErrorMessage = mockVscode.window.showErrorMessage;
@@ -469,17 +1030,7 @@ describe('exportTableCommand Fallback', () => {
         };
         DocumentRegistry.set('test', doc as any);
 
-        const fs = require('fs');
-        const originalCreateWriteStream = fs.createWriteStream;
-        const originalConsoleWarn = console.warn;
-
         try {
-            fs.createWriteStream = () => {
-                throw new Error('Simulated stream failure');
-            };
-
-            console.warn = () => {};
-
             await exportTableCommand(
                 {} as any,
                 undefined,
@@ -493,14 +1044,15 @@ describe('exportTableCommand Fallback', () => {
             assert.strictEqual(fileWritten, false, 'Should not have written file');
             assert.strictEqual(errorMessageShown, 'Export failed: Simulated query failure for testing');
             assert.strictEqual(consoleErrorCalled, true, 'console.error should have been called');
+            await assert.rejects(fsPromises.stat(finalPath), (error: any) => error?.code === 'ENOENT');
+            assert.deepStrictEqual(await fsPromises.readdir(scratch), []);
         } finally {
-            fs.createWriteStream = originalCreateWriteStream;
             mockVscode.window.showErrorMessage = originalShowErrorMessage;
             mockVscode.window.showSaveDialog = originalShowSaveDialog;
             mockVscode.workspace.fs.writeFile = originalWriteFile;
             console.error = originalConsoleError;
-            console.warn = originalConsoleWarn;
             DocumentRegistry.delete('test');
+            await fsPromises.rm(scratch, { recursive: true, force: true });
         }
     });
 });
