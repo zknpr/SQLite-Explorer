@@ -23,6 +23,13 @@ const AsyncDatabase = sqlite.AsyncDatabase;
 
 const HEADER_SIZE = 4;
 
+// Both stdio handles changed API in the same txiki generation. Detect once so
+// the legacy path stays identical and the WHATWG handles remain locked to one
+// reader/writer for the worker's lifetime.
+const usesLegacyStdio = typeof tjs.stdout.write === 'function';
+const stdoutWriter = usesLegacyStdio ? null : tjs.stdout.getWriter();
+const stdinReader = usesLegacyStdio ? null : tjs.stdin.getReader();
+
 // ============================================================================
 // Database State
 // ============================================================================
@@ -58,9 +65,65 @@ async function writeMessage(msg) {
   const view = new DataView(header.buffer);
   view.setUint32(0, serialized.byteLength, false); // big-endian
 
-  await tjs.stdout.write(header);
-  await tjs.stdout.write(serialized);
+  if (usesLegacyStdio) {
+    await tjs.stdout.write(header);
+    await tjs.stdout.write(serialized);
+    return;
+  }
+
+  await stdoutWriter.write(header);
+  await stdoutWriter.write(serialized);
 }
+
+/**
+ * Adapt arbitrary stream chunks into exact-size reads while retaining bytes
+ * that belong to later headers or messages.
+ *
+ * @param {() => Promise<{value?: Uint8Array, done: boolean}>} readChunk
+ * @returns {(buffer: Uint8Array) => Promise<number>}
+ */
+function createExactReader(readChunk) {
+  let pending = new Uint8Array(0);
+  let pendingOffset = 0;
+  let ended = false;
+
+  return async function readExactFromChunks(buffer) {
+    let totalRead = 0;
+
+    while (totalRead < buffer.byteLength) {
+      if (pendingOffset >= pending.byteLength) {
+        if (ended) return totalRead;
+
+        const { value, done } = await readChunk();
+        if (done) {
+          ended = true;
+          return totalRead;
+        }
+        if (!value || value.byteLength === 0) continue;
+
+        pending = value;
+        pendingOffset = 0;
+      }
+
+      const copyLength = Math.min(
+        buffer.byteLength - totalRead,
+        pending.byteLength - pendingOffset
+      );
+      buffer.set(
+        pending.subarray(pendingOffset, pendingOffset + copyLength),
+        totalRead
+      );
+      pendingOffset += copyLength;
+      totalRead += copyLength;
+    }
+
+    return totalRead;
+  };
+}
+
+const readStreamExact = usesLegacyStdio
+  ? null
+  : createExactReader(() => stdinReader.read());
 
 /**
  * Read exactly N bytes from stdin into buffer.
@@ -71,6 +134,10 @@ async function writeMessage(msg) {
  * @returns {Promise<number>} Total bytes read, 0 on EOF
  */
 async function readExact(buffer) {
+  if (!usesLegacyStdio) {
+    return readStreamExact(buffer);
+  }
+
   let totalRead = 0;
   const length = buffer.byteLength;
 
