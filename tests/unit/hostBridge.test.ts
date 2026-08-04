@@ -7,9 +7,98 @@ import * as vscode from 'vscode';
 import { createDeferred } from './helpers/deferred';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { serializeOperations } from '../../src/core/operation-serializer';
-import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
+import {
+    encodePrimaryKeyRecordId,
+    encodeReadOnlyPrimaryKeyRecordId
+} from '../../src/core/row-identity';
 
 describe('HostBridge', () => {
+    it('rejects every cell/row mutation for an oversized primary-key identity with its precise reason', async () => {
+        const reason = 'Row is read-only because primary-key column "key" is 32 bytes.';
+        const rowId = encodeReadOnlyPrimaryKeyRecordId(reason, 0);
+        const dbOps = {
+            executeQuery: mock.fn(async () => []),
+            updateCell: mock.fn(async () => {}),
+            deleteRows: mock.fn(async () => {}),
+            updateCellBatch: mock.fn(async () => {})
+        };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            {
+                uri: vscode.Uri.parse('file:///test.db'),
+                documentKey: Promise.resolve('test-key'),
+                databaseOperations: dbOps,
+                connectionGeneration: 1,
+                isReadOnlyMode: false,
+                recordExternalModification: mock.fn()
+            } as any
+        );
+
+        await assert.rejects(
+            () => bridge.updateCell('rowidless', rowId, 'value', 'after'),
+            error => error instanceof Error && error.message === reason
+        );
+        await assert.rejects(
+            () => bridge.deleteRows('rowidless', [rowId]),
+            error => error instanceof Error && error.message === reason
+        );
+        await assert.rejects(
+            () => bridge.updateCellBatch(
+                'rowidless',
+                [{ rowId, column: 'value', value: 'after' }],
+                'Batch'
+            ),
+            error => error instanceof Error && error.message === reason
+        );
+        await assert.rejects(
+            () => bridge.openCellEditor(
+                { table: 'rowidless', name: '' },
+                rowId,
+                'value',
+                {},
+                { value: 'preview' }
+            ),
+            error => error instanceof Error && error.message === reason
+        );
+        assert.strictEqual(dbOps.executeQuery.mock.callCount(), 0);
+        assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+        assert.strictEqual(dbOps.deleteRows.mock.callCount(), 0);
+        assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 0);
+    });
+
+    it('enforces the configured inline-cell ceiling instead of trusting the caller', async () => {
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const dbOps = result.operations!;
+        const configStore = (vscode.workspace as any)._config as Map<string, unknown>;
+        configStore.set('maxInlineCellBytes', 1024);
+        try {
+            await dbOps.executeQuery(
+                "CREATE TABLE bounded_bridge (value TEXT); " +
+                "INSERT INTO bounded_bridge VALUES (printf('%.*c', 2048, 'x'))"
+            );
+            const bridge = new HostBridge(
+                { webviews: new Map(), context: {}, isReadOnly: false } as any,
+                { databaseOperations: dbOps, isReadOnlyMode: false } as any
+            );
+
+            const page = await bridge.fetchTableData('bounded_bridge', {
+                columns: ['value'],
+                limit: 1,
+                offset: 0,
+                maxInlineCellBytes: 8 * 1024 * 1024,
+                maxPageResponseBytes: 8 * 1024 * 1024 * 1024
+            } as any);
+
+            assert.ok(Buffer.byteLength(page.rows[0][0] as string, 'utf8') <= 1024);
+            assert.deepStrictEqual((page as any).oversizedCells, {
+                0: { 0: { storageClass: 'text', byteLength: 2048 } }
+            });
+        } finally {
+            configStore.clear();
+            (dbOps as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('cancels a superseded view preview', async () => {
         const signals: Array<AbortSignal | undefined> = [];
         let releaseFirstPreview: (() => void) | undefined;

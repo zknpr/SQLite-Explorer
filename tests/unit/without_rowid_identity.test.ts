@@ -22,6 +22,40 @@ describe('WITHOUT ROWID primary-key identity', () => {
         (engine as DatabaseOperations & { shutdown?: () => void }).shutdown?.();
     });
 
+    it('marks a row read-only instead of encoding a truncated oversized primary key', async () => {
+        await engine.executeQuery(
+            "CREATE TABLE oversized_identity (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID; " +
+            "INSERT INTO oversized_identity VALUES ('abcdefghijklmnopqrstuvwxyz012345', 'visible')"
+        );
+        const page = await engine.fetchTableData('oversized_identity', {
+            columns: ['rowid', 'key', 'value'],
+            limit: 1,
+            offset: 0,
+            maxInlineCellBytes: 8,
+            maxPageResponseBytes: 64
+        });
+        const identity = page.rows[0][0] as RecordId;
+
+        assert.match(String(identity), /^readonly-pk:/);
+        assert.doesNotMatch(String(identity), /^pk:/);
+        assert.strictEqual(page.rows[0][1], 'ab');
+        assert.deepStrictEqual(page.oversizedCells, {
+            0: { 1: { storageClass: 'text', byteLength: 32 } }
+        });
+        assert.match(
+            page.readOnlyRowReasons?.[0] ?? '',
+            /WITHOUT ROWID primary-key column "key".*32 bytes.*8-byte inline limit.*identity was not transported/
+        );
+        await assert.rejects(
+            engine.updateCell('oversized_identity', identity, 'value', 'changed'),
+            /WITHOUT ROWID primary-key column "key".*32 bytes.*identity was not transported/
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT value FROM oversized_identity'))[0].rows,
+            [['visible']]
+        );
+    });
+
     it('edits a row identified by a TEXT primary key', async () => {
         await engine.executeQuery(
             "CREATE TABLE text_identity (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID; " +

@@ -35,6 +35,7 @@ import {
   prepareCellUpdateForStorage
 } from '../../../src/core/json-utils.ts';
 import {
+  assertMutableRecordId,
   buildRecordIdentitiesPredicate,
   buildRecordIdentityPredicate,
   buildTableIdentityMap,
@@ -52,6 +53,13 @@ import {
   normalizeIntegerRowsForTransport,
   ROWID_TABLE_AUTHORITY_SQL
 } from '../../../src/core/integer-utils.ts';
+import {
+  buildCellContainmentQuery,
+  decodeCellContainment,
+  DEFAULT_MAX_INLINE_CELL_BYTES,
+  DEFAULT_MAX_PAGE_RESPONSE_BYTES,
+  remapPrimaryKeyContainment
+} from '../../../src/core/cell-containment.ts';
 
 // ============================================================================
 // Configuration
@@ -689,7 +697,28 @@ async function fetchTableData(table, options = {}) {
   const sourceStatement = db.prepare(sql, params);
   const headers = sourceStatement.getColumnNames();
   sourceStatement.free();
-  const transportQuery = buildExactNumericTextQuery(sql, headers.length);
+  const requestedCellLimit = Number.isSafeInteger(options.maxInlineCellBytes)
+    && options.maxInlineCellBytes > 0
+    ? options.maxInlineCellBytes
+    : DEFAULT_MAX_INLINE_CELL_BYTES;
+  const requestedPageLimit = Number.isSafeInteger(options.maxPageResponseBytes)
+    && options.maxPageResponseBytes > 0
+    ? options.maxPageResponseBytes
+    : DEFAULT_MAX_PAGE_RESPONSE_BYTES;
+  const containmentOptions = {
+    limit: parseInt(limit, 10),
+    maxInlineCellBytes: Math.min(DEFAULT_MAX_INLINE_CELL_BYTES, requestedCellLimit),
+    maxPageResponseBytes: Math.min(DEFAULT_MAX_PAGE_RESPONSE_BYTES, requestedPageLimit)
+  };
+  const containmentQuery = buildCellContainmentQuery(
+    sql,
+    headers.length,
+    containmentOptions
+  );
+  const transportQuery = buildExactNumericTextQuery(
+    containmentQuery.sql,
+    headers.length + 1
+  );
   const results = db.exec(transportQuery.sql, params, { useBigInt: true });
 
   const sourceRows = results[0]?.values ?? [];
@@ -720,50 +749,46 @@ async function fetchTableData(table, options = {}) {
     }
   }
   const companionExactTexts = collectRowIdExactRealTexts(sourceRows, companionResults);
-  const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+  const normalized = normalizeIntegerRowsForTransport(
     sourceRows,
     transportQuery.valueColumnCount,
     companionExactTexts,
     isRowIdTable && needsExactRowIdIdentity ? 0 : undefined
   );
+  const contained = decodeCellContainment(
+    normalized.rows,
+    headers.length,
+    normalized.exactIntegerTexts
+  );
+  const { rows, oversizedCells, exactIntegerTexts } = contained;
   if (primaryKeyContext) {
-    const primaryKeyIndices = primaryKeyContext.identity.columns.map(column => {
-      const index = headers.indexOf(column.identifier);
-      if (index < 0) {
-        throw new Error(`Primary-key column missing from table fetch: ${column.identifier}`);
-      }
-      return index;
-    });
     const visibleColumnCount = primaryKeyContext.visibleColumns.length;
-    const identities = sourceRows.map(row => encodePrimaryKeyRecordId(
-      primaryKeyContext.identity.columns,
-      primaryKeyIndices.map(index => row[index])
-    ));
-    let shiftedExactIntegerTexts;
-    if (exactIntegerTexts) {
-      for (const [rowIndexText, exactRow] of Object.entries(exactIntegerTexts)) {
-        for (const [columnIndexText, exactText] of Object.entries(exactRow)) {
-          const columnIndex = Number(columnIndexText);
-          if (columnIndex >= visibleColumnCount) continue;
-          shiftedExactIntegerTexts ??= {};
-          shiftedExactIntegerTexts[Number(rowIndexText)] ??= {};
-          shiftedExactIntegerTexts[Number(rowIndexText)][columnIndex + 1] = exactText;
-        }
-      }
-    }
+    const remapped = remapPrimaryKeyContainment({
+      identity: primaryKeyContext.identity,
+      sourceColumns: headers,
+      visibleColumnCount,
+      identityRows: sourceRows,
+      rows,
+      oversizedCells,
+      exactIntegerTexts,
+      effectiveInlineCellBytes: containmentQuery.effectiveInlineCellBytes,
+      rowOffset: parseInt(offset, 10)
+    });
     return {
       headers: ['rowid', ...primaryKeyContext.visibleColumns],
-      rows: rows.map((row, index) => [
-        identities[index],
-        ...row.slice(0, visibleColumnCount)
-      ]),
-      exactIntegerTexts: shiftedExactIntegerTexts
+      rows: remapped.rows,
+      exactIntegerTexts: remapped.exactIntegerTexts,
+      ...(remapped.oversizedCells ? { oversizedCells: remapped.oversizedCells } : {}),
+      ...(remapped.readOnlyRowReasons
+        ? { readOnlyRowReasons: remapped.readOnlyRowReasons }
+        : {})
     };
   }
   return {
     headers,
     rows,
-    exactIntegerTexts
+    exactIntegerTexts,
+    ...(oversizedCells ? { oversizedCells } : {})
   };
 }
 
@@ -1001,6 +1026,7 @@ async function setPragma(pragma, value) {
  * @param {*} value - New value
  */
 async function updateCell(table, rowId, column, value) {
+  assertMutableRecordId(rowId);
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Cell updates');
 
@@ -1097,6 +1123,7 @@ async function insertRow(table, data) {
  * @param {Array<string|number>} rowIds - Row IDs to delete
  */
 async function deleteRows(table, rowIds) {
+  rowIds.forEach(assertMutableRecordId);
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Row deletion');
 
@@ -1695,6 +1722,7 @@ async function redoModification(modification) {
  * @param {Array<Object>} updates - Array of {rowId, column, value}
  */
 async function updateCellBatch(table, updates) {
+  updates.forEach(update => assertMutableRecordId(update.rowId));
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Batch cell updates');
 

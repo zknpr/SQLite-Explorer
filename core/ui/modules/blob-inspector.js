@@ -2,6 +2,8 @@ import { backendApi } from './api.js';
 import { state } from './state.js';
 import {
     clearExactIntegerText,
+    clearOversizedCellMetadata,
+    getCellMutationBlockReason,
     getRowDataOffset,
     remapDisplayedRowIdentity,
     resolveDisplayedCell
@@ -86,10 +88,17 @@ export class BlobInspector {
         this.isUploading = uploading;
         const replaceBtn = document.getElementById('blob-replace-btn');
         const downloadBtn = document.getElementById('blob-download-btn');
+        const mutationBlockReason = this.currentCellInfo
+            ? getCellMutationBlockReason(
+                this.currentCellInfo.rowIdx,
+                this.currentCellInfo.colIdx
+            )
+            : undefined;
 
         if (replaceBtn) {
-            replaceBtn.disabled = state.isReadOnly || uploading;
+            replaceBtn.disabled = state.isReadOnly || uploading || !!mutationBlockReason;
             replaceBtn.textContent = uploading ? 'Uploading...' : 'Replace';
+            replaceBtn.title = mutationBlockReason || '';
         }
         if (downloadBtn) {
             downloadBtn.disabled = uploading;
@@ -99,6 +108,16 @@ export class BlobInspector {
     async handleReplace() {
         // Prevent concurrent uploads
         if (state.isReadOnly || this.isUploading) return;
+        const mutationBlockReason = this.currentCellInfo
+            ? getCellMutationBlockReason(
+                this.currentCellInfo.rowIdx,
+                this.currentCellInfo.colIdx
+            )
+            : undefined;
+        if (mutationBlockReason) {
+            updateStatus(mutationBlockReason);
+            return;
+        }
 
         try {
             // Check fileOperations setting to determine behavior
@@ -217,6 +236,7 @@ export class BlobInspector {
             if (currentCell) {
                 state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = uint8Array;
                 clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
+                clearOversizedCellMetadata(currentCell.rowIdx, currentCell.colIdx);
             }
 
             // Update Inspector UI
@@ -336,6 +356,7 @@ export class BlobInspector {
         this.currentRowId = rowId;
         this.currentColName = colName;
         this.currentCellInfo = { rowIdx, colIdx };
+        this.setUploadState(false);
 
         // Show modal
         this.modal.classList.remove('hidden');

@@ -10,13 +10,14 @@ import * as vsc from 'vscode';
 import * as path from 'path';
 
 import type { DatabaseEditorProvider, DatabaseViewerProvider } from './editorController';
-import { ConfigurationSection, ExtensionId, SidebarLeft, SidebarRight, UriScheme } from './config';
+import { ConfigurationSection, ExtensionId, getMaxInlineCellBytes, SidebarLeft, SidebarRight, UriScheme } from './config';
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
 import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity } from './core/types';
 import { prepareCellUpdateForStorage } from './core/json-utils';
 import {
+  assertMutableRecordId,
   buildRecordIdentityPredicate,
   classifyTableIdentity,
   decodePrimaryKeyRecordId,
@@ -25,6 +26,7 @@ import {
 } from './core/row-identity';
 import { escapeIdentifier, validateRowId, validateRowIds } from './core/sql-utils';
 import { isViewDefinitionConflictError } from './core/view-utils';
+import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './core/cell-containment';
 
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
@@ -168,6 +170,7 @@ export class HostBridge implements ToastService {
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
+    assertMutableRecordId(rowId);
 
     const identity = await this.resolveTableIdentity(dbOps, table);
     const predicate = buildRecordIdentityPredicate(rowId, identity);
@@ -273,6 +276,7 @@ export class HostBridge implements ToastService {
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
+    rowIds.forEach(assertMutableRecordId);
 
     // Capture row data before deletion for rowid engines. PK-capable engines
     // return their atomically captured rows from deleteRows below.
@@ -658,6 +662,7 @@ export class HostBridge implements ToastService {
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
+    updates.forEach(update => assertMutableRecordId(update.rowId));
 
     if (updates.length === 0) return;
 
@@ -710,7 +715,20 @@ export class HostBridge implements ToastService {
     const dbOps = this.ensureDatabaseInitialized();
 
     if ('fetchTableData' in dbOps) {
-      return await dbOps.fetchTableData(table, options);
+      const configuredCellLimit = getMaxInlineCellBytes();
+      const requestedCellLimit = Number.isSafeInteger(options.maxInlineCellBytes)
+        && (options.maxInlineCellBytes ?? 0) > 0
+        ? options.maxInlineCellBytes!
+        : configuredCellLimit;
+      const requestedPageLimit = Number.isSafeInteger(options.maxPageResponseBytes)
+        && (options.maxPageResponseBytes ?? 0) > 0
+        ? options.maxPageResponseBytes!
+        : DEFAULT_MAX_PAGE_RESPONSE_BYTES;
+      return await dbOps.fetchTableData(table, {
+        ...options,
+        maxInlineCellBytes: Math.min(configuredCellLimit, requestedCellLimit),
+        maxPageResponseBytes: Math.min(DEFAULT_MAX_PAGE_RESPONSE_BYTES, requestedPageLimit)
+      });
     } else {
       throw new Error("Backend does not support fetchTableData");
     }
@@ -942,6 +960,7 @@ export class HostBridge implements ToastService {
     webviewId?: string,
     rowCount?: number,
   } = {}) {
+    assertMutableRecordId(rowId);
     const { document } = this;
     if (document.uri.scheme !== 'untitled') {
       let cellParts: string[];

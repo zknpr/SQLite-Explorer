@@ -177,7 +177,9 @@ async function probeGridFetch(options: ProbeOptions): Promise<Record<string, unk
   const before = memorySnapshot();
   const startedAt = performance.now();
   return withNative(options.fixture, true, async operations => {
-    const { value } = await fetchGridCell(operations, options.kind);
+    const { result, value } = await fetchGridCell(operations, options.kind);
+    const metadata = result.oversizedCells?.[0]?.[2];
+    const serializedResponseChars = JSON.stringify(serializeValue(result)).length;
     const after = memorySnapshot();
     return {
       mode: options.mode,
@@ -185,7 +187,11 @@ async function probeGridFetch(options: ProbeOptions): Promise<Record<string, unk
       rawCellBytes: options.sizeBytes,
       transportedCellBytes: cellByteLength(value),
       valueType: value instanceof Uint8Array ? 'Uint8Array' : typeof value,
-      oversized: false,
+      oversized: metadata !== undefined,
+      storageClass: metadata?.storageClass,
+      sourceCellBytes: metadata?.byteLength,
+      serializedResponseChars,
+      maxRssBytes: after.maxRssBytes,
       elapsedMs: performance.now() - startedAt,
       memoryBefore: before,
       memoryAfter: after

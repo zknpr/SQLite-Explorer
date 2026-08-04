@@ -53,6 +53,7 @@ import {
   prepareCellUpdateForStorage
 } from './core/json-utils';
 import {
+  assertMutableRecordId,
   buildRecordIdentitiesPredicate,
   buildRecordIdentityPredicate,
   buildTableIdentityMap,
@@ -70,6 +71,11 @@ import {
   normalizeIntegerRowsForTransport,
   ROWID_TABLE_AUTHORITY_SQL
 } from './core/integer-utils';
+import {
+  buildCellContainmentQuery,
+  decodeCellContainment,
+  remapPrimaryKeyContainment
+} from './core/cell-containment';
 import { serializeOperations } from './core/operation-serializer';
 import { InvocationTimeoutError } from './core/rpc';
 import {
@@ -1321,6 +1327,7 @@ export async function createNativeDatabaseConnection(
          * Update a single cell value.
          */
         updateCell: async (table: string, rowId: RecordId, column: string, value: CellValue, patch?: string) => {
+          assertMutableRecordId(rowId);
           if (isPrimaryKeyRecordId(rowId)) {
             const identity = await resolveNativeTableIdentity(table);
             if (identity.kind !== 'primaryKey') {
@@ -1444,6 +1451,7 @@ export async function createNativeDatabaseConnection(
          * Delete rows by ID.
          */
         deleteRows: async (table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void> => {
+          rowIds.forEach(assertMutableRecordId);
           if (rowIds.length === 0) return [];
 
           if (rowIds.some(isPrimaryKeyRecordId)) {
@@ -1851,7 +1859,11 @@ export async function createNativeDatabaseConnection(
             orderByColumns: identityOrderBy
           };
           const { sql, params } = buildSelectQuery(table, queryOptions);
-          const transportQuery = buildExactNumericTextQuery(sql, columns.length);
+          const containmentQuery = buildCellContainmentQuery(sql, columns.length, queryOptions);
+          const transportQuery = buildExactNumericTextQuery(
+            containmentQuery.sql,
+            columns.length + 1
+          );
           const hasRowIdShape = columns[0]?.toLowerCase() === 'rowid';
           const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
             && hasRowIdShape;
@@ -1914,52 +1926,46 @@ export async function createNativeDatabaseConnection(
             // txiki preserves SQLite int64 values as BigInt. The generated
             // companion columns also retain authoritative REAL text before V8
             // normalizes the storage class into a JavaScript Number.
-            const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+            const normalized = normalizeIntegerRowsForTransport(
               result.values,
               undefined,
               mergeExactIntegerTextMaps(companionExactTexts, result.exactIntegerTexts),
               needsExactRowIdIdentity ? 0 : undefined
             );
+            const contained = decodeCellContainment(
+              normalized.rows,
+              columns.length,
+              normalized.exactIntegerTexts
+            );
+            const { rows, oversizedCells, exactIntegerTexts } = contained;
 
             if (primaryKeyContext) {
-              const primaryKeyIndices = primaryKeyContext.identity.columns.map(column => {
-                const index = columns.indexOf(column.identifier);
-                if (index < 0) {
-                  throw new Error(`Primary-key column missing from table fetch: ${column.identifier}`);
-                }
-                return index;
-              });
               const visibleColumnCount = primaryKeyContext.visibleColumns.length;
-              const identities = result.values.map(row => encodePrimaryKeyRecordId(
-                primaryKeyContext!.identity.columns,
-                primaryKeyIndices.map(index => row[index])
-              ));
-              let shiftedExactIntegerTexts: ExactIntegerTextMap | undefined;
-              if (exactIntegerTexts) {
-                for (const [rowIndexText, exactRow] of Object.entries(exactIntegerTexts)) {
-                  for (const [columnIndexText, exactText] of Object.entries(exactRow)) {
-                    const columnIndex = Number(columnIndexText);
-                    if (columnIndex >= visibleColumnCount) continue;
-                    shiftedExactIntegerTexts ??= {};
-                    shiftedExactIntegerTexts[Number(rowIndexText)] ??= {};
-                    shiftedExactIntegerTexts[Number(rowIndexText)][columnIndex + 1] = exactText;
-                  }
-                }
-              }
-              const resultRows = rows.map((row, index) => [
-                identities[index],
-                ...row.slice(0, visibleColumnCount)
-              ]);
+              const remapped = remapPrimaryKeyContainment({
+                identity: primaryKeyContext.identity,
+                sourceColumns: columns,
+                visibleColumnCount,
+                identityRows: result.values,
+                rows,
+                oversizedCells,
+                exactIntegerTexts,
+                effectiveInlineCellBytes: containmentQuery.effectiveInlineCellBytes,
+                rowOffset: queryOptions.offset
+              });
               const resultHeaders = ['rowid', ...primaryKeyContext.visibleColumns];
               if (snapshotName) {
                 await worker.call('run', [`RELEASE ${snapshotName}`]);
               }
               return {
                 headers: resultHeaders,
-                rows: resultRows,
+                rows: remapped.rows,
                 columns: resultHeaders,
-                values: resultRows,
-                exactIntegerTexts: shiftedExactIntegerTexts
+                values: remapped.rows,
+                exactIntegerTexts: remapped.exactIntegerTexts,
+                ...(remapped.oversizedCells ? { oversizedCells: remapped.oversizedCells } : {}),
+                ...(remapped.readOnlyRowReasons
+                  ? { readOnlyRowReasons: remapped.readOnlyRowReasons }
+                  : {})
               };
             }
 
@@ -1971,7 +1977,8 @@ export async function createNativeDatabaseConnection(
               rows: rows,
               columns,
               values: rows,
-              exactIntegerTexts
+              exactIntegerTexts,
+              ...(oversizedCells ? { oversizedCells } : {})
             };
           } catch (err) {
             if (snapshotName) {
@@ -2132,6 +2139,7 @@ export async function createNativeDatabaseConnection(
          * Update multiple cells in a batch.
          */
         updateCellBatch: async (table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> => {
+          updates.forEach(update => assertMutableRecordId(update.rowId));
           if (updates.length === 0) return [];
 
           if (updates.some(update => isPrimaryKeyRecordId(update.rowId))) {

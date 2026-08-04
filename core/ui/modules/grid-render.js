@@ -6,10 +6,30 @@ import {
     getCellValue,
     getCellValueForDisplay,
     getExactIntegerText,
+    getOversizedCellMetadata,
+    getReadOnlyRowReason,
+    getCellMutationBlockReason,
     getOrderedColumnIndices,
     getOrderedRowIndices
 } from './data-utils.js';
 import { syncSelectionDOM } from './grid-selection.js';
+
+const OVERSIZED_BLOB_PREVIEW_BYTES = 16;
+
+function formatOversizedPreview(value, metadata, ordinaryDisplayValue) {
+    const preview = metadata.storageClass === 'blob' && value instanceof Uint8Array
+        ? Array.from(value.subarray(0, OVERSIZED_BLOB_PREVIEW_BYTES), byte => (
+            byte.toString(16).padStart(2, '0')
+        )).join(' ')
+        : ordinaryDisplayValue;
+    return {
+        preview,
+        details: (
+            `… · ${metadata.storageClass.toUpperCase()} · ` +
+            `${metadata.byteLength.toLocaleString()} bytes · too large to edit inline`
+        )
+    };
+}
 
 function createEmptyView() {
     const emptyView = document.createElement('div');
@@ -200,12 +220,14 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
         const row = state.gridData[rowIdx];
         const isSelected = state.selectedRowIds.has(rowId);
         const isRowPinned = state.pinnedRowIds.has(rowId);
+        const readOnlyRowReason = getReadOnlyRowReason(rowIdx);
 
         const tr = document.createElement('tr');
         tr.id = `row-${rowIdx}`;
-        tr.className = `data-row ${isSelected ? 'selected' : ''} ${isRowPinned ? 'pinned' : ''}`;
+        tr.className = `data-row ${isSelected ? 'selected' : ''} ${isRowPinned ? 'pinned' : ''} ${readOnlyRowReason ? 'read-only-row' : ''}`;
         tr.dataset.rowid = rowId;
         tr.dataset.rowidx = rowIdx;
+        if (readOnlyRowReason) tr.title = readOnlyRowReason;
 
         if (isRowPinned) {
             tr.style.top = `${pinnedRowOffsets.get(rowId)}px`;
@@ -238,7 +260,8 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
             const isNull = value === null || value === undefined;
             const isCellSelected = selectedCellKeys.has(`${rowIdx},${originalColIdx}`);
             const isColPinned = state.pinnedColumns.has(col.name);
-            const hasContent = !isNull && !(value instanceof Uint8Array);
+            const oversizedMetadata = getOversizedCellMetadata(rowIdx, originalColIdx);
+            const hasContent = !oversizedMetadata && !isNull && !(value instanceof Uint8Array);
             const colWidth = state.columnWidths[col.name] || 120;
             const isActiveMatch = !!activeMatch && activeMatch.rowIdx === rowIdx && activeMatch.colIdx === originalColIdx;
             const visibleValue = getCellValueForDisplay(row, rowIdx, originalColIdx);
@@ -254,9 +277,12 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
 
             const td = document.createElement('td');
             td.id = `cell-${rowIdx}-${originalColIdx}`;
-            td.className = `data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''} ${isActiveMatch ? 'active-match-cell' : ''}`;
+            td.className = `data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''} ${isActiveMatch ? 'active-match-cell' : ''} ${oversizedMetadata ? 'oversized-cell' : ''}`;
             td.dataset.rowidx = rowIdx;
             td.dataset.colidx = originalColIdx;
+            if (oversizedMetadata || readOnlyRowReason) {
+                td.title = getCellMutationBlockReason(rowIdx, originalColIdx);
+            }
 
             Object.assign(td.style, {
                 width: `${colWidth}px`,
@@ -275,11 +301,17 @@ function createTableBody(orderedColumns, columnIndexMap, pinnedColumnOffsets, ro
             textSpan.className = 'cell-text';
             // Use DOM text nodes (never innerHTML) for security (prevents XSS).
             // formatCellValueAsText returns unescaped text suitable for textContent/text nodes.
+            const oversizedDisplay = oversizedMetadata
+                ? formatOversizedPreview(value, oversizedMetadata, displayValue)
+                : undefined;
             appendHighlightedText(
                 textSpan,
-                displayValue,
+                oversizedDisplay?.preview ?? displayValue,
                 buildCellHighlightMatcher(value, columnFilterValues[displayColIdx], exactIntegerText)
             );
+            if (oversizedDisplay) {
+                textSpan.appendChild(document.createTextNode(oversizedDisplay.details));
+            }
             td.appendChild(textSpan);
 
             if (hasContent) {

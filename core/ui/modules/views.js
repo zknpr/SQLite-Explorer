@@ -431,6 +431,9 @@ export async function dropViewFromSidebar(view) {
             state.renderedTable = null;
             state.tableColumns = [];
             state.gridData = [];
+            state.gridExactIntegerTexts = {};
+            state.gridOversizedCells = {};
+            state.gridReadOnlyRowReasons = {};
             document.getElementById('tableNameLabel').textContent = 'No table selected';
             showEmptyState();
             updateToolbarButtons();

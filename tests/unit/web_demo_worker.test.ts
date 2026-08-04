@@ -566,6 +566,79 @@ describe('web demo view worker', () => {
         assert.strictEqual(underscoreCount, 1);
     });
 
+    it('matches native/WASM bounded TEXT and BLOB grid previews', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_contained_cells (text_value TEXT, blob_value BLOB); ' +
+            "INSERT INTO demo_contained_cells VALUES ('😀😀😀', x'000102030405060708090a0b'); " +
+            "INSERT INTO demo_contained_cells VALUES ('ok', x'0102')"
+        );
+
+        const page = await worker.invoke('fetchTableData', 'demo_contained_cells', {
+            columns: ['rowid', 'text_value', 'blob_value'],
+            orderBy: 'rowid',
+            limit: 2,
+            offset: 0,
+            maxInlineCellBytes: 8,
+            maxPageResponseBytes: 64
+        });
+
+        assert.deepStrictEqual(Array.from(page.rows[0].slice(0, 2)), [1, '😀😀']);
+        assert.deepStrictEqual(Array.from(page.rows[0][2]), [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert.deepStrictEqual(Array.from(page.rows[1].slice(0, 2)), [2, 'ok']);
+        assert.deepStrictEqual(Array.from(page.rows[1][2]), [1, 2]);
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(page.oversizedCells)), {
+            0: {
+                1: { storageClass: 'text', byteLength: 12 },
+                2: { storageClass: 'blob', byteLength: 12 }
+            }
+        });
+
+        const small = await worker.invoke('fetchTableData', 'demo_contained_cells', {
+            columns: ['rowid', 'text_value', 'blob_value'],
+            filters: [{ column: 'text_value', value: 'ok' }],
+            limit: 1,
+            offset: 0,
+            maxInlineCellBytes: 8,
+            maxPageResponseBytes: 64
+        });
+        assert.deepStrictEqual(Array.from(small.rows[0].slice(0, 2)), [2, 'ok']);
+        assert.deepStrictEqual(Array.from(small.rows[0][2]), [1, 2]);
+        assert.strictEqual(small.oversizedCells, undefined);
+    });
+
+    it('marks an oversized demo WITHOUT ROWID primary key read-only', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_oversized_identity ' +
+            '(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO demo_oversized_identity VALUES ('abcdefghijklmnopqrstuvwxyz012345', 'visible')"
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_oversized_identity', {
+            columns: ['rowid', 'key', 'value'],
+            limit: 1,
+            offset: 0,
+            maxInlineCellBytes: 8,
+            maxPageResponseBytes: 64
+        });
+        const identity = page.rows[0][0];
+
+        assert.match(String(identity), /^readonly-pk:/);
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(page.oversizedCells)), {
+            0: { 1: { storageClass: 'text', byteLength: 32 } }
+        });
+        assert.match(
+            page.readOnlyRowReasons?.[0] ?? '',
+            /WITHOUT ROWID primary-key column "key".*32 bytes.*identity was not transported/
+        );
+        await assert.rejects(
+            worker.invoke('updateCell', 'demo_oversized_identity', identity, 'value', 'changed'),
+            /WITHOUT ROWID primary-key column "key".*32 bytes.*identity was not transported/
+        );
+    });
+
     it('excludes the hidden rowid from demo data and count global filters', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

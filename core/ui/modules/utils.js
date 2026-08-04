@@ -4,7 +4,8 @@
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 import {
     decodePrimaryKeyRecordId,
-    isPrimaryKeyRecordId
+    isPrimaryKeyRecordId,
+    isReadOnlyPrimaryKeyRecordId
 } from '../../../src/core/row-identity.ts';
 
 /**
@@ -114,6 +115,9 @@ export function appendHighlightedText(parentEl, text, matcher) {
  * Validate and sanitize a rowid for use in SQL queries.
  */
 export function validateRowId(rowId) {
+    // Read-only identity tokens never enter SQL. Preserve them through DOM event
+    // routing so the host can return the exact server-authored refusal reason.
+    if (isReadOnlyPrimaryKeyRecordId(rowId)) return rowId;
     if (isPrimaryKeyRecordId(rowId)) {
         decodePrimaryKeyRecordId(rowId);
         return rowId;

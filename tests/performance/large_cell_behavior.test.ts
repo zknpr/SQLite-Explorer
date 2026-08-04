@@ -11,6 +11,13 @@ const SIZE_MIB = Number(process.env.SQLITE_EXPLORER_LARGE_CELL_MIB ?? '256');
 const MIB = 1024 * 1024;
 const EXPECTED_CELL_BYTES = SIZE_MIB * MIB;
 const MAX_INLINE_CELL_BYTES = MIB;
+// QueryResultSet retains rows/values compatibility aliases, and BLOBs expand to
+// base64 in the existing RPC serializer. One 1 MiB bounded BLOB therefore stays
+// below 3 MiB on the wire instead of amplifying the 256 MiB source cell.
+const MAX_GRID_RESPONSE_CHARS = 3 * MIB;
+// The pinned pre-containment probes peaked at 609–896 MiB RSS. Keep this well
+// below that lower bound while leaving headroom for native SQLite and test setup.
+const MAX_GRID_PROBE_RSS_BYTES = 384 * MIB;
 const MAX_SINGLE_OUTPUT_CHUNK = MIB;
 const READ_WINDOW_BYTES = 64 * 1024;
 const TEST_ROOT = path.join(REPO_ROOT, '.tmp', `large-cell-tests-${process.pid}`);
@@ -209,15 +216,23 @@ describe('very large single-cell behavior (opt-in)', () => {
   });
 
   for (const kind of ['blob', 'text'] as const) {
-    knownFailure(
+    test(
       `grid fetch keeps an oversized ${kind.toUpperCase()} out of the native IPC result`,
-      'fetchTableData currently transports the complete cell',
+      {
+        skip: !RUN_LARGE_CELL_TESTS
+          && `set SQLITE_EXPLORER_RUN_LARGE_CELL_TESTS=1 to run the ${SIZE_MIB} MiB probes`,
+        timeout: 300_000
+      },
       async t => {
         const result = await runProbe('grid-fetch', { kind });
         diagnose(t, result);
         assert.equal(result.failureStage, undefined);
         assert.equal(result.oversized, true);
+        assert.equal(result.storageClass, kind);
+        assert.equal(result.sourceCellBytes, EXPECTED_CELL_BYTES);
         assert.ok(Number(result.transportedCellBytes) <= MAX_INLINE_CELL_BYTES);
+        assert.ok(Number(result.serializedResponseChars) <= MAX_GRID_RESPONSE_CHARS);
+        assert.ok(Number(result.maxRssBytes) <= MAX_GRID_PROBE_RSS_BYTES);
       }
     );
   }

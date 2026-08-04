@@ -367,6 +367,75 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.strictEqual(result.exactIntegerTexts?.[0]?.[0], '9007199254740993');
         });
 
+        await testContext.test('matches WASM/demo bounded TEXT and BLOB grid previews', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_contained_cells (text_value TEXT, blob_value BLOB); ' +
+                "INSERT INTO native_contained_cells VALUES ('😀😀😀', x'000102030405060708090a0b'); " +
+                "INSERT INTO native_contained_cells VALUES ('ok', x'0102')"
+            );
+            const page = await engine.fetchTableData('native_contained_cells', {
+                columns: ['rowid', 'text_value', 'blob_value'],
+                orderBy: 'rowid',
+                limit: 2,
+                offset: 0,
+                maxInlineCellBytes: 8,
+                maxPageResponseBytes: 64
+            });
+
+            assert.deepStrictEqual(page.rows[0], [
+                1,
+                '😀😀',
+                Uint8Array.from([0, 1, 2, 3, 4, 5, 6, 7])
+            ]);
+            assert.deepStrictEqual(page.rows[1], [2, 'ok', Uint8Array.from([1, 2])]);
+            assert.deepStrictEqual(page.oversizedCells, {
+                0: {
+                    1: { storageClass: 'text', byteLength: 12 },
+                    2: { storageClass: 'blob', byteLength: 12 }
+                }
+            });
+
+            const small = await engine.fetchTableData('native_contained_cells', {
+                columns: ['rowid', 'text_value', 'blob_value'],
+                filters: [{ column: 'text_value', value: 'ok' }],
+                limit: 1,
+                offset: 0,
+                maxInlineCellBytes: 8,
+                maxPageResponseBytes: 64
+            });
+            assert.deepStrictEqual(small.rows, [[2, 'ok', Uint8Array.from([1, 2])]]);
+            assert.strictEqual(small.oversizedCells, undefined);
+        });
+
+        await testContext.test('marks an oversized native WITHOUT ROWID primary key read-only', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_oversized_identity ' +
+                '(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID; ' +
+                "INSERT INTO native_oversized_identity VALUES ('abcdefghijklmnopqrstuvwxyz012345', 'visible')"
+            );
+            const page = await engine.fetchTableData('native_oversized_identity', {
+                columns: ['rowid', 'key', 'value'],
+                limit: 1,
+                offset: 0,
+                maxInlineCellBytes: 8,
+                maxPageResponseBytes: 64
+            });
+            const identity = page.rows[0][0] as string;
+
+            assert.match(identity, /^readonly-pk:/);
+            assert.deepStrictEqual(page.oversizedCells, {
+                0: { 1: { storageClass: 'text', byteLength: 32 } }
+            });
+            assert.match(
+                page.readOnlyRowReasons?.[0] ?? '',
+                /WITHOUT ROWID primary-key column "key".*32 bytes.*identity was not transported/
+            );
+            await assert.rejects(
+                engine.updateCell('native_oversized_identity', identity, 'value', 'changed'),
+                /WITHOUT ROWID primary-key column "key".*32 bytes.*identity was not transported/
+            );
+        });
+
         await testContext.test('keeps adjacent unsafe native rowids distinct and editable', async () => {
             await engine.executeQuery(
                 'CREATE TABLE native_unsafe_rowids (value TEXT); ' +

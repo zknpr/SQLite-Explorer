@@ -26,6 +26,13 @@ export const state = {
     // Sparse row/data-column exact text for SQLite INTEGERs outside JS's safe
     // range. General grid values stay numbers for backward compatibility.
     gridExactIntegerTexts: {},
+    // Sparse row/source-column metadata for TEXT/BLOB values that were bounded
+    // at the query boundary. Source-column indexing includes the identity slot
+    // used by tables, matching gridExactIntegerTexts.
+    gridOversizedCells: {},
+    // Sparse reasons for WITHOUT ROWID rows whose complete primary-key identity
+    // was intentionally not transported because a key member was oversized.
+    gridReadOnlyRowReasons: {},
 
     // Cell editing state
     editingCellInfo: null,

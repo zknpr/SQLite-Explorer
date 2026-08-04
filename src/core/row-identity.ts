@@ -8,6 +8,8 @@ import { escapeIdentifier, validateRowId } from './sql-utils';
 
 const PRIMARY_KEY_RECORD_ID_PREFIX = 'pk:';
 const PRIMARY_KEY_RECORD_ID_VERSION = 1;
+const READ_ONLY_PRIMARY_KEY_RECORD_ID_PREFIX = 'readonly-pk:';
+const READ_ONLY_PRIMARY_KEY_RECORD_ID_VERSION = 1;
 
 /** Set-based identity metadata used by every schema-loading backend. */
 export const TABLE_IDENTITY_METADATA_SQL = `
@@ -34,6 +36,12 @@ type EncodedPrimaryKeyValue =
 interface PrimaryKeyRecordIdPayload {
   v: 1;
   c: Array<[string, EncodedPrimaryKeyValue]>;
+}
+
+interface ReadOnlyPrimaryKeyRecordIdPayload {
+  v: 1;
+  r: number;
+  m: string;
 }
 
 export interface DecodedPrimaryKeyRecordId {
@@ -112,6 +120,69 @@ export function isPrimaryKeyRecordId(recordId: unknown): recordId is string {
   return typeof recordId === 'string' && recordId.startsWith(PRIMARY_KEY_RECORD_ID_PREFIX);
 }
 
+export function isReadOnlyPrimaryKeyRecordId(recordId: unknown): recordId is string {
+  return typeof recordId === 'string'
+    && recordId.startsWith(READ_ONLY_PRIMARY_KEY_RECORD_ID_PREFIX);
+}
+
+/** Create a non-mutable row token without embedding any truncated key bytes. */
+export function encodeReadOnlyPrimaryKeyRecordId(
+  reason: string,
+  rowOrdinal: number
+): RecordId {
+  if (!reason || reason.length > 4096) {
+    throw new Error('Read-only primary-key reason must contain 1 through 4096 characters');
+  }
+  if (!Number.isSafeInteger(rowOrdinal) || rowOrdinal < 0) {
+    throw new Error(`Invalid read-only primary-key row ordinal: ${rowOrdinal}`);
+  }
+  const payload: ReadOnlyPrimaryKeyRecordIdPayload = {
+    v: READ_ONLY_PRIMARY_KEY_RECORD_ID_VERSION,
+    r: rowOrdinal,
+    m: reason
+  };
+  return READ_ONLY_PRIMARY_KEY_RECORD_ID_PREFIX
+    + encodeURIComponent(JSON.stringify(payload));
+}
+
+function decodeReadOnlyPrimaryKeyRecordId(recordId: string): ReadOnlyPrimaryKeyRecordIdPayload {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(decodeURIComponent(
+      recordId.slice(READ_ONLY_PRIMARY_KEY_RECORD_ID_PREFIX.length)
+    ));
+  } catch {
+    throw new Error('Invalid read-only primary-key identity encoding');
+  }
+  if (
+    !payload
+    || typeof payload !== 'object'
+    || Array.isArray(payload)
+    || Object.keys(payload).length !== 3
+    || (payload as { v?: unknown }).v !== READ_ONLY_PRIMARY_KEY_RECORD_ID_VERSION
+    || !Number.isSafeInteger((payload as { r?: unknown }).r)
+    || Number((payload as { r?: unknown }).r) < 0
+    || typeof (payload as { m?: unknown }).m !== 'string'
+    || String((payload as { m?: unknown }).m).length < 1
+    || String((payload as { m?: unknown }).m).length > 4096
+  ) {
+    throw new Error('Invalid read-only primary-key identity payload');
+  }
+  const decoded = payload as ReadOnlyPrimaryKeyRecordIdPayload;
+  const canonical = READ_ONLY_PRIMARY_KEY_RECORD_ID_PREFIX
+    + encodeURIComponent(JSON.stringify(decoded));
+  if (canonical !== recordId) {
+    throw new Error('Read-only primary-key identity is not canonical');
+  }
+  return decoded;
+}
+
+/** Fail every mutation path with the exact reason transported by the grid. */
+export function assertMutableRecordId(recordId: RecordId): void {
+  if (!isReadOnlyPrimaryKeyRecordId(recordId)) return;
+  throw new Error(decodeReadOnlyPrimaryKeyRecordId(recordId).m);
+}
+
 /** Encode ordered PK values into a canonical, RPC- and URI-safe opaque RecordId. */
 export function encodePrimaryKeyRecordId(
   columns: readonly PrimaryKeyColumn[],
@@ -179,6 +250,7 @@ export function buildRecordIdentityPredicate(
   recordId: RecordId,
   identity: TableIdentity
 ): RecordIdentityPredicate {
+  assertMutableRecordId(recordId);
   if (identity.kind === 'rowid') {
     return { sql: 'rowid = ?', params: [validateRowId(recordId)] };
   }

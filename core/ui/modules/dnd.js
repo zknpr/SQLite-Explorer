@@ -6,6 +6,8 @@ import { updateStatus } from './ui.js';
 import { state } from './state.js';
 import {
     clearExactIntegerText,
+    clearOversizedCellMetadata,
+    getCellMutationBlockReason,
     getRowId,
     getRowDataOffset,
     remapDisplayedRowIdentity,
@@ -56,7 +58,12 @@ function onDragOver(e) {
     e.dataTransfer.dropEffect = 'copy';
 
     const cell = e.target.closest('.data-cell');
-    if (cell && !cell.classList.contains('row-number')) {
+    const rowIdx = cell ? parseInt(cell.dataset.rowidx, 10) : -1;
+    const colIdx = cell ? parseInt(cell.dataset.colidx, 10) : -1;
+    const mutationBlockReason = rowIdx >= 0 && colIdx >= 0
+        ? getCellMutationBlockReason(rowIdx, colIdx)
+        : undefined;
+    if (cell && !cell.classList.contains('row-number') && !mutationBlockReason) {
         if (lastHighlightedCell && lastHighlightedCell !== cell) {
             lastHighlightedCell.classList.remove('drag-over');
         }
@@ -131,6 +138,11 @@ function captureUploadTarget(cell) {
 
     const rowIdx = parseInt(cell.dataset.rowidx, 10);
     const colIdx = parseInt(cell.dataset.colidx, 10);
+    const mutationBlockReason = getCellMutationBlockReason(rowIdx, colIdx);
+    if (mutationBlockReason) {
+        updateStatus(mutationBlockReason);
+        return null;
+    }
     const row = state.gridData?.[rowIdx];
     const column = state.tableColumns[colIdx];
     if (!row || !column) return null;
@@ -251,6 +263,7 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
             if (currentCell) {
                 state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = uint8Array;
                 clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
+                clearOversizedCellMetadata(currentCell.rowIdx, currentCell.colIdx);
                 const cellElement = document.getElementById(
                     `cell-${currentCell.rowIdx}-${currentCell.colIdx}`
                 );

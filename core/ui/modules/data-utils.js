@@ -43,6 +43,26 @@ export function getExactIntegerText(rowIdx, colIdx) {
     return state.gridExactIntegerTexts?.[rowIdx]?.[colIdx + getRowDataOffset()];
 }
 
+export function getOversizedCellMetadata(rowIdx, colIdx) {
+    return state.gridOversizedCells?.[rowIdx]?.[colIdx + getRowDataOffset()];
+}
+
+export function getReadOnlyRowReason(rowIdx) {
+    return state.gridReadOnlyRowReasons?.[rowIdx];
+}
+
+/** Explain why a grid cell cannot enter any mutation workflow. */
+export function getCellMutationBlockReason(rowIdx, colIdx) {
+    const rowReason = getReadOnlyRowReason(rowIdx);
+    if (rowReason) return rowReason;
+    const oversized = getOversizedCellMetadata(rowIdx, colIdx);
+    if (!oversized) return undefined;
+    return (
+        `Too large to edit inline — ${oversized.byteLength.toLocaleString()} bytes ` +
+        `(${oversized.storageClass.toUpperCase()})`
+    );
+}
+
 /** Return the authoritative user-visible value when SQLite supplied one. */
 export function getCellValueForDisplay(row, rowIdx, colIdx) {
     return getExactIntegerText(rowIdx, colIdx) ?? getCellValue(row, colIdx);
@@ -53,6 +73,13 @@ export function clearExactIntegerText(rowIdx, colIdx) {
     if (!exactRow) return;
     delete exactRow[colIdx + getRowDataOffset()];
     if (Object.keys(exactRow).length === 0) delete state.gridExactIntegerTexts[rowIdx];
+}
+
+export function clearOversizedCellMetadata(rowIdx, colIdx) {
+    const oversizedRow = state.gridOversizedCells?.[rowIdx];
+    if (!oversizedRow) return;
+    delete oversizedRow[colIdx + getRowDataOffset()];
+    if (Object.keys(oversizedRow).length === 0) delete state.gridOversizedCells[rowIdx];
 }
 
 /** Return original column indices in the same pinned-first order as the grid. */

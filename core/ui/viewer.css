@@ -768,6 +768,15 @@ body {
     font-style: italic;
 }
 
+.data-cell.oversized-cell {
+    color: var(--vscode-editorWarning-foreground, #cca700);
+    cursor: not-allowed;
+}
+
+.data-row.read-only-row .data-cell.row-number {
+    color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
 .data-cell.cell-selected {
     background: var(--active-bg);
 }

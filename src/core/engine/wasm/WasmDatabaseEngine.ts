@@ -46,8 +46,14 @@ import {
   normalizeIntegerRowsForTransport,
   ROWID_TABLE_AUTHORITY_SQL
 } from '../../integer-utils';
+import {
+  buildCellContainmentQuery,
+  decodeCellContainment,
+  remapPrimaryKeyContainment
+} from '../../cell-containment';
 import { getNodeFs } from '../../platform/fs';
 import {
+  assertMutableRecordId,
   buildRecordIdentitiesPredicate,
   buildRecordIdentityPredicate,
   buildTableIdentityMap,
@@ -909,6 +915,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     value: CellValue,
     patch?: string
   ): Promise<RecordId> {
+    assertMutableRecordId(rowId);
     if (isPrimaryKeyRecordId(rowId)) {
       const identity = await this.resolveTableIdentity(table);
       if (identity.kind !== 'primaryKey') {
@@ -1079,6 +1086,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * Delete rows by ID.
    */
   async deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void> {
+    rowIds.forEach(assertMutableRecordId);
     if (rowIds.length === 0) return [];
 
     if (rowIds.some(isPrimaryKeyRecordId)) {
@@ -1753,6 +1761,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * Update multiple cells in a batch.
    */
   async updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> {
+    updates.forEach(update => assertMutableRecordId(update.rowId));
     if (updates.length === 0) return [];
 
     if (updates.some(update => isPrimaryKeyRecordId(update.rowId))) {
@@ -1981,7 +1990,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         headerStmt.free();
         headerStmt = null;
 
-        const transportQuery = buildExactNumericTextQuery(sql, headers.length);
+        const containmentQuery = buildCellContainmentQuery(sql, headers.length, queryOptions);
+        const transportQuery = buildExactNumericTextQuery(
+          containmentQuery.sql,
+          headers.length + 1
+        );
         stmt = this.instance.prepare(transportQuery.sql, bindParams);
         const sourceRows: Array<Array<CellValue | bigint>> = [];
 
@@ -2037,48 +2050,42 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           companionResults
         );
 
-        const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+        const normalized = normalizeIntegerRowsForTransport(
           sourceRows,
           transportQuery.valueColumnCount,
           companionExactTexts,
           isRowIdTable && needsExactRowIdIdentity ? 0 : undefined
         );
+        const contained = decodeCellContainment(
+          normalized.rows,
+          headers.length,
+          normalized.exactIntegerTexts
+        );
+        const { rows, oversizedCells, exactIntegerTexts } = contained;
         if (primaryKeyContext) {
-          const primaryKeyIndices = primaryKeyContext.identity.columns.map(column => {
-            const index = headers.indexOf(column.identifier);
-            if (index < 0) {
-              throw new Error(`Primary-key column missing from table fetch: ${column.identifier}`);
-            }
-            return index;
-          });
           const visibleColumnCount = primaryKeyContext.visibleColumns.length;
-          const identities = sourceRows.map(row => encodePrimaryKeyRecordId(
-            primaryKeyContext!.identity.columns,
-            primaryKeyIndices.map(index => row[index])
-          ));
-          let shiftedExactIntegerTexts: QueryResultSet['exactIntegerTexts'];
-          if (exactIntegerTexts) {
-            for (const [rowIndexText, exactRow] of Object.entries(exactIntegerTexts)) {
-              for (const [columnIndexText, exactText] of Object.entries(exactRow)) {
-                const columnIndex = Number(columnIndexText);
-                if (columnIndex >= visibleColumnCount) continue;
-                shiftedExactIntegerTexts ??= {};
-                shiftedExactIntegerTexts[Number(rowIndexText)] ??= {};
-                shiftedExactIntegerTexts[Number(rowIndexText)][columnIndex + 1] = exactText;
-              }
-            }
-          }
-          const resultRows = rows.map((row, index) => [
-            identities[index],
-            ...row.slice(0, visibleColumnCount)
-          ]);
+          const remapped = remapPrimaryKeyContainment({
+            identity: primaryKeyContext.identity,
+            sourceColumns: headers,
+            visibleColumnCount,
+            identityRows: sourceRows,
+            rows,
+            oversizedCells,
+            exactIntegerTexts,
+            effectiveInlineCellBytes: containmentQuery.effectiveInlineCellBytes,
+            rowOffset: queryOptions.offset
+          });
           const resultHeaders = ['rowid', ...primaryKeyContext.visibleColumns];
           return {
             headers: resultHeaders,
-            rows: resultRows,
+            rows: remapped.rows,
             columns: resultHeaders,
-            values: resultRows,
-            exactIntegerTexts: shiftedExactIntegerTexts
+            values: remapped.rows,
+            exactIntegerTexts: remapped.exactIntegerTexts,
+            ...(remapped.oversizedCells ? { oversizedCells: remapped.oversizedCells } : {}),
+            ...(remapped.readOnlyRowReasons
+              ? { readOnlyRowReasons: remapped.readOnlyRowReasons }
+              : {})
           };
         }
         return {
@@ -2086,7 +2093,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             rows,
             columns: headers,
             values: rows,
-            exactIntegerTexts
+            exactIntegerTexts,
+            ...(oversizedCells ? { oversizedCells } : {})
         };
     } catch (err) {
         const errorDetail = err instanceof Error ? err.message : String(err);

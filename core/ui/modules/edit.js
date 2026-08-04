@@ -12,6 +12,10 @@ import {
     getCellValue,
     getCellValueForDisplay,
     clearExactIntegerText,
+    clearOversizedCellMetadata,
+    getOversizedCellMetadata,
+    getReadOnlyRowReason,
+    getCellMutationBlockReason,
     getRowId,
     resolveDisplayedCell,
     remapDisplayedRowIdentity,
@@ -48,6 +52,12 @@ export function initEdit() {
 export function startCellEdit(rowIdx, colIdx, rowId) {
     if (state.isReadOnly || state.selectedTableType !== 'table') {
         updateStatus('Views are read-only');
+        return;
+    }
+
+    const mutationBlockReason = getCellMutationBlockReason(rowIdx, colIdx);
+    if (mutationBlockReason) {
+        updateStatus(mutationBlockReason);
         return;
     }
 
@@ -213,6 +223,7 @@ export async function saveCellEdit() {
         if (currentCell) {
             state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = valueToSave;
             clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
+            clearOversizedCellMetadata(currentCell.rowIdx, currentCell.colIdx);
         }
 
         if (state.editingCellInfo === editSession) cleanupCellEdit();
@@ -326,6 +337,11 @@ export async function openCellInVsCode() {
     if (!state.cellPreviewInfo) return;
 
     const { rowIdx, colIdx, rowId, columnName, originalValue, originalText } = state.cellPreviewInfo;
+    const mutationBlockReason = getCellMutationBlockReason(rowIdx, colIdx);
+    if (mutationBlockReason) {
+        updateStatus(mutationBlockReason);
+        return;
+    }
     const column = state.tableColumns[colIdx];
 
     // We get the webview id from dataset if available or assume 'default'
@@ -356,6 +372,12 @@ export async function openCellInVsCode() {
 }
 
 export function openCellPreview(rowIdx, colIdx, rowId) {
+    const oversizedMetadata = getOversizedCellMetadata(rowIdx, colIdx);
+    if (oversizedMetadata) {
+        updateStatus(getCellMutationBlockReason(rowIdx, colIdx));
+        return;
+    }
+
     if (state.editingCellInfo) {
         cancelCellEdit();
     }
@@ -367,6 +389,7 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     if (!row) return;
 
     const value = getCellValue(row, colIdx);
+    const readOnlyRowReason = getReadOnlyRowReason(rowIdx);
 
     // Delegate BLOB inspection
     if (value instanceof Uint8Array) {
@@ -383,7 +406,8 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
         rowId,
         columnName: column.name,
         originalValue: value,
-        originalText
+        originalText,
+        readOnlyReason: readOnlyRowReason
     };
 
     const modal = document.getElementById('cellPreviewModal');
@@ -393,6 +417,7 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     resetTextareaTabFocusEscape(textarea);
     const readonlyBadgeEl = document.getElementById('cellPreviewReadonlyBadge');
     const saveBtnEl = document.getElementById('cellPreviewSaveBtn');
+    const openInVsCodeBtnEl = document.getElementById('openInVsCodeBtn');
     const wrapBtnEl = document.getElementById('wrapTextBtn');
 
     columnNameEl.textContent = column.name;
@@ -409,17 +434,23 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
 
     textarea.value = displayValue;
 
-    const isReadonly = state.isReadOnly || state.selectedTableType !== 'table';
+    const isReadonly = state.isReadOnly || state.selectedTableType !== 'table' || !!readOnlyRowReason;
     textarea.readOnly = isReadonly;
     if (isReadonly) {
         textarea.classList.add('readonly');
         readonlyBadgeEl.style.display = 'inline';
+        readonlyBadgeEl.textContent = readOnlyRowReason
+            ? 'Read-only (primary key too large)'
+            : 'Read-only (View)';
+        readonlyBadgeEl.title = readOnlyRowReason || '';
         saveBtnEl.style.display = 'none';
     } else {
         textarea.classList.remove('readonly');
         readonlyBadgeEl.style.display = 'none';
+        readonlyBadgeEl.title = '';
         saveBtnEl.style.display = 'inline-block';
     }
+    if (openInVsCodeBtnEl) openInVsCodeBtnEl.style.display = readOnlyRowReason ? 'none' : '';
 
     updateCellPreviewCharCount();
 
@@ -464,6 +495,10 @@ export async function saveCellPreview() {
         return;
     }
     if (!state.cellPreviewInfo) return;
+    if (state.cellPreviewInfo.readOnlyReason) {
+        updateStatus(state.cellPreviewInfo.readOnlyReason);
+        return;
+    }
     if (state.selectedTableType !== 'table') {
         updateStatus('Views are read-only');
         return;
@@ -521,6 +556,7 @@ export async function saveCellPreview() {
         if (currentCell) {
             state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = valueToSave;
             clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
+            clearOversizedCellMetadata(currentCell.rowIdx, currentCell.colIdx);
         }
 
         if (state.cellPreviewInfo === previewSession) closeCellPreview();

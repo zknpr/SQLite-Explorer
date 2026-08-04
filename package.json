@@ -149,6 +149,13 @@
           "default": 30000,
           "markdownDescription": "Maximum time in milliseconds for query execution before timeout. Prevents runaway queries from freezing the extension. Set to a higher value for complex queries on large databases."
         },
+        "sqliteExplorer.maxInlineCellBytes": {
+          "type": "number",
+          "minimum": 1024,
+          "maximum": 16777216,
+          "default": 1048576,
+          "markdownDescription": "Maximum source bytes fetched inline for one TEXT or BLOB grid cell. The 1 MiB default keeps ordinary values inline while containing the 609–896 MiB RSS amplification observed when a 256 MiB cell crossed the grid/IPC path. A fixed 16 MiB page budget may reduce the effective preview for wide or large pages."
+        },
         "sqliteExplorer.maxUndoMemory": {
           "type": "number",
           "minimum": 1048576,

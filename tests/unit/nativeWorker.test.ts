@@ -1001,12 +1001,21 @@ describe('createNativeDatabaseConnection', () => {
 
     it('merges native and companion exact numeric text maps with native entries winning', async () => {
         const columns = ['rowid', ...Array.from({ length: 1000 }, (_, index) => `c${index}`)];
-        const sourceRow = [1, 1.25, 2.5, ...Array.from({ length: 998 }, () => 0)];
+        // queryNumeric receives the bounded transport SELECT, whose final
+        // private column packs one empty containment token per numeric value.
+        const transportColumns = [...columns, '__sqlite_explorer_cell_metadata'];
+        const sourceRow = [
+            1,
+            1.25,
+            2.5,
+            ...Array.from({ length: 998 }, () => 0),
+            '|'.repeat(columns.length - 1)
+        ];
         const connection = await createRecordingConnection(call => {
             if (call.method === 'queryNumeric') {
                 return {
                     result: {
-                        columns,
+                        columns: transportColumns,
                         values: [sourceRow],
                         exactIntegerTexts: { 0: { 2: '2.50000000000001' } }
                     }

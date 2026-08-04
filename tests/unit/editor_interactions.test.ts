@@ -16,6 +16,7 @@ const editModulePath = '../../core/ui/modules/edit.js';
 const gridEventsModulePath = '../../core/ui/modules/grid-events.js';
 const globalShortcutsModulePath = '../../core/ui/modules/global-shortcuts.js';
 const dndModulePath = '../../core/ui/modules/dnd.js';
+const clipboardModulePath = '../../core/ui/modules/clipboard.js';
 
 function createClassList(initial: string[] = []) {
     const classes = new Set(initial);
@@ -58,6 +59,8 @@ describe('editor keyboard and grid selection interactions', () => {
         state.tableColumns = [];
         state.gridData = [];
         state.gridExactIntegerTexts = {};
+        state.gridOversizedCells = {};
+        state.gridReadOnlyRowReasons = {};
         state.pinnedColumns.clear();
         state.pinnedRowIds.clear();
         state.selectedTable = null;
@@ -875,6 +878,107 @@ describe('editor keyboard and grid selection interactions', () => {
 
         assert.strictEqual(container.scrollLeft, 30);
         assert.strictEqual(scrollLeftWhenFocused, 30);
+    });
+
+    it('refuses inline editing of a bounded oversized preview with the exact byte count', async () => {
+        const status = { textContent: '' };
+        const cell = {
+            innerHTML: '',
+            classList: createClassList(),
+            children: [] as any[],
+            appendChild(child: any) { this.children.push(child); }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'statusText') return status;
+                if (id === 'cell-0-0') return cell;
+                return null;
+            }
+        };
+        const { state } = await import(stateModulePath);
+        const { startCellEdit } = await import(editModulePath);
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.gridData = [[1, 'bounded preview']];
+        state.gridOversizedCells = {
+            0: { 1: { storageClass: 'text', byteLength: 268435456 } }
+        };
+
+        startCellEdit(0, 0, 1);
+
+        assert.strictEqual(state.editingCellInfo, null);
+        assert.strictEqual(cell.children.length, 0);
+        assert.strictEqual(
+            status.textContent,
+            'Too large to edit inline — 268,435,456 bytes (TEXT)'
+        );
+    });
+
+    it('refuses clear and drag/drop mutation affordances for oversized previews', async () => {
+        const listeners = new Map<string, (event: any) => any>();
+        const status = { textContent: '' };
+        const cell = {
+            dataset: { rowidx: '0', colidx: '0' },
+            classList: createClassList(),
+            closest(selector: string) {
+                return selector === '.data-cell' ? this : null;
+            }
+        };
+        const container = {
+            addEventListener(type: string, listener: (event: any) => any) {
+                listeners.set(type, listener);
+            }
+        };
+        (globalThis as any).document = {
+            addEventListener() {},
+            getElementById(id: string) {
+                if (id === 'gridContainer') return container;
+                if (id === 'statusText') return status;
+                return null;
+            }
+        };
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { clearSelectedCellValues } = await import(clipboardModulePath);
+        const { initDragAndDrop } = await import(dndModulePath);
+        const originalUpdateCellBatch = backendApi.updateCellBatch;
+        let updateCalls = 0;
+        backendApi.updateCellBatch = async () => {
+            updateCalls++;
+            throw new Error('unexpected backend update');
+        };
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'payload', type: 'BLOB' }];
+        state.gridData = [[1, new Uint8Array([0xde, 0xad])]];
+        state.gridOversizedCells = {
+            0: { 1: { storageClass: 'blob', byteLength: 4096 } }
+        };
+        state.selectedCells = [{
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 1,
+            value: state.gridData[0][1]
+        }];
+
+        try {
+            await clearSelectedCellValues();
+            assert.strictEqual(updateCalls, 0);
+            assert.strictEqual(status.textContent, 'Too large to edit inline — 4,096 bytes (BLOB)');
+
+            status.textContent = '';
+            initDragAndDrop();
+            await listeners.get('drop')?.({
+                preventDefault() {},
+                target: cell,
+                dataTransfer: { files: [], getData: () => '' }
+            });
+            assert.strictEqual(status.textContent, 'Too large to edit inline — 4,096 bytes (BLOB)');
+        } finally {
+            backendApi.updateCellBatch = originalUpdateCellBatch;
+        }
     });
 
     it('keeps Tab advancement bound to the intended row when the edit changes sort order', async () => {

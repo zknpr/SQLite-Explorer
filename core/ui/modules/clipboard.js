@@ -7,6 +7,7 @@ import { updateStatus, updateToolbarButtons } from './ui.js';
 import { loadTableData } from './grid.js';
 import {
     getCellValueForDisplay,
+    getCellMutationBlockReason,
     getRowDataOffset,
     remapDisplayedRowIdentity,
     resolveDisplayedCell
@@ -121,6 +122,13 @@ export async function clearSelectedCellValues() {
     if (state.isReadOnly || state.selectedTableType !== 'table') {
         updateStatus('Views are read-only');
         return;
+    }
+    for (const cell of state.selectedCells) {
+        const mutationBlockReason = getCellMutationBlockReason(cell.rowIdx, cell.colIdx);
+        if (mutationBlockReason) {
+            updateStatus(mutationBlockReason);
+            return;
+        }
     }
 
     try {

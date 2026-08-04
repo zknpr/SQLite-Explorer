@@ -184,6 +184,8 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         state.currentPageIndex = currentPageIndex;
         state.gridData = dataResult.rows || [];
         state.gridExactIntegerTexts = dataResult.exactIntegerTexts || {};
+        state.gridOversizedCells = dataResult.oversizedCells || {};
+        state.gridReadOnlyRowReasons = dataResult.readOnlyRowReasons || {};
         state.lastSuccessfulFilterState = {
             table: requestedTable,
             filterQuery: requestedFilterQuery,

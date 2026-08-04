@@ -34,6 +34,21 @@ export type CellValue = string | number | bigint | null | Uint8Array;
  */
 export type ExactIntegerTextMap = Record<number, Record<number, string>>;
 
+/** SQLite storage classes whose grid values can require bounded previews. */
+export type OversizedCellStorageClass = 'text' | 'blob';
+
+/** Exact source metadata for one grid cell whose transported value is a preview. */
+export interface OversizedCellMetadata {
+  storageClass: OversizedCellStorageClass;
+  byteLength: number;
+}
+
+/** Sparse row/column metadata for cells bounded at the query boundary. */
+export type OversizedCellMap = Record<number, Record<number, OversizedCellMetadata>>;
+
+/** Sparse reasons for rows that cannot safely be mutated from their grid identity. */
+export type ReadOnlyRowReasonMap = Record<number, string>;
+
 /**
  * Unique identifier for a database row.
  * Can be numeric ROWID or string for compatibility.
@@ -71,6 +86,10 @@ export interface QueryResultSet {
   rows: CellValue[][];
   /** Sparse row/column sidecar for numeric text lost by the number-based grid contract. */
   exactIntegerTexts?: ExactIntegerTextMap;
+  /** Sparse source metadata for TEXT/BLOB values returned as bounded previews. */
+  oversizedCells?: OversizedCellMap;
+  /** Rows whose database identity was deliberately not transported. */
+  readOnlyRowReasons?: ReadOnlyRowReasonMap;
   /** Column names - sql.js compatible alias for webview */
   columns?: string[];
   /** Row data - sql.js compatible alias for webview */
@@ -463,6 +482,10 @@ export interface TableQueryOptions {
     value: string;
   }[];
   globalFilter?: string;
+  /** Maximum source bytes transported inline for any one TEXT/BLOB grid cell. */
+  maxInlineCellBytes?: number;
+  /** Maximum aggregate inline-cell preview bytes allocated across one page. */
+  maxPageResponseBytes?: number;
 }
 
 export interface TableCountOptions {

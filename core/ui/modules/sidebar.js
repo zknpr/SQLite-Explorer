@@ -5,7 +5,12 @@ import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus } from './ui.js';
 import { loadTableData, loadTableColumns } from './grid.js';
-import { getCellValueForDisplay, getRowDataOffset, getRowId } from './data-utils.js';
+import {
+    getCellMutationBlockReason,
+    getCellValueForDisplay,
+    getRowDataOffset,
+    getRowId
+} from './data-utils.js';
 import { updateSelectionStates } from './grid-selection.js';
 import { openCreateTableModal } from './crud.js';
 import { openSettingsModal } from './settings.js';
@@ -384,6 +389,13 @@ export function updateBatchSidebar() {
 
 export async function applyBatchUpdate() {
     if (state.selectedCells.length === 0) return;
+    for (const cell of state.selectedCells) {
+        const mutationBlockReason = getCellMutationBlockReason(cell.rowIdx, cell.colIdx);
+        if (mutationBlockReason) {
+            updateStatus(mutationBlockReason);
+            return;
+        }
+    }
 
     const inputs = document.querySelectorAll('.batch-input');
 
