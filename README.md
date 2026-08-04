@@ -34,13 +34,16 @@ Handle tables with thousands of rows smoothly with pagination.
 - **Open SQLite files directly** — Supports `.sqlite`, `.db`, `.sqlite3`, `.db3`, `.sdb`, `.s3db`, and `.gpkg` formats
 - **Schema browser** — Explore tables, views, and indexes in a sidebar with search filtering
 - **Pagination** — Navigate large datasets with configurable page sizes (100–100,000 rows)
-- **Column sorting** — Click headers to sort ascending/descending
-- **Column & global filtering** — Per-column search and full-table text search
+- **Tri-state column sorting** — Click headers to cycle none → ascending → descending
+- **Column & global filtering** — Per-column search and full-table text search, with match highlighting and Enter / Shift+Enter navigation between matches
+- **View management** — Create, edit, and drop views from the sidebar; definitions are validated and previewed before saving, and edits open in a real VS Code editor tab
+- **Exact 64-bit integers** — Values beyond JavaScript's safe range display, edit, filter, and export losslessly
 - **Pin columns & rows** — Keep important data visible while scrolling
 - **SQL logging** — View all executed queries (reads and writes) in the VS Code Output panel
 
 ### Editing
 - **Inline cell editing** — Double-click any cell to modify its value
+- **WITHOUT ROWID tables** — Fully editable via primary-key identity: composite keys, TEXT/REAL/BLOB key columns, exact 64-bit keys, complete undo/redo
 - **VS Code editor integration** — Edit large values (JSON, SQL, text) in a full VS Code editor tab
 - **Batch updates** — Update a column for multiple selected rows simultaneously via the sidebar
 - **Row operations** — Insert new rows, delete selected rows
@@ -66,7 +69,7 @@ Handle tables with thousands of rows smoothly with pagination.
 
 ### Database Settings
 - **Pragma editor** — Configure SQLite pragmas (journal mode, foreign keys, synchronous, cache size, etc.) via GUI
-- **Query timeout** — Configurable timeout prevents runaway queries (default 30s)
+- **Query interruption** — Runaway queries are cancelled mid-statement on both backends; the configurable timeout (default 30s) is enforced inside SQLite's VM, and superseded view previews are cancelled automatically
 - **Auto-commit** — Optional instant-save mode for remote workspaces
 
 ### Cross-Platform
@@ -117,6 +120,8 @@ code --install-extension zknpr.sqlite-explorer
 | `Double-click` | Edit cell (inline, modal, or VS Code tab — configurable) |
 | `Enter` | Save cell edit |
 | `Escape` | Cancel edit / clear selection |
+| `Ctrl+A` / `Cmd+A` | Select all cells |
+| `Enter` / `Shift+Enter` (filter active) | Jump to next / previous match |
 | `Ctrl+C` / `Cmd+C` | Copy selected cells (tab-separated) |
 | `Ctrl+Z` / `Cmd+Z` | Undo |
 | `Ctrl+Y` / `Cmd+Shift+Z` | Redo |
@@ -180,7 +185,7 @@ cd sqlite-explorer
 
 npm install          # Install dependencies
 node scripts/build.mjs   # Build extension + worker
-npm test             # Run 237 unit tests
+npm test             # Run the unit test suite
 npm run package      # Package as .vsix
 ./install.sh         # Build + package + install to VS Code
 ```
@@ -206,8 +211,8 @@ If you find this extension useful, consider supporting development:
 
 ## Credits
 
-- **[sql.js](https://github.com/sql-js/sql.js)** — WebAssembly SQLite implementation
-- **[txiki.js](https://github.com/nicolo-ribaudo/txiki.js)** — Native JavaScript runtime (native SQLite backend)
+- **[sql.js](https://github.com/sql-js/sql.js)** — WebAssembly SQLite implementation (shipped as a [patched build](https://github.com/zknpr/sql.js/tree/sqlite-explorer/progress-interrupt) adding progress-handler and interrupt exports for query cancellation)
+- **[txiki.js](https://github.com/saghul/txiki.js)** — Native JavaScript runtime powering the native SQLite backend (custom build with async SQLite, V8-format IPC serialization, and query cancellation)
 - **[@vscode/codicons](https://github.com/microsoft/vscode-codicons)** — Icon font
 - **Icon** — [SQLite](https://iconscout.com/3d-icons/sqlite) by [Toms Design](https://iconscout.com/contributors/tomsdesign)
 
