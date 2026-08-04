@@ -193,7 +193,17 @@ function runSingleStatement(sql) {
 }
 
 function normalizeBindParams(params) {
-  return params?.map(value => typeof value === 'bigint' ? value.toString() : value);
+  return params?.map(value => {
+    if (typeof value !== 'bigint') return value;
+    const numericValue = Number(value);
+    return Number.isSafeInteger(numericValue) ? numericValue : value.toString();
+  });
+}
+
+function bindPlaceholder(value) {
+  return typeof value === 'bigint' && !Number.isSafeInteger(Number(value))
+    ? 'CAST(? AS INTEGER)'
+    : '?';
 }
 
 function compileSingleStatement(sql) {
@@ -853,6 +863,20 @@ async function getTableInfo(table) {
   }));
 }
 
+function getInsertableColumnNames(table) {
+  const result = db.exec(
+    'SELECT name FROM pragma_table_xinfo(?) ' +
+    'WHERE hidden NOT IN (2, 3) ORDER BY cid',
+    [table]
+  );
+  return (result[0]?.values ?? []).map(row => {
+    if (typeof row[0] !== 'string') {
+      throw new Error(`SQLite returned invalid column metadata for ${table}`);
+    }
+    return row[0];
+  });
+}
+
 /**
  * Get current pragma values.
  *
@@ -952,8 +976,9 @@ async function updateCell(table, rowId, column, value) {
   }
 
   db.run(
-    `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`,
-    [value, rowId]
+    `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ` +
+    `${bindPlaceholder(value)} WHERE rowid = ?`,
+    normalizeBindParams([value, rowId])
   );
   return validateRowId(rowId);
 }
@@ -979,7 +1004,7 @@ async function insertRow(table, data) {
     insertSql = `INSERT INTO ${escapeIdentifier(table)} DEFAULT VALUES`;
   } else {
     const columnList = columns.map(escapeIdentifier).join(', ');
-    const placeholders = columns.map(() => '?').join(', ');
+    const placeholders = values.map(bindPlaceholder).join(', ');
 
     insertSql = `INSERT INTO ${escapeIdentifier(table)} (${columnList}) VALUES (${placeholders})`;
   }
@@ -1050,8 +1075,10 @@ async function deleteRows(table, rowIds) {
     const savepointName = createViewSavepointName('sp_delete_pk_rows');
     runSingleStatement(`SAVEPOINT ${savepointName}`);
     try {
+      const insertableColumns = getInsertableColumnNames(table);
       const current = db.exec(
-        `SELECT * FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+        `SELECT ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+        `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
         normalizeBindParams(predicate.params),
         { useBigInt: true }
       )[0];
@@ -1084,12 +1111,43 @@ async function deleteRows(table, rowIds) {
     }
   }
 
-  const placeholders = rowIds.map(() => '?').join(', ');
-
-  db.run(
-    `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
-    rowIds
-  );
+  const validIds = rowIds.map(validateRowId);
+  const placeholders = validIds.map(() => '?').join(', ');
+  const savepointName = createViewSavepointName('sp_delete_rowid_rows');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const insertableColumns = getInsertableColumnNames(table);
+    const current = db.exec(
+      `SELECT CAST(rowid AS TEXT), ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+      `FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
+      normalizeBindParams(validIds),
+      { useBigInt: true }
+    )[0];
+    const deletedRows = (current?.values ?? []).map(row => {
+      const deletedRowId = validateRowId(row[0]);
+      return {
+        rowId: deletedRowId,
+        row: {
+          ...Object.fromEntries(
+            insertableColumns.map((column, index) => [column, row[index + 1]])
+          ),
+          rowid: deletedRowId
+        }
+      };
+    });
+    if (deletedRows.length !== validIds.length) {
+      throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
+    }
+    db.run(
+      `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
+      normalizeBindParams(validIds)
+    );
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return deletedRows;
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'deleteRowidRows');
+    throw error;
+  }
 }
 
 /**
@@ -1441,7 +1499,13 @@ async function undoModification(modification) {
           }]
         : []);
       const updates = [];
-      for (const cell of cells) {
+      // Reverse identity-changing batches so a key occupied by a later row is
+      // vacated first, without reordering ordinary history replay.
+      const hasIdentityTransition = cells.some(cell => (
+        cell.newRowId !== undefined && cell.newRowId !== cell.rowId
+      ));
+      const undoCells = hasIdentityTransition ? [...cells].reverse() : cells;
+      for (const cell of undoCells) {
         const currentRowId = cell.newRowId ?? cell.rowId;
         let value = cell.priorValue ?? null;
         if (cell.operation === 'json_patch') {
@@ -1636,8 +1700,8 @@ async function updateCellBatch(table, updates) {
             : prepared.value;
           return { update, priorValue, prepared, storedValue };
         });
-        const setClause = preparedUpdates.map(({ update }) => (
-          `${escapeIdentifier(update.column)} = ?`
+        const setClause = preparedUpdates.map(({ update, storedValue }) => (
+          `${escapeIdentifier(update.column)} = ${bindPlaceholder(storedValue)}`
         )).join(', ');
         db.run(
           `UPDATE ${escapeIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
@@ -1725,7 +1789,7 @@ async function updateCellBatch(table, updates) {
       const escapedColumn = escapeIdentifier(update.column);
       const sql = update.operation === 'json_patch'
         ? `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`
-        : `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+        : `UPDATE ${escapedTable} SET ${escapedColumn} = ${bindPlaceholder(update.value)} WHERE rowid = ?`;
       db.run(sql, normalizeBindParams([update.value, update.rowId]));
     }
     runSingleStatement(`RELEASE ${savepointName}`);

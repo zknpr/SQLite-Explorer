@@ -279,28 +279,32 @@ export class HostBridge implements ToastService {
         const validIds = validateRowIds(rowIds);
         if (validIds.length > 0) {
             const placeholders = validIds.map(() => '?').join(', ');
-            // We select rowid to map back correctly, though we already have IDs.
-            // Using * to get all columns.
+            const columnResult = await dbOps.executeQuery(
+                'SELECT name FROM pragma_table_xinfo(?) ' +
+                'WHERE hidden NOT IN (2, 3) ORDER BY cid',
+                [table]
+            );
+            const insertableColumns = (columnResult[0]?.rows ?? []).map(row => {
+                if (typeof row[0] !== 'string') {
+                    throw new Error(`SQLite returned invalid column metadata for ${table}`);
+                }
+                return row[0];
+            });
             const sql =
-                `SELECT CAST(rowid AS TEXT) AS rowid, * FROM ${escapeIdentifier(table)} ` +
+                `SELECT CAST(rowid AS TEXT) AS rowid, ` +
+                `${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+                `FROM ${escapeIdentifier(table)} ` +
                 `WHERE rowid IN (${placeholders})`;
             const result = await dbOps.executeQuery(sql, validIds);
 
             if (result && result.length > 0 && result[0].rows) {
-                const headers = result[0].headers;
                 const rows = result[0].rows;
 
                 deletedRowsData = rows.map(r => {
                     const rowData: Record<string, CellValue> = {};
-                    // First col is rowid because we asked for it
                     const rId = validateRowId(r[0] as RecordId);
-                  
-
-                    for (let i = 0; i < headers.length; i++) {
-                        const name = headers[i];
-                        if (name !== 'rowid') {
-                            rowData[name] = r[i];
-                        }
+                    for (let i = 0; i < insertableColumns.length; i++) {
+                        rowData[insertableColumns[i]] = r[i + 1];
                     }
                     // Explicitly include rowid in the row data to ensure it's restored with the same ID
                     rowData['rowid'] = rId;

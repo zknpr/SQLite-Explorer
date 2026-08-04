@@ -125,7 +125,18 @@ interface ExistingViewForIntent {
 function normalizeWasmBindParams(
   params?: readonly CellValue[]
 ): WasmBindValue[] | undefined {
-  return params?.map(value => typeof value === 'bigint' ? value.toString() : value);
+  return params?.map(value => {
+    if (typeof value !== 'bigint') return value;
+    const numericValue = Number(value);
+    return Number.isSafeInteger(numericValue) ? numericValue : value.toString();
+  });
+}
+
+/** sql.js binds unsafe bigint as TEXT; cast only those captured INTEGER values. */
+function wasmBindPlaceholder(value: CellValue): string {
+  return typeof value === 'bigint' && !Number.isSafeInteger(Number(value))
+    ? 'CAST(? AS INTEGER)'
+    : '?';
 }
 
 // ============================================================================
@@ -488,8 +499,17 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       operation
     } = mod;
     if (affectedCells) {
+      // Forward replay can vacate a key that a later row occupies. Undo batches
+      // containing identity transitions in reverse so the dependent key is
+      // vacated first, while preserving established order for ordinary edits.
+      const hasIdentityTransition = affectedCells.some(cell => (
+        cell.newRowId !== undefined && cell.newRowId !== cell.rowId
+      ));
+      const undoCells = hasIdentityTransition
+        ? [...affectedCells].reverse()
+        : affectedCells;
       const updates: CellUpdate[] = await Promise.all(
-        affectedCells.map(async (cell) => ({
+        undoCells.map(async (cell) => ({
           rowId: cell.newRowId ?? cell.rowId,
           column: cell.columnName,
           value: await this.computeUndoValue(
@@ -617,18 +637,25 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
 
         if (rowUpdates.size > 0) {
-          const columnsToSet = deletedColumns.map(c => escapeIdentifier(c.name));
-          const setClause = columnsToSet.map(c => `${c} = ?`).join(', ');
-          const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${setClause} WHERE rowid = ?`;
-          const stmt = this.instance.prepare(sql);
+          const statements = new Map<string, WasmPreparedStatement>();
           try {
             for (const [rId, rowObj] of rowUpdates.entries()) {
               const params: CellValue[] = deletedColumns.map(c => rowObj[c.name] ?? null);
+              const setClause = deletedColumns.map((column, index) => (
+                `${escapeIdentifier(column.name)} = ${wasmBindPlaceholder(params[index])}`
+              )).join(', ');
+              const sql =
+                `UPDATE ${escapeIdentifier(targetTable)} SET ${setClause} WHERE rowid = ?`;
+              let stmt = statements.get(sql);
+              if (!stmt) {
+                stmt = this.instance.prepare(sql);
+                statements.set(sql, stmt);
+              }
               params.push(rId);
               stmt.run(normalizeWasmBindParams(params));
             }
           } finally {
-            stmt.free();
+            for (const stmt of statements.values()) stmt.free();
           }
         }
 
@@ -874,7 +901,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             params = [newValueStr, rowIdNum];
         }
     } else {
-        sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
+        sql =
+          `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ` +
+          `${wasmBindPlaceholder(value)} WHERE rowid = ?`;
         params = [value, rowIdNum];
     }
 
@@ -895,8 +924,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       sql = `INSERT INTO ${escapeIdentifier(table)} DEFAULT VALUES`;
     } else {
       const colNames = columns.map(escapeIdentifier).join(', ');
-      const placeholders = columns.map(() => '?').join(', ');
       params = columns.map(col => data[col]);
+      const placeholders = params.map(wasmBindPlaceholder).join(', ');
       sql = `INSERT INTO ${escapeIdentifier(table)} (${colNames}) VALUES (${placeholders})`;
     }
 
@@ -943,19 +972,24 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery('BEGIN TRANSACTION');
     try {
       const escapedTable = escapeIdentifier(table);
-      const groups = new Map<string, { columns: string[], data: CellValue[][] }>();
+      const groups = new Map<
+        string,
+        { columns: string[], placeholders: string[], data: CellValue[][] }
+      >();
 
       for (const row of rows) {
         const columns = Object.keys(row);
-        const key = columns.join('\0');
+        const values = columns.map(col => row[col]);
+        const placeholders = values.map(wasmBindPlaceholder);
+        const key = `${columns.join('\0')}\0\0${placeholders.join('\0')}`;
         if (!groups.has(key)) {
-          groups.set(key, { columns, data: [] });
+          groups.set(key, { columns, placeholders, data: [] });
         }
-        groups.get(key)!.data.push(columns.map(col => row[col]));
+        groups.get(key)!.data.push(values);
       }
 
       for (const group of groups.values()) {
-        const { columns, data } = group;
+        const { columns, placeholders, data } = group;
         let sql: string;
         if (columns.length === 0) {
           sql = `INSERT INTO ${escapedTable} DEFAULT VALUES`;
@@ -969,8 +1003,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           }
         } else {
           const colNames = columns.map(escapeIdentifier).join(', ');
-          const placeholders = columns.map(() => '?').join(', ');
-          sql = `INSERT INTO ${escapedTable} (${colNames}) VALUES (${placeholders})`;
+          sql = `INSERT INTO ${escapedTable} (${colNames}) VALUES (${placeholders.join(', ')})`;
           const stmt = this.instance.prepare(sql);
           try {
             for (const params of data) {
@@ -1007,8 +1040,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const savepointName = this.createSavepointName('sp_delete_pk_rows');
       await this.executeQuery(`SAVEPOINT ${savepointName}`);
       try {
+        const insertableColumns = await this.getInsertableColumnNames(table);
         const current = this.queryRaw(
-          `SELECT * FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+          `SELECT ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+          `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
           predicate.params
         );
         const primaryKeyIndices = identity.columns.map(column => {
@@ -1041,12 +1076,39 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
     }
 
-    // Validate all row IDs
+    // Snapshot and delete rowid rows under one savepoint, matching the PK path.
     const validIds = validateRowIds(rowIds);
-
     const placeholders = validIds.map(() => '?').join(', ');
-    const sql = `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`;
-    await this.executeQuery(sql, validIds);
+    const savepointName = this.createSavepointName('sp_delete_rowid_rows');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      const insertableColumns = await this.getInsertableColumnNames(table);
+      const current = this.queryRaw(
+        `SELECT CAST(rowid AS TEXT), ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+        `FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
+        validIds
+      );
+      const deletedRows = current.rows.map(row => {
+        const rowId = validateRowId(row[0] as RecordId | bigint);
+        const rowData: Record<string, CellValue> = Object.fromEntries(
+          insertableColumns.map((column, index) => [column, row[index + 1] as CellValue])
+        );
+        rowData.rowid = rowId;
+        return { rowId, row: rowData };
+      });
+      if (deletedRows.length !== validIds.length) {
+        throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
+      }
+      await this.executeQuery(
+        `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
+        validIds
+      );
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return deletedRows;
+    } catch (error) {
+      await this.safeRollbackSavepoint(savepointName, 'deleteRowidRows');
+      throw error;
+    }
   }
 
   /**
@@ -1192,6 +1254,21 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
+  /** Columns SQLite permits in an INSERT; generated columns have hidden 2/3. */
+  private async getInsertableColumnNames(table: string): Promise<string[]> {
+    const result = await this.executeQuery(
+      'SELECT name FROM pragma_table_xinfo(?) ' +
+      'WHERE hidden NOT IN (2, 3) ORDER BY cid',
+      [table]
+    );
+    return (result[0]?.rows ?? []).map(row => {
+      if (typeof row[0] !== 'string') {
+        throw new Error(`SQLite returned invalid column metadata for ${table}`);
+      }
+      return row[0];
+    });
+  }
+
   private readPrimaryKeyRecordId(
     table: string,
     identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
@@ -1263,8 +1340,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           return { update, priorValue, prepared, storedValue };
         });
 
-        const setClause = preparedUpdates.map(({ update }) => (
-          `${escapeIdentifier(update.column)} = ?`
+        const setClause = preparedUpdates.map(({ update, storedValue }) => (
+          `${escapeIdentifier(update.column)} = ${wasmBindPlaceholder(storedValue)}`
         )).join(', ');
         await this.executeQuery(
           `UPDATE ${escapeIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
@@ -1684,7 +1761,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
       const updatesByColumn = new Map<string, CellUpdate[]>();
       for (const update of processedUpdates) {
-          const key = `${update.column}|${update.operation || 'set'}`;
+          const key =
+            `${update.column}|${update.operation || 'set'}|` +
+            `${wasmBindPlaceholder(update.value)}`;
           if (!updatesByColumn.has(key)) {
               updatesByColumn.set(key, []);
           }
@@ -1692,7 +1771,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
 
       for (const [key, columnUpdates] of updatesByColumn.entries()) {
-          const [column, op] = key.split('|');
+          const [column, op, valuePlaceholder] = key.split('|');
           const escapedColumn = escapeIdentifier(column);
 
           // For json_patch operations, choose between native SQLite json_patch()
@@ -1703,7 +1782,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           // but the expected behavior is to treat NULL as empty object (matching JS fallback).
           const sql = useNativePatch
             ? `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`
-            : `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+            : `UPDATE ${escapedTable} SET ${escapedColumn} = ${valuePlaceholder} WHERE rowid = ?`;
 
           const stmt = this.instance.prepare(sql);
 

@@ -726,6 +726,20 @@ export async function createNativeDatabaseConnection(
         }));
       };
 
+      const getNativeInsertableColumnNames = async (table: string): Promise<string[]> => {
+        const result = await worker.call<NativeQueryResult>('query', [
+          'SELECT name FROM pragma_table_xinfo(?) ' +
+          'WHERE hidden NOT IN (2, 3) ORDER BY cid',
+          [table]
+        ]);
+        return (result.values ?? []).map(row => {
+          if (typeof row[0] !== 'string') {
+            throw new Error(`SQLite returned invalid column metadata for ${table}`);
+          }
+          return row[0];
+        });
+      };
+
       const findNativeTableIdentity = async (table: string): Promise<TableIdentity | undefined> => {
         const metadata = await worker.call<NativeQueryResult>('query', [
           `SELECT "type", "wr" FROM pragma_table_list ` +
@@ -985,7 +999,16 @@ export async function createNativeDatabaseConnection(
               };
 
               if (affectedCells) {
-                const currentRowIds = affectedCells.map(cell => cell.newRowId ?? cell.rowId);
+                // A later forward transition may occupy a key vacated by an
+                // earlier row. Reverse only identity-changing batches so
+                // ordinary edit replay retains its established call order.
+                const hasIdentityTransition = affectedCells.some(cell => (
+                  cell.newRowId !== undefined && cell.newRowId !== cell.rowId
+                ));
+                const undoCells = hasIdentityTransition
+                  ? [...affectedCells].reverse()
+                  : affectedCells;
+                const currentRowIds = undoCells.map(cell => cell.newRowId ?? cell.rowId);
                 const usesPrimaryKey = currentRowIds.some(isPrimaryKeyRecordId);
                 if (usesPrimaryKey && !currentRowIds.every(isPrimaryKeyRecordId)) {
                   throw new Error('Cannot mix rowid and primary-key row identities');
@@ -993,7 +1016,7 @@ export async function createNativeDatabaseConnection(
                 const identity = usesPrimaryKey
                   ? await resolveNativeTableIdentity(targetTable)
                   : { kind: 'rowid' } as const;
-                const patchCells = affectedCells.filter(cell => cell.operation === 'json_patch');
+                const patchCells = undoCells.filter(cell => cell.operation === 'json_patch');
                 let patchReads: NativeQueryBatchResult | undefined;
                 if (patchCells.length > 0) {
                   patchReads = await worker.call<NativeQueryBatchResult>('queryBatch', [
@@ -1014,7 +1037,7 @@ export async function createNativeDatabaseConnection(
                 }
                 const updates: CellUpdate[] = [];
                 let patchIndex = 0;
-                for (const cell of affectedCells) {
+                for (const cell of undoCells) {
                   const currentRowId = cell.newRowId ?? cell.rowId;
                   let value = cell.priorValue ?? null;
                   if (cell.operation === 'json_patch') {
@@ -1385,8 +1408,10 @@ export async function createNativeDatabaseConnection(
             const savepointName = createSavepointName('sp_delete_pk_rows');
             await worker.call('run', [`SAVEPOINT ${savepointName}`]);
             try {
+              const insertableColumns = await getNativeInsertableColumnNames(table);
               const current = await worker.call<NativeQueryResult>('query', [
-                `SELECT * FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+                `SELECT ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+                `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
                 predicate.params
               ]);
               const primaryKeyIndices = identity.columns.map(column => {
@@ -1421,12 +1446,40 @@ export async function createNativeDatabaseConnection(
             }
           }
 
-          // Validate all row IDs
+          // Snapshot rowid rows atomically and return the same replay payload
+          // shape as primary-key deletion.
           const validIds = validateRowIds(rowIds);
-
           const placeholders = validIds.map(() => '?').join(', ');
-          const sql = `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`;
-          await worker.call('run', [sql, validIds]);
+          const savepointName = createSavepointName('sp_delete_rowid_rows');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            const insertableColumns = await getNativeInsertableColumnNames(table);
+            const current = await worker.call<NativeQueryResult>('query', [
+              `SELECT CAST(rowid AS TEXT), ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+              `FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
+              validIds
+            ]);
+            const deletedRows = current.values.map(row => {
+              const deletedRowId = validateRowId(row[0] as RecordId | bigint);
+              const rowData: Record<string, CellValue> = Object.fromEntries(
+                insertableColumns.map((column, index) => [column, row[index + 1]])
+              );
+              rowData.rowid = deletedRowId;
+              return { rowId: deletedRowId, row: rowData };
+            });
+            if (deletedRows.length !== validIds.length) {
+              throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
+            }
+            await worker.call('run', [
+              `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
+              validIds
+            ]);
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return deletedRows;
+          } catch (error) {
+            await safeRollbackSavepoint(savepointName, 'deleteNativeRowidRows');
+            throw error;
+          }
         },
 
         /**

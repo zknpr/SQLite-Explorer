@@ -216,6 +216,40 @@ describe('HostBridge', () => {
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
+    it('excludes generated columns from the fallback rowid deletion snapshot', async () => {
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => {
+                if (sql.includes('pragma_table_xinfo')) {
+                    return [{ headers: ['name'], rows: [['base']] }];
+                }
+                return [{
+                    headers: ['rowid', 'base', 'stored_value', 'virtual_value'],
+                    rows: [[9, 5, 10, 15]]
+                }];
+            }),
+            deleteRows: mock.fn(async () => undefined)
+        };
+        const recordExternalModification = mock.fn();
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            recordExternalModification
+        };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            mockDocument as any
+        );
+        (bridge as any).ensureDatabaseInitialized = () => dbOps as any;
+
+        await bridge.deleteRows('generated_rows', [9]);
+
+        const modification = recordExternalModification.mock.calls[0].arguments[0] as any;
+        assert.deepStrictEqual(modification.deletedRows, [{
+            rowId: 9,
+            row: { base: 5, rowid: 9 }
+        }]);
+    });
+
     it('treats connection-level read-only documents as read-only for web mutators', async () => {
         const dbOps = {
             updateCell: mock.fn(async () => {}),

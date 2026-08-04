@@ -98,6 +98,40 @@ describe('WITHOUT ROWID primary-key identity', () => {
         );
     });
 
+    it('undoes dependent composite-key changes in reverse transition order', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE dependent_identity (' +
+            'tenant INTEGER, sequence INTEGER, value TEXT, ' +
+            'PRIMARY KEY (tenant, sequence)' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO dependent_identity VALUES (1, 1, 'first'), (1, 2, 'second')"
+        );
+        const page = await engine.fetchTableData('dependent_identity', {
+            columns: ['rowid', 'tenant', 'sequence', 'value'],
+            orderBy: 'sequence',
+            limit: 10,
+            offset: 0
+        });
+
+        const affectedCells = await engine.updateCellBatch('dependent_identity', [
+            { rowId: page.rows[0][0] as RecordId, column: 'tenant', value: 2 },
+            { rowId: page.rows[1][0] as RecordId, column: 'sequence', value: 1 }
+        ]);
+        await engine.undoModification({
+            description: 'Undo dependent composite identities',
+            modificationType: 'cell_update',
+            targetTable: 'dependent_identity',
+            affectedCells
+        });
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT tenant, sequence, value FROM dependent_identity ORDER BY sequence'
+            ))[0].rows,
+            [[1, 1, 'first'], [1, 2, 'second']]
+        );
+    });
+
     it('keeps adjacent unsafe int64 primary keys distinct and editable', async () => {
         await engine.executeQuery(
             'CREATE TABLE int64_identity (id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID; ' +
@@ -164,6 +198,124 @@ describe('WITHOUT ROWID primary-key identity', () => {
             affectedRowIds: [identity]
         });
         assert.strictEqual(await engine.fetchTableCount('row_lifecycle', {}), 0);
+    });
+
+    it('restores a deleted WITHOUT ROWID row without inserting generated columns', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE generated_pk_row (' +
+            'id INTEGER PRIMARY KEY, base INTEGER, ' +
+            'stored_value INTEGER GENERATED ALWAYS AS (base * 2) STORED, ' +
+            'virtual_value INTEGER GENERATED ALWAYS AS (base * 3) VIRTUAL' +
+            ') WITHOUT ROWID; ' +
+            'INSERT INTO generated_pk_row (id, base) VALUES (7, 5)'
+        );
+        const page = await engine.fetchTableData('generated_pk_row', {
+            columns: ['rowid', 'id', 'base', 'stored_value', 'virtual_value'],
+            limit: 10,
+            offset: 0
+        });
+        const rowId = page.rows[0][0] as RecordId;
+        const deletedRows = await engine.deleteRows('generated_pk_row', [rowId]);
+        assert.ok(deletedRows);
+
+        await engine.undoModification({
+            description: 'Restore generated PK row',
+            modificationType: 'row_delete',
+            targetTable: 'generated_pk_row',
+            deletedRows
+        });
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT id, base, stored_value, virtual_value FROM generated_pk_row'
+            ))[0].rows,
+            [[7, 5, 10, 15]]
+        );
+    });
+
+    it('restores a deleted rowid row without inserting generated columns', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE generated_rowid_row (' +
+            'base INTEGER, ' +
+            'stored_value INTEGER GENERATED ALWAYS AS (base * 2) STORED, ' +
+            'virtual_value INTEGER GENERATED ALWAYS AS (base * 3) VIRTUAL' +
+            '); ' +
+            'INSERT INTO generated_rowid_row (rowid, base) VALUES (9, 5)'
+        );
+        const deletedRows = await engine.deleteRows('generated_rowid_row', [9]);
+        assert.ok(deletedRows);
+
+        await engine.undoModification({
+            description: 'Restore generated rowid row',
+            modificationType: 'row_delete',
+            targetTable: 'generated_rowid_row',
+            deletedRows
+        });
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT rowid, base, stored_value, virtual_value FROM generated_rowid_row'
+            ))[0].rows,
+            [[9, 5, 10, 15]]
+        );
+    });
+
+    it('preserves an unsafe INTEGER prior storage class when undoing a typeless cell', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE typeless_undo (' +
+            'id INTEGER PRIMARY KEY, value' +
+            ') WITHOUT ROWID; ' +
+            'INSERT INTO typeless_undo VALUES (1, 9007199254740993)'
+        );
+        const page = await engine.fetchTableData('typeless_undo', {
+            columns: ['rowid', 'id', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        const affectedCells = await engine.updateCellBatch('typeless_undo', [{
+            rowId: page.rows[0][0] as RecordId,
+            column: 'value',
+            value: 'changed'
+        }]);
+        assert.strictEqual(typeof affectedCells[0].priorValue, 'bigint');
+
+        await engine.undoModification({
+            description: 'Restore unsafe typeless INTEGER',
+            modificationType: 'cell_update',
+            targetTable: 'typeless_undo',
+            affectedCells
+        });
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(value), CAST(value AS TEXT) FROM typeless_undo'
+            ))[0].rows,
+            [['integer', '9007199254740993']]
+        );
+    });
+
+    it('preserves an unsafe INTEGER storage class when restoring a deleted typeless row', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE typeless_restore (value); ' +
+            'INSERT INTO typeless_restore (rowid, value) VALUES (11, 9007199254740993)'
+        );
+        const deletedRows = await engine.deleteRows('typeless_restore', [11]);
+        assert.ok(deletedRows);
+        assert.strictEqual(typeof deletedRows[0].row.value, 'bigint');
+
+        await engine.undoModification({
+            description: 'Restore deleted unsafe typeless INTEGER',
+            modificationType: 'row_delete',
+            targetTable: 'typeless_restore',
+            deletedRows
+        });
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT rowid, typeof(value), CAST(value AS TEXT) FROM typeless_restore'
+            ))[0].rows,
+            [[11, 'integer', '9007199254740993']]
+        );
     });
 
     it('loads and edits rowid-addressable FTS virtual and shadow tables', async () => {

@@ -762,6 +762,173 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('undoes dependent demo composite-key changes in reverse transition order', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_dependent_identity (' +
+            'tenant INTEGER, sequence INTEGER, value TEXT, ' +
+            'PRIMARY KEY (tenant, sequence)' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_dependent_identity VALUES (1, 1, 'first'), (1, 2, 'second')"
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_dependent_identity', {
+            columns: ['rowid', 'tenant', 'sequence', 'value'],
+            orderBy: 'sequence',
+            limit: 10,
+            offset: 0
+        });
+        const affectedCells = await worker.invoke('updateCellBatch', 'demo_dependent_identity', [
+            { rowId: page.rows[0][0], column: 'tenant', value: 2 },
+            { rowId: page.rows[1][0], column: 'sequence', value: 1 }
+        ]);
+
+        await worker.invoke('undoModification', {
+            modificationType: 'cell_update',
+            targetTable: 'demo_dependent_identity',
+            affectedCells
+        });
+
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT tenant, sequence, value FROM demo_dependent_identity ORDER BY sequence'
+            ))[0].rows,
+            [[1, 1, 'first'], [1, 2, 'second']]
+        );
+    });
+
+    it('restores a deleted demo WITHOUT ROWID row without inserting generated columns', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_generated_pk_row (' +
+            'id INTEGER PRIMARY KEY, base INTEGER, ' +
+            'stored_value INTEGER GENERATED ALWAYS AS (base * 2) STORED, ' +
+            'virtual_value INTEGER GENERATED ALWAYS AS (base * 3) VIRTUAL' +
+            ') WITHOUT ROWID; ' +
+            'INSERT INTO demo_generated_pk_row (id, base) VALUES (7, 5)'
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_generated_pk_row', {
+            columns: ['rowid', 'id', 'base', 'stored_value', 'virtual_value'],
+            limit: 10,
+            offset: 0
+        });
+        const deletedRows = await worker.invoke(
+            'deleteRows',
+            'demo_generated_pk_row',
+            [page.rows[0][0]]
+        );
+
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete',
+            targetTable: 'demo_generated_pk_row',
+            deletedRows
+        });
+
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT id, base, stored_value, virtual_value FROM demo_generated_pk_row'
+            ))[0].rows,
+            [[7, 5, 10, 15]]
+        );
+    });
+
+    it('restores a deleted demo rowid row without inserting generated columns', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_generated_rowid_row (' +
+            'base INTEGER, ' +
+            'stored_value INTEGER GENERATED ALWAYS AS (base * 2) STORED, ' +
+            'virtual_value INTEGER GENERATED ALWAYS AS (base * 3) VIRTUAL' +
+            '); ' +
+            'INSERT INTO demo_generated_rowid_row (rowid, base) VALUES (9, 5)'
+        );
+        const deletedRows = await worker.invoke(
+            'deleteRows',
+            'demo_generated_rowid_row',
+            [9]
+        );
+        assert.ok(deletedRows);
+
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete',
+            targetTable: 'demo_generated_rowid_row',
+            deletedRows
+        });
+
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT rowid, base, stored_value, virtual_value FROM demo_generated_rowid_row'
+            ))[0].rows,
+            [[9, 5, 10, 15]]
+        );
+    });
+
+    it('preserves an unsafe demo INTEGER prior storage class when undoing a typeless cell', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_typeless_undo (' +
+            'id INTEGER PRIMARY KEY, value' +
+            ') WITHOUT ROWID; ' +
+            'INSERT INTO demo_typeless_undo VALUES (1, 9007199254740993)'
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_typeless_undo', {
+            columns: ['rowid', 'id', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        const affectedCells = await worker.invoke('updateCellBatch', 'demo_typeless_undo', [{
+            rowId: page.rows[0][0],
+            column: 'value',
+            value: 'changed'
+        }]);
+        assert.strictEqual(typeof affectedCells[0].priorValue, 'bigint');
+
+        await worker.invoke('undoModification', {
+            modificationType: 'cell_update',
+            targetTable: 'demo_typeless_undo',
+            affectedCells
+        });
+
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT typeof(value), CAST(value AS TEXT) FROM demo_typeless_undo'
+            ))[0].rows,
+            [['integer', '9007199254740993']]
+        );
+    });
+
+    it('preserves an unsafe demo INTEGER storage class when restoring a deleted typeless row', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_typeless_restore (value); ' +
+            'INSERT INTO demo_typeless_restore (rowid, value) VALUES (11, 9007199254740993)'
+        );
+        const deletedRows = await worker.invoke('deleteRows', 'demo_typeless_restore', [11]);
+        assert.strictEqual(typeof deletedRows[0].row.value, 'bigint');
+
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete',
+            targetTable: 'demo_typeless_restore',
+            deletedRows
+        });
+
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT rowid, typeof(value), CAST(value AS TEXT) FROM demo_typeless_restore'
+            ))[0].rows,
+            [[11, 'integer', '9007199254740993']]
+        );
+    });
+
     it('loads and edits rowid-addressable demo FTS virtual and shadow tables', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

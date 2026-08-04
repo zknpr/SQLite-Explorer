@@ -525,6 +525,71 @@ describe('SQLiteFileSystemProvider', () => {
             }
         });
 
+        it('retargets an open external editor after each primary-key member save', async () => {
+            const engineResult = await createDatabaseEngine({
+                content: null,
+                maxSize: 0,
+                readOnlyMode: false
+            });
+            const engine = engineResult.operations!;
+            await engine.executeQuery(
+                'CREATE TABLE retargeted_editor (' +
+                'id INTEGER PRIMARY KEY, value TEXT' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO retargeted_editor VALUES (1, 'payload')"
+            );
+            const page = await engine.fetchTableData('retargeted_editor', {
+                columns: ['rowid', 'id', 'value'],
+                limit: 10,
+                offset: 0
+            });
+            const originalIdentity = page.rows[0][0];
+            const document = setupMockDocument(docKey, engine);
+            const uri = vscode.Uri.from({
+                scheme: 'vscode-sqlite',
+                path: '/' + [docKey, 'retargeted_editor', 'group', String(originalIdentity), 'id.txt']
+                    .map(part => encodeURIComponent(part))
+                    .join('/')
+            });
+            const changedUris: string[] = [];
+            const subscription = provider.onDidChangeFile(changes => {
+                changedUris.push(...changes.map(change => change.uri.toString()));
+            });
+
+            try {
+                await provider.writeFile(
+                    uri,
+                    new TextEncoder().encode('2'),
+                    { create: false, overwrite: true }
+                );
+                await provider.writeFile(
+                    uri,
+                    new TextEncoder().encode('3'),
+                    { create: false, overwrite: true }
+                );
+
+                assert.strictEqual(
+                    new TextDecoder().decode(await provider.readFile(uri)),
+                    '3'
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'SELECT CAST(id AS TEXT), value FROM retargeted_editor'
+                    ))[0].rows,
+                    [['3', 'payload']]
+                );
+                const modifications = (document.recordExternalModification as any).mock.calls
+                    .map((call: any) => call.arguments[0]);
+                assert.strictEqual(modifications.length, 2);
+                assert.strictEqual(modifications[1].targetRowId, modifications[0].newTargetRowId);
+                assert.strictEqual(changedUris.length, 2);
+                assert.ok(changedUris.every(changedUri => changedUri === uri.toString()));
+            } finally {
+                subscription.dispose();
+                (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+
         it('should write binary content if not valid UTF-8', async () => {
             const dbOps = {
                 updateCell: mock.fn(async () => {})

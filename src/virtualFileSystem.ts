@@ -59,6 +59,16 @@ function getViewDefinitionErrorDetail(error: unknown): string {
 export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     readonly onDidChangeFile: vsc.Event<vsc.FileChangeEvent[]>;
     private _emitter = new vsc.EventEmitter<vsc.FileChangeEvent[]>();
+    /**
+     * TextDocument URIs are immutable for the lifetime of an open VS Code
+     * document. Keep the current PK target behind that stable resource URI so
+     * saving a key member can retarget subsequent reads and saves without
+     * closing the editor or replacing its buffer.
+     */
+    private readonly cellDocumentTargets = new WeakMap<
+        DatabaseDocument,
+        Map<string, RecordId>
+    >();
     private readonly viewDocumentMetadata = new Map<
         DatabaseDocument,
         Map<string, ViewDocumentMetadata>
@@ -191,13 +201,14 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             }
 
             const colName = column;
+            const targetRowId = this.getCellDocumentTarget(document, uri, rowId);
             let rowPredicate: ReturnType<typeof buildRecordIdentityPredicate>;
             try {
-                if (isPrimaryKeyRecordId(rowId)) {
+                if (isPrimaryKeyRecordId(targetRowId)) {
                     const identity = await this.resolveTableIdentity(document, table);
-                    rowPredicate = buildRecordIdentityPredicate(rowId, identity);
+                    rowPredicate = buildRecordIdentityPredicate(targetRowId, identity);
                 } else {
-                    const validatedRowId = validateRowId(rowId);
+                    const validatedRowId = validateRowId(targetRowId);
                     rowPredicate = { sql: 'rowid = ?', params: [validatedRowId] };
                 }
             } catch {
@@ -347,15 +358,16 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         }
 
         try {
+            const targetRowId = this.getCellDocumentTarget(document, uri, rowId);
             let validatedRowId: RecordId;
             let rowPredicate: ReturnType<typeof buildRecordIdentityPredicate>;
             try {
-                if (isPrimaryKeyRecordId(rowId)) {
+                if (isPrimaryKeyRecordId(targetRowId)) {
                     const identity = await this.resolveTableIdentity(document, table);
-                    rowPredicate = buildRecordIdentityPredicate(rowId, identity);
-                    validatedRowId = rowId;
+                    rowPredicate = buildRecordIdentityPredicate(targetRowId, identity);
+                    validatedRowId = targetRowId;
                 } else {
-                    validatedRowId = validateRowId(rowId);
+                    validatedRowId = validateRowId(targetRowId);
                     rowPredicate = { sql: 'rowid = ?', params: [validatedRowId] };
                 }
             } catch {
@@ -400,6 +412,9 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 value
             );
             const newTargetRowId = updatedRowId ?? validatedRowId;
+            if (isPrimaryKeyRecordId(validatedRowId)) {
+                this.setCellDocumentTarget(document, uri, newTargetRowId);
+            }
 
             // Trigger refresh
             document.recordExternalModification({
@@ -428,6 +443,28 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
     async rename(oldUri: vsc.Uri, newUri: vsc.Uri, options: { overwrite: boolean }): Promise<void> {
         throw vsc.FileSystemError.NoPermissions();
+    }
+
+    private getCellDocumentTarget(
+        document: DatabaseDocument,
+        uri: vsc.Uri,
+        uriRowId: string
+    ): RecordId {
+        if (!isPrimaryKeyRecordId(uriRowId)) return uriRowId;
+        return this.cellDocumentTargets.get(document)?.get(uri.toString()) ?? uriRowId;
+    }
+
+    private setCellDocumentTarget(
+        document: DatabaseDocument,
+        uri: vsc.Uri,
+        rowId: RecordId
+    ): void {
+        let targets = this.cellDocumentTargets.get(document);
+        if (!targets) {
+            targets = new Map<string, RecordId>();
+            this.cellDocumentTargets.set(document, targets);
+        }
+        targets.set(uri.toString(), rowId);
     }
 
     private parseUri(uri: vsc.Uri): { document: DatabaseDocument, table: string, rowId: string, column: string } {
