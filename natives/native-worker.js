@@ -605,6 +605,83 @@ function readCellMetadata(connection, table, column, locator) {
   };
 }
 
+/** Match TextEncoder's replacement semantics without allocating a byte copy. */
+function cellEditUtf8ByteLength(value) {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit <= 0x7f) bytes++;
+    else if (codeUnit <= 0x7ff) bytes += 2;
+    else if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        bytes += 4;
+        index++;
+      } else bytes += 3;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+/** Execute the exact-metadata compare-and-set without selecting the prior value. */
+function replaceOversizedCellValue(
+  connection,
+  table,
+  column,
+  locator,
+  value,
+  expected,
+  limitBytes
+) {
+  if (!Number.isSafeInteger(limitBytes) || limitBytes < 1) {
+    throw new Error('Cell edit limit must be a positive safe integer');
+  }
+  const newStorageClass = typeof value === 'string'
+    ? 'text'
+    : value instanceof Uint8Array
+      ? 'blob'
+      : undefined;
+  const newByteLength = newStorageClass === 'text'
+    ? cellEditUtf8ByteLength(value)
+    : newStorageClass === 'blob'
+      ? value.byteLength
+      : 0;
+  if (newStorageClass && newByteLength > limitBytes) {
+    throw new Error(
+      `New ${newStorageClass.toUpperCase()} cell value is ${newByteLength} bytes and ` +
+      `exceeds the ${limitBytes}-byte edit limit.`
+    );
+  }
+  if (
+    !expected ||
+    !['text', 'blob'].includes(expected.storageClass) ||
+    !Number.isSafeInteger(expected.byteLength) ||
+    expected.byteLength <= limitBytes
+  ) {
+    throw new Error(
+      'Guarded oversized-cell replacement requires exact TEXT/BLOB metadata above the edit limit'
+    );
+  }
+
+  const escapedTable = escapeCellIdentifier(table, 'table');
+  const escapedColumn = escapeCellIdentifier(column, 'column');
+  const predicate = buildCellLocator(locator);
+  executeStatement(
+    connection,
+    `UPDATE ${escapedTable} SET ${escapedColumn} = ? ` +
+      `WHERE ${predicate.sql} AND typeof(${escapedColumn}) = ? ` +
+      `AND length(CAST(${escapedColumn} AS BLOB)) = ?`,
+    [value, ...predicate.params, expected.storageClass, expected.byteLength]
+  );
+  const changesResult = executeQuery(connection, 'SELECT changes() AS changes', []);
+  const rawChanges = changesResult.values[0]?.[0];
+  const changes = typeof rawChanges === 'bigint' ? Number(rawChanges) : rawChanges;
+  if (!Number.isSafeInteger(changes) || changes < 0) {
+    throw new Error('SQLite returned an invalid changes() count');
+  }
+  return { changes };
+}
+
 function createCellReadSessionId() {
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
     return globalThis.crypto.randomUUID();
@@ -1067,6 +1144,21 @@ async function handleRequest(request) {
         const [table, column, locator] = args;
         if (!db) throw new Error('Database not open');
         result = readCellMetadata(db, table, column, locator).metadata;
+        break;
+      }
+
+      case "replaceOversizedCell": {
+        const [table, column, locator, value, expected, limitBytes] = args;
+        if (!db) throw new Error('Database not open');
+        result = replaceOversizedCellValue(
+          db,
+          table,
+          column,
+          locator,
+          value,
+          expected,
+          limitBytes
+        );
         break;
       }
 

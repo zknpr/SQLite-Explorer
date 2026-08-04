@@ -33,6 +33,7 @@ class MockDatabaseOperations implements DatabaseOperations {
     async flushChanges(signal?: AbortSignal): Promise<void> {}
     async discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void> {}
     async updateCell(table: string, rowId: number, column: string, value: CellValue, patch?: string): Promise<void> {}
+    async replaceOversizedCell(): Promise<void> {}
     async insertRow(table: string, data: Record<string, CellValue>): Promise<number> { return 1; }
     async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {}
     async deleteRows(table: string, rowIds: number[]): Promise<void> {}

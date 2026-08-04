@@ -849,6 +849,103 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         ]);
     });
 
+    it('surfaces the oversized-edit barrier while a later normal edit still undoes and redoes', async () => {
+        const undoCalls: unknown[] = [];
+        const redoCalls: unknown[] = [];
+        const dbOps = {
+            undoModification: async (entry: unknown) => { undoCalls.push(entry); },
+            redoModification: async (entry: unknown) => { redoCalls.push(entry); }
+        };
+        const doc = createDocBypassingFactory(dbOps);
+        const actions = new Map<string, { undo(): Promise<void>; redo(): Promise<void> }>();
+        doc.onDidChange((event: any) => actions.set(event.label, event));
+
+        const originalShowWarningMessage = mockVscode.window.showWarningMessage;
+        const warnings: string[] = [];
+        mockVscode.window.showWarningMessage = async (message?: string) => {
+            warnings.push(String(message));
+            return undefined;
+        };
+        try {
+            doc.recordModification({
+                label: 'Before Barrier',
+                description: 'old edit',
+                modificationType: 'cell_update'
+            });
+            doc.recordModification({
+                label: 'Replace Oversized Cell',
+                description: 'forward-only replacement',
+                modificationType: 'cell_update',
+                targetTable: 'items',
+                targetRowId: 1,
+                targetColumn: 'payload',
+                newValue: 'bounded',
+                undoPolicy: 'barrier'
+            });
+            const normal = {
+                label: 'After Barrier',
+                description: 'normal edit',
+                modificationType: 'cell_update' as const,
+                targetTable: 'items',
+                targetRowId: 2,
+                targetColumn: 'name',
+                priorValue: 'a',
+                newValue: 'b'
+            };
+            doc.recordModification(normal);
+
+            await actions.get('After Barrier')!.undo();
+            assert.deepStrictEqual(undoCalls, [normal]);
+
+            await actions.get('Replace Oversized Cell')!.undo();
+            assert.deepStrictEqual(undoCalls, [normal]);
+            assert.strictEqual(warnings.length, 1);
+            assert.match(warnings[0], /cannot be undone/i);
+            assert.match(warnings[0], /oversized cell/i);
+
+            await actions.get('After Barrier')!.redo();
+            assert.deepStrictEqual(redoCalls, [normal]);
+        } finally {
+            mockVscode.window.showWarningMessage = originalShowWarningMessage;
+        }
+    });
+
+    it('refuses File Revert before an unsaved oversized-edit barrier can write a fake prior value', async () => {
+        const discardCalls: unknown[][] = [];
+        const doc = createDocBypassingFactory({
+            discardModifications: async (entries: unknown[]) => { discardCalls.push(entries); }
+        });
+        doc.recordExternalModification({
+            label: 'Replace Oversized Cell',
+            description: 'forward-only replacement',
+            modificationType: 'cell_update',
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'payload',
+            newValue: 'bounded',
+            undoPolicy: 'barrier'
+        });
+
+        const originalShowWarningMessage = mockVscode.window.showWarningMessage;
+        const warnings: string[] = [];
+        mockVscode.window.showWarningMessage = async (message?: string) => {
+            warnings.push(String(message));
+            return undefined;
+        };
+        try {
+            await assert.rejects(
+                doc.revert(undefined),
+                /File Revert cannot cross an unsaved oversized-cell history barrier/
+            );
+            assert.deepStrictEqual(discardCalls, []);
+            assert.strictEqual(warnings.length, 1);
+            assert.match(warnings[0], /save the database first/i);
+            assert.match(warnings[0], /prior value was not retained/i);
+        } finally {
+            mockVscode.window.showWarningMessage = originalShowWarningMessage;
+        }
+    });
+
     it('invalidates every open view document after File Revert', async () => {
         const doc = createDocBypassingFactory({});
         const contentChanges: unknown[] = [];

@@ -51,12 +51,21 @@ export function getReadOnlyRowReason(rowIdx) {
     return state.gridReadOnlyRowReasons?.[rowIdx];
 }
 
-/** Explain why a grid cell cannot enter any mutation workflow. */
-export function getCellMutationBlockReason(rowIdx, colIdx) {
+/**
+ * Explain why a grid cell cannot enter a mutation workflow. Single-cell
+ * replacement callers may opt into the Stage-D confirmation path; batch and
+ * external-full-editor callers remain blocked because they cannot establish
+ * one exact confirmed prior per update.
+ */
+export function getCellMutationBlockReason(
+    rowIdx,
+    colIdx,
+    { allowOversizedReplacement = false } = {}
+) {
     const rowReason = getReadOnlyRowReason(rowIdx);
     if (rowReason) return rowReason;
     const oversized = getOversizedCellMetadata(rowIdx, colIdx);
-    if (!oversized) return undefined;
+    if (!oversized || allowOversizedReplacement) return undefined;
     return (
         `Too large to edit inline — ${oversized.byteLength.toLocaleString()} bytes ` +
         `(${oversized.storageClass.toUpperCase()})`

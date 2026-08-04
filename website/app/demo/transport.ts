@@ -5,6 +5,10 @@ import {
   toWebviewPayloadLimitErrorData
 } from '../../../src/core/webview-transport';
 import { deserializeValue } from '../../../core/ui/modules/transport.js';
+import {
+  fromCellEditRpcErrorData,
+  toCellEditRpcErrorData
+} from '../../../src/core/cell-edit-policy';
 
 export function guardDemoIframeRequest(value: unknown): void {
   assertWebviewTransportPayload(value, {
@@ -38,7 +42,8 @@ export function deserializeDemoIframeRequest(value: unknown): unknown {
 
 export function demoRpcErrorFields(error: unknown) {
   const errorMessage = error instanceof Error ? error.message : String(error);
-  const typed = toWebviewPayloadLimitErrorData(error);
+  const typed = toCellEditRpcErrorData(error)
+    ?? toWebviewPayloadLimitErrorData(error);
   return {
     errorMessage,
     ...(typed ? { error: typed } : {})
@@ -49,6 +54,7 @@ export function demoRpcErrorFromResponse(content: {
   error?: unknown;
   errorMessage?: string;
 }): Error {
-  return fromWebviewPayloadLimitErrorData(content.error)
+  return fromCellEditRpcErrorData(content.error)
+    ?? fromWebviewPayloadLimitErrorData(content.error)
     ?? new Error(content.errorMessage || 'RPC failed');
 }

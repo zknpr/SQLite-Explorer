@@ -465,16 +465,37 @@ async function probeCellSaveUndo(options: ProbeOptions): Promise<Record<string, 
   const scratch = await cloneFixture(options);
   const before = memorySnapshot();
   const startedAt = performance.now();
+  const originalShowWarningMessage = (vscode.window as any).showWarningMessage;
+  let confirmationMessage = '';
   try {
     return await withNative(scratch, false, async operations => {
       const tracker = new ModificationTracker<ProbeModification>(100, 50 * 1024 * 1024);
+      let containmentReadObserved = false;
+      let wholePriorValueReadObserved = false;
+      const instrumentedOperations = new Proxy(operations, {
+        get(target, property, receiver) {
+          if (property !== 'executeQuery') return Reflect.get(target, property, receiver);
+          return async (sql: string, params?: CellValue[]) => {
+            if (sql.includes('FROM "large_cells"') && sql.includes('"payload"')) {
+              const bounded = sql.includes('THEN NULL ELSE "payload" END');
+              containmentReadObserved ||= bounded;
+              wholePriorValueReadObserved ||= !bounded;
+            }
+            return operations.executeQuery(sql, params);
+          };
+        }
+      });
       const document = {
         uri: vscode.Uri.file(scratch),
         documentKey: Promise.resolve('large-cell-probe'),
-        databaseOperations: operations,
+        databaseOperations: instrumentedOperations,
         connectionGeneration: 0,
         isReadOnlyMode: false,
         recordExternalModification: (modification: ProbeModification) => tracker.record(modification)
+      };
+      (vscode.window as any).showWarningMessage = async (message: string) => {
+        confirmationMessage = String(message);
+        return { title: 'Replace Without Undo', value: true };
       };
       const bridge = new HostBridge({
         webviews: new Map(),
@@ -482,21 +503,35 @@ async function probeCellSaveUndo(options: ProbeOptions): Promise<Record<string, 
         isReadOnly: false
       } as any, document as any);
       await bridge.updateCell('large_cells', 1, 'payload', 'replacement');
+      const entries = tracker.getUncommittedEntries();
+      const entry = entries[0];
       const undoable = tracker.canStepBack;
-      const entry = tracker.stepBack() as ProbeModification | undefined;
       const retainedPriorBytes = cellByteLength(entry?.priorValue);
+      const after = memorySnapshot();
       return {
         mode: options.mode,
         rawCellBytes: options.sizeBytes,
         undoable,
+        redoable: tracker.canStepForward,
+        undoPolicy: entry?.undoPolicy,
         retainedPriorBytes,
-        historyEntryCountBeforeUndo: undoable ? 1 : 0,
+        historyEntryCount: entries.length,
+        confirmationSurfaced: confirmationMessage.length > 0,
+        confirmationContainsTarget:
+          confirmationMessage.includes('large_cells') && confirmationMessage.includes('payload'),
+        confirmationContainsStorageClass: confirmationMessage.includes('BLOB'),
+        confirmationContainsExactBytes:
+          confirmationMessage.includes(options.sizeBytes.toLocaleString()),
+        containmentReadObserved,
+        wholePriorValueReadObserved,
         elapsedMs: performance.now() - startedAt,
         memoryBefore: before,
-        memoryAfter: memorySnapshot()
+        memoryAfter: after,
+        maxRssBytes: after.maxRssBytes
       };
     });
   } finally {
+    (vscode.window as any).showWarningMessage = originalShowWarningMessage;
     await removeDatabaseFiles(scratch);
   }
 }

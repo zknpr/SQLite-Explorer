@@ -229,6 +229,15 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    * @param entry - Modification to record
    */
   record(entry: T): void {
+    if (entry.undoPolicy === 'barrier') {
+      this.recordBarrier(entry);
+      return;
+    }
+    this.recordEntry(entry);
+  }
+
+  /** Add an entry using the shared branching, retention, and checkpoint rules. */
+  private recordEntry(entry: T): void {
     this.advanceMutationRevision();
 
     // Calculate size of new entry
@@ -298,11 +307,25 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   }
 
   /**
+   * Insert a bounded, forward-replayable barrier into the current timeline.
+   * Earlier entries remain available to hot-exit/revert reconciliation but are
+   * no longer reachable through Undo. Recording the barrier also applies the
+   * normal branch rule, so stale redo entries are discarded.
+   */
+  recordBarrier(entry: T): void {
+    if (entry.undoPolicy !== 'barrier') {
+      throw new Error('A history barrier entry must declare undoPolicy="barrier"');
+    }
+    this.recordEntry(entry);
+  }
+
+  /**
    * Step backward in timeline (undo).
    *
    * @returns The modification that was undone, or undefined if at beginning
    */
   stepBack(): T | undefined {
+    if (this.timeline.at(-1)?.undoPolicy === 'barrier') return undefined;
     const entry = this.timeline.pop();
     const size = this.timelineSizes.pop();
 
@@ -556,7 +579,19 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    * Check if undo is available.
    */
   get canStepBack(): boolean {
-    return this.timeline.length > 0;
+    return this.timeline.length > 0 && this.timeline.at(-1)?.undoPolicy !== 'barrier';
+  }
+
+  /** True when an undo attempt is stopped by the forward-only sentinel. */
+  get isUndoBlockedByBarrier(): boolean {
+    return this.timeline.at(-1)?.undoPolicy === 'barrier';
+  }
+
+  /** True while File Revert would have to cross a prior value we did not retain. */
+  get hasUncommittedHistoryBarrier(): boolean {
+    return this.timeline
+      .slice(this.checkpointIndex)
+      .some(entry => entry.undoPolicy === 'barrier');
   }
 
   /**

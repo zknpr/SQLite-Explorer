@@ -354,6 +354,7 @@ describe('SQLiteFileSystemProvider', () => {
 
         it('should map string error to Unavailable', async () => {
             const dbOps = {
+                getCellMetadata: mock.fn(async () => ({ storageClass: 'text', byteLength: 0 })),
                 updateCell: mock.fn(async () => {
                     throw 'Database write string error';
                 })
@@ -369,6 +370,7 @@ describe('SQLiteFileSystemProvider', () => {
 
         it('should map Error object to Unavailable', async () => {
             const dbOps = {
+                getCellMetadata: mock.fn(async () => ({ storageClass: 'text', byteLength: 0 })),
                 updateCell: mock.fn(async () => {
                     throw new Error('Database write error');
                 })
@@ -406,6 +408,7 @@ describe('SQLiteFileSystemProvider', () => {
 
         it('should write text content correctly', async () => {
             const dbOps = {
+                getCellMetadata: mock.fn(async () => ({ storageClass: 'text', byteLength: 11 })),
                 updateCell: mock.fn(async () => {})
             };
             const doc = setupMockDocument(docKey, dbOps);
@@ -415,8 +418,119 @@ describe('SQLiteFileSystemProvider', () => {
             await provider.writeFile(uri, content, { create: false, overwrite: true });
 
             assert.strictEqual(dbOps.updateCell.mock.callCount(), 1);
-            assert.deepStrictEqual(dbOps.updateCell.mock.calls[0].arguments, ['users', 1, 'col', 'Hello World']);
+            assert.deepStrictEqual(dbOps.updateCell.mock.calls[0].arguments, [
+                'users',
+                1,
+                'col',
+                'Hello World',
+                undefined,
+                1024 * 1024
+            ]);
             assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 1);
+        });
+
+        it('refuses an oversized new external-editor value before metadata or mutation', async () => {
+            const dbOps = {
+                getCellMetadata: mock.fn(async () => ({ storageClass: 'text', byteLength: 1 })),
+                updateCell: mock.fn(async () => {}),
+                replaceOversizedCell: mock.fn(async () => {})
+            };
+            const doc = setupMockDocument(docKey, dbOps);
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/col.txt`);
+
+            await assert.rejects(
+                provider.writeFile(
+                    uri,
+                    new Uint8Array(1024 * 1024 + 1),
+                    { create: false, overwrite: true }
+                ),
+                /New TEXT cell value is 1048577 bytes.*1048576-byte edit limit/i
+            );
+            assert.strictEqual(dbOps.getCellMetadata.mock.callCount(), 0);
+            assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+            assert.strictEqual(dbOps.replaceOversizedCell.mock.callCount(), 0);
+            assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 0);
+        });
+
+        it('confirms and barriers an oversized external-editor replacement without reading it', async () => {
+            const dbOps = {
+                getCellMetadata: mock.fn(async () => ({
+                    storageClass: 'blob',
+                    byteLength: 2 * 1024 * 1024
+                })),
+                executeQuery: mock.fn(async () => {
+                    throw new Error('whole prior value must not be queried');
+                }),
+                updateCell: mock.fn(async () => {
+                    throw new Error('ordinary update must not run');
+                }),
+                replaceOversizedCell: mock.fn(async () => 1)
+            };
+            const doc = setupMockDocument(docKey, dbOps);
+            const warning = mock.method(
+                vscode.window,
+                'showWarningMessage',
+                async (...args: any[]) => args[2]
+            );
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/assets/group/1/payload.bin`);
+            const saved = new Uint8Array([0xff, 0xfe]);
+
+            await provider.writeFile(uri, saved, { create: false, overwrite: true });
+
+            assert.match(String(warning.mock.calls[0].arguments[0]), /"assets"\."payload"/);
+            assert.match(String(warning.mock.calls[0].arguments[0]), /BLOB/);
+            assert.match(
+                String(warning.mock.calls[0].arguments[0]),
+                /2(?:,|\.)097(?:,|\.)152 bytes/
+            );
+            assert.deepStrictEqual(dbOps.replaceOversizedCell.mock.calls[0].arguments, [
+                'assets',
+                1,
+                'payload',
+                saved,
+                { storageClass: 'blob', byteLength: 2 * 1024 * 1024 },
+                1024 * 1024
+            ]);
+            assert.strictEqual(dbOps.executeQuery.mock.callCount(), 0);
+            assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+            assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 1);
+            assert.strictEqual(
+                (doc.recordExternalModification as any).mock.calls[0].arguments[0].undoPolicy,
+                'barrier'
+            );
+            assert.strictEqual(
+                'priorValue' in (doc.recordExternalModification as any).mock.calls[0].arguments[0],
+                false
+            );
+        });
+
+        it('leaves external-editor history untouched when oversized replacement fails', async () => {
+            const dbOps = {
+                getCellMetadata: mock.fn(async () => ({
+                    storageClass: 'blob',
+                    byteLength: 2 * 1024 * 1024
+                })),
+                replaceOversizedCell: mock.fn(async () => {
+                    throw new Error('guarded update failed');
+                })
+            };
+            const doc = setupMockDocument(docKey, dbOps);
+            mock.method(
+                vscode.window,
+                'showWarningMessage',
+                async (...args: any[]) => args[2]
+            );
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/assets/group/1/payload.bin`);
+
+            await assert.rejects(
+                provider.writeFile(
+                    uri,
+                    new Uint8Array([0xff]),
+                    { create: false, overwrite: true }
+                ),
+                /guarded update failed/
+            );
+            assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 0);
         });
 
         it('keeps an unsafe INTEGER byte-identical across external-editor open and save', async () => {
@@ -638,6 +752,7 @@ describe('SQLiteFileSystemProvider', () => {
 
         it('should write binary content if not valid UTF-8', async () => {
             const dbOps = {
+                getCellMetadata: mock.fn(async () => ({ storageClass: 'blob', byteLength: 3 })),
                 updateCell: mock.fn(async () => {})
             };
             const doc = setupMockDocument(docKey, dbOps);
@@ -647,7 +762,14 @@ describe('SQLiteFileSystemProvider', () => {
             await provider.writeFile(uri, content, { create: false, overwrite: true });
 
             assert.strictEqual(dbOps.updateCell.mock.callCount(), 1);
-            assert.deepStrictEqual(dbOps.updateCell.mock.calls[0].arguments, ['users', 1, 'col', content]);
+            assert.deepStrictEqual(dbOps.updateCell.mock.calls[0].arguments, [
+                'users',
+                1,
+                'col',
+                content,
+                undefined,
+                1024 * 1024
+            ]);
             assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 1);
         });
 

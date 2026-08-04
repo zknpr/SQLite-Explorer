@@ -28,7 +28,8 @@ import type {
     CellMetadata,
     CellReadChunk,
     CellReadSession,
-    CellReadTarget
+    CellReadTarget,
+    OversizedCellMetadata
 } from './core/types';
 import { escapeIdentifier } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -171,7 +172,14 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.logAndDelegate(`Discarding ${mods.length} modifications`, true, 'discardModifications', mods, signal);
     }
 
-    async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<RecordId | void> {
+    async updateCell(
+        table: string,
+        rowId: RecordId,
+        column: string,
+        value: CellValue,
+        patch?: string,
+        maxEditValueBytes?: number
+    ): Promise<RecordId | void> {
         // Reconstruct SQL for logging
         let sql;
         if (patch) {
@@ -180,10 +188,37 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
             sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ${this.sanitizeValue(value)} WHERE rowid = ${rowId}`;
         }
         this.log(sql, true);
-        return this.wrapped.updateCell(table, rowId, column, value, patch);
+        return this.wrapped.updateCell(table, rowId, column, value, patch, maxEditValueBytes);
     }
 
-    async insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined> {
+    async replaceOversizedCell(
+        table: string,
+        rowId: RecordId,
+        column: string,
+        value: CellValue,
+        expected: OversizedCellMetadata,
+        maxEditValueBytes?: number
+    ): Promise<RecordId | void> {
+        this.log(
+            `Replacing confirmed oversized ${escapeIdentifier(table)}.${escapeIdentifier(column)} ` +
+            `(${expected.storageClass}, ${expected.byteLength} bytes) without in-memory undo`,
+            true
+        );
+        return this.wrapped.replaceOversizedCell(
+            table,
+            rowId,
+            column,
+            value,
+            expected,
+            maxEditValueBytes
+        );
+    }
+
+    async insertRow(
+        table: string,
+        data: Record<string, CellValue>,
+        maxEditValueBytes?: number
+    ): Promise<RecordId | undefined> {
         const columns = Object.keys(data);
         let sql;
         if (columns.length === 0) {
@@ -195,12 +230,16 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
             sql = `INSERT INTO ${escapeIdentifier(table)} (${colNames}) VALUES (${values})`;
         }
         this.log(sql, true);
-        return this.wrapped.insertRow(table, data);
+        return this.wrapped.insertRow(table, data, maxEditValueBytes);
     }
 
-    async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
+    async insertRowBatch(
+        table: string,
+        rows: Record<string, CellValue>[],
+        maxEditValueBytes?: number
+    ): Promise<void> {
         this.log(`INSERT batch: ${rows.length} rows into ${escapeIdentifier(table)}`, true);
-        return this.wrapped.insertRowBatch(table, rows);
+        return this.wrapped.insertRowBatch(table, rows, maxEditValueBytes);
     }
 
     async deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void> {
@@ -315,9 +354,13 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         );
     }
 
-    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> {
+    async updateCellBatch(
+        table: string,
+        updates: CellUpdate[],
+        maxEditValueBytes?: number
+    ): Promise<CellUpdateResult[]> {
         this.log(`Batch update ${updates.length} cells in ${table}`, true);
-        return this.wrapped.updateCellBatch(table, updates);
+        return this.wrapped.updateCellBatch(table, updates, maxEditValueBytes);
     }
 
     async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {

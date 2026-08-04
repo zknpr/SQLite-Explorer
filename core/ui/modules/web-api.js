@@ -14,6 +14,11 @@ import {
     errorFromRpcResponse,
     rpcErrorFields
 } from './transport.js';
+import { DEFAULT_MAX_INLINE_CELL_BYTES } from '../../../src/core/cell-containment.ts';
+import {
+    formatOversizedCellReplacementWarning,
+    isOversizedCellReplacementConflictError
+} from '../../../src/core/cell-edit-policy.ts';
 
 export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
 
@@ -381,15 +386,61 @@ export const backendApi = {
         sendRpcRequest('exportTable', [dbParams, columns, dbOptions, tableStore, exportOptions, extras]),
 
     // Database operations
-    updateCell: (table, rowId, column, value, originalValue) =>
-        sendRpcRequest('updateCell', [table, rowId, column, value, originalValue]),
+    updateCell: async (table, rowId, column, value, originalValue) => {
+        while (true) {
+            const metadata = await sendRpcRequest('getCellMetadata', [{
+                table,
+                rowId,
+                column
+            }]);
+            if (
+                (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
+                && metadata.byteLength > DEFAULT_MAX_INLINE_CELL_BYTES
+            ) {
+                if (!window.confirm(formatOversizedCellReplacementWarning(
+                    table,
+                    column,
+                    metadata
+                ))) {
+                    throw new Error('Oversized cell replacement cancelled');
+                }
+                try {
+                    return await sendRpcRequest('replaceOversizedCell', [
+                        table,
+                        rowId,
+                        column,
+                        value,
+                        {
+                            storageClass: metadata.storageClass,
+                            byteLength: metadata.byteLength
+                        },
+                        DEFAULT_MAX_INLINE_CELL_BYTES
+                    ]);
+                } catch (error) {
+                    if (isOversizedCellReplacementConflictError(error)) continue;
+                    throw error;
+                }
+            }
+            return sendRpcRequest('updateCell', [
+                table,
+                rowId,
+                column,
+                value,
+                originalValue,
+                DEFAULT_MAX_INLINE_CELL_BYTES
+            ]);
+        }
+    },
     getCellMetadata: (target) => sendRpcRequest('getCellMetadata', [target]),
     openCellReadSession: (target) => sendRpcRequest('openCellReadSession', [target]),
     readCellChunk: (sessionId, byteOffset, maxBytes) =>
         sendRpcRequest('readCellChunk', [sessionId, byteOffset, maxBytes]),
     closeCellReadSession: (sessionId) =>
         sendRpcRequest('closeCellReadSession', [sessionId]),
-    insertRow: (table, data) => sendRpcRequest('insertRow', [table, data]),
+    insertRow: (table, data) => sendRpcRequest(
+        'insertRow',
+        [table, data, DEFAULT_MAX_INLINE_CELL_BYTES]
+    ),
     deleteRows: (table, rowIds) => sendRpcRequest('deleteRows', [table, rowIds]),
     deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),
     createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
@@ -436,7 +487,10 @@ export const backendApi = {
         }
         return sendRpcRequest('dropView', [view, current.sql, triggerSnapshot]);
     },
-    updateCellBatch: (table, updates, label) => sendRpcRequest('updateCellBatch', [table, updates, label]),
+    updateCellBatch: (table, updates, label) => sendRpcRequest(
+        'updateCellBatch',
+        [table, updates, label, DEFAULT_MAX_INLINE_CELL_BYTES]
+    ),
     addColumn: (table, column, type, defaultValue) => sendRpcRequest('addColumn', [table, column, type, defaultValue]),
     fetchTableData: (table, options) => sendRpcRequest('fetchTableData', [table, options]),
     fetchTableCount: (table, options) => sendRpcRequest('fetchTableCount', [table, options]),

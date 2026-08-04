@@ -44,7 +44,8 @@ import type {
   CellMetadata,
   CellReadChunk,
   CellReadSession,
-  CellReadTarget
+  CellReadTarget,
+  OversizedCellMetadata
 } from './core/types';
 
 import { Worker } from './platform/threadPool';
@@ -105,9 +106,32 @@ interface WorkerMethods {
   redoModification(mod: ModificationEntry): Promise<void>;
   flushChanges(): Promise<void>;
   discardModifications(mods: ModificationEntry[]): Promise<void>;
-  updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<RecordId | void>;
-  insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined>;
-  insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
+  updateCell(
+    table: string,
+    rowId: RecordId,
+    column: string,
+    value: CellValue,
+    patch?: string,
+    maxEditValueBytes?: number
+  ): Promise<RecordId | void>;
+  replaceOversizedCell(
+    table: string,
+    rowId: RecordId,
+    column: string,
+    value: CellValue,
+    expected: OversizedCellMetadata,
+    maxEditValueBytes?: number
+  ): Promise<RecordId | void>;
+  insertRow(
+    table: string,
+    data: Record<string, CellValue>,
+    maxEditValueBytes?: number
+  ): Promise<RecordId | undefined>;
+  insertRowBatch(
+    table: string,
+    rows: Record<string, CellValue>[],
+    maxEditValueBytes?: number
+  ): Promise<void>;
   deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void>;
   deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
@@ -138,7 +162,11 @@ interface WorkerMethods {
     expectedSql?: string,
     expectedTriggers?: readonly ViewTriggerDefinition[]
   ): Promise<ViewDefinition>;
-  updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]>;
+  updateCellBatch(
+    table: string,
+    updates: CellUpdate[],
+    maxEditValueBytes?: number
+  ): Promise<CellUpdateResult[]>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
   fetchTableCount(table: string, options: TableCountOptions): Promise<number>;
@@ -164,6 +192,7 @@ const WORKER_METHOD_NAMES = [
   'flushChanges',
   'discardModifications',
   'updateCell',
+  'replaceOversizedCell',
   'insertRow',
   'insertRowBatch',
   'deleteRows',
@@ -470,12 +499,46 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.discardModifications(mods, signal),
         // Preserve JSON merge patches when the browser facade calls the
         // in-process endpoint directly.
-        updateCell: (table: string, rowId: RecordId, column: string, value: CellValue, patch?: string) =>
-          endpoint.updateCell(table, rowId, column, value, patch),
-        insertRow: (table: string, data: Record<string, CellValue>) =>
-          endpoint.insertRow(table, data),
-        insertRowBatch: (table: string, rows: Record<string, CellValue>[]) =>
-          endpoint.insertRowBatch(table, rows),
+        updateCell: (
+          table: string,
+          rowId: RecordId,
+          column: string,
+          value: CellValue,
+          patch?: string,
+          maxEditValueBytes?: number
+        ) => endpoint.updateCell(
+          table,
+          rowId,
+          column,
+          value,
+          patch,
+          maxEditValueBytes
+        ),
+        replaceOversizedCell: (
+          table: string,
+          rowId: RecordId,
+          column: string,
+          value: CellValue,
+          expected: OversizedCellMetadata,
+          maxEditValueBytes?: number
+        ) => endpoint.replaceOversizedCell(
+          table,
+          rowId,
+          column,
+          value,
+          expected,
+          maxEditValueBytes
+        ),
+        insertRow: (
+          table: string,
+          data: Record<string, CellValue>,
+          maxEditValueBytes?: number
+        ) => endpoint.insertRow(table, data, maxEditValueBytes),
+        insertRowBatch: (
+          table: string,
+          rows: Record<string, CellValue>[],
+          maxEditValueBytes?: number
+        ) => endpoint.insertRowBatch(table, rows, maxEditValueBytes),
         deleteRows: (table: string, rowIds: RecordId[]) =>
           endpoint.deleteRows(table, rowIds),
         deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
@@ -518,8 +581,11 @@ async function createInProcessWasmDatabaseConnection(
           expectedSql?: string,
           expectedTriggers?: readonly ViewTriggerDefinition[]
         ) => endpoint.dropView(view, expectedSql, expectedTriggers),
-        updateCellBatch: (table: string, updates: CellUpdate[]) =>
-          endpoint.updateCellBatch(table, updates),
+        updateCellBatch: (
+          table: string,
+          updates: CellUpdate[],
+          maxEditValueBytes?: number
+        ) => endpoint.updateCellBatch(table, updates, maxEditValueBytes),
         addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
           endpoint.addColumn(table, column, type, defaultValue),
         fetchTableData: (table: string, options: TableQueryOptions) =>
@@ -727,18 +793,53 @@ async function createWorkerBackedWasmDatabaseConnection(
             callWorkerAfterAbortCheck(signal, () => workerProxy.discardModifications(mods)),
           // Preserve JSON merge patches through worker RPC while transferring
           // a private Uint8Array copy (the host may retain the original in history).
-          updateCell: (table: string, rowId: RecordId, column: string, value: CellValue, patch?: string) =>
-            workerProxy.updateCell(table, rowId, column, wrapForTransfer(value), patch),
-          insertRow: (table: string, data: Record<string, CellValue>) => {
+          updateCell: (
+            table: string,
+            rowId: RecordId,
+            column: string,
+            value: CellValue,
+            patch?: string,
+            maxEditValueBytes?: number
+          ) => workerProxy.updateCell(
+            table,
+            rowId,
+            column,
+            wrapForTransfer(value),
+            patch,
+            maxEditValueBytes
+          ),
+          replaceOversizedCell: (
+            table: string,
+            rowId: RecordId,
+            column: string,
+            value: CellValue,
+            expected: OversizedCellMetadata,
+            maxEditValueBytes?: number
+          ) => workerProxy.replaceOversizedCell(
+            table,
+            rowId,
+            column,
+            wrapForTransfer(value),
+            expected,
+            maxEditValueBytes
+          ),
+          insertRow: (
+            table: string,
+            data: Record<string, CellValue>,
+            maxEditValueBytes?: number
+          ) => {
             // Retain caller-owned values because insert history records this object.
             const wrappedData: Record<string, CellValue> = {};
             for (const key of Object.keys(data)) {
               wrappedData[key] = wrapForTransfer(data[key]);
             }
-            return workerProxy.insertRow(table, wrappedData);
+            return workerProxy.insertRow(table, wrappedData, maxEditValueBytes);
           },
-          insertRowBatch: (table: string, rows: Record<string, CellValue>[]) =>
-            workerProxy.insertRowBatch(table, rows),
+          insertRowBatch: (
+            table: string,
+            rows: Record<string, CellValue>[],
+            maxEditValueBytes?: number
+          ) => workerProxy.insertRowBatch(table, rows, maxEditValueBytes),
           deleteRows: (table: string, rowIds: RecordId[]) =>
             workerProxy.deleteRows(table, rowIds),
           deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
@@ -794,13 +895,17 @@ async function createWorkerBackedWasmDatabaseConnection(
             expectedSql?: string,
             expectedTriggers?: readonly ViewTriggerDefinition[]
           ) => workerProxy.dropView(view, expectedSql, expectedTriggers),
-          updateCellBatch: (table: string, updates: CellUpdate[]) => {
+          updateCellBatch: (
+            table: string,
+            updates: CellUpdate[],
+            maxEditValueBytes?: number
+          ) => {
             // Retain caller-owned values because batch history records these updates.
             const wrappedUpdates = updates.map(u => ({
               ...u,
               value: wrapForTransfer(u.value)
             }));
-            return workerProxy.updateCellBatch(table, wrappedUpdates);
+            return workerProxy.updateCellBatch(table, wrappedUpdates, maxEditValueBytes);
           },
           addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
             workerProxy.addColumn(table, column, type, defaultValue),

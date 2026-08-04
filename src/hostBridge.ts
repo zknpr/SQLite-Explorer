@@ -28,6 +28,13 @@ import { escapeIdentifier, validateRowId, validateRowIds } from './core/sql-util
 import { isViewDefinitionConflictError } from './core/view-utils';
 import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './core/cell-containment';
 import type { CellMaterializationService } from './cellMaterialization';
+import {
+  assertCellValueWithinEditLimit,
+  assertCellValuesWithinEditLimit,
+  formatOversizedCellReplacementWarning,
+  isOversizedCellReplacementConflictError,
+  isOversizedCellReplacementRequiredError
+} from './core/cell-edit-policy';
 
 interface ActiveCellMediaPreview {
   previewId: string;
@@ -218,60 +225,155 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
     assertMutableRecordId(rowId);
+    const editLimitBytes = getMaxInlineCellBytes();
+    // Stage C guards the transport ceiling. Stage D applies the stricter
+    // semantic policy before any database read or confirmation work.
+    assertCellValueWithinEditLimit(value, editLimitBytes);
 
     const identity = await this.resolveTableIdentity(dbOps, table);
     const predicate = buildRecordIdentityPredicate(rowId, identity);
     this.assertConnectionGeneration(connectionGeneration);
 
-    // The caller's original value may have been captured before asynchronous
-    // work (notably reading a dropped BLOB). Read by stable row identity as
-    // close to the write as possible so undo and JSON patches are based on the
-    // database value that this update actually replaces.
-    const current = await dbOps.executeQuery(
-      `SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} ` +
-      `WHERE ${predicate.sql} LIMIT 1`,
-      predicate.params
-    );
-    const currentRow = current[0]?.rows[0];
-    if (!currentRow) {
-      throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+    const escapedColumn = escapeIdentifier(column);
+    const byteLengthExpression =
+      `CASE WHEN ${escapedColumn} IS NULL THEN 0 ` +
+      `ELSE length(CAST(${escapedColumn} AS BLOB)) END`;
+
+    while (true) {
+      // The CASE expression is the containment boundary for edit history: a
+      // bounded prior follows the existing path, while an oversized prior is
+      // represented only by typeof()/exact byte length and is never returned.
+      const current = await dbOps.executeQuery(
+        `SELECT typeof(${escapedColumn}), ${byteLengthExpression}, ` +
+        `CASE WHEN typeof(${escapedColumn}) IN ('text', 'blob') ` +
+        `AND ${byteLengthExpression} > ? THEN NULL ELSE ${escapedColumn} END ` +
+        `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql} LIMIT 1`,
+        [editLimitBytes, ...predicate.params]
+      );
+      this.assertConnectionGeneration(connectionGeneration);
+      const currentRow = current[0]?.rows[0];
+      if (!currentRow) {
+        throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+      }
+      const storageClass = currentRow[0];
+      const rawByteLength = currentRow[1];
+      const byteLength = typeof rawByteLength === 'bigint'
+        ? Number(rawByteLength)
+        : rawByteLength;
+      if (
+        !['null', 'integer', 'real', 'text', 'blob'].includes(String(storageClass))
+        || !Number.isSafeInteger(byteLength)
+        || Number(byteLength) < 0
+      ) {
+        throw new Error(`SQLite returned invalid cell metadata for ${table}.${column}`);
+      }
+
+      const oversized = (storageClass === 'text' || storageClass === 'blob')
+        && Number(byteLength) > editLimitBytes;
+      if (oversized) {
+        const expected = {
+          storageClass,
+          byteLength: Number(byteLength)
+        } as const;
+        const answer = await vsc.window.showWarningMessage(
+          formatOversizedCellReplacementWarning(table, column, expected),
+          { modal: true },
+          { title: vsc.l10n.t('Replace Without Undo'), value: true },
+          { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
+        );
+        if (!answer?.value) throw new vsc.CancellationError();
+
+        this.assertConnectionGeneration(connectionGeneration);
+        if (!('replaceOversizedCell' in dbOps)) {
+          throw new Error('Backend does not support guarded oversized-cell replacement');
+        }
+        try {
+          const updatedRowId = await dbOps.replaceOversizedCell(
+            table,
+            rowId,
+            column,
+            value,
+            expected,
+            editLimitBytes
+          );
+          this.assertConnectionGeneration(connectionGeneration);
+          const newTargetRowId = updatedRowId ?? rowId;
+          // This bounded forward entry is the future file-backed-undo hook: a
+          // later stage can attach a checksummed prior snapshot and remove the
+          // barrier policy without changing the confirmed backend operation.
+          this.document.recordExternalModification({
+            label: 'Replace Oversized Cell',
+            description: `Replace oversized ${table}.${column} without undo`,
+            modificationType: 'cell_update',
+            targetTable: table,
+            targetRowId: rowId,
+            ...(isPrimaryKeyRecordId(rowId) ? { newTargetRowId } : {}),
+            targetColumn: column,
+            newValue: value,
+            operation: 'set',
+            undoPolicy: 'barrier'
+          });
+          return newTargetRowId;
+        } catch (error) {
+          // Metadata is exactly what the user confirmed. Re-read and re-confirm
+          // if another writer changed it while the modal was open.
+          if (isOversizedCellReplacementConflictError(error)) continue;
+          throw error;
+        }
+      }
+
+      const primaryKeyIndex = identity.kind === 'primaryKey'
+        ? identity.columns.findIndex(keyColumn => keyColumn.identifier === column)
+        : -1;
+      const priorValue = primaryKeyIndex >= 0
+        ? predicate.primaryKey!.values[primaryKeyIndex]
+        : currentRow[2];
+      const prepared = prepareCellUpdateForStorage(value, priorValue);
+      const patch = prepared.operation === 'json_patch' ? String(prepared.value) : undefined;
+
+      this.assertConnectionGeneration(connectionGeneration);
+
+      // Use specific method instead of generic exec
+      // This allows the backend to handle safe SQL construction
+      if ('updateCell' in dbOps) {
+        let updatedRowId: RecordId | void;
+        try {
+          updatedRowId = await dbOps.updateCell(
+            table,
+            rowId,
+            column,
+            value,
+            patch,
+            editLimitBytes
+          );
+        } catch (error) {
+          // A concurrent writer can make the prior oversized after our
+          // metadata read. Re-enter the metadata/confirmation loop rather than
+          // bypassing the extension-host confirmation with a normal update.
+          if (isOversizedCellReplacementRequiredError(error)) continue;
+          throw error;
+        }
+        const newTargetRowId = updatedRowId ?? rowId;
+
+        // Fire edit event
+        this.document.recordExternalModification({
+          label: 'Update Cell',
+          description: `Update ${table}.${column}`,
+          modificationType: 'cell_update',
+          targetTable: table,
+          targetRowId: rowId,
+          ...(isPrimaryKeyRecordId(rowId) ? { newTargetRowId } : {}),
+          targetColumn: column,
+          newValue: prepared.value,
+          operation: prepared.operation,
+          priorValue
+        });
+        return newTargetRowId;
+      } else {
+        // Fallback for older backend versions (shouldn't happen if built correctly)
+        throw new Error("Backend does not support updateCell");
+      }
     }
-    const primaryKeyIndex = identity.kind === 'primaryKey'
-      ? identity.columns.findIndex(keyColumn => keyColumn.identifier === column)
-      : -1;
-    const priorValue = primaryKeyIndex >= 0
-      ? predicate.primaryKey!.values[primaryKeyIndex]
-      : currentRow[0];
-    const prepared = prepareCellUpdateForStorage(value, priorValue);
-    const patch = prepared.operation === 'json_patch' ? String(prepared.value) : undefined;
-
-    this.assertConnectionGeneration(connectionGeneration);
-
-    // Use specific method instead of generic exec
-    // This allows the backend to handle safe SQL construction
-    if ('updateCell' in dbOps) {
-      const updatedRowId = await dbOps.updateCell(table, rowId, column, value, patch);
-      const newTargetRowId = updatedRowId ?? rowId;
-
-      // Fire edit event
-      this.document.recordExternalModification({
-        label: 'Update Cell',
-        description: `Update ${table}.${column}`,
-        modificationType: 'cell_update',
-        targetTable: table,
-        targetRowId: rowId,
-        ...(isPrimaryKeyRecordId(rowId) ? { newTargetRowId } : {}),
-        targetColumn: column,
-        newValue: prepared.value,
-        operation: prepared.operation,
-        priorValue
-      });
-      return newTargetRowId;
-    } else {
-      // Fallback for older backend versions (shouldn't happen if built correctly)
-      throw new Error("Backend does not support updateCell");
-    }
-
   }
 
   /**
@@ -284,10 +386,14 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
+    const editLimitBytes = assertCellValuesWithinEditLimit(
+      Object.values(data),
+      getMaxInlineCellBytes()
+    );
     let rowId: RecordId | undefined;
 
     if ('insertRow' in dbOps) {
-      rowId = await dbOps.insertRow(table, data);
+      rowId = await dbOps.insertRow(table, data, editLimitBytes);
     } else {
       throw new Error("Backend does not support insertRow");
     }
@@ -712,9 +818,13 @@ export class HostBridge implements ToastService {
     updates.forEach(update => assertMutableRecordId(update.rowId));
 
     if (updates.length === 0) return;
+    const editLimitBytes = assertCellValuesWithinEditLimit(
+      updates.map(update => update.value),
+      getMaxInlineCellBytes()
+    );
 
     this.assertConnectionGeneration(connectionGeneration);
-    const historyCells = await dbOps.updateCellBatch(table, updates);
+    const historyCells = await dbOps.updateCellBatch(table, updates, editLimitBytes);
     this.assertConnectionGeneration(connectionGeneration);
 
     // Fire batch edit event

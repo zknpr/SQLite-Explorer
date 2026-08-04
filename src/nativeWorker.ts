@@ -46,7 +46,8 @@ import type {
   CellMetadata,
   CellReadChunk,
   CellReadSession,
-  CellReadTarget
+  CellReadTarget,
+  OversizedCellMetadata
 } from './core/types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -104,12 +105,104 @@ import {
   validateCellReadTarget,
   validateCellReadWindow
 } from './core/cell-read';
+import {
+  assertCellValueWithinEditLimit,
+  assertCellValuesWithinEditLimit,
+  assertOversizedCellReplacementExpectation,
+  OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE,
+  OversizedCellReplacementRequiredError
+} from './core/cell-edit-policy';
 
 // ============================================================================
 // Utility Functions
 // ============================================================================
 
 // Utility functions moved to src/core/sql-utils.ts
+
+// This token never crosses RPC. It distinguishes restoration of a value that
+// already existed in history from a user request to create oversized content.
+const HISTORY_REPLAY_EDIT_TOKEN = Symbol('history-replay-edit');
+
+type NativeHistoryUpdateCell = (
+  table: string,
+  rowId: RecordId,
+  column: string,
+  value: CellValue,
+  patch?: string,
+  maxEditValueBytes?: number,
+  historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+) => Promise<RecordId | void>;
+
+type NativeHistoryUpdateCellBatch = (
+  table: string,
+  updates: CellUpdate[],
+  maxEditValueBytes?: number,
+  historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+) => Promise<CellUpdateResult[]>;
+
+type NativeHistoryInsertRow = (
+  table: string,
+  data: Record<string, CellValue>,
+  maxEditValueBytes?: number,
+  historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+) => Promise<RecordId | undefined>;
+
+type NativeHistoryInsertRowBatch = (
+  table: string,
+  rows: Record<string, CellValue>[],
+  maxEditValueBytes?: number,
+  historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+) => Promise<void>;
+
+const updateNativeCellForHistory = (
+  operations: DatabaseOperations,
+  table: string,
+  rowId: RecordId,
+  column: string,
+  value: CellValue,
+  patch?: string
+) => (operations.updateCell as NativeHistoryUpdateCell)(
+  table,
+  rowId,
+  column,
+  value,
+  patch,
+  undefined,
+  HISTORY_REPLAY_EDIT_TOKEN
+);
+
+const updateNativeCellBatchForHistory = (
+  operations: DatabaseOperations,
+  table: string,
+  updates: CellUpdate[]
+) => (operations.updateCellBatch as NativeHistoryUpdateCellBatch)(
+  table,
+  updates,
+  undefined,
+  HISTORY_REPLAY_EDIT_TOKEN
+);
+
+const insertNativeRowForHistory = (
+  operations: DatabaseOperations,
+  table: string,
+  data: Record<string, CellValue>
+) => (operations.insertRow as NativeHistoryInsertRow)(
+  table,
+  data,
+  undefined,
+  HISTORY_REPLAY_EDIT_TOKEN
+);
+
+const insertNativeRowBatchForHistory = (
+  operations: DatabaseOperations,
+  table: string,
+  rows: Record<string, CellValue>[]
+) => (operations.insertRowBatch as NativeHistoryInsertRowBatch)(
+  table,
+  rows,
+  undefined,
+  HISTORY_REPLAY_EDIT_TOKEN
+);
 
 function mergeExactIntegerTextMaps(
   companionTexts: ExactIntegerTextMap | undefined,
@@ -827,6 +920,78 @@ export async function createNativeDatabaseConnection(
         return identity;
       };
 
+      const buildNativeCellLocator = (
+        rowId: RecordId,
+        identity: TableIdentity
+      ): {
+        kind: 'rowid'; value: CellValue;
+      } | {
+        kind: 'primaryKey'; columns: string[]; values: CellValue[];
+      } => {
+        const predicate = buildRecordIdentityPredicate(rowId, identity);
+        return identity.kind === 'rowid'
+          ? { kind: 'rowid', value: predicate.params[0] }
+          : {
+              kind: 'primaryKey',
+              columns: identity.columns.map(column => column.identifier),
+              values: predicate.params
+            };
+      };
+
+      const readNativeCellMetadata = async (
+        table: string,
+        rowId: RecordId,
+        column: string,
+        identity?: TableIdentity
+      ): Promise<CellMetadata> => worker.call<CellMetadata>('getCellMetadata', [
+        table,
+        column,
+        buildNativeCellLocator(rowId, identity ?? await resolveNativeTableIdentity(table))
+      ]);
+
+      const assertNativeCellPriorWithinEditLimit = async (
+        table: string,
+        rowId: RecordId,
+        column: string,
+        editLimitBytes: number,
+        identity?: TableIdentity
+      ): Promise<void> => {
+        const metadata = await readNativeCellMetadata(table, rowId, column, identity);
+        if (
+          (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
+          && metadata.byteLength > editLimitBytes
+        ) {
+          throw new OversizedCellReplacementRequiredError(
+            table,
+            column,
+            metadata.storageClass,
+            metadata.byteLength,
+            editLimitBytes
+          );
+        }
+      };
+
+      const assertNativeBatchPriorsWithinEditLimit = async (
+        table: string,
+        updates: readonly CellUpdate[],
+        editLimitBytes: number,
+        identity: TableIdentity
+      ): Promise<void> => {
+        const seen = new Set<string>();
+        for (const update of updates) {
+          const key = `${String(update.rowId)}\0${update.column}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          await assertNativeCellPriorWithinEditLimit(
+            table,
+            update.rowId,
+            update.column,
+            editLimitBytes,
+            identity
+          );
+        }
+      };
+
       const queryNativeSingleStatement = async <T>(
         sql: string,
         params?: CellValue[]
@@ -869,11 +1034,30 @@ export async function createNativeDatabaseConnection(
       const updateNativePrimaryKeyCellBatch = async (
         table: string,
         identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
-        updates: CellUpdate[]
+        updates: CellUpdate[],
+        maxEditValueBytes?: number,
+        historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
       ): Promise<CellUpdateResult[]> => {
+        const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+        const editLimitBytes = isHistoryReplay
+          ? 0
+          : assertCellValuesWithinEditLimit(
+              updates.map(update => update.value),
+              maxEditValueBytes
+            );
         const savepointName = createSavepointName('sp_update_pk_batch');
         await worker.call('run', [`SAVEPOINT ${savepointName}`]);
         try {
+          // Keep the existing full prior-value read below for bounded history,
+          // but refuse oversized priors from metadata before it can run.
+          if (!isHistoryReplay && maxEditValueBytes !== undefined) {
+            await assertNativeBatchPriorsWithinEditLimit(
+              table,
+              updates,
+              editLimitBytes,
+              identity
+            );
+          }
           const updatesByRow = new Map<RecordId, CellUpdate[]>();
           for (const update of updates) {
             const rowUpdates = updatesByRow.get(update.rowId) ?? [];
@@ -907,6 +1091,10 @@ export async function createNativeDatabaseConnection(
               const storedValue = prepared.operation === 'json_patch'
                 ? applyNativeJsonPatchValue(priorValue, prepared.value)
                 : prepared.value;
+              if (!isHistoryReplay && prepared.operation === 'json_patch') {
+                // Validate the merged value, not only its bounded patch payload.
+                assertCellValueWithinEditLimit(storedValue, editLimitBytes);
+              }
               return { update, priorValue, prepared, storedValue };
             });
             await worker.call('run', [
@@ -1030,20 +1218,7 @@ export async function createNativeDatabaseConnection(
 
         getCellMetadata: async (target: CellReadTarget): Promise<CellMetadata> => {
           validateCellReadTarget(target);
-          const identity = await resolveNativeTableIdentity(target.table);
-          const predicate = buildRecordIdentityPredicate(target.rowId, identity);
-          const locator = identity.kind === 'rowid'
-            ? { kind: 'rowid' as const, value: predicate.params[0] }
-            : {
-                kind: 'primaryKey' as const,
-                columns: identity.columns.map(column => column.identifier),
-                values: predicate.params
-              };
-          return worker.call<CellMetadata>('getCellMetadata', [
-            target.table,
-            target.column,
-            locator
-          ]);
+          return readNativeCellMetadata(target.table, target.rowId, target.column);
         },
 
         openCellReadSession: async (target: CellReadTarget): Promise<CellReadSession> => {
@@ -1172,7 +1347,9 @@ export async function createNativeDatabaseConnection(
                   await updateNativePrimaryKeyCellBatch(
                     targetTable,
                     identity as Extract<TableIdentity, { kind: 'primaryKey' }>,
-                    updates
+                    updates,
+                    undefined,
+                    HISTORY_REPLAY_EDIT_TOKEN
                   );
                 } else {
                   await worker.call('execBatch', [updates.map(update => ({
@@ -1198,7 +1375,13 @@ export async function createNativeDatabaseConnection(
                   const currentValue = (read.values[0]?.[0] ?? null) as CellValue;
                   value = computeUndoValue(currentValue, priorValue, newValue, operation);
                 }
-                await rawOperations.updateCell(targetTable, currentRowId, targetColumn, value);
+                await updateNativeCellForHistory(
+                  rawOperations,
+                  targetTable,
+                  currentRowId,
+                  targetColumn,
+                  value
+                );
               }
               break;
             }
@@ -1211,7 +1394,11 @@ export async function createNativeDatabaseConnection(
 
             case 'row_delete':
               if (deletedRows && deletedRows.length > 0) {
-                await rawOperations.insertRowBatch(targetTable, deletedRows.map(dr => dr.row));
+                await insertNativeRowBatchForHistory(
+                  rawOperations,
+                  targetTable,
+                  deletedRows.map(dr => dr.row)
+                );
               }
               break;
 
@@ -1297,7 +1484,7 @@ export async function createNativeDatabaseConnection(
           switch (modificationType) {
             case 'cell_update':
               if (affectedCells) {
-                await rawOperations.updateCellBatch(targetTable, affectedCells.map(c => ({
+                await updateNativeCellBatchForHistory(rawOperations, targetTable, affectedCells.map(c => ({
                   rowId: c.rowId,
                   column: c.columnName,
                   value: c.newValue ?? null,
@@ -1307,9 +1494,22 @@ export async function createNativeDatabaseConnection(
                 const replayOperation = normalizeReplayCellOperation(operation);
                 if (replayOperation === 'json_patch') {
                   const patch = typeof newValue === 'string' ? newValue : JSON.stringify(newValue ?? null);
-                  await rawOperations.updateCell(targetTable, targetRowId, targetColumn, null, patch);
+                  await updateNativeCellForHistory(
+                    rawOperations,
+                    targetTable,
+                    targetRowId,
+                    targetColumn,
+                    null,
+                    patch
+                  );
                 } else {
-                  await rawOperations.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
+                  await updateNativeCellForHistory(
+                    rawOperations,
+                    targetTable,
+                    targetRowId,
+                    targetColumn,
+                    newValue ?? null
+                  );
                 }
               }
               break;
@@ -1319,7 +1519,7 @@ export async function createNativeDatabaseConnection(
                 const dataToInsert = targetRowId !== undefined && !isPrimaryKeyRecordId(targetRowId)
                   ? { ...rowData, rowid: targetRowId }
                   : rowData;
-                await rawOperations.insertRow(targetTable, dataToInsert);
+                await insertNativeRowForHistory(rawOperations, targetTable, dataToInsert);
               }
               break;
 
@@ -1387,7 +1587,20 @@ export async function createNativeDatabaseConnection(
         /**
          * Update a single cell value.
          */
-        updateCell: async (table: string, rowId: RecordId, column: string, value: CellValue, patch?: string) => {
+        updateCell: async (
+          table: string,
+          rowId: RecordId,
+          column: string,
+          value: CellValue,
+          patch?: string,
+          maxEditValueBytes?: number,
+          historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+        ) => {
+          const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+          const enforcePriorPolicy = !isHistoryReplay && maxEditValueBytes !== undefined;
+          const editLimitBytes = isHistoryReplay
+            ? 0
+            : assertCellValuesWithinEditLimit([value], maxEditValueBytes);
           assertMutableRecordId(rowId);
           if (isPrimaryKeyRecordId(rowId)) {
             const identity = await resolveNativeTableIdentity(table);
@@ -1399,7 +1612,7 @@ export async function createNativeDatabaseConnection(
               column,
               value: patch ?? value,
               operation: patch === undefined ? 'set' : 'json_patch'
-            }]);
+            }], maxEditValueBytes, historyReplayToken);
             return result[0]?.newRowId ?? rowId;
           }
 
@@ -1412,21 +1625,113 @@ export async function createNativeDatabaseConnection(
           if (patch) {
             // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL,
             // but expected behavior is to treat NULL as empty object (matching WASM path)
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(COALESCE(${escapeIdentifier(column)}, '{}'), ?) WHERE rowid = ?`;
-            params = [patch, rowIdNum];
+            const escapedColumn = escapeIdentifier(column);
+            sql =
+              `UPDATE ${escapeIdentifier(table)} SET ${escapedColumn} = ` +
+              `json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?` +
+              (enforcePriorPolicy
+                ? ` AND NOT (typeof(${escapedColumn}) IN ('text', 'blob') ` +
+                  `AND length(CAST(${escapedColumn} AS BLOB)) > ?)`
+                : '');
+            params = enforcePriorPolicy
+              ? [patch, rowIdNum, editLimitBytes]
+              : [patch, rowIdNum];
           } else {
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
-            params = [value, rowIdNum];
+            const escapedColumn = escapeIdentifier(column);
+            sql =
+              `UPDATE ${escapeIdentifier(table)} SET ${escapedColumn} = ? WHERE rowid = ?` +
+              (enforcePriorPolicy
+                ? ` AND NOT (typeof(${escapedColumn}) IN ('text', 'blob') ` +
+                  `AND length(CAST(${escapedColumn} AS BLOB)) > ?)`
+                : '');
+            params = enforcePriorPolicy
+              ? [value, rowIdNum, editLimitBytes]
+              : [value, rowIdNum];
           }
 
-          await worker.call('run', [sql, params]);
+          const result = await worker.call<{ changes: number }>('run', [sql, params]);
+          if (enforcePriorPolicy && result?.changes !== 1) {
+            await assertNativeCellPriorWithinEditLimit(
+              table,
+              rowIdNum,
+              column,
+              editLimitBytes,
+              { kind: 'rowid' }
+            );
+            throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+          }
           return rowIdNum;
+        },
+
+        replaceOversizedCell: async (
+          table: string,
+          rowId: RecordId,
+          column: string,
+          value: CellValue,
+          expected: OversizedCellMetadata,
+          maxEditValueBytes?: number
+        ) => {
+          const editLimitBytes = assertCellValuesWithinEditLimit(
+            [value],
+            maxEditValueBytes
+          );
+          assertOversizedCellReplacementExpectation(expected, editLimitBytes);
+          assertMutableRecordId(rowId);
+          const identity = await resolveNativeTableIdentity(table);
+          const predicate = buildRecordIdentityPredicate(rowId, identity);
+          const locator = buildNativeCellLocator(rowId, identity);
+
+          const updateAndResolveIdentity = async (): Promise<RecordId> => {
+            const result = await worker.call<{ changes: number }>('replaceOversizedCell', [
+              table,
+              column,
+              locator,
+              value,
+              expected,
+              editLimitBytes
+            ]);
+            if (result?.changes !== 1) {
+              throw new Error(OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE);
+            }
+            if (identity.kind === 'rowid') return validateRowId(rowId);
+
+            const candidateValues = [...predicate.primaryKey!.values];
+            const keyIndex = identity.columns.findIndex(key => key.identifier === column);
+            if (keyIndex >= 0) candidateValues[keyIndex] = value;
+            const candidateId = encodePrimaryKeyRecordId(identity.columns, candidateValues);
+            return readNativePrimaryKeyRecordId(
+              table,
+              identity,
+              buildRecordIdentityPredicate(candidateId, identity)
+            );
+          };
+
+          if (identity.kind === 'rowid') return updateAndResolveIdentity();
+
+          const savepointName = createSavepointName('sp_replace_oversized_cell');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            const newRowId = await updateAndResolveIdentity();
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return newRowId;
+          } catch (error) {
+            await safeRollbackSavepoint(savepointName, 'replaceOversizedCell');
+            throw error;
+          }
         },
 
         /**
          * Insert a new row.
          */
-        insertRow: async (table: string, data: Record<string, CellValue>) => {
+        insertRow: async (
+          table: string,
+          data: Record<string, CellValue>,
+          maxEditValueBytes?: number,
+          historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+        ) => {
+          if (historyReplayToken !== HISTORY_REPLAY_EDIT_TOKEN) {
+            assertCellValuesWithinEditLimit(Object.values(data), maxEditValueBytes);
+          }
           const identity = await resolveNativeTableIdentity(table);
           const columns = Object.keys(data);
           let sql: string;
@@ -1481,8 +1786,19 @@ export async function createNativeDatabaseConnection(
         /**
          * Insert multiple rows in a batch.
          */
-        insertRowBatch: async (table: string, rows: Record<string, CellValue>[]) => {
+        insertRowBatch: async (
+          table: string,
+          rows: Record<string, CellValue>[],
+          maxEditValueBytes?: number,
+          historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+        ) => {
           if (rows.length === 0) return;
+          if (historyReplayToken !== HISTORY_REPLAY_EDIT_TOKEN) {
+            assertCellValuesWithinEditLimit(
+              rows.flatMap(row => Object.values(row)),
+              maxEditValueBytes
+            );
+          }
 
           const batchItems: { sql: string; params: CellValue[] }[] = [];
           const escapedTable = escapeIdentifier(table);
@@ -2199,9 +2515,21 @@ export async function createNativeDatabaseConnection(
         /**
          * Update multiple cells in a batch.
          */
-        updateCellBatch: async (table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> => {
+        updateCellBatch: async (
+          table: string,
+          updates: CellUpdate[],
+          maxEditValueBytes?: number,
+          historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+        ): Promise<CellUpdateResult[]> => {
           updates.forEach(update => assertMutableRecordId(update.rowId));
           if (updates.length === 0) return [];
+          const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+          const editLimitBytes = isHistoryReplay
+            ? 0
+            : assertCellValuesWithinEditLimit(
+                updates.map(update => update.value),
+                maxEditValueBytes
+              );
 
           if (updates.some(update => isPrimaryKeyRecordId(update.rowId))) {
             if (!updates.every(update => isPrimaryKeyRecordId(update.rowId))) {
@@ -2211,7 +2539,13 @@ export async function createNativeDatabaseConnection(
             if (identity.kind !== 'primaryKey') {
               throw new Error(`Primary-key identity cannot target rowid table ${table}`);
             }
-            return updateNativePrimaryKeyCellBatch(table, identity, updates);
+            return updateNativePrimaryKeyCellBatch(
+              table,
+              identity,
+              updates,
+              maxEditValueBytes,
+              historyReplayToken
+            );
           }
 
           const batchItems: { sql: string; paramsList?: CellValue[][], params?: CellValue[] }[] = [];
@@ -2220,6 +2554,14 @@ export async function createNativeDatabaseConnection(
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
 
           try {
+          if (!isHistoryReplay && maxEditValueBytes !== undefined) {
+            await assertNativeBatchPriorsWithinEditLimit(
+              table,
+              updates,
+              editLimitBytes,
+              { kind: 'rowid' }
+            );
+          }
           const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
           const columns = [...new Set(updates.map(update => update.column))];
           const placeholders = rowIds.map(() => '?').join(', ');
@@ -2241,12 +2583,16 @@ export async function createNativeDatabaseConnection(
             if (!row) {
               throw new Error(`Cannot update ${table}.${update.column}: row ${update.rowId} no longer exists`);
             }
-            const priorValue = row.get(update.column);
+            const priorValue = row.get(update.column) as CellValue;
             const prepared = prepareCellUpdateForStorage(
               update.value,
               priorValue,
               update.operation ?? 'set'
             );
+            if (!isHistoryReplay && prepared.operation === 'json_patch') {
+              const storedValue = applyNativeJsonPatchValue(priorValue, prepared.value);
+              assertCellValueWithinEditLimit(storedValue, editLimitBytes);
+            }
             results.push({
               rowId,
               columnName: update.column,

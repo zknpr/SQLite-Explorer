@@ -32,7 +32,8 @@ import type {
   CellReadChunk,
   CellReadSession,
   CellReadTarget,
-  CellTextEncoding
+  CellTextEncoding,
+  OversizedCellMetadata
 } from '../../types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from '../../sql-utils';
 import { crypto } from '../../../platform/cryptoShim';
@@ -97,12 +98,24 @@ import {
   validateCellReadWindow,
   type CellReadSqlTarget
 } from '../../cell-read';
+import {
+  assertCellValueWithinEditLimit,
+  assertCellValuesWithinEditLimit,
+  assertOversizedCellReplacementExpectation,
+  OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE,
+  OversizedCellReplacementRequiredError
+} from '../../cell-edit-policy';
 
 // ============================================================================
 // Internal sql.js Types
 // ============================================================================
 
 type WasmBindValue = Exclude<CellValue, bigint>;
+
+// Public mutation entry points enforce Stage D. History replay supplies this
+// unforgeable in-process token so restoring an already-existing legacy value
+// is not misclassified as creating a new oversized value.
+const HISTORY_REPLAY_EDIT_TOKEN = Symbol('history-replay-edit');
 
 interface WasmPreparedStatement {
   run(params?: WasmBindValue[]): void;
@@ -844,7 +857,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           )
         }))
       );
-      await this.updateCellBatch(targetTable, updates);
+      await this.updateCellBatch(
+        targetTable,
+        updates,
+        undefined,
+        HISTORY_REPLAY_EDIT_TOKEN
+      );
     } else if (targetRowId !== undefined && targetColumn) {
       await this.updateCell(
         targetTable,
@@ -857,7 +875,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           priorValue,
           newValue,
           operation
-        )
+        ),
+        undefined,
+        undefined,
+        HISTORY_REPLAY_EDIT_TOKEN
       );
     }
   }
@@ -911,7 +932,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const { deletedRows } = mod;
     // Undo delete = re-insert rows
     if (deletedRows && deletedRows.length > 0) {
-      await this.insertRowBatch(targetTable, deletedRows.map(dr => dr.row));
+      await this.insertRowBatch(
+        targetTable,
+        deletedRows.map(dr => dr.row),
+        undefined,
+        HISTORY_REPLAY_EDIT_TOKEN
+      );
     }
   }
 
@@ -1022,14 +1048,35 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                     value: cell.newValue ?? null,
                     operation: this.normalizeReplayCellOperation(cell.operation, strict, 'cell_update')
                 }));
-                await this.updateCellBatch(targetTable, updates);
+                await this.updateCellBatch(
+                  targetTable,
+                  updates,
+                  undefined,
+                  HISTORY_REPLAY_EDIT_TOKEN
+                );
             } else if (targetRowId !== undefined && targetColumn) {
                 const replayOperation = this.normalizeReplayCellOperation(operation, strict, 'cell_update');
                 if (replayOperation === 'json_patch') {
                     const patch = typeof newValue === 'string' ? newValue : JSON.stringify(newValue ?? null);
-                    await this.updateCell(targetTable, targetRowId, targetColumn, null, patch);
+                    await this.updateCell(
+                      targetTable,
+                      targetRowId,
+                      targetColumn,
+                      null,
+                      patch,
+                      undefined,
+                      HISTORY_REPLAY_EDIT_TOKEN
+                    );
                 } else {
-                    await this.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
+                    await this.updateCell(
+                      targetTable,
+                      targetRowId,
+                      targetColumn,
+                      newValue ?? null,
+                      undefined,
+                      undefined,
+                      HISTORY_REPLAY_EDIT_TOKEN
+                    );
                 }
             } else if (strict) {
                 throw new Error('Cannot apply cell_update: missing target cell or affected cells');
@@ -1043,7 +1090,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                 const dataToInsert = targetRowId !== undefined && !isPrimaryKeyRecordId(targetRowId)
                     ? { ...rowData, rowid: targetRowId }
                     : rowData;
-                await this.insertRow(targetTable, dataToInsert);
+                await this.insertRow(
+                  targetTable,
+                  dataToInsert,
+                  undefined,
+                  HISTORY_REPLAY_EDIT_TOKEN
+                );
             } else if (strict) {
                 throw new Error('Cannot apply row_insert: missing row data');
             }
@@ -1176,9 +1228,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     rowId: RecordId,
     column: string,
     value: CellValue,
-    patch?: string
+    patch?: string,
+    maxEditValueBytes?: number,
+    historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
   ): Promise<RecordId> {
     this.assertNoActiveCellReadSession();
+    const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+    const enforcePriorPolicy = !isHistoryReplay && maxEditValueBytes !== undefined;
+    const editLimitBytes = isHistoryReplay
+      ? 0
+      : assertCellValuesWithinEditLimit([value], maxEditValueBytes);
     assertMutableRecordId(rowId);
     if (isPrimaryKeyRecordId(rowId)) {
       const identity = await this.resolveTableIdentity(table);
@@ -1190,7 +1249,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         column,
         value: patch ?? value,
         operation: patch === undefined ? 'set' : 'json_patch'
-      }]);
+      }], maxEditValueBytes, historyReplayToken);
       return result[0]?.newRowId ?? rowId;
     }
 
@@ -1208,11 +1267,34 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             // Use SQLite's native json_patch() — single UPDATE, no SELECT round-trip.
             // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL per SQL semantics,
             // but the expected behavior is to treat NULL as empty object (matching JS fallback).
-            sql = `UPDATE ${escapedTbl} SET ${escapedCol} = json_patch(COALESCE(${escapedCol}, '{}'), ?) WHERE rowid = ?`;
-            params = [typeof patch === 'string' ? patch : JSON.stringify(patch), rowIdNum];
+            sql =
+              `UPDATE ${escapedTbl} SET ${escapedCol} = ` +
+              `json_patch(COALESCE(${escapedCol}, '{}'), ?) WHERE rowid = ?` +
+              (enforcePriorPolicy
+                ? ` AND NOT (typeof(${escapedCol}) IN ('text', 'blob') ` +
+                  `AND length(CAST(${escapedCol} AS BLOB)) > ?)`
+                : '');
+            params = enforcePriorPolicy
+              ? [
+                  typeof patch === 'string' ? patch : JSON.stringify(patch),
+                  rowIdNum,
+                  editLimitBytes
+                ]
+              : [typeof patch === 'string' ? patch : JSON.stringify(patch), rowIdNum];
         } else {
             // Fallback: read current value, apply patch in JS, write back
-            const currentResult = await this.executeQuery(`SELECT ${escapedCol} FROM ${escapedTbl} WHERE rowid = ?`, [rowIdNum]);
+            if (enforcePriorPolicy) {
+              await this.assertCellPriorWithinEditLimit(
+                table,
+                rowIdNum,
+                column,
+                editLimitBytes
+              );
+            }
+            const currentResult = await this.executeQuery(
+              `SELECT ${escapedCol} FROM ${escapedTbl} WHERE rowid = ?`,
+              [rowIdNum]
+            );
             let currentValue = currentResult[0]?.rows[0]?.[0];
 
             const currentObj = parseJsonValueForPatching(currentValue, 'updateCell');
@@ -1225,20 +1307,98 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             params = [newValueStr, rowIdNum];
         }
     } else {
+        const escapedColumn = escapeIdentifier(column);
         sql =
-          `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ` +
-          `${wasmBindPlaceholder(value)} WHERE rowid = ?`;
-        params = [value, rowIdNum];
+          `UPDATE ${escapeIdentifier(table)} SET ${escapedColumn} = ` +
+          `${wasmBindPlaceholder(value)} WHERE rowid = ?` +
+          (enforcePriorPolicy
+            ? ` AND NOT (typeof(${escapedColumn}) IN ('text', 'blob') ` +
+              `AND length(CAST(${escapedColumn} AS BLOB)) > ?)`
+            : '');
+        params = enforcePriorPolicy
+          ? [value, rowIdNum, editLimitBytes]
+          : [value, rowIdNum];
     }
 
     await this.executeQuery(sql, params);
+    if (enforcePriorPolicy && this.readChangesCount() !== 1) {
+      await this.assertCellPriorWithinEditLimit(table, rowIdNum, column, editLimitBytes);
+      throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+    }
     return rowIdNum;
+  }
+
+  async replaceOversizedCell(
+    table: string,
+    rowId: RecordId,
+    column: string,
+    value: CellValue,
+    expected: OversizedCellMetadata,
+    maxEditValueBytes?: number
+  ): Promise<RecordId> {
+    this.assertNoActiveCellReadSession();
+    const editLimitBytes = assertCellValuesWithinEditLimit([value], maxEditValueBytes);
+    assertOversizedCellReplacementExpectation(expected, editLimitBytes);
+    assertMutableRecordId(rowId);
+    const identity = await this.resolveTableIdentity(table);
+    const predicate = buildRecordIdentityPredicate(rowId, identity);
+    const escapedTable = escapeIdentifier(table);
+    const escapedColumn = escapeIdentifier(column);
+    const guardedSql =
+      `UPDATE ${escapedTable} SET ${escapedColumn} = ${wasmBindPlaceholder(value)} ` +
+      `WHERE ${predicate.sql} AND typeof(${escapedColumn}) = ? ` +
+      `AND length(CAST(${escapedColumn} AS BLOB)) = ?`;
+    const guardedParams = [
+      value,
+      ...predicate.params,
+      expected.storageClass,
+      expected.byteLength
+    ];
+
+    const updateAndResolveIdentity = async (): Promise<RecordId> => {
+      await this.executeQuery(guardedSql, guardedParams);
+      if (this.readChangesCount() !== 1) {
+        throw new Error(OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE);
+      }
+      if (identity.kind === 'rowid') return validateRowId(rowId);
+
+      const candidateValues = [...predicate.primaryKey!.values];
+      const keyIndex = identity.columns.findIndex(key => key.identifier === column);
+      if (keyIndex >= 0) candidateValues[keyIndex] = value;
+      const candidateId = encodePrimaryKeyRecordId(identity.columns, candidateValues);
+      return this.readPrimaryKeyRecordId(
+        table,
+        identity,
+        buildRecordIdentityPredicate(candidateId, identity)
+      );
+    };
+
+    if (identity.kind === 'rowid') return updateAndResolveIdentity();
+
+    const savepointName = this.createSavepointName('sp_replace_oversized_cell');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      const newRowId = await updateAndResolveIdentity();
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return newRowId;
+    } catch (error) {
+      await this.safeRollbackSavepoint(savepointName, 'replaceOversizedCell');
+      throw error;
+    }
   }
 
   /**
    * Insert a new row.
    */
-  async insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined> {
+  async insertRow(
+    table: string,
+    data: Record<string, CellValue>,
+    maxEditValueBytes?: number,
+    historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+  ): Promise<RecordId | undefined> {
+    if (historyReplayToken !== HISTORY_REPLAY_EDIT_TOKEN) {
+      assertCellValuesWithinEditLimit(Object.values(data), maxEditValueBytes);
+    }
     const identity = await this.resolveTableIdentity(table);
     const columns = Object.keys(data);
     let sql: string;
@@ -1290,8 +1450,19 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Insert multiple rows in a batch within a transaction.
    */
-  async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
+  async insertRowBatch(
+    table: string,
+    rows: Record<string, CellValue>[],
+    maxEditValueBytes?: number,
+    historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+  ): Promise<void> {
     if (rows.length === 0) return;
+    if (historyReplayToken !== HISTORY_REPLAY_EDIT_TOKEN) {
+      assertCellValuesWithinEditLimit(
+        rows.flatMap(row => Object.values(row)),
+        maxEditValueBytes
+      );
+    }
 
     await this.executeQuery('BEGIN TRANSACTION');
     try {
@@ -1579,6 +1750,55 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
+  private readChangesCount(): number {
+    const raw = this.queryRaw('SELECT changes()').rows[0]?.[0];
+    const changes = typeof raw === 'bigint' ? Number(raw) : raw;
+    if (!Number.isSafeInteger(changes) || Number(changes) < 0) {
+      throw new Error('SQLite returned an invalid changes() count');
+    }
+    return Number(changes);
+  }
+
+  private async assertCellPriorWithinEditLimit(
+    table: string,
+    rowId: RecordId,
+    column: string,
+    editLimitBytes: number
+  ): Promise<void> {
+    const metadata = await this.getCellMetadata({ table, rowId, column });
+    if (
+      (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
+      && metadata.byteLength > editLimitBytes
+    ) {
+      throw new OversizedCellReplacementRequiredError(
+        table,
+        column,
+        metadata.storageClass,
+        metadata.byteLength,
+        editLimitBytes
+      );
+    }
+  }
+
+  private async assertBatchPriorsWithinEditLimit(
+    table: string,
+    updates: readonly CellUpdate[],
+    editLimitBytes: number
+  ): Promise<void> {
+    const seen = new Set<string>();
+    for (const update of updates) {
+      const key = `${String(update.rowId)}\0${update.column}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      await this.assertCellPriorWithinEditLimit(
+        table,
+        update.rowId,
+        update.column,
+        editLimitBytes
+      );
+    }
+  }
+
   /** Columns SQLite permits in an INSERT; generated columns have hidden 2/3. */
   private async getInsertableColumnNames(table: string): Promise<string[]> {
     const result = await this.executeQuery(
@@ -1624,11 +1844,25 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private async updatePrimaryKeyCellBatch(
     table: string,
     identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
-    updates: CellUpdate[]
+    updates: CellUpdate[],
+    maxEditValueBytes?: number,
+    historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
   ): Promise<CellUpdateResult[]> {
+    const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+    const editLimitBytes = isHistoryReplay
+      ? 0
+      : assertCellValuesWithinEditLimit(
+          updates.map(update => update.value),
+          maxEditValueBytes
+        );
     const savepointName = this.createSavepointName('sp_update_pk_batch');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
+      // Metadata-only preflight must run before the established full prior-value
+      // SELECT below. Normal bounded edits retain the same SAVEPOINT and update path.
+      if (!isHistoryReplay && maxEditValueBytes !== undefined) {
+        await this.assertBatchPriorsWithinEditLimit(table, updates, editLimitBytes);
+      }
       const updatesByRow = new Map<RecordId, CellUpdate[]>();
       for (const update of updates) {
         const rowUpdates = updatesByRow.get(update.rowId) ?? [];
@@ -1662,6 +1896,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           const storedValue = prepared.operation === 'json_patch'
             ? this.applyJsonPatchValue(priorValue, prepared.value)
             : prepared.value;
+          if (!isHistoryReplay && prepared.operation === 'json_patch') {
+            // A bounded merge-patch can still create an oversized stored value.
+            // Validate the result while the row is still protected by the savepoint.
+            assertCellValueWithinEditLimit(storedValue, editLimitBytes);
+          }
           return { update, priorValue, prepared, storedValue };
         });
 
@@ -2024,9 +2263,21 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Update multiple cells in a batch.
    */
-  async updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> {
+  async updateCellBatch(
+    table: string,
+    updates: CellUpdate[],
+    maxEditValueBytes?: number,
+    historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+  ): Promise<CellUpdateResult[]> {
     updates.forEach(update => assertMutableRecordId(update.rowId));
     if (updates.length === 0) return [];
+    const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+    const editLimitBytes = isHistoryReplay
+      ? 0
+      : assertCellValuesWithinEditLimit(
+          updates.map(update => update.value),
+          maxEditValueBytes
+        );
 
     if (updates.some(update => isPrimaryKeyRecordId(update.rowId))) {
       if (!updates.every(update => isPrimaryKeyRecordId(update.rowId))) {
@@ -2036,7 +2287,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       if (identity.kind !== 'primaryKey') {
         throw new Error(`Primary-key identity cannot target rowid table ${table}`);
       }
-      return this.updatePrimaryKeyCellBatch(table, identity, updates);
+      return this.updatePrimaryKeyCellBatch(
+        table,
+        identity,
+        updates,
+        maxEditValueBytes,
+        historyReplayToken
+      );
     }
 
     // Use SAVEPOINT instead of BEGIN TRANSACTION so this method can be called
@@ -2046,6 +2303,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const savepointName = this.createSavepointName('sp_update_batch');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
+      // Refuse the unconfirmed oversized case before the existing SELECT can
+      // materialize any prior value into JavaScript history.
+      if (!isHistoryReplay && maxEditValueBytes !== undefined) {
+        await this.assertBatchPriorsWithinEditLimit(table, updates, editLimitBytes);
+      }
       const escapedTable = escapeIdentifier(table);
       const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
       const columns = [...new Set(updates.map(update => update.column))];
@@ -2068,12 +2330,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         if (!row) {
           throw new Error(`Cannot update ${table}.${update.column}: row ${update.rowId} no longer exists`);
         }
-        const priorValue = row.get(update.column);
+        const priorValue = row.get(update.column) as CellValue;
         const prepared = prepareCellUpdateForStorage(
           update.value,
           priorValue,
           update.operation ?? 'set'
         );
+        if (!isHistoryReplay && prepared.operation === 'json_patch') {
+          const storedValue = this.applyJsonPatchValue(priorValue, prepared.value);
+          assertCellValueWithinEditLimit(storedValue, editLimitBytes);
+        }
         results.push({
           rowId,
           columnName: update.column,

@@ -22,6 +22,7 @@ const MAX_GRID_RESPONSE_CHARS = 2 * MIB;
 // below that lower bound while leaving headroom for native SQLite and test setup.
 const MAX_GRID_PROBE_RSS_BYTES = 384 * MIB;
 const MAX_STAGE_B_SURFACE_RSS_BYTES = 384 * MIB;
+const MAX_STAGE_D_EDIT_RSS_BYTES = 384 * MIB;
 const MAX_INSPECTOR_PREVIEW_BYTES = 64 * 1024;
 const MAX_SINGLE_OUTPUT_CHUNK = MIB;
 const READ_WINDOW_BYTES = 64 * 1024;
@@ -189,6 +190,17 @@ function stageCTest(
   }, body);
 }
 
+function stageDTest(
+  name: string,
+  body: (t: TestContext) => Promise<void>
+): void {
+  test(name, {
+    skip: !RUN_LARGE_CELL_TESTS
+      && `set SQLITE_EXPLORER_RUN_LARGE_CELL_TESTS=1 to run the ${SIZE_MIB} MiB probes`,
+    timeout: 300_000
+  }, body);
+}
+
 before(async () => {
   if (!RUN_LARGE_CELL_TESTS) return;
   validateSize();
@@ -328,15 +340,24 @@ describe('very large single-cell behavior (opt-in)', () => {
     }
   );
 
-  knownFailure(
-    'oversized prior values are not retained in the in-memory undo entry',
-    'maxUndoMemory deliberately keeps one entry even when that entry exceeds the limit',
+  stageDTest(
+    'oversized replacement uses a confirmed non-crossable barrier without retaining the prior value',
     async t => {
       const result = await runProbe('cell-save-undo', { kind: 'blob' });
       diagnose(t, result);
       assert.equal(result.failureStage, undefined);
       assert.equal(result.undoable, false);
+      assert.equal(result.redoable, false);
+      assert.equal(result.undoPolicy, 'barrier');
       assert.equal(result.retainedPriorBytes, 0);
+      assert.equal(result.historyEntryCount, 1);
+      assert.equal(result.confirmationSurfaced, true);
+      assert.equal(result.confirmationContainsTarget, true);
+      assert.equal(result.confirmationContainsStorageClass, true);
+      assert.equal(result.confirmationContainsExactBytes, true);
+      assert.equal(result.containmentReadObserved, true);
+      assert.equal(result.wholePriorValueReadObserved, false);
+      assert.ok(Number(result.maxRssBytes) <= MAX_STAGE_D_EDIT_RSS_BYTES);
     }
   );
 

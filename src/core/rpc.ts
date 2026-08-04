@@ -9,6 +9,11 @@
  * - Extension Host <-> Webview Panel
  */
 
+import {
+  fromCellEditRpcErrorData,
+  toCellEditRpcErrorData
+} from './cell-edit-policy';
+
 // ============================================================================
 // Message Protocol Types
 // ============================================================================
@@ -100,6 +105,7 @@ export class InvocationTimeoutError extends Error {
 // may restore timeout identity; ordinary messages that happen to mention a
 // timeout remain ordinary Error instances.
 const INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX = '\u001eSQLiteExplorerInvocationTimeout:';
+const CELL_EDIT_ERROR_TEXT_PREFIX = '\u001eSQLiteExplorerCellEditPolicy:';
 
 export function isInvocationTimeoutError(error: unknown): error is InvocationTimeoutError {
   if (error instanceof InvocationTimeoutError) return true;
@@ -110,29 +116,44 @@ export function isInvocationTimeoutError(error: unknown): error is InvocationTim
 }
 
 function serializeInvocationError(error: unknown): string {
-  if (!isInvocationTimeoutError(error)) {
-    return error instanceof Error ? error.message : String(error);
+  if (isInvocationTimeoutError(error)) {
+    const message = error instanceof Error ? error.message : String(error);
+    return INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX + JSON.stringify({
+      methodName: error.methodName,
+      message
+    });
   }
-  const message = error instanceof Error ? error.message : String(error);
-  return INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX + JSON.stringify({
-    methodName: error.methodName,
-    message
-  });
+  const cellEditError = toCellEditRpcErrorData(error);
+  if (cellEditError) {
+    return CELL_EDIT_ERROR_TEXT_PREFIX + JSON.stringify(cellEditError);
+  }
+  return error instanceof Error ? error.message : String(error);
 }
 
 function deserializeInvocationError(errorText: string): Error {
-  if (!errorText.startsWith(INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX)) {
+  if (errorText.startsWith(INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX)) {
+    try {
+      const payload = JSON.parse(errorText.slice(INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX.length));
+      if (typeof payload?.methodName === 'string' && typeof payload?.message === 'string') {
+        return new InvocationTimeoutError(payload.methodName, payload.message);
+      }
+    } catch {
+      // A malformed marker is an ordinary remote failure, never timeout recovery.
+    }
     return new Error(errorText);
   }
 
-  try {
-    const payload = JSON.parse(errorText.slice(INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX.length));
-    if (typeof payload?.methodName === 'string' && typeof payload?.message === 'string') {
-      return new InvocationTimeoutError(payload.methodName, payload.message);
+  if (errorText.startsWith(CELL_EDIT_ERROR_TEXT_PREFIX)) {
+    try {
+      const payload = JSON.parse(errorText.slice(CELL_EDIT_ERROR_TEXT_PREFIX.length));
+      const typed = fromCellEditRpcErrorData(payload);
+      if (typed) return typed;
+    } catch {
+      // A malformed private marker remains an ordinary remote failure.
     }
-  } catch {
-    // A malformed marker is an ordinary remote failure, never timeout recovery.
+    return new Error(errorText);
   }
+
   return new Error(errorText);
 }
 

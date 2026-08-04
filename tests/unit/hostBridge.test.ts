@@ -12,6 +12,10 @@ import {
     encodePrimaryKeyRecordId,
     encodeReadOnlyPrimaryKeyRecordId
 } from '../../src/core/row-identity';
+import {
+    CELL_EDIT_VALUE_TOO_LARGE_CODE,
+    toCellEditPolicyErrorData
+} from '../../src/core/cell-edit-policy';
 
 describe('HostBridge', () => {
     it('projects one canonical row matrix without changing bounded consumer bytes', () => {
@@ -839,6 +843,144 @@ describe('HostBridge', () => {
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
+    it('rejects an oversized new cell value with a typed refusal before any database read', async () => {
+        const dbOps = {
+            executeQuery: mock.fn(async () => []),
+            updateCell: mock.fn(async () => {})
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        await assert.rejects(
+            () => bridge.updateCell(
+                'items',
+                7,
+                'payload',
+                new Uint8Array(1024 * 1024 + 1)
+            ),
+            error => {
+                const typed = toCellEditPolicyErrorData(error);
+                assert.strictEqual(typed?.code, CELL_EDIT_VALUE_TOO_LARGE_CODE);
+                assert.strictEqual(typed?.storageClass, 'blob');
+                assert.strictEqual(typed?.actualBytes, 1024 * 1024 + 1);
+                assert.strictEqual(typed?.limitBytes, 1024 * 1024);
+                return true;
+            }
+        );
+
+        assert.strictEqual(dbOps.executeQuery.mock.callCount(), 0);
+        assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('confirms and replaces an oversized prior cell without selecting its whole value', async () => {
+        const sourceBytes = 256 * 1024 * 1024;
+        const sqlCalls: string[] = [];
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => {
+                sqlCalls.push(sql);
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
+                }
+                assert.match(sql, /CASE WHEN/);
+                assert.match(sql, /length\(CAST\("payload" AS BLOB\)\)/);
+                assert.doesNotMatch(sql, /^SELECT\s+"payload"\s+FROM/i);
+                return [{
+                    headers: ['storage_class', 'byte_length', 'bounded_value'],
+                    rows: [['blob', sourceBytes, null]]
+                }];
+            }),
+            replaceOversizedCell: mock.fn(async () => 7),
+            updateCell: mock.fn(async () => 7)
+        };
+        const recordExternalModification = mock.fn();
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+        const confirmations: unknown[][] = [];
+        mock.method(vscode.window, 'showWarningMessage', async (...args: unknown[]) => {
+            confirmations.push(args);
+            return { title: 'Replace Without Undo', value: true } as any;
+        });
+
+        const updatedRowId = await bridge.updateCell('items', 7, 'payload', 'replacement');
+
+        assert.strictEqual(updatedRowId, 7);
+        assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+        assert.strictEqual(dbOps.replaceOversizedCell.mock.callCount(), 1);
+        assert.deepStrictEqual(dbOps.replaceOversizedCell.mock.calls[0].arguments, [
+            'items',
+            7,
+            'payload',
+            'replacement',
+            { storageClass: 'blob', byteLength: sourceBytes },
+            1024 * 1024
+        ]);
+        assert.strictEqual(confirmations.length, 1);
+        const confirmationText = String(confirmations[0][0]);
+        assert.match(confirmationText, /items/);
+        assert.match(confirmationText, /payload/);
+        assert.match(confirmationText, /BLOB/);
+        assert.match(confirmationText, /268[,.]435[,.]456 bytes/);
+        assert.match(confirmationText, /cannot be undone/i);
+        assert.match(confirmationText, /Undo will not cross this edit/i);
+        assert.match(confirmationText, /redo history will be discarded/i);
+        assert.strictEqual(sqlCalls.length, 2);
+
+        const modification = recordExternalModification.mock.calls[0].arguments[0] as any;
+        assert.strictEqual(modification.undoPolicy, 'barrier');
+        assert.strictEqual(modification.priorValue, undefined);
+        assert.strictEqual(modification.newValue, 'replacement');
+    });
+
+    it('leaves history untouched when an oversized replacement fails after confirmation', async () => {
+        const writeError = new Error('guarded update failed');
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => sql.includes('pragma_table_list')
+                ? [{ headers: ['type', 'wr'], rows: [['table', 0]] }]
+                : [{
+                    headers: ['storage_class', 'byte_length', 'bounded_value'],
+                    rows: [['text', 4 * 1024 * 1024, null]]
+                }]),
+            replaceOversizedCell: mock.fn(async () => { throw writeError; }),
+            updateCell: mock.fn(async () => 1)
+        };
+        const recordExternalModification = mock.fn();
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+        mock.method(vscode.window, 'showWarningMessage', async () => (
+            { title: 'Replace Without Undo', value: true } as any
+        ));
+
+        await assert.rejects(
+            () => bridge.updateCell('items', 1, 'payload', 'replacement'),
+            error => error === writeError
+        );
+
+        assert.strictEqual(dbOps.replaceOversizedCell.mock.callCount(), 1);
+        assert.strictEqual(recordExternalModification.mock.callCount(), 0);
+    });
+
     it('uses database-current batch values for JSON patches and undo history', async () => {
         const sqlCalls: string[] = [];
         const batchCalls: any[][] = [];
@@ -1120,7 +1262,10 @@ describe('HostBridge', () => {
                         ? [{ headers: ['type', 'wr'], rows: [] }]
                         : [{ headers: ['type', 'wr'], rows: [['virtual', 0]] }];
                 }
-                return [{ headers: ['body'], rows: [['before']] }];
+                return [{
+                    headers: ['storage_class', 'byte_length', 'bounded_value'],
+                    rows: [['text', 6, 'before']]
+                }];
             }),
             getTableInfo: mock.fn(async () => {
                 throw new Error('virtual tables must not require declared-PK metadata');

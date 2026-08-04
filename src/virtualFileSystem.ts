@@ -14,6 +14,12 @@ import {
 } from './core/view-utils';
 import { GlobalOutputChannel } from './main';
 import { getMaxInlineCellBytes } from './config';
+import {
+    assertCellValueWithinEditLimit,
+    formatOversizedCellReplacementWarning,
+    isOversizedCellReplacementConflictError,
+    isOversizedCellReplacementRequiredError
+} from './core/cell-edit-policy';
 
 import type {
     DatabaseDocument,
@@ -406,48 +412,135 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             } catch {
                 // Keep as Uint8Array, treating as BLOB
             }
+            const editLimitBytes = getMaxInlineCellBytes();
+            assertCellValueWithinEditLimit(value, editLimitBytes);
 
-            let priorValue: import('./core/types').CellValue | undefined;
-            if (isPrimaryKeyRecordId(validatedRowId)) {
-                const previous = await document.databaseOperations.executeQuery(
-                    `SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} ` +
-                    `WHERE ${rowPredicate.sql} LIMIT 2`,
-                    rowPredicate.params
-                );
-                if (previous[0]?.rows.length !== 1) {
-                    throw new Error(`Cannot update ${table}.${column}: row identity no longer exists`);
+            while (true) {
+                const metadata = await document.databaseOperations.getCellMetadata({
+                    table,
+                    rowId: validatedRowId,
+                    column
+                });
+                const oversized = (
+                    metadata.storageClass === 'text' || metadata.storageClass === 'blob'
+                ) && metadata.byteLength > editLimitBytes;
+
+                if (oversized) {
+                    const expected = {
+                        storageClass: metadata.storageClass as 'text' | 'blob',
+                        byteLength: metadata.byteLength
+                    };
+                    const answer = await vsc.window.showWarningMessage(
+                        formatOversizedCellReplacementWarning(table, column, expected),
+                        { modal: true },
+                        { title: vsc.l10n.t('Replace Without Undo'), value: true },
+                        { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
+                    );
+                    if (!answer?.value) throw new vsc.CancellationError();
+
+                    try {
+                        const updatedRowId = await document.databaseOperations.replaceOversizedCell(
+                            table,
+                            validatedRowId,
+                            column,
+                            value,
+                            expected,
+                            editLimitBytes
+                        );
+                        const newTargetRowId = updatedRowId ?? validatedRowId;
+                        if (isPrimaryKeyRecordId(validatedRowId)) {
+                            this.setCellDocumentTarget(document, uri, newTargetRowId);
+                        }
+                        // Future file-backed undo would attach its checksummed
+                        // snapshot here and replace this forward-only policy.
+                        document.recordExternalModification({
+                            label: 'Replace Oversized Cell (External)',
+                            description: `Replace oversized ${table}.${column} from editor without undo`,
+                            modificationType: 'cell_update',
+                            targetTable: table,
+                            targetRowId: validatedRowId,
+                            ...(isPrimaryKeyRecordId(validatedRowId) ? { newTargetRowId } : {}),
+                            targetColumn: column,
+                            newValue: value,
+                            operation: 'set',
+                            undoPolicy: 'barrier'
+                        });
+                        this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
+                        return;
+                    } catch (error) {
+                        if (isOversizedCellReplacementConflictError(error)) continue;
+                        throw error;
+                    }
                 }
-                const keyColumnIndex = rowPredicate.primaryKey?.columns.indexOf(column) ?? -1;
-                priorValue = keyColumnIndex >= 0
-                    ? rowPredicate.primaryKey!.values[keyColumnIndex]
-                    : previous[0].rows[0][0];
+
+                let priorValue: import('./core/types').CellValue | undefined;
+                if (isPrimaryKeyRecordId(validatedRowId)) {
+                    const escapedColumn = escapeIdentifier(column);
+                    const byteLengthExpression =
+                        `CASE WHEN ${escapedColumn} IS NULL THEN 0 ` +
+                        `ELSE length(CAST(${escapedColumn} AS BLOB)) END`;
+                    const previous = await document.databaseOperations.executeQuery(
+                        `SELECT typeof(${escapedColumn}), ${byteLengthExpression}, ` +
+                        `CASE WHEN typeof(${escapedColumn}) IN ('text', 'blob') ` +
+                        `AND ${byteLengthExpression} > ? THEN NULL ELSE ${escapedColumn} END ` +
+                        `FROM ${escapeIdentifier(table)} WHERE ${rowPredicate.sql} LIMIT 2`,
+                        [editLimitBytes, ...rowPredicate.params]
+                    );
+                    if (previous[0]?.rows.length !== 1) {
+                        throw new Error(`Cannot update ${table}.${column}: row identity no longer exists`);
+                    }
+                    const [storageClass, rawByteLength, boundedValue] = previous[0].rows[0];
+                    const byteLength = typeof rawByteLength === 'bigint'
+                        ? Number(rawByteLength)
+                        : rawByteLength;
+                    if (
+                        (storageClass === 'text' || storageClass === 'blob')
+                        && Number(byteLength) > editLimitBytes
+                    ) {
+                        // The CASE above deliberately returned NULL instead of
+                        // the raced oversized payload. Re-read and confirm it.
+                        continue;
+                    }
+                    const keyColumnIndex = rowPredicate.primaryKey?.columns.indexOf(column) ?? -1;
+                    priorValue = keyColumnIndex >= 0
+                        ? rowPredicate.primaryKey!.values[keyColumnIndex]
+                        : boundedValue;
+                }
+
+                let updatedRowId: RecordId | void;
+                try {
+                    updatedRowId = await document.databaseOperations.updateCell(
+                        table,
+                        validatedRowId,
+                        column,
+                        value,
+                        undefined,
+                        editLimitBytes
+                    );
+                } catch (error) {
+                    if (isOversizedCellReplacementRequiredError(error)) continue;
+                    throw error;
+                }
+                const newTargetRowId = updatedRowId ?? validatedRowId;
+                if (isPrimaryKeyRecordId(validatedRowId)) {
+                    this.setCellDocumentTarget(document, uri, newTargetRowId);
+                }
+
+                document.recordExternalModification({
+                    label: 'Edit Cell (External)',
+                    description: `Update ${table}.${column} from editor`,
+                    modificationType: 'cell_update',
+                    targetTable: table,
+                    targetRowId: validatedRowId,
+                    ...(isPrimaryKeyRecordId(validatedRowId) ? { newTargetRowId } : {}),
+                    targetColumn: column,
+                    ...(isPrimaryKeyRecordId(validatedRowId) ? { priorValue } : {}),
+                    newValue: value
+                });
+
+                this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
+                return;
             }
-
-            const updatedRowId = await document.databaseOperations.updateCell(
-                table,
-                validatedRowId,
-                column,
-                value
-            );
-            const newTargetRowId = updatedRowId ?? validatedRowId;
-            if (isPrimaryKeyRecordId(validatedRowId)) {
-                this.setCellDocumentTarget(document, uri, newTargetRowId);
-            }
-
-            // Trigger refresh
-            document.recordExternalModification({
-                label: 'Edit Cell (External)',
-                description: `Update ${table}.${column} from editor`,
-                modificationType: 'cell_update',
-                targetTable: table,
-                targetRowId: validatedRowId,
-                ...(isPrimaryKeyRecordId(validatedRowId) ? { newTargetRowId } : {}),
-                targetColumn: column,
-                ...(isPrimaryKeyRecordId(validatedRowId) ? { priorValue } : {}),
-                newValue: value
-            });
-
-            this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
 
         } catch (err) {
             GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error writing cell: ${err instanceof Error ? err.message : String(err)}`);

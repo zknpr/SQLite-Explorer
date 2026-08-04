@@ -287,7 +287,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   recordModification(modification: DocumentModification): void {
     const tracker = this.#modificationTracker;
-    tracker.record(modification);
+    if (modification.undoPolicy === 'barrier') {
+      tracker.recordBarrier(modification);
+    } else {
+      tracker.record(modification);
+    }
 
     // Ensure future stack is cleared so we don't have stale redo actions
     // This is handled by tracker.record, but explicit check in emitter helps
@@ -297,8 +301,14 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       undo: async () => {
         const undoneEntry = tracker.stepBack();
         if (!undoneEntry) {
-            GlobalOutputChannel?.appendLine('[Undo] No entry found in tracker');
+          if (tracker.isUndoBlockedByBarrier) {
+            await vsc.window.showWarningMessage(vsc.l10n.t(
+              'This oversized cell replacement cannot be undone. Undo cannot cross its history barrier.'
+            ));
             return;
+          }
+          GlobalOutputChannel?.appendLine('[Undo] No entry found in tracker');
+          return;
         }
         try {
             await this.databaseOperations.undoModification(undoneEntry);
@@ -495,6 +505,14 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   async revert(cancellation: vsc.CancellationToken): Promise<void> {
     await this.ensureWritable();
+    if (this.#modificationTracker.hasUncommittedHistoryBarrier) {
+      const message = vsc.l10n.t(
+        'The prior value was not retained for an oversized-cell replacement. ' +
+        'File Revert cannot cross that edit; save the database first to establish a new baseline.'
+      );
+      await vsc.window.showWarningMessage(message);
+      throw new Error('File Revert cannot cross an unsaved oversized-cell history barrier');
+    }
     let invalidatedByRecoveryReload = false;
     try {
       await revertDatabaseToSaved(

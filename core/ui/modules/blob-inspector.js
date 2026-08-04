@@ -121,7 +121,8 @@ export class BlobInspector {
         const mutationBlockReason = this.currentCellInfo
             ? getCellMutationBlockReason(
                 this.currentCellInfo.rowIdx,
-                this.currentCellInfo.colIdx
+                this.currentCellInfo.colIdx,
+                { allowOversizedReplacement: true }
             )
             : undefined;
 
@@ -147,7 +148,8 @@ export class BlobInspector {
         const mutationBlockReason = this.currentCellInfo
             ? getCellMutationBlockReason(
                 this.currentCellInfo.rowIdx,
-                this.currentCellInfo.colIdx
+                this.currentCellInfo.colIdx,
+                { allowOversizedReplacement: true }
             )
             : undefined;
         if (mutationBlockReason) {

@@ -9,6 +9,10 @@ import {
   InvocationTimeoutError,
   isInvocationTimeoutError
 } from '../../src/core/rpc';
+import {
+  CellEditPolicyError,
+  CELL_EDIT_VALUE_TOO_LARGE_CODE
+} from '../../src/core/cell-edit-policy';
 
 describe('RPC', () => {
   describe('processProtocolMessage', () => {
@@ -202,6 +206,43 @@ describe('RPC', () => {
       assert.strictEqual(isInvocationTimeoutError(timeoutError), true);
       assert.strictEqual(timeoutError.methodName, 'discardModifications');
       assert.strictEqual(timeoutError.message, 'worker history timed out');
+      return true;
+    });
+  });
+
+  it('preserves typed cell-edit refusals across a worker response', async () => {
+    let invocation: unknown;
+    const proxy = buildMethodProxy<{ insertRow: () => Promise<void> }>(
+      envelope => { invocation = envelope; },
+      ['insertRow']
+    );
+    const pending = proxy.insertRow();
+    const response = await new Promise<unknown>(resolve => {
+      processProtocolMessage(
+        invocation,
+        {
+          insertRow() {
+            throw new CellEditPolicyError('text', 2049, 2048);
+          }
+        },
+        resolve as any
+      );
+    });
+
+    processProtocolMessage(
+      response,
+      undefined,
+      undefined,
+      undefined,
+      proxy.__pendingInvocations
+    );
+
+    await assert.rejects(pending, error => {
+      if (!(error instanceof CellEditPolicyError)) return false;
+      assert.strictEqual(error.code, CELL_EDIT_VALUE_TOO_LARGE_CODE);
+      assert.strictEqual(error.storageClass, 'text');
+      assert.strictEqual(error.actualBytes, 2049);
+      assert.strictEqual(error.limitBytes, 2048);
       return true;
     });
   });

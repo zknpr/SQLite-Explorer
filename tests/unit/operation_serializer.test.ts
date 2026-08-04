@@ -27,6 +27,7 @@ function createOperations(overrides: Partial<DatabaseOperations> = {}): Database
         flushChanges: async () => {},
         discardModifications: async () => {},
         updateCell: async () => {},
+        replaceOversizedCell: async () => {},
         insertRow: async () => undefined,
         insertRowBatch: async () => {},
         deleteRows: async () => {},

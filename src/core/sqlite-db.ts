@@ -30,7 +30,8 @@ import type {
   CellMetadata,
   CellReadChunk,
   CellReadSession,
-  CellReadTarget
+  CellReadTarget,
+  OversizedCellMetadata
 } from './types';
 import { getNodeFs } from './platform/fs';
 import {
@@ -242,18 +243,58 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().discardModifications(mods, signal);
     },
 
-    async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<RecordId | void> {
+    async updateCell(
+      table: string,
+      rowId: RecordId,
+      column: string,
+      value: CellValue,
+      patch?: string,
+      maxEditValueBytes?: number
+    ): Promise<RecordId | void> {
       // Forward the optional JSON merge patch so browser/in-process cell edits
       // can update the current document instead of replacing it with stale data.
-      return requireEngine().updateCell(table, rowId, column, value, patch);
+      return requireEngine().updateCell(
+        table,
+        rowId,
+        column,
+        value,
+        patch,
+        maxEditValueBytes
+      );
     },
 
-    async insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined> {
-      return requireEngine().insertRow(table, data);
+    async replaceOversizedCell(
+      table: string,
+      rowId: RecordId,
+      column: string,
+      value: CellValue,
+      expected: OversizedCellMetadata,
+      maxEditValueBytes?: number
+    ): Promise<RecordId | void> {
+      return requireEngine().replaceOversizedCell(
+        table,
+        rowId,
+        column,
+        value,
+        expected,
+        maxEditValueBytes
+      );
     },
 
-    async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
-      return requireEngine().insertRowBatch(table, rows);
+    async insertRow(
+      table: string,
+      data: Record<string, CellValue>,
+      maxEditValueBytes?: number
+    ): Promise<RecordId | undefined> {
+      return requireEngine().insertRow(table, data, maxEditValueBytes);
+    },
+
+    async insertRowBatch(
+      table: string,
+      rows: Record<string, CellValue>[],
+      maxEditValueBytes?: number
+    ): Promise<void> {
+      return requireEngine().insertRowBatch(table, rows, maxEditValueBytes);
     },
 
     async deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void> {
@@ -328,8 +369,12 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().dropView(view, expectedSql, expectedTriggers);
     },
 
-    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> {
-      return requireEngine().updateCellBatch(table, updates);
+    async updateCellBatch(
+      table: string,
+      updates: CellUpdate[],
+      maxEditValueBytes?: number
+    ): Promise<CellUpdateResult[]> {
+      return requireEngine().updateCellBatch(table, updates, maxEditValueBytes);
     },
 
     async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {

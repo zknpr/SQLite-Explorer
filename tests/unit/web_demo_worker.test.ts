@@ -9,6 +9,10 @@ import vm from 'node:vm';
 import { Worker as NodeWorker } from 'node:worker_threads';
 import esbuild from 'esbuild';
 import initSqlJs from '../../vendor/sql.js/sql-wasm.js';
+import {
+    CellEditPolicyError,
+    fromCellEditRpcErrorData
+} from '../../src/core/cell-edit-policy';
 
 interface WorkerHarness {
     invoke(method: string, ...payload: unknown[]): Promise<any>;
@@ -145,7 +149,8 @@ async function createWorkerHarness(options: {
         assert.notStrictEqual(responseIndex, -1, `worker did not respond to ${method}`);
         const [response] = responses.splice(responseIndex, 1);
         if (!response.content.success) {
-            throw new Error(response.content.errorMessage);
+            throw fromCellEditRpcErrorData(response.content.error)
+                ?? new Error(response.content.errorMessage);
         }
         return response.content.data;
     };
@@ -172,6 +177,110 @@ async function workerScalar(worker: WorkerHarness, sql: string): Promise<unknown
 }
 
 describe('web demo view worker', () => {
+    it('enforces typed new-value limits and guarded oversized replacement', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (_kind, sql) => observedSql.push(sql)
+        });
+        const limit = 1024;
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_stage_d (payload BLOB); ' +
+            `INSERT INTO demo_stage_d VALUES (zeroblob(${limit + 1}))`
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'updateCell',
+                'demo_stage_d',
+                1,
+                'payload',
+                new Uint8Array(limit + 1),
+                undefined,
+                limit
+            ),
+            error => {
+                assert.ok(error instanceof CellEditPolicyError);
+                assert.strictEqual(error.actualBytes, limit + 1);
+                assert.strictEqual(error.limitBytes, limit);
+                return true;
+            }
+        );
+
+        observedSql.length = 0;
+        await worker.invoke(
+            'replaceOversizedCell',
+            'demo_stage_d',
+            1,
+            'payload',
+            'bounded',
+            { storageClass: 'blob', byteLength: limit + 1 },
+            limit
+        );
+        assert.ok(
+            observedSql.every(sql => !/^\s*SELECT\s+"payload"\b/i.test(sql)),
+            `demo replacement selected the prior payload: ${observedSql.join('\n')}`
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT payload FROM demo_stage_d'),
+            'bounded'
+        );
+
+        const legacyValue = new Uint8Array(1024 * 1024 + 1);
+        await assert.rejects(
+            worker.invoke('updateCell', 'demo_stage_d', 1, 'payload', legacyValue),
+            CellEditPolicyError
+        );
+        const legacyModification = {
+            modificationType: 'cell_update',
+            description: 'legacy oversized prior',
+            targetTable: 'demo_stage_d',
+            targetRowId: 1,
+            targetColumn: 'payload',
+            priorValue: legacyValue,
+            newValue: 'bounded'
+        };
+        await worker.invoke('undoModification', legacyModification);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT length(payload) FROM demo_stage_d'),
+            legacyValue.byteLength
+        );
+        await worker.invoke('redoModification', legacyModification);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT payload FROM demo_stage_d'),
+            'bounded'
+        );
+    });
+
+    it('rejects a demo JSON patch whose resulting stored value is oversized', async () => {
+        const worker = await createWorkerHarness();
+        const prior = JSON.stringify({ a: 'x'.repeat(32) });
+        const patch = JSON.stringify({ b: 'y'.repeat(32) });
+        const limit = 64;
+        await worker.invoke('runQuery', 'CREATE TABLE demo_patch_limits (payload TEXT)');
+        await worker.invoke('insertRow', 'demo_patch_limits', { payload: prior }, limit);
+
+        await assert.rejects(
+            worker.invoke(
+                'updateCellBatch',
+                'demo_patch_limits',
+                [{ rowId: 1, column: 'payload', value: patch, operation: 'json_patch' }],
+                undefined,
+                limit
+            ),
+            error => {
+                assert.ok(error instanceof CellEditPolicyError);
+                assert.strictEqual(error.storageClass, 'text');
+                assert.ok(error.actualBytes > limit);
+                return true;
+            }
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT payload FROM demo_patch_limits'),
+            prior
+        );
+    });
+
     it('loads the patched sql.js release from self-hosted files', async () => {
         const importedUrls: string[] = [];
         let wasmUrl = '';

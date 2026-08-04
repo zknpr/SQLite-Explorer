@@ -10,6 +10,10 @@ import { isNativeAvailable, NativeWorkerProcess } from '../../src/nativeWorker';
 import { InvocationTimeoutError } from '../../src/core/rpc';
 import type { DatabaseOperations } from '../../src/core/types';
 import { createDeferred } from './helpers/deferred';
+import {
+    CellEditPolicyError,
+    OversizedCellReplacementRequiredError
+} from '../../src/core/cell-edit-policy';
 
 const nativeWorkerSource = fs.readFileSync(
     path.resolve(process.cwd(), 'natives', 'native-worker.js'),
@@ -415,6 +419,193 @@ describe('createNativeDatabaseConnection', () => {
                 !['getCellMetadata', 'openCellReadSession'].includes(call.method)
                 || !call.args.some(argument => typeof argument === 'string' && /rowid\s*=/.test(argument))
             )));
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rejects oversized native new values before crossing the worker boundary', async () => {
+        const connection = await createRecordingConnection(() => ({
+            result: { changes: 1, lastInsertRowId: 1 }
+        }));
+        const limit = 1024;
+        const oversized = new Uint8Array(limit + 1);
+        try {
+            connection.calls.length = 0;
+            for (const mutation of [
+                () => connection.databaseOps.updateCell(
+                    'native_limits', 1, 'payload', oversized, undefined, limit
+                ),
+                () => connection.databaseOps.insertRow(
+                    'native_limits', { payload: oversized }, limit
+                ),
+                () => connection.databaseOps.insertRowBatch(
+                    'native_limits', [{ payload: oversized }], limit
+                ),
+                () => connection.databaseOps.updateCellBatch(
+                    'native_limits',
+                    [{ rowId: 1, column: 'payload', value: oversized }],
+                    limit
+                )
+            ]) {
+                await assert.rejects(mutation, error => {
+                    assert.ok(error instanceof CellEditPolicyError);
+                    assert.strictEqual(error.actualBytes, limit + 1);
+                    return true;
+                });
+            }
+            assert.strictEqual([...connection.calls].length, 0);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rejects a native JSON patch whose resulting stored value is oversized', async () => {
+        const prior = JSON.stringify({ a: 'x'.repeat(32) });
+        const patch = JSON.stringify({ b: 'y'.repeat(32) });
+        const limit = 64;
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'getCellMetadata') {
+                return { result: { storageClass: 'text', byteLength: prior.length } };
+            }
+            if (call.method === 'query') {
+                return { result: { columns: ['rowid', 'payload'], values: [[1, prior]] } };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.updateCellBatch(
+                    'native_patch_limits',
+                    [{ rowId: 1, column: 'payload', value: patch, operation: 'json_patch' }],
+                    limit
+                ),
+                error => {
+                    assert.ok(error instanceof CellEditPolicyError);
+                    assert.strictEqual(error.storageClass, 'text');
+                    assert.ok(error.actualBytes > limit);
+                    return true;
+                }
+            );
+            assert.strictEqual(
+                connection.calls.some(call => call.method === 'execBatch'),
+                false,
+                'native mutation must not run after the policy refusal'
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('lets native history restore a legacy oversized prior while public edits remain guarded', async () => {
+        const connection = await createRecordingConnection(() => ({
+            result: { changes: 1, lastInsertRowId: 1 }
+        }));
+        const legacyValue = new Uint8Array(1024 * 1024 + 1);
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.updateCell(
+                    'native_legacy_history', 1, 'payload', legacyValue
+                ),
+                CellEditPolicyError
+            );
+
+            await connection.databaseOps.undoModification({
+                modificationType: 'cell_update',
+                description: 'legacy oversized prior',
+                targetTable: 'native_legacy_history',
+                targetRowId: 1,
+                targetColumn: 'payload',
+                priorValue: legacyValue,
+                newValue: Uint8Array.from([1])
+            });
+            assert.deepStrictEqual(connection.calls.map(call => call.method), ['run']);
+            const runParams = connection.calls[0].args[1] as unknown[];
+            const restoredValue = runParams[0];
+            assert.ok(restoredValue instanceof Uint8Array);
+            assert.strictEqual(restoredValue.byteLength, legacyValue.byteLength);
+            assert.strictEqual(restoredValue[0], 0);
+            assert.strictEqual(restoredValue.at(-1), 0);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('uses the native guarded replacement command without reading the prior value', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                return {
+                    result: {
+                        columns: ['type', 'wr'],
+                        values: [['table', 0]]
+                    }
+                };
+            }
+            if (call.method === 'replaceOversizedCell') {
+                return { result: { changes: 1 } };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+        try {
+            connection.calls.length = 0;
+            await connection.databaseOps.replaceOversizedCell(
+                'native_large',
+                7,
+                'payload',
+                'bounded',
+                { storageClass: 'blob', byteLength: 2048 },
+                1024
+            );
+
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['query', 'replaceOversizedCell']
+            );
+            const guarded = connection.calls[1];
+            assert.deepStrictEqual(guarded.args, [
+                'native_large',
+                'payload',
+                { kind: 'rowid', value: 7 },
+                'bounded',
+                { storageClass: 'blob', byteLength: 2048 },
+                1024
+            ]);
+            assert.ok(connection.calls.every(call => (
+                call.method !== 'query'
+                || !/SELECT\s+"payload"/i.test(String(call.args[0]))
+            )));
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('refuses an unconfirmed oversized native prior using metadata only', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'open') return { result: { success: true } };
+            if (call.method === 'run') return { result: { changes: 0 } };
+            if (call.method === 'getCellMetadata') {
+                return { result: { storageClass: 'blob', byteLength: 2048 } };
+            }
+            throw new Error(`unexpected native call: ${call.method}`);
+        });
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.updateCell(
+                    'native_large', 7, 'payload', 'bounded', undefined, 1024
+                ),
+                error => {
+                    assert.ok(error instanceof OversizedCellReplacementRequiredError);
+                    assert.strictEqual(error.actualBytes, 2048);
+                    return true;
+                }
+            );
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['run', 'getCellMetadata']
+            );
         } finally {
             connection.dispose();
         }

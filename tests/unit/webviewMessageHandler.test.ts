@@ -7,6 +7,10 @@ import {
     WEBVIEW_PAYLOAD_LIMIT_ERROR_CODE
 } from '../../src/core/webview-transport';
 import type { PendingInvocation } from '../../src/core/rpc';
+import {
+    CellEditPolicyError,
+    CELL_EDIT_VALUE_TOO_LARGE_CODE
+} from '../../src/core/cell-edit-policy';
 
 function nextPostedMessage() {
     let resolve!: (message: any) => void;
@@ -103,6 +107,36 @@ describe('WebviewMessageHandler', () => {
 
         assert.strictEqual(sentMessage.content.success, false);
         assert.match(sentMessage.content.errorMessage, /Method 'unknown' not found/);
+    });
+
+    it('surfaces oversized new-value refusal as a typed RPC error', async () => {
+        const hostBridge = {
+            insertRow: () => {
+                throw new CellEditPolicyError('blob', 2049, 2048);
+            }
+        };
+        const posted = nextPostedMessage();
+        const handler = new WebviewMessageHandler(
+            posted.postMessage,
+            hostBridge as unknown as import('../../src/hostBridge').HostBridge
+        );
+
+        handler.handleMessage({
+            channel: 'rpc',
+            content: {
+                kind: 'invoke',
+                messageId: 'typed-cell-edit-refusal',
+                targetMethod: 'insertRow',
+                payload: ['cells', { payload: new Uint8Array(1) }]
+            }
+        });
+
+        const message = await posted.promise;
+        assert.strictEqual(message.content.success, false);
+        assert.strictEqual(message.content.error.code, CELL_EDIT_VALUE_TOO_LARGE_CODE);
+        assert.strictEqual(message.content.error.storageClass, 'blob');
+        assert.strictEqual(message.content.error.actualBytes, 2049);
+        assert.strictEqual(message.content.error.limitBytes, 2048);
     });
 
     it('should handle legacy RPC request', () => {

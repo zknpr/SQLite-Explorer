@@ -6,6 +6,10 @@ import {
   fromWebviewPayloadLimitErrorData,
   toWebviewPayloadLimitErrorData
 } from './core/webview-transport';
+import {
+  fromCellEditRpcErrorData,
+  toCellEditRpcErrorData
+} from './core/cell-edit-policy';
 import type { HostBridge } from './hostBridge';
 
 interface WebviewRpcInvokeMessage {
@@ -103,7 +107,10 @@ export class WebviewMessageHandler {
     // Object methods like 'constructor', '__defineGetter__', 'toString'.
     if (!BLOCKED_METHODS.has(targetMethod) && targetMethod in hostBridge && typeof (hostBridge as unknown as Record<string, unknown>)[targetMethod] === 'function') {
       const fn = (hostBridge as unknown as Record<string, unknown>)[targetMethod] as Function;
-      Promise.resolve(fn.apply(hostBridge, deserializedPayload))
+      // Start the invocation inside the promise chain so synchronous typed
+      // policy refusals take the same serialized error path as async rejects.
+      Promise.resolve()
+        .then(() => fn.apply(hostBridge, deserializedPayload))
         .then(result => {
           const rawResponse = {
             channel: 'rpc' as const,
@@ -169,7 +176,8 @@ export class WebviewMessageHandler {
         this.#postLegacyFailure(message.id, error);
         return;
       }
-      Promise.resolve(fn.apply(hostBridge, deserializedArgs))
+      Promise.resolve()
+        .then(() => fn.apply(hostBridge, deserializedArgs))
         .then(result => {
           assertWebviewTransportPayload({
             type: 'rpc-response',
@@ -208,7 +216,8 @@ export class WebviewMessageHandler {
       assertWebviewTransportPayload(message, {
         surface: WEBVIEW_TRANSPORT_SURFACES.webviewResponse
       });
-      fault = fromWebviewPayloadLimitErrorData(response.error);
+      fault = fromCellEditRpcErrorData(response.error)
+        ?? fromWebviewPayloadLimitErrorData(response.error);
     } catch (error) {
       fault = error instanceof Error ? error : new Error(String(error));
     }
@@ -224,7 +233,8 @@ export class WebviewMessageHandler {
   }
 
   #postRpcFailure(messageId: string, error: unknown): void {
-    const errorData = toWebviewPayloadLimitErrorData(error);
+    const errorData = toCellEditRpcErrorData(error)
+      ?? toWebviewPayloadLimitErrorData(error);
     this.postMessage({
       channel: 'rpc',
       content: {
@@ -238,7 +248,8 @@ export class WebviewMessageHandler {
   }
 
   #postLegacyFailure(id: string | number, error: unknown): void {
-    const errorData = toWebviewPayloadLimitErrorData(error);
+    const errorData = toCellEditRpcErrorData(error)
+      ?? toWebviewPayloadLimitErrorData(error);
     this.postMessage({
       type: 'rpc-response',
       id,

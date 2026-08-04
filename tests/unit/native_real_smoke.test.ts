@@ -12,6 +12,10 @@ import {
 } from '../../src/nativeWorker';
 import { cancelTokenToAbortSignal } from '../../src/core/cancellation-utils';
 import { InvocationTimeoutError } from '../../src/core/rpc';
+import {
+    CellEditPolicyError,
+    OversizedCellReplacementRequiredError
+} from '../../src/core/cell-edit-policy';
 
 const BUNDLED_TXIKI_SQLITE_VERSION = '3.51.2';
 const DIVERGENT_REAL_TEXT_BY_NATIVE_SQLITE_VERSION: Record<string, string> = {
@@ -405,6 +409,59 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             });
             assert.deepStrictEqual(small.rows, [[2, 'ok', Uint8Array.from([1, 2])]]);
             assert.strictEqual(small.oversizedCells, undefined);
+        });
+
+        await testContext.test('guards and replaces an oversized native cell without a prior payload read', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_stage_d (payload BLOB); ' +
+                'INSERT INTO native_stage_d(payload) VALUES (zeroblob(2048))'
+            );
+
+            await assert.rejects(
+                engine.updateCell(
+                    'native_stage_d',
+                    1,
+                    'payload',
+                    new Uint8Array(1025),
+                    undefined,
+                    1024
+                ),
+                (error: unknown) => {
+                    assert.ok(error instanceof CellEditPolicyError);
+                    assert.strictEqual(error.actualBytes, 1025);
+                    assert.strictEqual(error.limitBytes, 1024);
+                    return true;
+                }
+            );
+            await assert.rejects(
+                engine.updateCell(
+                    'native_stage_d',
+                    1,
+                    'payload',
+                    Uint8Array.from([1, 2, 3]),
+                    undefined,
+                    1024
+                ),
+                (error: unknown) => {
+                    assert.ok(error instanceof OversizedCellReplacementRequiredError);
+                    assert.strictEqual(error.storageClass, 'blob');
+                    assert.strictEqual(error.actualBytes, 2048);
+                    return true;
+                }
+            );
+
+            await engine.replaceOversizedCell(
+                'native_stage_d',
+                1,
+                'payload',
+                Uint8Array.from([1, 2, 3]),
+                { storageClass: 'blob', byteLength: 2048 },
+                1024
+            );
+            const result = await engine.executeQuery(
+                'SELECT typeof(payload), length(payload), hex(payload) FROM native_stage_d'
+            );
+            assert.deepStrictEqual(result[0].rows, [['blob', 3, '010203']]);
         });
 
         await testContext.test('keeps chunked cell reads on a dedicated native snapshot', async () => {

@@ -61,7 +61,7 @@ function onDragOver(e) {
     const rowIdx = cell ? parseInt(cell.dataset.rowidx, 10) : -1;
     const colIdx = cell ? parseInt(cell.dataset.colidx, 10) : -1;
     const mutationBlockReason = rowIdx >= 0 && colIdx >= 0
-        ? getCellMutationBlockReason(rowIdx, colIdx)
+        ? getCellMutationBlockReason(rowIdx, colIdx, { allowOversizedReplacement: true })
         : undefined;
     if (cell && !cell.classList.contains('row-number') && !mutationBlockReason) {
         if (lastHighlightedCell && lastHighlightedCell !== cell) {
@@ -138,7 +138,11 @@ function captureUploadTarget(cell) {
 
     const rowIdx = parseInt(cell.dataset.rowidx, 10);
     const colIdx = parseInt(cell.dataset.colidx, 10);
-    const mutationBlockReason = getCellMutationBlockReason(rowIdx, colIdx);
+    const mutationBlockReason = getCellMutationBlockReason(
+        rowIdx,
+        colIdx,
+        { allowOversizedReplacement: true }
+    );
     if (mutationBlockReason) {
         updateStatus(mutationBlockReason);
         return null;

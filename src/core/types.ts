@@ -293,6 +293,13 @@ export interface ModificationEntry {
   newValue?: CellValue;
   /** Cell update operation; missing values from older backups are treated as set. */
   operation?: CellUpdateOperation;
+  /**
+   * A forward-only edit that cannot be crossed by in-memory undo. Stage D uses
+   * this when the prior cell was intentionally never materialized. A future
+   * file-backed snapshot can hook in here by replacing the barrier with a
+   * checksummed prior-value reference and a restorable undo policy.
+   */
+  undoPolicy?: 'barrier';
   /** Raw SQL executed */
   executedQuery?: string;
   /** Multiple affected rows */
@@ -391,13 +398,38 @@ export interface DatabaseOperations {
   discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
 
   /** Update a single cell value */
-  updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<RecordId | void>;
+  updateCell(
+    table: string,
+    rowId: RecordId,
+    column: string,
+    value: CellValue,
+    patch?: string,
+    maxEditValueBytes?: number
+  ): Promise<RecordId | void>;
+
+  /** Atomically replace a confirmed oversized prior without materializing it. */
+  replaceOversizedCell(
+    table: string,
+    rowId: RecordId,
+    column: string,
+    value: CellValue,
+    expected: OversizedCellMetadata,
+    maxEditValueBytes?: number
+  ): Promise<RecordId | void>;
 
   /** Insert a new row */
-  insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined>;
+  insertRow(
+    table: string,
+    data: Record<string, CellValue>,
+    maxEditValueBytes?: number
+  ): Promise<RecordId | undefined>;
 
   /** Insert multiple rows in a batch */
-  insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
+  insertRowBatch(
+    table: string,
+    rows: Record<string, CellValue>[],
+    maxEditValueBytes?: number
+  ): Promise<void>;
 
   /** Delete rows by ID */
   deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void>;
@@ -450,7 +482,11 @@ export interface DatabaseOperations {
   ): Promise<ViewDefinition>;
 
   /** Update multiple cells in a batch */
-  updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]>;
+  updateCellBatch(
+    table: string,
+    updates: CellUpdate[],
+    maxEditValueBytes?: number
+  ): Promise<CellUpdateResult[]>;
 
   /** Add a new column to a table */
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;

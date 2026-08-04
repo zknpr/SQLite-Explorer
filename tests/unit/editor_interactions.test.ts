@@ -915,7 +915,7 @@ describe('editor keyboard and grid selection interactions', () => {
         );
     });
 
-    it('refuses clear and drag/drop mutation affordances for oversized previews', async () => {
+    it('keeps batch clear blocked but permits confirmed single-cell replacement affordances', async () => {
         const listeners = new Map<string, (event: any) => any>();
         const status = { textContent: '' };
         const cell = {
@@ -932,6 +932,9 @@ describe('editor keyboard and grid selection interactions', () => {
         };
         (globalThis as any).document = {
             addEventListener() {},
+            createElement() {
+                return { className: '', textContent: '', title: '' };
+            },
             getElementById(id: string) {
                 if (id === 'gridContainer') return container;
                 if (id === 'statusText') return status;
@@ -944,10 +947,18 @@ describe('editor keyboard and grid selection interactions', () => {
         const { clearSelectedCellValues } = await import(clipboardModulePath);
         const { initDragAndDrop } = await import(dndModulePath);
         const originalUpdateCellBatch = backendApi.updateCellBatch;
-        let updateCalls = 0;
+        const originalUpdateCell = backendApi.updateCell;
+        const originalReadWorkspaceFileUri = backendApi.readWorkspaceFileUri;
+        let batchUpdateCalls = 0;
+        let singleUpdateCalls = 0;
         backendApi.updateCellBatch = async () => {
-            updateCalls++;
+            batchUpdateCalls++;
             throw new Error('unexpected backend update');
+        };
+        backendApi.readWorkspaceFileUri = async () => new Uint8Array([1, 2, 3]);
+        backendApi.updateCell = async () => {
+            singleUpdateCalls++;
+            return 1;
         };
         state.selectedTable = 'items';
         state.selectedTableType = 'table';
@@ -965,7 +976,7 @@ describe('editor keyboard and grid selection interactions', () => {
 
         try {
             await clearSelectedCellValues();
-            assert.strictEqual(updateCalls, 0);
+            assert.strictEqual(batchUpdateCalls, 0);
             assert.strictEqual(status.textContent, 'Too large to edit inline — 4,096 bytes (BLOB)');
 
             status.textContent = '';
@@ -973,11 +984,18 @@ describe('editor keyboard and grid selection interactions', () => {
             await listeners.get('drop')?.({
                 preventDefault() {},
                 target: cell,
-                dataTransfer: { files: [], getData: () => '' }
+                dataTransfer: {
+                    files: [],
+                    getData: (type: string) => type === 'text/uri-list' ? 'file:///tmp/new.bin' : ''
+                }
             });
-            assert.strictEqual(status.textContent, 'Too large to edit inline — 4,096 bytes (BLOB)');
+            assert.strictEqual(singleUpdateCalls, 1);
+            assert.strictEqual(status.textContent, 'Uploaded new.bin');
+            assert.strictEqual(state.gridOversizedCells[0], undefined);
         } finally {
             backendApi.updateCellBatch = originalUpdateCellBatch;
+            backendApi.updateCell = originalUpdateCell;
+            backendApi.readWorkspaceFileUri = originalReadWorkspaceFileUri;
         }
     });
 

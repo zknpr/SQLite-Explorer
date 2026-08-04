@@ -5,6 +5,10 @@ import {
     fromWebviewPayloadLimitErrorData,
     toWebviewPayloadLimitErrorData
 } from '../../../src/core/webview-transport.ts';
+import {
+    fromCellEditRpcErrorData,
+    toCellEditRpcErrorData
+} from '../../../src/core/cell-edit-policy.ts';
 
 export {
     MAX_WEBVIEW_BINARY_VALUE_BYTES,
@@ -116,13 +120,15 @@ export function deserializeValue(value, limits) {
 }
 
 export function errorFromRpcResponse(message) {
-    return fromWebviewPayloadLimitErrorData(message?.error)
+    return fromCellEditRpcErrorData(message?.error)
+        ?? fromWebviewPayloadLimitErrorData(message?.error)
         ?? new Error(message?.errorMessage || 'RPC failed');
 }
 
 export function rpcErrorFields(error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const typed = toWebviewPayloadLimitErrorData(error);
+    const typed = toCellEditRpcErrorData(error)
+        ?? toWebviewPayloadLimitErrorData(error);
     return {
         errorMessage,
         ...(typed ? { error: typed } : {})

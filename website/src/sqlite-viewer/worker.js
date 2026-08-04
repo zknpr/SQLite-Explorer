@@ -71,6 +71,14 @@ import {
   validateCellReadTarget,
   validateCellReadWindow
 } from '../../../src/core/cell-read.ts';
+import {
+  assertCellValueWithinEditLimit,
+  assertCellValuesWithinEditLimit,
+  assertOversizedCellReplacementExpectation,
+  OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE,
+  OversizedCellReplacementRequiredError,
+  toCellEditRpcErrorData
+} from '../../../src/core/cell-edit-policy.ts';
 
 // ============================================================================
 // Configuration
@@ -80,6 +88,9 @@ const SQL_JS_GLUE_URL = './sql-wasm.js';
 const SQL_JS_WASM_URL = './sql-wasm.wasm';
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 const PROGRESS_HANDLER_INTERVAL = 1000;
+// RPC payloads cannot forge this Symbol; only in-worker history restoration
+// may bypass the new-value policy for a value that already existed.
+const HISTORY_REPLAY_EDIT_TOKEN = Symbol('history-replay-edit');
 
 // ============================================================================
 // State
@@ -1252,7 +1263,20 @@ async function setPragma(pragma, value) {
  * @param {string} column - Column name
  * @param {*} value - New value
  */
-async function updateCell(table, rowId, column, value) {
+async function updateCell(
+  table,
+  rowId,
+  column,
+  value,
+  _originalValue,
+  maxEditValueBytes,
+  historyReplayToken
+) {
+  const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+  const enforcePriorPolicy = !isHistoryReplay && maxEditValueBytes !== undefined;
+  const editLimitBytes = isHistoryReplay
+    ? 0
+    : assertCellValuesWithinEditLimit([value], maxEditValueBytes);
   assertMutableRecordId(rowId);
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Cell updates');
@@ -1263,16 +1287,103 @@ async function updateCell(table, rowId, column, value) {
       column,
       value,
       operation: 'set'
-    }]);
+    }], undefined, maxEditValueBytes, historyReplayToken);
     return outcomes[0]?.newRowId ?? rowId;
   }
 
+  const escapedColumn = escapeIdentifier(column);
   db.run(
-    `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ` +
-    `${bindPlaceholder(value)} WHERE rowid = ?`,
-    normalizeBindParams([value, rowId])
+    `UPDATE ${escapeIdentifier(table)} SET ${escapedColumn} = ` +
+    `${bindPlaceholder(value)} WHERE rowid = ?` +
+    (enforcePriorPolicy
+      ? ` AND NOT (typeof(${escapedColumn}) IN ('text', 'blob') ` +
+        `AND length(CAST(${escapedColumn} AS BLOB)) > ?)`
+      : ''),
+    normalizeBindParams(
+      enforcePriorPolicy ? [value, rowId, editLimitBytes] : [value, rowId]
+    )
   );
+  if (enforcePriorPolicy) {
+    const changes = db.exec('SELECT changes()')[0]?.values?.[0]?.[0];
+    if (changes !== 1) {
+      const metadata = await getCellMetadata({ table, rowId, column });
+      if (
+        (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
+        && metadata.byteLength > editLimitBytes
+      ) {
+        throw new OversizedCellReplacementRequiredError(
+          table,
+          column,
+          metadata.storageClass,
+          metadata.byteLength,
+          editLimitBytes
+        );
+      }
+      throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+    }
+  }
   return validateRowId(rowId);
+}
+
+/** Exact-metadata compare-and-set that never selects the previous cell value. */
+async function replaceOversizedCell(
+  table,
+  rowId,
+  column,
+  value,
+  expected,
+  maxEditValueBytes
+) {
+  const editLimitBytes = assertCellValuesWithinEditLimit(
+    [value],
+    maxEditValueBytes
+  );
+  assertOversizedCellReplacementExpectation(expected, editLimitBytes);
+  assertMutableRecordId(rowId);
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Oversized cell replacement');
+
+  const identity = await resolveTableIdentity(table);
+  const predicate = buildRecordIdentityPredicate(rowId, identity);
+  const escapedColumn = escapeIdentifier(column);
+  const applyGuardedUpdate = () => {
+    db.run(
+      `UPDATE ${escapeIdentifier(table)} SET ${escapedColumn} = ${bindPlaceholder(value)} ` +
+      `WHERE ${predicate.sql} AND typeof(${escapedColumn}) = ? ` +
+      `AND length(CAST(${escapedColumn} AS BLOB)) = ?`,
+      normalizeBindParams([
+        value,
+        ...predicate.params,
+        expected.storageClass,
+        expected.byteLength
+      ])
+    );
+    const changes = db.exec('SELECT changes()')[0]?.values?.[0]?.[0];
+    if (changes !== 1) throw new Error(OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE);
+    if (identity.kind === 'rowid') return validateRowId(rowId);
+
+    const candidateValues = [...predicate.primaryKey.values];
+    const keyIndex = identity.columns.findIndex(key => key.identifier === column);
+    if (keyIndex >= 0) candidateValues[keyIndex] = value;
+    const candidateId = encodePrimaryKeyRecordId(identity.columns, candidateValues);
+    return readPrimaryKeyRecordId(
+      table,
+      identity,
+      buildRecordIdentityPredicate(candidateId, identity)
+    );
+  };
+
+  if (identity.kind === 'rowid') return applyGuardedUpdate();
+  const savepointName = createViewSavepointName('sp_replace_oversized_cell');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const newRowId = applyGuardedUpdate();
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return newRowId;
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'replaceOversizedCell');
+    throw error;
+  }
 }
 
 /**
@@ -1282,9 +1393,12 @@ async function updateCell(table, rowId, column, value) {
  * @param {Object} data - Column-value pairs
  * @returns {Promise<number>} Inserted row ID
  */
-async function insertRow(table, data) {
+async function insertRow(table, data, maxEditValueBytes, historyReplayToken) {
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Row insertion');
+  if (historyReplayToken !== HISTORY_REPLAY_EDIT_TOKEN) {
+    assertCellValuesWithinEditLimit(Object.values(data), maxEditValueBytes);
+  }
 
   const columns = Object.keys(data);
   const values = Object.values(data);
@@ -1826,7 +1940,13 @@ async function undoModification(modification) {
         }
         updates.push({ rowId: currentRowId, column: cell.columnName, value });
       }
-      await updateCellBatch(targetTable, updates);
+      await updateCellBatch(
+        targetTable,
+        updates,
+        undefined,
+        undefined,
+        HISTORY_REPLAY_EDIT_TOKEN
+      );
       return;
     }
     case 'row_insert':
@@ -1838,7 +1958,12 @@ async function undoModification(modification) {
       runSingleStatement(`SAVEPOINT ${savepointName}`);
       try {
         for (const deletedRow of deletedRows) {
-          await insertRow(targetTable, deletedRow.row);
+          await insertRow(
+            targetTable,
+            deletedRow.row,
+            undefined,
+            HISTORY_REPLAY_EDIT_TOKEN
+          );
         }
         runSingleStatement(`RELEASE ${savepointName}`);
       } catch (error) {
@@ -1903,14 +2028,25 @@ async function redoModification(modification) {
             operation: operation ?? 'set'
           }]
         : []);
-      await updateCellBatch(targetTable, updates);
+      await updateCellBatch(
+        targetTable,
+        updates,
+        undefined,
+        undefined,
+        HISTORY_REPLAY_EDIT_TOKEN
+      );
       return;
     }
     case 'row_insert': {
       const dataToInsert = targetRowId !== undefined && !isPrimaryKeyRecordId(targetRowId)
         ? { rowid: targetRowId, ...(rowData ?? {}) }
         : (rowData ?? {});
-      await insertRow(targetTable, dataToInsert);
+      await insertRow(
+        targetTable,
+        dataToInsert,
+        undefined,
+        HISTORY_REPLAY_EDIT_TOKEN
+      );
       return;
     }
     case 'row_delete':
@@ -1948,12 +2084,25 @@ async function redoModification(modification) {
  * @param {string} table - Table name
  * @param {Array<Object>} updates - Array of {rowId, column, value}
  */
-async function updateCellBatch(table, updates) {
+async function updateCellBatch(
+  table,
+  updates,
+  _label,
+  maxEditValueBytes,
+  historyReplayToken
+) {
   updates.forEach(update => assertMutableRecordId(update.rowId));
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Batch cell updates');
 
   if (updates.length === 0) return [];
+  const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+  const editLimitBytes = isHistoryReplay
+    ? 0
+    : assertCellValuesWithinEditLimit(
+        updates.map(update => update.value),
+        maxEditValueBytes
+      );
 
   if (updates.some(update => isPrimaryKeyRecordId(update.rowId))) {
     if (!updates.every(update => isPrimaryKeyRecordId(update.rowId))) {
@@ -1967,6 +2116,27 @@ async function updateCellBatch(table, updates) {
     const savepointName = createViewSavepointName('sp_update_pk_batch');
     runSingleStatement(`SAVEPOINT ${savepointName}`);
     try {
+      if (!isHistoryReplay && maxEditValueBytes !== undefined) {
+        for (const update of updates) {
+          const metadata = await getCellMetadata({
+            table,
+            rowId: update.rowId,
+            column: update.column
+          });
+          if (
+            (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
+            && metadata.byteLength > editLimitBytes
+          ) {
+            throw new OversizedCellReplacementRequiredError(
+              table,
+              update.column,
+              metadata.storageClass,
+              metadata.byteLength,
+              editLimitBytes
+            );
+          }
+        }
+      }
       const updatesByRow = new Map();
       for (const update of updates) {
         const rowUpdates = updatesByRow.get(update.rowId) ?? [];
@@ -2001,6 +2171,10 @@ async function updateCellBatch(table, updates) {
           const storedValue = prepared.operation === 'json_patch'
             ? applyJsonPatchValue(priorValue, prepared.value)
             : prepared.value;
+          if (!isHistoryReplay && prepared.operation === 'json_patch') {
+            // The resulting JSON can exceed the limit even when the patch does not.
+            assertCellValueWithinEditLimit(storedValue, editLimitBytes);
+          }
           return { update, priorValue, prepared, storedValue };
         });
         const setClause = preparedUpdates.map(({ update, storedValue }) => (
@@ -2050,6 +2224,27 @@ async function updateCellBatch(table, updates) {
   const savepointName = createViewSavepointName('sp_update_cell_batch');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
+    if (!isHistoryReplay && maxEditValueBytes !== undefined) {
+      for (const update of updates) {
+        const metadata = await getCellMetadata({
+          table,
+          rowId: update.rowId,
+          column: update.column
+        });
+        if (
+          (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
+          && metadata.byteLength > editLimitBytes
+        ) {
+          throw new OversizedCellReplacementRequiredError(
+            table,
+            update.column,
+            metadata.storageClass,
+            metadata.byteLength,
+            editLimitBytes
+          );
+        }
+      }
+    }
     const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
     const columns = [...new Set(updates.map(update => update.column))];
     const placeholders = rowIds.map(() => '?').join(', ');
@@ -2079,6 +2274,10 @@ async function updateCellBatch(table, updates) {
         priorValue,
         update.operation ?? 'set'
       );
+      if (!isHistoryReplay && prepared.operation === 'json_patch') {
+        const storedValue = applyJsonPatchValue(priorValue, prepared.value);
+        assertCellValueWithinEditLimit(storedValue, editLimitBytes);
+      }
       results.push({
         rowId,
         columnName: update.column,
@@ -2190,6 +2389,7 @@ const methods = {
   getPragmas,
   setPragma,
   updateCell,
+  replaceOversizedCell,
   insertRow,
   deleteRows,
   deleteColumns,
@@ -2260,13 +2460,15 @@ self.onmessage = async (event) => {
   } catch (error) {
     console.error('[Worker] Method error:', targetMethod, error);
 
+    const errorData = toCellEditRpcErrorData(error);
     self.postMessage({
       channel: 'rpc',
       content: {
         kind: 'response',
         messageId,
         success: false,
-        errorMessage: error.message || 'Unknown error'
+        errorMessage: error.message || 'Unknown error',
+        ...(errorData ? { error: errorData } : {})
       }
     });
   }
