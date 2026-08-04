@@ -15,6 +15,8 @@ class classEventEmitter {
     }
 }
 
+const closeTextDocumentEmitter = new classEventEmitter();
+
 export const mockVscode = {
     Uri: {
         parse: (path: string) => {
@@ -123,6 +125,8 @@ export const mockVscode = {
             };
         },
         getWorkspaceFolder: () => undefined,
+        onDidCloseTextDocument: closeTextDocumentEmitter.event,
+        __fireDidCloseTextDocument: (document: any) => closeTextDocumentEmitter.fire(document),
         fs: {
             readFile: () => Promise.resolve(new Uint8Array()),
             writeFile: () => Promise.resolve()

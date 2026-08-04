@@ -18,6 +18,8 @@ const MAX_GRID_RESPONSE_CHARS = 3 * MIB;
 // The pinned pre-containment probes peaked at 609–896 MiB RSS. Keep this well
 // below that lower bound while leaving headroom for native SQLite and test setup.
 const MAX_GRID_PROBE_RSS_BYTES = 384 * MIB;
+const MAX_STAGE_B_SURFACE_RSS_BYTES = 384 * MIB;
+const MAX_INSPECTOR_PREVIEW_BYTES = 64 * 1024;
 const MAX_SINGLE_OUTPUT_CHUNK = MIB;
 const READ_WINDOW_BYTES = 64 * 1024;
 const TEST_ROOT = path.join(REPO_ROOT, '.tmp', `large-cell-tests-${process.pid}`);
@@ -259,25 +261,42 @@ describe('very large single-cell behavior (opt-in)', () => {
     }
   );
 
-  knownFailure(
+  test(
     'blob inspector decodes only a bounded preview of a text-like oversized BLOB',
-    'blob inspector currently decodes the complete value into DOM text',
+    {
+      skip: !RUN_LARGE_CELL_TESTS
+        && `set SQLITE_EXPLORER_RUN_LARGE_CELL_TESTS=1 to run the ${SIZE_MIB} MiB probes`,
+      timeout: 300_000
+    },
     async t => {
       const result = await runProbe('blob-inspector', { kind: 'blob' });
       diagnose(t, result);
       assert.equal(result.failureStage, undefined);
-      assert.ok(Number(result.largestDomTextChars) <= MAX_INLINE_CELL_BYTES);
+      assert.equal(result.sourceCellBytes, EXPECTED_CELL_BYTES);
+      assert.ok(Number(result.transportedCellBytes) <= MAX_INLINE_CELL_BYTES);
+      assert.ok(Number(result.inspectorPreviewBytes) <= MAX_INSPECTOR_PREVIEW_BYTES);
+      assert.ok(Number(result.largestDomTextChars) <= MAX_INSPECTOR_PREVIEW_BYTES);
+      assert.ok(Number(result.maxRssBytes) <= MAX_STAGE_B_SURFACE_RSS_BYTES);
     }
   );
 
-  knownFailure(
+  test(
     'VFS editor open avoids returning an oversized cell from readFile',
-    'FileSystemProvider.readFile currently returns one whole Uint8Array',
+    {
+      skip: !RUN_LARGE_CELL_TESTS
+        && `set SQLITE_EXPLORER_RUN_LARGE_CELL_TESTS=1 to run the ${SIZE_MIB} MiB probes`,
+      timeout: 300_000
+    },
     async t => {
-      const result = await runProbe('vfs-read', { kind: 'text' });
+      const result = await runProbe('vfs-read', { kind: 'text', timeoutMs: 300_000 });
       diagnose(t, result);
       assert.equal(result.failureStage, undefined);
-      assert.ok(Number(result.returnedBytes) <= MAX_INLINE_CELL_BYTES);
+      assert.equal(result.openedScheme, 'file');
+      assert.equal(result.vfsReadFileCalled, false);
+      assert.equal(result.markedReadOnly, true);
+      assert.equal(result.materializedBytes, EXPECTED_CELL_BYTES);
+      assert.ok(Number(result.sampledBytes) <= 64 * 1024);
+      assert.ok(Number(result.maxRssBytes) <= MAX_STAGE_B_SURFACE_RSS_BYTES);
     }
   );
 

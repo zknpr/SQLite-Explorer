@@ -11,7 +11,7 @@ import { createNativeDatabaseConnection } from '../../../src/nativeWorker';
 import { serializeValue } from '../../../src/core/serialization';
 import { ModificationTracker } from '../../../src/core/undo-history';
 import { HostBridge } from '../../../src/hostBridge';
-import { SQLiteFileSystemProvider } from '../../../src/virtualFileSystem';
+import { CellMaterializationService } from '../../../src/cellMaterialization';
 import { DocumentRegistry } from '../../../src/documentRegistry';
 import { exportTableCommand } from '../../../src/tableExporter';
 import type { DatabaseConnectionBundle } from '../../../src/connectionTypes';
@@ -316,8 +316,10 @@ async function probeBlobInspector(options: ProbeOptions): Promise<Record<string,
   const before = memorySnapshot();
   const startedAt = performance.now();
   return withNative(options.fixture, true, async operations => {
-    const { value } = await fetchGridCell(operations, 'blob');
+    const { result, value } = await fetchGridCell(operations, 'blob');
     if (!(value instanceof Uint8Array)) throw new Error('BLOB fixture did not return Uint8Array');
+    const metadata = result.oversizedCells?.[0]?.[2];
+    if (!metadata) throw new Error('BLOB fixture was not marked oversized');
 
     let largestDomTextChars = 0;
     const createElement = () => {
@@ -339,18 +341,29 @@ async function probeBlobInspector(options: ProbeOptions): Promise<Record<string,
     ).href;
     const { BlobInspector } = await import(`${modulePath}?large-cell-probe=${process.pid}`);
     const inspector = Object.create(BlobInspector.prototype);
-    inspector.previewContainer = { appendChild: () => undefined };
-    const type = inspector.detectType(value);
-    inspector.renderPreview(value, type);
+    inspector.currentObjectUrl = null;
+    inspector.previewContainer = { innerHTML: '', appendChild: () => undefined };
+    inspector.hexContainer = { value: '' };
+    inspector.infoContainer = { textContent: '' };
+    inspector.modal = { classList: { remove: () => undefined } };
+    inspector.cleanup = () => undefined;
+    inspector.setUploadState = () => undefined;
+    inspector.switchTab = () => undefined;
+    inspector.inspectOversized(value, metadata, 1, 'payload', 0, 0);
+    const after = memorySnapshot();
 
     return {
       mode: options.mode,
-      rawCellBytes: value.byteLength,
-      detectedType: type.type,
+      rawCellBytes: options.sizeBytes,
+      sourceCellBytes: metadata.byteLength,
+      transportedCellBytes: value.byteLength,
+      inspectorPreviewBytes: inspector.currentData.byteLength,
+      detectedType: inspector.currentType.type,
       largestDomTextChars,
       elapsedMs: performance.now() - startedAt,
       memoryBefore: before,
-      memoryAfter: memorySnapshot()
+      memoryAfter: after,
+      maxRssBytes: after.maxRssBytes
     };
   });
 }
@@ -359,34 +372,77 @@ async function probeVfsRead(options: ProbeOptions): Promise<Record<string, unkno
   const before = memorySnapshot();
   const startedAt = performance.now();
   return withNative(options.fixture, true, async operations => {
-    const documentKey = 'large-cell-probe';
+    const { value } = await fetchGridCell(operations, options.kind);
+    const storageRoot = vscode.Uri.file(
+      path.join(options.scratchRoot, `materialized-${process.pid}`)
+    );
+    const materializer = new CellMaterializationService(storageRoot);
+    let openedUri: vscode.Uri | undefined;
+    let markedReadOnly = false;
+    const originalExecuteCommand = vscode.commands.executeCommand;
     const document = {
+      uri: vscode.Uri.file(options.fixture),
+      documentKey: Promise.resolve('large-cell-probe'),
       databaseOperations: operations,
       connectionGeneration: 0,
       isReadOnlyMode: true,
-      onDidChangeContent: () => new vscode.Disposable(() => undefined),
       onDidDispose: () => new vscode.Disposable(() => undefined),
       recordExternalModification: () => undefined
     };
-    DocumentRegistry.set(documentKey, document as any);
     try {
-      const provider = new SQLiteFileSystemProvider();
       const rowId = options.kind === 'blob' ? 1 : 2;
-      const uri = vscode.Uri.parse(
-        `vscode-sqlite://${documentKey}/large_cells/group/${rowId}/payload.txt`
+      (vscode.commands as any).executeCommand = async (
+        command: string,
+        uri?: vscode.Uri
+      ) => {
+        if (command === 'vscode.open') openedUri = uri;
+        if (command === 'workbench.action.files.setActiveEditorReadonlyInSession') {
+          markedReadOnly = true;
+        }
+      };
+      const bridge = new HostBridge({
+        webviews: new Map(),
+        context: {},
+        isReadOnly: true,
+        cellMaterializer: materializer
+      } as any, document as any);
+      await bridge.openCellEditor(
+        { table: 'large_cells', name: '' },
+        rowId,
+        'payload',
+        {},
+        { value }
       );
-      const content = await provider.readFile(uri);
+      if (!openedUri || openedUri.scheme !== 'file') {
+        throw new Error('Oversized VFS flow did not open a temp-backed file URI');
+      }
+      const stat = await fs.stat(openedUri.fsPath);
+      const handle = await fs.open(openedUri.fsPath, 'r');
+      const sample = new Uint8Array(64 * 1024);
+      let sampledBytes = 0;
+      try {
+        sampledBytes = (await handle.read(sample, 0, sample.byteLength, 0)).bytesRead;
+      } finally {
+        await handle.close();
+      }
+      const after = memorySnapshot();
       return {
         mode: options.mode,
         kind: options.kind,
         rawCellBytes: options.sizeBytes,
-        returnedBytes: content.byteLength,
+        openedScheme: openedUri.scheme,
+        vfsReadFileCalled: false,
+        markedReadOnly,
+        materializedBytes: stat.size,
+        sampledBytes,
         elapsedMs: performance.now() - startedAt,
         memoryBefore: before,
-        memoryAfter: memorySnapshot()
+        memoryAfter: after,
+        maxRssBytes: after.maxRssBytes
       };
     } finally {
-      DocumentRegistry.delete(documentKey);
+      (vscode.commands as any).executeCommand = originalExecuteCommand;
+      materializer.dispose();
     }
   });
 }

@@ -27,6 +27,7 @@ import {
 import { escapeIdentifier, validateRowId, validateRowIds } from './core/sql-utils';
 import { isViewDefinitionConflictError } from './core/view-utils';
 import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './core/cell-containment';
+import type { CellMaterializationService } from './cellMaterialization';
 
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
@@ -51,6 +52,7 @@ interface ToastService {
  */
 export class HostBridge implements ToastService {
   private activePreviewController: AbortController | undefined;
+  private activeCellMaterializationController: AbortController | undefined;
 
   constructor(
     private readonly viewerProvider: DatabaseEditorProvider | DatabaseViewerProvider,
@@ -61,6 +63,9 @@ export class HostBridge implements ToastService {
   private get webviews() { return this.viewerProvider.webviews; }
   private get reporter() { return this.viewerProvider.reporter; }
   private get context() { return this.viewerProvider.context; }
+  private get cellMaterializer(): CellMaterializationService | undefined {
+    return this.viewerProvider.cellMaterializer;
+  }
 
   /**
    * Ensures the database operations are initialized and returns them.
@@ -970,6 +975,58 @@ export class HostBridge implements ToastService {
       } else {
         // Determine file extension based on content type
         const extname = await determineCellExtension(value, type);
+        const materializer = this.cellMaterializer;
+        if (materializer && colName) {
+          const target = { table: params.table, rowId, column: colName };
+          const metadata = await this.ensureDatabaseInitialized().getCellMetadata(target);
+          if (metadata.byteLength > getMaxInlineCellBytes()) {
+            let materialized;
+            this.activeCellMaterializationController?.abort();
+            const materializationController = new AbortController();
+            this.activeCellMaterializationController = materializationController;
+            const documentDisposeSubscription = document.onDidDispose(
+              () => materializationController.abort()
+            );
+            try {
+              materialized = await materializer.materialize(
+                this.ensureDatabaseInitialized(),
+                target,
+                {
+                  signal: materializationController.signal,
+                  fileExtension: extname.slice(1),
+                  owner: document
+                }
+              );
+            } catch (error) {
+              const details = error instanceof Error ? error.message : String(error);
+              throw new Error(
+                `The oversized cell could not be opened from a temporary file: ${details}. ` +
+                'Export the cell instead to choose an explicit destination.',
+                { cause: error }
+              );
+            } finally {
+              documentDisposeSubscription.dispose();
+              if (this.activeCellMaterializationController === materializationController) {
+                this.activeCellMaterializationController = undefined;
+              }
+            }
+
+            try {
+              await vsc.commands.executeCommand(
+                'vscode.open',
+                materialized.uri,
+                vsc.ViewColumn.Two
+              );
+              await vsc.commands.executeCommand(
+                'workbench.action.files.setActiveEditorReadonlyInSession'
+              );
+            } catch (error) {
+              materializer.release(materialized.uri);
+              throw error;
+            }
+            return;
+          }
+        }
         const cellFilename = (colName || 'cell') + extname;
 
         // Use simple path structure

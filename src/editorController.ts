@@ -19,6 +19,7 @@ import { SupportsWriteMode, IsRemoteWorkspaceMode, DatabaseDocument, isAutoCommi
 
 import { buildMethodProxy } from './core/rpc';
 import { WebviewMessageHandler } from './webviewMessageHandler';
+import type { CellMaterializationService } from './cellMaterialization';
 
 // Webview functions interface - methods the webview exposes to extension
 interface WebviewBridgeFunctions {
@@ -71,6 +72,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     readonly isVerified: boolean,
     readonly accessToken?: string,
     readonly forceReadOnly?: boolean,
+    readonly cellMaterializer?: CellMaterializationService,
   ) {
     super();
   }
@@ -386,7 +388,8 @@ export function registerEditorProvider(
   context: vsc.ExtensionContext,
   reporter: TelemetryReporter | undefined,
   outputChannel: vsc.OutputChannel | null,
-  { verified, accessToken, readOnly }: { verified: boolean, accessToken?: string, readOnly?: boolean }
+  { verified, accessToken, readOnly }: { verified: boolean, accessToken?: string, readOnly?: boolean },
+  cellMaterializer?: CellMaterializationService
 ) {
   // Optional chaining is required: `import.meta.env` is undefined when this module is require()'d
   // under tsx (unit tests); esbuild's `define` substitutes the value in real builds. Do not make
@@ -397,7 +400,16 @@ export function registerEditorProvider(
   const Provider = enableReadWrite ? DatabaseEditorProvider : DatabaseViewerProvider;
   return vsc.window.registerCustomEditorProvider(
     viewType,
-    new Provider(viewType, context, reporter, outputChannel, verified, accessToken, readOnly),
+    new Provider(
+      viewType,
+      context,
+      reporter,
+      outputChannel,
+      verified,
+      accessToken,
+      readOnly,
+      cellMaterializer
+    ),
     {
       webviewOptions: {
         enableFindWidget: false,

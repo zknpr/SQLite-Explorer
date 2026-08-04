@@ -40,7 +40,11 @@ import type {
   ViewDefinition,
   ViewDefinitionIntent,
   ViewEditResult,
-  ViewTriggerDefinition
+  ViewTriggerDefinition,
+  CellMetadata,
+  CellReadChunk,
+  CellReadSession,
+  CellReadTarget
 } from './core/types';
 
 import { Worker } from './platform/threadPool';
@@ -87,6 +91,14 @@ interface WorkerMethods {
     params?: CellValue[],
     cancellationFlag?: Int32Array
   ): Promise<QueryResultSet[]>;
+  getCellMetadata(target: CellReadTarget): Promise<CellMetadata>;
+  openCellReadSession(target: CellReadTarget): Promise<CellReadSession>;
+  readCellChunk(
+    sessionId: string,
+    byteOffset: number,
+    maxBytes: number
+  ): Promise<CellReadChunk>;
+  closeCellReadSession(sessionId: string): Promise<void>;
   exportDatabase(): Promise<Uint8Array>;
   applyModifications(mods: ModificationEntry[]): Promise<void>;
   undoModification(mod: ModificationEntry): Promise<void>;
@@ -141,6 +153,10 @@ interface WorkerMethods {
 const WORKER_METHOD_NAMES = [
   'initializeDatabase',
   'runQuery',
+  'getCellMetadata',
+  'openCellReadSession',
+  'readCellChunk',
+  'closeCellReadSession',
   'exportDatabase',
   'applyModifications',
   'undoModification',
@@ -433,6 +449,14 @@ async function createInProcessWasmDatabaseConnection(
         engineKind: Promise.resolve('wasm'),
         executeQuery: (sql: string, params?: CellValue[], signal?: AbortSignal) =>
           endpoint.runQuery(sql, params, signal),
+        getCellMetadata: (target: CellReadTarget) =>
+          endpoint.getCellMetadata(target),
+        openCellReadSession: (target: CellReadTarget) =>
+          endpoint.openCellReadSession(target),
+        readCellChunk: (sessionId: string, byteOffset: number, maxBytes: number) =>
+          endpoint.readCellChunk(sessionId, byteOffset, maxBytes),
+        closeCellReadSession: (sessionId: string) =>
+          endpoint.closeCellReadSession(sessionId),
         serializeDatabase: () => endpoint.exportDatabase(),
         applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
           endpoint.applyModifications(mods, signal),
@@ -682,6 +706,14 @@ async function createWorkerBackedWasmDatabaseConnection(
                 )
               : workerProxy.runQuery(sql, params)
           ),
+          getCellMetadata: (target: CellReadTarget) =>
+            workerProxy.getCellMetadata(target),
+          openCellReadSession: (target: CellReadTarget) =>
+            workerProxy.openCellReadSession(target),
+          readCellChunk: (sessionId: string, byteOffset: number, maxBytes: number) =>
+            workerProxy.readCellChunk(sessionId, byteOffset, maxBytes),
+          closeCellReadSession: (sessionId: string) =>
+            workerProxy.closeCellReadSession(sessionId),
           serializeDatabase: () => workerProxy.exportDatabase(),
           applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
             callWorkerAfterAbortCheck(signal, () => workerProxy.applyModifications(mods)),

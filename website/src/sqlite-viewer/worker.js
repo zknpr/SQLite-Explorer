@@ -60,6 +60,17 @@ import {
   DEFAULT_MAX_PAGE_RESPONSE_BYTES,
   remapPrimaryKeyContainment
 } from '../../../src/core/cell-containment.ts';
+import {
+  buildCellChunkQuery,
+  buildCellMetadataQuery,
+  decodeCellMetadata,
+  DEFAULT_CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS,
+  DEFAULT_CELL_READ_SESSION_IDLE_TIMEOUT_MS,
+  normalizeCellReadTimeout,
+  normalizeCellTextEncoding,
+  validateCellReadTarget,
+  validateCellReadWindow
+} from '../../../src/core/cell-read.ts';
 
 // ============================================================================
 // Configuration
@@ -87,6 +98,10 @@ let db = null;
 let SQL = null;
 let queryTimeout = DEFAULT_QUERY_TIMEOUT_MS;
 let readOnlyMode = false;
+let cellReadSessionIdleTimeoutMs = DEFAULT_CELL_READ_SESSION_IDLE_TIMEOUT_MS;
+let cellReadSessionAbsoluteTimeoutMs = DEFAULT_CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS;
+let activeCellReadSession = null;
+const closedCellReadSessionIds = new Set();
 
 // ============================================================================
 // sql.js Loading
@@ -302,6 +317,208 @@ function safeRollbackSavepoint(savepointName, context) {
   }
 }
 
+function rememberClosedCellReadSession(sessionId) {
+  closedCellReadSessionIds.add(sessionId);
+  while (closedCellReadSessionIds.size > 64) {
+    closedCellReadSessionIds.delete(closedCellReadSessionIds.values().next().value);
+  }
+}
+
+function rollbackAndReleaseCellReadSavepoint(savepointName) {
+  runSingleStatement(`ROLLBACK TO ${savepointName}`);
+  runSingleStatement(`RELEASE ${savepointName}`);
+}
+
+function closeActiveCellReadSession(expectedSessionId) {
+  const session = activeCellReadSession;
+  if (!session) return false;
+  if (expectedSessionId !== undefined && session.sessionId !== expectedSessionId) return false;
+
+  activeCellReadSession = null;
+  rememberClosedCellReadSession(session.sessionId);
+  if (session.expiryTimer !== undefined) clearTimeout(session.expiryTimer);
+  try {
+    runSingleStatement(`RELEASE ${session.savepointName}`);
+  } catch (releaseError) {
+    try {
+      rollbackAndReleaseCellReadSavepoint(session.savepointName);
+    } catch (rollbackError) {
+      // Closing the only connection is the final fail-closed release mechanism:
+      // a damaged bracket must never retain a snapshot indefinitely.
+      const cleanupErrors = [releaseError, rollbackError];
+      try {
+        db?.close();
+      } catch (closeError) {
+        cleanupErrors.push(closeError);
+      } finally {
+        db = null;
+      }
+      throw new AggregateError(
+        cleanupErrors,
+        'Cell read snapshot cleanup failed; the owning web database was closed'
+      );
+    }
+  }
+  return true;
+}
+
+function scheduleCellReadSessionExpiry(session) {
+  if (session.expiryTimer !== undefined) clearTimeout(session.expiryTimer);
+  session.expiresAt = Math.min(
+    session.absoluteExpiresAt,
+    session.lastAccessAt + cellReadSessionIdleTimeoutMs
+  );
+  session.expiryTimer = setTimeout(() => {
+    try {
+      closeActiveCellReadSession(session.sessionId);
+    } catch (error) {
+      console.error('[Worker] Failed to expire cell read session:', error);
+    }
+  }, Math.max(1, session.expiresAt - Date.now()));
+}
+
+async function resolveCellReadSqlTarget(target) {
+  validateCellReadTarget(target);
+  const identity = await resolveTableIdentity(target.table);
+  const predicate = buildRecordIdentityPredicate(target.rowId, identity);
+  return {
+    table: target.table,
+    column: target.column,
+    predicateSql: predicate.sql,
+    predicateParams: predicate.params
+  };
+}
+
+function queryCellMetadata(target, sqlTarget) {
+  const query = buildCellMetadataQuery(sqlTarget);
+  const result = db.exec(
+    query.sql,
+    normalizeBindParams(query.params),
+    { useBigInt: true }
+  );
+  const encodingResult = db.exec('PRAGMA encoding');
+  const textEncoding = normalizeCellTextEncoding(encodingResult[0]?.values?.[0]?.[0]);
+  return decodeCellMetadata(result[0]?.values ?? [], textEncoding, target);
+}
+
+async function getCellMetadata(target) {
+  if (!db) throw new Error('No database initialized');
+  const sqlTarget = await resolveCellReadSqlTarget(target);
+  return queryCellMetadata(target, sqlTarget);
+}
+
+async function openCellReadSession(target) {
+  if (!db) throw new Error('No database initialized');
+  if (activeCellReadSession) {
+    throw new Error('At most one web cell read session may be open');
+  }
+  const sqlTarget = await resolveCellReadSqlTarget(target);
+  const savepointName = createViewSavepointName('sp_cell_read');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    // This first read fixes sql.js's connection snapshot before returning.
+    const metadata = queryCellMetadata(target, sqlTarget);
+    const now = Date.now();
+    const session = {
+      sessionId: crypto.randomUUID(),
+      target,
+      sqlTarget,
+      metadata,
+      savepointName,
+      lastAccessAt: now,
+      absoluteExpiresAt: now + cellReadSessionAbsoluteTimeoutMs,
+      expiresAt: now + cellReadSessionIdleTimeoutMs,
+      expiryTimer: undefined
+    };
+    activeCellReadSession = session;
+    scheduleCellReadSessionExpiry(session);
+    return {
+      sessionId: session.sessionId,
+      metadata,
+      expiresAt: session.expiresAt
+    };
+  } catch (error) {
+    try {
+      rollbackAndReleaseCellReadSavepoint(savepointName);
+    } catch (cleanupError) {
+      const cleanupErrors = [error, cleanupError];
+      try {
+        db?.close();
+      } catch (closeError) {
+        cleanupErrors.push(closeError);
+      } finally {
+        db = null;
+      }
+      throw new AggregateError(
+        cleanupErrors,
+        'Cell read session open failed; the owning web database was closed'
+      );
+    }
+    throw error;
+  }
+}
+
+async function readCellChunk(sessionId, byteOffset, maxBytes) {
+  validateCellReadWindow(byteOffset, maxBytes);
+  const session = activeCellReadSession;
+  if (!session || session.sessionId !== sessionId) {
+    throw new Error(
+      closedCellReadSessionIds.has(sessionId)
+        ? `Cell read session ${sessionId} is closed or expired`
+        : `Unknown cell read session: ${String(sessionId)}`
+    );
+  }
+  if (Date.now() >= session.expiresAt) {
+    closeActiveCellReadSession(sessionId);
+    throw new Error(`Cell read session ${sessionId} is closed or expired`);
+  }
+  const query = buildCellChunkQuery(session.sqlTarget);
+  const result = db.exec(
+    query.sql,
+    normalizeBindParams([byteOffset, maxBytes, ...query.params])
+  );
+  const rows = result[0]?.values ?? [];
+  if (rows.length !== 1) {
+    throw new Error(
+      rows.length === 0
+        ? `Cell ${session.target.table}.${session.target.column} no longer exists in its snapshot`
+        : `Cell ${session.target.table}.${session.target.column} matched more than one row`
+    );
+  }
+  const value = rows[0][0];
+  const bytes = value === null ? new Uint8Array(0) : value;
+  if (!(bytes instanceof Uint8Array)) {
+    throw new Error(
+      `SQLite returned a non-BLOB chunk for ${session.target.table}.${session.target.column}`
+    );
+  }
+  session.lastAccessAt = Date.now();
+  scheduleCellReadSessionExpiry(session);
+  return {
+    byteOffset,
+    bytes: bytes.slice(),
+    done: byteOffset + bytes.byteLength >= session.metadata.byteLength
+  };
+}
+
+async function closeCellReadSession(sessionId) {
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    throw new Error('Cell read session id is required');
+  }
+  if (!closeActiveCellReadSession(sessionId) && !closedCellReadSessionIds.has(sessionId)) {
+    throw new Error(`Unknown cell read session: ${sessionId}`);
+  }
+}
+
+function assertCellReadSessionAllowsMethod(targetMethod) {
+  if (
+    activeCellReadSession &&
+    !['readCellChunk', 'closeCellReadSession', 'initializeDatabase'].includes(targetMethod)
+  ) {
+    throw new Error('A cell read snapshot is active; close it before another database operation');
+  }
+}
+
 // ============================================================================
 // Database Operations
 // ============================================================================
@@ -317,6 +534,7 @@ function safeRollbackSavepoint(savepointName, context) {
  */
 async function initializeDatabase(filename, config) {
   // Close existing database
+  closeActiveCellReadSession();
   if (db) {
     db.close();
     db = null;
@@ -326,6 +544,15 @@ async function initializeDatabase(filename, config) {
     ? config.queryTimeout
     : DEFAULT_QUERY_TIMEOUT_MS;
   readOnlyMode = config.readOnlyMode === true;
+  cellReadSessionIdleTimeoutMs = normalizeCellReadTimeout(
+    config.cellReadSessionIdleTimeoutMs,
+    DEFAULT_CELL_READ_SESSION_IDLE_TIMEOUT_MS
+  );
+  cellReadSessionAbsoluteTimeoutMs = normalizeCellReadTimeout(
+    config.cellReadSessionAbsoluteTimeoutMs,
+    DEFAULT_CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS
+  );
+  closedCellReadSessionIds.clear();
 
   // Initialize sql.js with WASM
   if (!SQL) {
@@ -1950,6 +2177,10 @@ async function fireEditEvent(_edit) {
 const methods = {
   initializeDatabase,
   runQuery,
+  getCellMetadata,
+  openCellReadSession,
+  readCellChunk,
+  closeCellReadSession,
   exportDatabase,
   exportTable,
   fetchTableData,
@@ -2014,6 +2245,7 @@ self.onmessage = async (event) => {
 
   // Execute handler
   try {
+    assertCellReadSessionAllowsMethod(targetMethod);
     const result = await handler(...(payload || []));
 
     self.postMessage({

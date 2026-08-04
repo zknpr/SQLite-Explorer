@@ -27,7 +27,12 @@ import type {
   ViewEditResult,
   ViewTriggerDefinition,
   TableIdentity,
-  DeletedRow
+  DeletedRow,
+  CellMetadata,
+  CellReadChunk,
+  CellReadSession,
+  CellReadTarget,
+  CellTextEncoding
 } from '../../types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from '../../sql-utils';
 import { crypto } from '../../../platform/cryptoShim';
@@ -80,6 +85,18 @@ import {
   normalizeViewDefinitionError,
   normalizeViewSelectSql
 } from '../../view-utils';
+import {
+  buildCellChunkQuery,
+  buildCellMetadataQuery,
+  decodeCellMetadata,
+  DEFAULT_CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS,
+  DEFAULT_CELL_READ_SESSION_IDLE_TIMEOUT_MS,
+  normalizeCellReadTimeout,
+  normalizeCellTextEncoding,
+  validateCellReadTarget,
+  validateCellReadWindow,
+  type CellReadSqlTarget
+} from '../../cell-read';
 
 // ============================================================================
 // Internal sql.js Types
@@ -160,6 +177,18 @@ function wasmBindPlaceholder(value: CellValue): string {
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 const PROGRESS_HANDLER_INTERVAL = 1000;
 
+interface WasmCellReadSessionState {
+  sessionId: string;
+  target: CellReadTarget;
+  sqlTarget: CellReadSqlTarget;
+  metadata: CellMetadata;
+  savepointName: string;
+  absoluteExpiresAt: number;
+  expiresAt: number;
+  idleTimer: ReturnType<typeof setTimeout>;
+  absoluteTimer: ReturnType<typeof setTimeout>;
+}
+
 export class WasmDatabaseEngine implements DatabaseOperations {
   private readonly instance: WasmDatabaseInstance;
   private readonly queryTimeout: number;
@@ -167,18 +196,38 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private readonly logger: WasmEngineLogHandler;
   /** Whether SQLite's json_patch() function is available (JSON1 extension). */
   private readonly hasJsonPatch: boolean;
+  private readonly cellReadSessionIdleTimeoutMs: number;
+  private readonly cellReadSessionAbsoluteTimeoutMs: number;
+  private cellReadSession: WasmCellReadSessionState | undefined;
+  private readonly closedCellReadSessionIds = new Set<string>();
+  private instanceClosed = false;
   readonly engineKind = Promise.resolve('wasm' as const);
 
   constructor(
     instance: WasmDatabaseInstance,
     timeoutMs: number = DEFAULT_QUERY_TIMEOUT_MS,
     readOnlyMode: boolean = false,
-    logger?: WasmEngineLogHandler
+    logger?: WasmEngineLogHandler,
+    cellReadOptions: {
+      idleTimeoutMs?: number;
+      absoluteTimeoutMs?: number;
+    } = {}
   ) {
     this.instance = instance;
     this.queryTimeout = timeoutMs;
     this.readOnlyMode = readOnlyMode;
     this.logger = logger ?? ((level, ...args) => console[level](...args));
+    this.cellReadSessionIdleTimeoutMs = normalizeCellReadTimeout(
+      cellReadOptions.idleTimeoutMs,
+      DEFAULT_CELL_READ_SESSION_IDLE_TIMEOUT_MS
+    );
+    this.cellReadSessionAbsoluteTimeoutMs = Math.max(
+      this.cellReadSessionIdleTimeoutMs,
+      normalizeCellReadTimeout(
+        cellReadOptions.absoluteTimeoutMs,
+        DEFAULT_CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS
+      )
+    );
 
     if (this.readOnlyMode) {
       // Public mutation methods fail early with operation-specific messages,
@@ -377,6 +426,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     params?: CellValue[],
     cancellation?: WasmQueryCancellation
   ): Promise<QueryResultSet[]> {
+    this.assertNoActiveCellReadSession();
     const results: QueryResultSet[] = [];
     const executionState: { currentStmt?: WasmPreparedStatement } = {};
 
@@ -434,6 +484,219 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
       const errorDetail = err instanceof Error ? err.message : String(err);
       throw new Error(`Query failed: ${errorDetail}`);
+    }
+  }
+
+  private assertNoActiveCellReadSession(): void {
+    if (this.cellReadSession) {
+      throw new Error(
+        'A cell read session is active; close it before running another database operation'
+      );
+    }
+  }
+
+  private getCellTextEncoding(): CellTextEncoding {
+    const encoding = this.instance.exec('PRAGMA encoding')[0]?.values?.[0]?.[0];
+    return normalizeCellTextEncoding(encoding);
+  }
+
+  private async resolveCellReadSqlTarget(target: CellReadTarget): Promise<CellReadSqlTarget> {
+    validateCellReadTarget(target);
+    const identity = await this.resolveTableIdentity(target.table);
+    const predicate = buildRecordIdentityPredicate(target.rowId, identity);
+    return {
+      table: target.table,
+      column: target.column,
+      predicateSql: predicate.sql,
+      predicateParams: predicate.params
+    };
+  }
+
+  private readCellMetadata(
+    target: CellReadTarget,
+    sqlTarget: CellReadSqlTarget
+  ): CellMetadata {
+    const query = buildCellMetadataQuery(sqlTarget);
+    return decodeCellMetadata(
+      this.queryRaw(query.sql, query.params).rows,
+      this.getCellTextEncoding(),
+      target
+    );
+  }
+
+  async getCellMetadata(target: CellReadTarget): Promise<CellMetadata> {
+    this.assertNoActiveCellReadSession();
+    const sqlTarget = await this.resolveCellReadSqlTarget(target);
+    return this.readCellMetadata(target, sqlTarget);
+  }
+
+  async openCellReadSession(target: CellReadTarget): Promise<CellReadSession> {
+    this.assertNoActiveCellReadSession();
+    const sqlTarget = await this.resolveCellReadSqlTarget(target);
+    const sessionId = crypto.randomUUID();
+    const savepointName = this.createSavepointName('sp_cell_read');
+    this.instance.exec(`SAVEPOINT ${savepointName}`);
+
+    try {
+      // The metadata SELECT is deliberately the first database read inside the
+      // bracket. It fixes the snapshot before any chunk can be requested.
+      const metadata = this.readCellMetadata(target, sqlTarget);
+      const now = Date.now();
+      const absoluteExpiresAt = now + this.cellReadSessionAbsoluteTimeoutMs;
+      const expiresAt = Math.min(
+        now + this.cellReadSessionIdleTimeoutMs,
+        absoluteExpiresAt
+      );
+      const expire = () => this.expireCellReadSession(sessionId);
+      const idleTimer = setTimeout(expire, Math.max(1, expiresAt - now));
+      const absoluteTimer = setTimeout(
+        expire,
+        Math.max(1, absoluteExpiresAt - now)
+      );
+      (idleTimer as unknown as { unref?: () => void }).unref?.();
+      (absoluteTimer as unknown as { unref?: () => void }).unref?.();
+      this.cellReadSession = {
+        sessionId,
+        target: { ...target },
+        sqlTarget,
+        metadata,
+        savepointName,
+        absoluteExpiresAt,
+        expiresAt,
+        idleTimer,
+        absoluteTimer
+      };
+      return { sessionId, metadata, expiresAt };
+    } catch (error) {
+      try {
+        this.instance.exec(`ROLLBACK TO ${savepointName}`);
+        this.instance.exec(`RELEASE ${savepointName}`);
+      } catch (cleanupError) {
+        this.closeInstanceAfterCellReadCleanupFailure(
+          [error, cleanupError],
+          'Cell read session open failed and its savepoint cleanup also failed'
+        );
+      }
+      throw error;
+    }
+  }
+
+  async readCellChunk(
+    sessionId: string,
+    byteOffset: number,
+    maxBytes: number
+  ): Promise<CellReadChunk> {
+    validateCellReadWindow(byteOffset, maxBytes);
+    const session = this.cellReadSession;
+    if (!session || session.sessionId !== sessionId) {
+      throw new Error(`Cell read session expired or not found: ${sessionId}`);
+    }
+    if (Date.now() >= session.expiresAt || Date.now() >= session.absoluteExpiresAt) {
+      this.expireCellReadSession(sessionId);
+      throw new Error(`Cell read session expired or not found: ${sessionId}`);
+    }
+    if (byteOffset > session.metadata.byteLength) {
+      throw new Error(
+        `Cell read byte offset ${byteOffset} exceeds source length ${session.metadata.byteLength}`
+      );
+    }
+
+    const query = buildCellChunkQuery(session.sqlTarget);
+    const rows = this.queryRaw(
+      query.sql,
+      [byteOffset, maxBytes, ...query.params]
+    ).rows;
+    if (rows.length !== 1) {
+      throw new Error(`Snapshot cell ${session.target.table}.${session.target.column} disappeared`);
+    }
+    const rawBytes = rows[0][0];
+    if (!(rawBytes instanceof Uint8Array)) {
+      throw new Error('SQLite returned a non-BLOB cell read window');
+    }
+    const bytes = rawBytes.slice();
+    if (bytes.byteLength > maxBytes) {
+      throw new Error('SQLite returned a cell read window larger than requested');
+    }
+    this.refreshCellReadSession(session);
+    return {
+      byteOffset,
+      bytes,
+      done: byteOffset + bytes.byteLength >= session.metadata.byteLength
+    };
+  }
+
+  async closeCellReadSession(sessionId: string): Promise<void> {
+    if (this.closedCellReadSessionIds.has(sessionId)) return;
+    const session = this.cellReadSession;
+    if (!session || session.sessionId !== sessionId) {
+      throw new Error(`Cell read session expired or not found: ${sessionId}`);
+    }
+    this.releaseCellReadSession(session);
+  }
+
+  private refreshCellReadSession(session: WasmCellReadSessionState): void {
+    clearTimeout(session.idleTimer);
+    const now = Date.now();
+    session.expiresAt = Math.min(
+      now + this.cellReadSessionIdleTimeoutMs,
+      session.absoluteExpiresAt
+    );
+    session.idleTimer = setTimeout(
+      () => this.expireCellReadSession(session.sessionId),
+      Math.max(1, session.expiresAt - now)
+    );
+    (session.idleTimer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  private expireCellReadSession(sessionId: string): void {
+    const session = this.cellReadSession;
+    if (!session || session.sessionId !== sessionId) return;
+    try {
+      this.releaseCellReadSession(session);
+    } catch (error) {
+      this.logger('error', 'Failed to release expired cell read session:', error);
+    }
+  }
+
+  /**
+   * A failed ROLLBACK/RELEASE leaves the savepoint state unknowable. Closing
+   * the sql.js database is the only remaining way to ensure the snapshot
+   * cannot stay pinned after the session has been removed from our registry.
+   */
+  private closeInstanceAfterCellReadCleanupFailure(
+    errors: unknown[],
+    message: string
+  ): never {
+    try {
+      this.instance.close();
+      this.instanceClosed = true;
+    } catch (closeError) {
+      errors.push(closeError);
+    }
+    throw new AggregateError(errors, message);
+  }
+
+  private releaseCellReadSession(session: WasmCellReadSessionState): void {
+    clearTimeout(session.idleTimer);
+    clearTimeout(session.absoluteTimer);
+    this.cellReadSession = undefined;
+    this.closedCellReadSessionIds.add(session.sessionId);
+    if (this.closedCellReadSessionIds.size > 64) {
+      this.closedCellReadSessionIds.delete(this.closedCellReadSessionIds.values().next().value!);
+    }
+    try {
+      this.instance.exec(`RELEASE ${session.savepointName}`);
+    } catch (releaseError) {
+      try {
+        this.instance.exec(`ROLLBACK TO ${session.savepointName}`);
+        this.instance.exec(`RELEASE ${session.savepointName}`);
+      } catch (cleanupError) {
+        this.closeInstanceAfterCellReadCleanupFailure(
+          [releaseError, cleanupError],
+          'Failed to release cell read session savepoint'
+        );
+      }
+      throw releaseError;
     }
   }
 
@@ -915,6 +1178,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     value: CellValue,
     patch?: string
   ): Promise<RecordId> {
+    this.assertNoActiveCellReadSession();
     assertMutableRecordId(rowId);
     if (isPrimaryKeyRecordId(rowId)) {
       const identity = await this.resolveTableIdentity(table);
@@ -2257,7 +2521,17 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * Release database resources.
    */
   shutdown(): void {
-    this.instance.close();
+    if (this.cellReadSession) {
+      try {
+        this.releaseCellReadSession(this.cellReadSession);
+      } catch (error) {
+        this.logger('error', 'Failed to release cell read session during shutdown:', error);
+      }
+    }
+    if (!this.instanceClosed) {
+      this.instance.close();
+      this.instanceClosed = true;
+    }
   }
 
   /**

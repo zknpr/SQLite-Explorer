@@ -6,6 +6,7 @@ import { ExtensionId, FullExtensionId, FileNestingPatternsAdded, FirstInstallMs,
 import type { DbParams, ExportOptions } from './core/types';
 import { registerEditorProvider } from './editorController';
 import { SQLiteFileSystemProvider } from './virtualFileSystem';
+import { CellMaterializationService } from './cellMaterialization';
 
 export let GlobalOutputChannel: vsc.OutputChannel|null = null;
 
@@ -69,6 +70,12 @@ export async function activate(context: vsc.ExtensionContext) {
  */
 export async function activateProviders(context: vsc.ExtensionContext, reporter?: TelemetryReporter) {
   const subs = [];
+  const cellMaterializer = !import.meta.env?.VSCODE_BROWSER_EXT && context.globalStorageUri
+    ? new CellMaterializationService(
+        vsc.Uri.joinPath(context.globalStorageUri, 'cell-materializations')
+      )
+    : undefined;
+  if (cellMaterializer) subs.push(cellMaterializer);
 
   // Create output channel for SQL logging
   const channel = GlobalOutputChannel = vsc.window.createOutputChannel(Title, 'sql');
@@ -78,10 +85,24 @@ export async function activateProviders(context: vsc.ExtensionContext, reporter?
   subs.push(vsc.workspace.registerFileSystemProvider(UriScheme, new SQLiteFileSystemProvider(), { isCaseSensitive: true }));
 
   // Register the main editor provider (default for .sqlite, .db, etc.)
-  subs.push(registerEditorProvider(`${ExtensionId}.view`, context, reporter, channel, { verified: true }));
+  subs.push(registerEditorProvider(
+    `${ExtensionId}.view`,
+    context,
+    reporter,
+    channel,
+    { verified: true },
+    cellMaterializer
+  ));
 
   // Register optional provider (can be selected from "Open With" menu)
-  subs.push(registerEditorProvider(`${ExtensionId}.option`, context, reporter, channel, { verified: true }));
+  subs.push(registerEditorProvider(
+    `${ExtensionId}.option`,
+    context,
+    reporter,
+    channel,
+    { verified: true },
+    cellMaterializer
+  ));
 
   context.subscriptions.push(...subs);
 }

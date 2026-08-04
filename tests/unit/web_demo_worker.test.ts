@@ -74,6 +74,8 @@ async function createWorkerHarness(options: {
     queryTimeout?: number;
     now?: () => number;
     readOnlyMode?: boolean;
+    cellReadSessionIdleTimeoutMs?: number;
+    cellReadSessionAbsoluteTimeoutMs?: number;
     useBundledWasm?: boolean;
     initSqlJs?: (config: any) => Promise<any>;
     onImportScripts?: (url: string) => void;
@@ -151,7 +153,9 @@ async function createWorkerHarness(options: {
     const initConfig: Record<string, unknown> = {
         content: options.content ?? null,
         queryTimeout: options.queryTimeout,
-        readOnlyMode: options.readOnlyMode
+        readOnlyMode: options.readOnlyMode,
+        cellReadSessionIdleTimeoutMs: options.cellReadSessionIdleTimeoutMs,
+        cellReadSessionAbsoluteTimeoutMs: options.cellReadSessionAbsoluteTimeoutMs
     };
     if (options.useBundledWasm !== false) {
         initConfig.wasmBinary = new Uint8Array(readFileSync(
@@ -606,6 +610,85 @@ describe('web demo view worker', () => {
         assert.deepStrictEqual(Array.from(small.rows[0].slice(0, 2)), [2, 'ok']);
         assert.deepStrictEqual(Array.from(small.rows[0][2]), [1, 2]);
         assert.strictEqual(small.oversizedCells, undefined);
+    });
+
+    it('keeps demo cell chunks on one snapshot and preserves multibyte byte boundaries', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_cell_read_sessions (blob_value BLOB, text_value TEXT); ' +
+            "INSERT INTO demo_cell_read_sessions VALUES (x'4141414142424242', 'A😀Bé𝄞Z')"
+        );
+
+        const blobSession = await worker.invoke('openCellReadSession', {
+            table: 'demo_cell_read_sessions',
+            rowId: 1,
+            column: 'blob_value'
+        });
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(blobSession.metadata)), {
+            storageClass: 'blob',
+            byteLength: 8
+        });
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke('readCellChunk', blobSession.sessionId, 0, 4)).bytes),
+            [65, 65, 65, 65]
+        );
+        await assert.rejects(
+            worker.invoke(
+                'updateCell',
+                'demo_cell_read_sessions',
+                1,
+                'blob_value',
+                Uint8Array.from([67, 67, 67, 67, 68, 68, 68, 68])
+            ),
+            /cell read snapshot is active/i
+        );
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke('readCellChunk', blobSession.sessionId, 4, 4)).bytes),
+            [66, 66, 66, 66]
+        );
+        await worker.invoke('closeCellReadSession', blobSession.sessionId);
+
+        const textSession = await worker.invoke('openCellReadSession', {
+            table: 'demo_cell_read_sessions',
+            rowId: 1,
+            column: 'text_value'
+        });
+        const expected = new TextEncoder().encode('A😀Bé𝄞Z');
+        const assembled: number[] = [];
+        for (let offset = 0; offset < expected.byteLength; offset += 2) {
+            const chunk = await worker.invoke('readCellChunk', textSession.sessionId, offset, 2);
+            assembled.push(...Array.from(chunk.bytes as Uint8Array));
+        }
+        assert.deepStrictEqual(Uint8Array.from(assembled), expected);
+        await worker.invoke('closeCellReadSession', textSession.sessionId);
+    });
+
+    it('expires demo cell read sessions and releases their savepoint', async () => {
+        const worker = await createWorkerHarness({
+            cellReadSessionIdleTimeoutMs: 20,
+            cellReadSessionAbsoluteTimeoutMs: 100
+        });
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_expiring_cell (value TEXT); INSERT INTO demo_expiring_cell VALUES ('old')"
+        );
+        const session = await worker.invoke('openCellReadSession', {
+            table: 'demo_expiring_cell',
+            rowId: 1,
+            column: 'value'
+        });
+
+        await new Promise(resolve => setTimeout(resolve, 40));
+        await assert.rejects(
+            worker.invoke('readCellChunk', session.sessionId, 0, 2),
+            /closed or expired/i
+        );
+        await worker.invoke('updateCell', 'demo_expiring_cell', 1, 'value', 'new');
+        assert.strictEqual(await workerScalar(
+            worker,
+            'SELECT value FROM demo_expiring_cell WHERE rowid = 1'
+        ), 'new');
     });
 
     it('marks an oversized demo WITHOUT ROWID primary key read-only', async () => {

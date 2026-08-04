@@ -317,6 +317,51 @@ describe('workerFactory error path tests', () => {
     }
   });
 
+  it('routes bounded cell sessions through the desktop WASM worker facade', async () => {
+    const target = { table: 'items', rowId: 7, column: 'payload' };
+    const metadata = { storageClass: 'blob', byteLength: 3 };
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false }),
+      getCellMetadata: async (received: unknown) => {
+        assert.deepStrictEqual(received, target);
+        return metadata;
+      },
+      openCellReadSession: async (received: unknown) => {
+        assert.deepStrictEqual(received, target);
+        return { sessionId: 'session-1', metadata, expiresAt: 1234 };
+      },
+      readCellChunk: async (sessionId: string, byteOffset: number, maxBytes: number) => {
+        assert.deepStrictEqual([sessionId, byteOffset, maxBytes], ['session-1', 0, 3]);
+        return { byteOffset: 0, bytes: new Uint8Array([1, 2, 3]), done: true };
+      },
+      closeCellReadSession: async (sessionId: string) => {
+        assert.strictEqual(sessionId, 'session-1');
+      }
+    };
+
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+    const connection = await bundle.establishConnection(
+      { scheme: 'file', fsPath: '/test/db.sqlite', path: '/test/db.sqlite' } as any,
+      'test.sqlite'
+    );
+
+    assert.ok(exposedWorkerMethods.includes('getCellMetadata'));
+    assert.ok(exposedWorkerMethods.includes('openCellReadSession'));
+    assert.ok(exposedWorkerMethods.includes('readCellChunk'));
+    assert.ok(exposedWorkerMethods.includes('closeCellReadSession'));
+    assert.deepStrictEqual(await connection.databaseOps.getCellMetadata(target), metadata);
+    const session = await connection.databaseOps.openCellReadSession(target);
+    assert.strictEqual(session.sessionId, 'session-1');
+    assert.deepStrictEqual(
+      await connection.databaseOps.readCellChunk(session.sessionId, 0, 3),
+      { byteOffset: 0, bytes: new Uint8Array([1, 2, 3]), done: true }
+    );
+    await connection.databaseOps.closeCellReadSession(session.sessionId);
+  });
+
   it('rejects pre-aborted desktop worker operations instead of throwing synchronously', async () => {
     let applyCalls = 0;
     workerProxy = {

@@ -26,7 +26,11 @@ import type {
   ColumnDefinition,
   ModificationEntry,
   ViewDefinitionIntent,
-  ViewTriggerDefinition
+  ViewTriggerDefinition,
+  CellMetadata,
+  CellReadChunk,
+  CellReadSession,
+  CellReadTarget
 } from './types';
 import { getNodeFs } from './platform/fs';
 import {
@@ -113,7 +117,11 @@ export async function createDatabaseEngine(
     wasmInstance,
     config.queryTimeout,
     config.readOnlyMode ?? false,
-    logger
+    logger,
+    {
+      idleTimeoutMs: config.cellReadSessionIdleTimeoutMs,
+      absoluteTimeoutMs: config.cellReadSessionAbsoluteTimeoutMs
+    }
   );
 
   return {
@@ -180,6 +188,26 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       cancellation?: WasmQueryCancellation
     ): Promise<QueryResultSet[]> {
       return requireEngine().executeQuery(sql, params, cancellation);
+    },
+
+    async getCellMetadata(target: CellReadTarget): Promise<CellMetadata> {
+      return requireEngine().getCellMetadata(target);
+    },
+
+    async openCellReadSession(target: CellReadTarget): Promise<CellReadSession> {
+      return requireEngine().openCellReadSession(target);
+    },
+
+    async readCellChunk(
+      sessionId: string,
+      byteOffset: number,
+      maxBytes: number
+    ): Promise<CellReadChunk> {
+      return requireEngine().readCellChunk(sessionId, byteOffset, maxBytes);
+    },
+
+    async closeCellReadSession(sessionId: string): Promise<void> {
+      return requireEngine().closeCellReadSession(sessionId);
     },
 
     /**

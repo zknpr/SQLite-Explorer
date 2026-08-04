@@ -374,7 +374,23 @@ export async function openCellInVsCode() {
 export function openCellPreview(rowIdx, colIdx, rowId) {
     const oversizedMetadata = getOversizedCellMetadata(rowIdx, colIdx);
     if (oversizedMetadata) {
-        updateStatus(getCellMutationBlockReason(rowIdx, colIdx));
+        const column = state.tableColumns[colIdx];
+        const row = state.gridData[rowIdx];
+        if (!column || !row || !blobInspector) {
+            updateStatus(
+                `Bounded preview only — ${oversizedMetadata.byteLength.toLocaleString()} bytes ` +
+                `(${oversizedMetadata.storageClass.toUpperCase()})`
+            );
+            return;
+        }
+        blobInspector.inspectOversized(
+            getCellValue(row, colIdx),
+            oversizedMetadata,
+            rowId,
+            column.name,
+            rowIdx,
+            colIdx
+        );
         return;
     }
 

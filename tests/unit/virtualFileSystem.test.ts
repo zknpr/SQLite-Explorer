@@ -252,6 +252,52 @@ describe('SQLiteFileSystemProvider', () => {
             assert.deepStrictEqual(content, blob);
         });
 
+        it('keeps a small cell byte-identical after the metadata containment check', async () => {
+            const blob = Uint8Array.from([0, 255, 1, 254]);
+            let queryCount = 0;
+            const dbOps = {
+                getCellMetadata: mock.fn(async () => ({
+                    storageClass: 'blob',
+                    byteLength: blob.byteLength
+                })),
+                executeQuery: mock.fn(async () => {
+                    queryCount++;
+                    return queryCount === 1
+                        ? [{ rows: [[1]] }]
+                        : [{ rows: [[blob, null]] }];
+                })
+            };
+            setupMockDocument(docKey, dbOps);
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/users/group/1/payload.bin`
+            );
+
+            const content = await provider.readFile(uri);
+
+            assert.deepStrictEqual(content, blob);
+            assert.strictEqual(dbOps.getCellMetadata.mock.callCount(), 1);
+        });
+
+        it('refuses a direct oversized VFS read before fetching the raw value', async () => {
+            const dbOps = {
+                getCellMetadata: mock.fn(async () => ({
+                    storageClass: 'text',
+                    byteLength: 2 * 1024 * 1024
+                })),
+                executeQuery: mock.fn(async () => [{ rows: [[1]] }])
+            };
+            setupMockDocument(docKey, dbOps);
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/users/group/1/payload.txt`
+            );
+
+            await assert.rejects(
+                provider.readFile(uri),
+                /oversized.*temporary-file.*Export the cell instead/is
+            );
+            assert.strictEqual(dbOps.executeQuery.mock.callCount(), 1);
+        });
+
         it('should return invalid row ID message for non-numeric row ID', async () => {
             const dbOps = {
                 executeQuery: mock.fn(async (sql: string) => {

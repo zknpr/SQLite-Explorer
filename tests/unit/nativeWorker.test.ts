@@ -355,6 +355,71 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
+    it('routes bounded cell sessions with a structured validated row locator', async () => {
+        const metadata = { storageClass: 'blob', byteLength: 4 };
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                return {
+                    result: {
+                        columns: ['type', 'wr'],
+                        values: [['table', 0]]
+                    }
+                };
+            }
+            if (call.method === 'getCellMetadata') return { result: metadata };
+            if (call.method === 'openCellReadSession') {
+                return {
+                    result: {
+                        sessionId: 'native-session-1',
+                        metadata,
+                        expiresAt: 1234
+                    }
+                };
+            }
+            if (call.method === 'readCellChunk') {
+                return {
+                    result: {
+                        byteOffset: 0,
+                        bytes: new Uint8Array([0, 1, 2, 3]),
+                        done: true
+                    }
+                };
+            }
+            if (call.method === 'closeCellReadSession') return { result: { closed: true } };
+            return { result: { success: true } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            const target = { table: 'assets', rowId: 7, column: 'payload' };
+            assert.deepStrictEqual(await connection.databaseOps.getCellMetadata(target), metadata);
+            const session = await connection.databaseOps.openCellReadSession(target);
+            const chunk = await connection.databaseOps.readCellChunk(
+                session.sessionId,
+                0,
+                4
+            );
+            await connection.databaseOps.closeCellReadSession(session.sessionId);
+
+            assert.deepStrictEqual(chunk.bytes, new Uint8Array([0, 1, 2, 3]));
+            for (const method of ['getCellMetadata', 'openCellReadSession']) {
+                const call = connection.calls.find(candidate => candidate.method === method);
+                assert.ok(call, `missing ${method} native call`);
+                assert.deepStrictEqual(call.args, [
+                    'assets',
+                    'payload',
+                    { kind: 'rowid', value: 7 }
+                ]);
+            }
+            assert.ok(connection.calls.every(call => (
+                !['getCellMetadata', 'openCellReadSession'].includes(call.method)
+                || !call.args.some(argument => typeof argument === 'string' && /rowid\s*=/.test(argument))
+            )));
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('should throw an error with context when database opening fails', async () => {
         let mockProcess: any;
         const EventEmitter = require('node:events').EventEmitter;

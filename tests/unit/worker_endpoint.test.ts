@@ -89,6 +89,35 @@ describe('Worker Endpoint', () => {
         assert.ok(data.length > 0);
     });
 
+    it('routes bounded cell sessions through the worker endpoint', async () => {
+        await endpoint.initializeDatabase('test.db', {
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false,
+            wasmBinary
+        });
+        await endpoint.runQuery(
+            "CREATE TABLE cell_windows (payload TEXT); " +
+            "INSERT INTO cell_windows VALUES ('A😀B')"
+        );
+        const target = { table: 'cell_windows', rowId: 1, column: 'payload' };
+
+        const metadata = await endpoint.getCellMetadata(target);
+        assert.deepStrictEqual(metadata, {
+            storageClass: 'text',
+            byteLength: 6,
+            textEncoding: 'utf-8'
+        });
+        const session = await endpoint.openCellReadSession(target);
+        const first = await endpoint.readCellChunk(session.sessionId, 0, 3);
+        const second = await endpoint.readCellChunk(session.sessionId, 3, 3);
+        await endpoint.closeCellReadSession(session.sessionId);
+
+        assert.deepStrictEqual(first.bytes, new Uint8Array([65, 240, 159]));
+        assert.deepStrictEqual(second.bytes, new Uint8Array([152, 128, 66]));
+        assert.strictEqual(second.done, true);
+    });
+
     it('forwards skipped view-undo diagnostics through the endpoint logger', async () => {
         const logs: Array<{ level: string; args: unknown[] }> = [];
         endpoint = createWorkerEndpoint((level, ...args) => {

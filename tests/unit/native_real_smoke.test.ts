@@ -407,6 +407,55 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.strictEqual(small.oversizedCells, undefined);
         });
 
+        await testContext.test('keeps chunked cell reads on a dedicated native snapshot', async () => {
+            await engine.executeQuery('PRAGMA journal_mode = WAL');
+            await engine.executeQuery(
+                'CREATE TABLE native_cell_read_sessions (blob_value BLOB, text_value TEXT); ' +
+                "INSERT INTO native_cell_read_sessions VALUES (x'4141414142424242', 'A😀Bé𝄞Z')"
+            );
+
+            const blobSession = await engine.openCellReadSession({
+                table: 'native_cell_read_sessions',
+                rowId: 1,
+                column: 'blob_value'
+            });
+            assert.deepStrictEqual(blobSession.metadata, {
+                storageClass: 'blob',
+                byteLength: 8
+            });
+            const first = await engine.readCellChunk(blobSession.sessionId, 0, 4);
+            assert.deepStrictEqual(first.bytes, Uint8Array.from([65, 65, 65, 65]));
+
+            await engine.updateCell(
+                'native_cell_read_sessions',
+                1,
+                'blob_value',
+                Uint8Array.from([67, 67, 67, 67, 68, 68, 68, 68])
+            );
+            const second = await engine.readCellChunk(blobSession.sessionId, 4, 4);
+            assert.deepStrictEqual(second.bytes, Uint8Array.from([66, 66, 66, 66]));
+            await engine.closeCellReadSession(blobSession.sessionId);
+
+            const textSession = await engine.openCellReadSession({
+                table: 'native_cell_read_sessions',
+                rowId: 1,
+                column: 'text_value'
+            });
+            const expectedText = new TextEncoder().encode('A😀Bé𝄞Z');
+            assert.deepStrictEqual(textSession.metadata, {
+                storageClass: 'text',
+                byteLength: expectedText.byteLength,
+                textEncoding: 'utf-8'
+            });
+            const assembled: number[] = [];
+            for (let offset = 0; offset < expectedText.byteLength; offset += 2) {
+                const chunk = await engine.readCellChunk(textSession.sessionId, offset, 2);
+                assembled.push(...chunk.bytes);
+            }
+            assert.deepStrictEqual(Uint8Array.from(assembled), expectedText);
+            await engine.closeCellReadSession(textSession.sessionId);
+        });
+
         await testContext.test('marks an oversized native WITHOUT ROWID primary key read-only', async () => {
             await engine.executeQuery(
                 'CREATE TABLE native_oversized_identity ' +

@@ -13,6 +13,7 @@ import {
     isViewTriggerSnapshotCurrent
 } from './core/view-utils';
 import { GlobalOutputChannel } from './main';
+import { getMaxInlineCellBytes } from './config';
 
 import type {
     DatabaseDocument,
@@ -213,6 +214,23 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 }
             } catch {
                 return new TextEncoder().encode(`Invalid Row ID: ${rowId}`);
+            }
+
+            if (typeof document.databaseOperations.getCellMetadata === 'function') {
+                const metadata = await document.databaseOperations.getCellMetadata({
+                    table,
+                    rowId: targetRowId,
+                    column: colName
+                });
+                if (metadata.byteLength > getMaxInlineCellBytes()) {
+                    throw vsc.FileSystemError.NoPermissions(
+                        `This oversized ${metadata.storageClass.toUpperCase()} cell is ` +
+                        `${metadata.byteLength.toLocaleString()} bytes and cannot be returned by ` +
+                        'FileSystemProvider.readFile. Open it from the grid to use a read-only ' +
+                        'temporary-file document. Export the cell instead if temporary ' +
+                        'materialization is unavailable.'
+                    );
+                }
             }
 
             const escapedColumn = escapeIdentifier(colName);

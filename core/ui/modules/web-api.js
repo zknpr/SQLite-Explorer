@@ -343,6 +343,12 @@ export const backendApi = {
     // Database operations
     updateCell: (table, rowId, column, value, originalValue) =>
         sendRpcRequest('updateCell', [table, rowId, column, value, originalValue]),
+    getCellMetadata: (target) => sendRpcRequest('getCellMetadata', [target]),
+    openCellReadSession: (target) => sendRpcRequest('openCellReadSession', [target]),
+    readCellChunk: (sessionId, byteOffset, maxBytes) =>
+        sendRpcRequest('readCellChunk', [sessionId, byteOffset, maxBytes]),
+    closeCellReadSession: (sessionId) =>
+        sendRpcRequest('closeCellReadSession', [sessionId]),
     insertRow: (table, data) => sendRpcRequest('insertRow', [table, data]),
     deleteRows: (table, rowIds) => sendRpcRequest('deleteRows', [table, rowIds]),
     deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),

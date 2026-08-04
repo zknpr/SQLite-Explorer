@@ -24,7 +24,11 @@ import type {
     ViewDefinition,
     ViewDefinitionIntent,
     ViewEditResult,
-    ViewTriggerDefinition
+    ViewTriggerDefinition,
+    CellMetadata,
+    CellReadChunk,
+    CellReadSession,
+    CellReadTarget
 } from './core/types';
 import { escapeIdentifier } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -99,6 +103,48 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         const paramStr = params && params.length > 0 ? ` -- params: [${params.map(p => this.sanitizeValue(p)).join(', ')}]` : '';
         this.log(`${sql}${paramStr}`, isWrite);
         return this.wrapped.executeQuery(sql, params, signal);
+    }
+
+    async getCellMetadata(target: CellReadTarget): Promise<CellMetadata> {
+        return this.logAndDelegate(
+            `Reading cell metadata for ${escapeIdentifier(target.table)}.${escapeIdentifier(target.column)}`,
+            false,
+            'getCellMetadata',
+            target
+        );
+    }
+
+    async openCellReadSession(target: CellReadTarget): Promise<CellReadSession> {
+        return this.logAndDelegate(
+            `Opening bounded cell read for ${escapeIdentifier(target.table)}.${escapeIdentifier(target.column)}`,
+            false,
+            'openCellReadSession',
+            target
+        );
+    }
+
+    async readCellChunk(
+        sessionId: string,
+        byteOffset: number,
+        maxBytes: number
+    ): Promise<CellReadChunk> {
+        return this.logAndDelegate(
+            `Reading bounded cell bytes at offset ${byteOffset} (limit ${maxBytes})`,
+            false,
+            'readCellChunk',
+            sessionId,
+            byteOffset,
+            maxBytes
+        );
+    }
+
+    async closeCellReadSession(sessionId: string): Promise<void> {
+        return this.logAndDelegate(
+            'Closing bounded cell read',
+            false,
+            'closeCellReadSession',
+            sessionId
+        );
     }
 
     async serializeDatabase(): Promise<Uint8Array> {

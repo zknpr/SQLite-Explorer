@@ -262,6 +262,150 @@ describe('HostBridge', () => {
         assert.ok(uri.path.endsWith('.txt'), `Path should end with .txt, got ${uri.path}`);
     });
 
+    it('opens an oversized cell from a temp materialization and marks the editor read-only', async () => {
+        const executeCommandMock = mock.method(vscode.commands, 'executeCommand', async () => {});
+        const tempUri = vscode.Uri.file('/private/materialized/random.bin');
+        const materializer = {
+            materialize: mock.fn(async (_operations: any, _target: any, _options: any) => ({
+                uri: tempUri,
+                metadata: { storageClass: 'blob', byteLength: 2 * 1024 * 1024 },
+                byteLength: 2 * 1024 * 1024,
+                checksumSha256: '0'.repeat(64)
+            })),
+            release: mock.fn()
+        };
+        const dbOps = {
+            getCellMetadata: mock.fn(async (_target: any) => ({
+                storageClass: 'blob',
+                byteLength: 2 * 1024 * 1024
+            }))
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            onDidDispose: () => ({ dispose() {} })
+        };
+        const bridge = new HostBridge({
+            webviews: new Map(),
+            context: {},
+            cellMaterializer: materializer
+        } as any, mockDocument as any);
+
+        await bridge.openCellEditor(
+            { table: 'large_cells' },
+            1,
+            'payload',
+            {},
+            { value: new Uint8Array(1024), type: { type: 'binary', ext: 'bin' } }
+        );
+
+        assert.strictEqual(dbOps.getCellMetadata.mock.callCount(), 1);
+        assert.deepStrictEqual(dbOps.getCellMetadata.mock.calls[0].arguments[0], {
+            table: 'large_cells',
+            rowId: 1,
+            column: 'payload'
+        });
+        assert.strictEqual(materializer.materialize.mock.callCount(), 1);
+        assert.strictEqual(
+            materializer.materialize.mock.calls[0].arguments[2].owner,
+            mockDocument
+        );
+        assert.strictEqual(executeCommandMock.mock.callCount(), 2);
+        assert.deepStrictEqual(executeCommandMock.mock.calls[0].arguments, [
+            'vscode.open',
+            tempUri,
+            vscode.ViewColumn.Two
+        ]);
+        assert.strictEqual(
+            executeCommandMock.mock.calls[1].arguments[0],
+            'workbench.action.files.setActiveEditorReadonlyInSession'
+        );
+    });
+
+    it('refuses an oversized VFS open with an explicit export alternative if materialization fails', async () => {
+        const executeCommandMock = mock.method(vscode.commands, 'executeCommand', async () => {});
+        const materializer = {
+            materialize: mock.fn(async () => {
+                throw new Error('temporary-file quota exceeded');
+            }),
+            release: mock.fn()
+        };
+        const bridge = new HostBridge({
+            webviews: new Map(),
+            context: {},
+            cellMaterializer: materializer
+        } as any, {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: {
+                getCellMetadata: async () => ({
+                    storageClass: 'text',
+                    byteLength: 2 * 1024 * 1024
+                })
+            },
+            onDidDispose: () => ({ dispose() {} })
+        } as any);
+
+        await assert.rejects(
+            bridge.openCellEditor(
+                { table: 'large_cells' },
+                1,
+                'payload',
+                {},
+                { value: 'bounded preview' }
+            ),
+            /temporary-file quota exceeded.*Export the cell instead/is
+        );
+        assert.strictEqual(executeCommandMock.mock.callCount(), 0);
+    });
+
+    it('cancels in-flight oversized materialization when the database document closes', async () => {
+        const disposeEmitter = new vscode.EventEmitter<void>();
+        const materializeStarted = createDeferred<void>();
+        const materializer = {
+            materialize: mock.fn(async (_operations: any, _target: any, options: any) => {
+                materializeStarted.resolve();
+                await new Promise<void>((_resolve, reject) => {
+                    options.signal.addEventListener('abort', () => {
+                        const error = new Error('cancelled');
+                        error.name = 'AbortError';
+                        reject(error);
+                    }, { once: true });
+                });
+            }),
+            release: mock.fn()
+        };
+        const bridge = new HostBridge({
+            webviews: new Map(),
+            context: {},
+            cellMaterializer: materializer
+        } as any, {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: {
+                getCellMetadata: async () => ({
+                    storageClass: 'blob',
+                    byteLength: 2 * 1024 * 1024
+                })
+            },
+            onDidDispose: disposeEmitter.event
+        } as any);
+
+        const opening = bridge.openCellEditor(
+            { table: 'large_cells' },
+            1,
+            'payload',
+            {},
+            { value: new Uint8Array(8) }
+        );
+        await materializeStarted.promise;
+        disposeEmitter.fire();
+
+        await assert.rejects(opening, /cancelled.*Export the cell instead/is);
+        assert.strictEqual(materializer.materialize.mock.calls[0].arguments[2].signal.aborted, true);
+    });
+
     it('encodes a BLOB composite primary-key identity into one cell URI segment', async () => {
         const executeCommandMock = mock.method(vscode.commands, 'executeCommand', async () => {});
         const identity = encodePrimaryKeyRecordId(

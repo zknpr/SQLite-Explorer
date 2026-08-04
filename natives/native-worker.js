@@ -22,6 +22,10 @@ const AsyncDatabase = sqlite.AsyncDatabase;
 // ============================================================================
 
 const HEADER_SIZE = 4;
+const MAX_CELL_READ_CHUNK_BYTES = 1024 * 1024;
+const MAX_CELL_READ_SESSIONS = 4;
+const CELL_READ_SESSION_IDLE_TIMEOUT_MS = 30_000;
+const CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS = 5 * 60_000;
 
 // Both stdio handles changed API in the same txiki generation. Detect once so
 // the legacy path stays identical and the WHATWG handles remain locked to one
@@ -36,6 +40,7 @@ const stdinReader = usesLegacyStdio ? null : tjs.stdin.getReader();
 
 /** Currently open database instance */
 let db = null;
+let databasePath = null;
 
 /** Optional second connection used only for bounded reads outside transactions. */
 let asyncDb = null;
@@ -49,6 +54,10 @@ const activeOperations = new Map();
 const statements = new Map();
 let stmtCounter = 0;
 let savepointCounter = 0;
+
+/** Dedicated, bracketed read connections keyed by opaque session id. */
+const cellReadSessions = new Map();
+const closedCellReadSessionIds = new Set();
 
 // ============================================================================
 // Message Protocol
@@ -475,6 +484,254 @@ function executeQuery(db, sql, params) {
   };
 }
 
+function escapeCellIdentifier(value, label) {
+  if (typeof value !== 'string' || value.length === 0 || value.includes('\0')) {
+    throw new Error(`Cell read ${label} must be a non-empty SQLite identifier`);
+  }
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function isCellBinding(value) {
+  return value === null ||
+    typeof value === 'string' ||
+    (typeof value === 'number' && Number.isFinite(value)) ||
+    value instanceof Uint8Array;
+}
+
+function buildCellLocator(locator) {
+  if (!locator || typeof locator !== 'object') {
+    throw new Error('Cell read locator is required');
+  }
+  if (locator.kind === 'rowid') {
+    const value = locator.value;
+    const validNumber = typeof value === 'number' && Number.isSafeInteger(value);
+    const validText = typeof value === 'string' && /^-?(?:0|[1-9][0-9]*)$/.test(value);
+    if (!validNumber && !validText) {
+      throw new Error('Cell read rowid must be an exact integer');
+    }
+    return { sql: 'rowid = ?', params: [value] };
+  }
+  if (locator.kind !== 'primaryKey') {
+    throw new Error('Cell read locator kind is invalid');
+  }
+  if (
+    !Array.isArray(locator.columns) ||
+    locator.columns.length === 0 ||
+    !Array.isArray(locator.values) ||
+    locator.values.length !== locator.columns.length
+  ) {
+    throw new Error('Cell read primary-key locator is invalid');
+  }
+  const seen = new Set();
+  const columns = locator.columns.map(column => {
+    const escaped = escapeCellIdentifier(column, 'primary-key column');
+    if (seen.has(column)) throw new Error(`Duplicate cell read primary-key column: ${column}`);
+    seen.add(column);
+    return escaped;
+  });
+  if (locator.values.some(value => !isCellBinding(value))) {
+    throw new Error('Cell read primary-key locator contains an invalid value');
+  }
+  return {
+    sql: columns.map(column => `${column} = ?`).join(' AND '),
+    params: locator.values
+  };
+}
+
+function validateCellReadWindow(byteOffset, maxBytes) {
+  if (!Number.isSafeInteger(byteOffset) || byteOffset < 0) {
+    throw new Error('Cell read byte offset must be a non-negative safe integer');
+  }
+  if (
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes < 1 ||
+    maxBytes > MAX_CELL_READ_CHUNK_BYTES
+  ) {
+    throw new Error(
+      `Cell read chunk size must be an integer from 1 through ${MAX_CELL_READ_CHUNK_BYTES}`
+    );
+  }
+}
+
+function normalizeCellTextEncoding(value) {
+  const normalized = String(value).toLowerCase().replace(/[_\s-]/g, '');
+  if (normalized === 'utf8') return 'utf-8';
+  if (normalized === 'utf16le') return 'utf-16le';
+  if (normalized === 'utf16be') return 'utf-16be';
+  throw new Error(`Unsupported SQLite text encoding: ${String(value)}`);
+}
+
+function readCellMetadata(connection, table, column, locator) {
+  const escapedTable = escapeCellIdentifier(table, 'table');
+  const escapedColumn = escapeCellIdentifier(column, 'column');
+  const predicate = buildCellLocator(locator);
+  const metadataResult = executeQuery(
+    connection,
+    `SELECT typeof(${escapedColumn}), ` +
+      `CASE WHEN ${escapedColumn} IS NULL THEN 0 ` +
+      `ELSE length(CAST(${escapedColumn} AS BLOB)) END ` +
+      `FROM ${escapedTable} WHERE ${predicate.sql} LIMIT 2`,
+    predicate.params
+  );
+  if (metadataResult.values.length !== 1) {
+    throw new Error(
+      metadataResult.values.length === 0
+        ? `Cell ${table}.${column} no longer exists`
+        : `Cell ${table}.${column} matched more than one row`
+    );
+  }
+  const [storageClass, rawByteLength] = metadataResult.values[0];
+  if (!['null', 'integer', 'real', 'text', 'blob'].includes(storageClass)) {
+    throw new Error(`SQLite returned an invalid storage class for ${table}.${column}`);
+  }
+  const byteLength = typeof rawByteLength === 'bigint'
+    ? Number(rawByteLength)
+    : rawByteLength;
+  if (!Number.isSafeInteger(byteLength) || byteLength < 0) {
+    throw new Error(`SQLite returned an unsafe byte length for ${table}.${column}`);
+  }
+  let textEncoding;
+  if (storageClass === 'text') {
+    const encodingResult = executeQuery(connection, 'PRAGMA encoding', []);
+    textEncoding = normalizeCellTextEncoding(encodingResult.values[0]?.[0]);
+  }
+  return {
+    target: { table, column, locator, predicate, escapedTable, escapedColumn },
+    metadata: {
+      storageClass,
+      byteLength,
+      ...(textEncoding ? { textEncoding } : {})
+    }
+  };
+}
+
+function createCellReadSessionId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function') {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index++) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function rememberClosedCellReadSession(sessionId) {
+  closedCellReadSessionIds.add(sessionId);
+  while (closedCellReadSessionIds.size > 64) {
+    closedCellReadSessionIds.delete(closedCellReadSessionIds.values().next().value);
+  }
+}
+
+function scheduleCellReadSessionExpiry(session) {
+  if (session.expiryTimer !== undefined) clearTimeout(session.expiryTimer);
+  const expiresAt = Math.min(
+    session.absoluteExpiresAt,
+    session.lastAccessAt + CELL_READ_SESSION_IDLE_TIMEOUT_MS
+  );
+  session.expiresAt = expiresAt;
+  session.expiryTimer = setTimeout(() => {
+    try {
+      closeCellReadSessionInternal(session.sessionId);
+    } catch (err) {
+      console.error(
+        `[native-worker] Failed to expire cell read session ${session.sessionId}:`,
+        err?.message || String(err)
+      );
+    }
+  }, Math.max(1, expiresAt - Date.now()));
+}
+
+function abandonMainConnectionAfterCellReadCleanupFailure(connection, errors) {
+  // A main-connection savepoint exists only for :memory: databases. If its
+  // bracket cannot be unwound, invalidate and close the entire connection so
+  // an expired session cannot retain a hidden snapshot indefinitely.
+  for (const [, statement] of statements) {
+    try { statement.finalize(); } catch (finalizeError) { errors.push(finalizeError); }
+  }
+  statements.clear();
+  try {
+    connection.close();
+  } catch (closeError) {
+    errors.push(closeError);
+  } finally {
+    if (db === connection) {
+      db = null;
+      databasePath = null;
+    }
+  }
+}
+
+function closeCellReadSessionInternal(sessionId) {
+  const session = cellReadSessions.get(sessionId);
+  if (!session) return false;
+  cellReadSessions.delete(sessionId);
+  rememberClosedCellReadSession(sessionId);
+  if (session.expiryTimer !== undefined) clearTimeout(session.expiryTimer);
+
+  const cleanupErrors = [];
+  try {
+    session.connection.exec(`RELEASE SAVEPOINT "${session.savepointName}"`);
+  } catch (releaseError) {
+    try {
+      session.connection.exec(`ROLLBACK TO SAVEPOINT "${session.savepointName}"`);
+      session.connection.exec(`RELEASE SAVEPOINT "${session.savepointName}"`);
+    } catch (rollbackError) {
+      cleanupErrors.push(releaseError, rollbackError);
+    }
+  } finally {
+    if (!session.usesMainConnection) {
+      try {
+        session.connection.close();
+      } catch (closeError) {
+        cleanupErrors.push(closeError);
+      }
+    } else if (cleanupErrors.length > 0) {
+      abandonMainConnectionAfterCellReadCleanupFailure(
+        session.connection,
+        cleanupErrors
+      );
+    }
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(
+      cleanupErrors,
+      'Cell read snapshot cleanup failed; the owning connection was closed'
+    );
+  }
+  return true;
+}
+
+function closeAllCellReadSessions() {
+  let firstError;
+  for (const sessionId of [...cellReadSessions.keys()]) {
+    try {
+      closeCellReadSessionInternal(sessionId);
+    } catch (err) {
+      firstError ??= err;
+    }
+  }
+  if (firstError) throw firstError;
+}
+
+function assertMainConnectionCellReadSessionAllows(method) {
+  const hasMainConnectionSession = [...cellReadSessions.values()]
+    .some(session => session.usesMainConnection);
+  if (
+    hasMainConnectionSession &&
+    !['readCellChunk', 'closeCellReadSession', 'open', 'openMemory', 'close', 'cancel', 'ping']
+      .includes(method)
+  ) {
+    throw new Error(
+      'A cell read snapshot is active; close it before using the in-memory database connection'
+    );
+  }
+}
+
 /** Compact generated numeric metadata before crossing the V8 RPC boundary. */
 function compactExactNumericResult(result, transportColumns, valueColumnCount) {
   if (!Array.isArray(transportColumns) || transportColumns.length < 1) {
@@ -722,6 +979,7 @@ async function handleRequest(request) {
 
   try {
     let result;
+    assertMainConnectionCellReadSessionAllows(method);
 
     switch (method) {
       // ========================================
@@ -732,11 +990,13 @@ async function handleRequest(request) {
         // Open a database file
         // args: [path: string, readOnly?: boolean]
         const [path, readOnly = false] = args;
+        closeAllCellReadSessions();
         await closeAsyncDatabase();
         if (db) {
           try { db.close(); } catch (e) { /* ignore */ }
         }
         db = new Database(path, { readonly: readOnly });
+        databasePath = path;
         await openAsyncDatabase(path, readOnly);
         result = { success: true };
         break;
@@ -745,17 +1005,20 @@ async function handleRequest(request) {
       case "openMemory": {
         // Open an in-memory database with optional initial content
         // args: [content?: Uint8Array]
+        closeAllCellReadSessions();
         await closeAsyncDatabase();
         if (db) {
           try { db.close(); } catch (e) { /* ignore */ }
         }
         db = new Database(":memory:");
+        databasePath = null;
         result = { success: true };
         break;
       }
 
       case "close": {
         // Close the database
+        closeAllCellReadSessions();
         await closeAsyncDatabase();
         if (db) {
           // Finalize all statements first
@@ -767,6 +1030,7 @@ async function handleRequest(request) {
           db.close();
           db = null;
         }
+        databasePath = null;
         result = { success: true };
         break;
       }
@@ -796,6 +1060,148 @@ async function handleRequest(request) {
 
         result = executeQuery(db, sql, params);
         console.error("[native-worker] query complete");
+        break;
+      }
+
+      case "getCellMetadata": {
+        const [table, column, locator] = args;
+        if (!db) throw new Error('Database not open');
+        result = readCellMetadata(db, table, column, locator).metadata;
+        break;
+      }
+
+      case "openCellReadSession": {
+        const [table, column, locator] = args;
+        if (!db) throw new Error('Database not open');
+        if (cellReadSessions.size >= MAX_CELL_READ_SESSIONS) {
+          throw new Error(`At most ${MAX_CELL_READ_SESSIONS} cell read sessions may be open`);
+        }
+
+        const usesMainConnection = databasePath === null;
+        if (usesMainConnection && cellReadSessions.size > 0) {
+          throw new Error('Only one in-memory cell read session may be open');
+        }
+        const connection = usesMainConnection
+          ? db
+          : new Database(databasePath, { readonly: true });
+        const savepointName = `sqlite_explorer_cell_read_${++savepointCounter}`;
+        let bracketOpened = false;
+        try {
+          connection.exec(`SAVEPOINT "${savepointName}"`);
+          bracketOpened = true;
+          // The first SELECT fixes the snapshot before the session is returned.
+          const snapshot = readCellMetadata(connection, table, column, locator);
+          const now = Date.now();
+          const sessionId = createCellReadSessionId();
+          const session = {
+            sessionId,
+            connection,
+            usesMainConnection,
+            savepointName,
+            target: snapshot.target,
+            metadata: snapshot.metadata,
+            lastAccessAt: now,
+            absoluteExpiresAt: now + CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS,
+            expiresAt: now + CELL_READ_SESSION_IDLE_TIMEOUT_MS,
+            expiryTimer: undefined
+          };
+          cellReadSessions.set(sessionId, session);
+          scheduleCellReadSessionExpiry(session);
+          result = {
+            sessionId,
+            metadata: snapshot.metadata,
+            expiresAt: session.expiresAt
+          };
+        } catch (err) {
+          const cleanupErrors = [];
+          if (bracketOpened) {
+            try {
+              connection.exec(`ROLLBACK TO SAVEPOINT "${savepointName}"`);
+            } catch (rollbackError) {
+              cleanupErrors.push(rollbackError);
+            }
+            try {
+              connection.exec(`RELEASE SAVEPOINT "${savepointName}"`);
+            } catch (releaseError) {
+              cleanupErrors.push(releaseError);
+            }
+          }
+          if (!usesMainConnection) {
+            try { connection.close(); } catch (closeError) { cleanupErrors.push(closeError); }
+          } else if (cleanupErrors.length > 0) {
+            abandonMainConnectionAfterCellReadCleanupFailure(
+              connection,
+              cleanupErrors
+            );
+          }
+          if (cleanupErrors.length > 0) {
+            throw new AggregateError(
+              [err, ...cleanupErrors],
+              'Cell read session open failed and its snapshot bracket could not be cleanly released'
+            );
+          }
+          throw err;
+        }
+        break;
+      }
+
+      case "readCellChunk": {
+        const [sessionId, byteOffset, maxBytes] = args;
+        validateCellReadWindow(byteOffset, maxBytes);
+        const session = cellReadSessions.get(sessionId);
+        if (!session) {
+          throw new Error(
+            closedCellReadSessionIds.has(sessionId)
+              ? `Cell read session ${sessionId} is closed or expired`
+              : `Unknown cell read session: ${String(sessionId)}`
+          );
+        }
+        if (Date.now() >= session.expiresAt) {
+          closeCellReadSessionInternal(sessionId);
+          throw new Error(`Cell read session ${sessionId} is closed or expired`);
+        }
+        const { target, metadata } = session;
+        const chunkResult = executeQuery(
+          session.connection,
+          `SELECT substr(CAST(${target.escapedColumn} AS BLOB), ? + 1, ?) ` +
+            `FROM ${target.escapedTable} WHERE ${target.predicate.sql} LIMIT 2`,
+          [byteOffset, maxBytes, ...target.predicate.params]
+        );
+        if (chunkResult.values.length !== 1) {
+          throw new Error(
+            chunkResult.values.length === 0
+              ? `Cell ${target.table}.${target.column} no longer exists in its snapshot`
+              : `Cell ${target.table}.${target.column} matched more than one row`
+          );
+        }
+        const value = chunkResult.values[0][0];
+        const bytes = value === null
+          ? new Uint8Array(0)
+          : value instanceof Uint8Array
+            ? Uint8Array.from(value)
+            : undefined;
+        if (!bytes) {
+          throw new Error(`SQLite returned a non-BLOB chunk for ${target.table}.${target.column}`);
+        }
+        session.lastAccessAt = Date.now();
+        scheduleCellReadSessionExpiry(session);
+        result = {
+          byteOffset,
+          bytes,
+          done: byteOffset + bytes.byteLength >= metadata.byteLength
+        };
+        break;
+      }
+
+      case "closeCellReadSession": {
+        const [sessionId] = args;
+        if (typeof sessionId !== 'string' || sessionId.length === 0) {
+          throw new Error('Cell read session id is required');
+        }
+        if (!closeCellReadSessionInternal(sessionId) && !closedCellReadSessionIds.has(sessionId)) {
+          throw new Error(`Unknown cell read session: ${sessionId}`);
+        }
+        result = { success: true };
         break;
       }
 
@@ -1180,6 +1586,7 @@ async function main() {
   await requestTail;
   await writeTail;
 
+  closeAllCellReadSessions();
   await closeAsyncDatabase();
   if (db) {
     try { db.close(); } catch (e) { /* ignore */ }

@@ -46,6 +46,43 @@ export interface OversizedCellMetadata {
 /** Sparse row/column metadata for cells bounded at the query boundary. */
 export type OversizedCellMap = Record<number, Record<number, OversizedCellMetadata>>;
 
+/** Stable logical address for one table cell. */
+export interface CellReadTarget {
+  table: string;
+  rowId: RecordId;
+  column: string;
+}
+
+/** SQLite storage classes returned by typeof(). */
+export type CellStorageClass = 'null' | 'integer' | 'real' | 'text' | 'blob';
+
+/** Database encoding used by byte-windowed TEXT reads. */
+export type CellTextEncoding = 'utf-8' | 'utf-16le' | 'utf-16be';
+
+/** Source metadata captured without transporting the complete cell. */
+export interface CellMetadata {
+  storageClass: CellStorageClass;
+  /** Number of bytes in SQLite's database encoding. */
+  byteLength: number;
+  /** Present only for TEXT, whose byte windows must be decoded as a stream. */
+  textEncoding?: CellTextEncoding;
+}
+
+/** Opaque handle for a snapshot-consistent sequence of bounded reads. */
+export interface CellReadSession {
+  sessionId: string;
+  metadata: CellMetadata;
+  /** Epoch milliseconds for the current idle/absolute expiry boundary. */
+  expiresAt: number;
+}
+
+/** One bounded database-encoded byte window. */
+export interface CellReadChunk {
+  byteOffset: number;
+  bytes: Uint8Array;
+  done: boolean;
+}
+
 /** Sparse reasons for rows that cannot safely be mutated from their grid identity. */
 export type ReadOnlyRowReasonMap = Record<number, string>;
 
@@ -316,6 +353,22 @@ export interface DatabaseOperations {
     signal?: AbortSignal
   ): Promise<QueryResultSet[]>;
 
+  /** Read exact cell metadata without materializing its value. */
+  getCellMetadata(target: CellReadTarget): Promise<CellMetadata>;
+
+  /** Open a bounded, auto-expiring snapshot read bracket for one cell. */
+  openCellReadSession(target: CellReadTarget): Promise<CellReadSession>;
+
+  /** Read a bounded byte window from an open snapshot session. */
+  readCellChunk(
+    sessionId: string,
+    byteOffset: number,
+    maxBytes: number
+  ): Promise<CellReadChunk>;
+
+  /** Idempotently release a snapshot read bracket. */
+  closeCellReadSession(sessionId: string): Promise<void>;
+
   /** Export database to binary */
   serializeDatabase(): Promise<Uint8Array>;
 
@@ -555,6 +608,10 @@ export interface DatabaseInitConfig {
   readOnlyMode?: boolean;
   /** Query execution timeout in milliseconds */
   queryTimeout?: number;
+  /** Internal/test override; not exposed as a user setting. */
+  cellReadSessionIdleTimeoutMs?: number;
+  /** Internal/test override; not exposed as a user setting. */
+  cellReadSessionAbsoluteTimeoutMs?: number;
 }
 
 /**

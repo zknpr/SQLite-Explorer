@@ -3,11 +3,29 @@ import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import * as vsc from 'vscode';
 import { LoggingDatabaseOperations } from '../../src/loggingDatabaseOperations';
-import type { DatabaseOperations, CellValue, QueryResultSet, ModificationEntry, CellUpdate, TableQueryOptions, TableCountOptions, SchemaSnapshot, ColumnMetadata, ColumnDefinition } from '../../src/core/types';
+import type { DatabaseOperations, CellValue, QueryResultSet, ModificationEntry, CellUpdate, TableQueryOptions, TableCountOptions, SchemaSnapshot, ColumnMetadata, ColumnDefinition, CellReadTarget, CellMetadata, CellReadSession, CellReadChunk } from '../../src/core/types';
 
 class MockDatabaseOperations implements DatabaseOperations {
     engineKind = Promise.resolve('wasm' as const);
     async executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> { return []; }
+    async getCellMetadata(_target: CellReadTarget): Promise<CellMetadata> {
+        return { storageClass: 'blob', byteLength: 4 };
+    }
+    async openCellReadSession(_target: CellReadTarget): Promise<CellReadSession> {
+        return {
+            sessionId: 'mock-session',
+            metadata: { storageClass: 'blob', byteLength: 4 },
+            expiresAt: Date.now() + 1000
+        };
+    }
+    async readCellChunk(
+        _sessionId: string,
+        byteOffset: number,
+        _maxBytes: number
+    ): Promise<CellReadChunk> {
+        return { byteOffset, bytes: new Uint8Array(), done: true };
+    }
+    async closeCellReadSession(_sessionId: string): Promise<void> {}
     async serializeDatabase(): Promise<Uint8Array> { return new Uint8Array(); }
     async applyModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void> {}
     async undoModification(mod: ModificationEntry): Promise<void> {}

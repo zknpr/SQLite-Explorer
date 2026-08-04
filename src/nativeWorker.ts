@@ -42,7 +42,11 @@ import type {
   ViewTriggerDefinition,
   ExactIntegerTextMap,
   TableIdentity,
-  DeletedRow
+  DeletedRow,
+  CellMetadata,
+  CellReadChunk,
+  CellReadSession,
+  CellReadTarget
 } from './core/types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -96,6 +100,10 @@ import {
 } from './core/view-utils';
 import { crypto } from './platform/cryptoShim';
 import { DEFAULT_QUERY_TIMEOUT_MS } from './config';
+import {
+  validateCellReadTarget,
+  validateCellReadWindow
+} from './core/cell-read';
 
 // ============================================================================
 // Utility Functions
@@ -1018,6 +1026,59 @@ export async function createNativeDatabaseConnection(
             columnNames: result.columns,
             records: result.values
           }];
+        },
+
+        getCellMetadata: async (target: CellReadTarget): Promise<CellMetadata> => {
+          validateCellReadTarget(target);
+          const identity = await resolveNativeTableIdentity(target.table);
+          const predicate = buildRecordIdentityPredicate(target.rowId, identity);
+          const locator = identity.kind === 'rowid'
+            ? { kind: 'rowid' as const, value: predicate.params[0] }
+            : {
+                kind: 'primaryKey' as const,
+                columns: identity.columns.map(column => column.identifier),
+                values: predicate.params
+              };
+          return worker.call<CellMetadata>('getCellMetadata', [
+            target.table,
+            target.column,
+            locator
+          ]);
+        },
+
+        openCellReadSession: async (target: CellReadTarget): Promise<CellReadSession> => {
+          validateCellReadTarget(target);
+          const identity = await resolveNativeTableIdentity(target.table);
+          const predicate = buildRecordIdentityPredicate(target.rowId, identity);
+          const locator = identity.kind === 'rowid'
+            ? { kind: 'rowid' as const, value: predicate.params[0] }
+            : {
+                kind: 'primaryKey' as const,
+                columns: identity.columns.map(column => column.identifier),
+                values: predicate.params
+              };
+          return worker.call<CellReadSession>('openCellReadSession', [
+            target.table,
+            target.column,
+            locator
+          ]);
+        },
+
+        readCellChunk: async (
+          sessionId: string,
+          byteOffset: number,
+          maxBytes: number
+        ): Promise<CellReadChunk> => {
+          validateCellReadWindow(byteOffset, maxBytes);
+          return worker.call<CellReadChunk>('readCellChunk', [
+            sessionId,
+            byteOffset,
+            maxBytes
+          ]);
+        },
+
+        closeCellReadSession: async (sessionId: string): Promise<void> => {
+          await worker.call('closeCellReadSession', [sessionId]);
         },
 
         serializeDatabase: async (): Promise<Uint8Array> => {

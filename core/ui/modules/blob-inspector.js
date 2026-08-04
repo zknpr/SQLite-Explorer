@@ -31,6 +31,26 @@ const FILE_SIGNATURES = {
     AVI: [0x41, 0x56, 0x49, 0x20]
 };
 
+export const MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES = 64 * 1024;
+
+/** Keep inspector DOM work bounded and preserve a valid UTF-8 prefix for TEXT. */
+export function capOversizedInspectorPreview(value, storageClass) {
+    const bytes = storageClass === 'text'
+        ? new TextEncoder().encode(String(value))
+        : value instanceof Uint8Array
+            ? value
+            : new Uint8Array(value);
+    if (bytes.byteLength <= MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES) return bytes;
+
+    let end = MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES;
+    if (storageClass === 'text') {
+        // If the next byte is a continuation byte, the cap landed inside one
+        // UTF-8 sequence. Drop that sequence instead of displaying U+FFFD.
+        while (end > 0 && (bytes[end] & 0xC0) === 0x80) end--;
+    }
+    return bytes.slice(0, end);
+}
+
 export class BlobInspector {
     constructor() {
         this.currentObjectUrl = null;
@@ -44,6 +64,7 @@ export class BlobInspector {
         this.currentRowId = null;
         this.currentColName = null;
         this.currentCellInfo = null;
+        this.currentOversizedMetadata = null;
 
         // Track upload state to prevent multiple concurrent uploads and enable proper cleanup
         this.isUploading = false;
@@ -102,6 +123,12 @@ export class BlobInspector {
         }
         if (downloadBtn) {
             downloadBtn.disabled = uploading;
+            downloadBtn.textContent = this.currentOversizedMetadata
+                ? 'Open Full Content'
+                : 'Download';
+            downloadBtn.title = this.currentOversizedMetadata
+                ? 'Desktop opens a verified read-only temporary file; the web demo is preview-only'
+                : '';
         }
     }
 
@@ -271,6 +298,7 @@ export class BlobInspector {
 
     cleanup() {
         // Reset upload state to ensure buttons are re-enabled
+        this.currentOversizedMetadata = null;
         this.setUploadState(false);
 
         if (this.currentObjectUrl) {
@@ -312,6 +340,10 @@ export class BlobInspector {
 
     async download() {
         if (!this.currentData) return;
+        if (this.currentOversizedMetadata) {
+            await this.openFullContent();
+            return;
+        }
 
         let ext = this.currentType?.ext || 'bin';
         let filename = `blob_${this.currentRowId}.${ext}`;
@@ -333,6 +365,38 @@ export class BlobInspector {
         } catch (err) {
             console.error('Download failed:', err);
             updateStatus(`Download failed: ${err.message}`);
+        }
+    }
+
+    async openFullContent() {
+        if (
+            !this.currentOversizedMetadata
+            || !state.selectedTable
+            || this.currentRowId === null
+            || !this.currentColName
+        ) return;
+
+        try {
+            const webviewId = document.getElementById('vscode-env')?.dataset.webviewId || 'default';
+            const result = await backendApi.openCellEditor(
+                { table: state.selectedTable, name: '' },
+                this.currentRowId,
+                this.currentColName,
+                {},
+                {
+                    value: this.currentData,
+                    type: this.currentType,
+                    webviewId
+                }
+            );
+            if (result?.success === false) {
+                updateStatus(result.message || 'Full content is unavailable in the web demo');
+                return;
+            }
+            updateStatus('Opened full content in a verified read-only temporary file');
+        } catch (error) {
+            const details = error instanceof Error ? error.message : String(error);
+            updateStatus(`Full content unavailable: ${details}`);
         }
     }
 
@@ -379,6 +443,30 @@ export class BlobInspector {
         this.renderPreview(data, type);
 
         // Render Hex
+        this.renderHex(data);
+    }
+
+    inspectOversized(previewValue, metadata, rowId, colName, rowIdx, colIdx) {
+        this.cleanup();
+
+        this.currentRowId = rowId;
+        this.currentColName = colName;
+        this.currentCellInfo = { rowIdx, colIdx };
+        this.currentOversizedMetadata = metadata;
+        this.setUploadState(false);
+        this.modal.classList.remove('hidden');
+        this.switchTab('preview');
+
+        const data = capOversizedInspectorPreview(previewValue, metadata.storageClass);
+        this.currentData = data;
+        const type = this.detectType(data);
+        this.currentType = type;
+        this.infoContainer.textContent =
+            `${colName} (Row ${rowId}) | ${metadata.storageClass.toUpperCase()} | ` +
+            `Preview ${this.formatSize(data.byteLength)} of ${this.formatSize(metadata.byteLength)} | ` +
+            'Full content opens from a desktop temporary file; web is preview-only';
+
+        this.renderPreview(data, type);
         this.renderHex(data);
     }
 
