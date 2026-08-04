@@ -762,6 +762,133 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('loads and edits rowid-addressable demo FTS virtual and shadow tables', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE VIRTUAL TABLE demo_fts4_identity USING fts4(body); " +
+            "INSERT INTO demo_fts4_identity(body) VALUES ('before')"
+        );
+
+        const schema = await worker.invoke('fetchSchema');
+        assert.strictEqual(
+            schema.tables.find((table: any) => table.identifier === 'demo_fts4_identity')?.identity?.kind,
+            'rowid'
+        );
+        const shadows = schema.tables.filter((table: any) => (
+            table.identifier.startsWith('demo_fts4_identity_')
+        ));
+        assert.ok(shadows.length > 0);
+        assert.ok(shadows.every((table: any) => table.identity?.kind === 'rowid'));
+
+        const page = await worker.invoke('fetchTableData', 'demo_fts4_identity', {
+            columns: ['rowid', 'body'],
+            limit: 10,
+            offset: 0
+        });
+        await worker.invoke(
+            'updateCell',
+            'demo_fts4_identity',
+            page.rows[0][0],
+            'body',
+            'after'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT body FROM demo_fts4_identity'),
+            'after'
+        );
+
+        const shadowPage = await worker.invoke(
+            'fetchTableData',
+            'demo_fts4_identity_content',
+            { columns: ['rowid', 'c0body'], limit: 10, offset: 0 }
+        );
+        await worker.invoke(
+            'updateCell',
+            'demo_fts4_identity_content',
+            shadowPage.rows[0][0],
+            'c0body',
+            'shadow-after'
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT c0body FROM demo_fts4_identity_content'
+            ),
+            'shadow-after'
+        );
+    });
+
+    it('loads and edits demo FTS5 when the bundled SQLite provides FTS5', async t => {
+        const worker = await createWorkerHarness();
+        try {
+            await worker.invoke(
+                'runQuery',
+                "CREATE VIRTUAL TABLE demo_fts5_identity USING fts5(body); " +
+                "INSERT INTO demo_fts5_identity(body) VALUES ('before')"
+            );
+        } catch (error) {
+            if (/no such module: fts5/i.test(String(error))) {
+                t.skip('bundled sql.js does not include FTS5');
+                return;
+            }
+            throw error;
+        }
+
+        const schema = await worker.invoke('fetchSchema');
+        assert.strictEqual(
+            schema.tables.find((table: any) => table.identifier === 'demo_fts5_identity')?.identity?.kind,
+            'rowid'
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_fts5_identity', {
+            columns: ['rowid', 'body'],
+            limit: 10,
+            offset: 0
+        });
+        await worker.invoke(
+            'updateCell',
+            'demo_fts5_identity',
+            page.rows[0][0],
+            'body',
+            'after'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT body FROM demo_fts5_identity'),
+            'after'
+        );
+    });
+
+    it('loads all demo table identities with one bulk metadata query', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (kind, sql) => {
+                if (kind === 'exec') observedSql.push(sql);
+            }
+        });
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_schema_rowid (value TEXT); ' +
+            'CREATE TABLE demo_schema_pk_a (id TEXT PRIMARY KEY) WITHOUT ROWID; ' +
+            'CREATE TABLE demo_schema_pk_b (' +
+            'tenant TEXT, sequence INTEGER, PRIMARY KEY (tenant, sequence)' +
+            ') WITHOUT ROWID'
+        );
+        observedSql.length = 0;
+
+        const schema = await worker.invoke('fetchSchema');
+
+        assert.strictEqual(schema.tables.length, 3);
+        assert.strictEqual(
+            observedSql.filter(sql => sql.includes('pragma_table_list')).length,
+            1
+        );
+        assert.strictEqual(
+            observedSql.filter(sql => /PRAGMA\s+(?:main\.)?table_info/i.test(sql)).length,
+            0,
+            'schema identity must use one set-based metadata query'
+        );
+    });
+
     it('returns exact unsafe INTEGER text from demo view previews', async () => {
         const worker = await createWorkerHarness();
 

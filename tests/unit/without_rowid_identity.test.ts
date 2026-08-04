@@ -165,4 +165,168 @@ describe('WITHOUT ROWID primary-key identity', () => {
         });
         assert.strictEqual(await engine.fetchTableCount('row_lifecycle', {}), 0);
     });
+
+    it('loads and edits rowid-addressable FTS virtual and shadow tables', async () => {
+        await engine.executeQuery(
+            "CREATE VIRTUAL TABLE fts4_identity USING fts4(body); " +
+            "INSERT INTO fts4_identity(body) VALUES ('before')"
+        );
+
+        const schemaSql: string[] = [];
+        const originalExecuteQuery = engine.executeQuery.bind(engine);
+        engine.executeQuery = async (sql, params) => {
+            schemaSql.push(sql);
+            return originalExecuteQuery(sql, params);
+        };
+        let schema;
+        try {
+            schema = await engine.fetchSchema();
+        } finally {
+            engine.executeQuery = originalExecuteQuery;
+        }
+        assert.strictEqual(
+            schemaSql.filter(sql => sql.includes('pragma_table_list')).length,
+            1
+        );
+        assert.strictEqual(
+            schemaSql.filter(sql => /PRAGMA\s+(?:main\.)?table_info/i.test(sql)).length,
+            0
+        );
+        const virtualTable = schema.tables.find(table => table.identifier === 'fts4_identity');
+        const shadowTables = schema.tables.filter(table => table.identifier.startsWith('fts4_identity_'));
+        assert.deepStrictEqual(virtualTable?.identity, { kind: 'rowid' });
+        assert.ok(shadowTables.length > 0);
+        assert.ok(shadowTables.every(table => table.identity?.kind === 'rowid'));
+
+        const page = await engine.fetchTableData('fts4_identity', {
+            columns: ['rowid', 'body'],
+            limit: 10,
+            offset: 0
+        });
+        await engine.updateCell('fts4_identity', page.rows[0][0] as RecordId, 'body', 'after');
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT rowid, body FROM fts4_identity'))[0].rows,
+            [[1, 'after']]
+        );
+
+        const contentShadow = shadowTables.find(table => table.identifier.endsWith('_content'));
+        assert.ok(contentShadow);
+        const shadowPage = await engine.fetchTableData(contentShadow.identifier, {
+            columns: ['rowid', 'c0body'],
+            limit: 10,
+            offset: 0
+        });
+        await engine.updateCell(
+            contentShadow.identifier,
+            shadowPage.rows[0][0] as RecordId,
+            'c0body',
+            'shadow-after'
+        );
+        assert.strictEqual(
+            (await engine.executeQuery(
+                'SELECT c0body FROM fts4_identity_content WHERE rowid = ?',
+                [shadowPage.rows[0][0]]
+            ))[0].rows[0][0],
+            'shadow-after'
+        );
+    });
+
+    it('loads and edits an FTS5 virtual table when the bundled SQLite provides FTS5', async t => {
+        try {
+            await engine.executeQuery(
+                "CREATE VIRTUAL TABLE fts5_identity USING fts5(body); " +
+                "INSERT INTO fts5_identity(body) VALUES ('before')"
+            );
+        } catch (error) {
+            if (/no such module: fts5/i.test(String(error))) {
+                t.skip('bundled sql.js does not include FTS5');
+                return;
+            }
+            throw error;
+        }
+
+        const schema = await engine.fetchSchema();
+        assert.deepStrictEqual(
+            schema.tables.find(table => table.identifier === 'fts5_identity')?.identity,
+            { kind: 'rowid' }
+        );
+        const page = await engine.fetchTableData('fts5_identity', {
+            columns: ['rowid', 'body'],
+            limit: 10,
+            offset: 0
+        });
+        await engine.updateCell('fts5_identity', page.rows[0][0] as RecordId, 'body', 'after');
+        assert.strictEqual(
+            (await engine.executeQuery('SELECT body FROM fts5_identity'))[0].rows[0][0],
+            'after'
+        );
+    });
+
+    it('inserts a row while omitting a default-generated BLOB primary key', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE default_identity (' +
+            'id BLOB PRIMARY KEY DEFAULT (randomblob(16)), value TEXT NOT NULL' +
+            ') WITHOUT ROWID'
+        );
+
+        const identity = await engine.insertRow('default_identity', { value: 'payload' });
+
+        assert.match(String(identity), /^pk:/);
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT length(id), value FROM default_identity'
+            ))[0].rows,
+            [[16, 'payload']]
+        );
+    });
+
+    it('bulk-deletes 1500 rows through a single-column primary key', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE bulk_single (id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID; ' +
+            'WITH RECURSIVE rows(id) AS (' +
+            'VALUES(1) UNION ALL SELECT id + 1 FROM rows WHERE id < 1500' +
+            ') INSERT INTO bulk_single SELECT id, printf(\'value-%d\', id) FROM rows'
+        );
+        const page = await engine.fetchTableData('bulk_single', {
+            columns: ['rowid', 'id', 'value'],
+            orderBy: 'rowid',
+            limit: 1500,
+            offset: 0
+        });
+
+        const deleted = await engine.deleteRows(
+            'bulk_single',
+            page.rows.map(row => row[0] as RecordId)
+        );
+
+        assert.strictEqual(deleted?.length, 1500);
+        assert.strictEqual(await engine.fetchTableCount('bulk_single', {}), 0);
+    });
+
+    it('bulk-deletes 1000 rows through a composite primary key', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE bulk_composite (' +
+            'tenant INTEGER, sequence INTEGER, value TEXT, ' +
+            'PRIMARY KEY (tenant, sequence)' +
+            ') WITHOUT ROWID; ' +
+            'WITH RECURSIVE rows(id) AS (' +
+            'VALUES(1) UNION ALL SELECT id + 1 FROM rows WHERE id < 1000' +
+            ') INSERT INTO bulk_composite ' +
+            'SELECT id % 7, id, printf(\'value-%d\', id) FROM rows'
+        );
+        const page = await engine.fetchTableData('bulk_composite', {
+            columns: ['rowid', 'tenant', 'sequence', 'value'],
+            orderBy: 'rowid',
+            limit: 1000,
+            offset: 0
+        });
+
+        const deleted = await engine.deleteRows(
+            'bulk_composite',
+            page.rows.map(row => row[0] as RecordId)
+        );
+
+        assert.strictEqual(deleted?.length, 1000);
+        assert.strictEqual(await engine.fetchTableCount('bulk_composite', {}), 0);
+    });
 });

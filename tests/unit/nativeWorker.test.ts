@@ -286,6 +286,75 @@ describe('createNativeDatabaseConnection', () => {
         };
     }
 
+    it('loads native table identities in one schema queryBatch, including virtual and shadow tables', async () => {
+        const identityMetadata = {
+            columns: [
+                'table_name',
+                'object_type',
+                'without_rowid',
+                'column_ordinal',
+                'column_name',
+                'declared_type',
+                'primary_key_position'
+            ],
+            values: [
+                ['docs', 'table', 0, null, null, null, null],
+                ['docs_fts', 'virtual', 0, null, null, null, null],
+                ['docs_fts_data', 'shadow', 0, null, null, null, null],
+                ['records', 'table', 1, 0, 'tenant', 'TEXT', 1],
+                ['records', 'table', 1, 1, 'sequence', 'INTEGER', 2],
+                ['records', 'table', 1, 2, 'value', 'TEXT', 0]
+            ]
+        };
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [Array<{ sql: string }>];
+                return {
+                    result: {
+                        results: [
+                            {
+                                columns: ['name'],
+                                values: [['docs'], ['docs_fts'], ['docs_fts_data'], ['records']]
+                            },
+                            { columns: ['name'], values: [] },
+                            { columns: ['name', 'tbl_name'], values: [] },
+                            ...(queries.length > 3 ? [identityMetadata] : [])
+                        ]
+                    }
+                };
+            }
+            if (call.method === 'query') {
+                throw new Error('schema identity metadata must not use per-table IPC');
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            const schema = await connection.databaseOps.fetchSchema();
+
+            assert.deepStrictEqual(
+                schema.tables.map(table => [table.identifier, table.identity]),
+                [
+                    ['docs', { kind: 'rowid' }],
+                    ['docs_fts', { kind: 'rowid' }],
+                    ['docs_fts_data', { kind: 'rowid' }],
+                    ['records', {
+                        kind: 'primaryKey',
+                        columns: [
+                            { identifier: 'tenant', declaredType: 'TEXT', position: 1 },
+                            { identifier: 'sequence', declaredType: 'INTEGER', position: 2 }
+                        ]
+                    }]
+                ]
+            );
+            assert.deepStrictEqual(connection.calls.map(call => call.method), ['queryBatch']);
+            assert.strictEqual((connection.calls[0].args[0] as unknown[]).length, 4);
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('should throw an error with context when database opening fails', async () => {
         let mockProcess: any;
         const EventEmitter = require('node:events').EventEmitter;
@@ -945,9 +1014,9 @@ describe('createNativeDatabaseConnection', () => {
             }
             if (
                 call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT "wr" FROM pragma_table_list')
+                && String(call.args[0]).startsWith('SELECT "type", "wr" FROM pragma_table_list')
             ) {
-                return { result: { columns: ['wr'], values: [[0]] } };
+                return { result: { columns: ['type', 'wr'], values: [['table', 0]] } };
             }
             if (
                 call.method === 'query'
@@ -1045,9 +1114,9 @@ describe('createNativeDatabaseConnection', () => {
             }
             if (
                 call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT "wr" FROM pragma_table_list')
+                && String(call.args[0]).startsWith('SELECT "type", "wr" FROM pragma_table_list')
             ) {
-                return { result: { columns: ['wr'], values: [[0]] } };
+                return { result: { columns: ['type', 'wr'], values: [['table', 0]] } };
             }
             if (
                 call.method === 'query'

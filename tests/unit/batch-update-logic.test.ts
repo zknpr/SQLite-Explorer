@@ -76,6 +76,20 @@ describe('prepareBatchUpdates', () => {
     );
     assert.strictEqual(u.value, '9007199254740993');
   });
+  it('keeps unsafe WITHOUT ROWID NUMERIC-affinity keys exact in batch edits', () => {
+    for (const type of ['NUMERIC', 'DECIMAL(20, 0)']) {
+      const primaryKeyColumns: BatchColumnDef[] = [
+        { name: 'id', type, isPrimaryKey: true }
+      ];
+      const [u] = prepareBatchUpdates(
+        [cell(0, 0, '9223372036854775806')],
+        new Map([[0, input('9223372036854775807')]]),
+        primaryKeyColumns,
+        true
+      );
+      assert.strictEqual(u.value, '9223372036854775807', type);
+    }
+  });
   it('coerces REAL columns', () => {
     const [u] = prepareBatchUpdates([cell(0, 2, 1)], new Map([[2, input('3.14')]]), columns);
     assert.strictEqual(u.value, 3.14);

@@ -51,7 +51,7 @@ export function openAddRowModal() {
     state.tableColumns.forEach(col => {
         const usesDeclaredPrimaryKey = state.selectedTableIdentity?.kind === 'primaryKey';
         const isRequired = (col.notnull === 1 && !col.isPrimaryKey)
-            || (usesDeclaredPrimaryKey && col.isPrimaryKey);
+            || (usesDeclaredPrimaryKey && col.isPrimaryKey && col.dflt_value == null);
 
         const div = document.createElement('div');
         div.className = 'form-field';

@@ -18,6 +18,7 @@ import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, Table
 import { prepareCellUpdateForStorage } from './core/json-utils';
 import {
   buildRecordIdentityPredicate,
+  classifyTableIdentity,
   decodePrimaryKeyRecordId,
   isPrimaryKeyRecordId,
   primaryKeyColumnsFromTableInfo
@@ -92,14 +93,16 @@ export class HostBridge implements ToastService {
     table: string
   ): Promise<TableIdentity> {
     const metadata = await dbOps.executeQuery(
-      `SELECT "wr" FROM pragma_table_list ` +
-      `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' LIMIT 1`,
+      `SELECT "type", "wr" FROM pragma_table_list ` +
+      `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
       [table]
     );
     if ((metadata[0]?.rows.length ?? 0) === 0) {
       throw new Error(`Table not found: ${table}`);
     }
-    if (Number(metadata[0].rows[0][0]) !== 1) return { kind: 'rowid' };
+    const kind = classifyTableIdentity(metadata[0].rows[0][0], metadata[0].rows[0][1]);
+    if (!kind) throw new Error(`Table not found: ${table}`);
+    if (kind === 'rowid') return { kind: 'rowid' };
     const columns = primaryKeyColumnsFromTableInfo(await dbOps.getTableInfo(table));
     if (columns.length === 0) throw new Error(`WITHOUT ROWID table ${table} has no declared primary key`);
     return { kind: 'primaryKey', columns };

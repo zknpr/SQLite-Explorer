@@ -33,6 +33,19 @@ it('keeps unsafe INTEGER primary-key input as exact decimal text', async () => {
     assert.strictEqual(parseGridInputValue('9007199254740993', column, false), 9007199254740992);
 });
 
+it('keeps unsafe NUMERIC-affinity primary-key input as exact decimal text', async () => {
+    const { parseGridInputValue } = await import(utilsModulePath);
+
+    for (const type of ['NUMERIC', 'DECIMAL(20, 0)']) {
+        const column = { name: 'id', type, isPrimaryKey: true };
+        assert.strictEqual(
+            parseGridInputValue('9223372036854775807', column, true),
+            '9223372036854775807',
+            type
+        );
+    }
+});
+
 it('keeps numeric-looking TEXT primary-key input as text', async () => {
     const { parseGridInputValue } = await import(utilsModulePath);
     const column = { name: 'id', type: 'TEXT', isPrimaryKey: true };

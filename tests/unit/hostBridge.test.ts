@@ -384,7 +384,7 @@ describe('HostBridge', () => {
         const dbOps = {
             executeQuery: mock.fn(async (sql: string) => {
                 if (sql.includes('pragma_table_list')) {
-                    return [{ headers: ['wr'], rows: [[0]] }];
+                    return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
                 }
                 baselineStarted.resolve();
                 return baseline.promise;
@@ -419,7 +419,7 @@ describe('HostBridge', () => {
             executeQuery: mock.fn(async (sql: string) => {
                 sqlCalls.push(sql);
                 if (sql.includes('pragma_table_list')) {
-                    return [{ headers: ['wr'], rows: [[0]] }];
+                    return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
                 }
                 if (sql.startsWith('SELECT CAST(rowid AS TEXT)')) {
                     return [{
@@ -683,6 +683,43 @@ describe('HostBridge', () => {
         }
     });
 
+    it('preserves rowid editing for virtual tables when resolving host-side identity', async () => {
+        const identityQueries: string[] = [];
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => {
+                if (sql.includes('pragma_table_list')) {
+                    identityQueries.push(sql);
+                    return sql.includes(`"type" = 'table'`)
+                        ? [{ headers: ['type', 'wr'], rows: [] }]
+                        : [{ headers: ['type', 'wr'], rows: [['virtual', 0]] }];
+                }
+                return [{ headers: ['body'], rows: [['before']] }];
+            }),
+            getTableInfo: mock.fn(async () => {
+                throw new Error('virtual tables must not require declared-PK metadata');
+            }),
+            updateCell: mock.fn(async () => 7)
+        };
+        const recordExternalModification = mock.fn();
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        await bridge.updateCell('docs_fts', 7, 'body', 'after');
+
+        assert.strictEqual(dbOps.updateCell.mock.callCount(), 1);
+        assert.strictEqual(dbOps.getTableInfo.mock.callCount(), 0);
+        assert.strictEqual(recordExternalModification.mock.callCount(), 1);
+        assert.strictEqual(identityQueries.length, 1);
+        assert.doesNotMatch(identityQueries[0], /"type"\s*=\s*'table'/);
+    });
+
     it('does not record an atomic batch after Reload supersedes its connection', async () => {
         const sqlCalls: string[] = [];
         let connectionGeneration = 11;
@@ -690,7 +727,7 @@ describe('HostBridge', () => {
             executeQuery: mock.fn(async (sql: string) => {
                 sqlCalls.push(sql);
                 if (sql.includes('pragma_table_list')) {
-                    return [{ headers: ['wr'], rows: [[0]] }];
+                    return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
                 }
                 return [];
             }),
@@ -738,7 +775,7 @@ describe('HostBridge', () => {
         const dbOps = {
             executeQuery: mock.fn(async (sql: string) => {
                 if (sql.includes('pragma_table_list')) {
-                    return [{ headers: ['wr'], rows: [[0]] }];
+                    return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
                 }
                 return [];
             }),

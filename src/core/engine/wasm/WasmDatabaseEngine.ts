@@ -50,10 +50,13 @@ import { getNodeFs } from '../../platform/fs';
 import {
   buildRecordIdentitiesPredicate,
   buildRecordIdentityPredicate,
+  buildTableIdentityMap,
+  classifyTableIdentity,
   decodePrimaryKeyRecordId,
   encodePrimaryKeyRecordId,
   isPrimaryKeyRecordId,
-  primaryKeyColumnsFromTableInfo
+  primaryKeyColumnsFromTableInfo,
+  TABLE_IDENTITY_METADATA_SQL
 } from '../../row-identity';
 import {
   assertViewDefinitionSnapshotCurrent,
@@ -1147,12 +1150,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /** Discover table identity while allowing callers that also read views. */
   private async findTableIdentity(table: string): Promise<TableIdentity | undefined> {
     const metadata = await this.executeQuery(
-      `SELECT "wr" FROM pragma_table_list ` +
-      `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' LIMIT 1`,
+      `SELECT "type", "wr" FROM pragma_table_list ` +
+      `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
       [table]
     );
     if ((metadata[0]?.rows.length ?? 0) === 0) return undefined;
-    if (Number(metadata[0].rows[0][0]) !== 1) return { kind: 'rowid' };
+    const kind = classifyTableIdentity(metadata[0].rows[0][0], metadata[0].rows[0][1]);
+    if (!kind) return undefined;
+    if (kind === 'rowid') return { kind: 'rowid' };
 
     const columns = primaryKeyColumnsFromTableInfo(await this.getTableInfo(table));
     if (columns.length === 0) {
@@ -1976,19 +1981,24 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * Fetch database schema.
    */
   async fetchSchema(): Promise<SchemaSnapshot> {
-    // Combine schema queries into one
-    const schemaResult = await this.executeQuery(
-      "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
-    );
+    const [schemaResult, identityResult] = await Promise.all([
+      this.executeQuery(
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
+      ),
+      this.executeQuery(TABLE_IDENTITY_METADATA_SQL)
+    ]);
 
     const rows = schemaResult[0]?.rows || [];
+    const identities = buildTableIdentityMap(identityResult[0]?.rows || []);
 
-    const tables = await Promise.all(rows
+    const tables = rows
         .filter(r => r[0] === 'table')
-        .map(async r => ({
-          identifier: r[1] as string,
-          identity: await this.resolveTableIdentity(r[1] as string)
-        })));
+        .map(r => {
+          const identifier = r[1] as string;
+          const identity = identities.get(identifier);
+          if (!identity) throw new Error(`Table not found: ${identifier}`);
+          return { identifier, identity };
+        });
 
     const views = rows
         .filter(r => r[0] === 'view')

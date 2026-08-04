@@ -37,9 +37,12 @@ import {
 import {
   buildRecordIdentitiesPredicate,
   buildRecordIdentityPredicate,
+  buildTableIdentityMap,
+  classifyTableIdentity,
   encodePrimaryKeyRecordId,
   isPrimaryKeyRecordId,
-  primaryKeyColumnsFromTableInfo
+  primaryKeyColumnsFromTableInfo,
+  TABLE_IDENTITY_METADATA_SQL
 } from '../../../src/core/row-identity.ts';
 import {
   buildExactNumericTextQuery,
@@ -490,12 +493,14 @@ function exportToSql(table, headers, rows, includeTableName) {
 
 async function findTableIdentity(table) {
   const metadata = db.exec(
-    `SELECT "wr" FROM pragma_table_list ` +
-    `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' LIMIT 1`,
+    `SELECT "type", "wr" FROM pragma_table_list ` +
+    `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
     [table]
   );
   if ((metadata[0]?.values.length ?? 0) === 0) return undefined;
-  if (Number(metadata[0].values[0][0]) !== 1) return { kind: 'rowid' };
+  const kind = classifyTableIdentity(metadata[0].values[0][0], metadata[0].values[0][1]);
+  if (!kind) return undefined;
+  if (kind === 'rowid') return { kind: 'rowid' };
   const columns = primaryKeyColumnsFromTableInfo(await getTableInfo(table));
   if (columns.length === 0) {
     throw new Error(`WITHOUT ROWID table ${table} has no declared primary key`);
@@ -791,10 +796,14 @@ async function fetchSchema() {
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
     ORDER BY name
   `);
-  const tables = await Promise.all((tablesResult[0]?.values || []).map(async row => ({
-    identifier: row[0],
-    identity: await resolveTableIdentity(row[0])
-  })));
+  const identityResult = db.exec(TABLE_IDENTITY_METADATA_SQL);
+  const identities = buildTableIdentityMap(identityResult[0]?.values || []);
+  const tables = (tablesResult[0]?.values || []).map(row => {
+    const identifier = row[0];
+    const identity = identities.get(identifier);
+    if (!identity) throw new Error(`Table not found: ${identifier}`);
+    return { identifier, identity };
+  });
 
   // Get views
   const viewsResult = db.exec(`

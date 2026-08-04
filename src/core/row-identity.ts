@@ -9,6 +9,22 @@ import { escapeIdentifier, validateRowId } from './sql-utils';
 const PRIMARY_KEY_RECORD_ID_PREFIX = 'pk:';
 const PRIMARY_KEY_RECORD_ID_VERSION = 1;
 
+/** Set-based identity metadata used by every schema-loading backend. */
+export const TABLE_IDENTITY_METADATA_SQL = `
+SELECT
+  tl."name" AS table_name,
+  tl."type" AS object_type,
+  tl."wr" AS without_rowid,
+  ti."cid" AS column_ordinal,
+  ti."name" AS column_name,
+  ti."type" AS declared_type,
+  ti."pk" AS primary_key_position
+FROM pragma_table_list AS tl
+LEFT JOIN pragma_table_info(tl."name", tl."schema") AS ti
+  ON tl."type" = 'table' AND tl."wr" = 1
+WHERE tl."schema" = 'main' AND tl."name" NOT LIKE 'sqlite_%'
+ORDER BY tl."name", ti."cid"`;
+
 type EncodedPrimaryKeyValue =
   | ['integer', string]
   | ['real', number]
@@ -64,6 +80,15 @@ function decodePrimaryKeyValue(encoded: unknown): CellValue {
   switch (storageClass) {
     case 'integer':
       if (typeof value !== 'string') throw new Error('Invalid primary-key INTEGER identity');
+      let canonicalInteger: string;
+      try {
+        canonicalInteger = BigInt(value).toString();
+      } catch {
+        throw new Error('Invalid primary-key INTEGER identity');
+      }
+      if (value !== canonicalInteger) {
+        throw new Error('Primary-key INTEGER identity is not canonical');
+      }
       return validateRowId(value);
     case 'real':
       if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -181,10 +206,94 @@ export function buildRecordIdentitiesPredicate(
 ): RecordIdentityPredicate {
   if (recordIds.length === 0) throw new Error('At least one row identity is required');
   const predicates = recordIds.map(recordId => buildRecordIdentityPredicate(recordId, identity));
+
+  if (identity.kind === 'rowid') {
+    return {
+      sql: `rowid IN (${predicates.map(() => '?').join(', ')})`,
+      params: predicates.flatMap(predicate => predicate.params)
+    };
+  }
+
+  const escapedColumns = identity.columns.map(column => escapeIdentifier(column.identifier));
+  const params = predicates.flatMap(predicate => predicate.params);
+  if (escapedColumns.length === 1) {
+    return {
+      sql: `${escapedColumns[0]} IN (${predicates.map(() => '?').join(', ')})`,
+      params
+    };
+  }
+
+  const tuplePlaceholders = `(${escapedColumns.map(() => '?').join(', ')})`;
   return {
-    sql: predicates.map(predicate => `(${predicate.sql})`).join(' OR '),
-    params: predicates.flatMap(predicate => predicate.params)
+    sql: `(${escapedColumns.join(', ')}) IN (VALUES ${predicates.map(() => tuplePlaceholders).join(', ')})`,
+    params
   };
+}
+
+/** Map pragma_table_list's object kind to the row identity supported by SQLite Explorer. */
+export function classifyTableIdentity(
+  objectType: unknown,
+  withoutRowId: unknown
+): TableIdentity['kind'] | undefined {
+  if (objectType === 'virtual' || objectType === 'shadow') return 'rowid';
+  if (objectType !== 'table') return undefined;
+  return Number(withoutRowId) === 1 ? 'primaryKey' : 'rowid';
+}
+
+/** Build table identities from TABLE_IDENTITY_METADATA_SQL's ordered result rows. */
+export function buildTableIdentityMap(
+  rows: readonly (readonly unknown[])[]
+): Map<string, TableIdentity> {
+  const metadata = new Map<string, {
+    kind: TableIdentity['kind'];
+    columns: Array<{
+      identifier: string;
+      declaredType: string;
+      primaryKeyPosition: number;
+    }>;
+  }>();
+
+  for (const row of rows) {
+    const table = row[0];
+    if (typeof table !== 'string') {
+      throw new Error('SQLite returned invalid table identity metadata');
+    }
+    const kind = classifyTableIdentity(row[1], row[2]);
+    if (!kind) continue;
+
+    let entry = metadata.get(table);
+    if (!entry) {
+      entry = { kind, columns: [] };
+      metadata.set(table, entry);
+    } else if (entry.kind !== kind) {
+      throw new Error(`SQLite returned inconsistent identity metadata for ${table}`);
+    }
+
+    if (kind === 'primaryKey' && row[4] !== null && row[4] !== undefined) {
+      if (typeof row[4] !== 'string' || typeof row[5] !== 'string') {
+        throw new Error(`SQLite returned invalid column identity metadata for ${table}`);
+      }
+      entry.columns.push({
+        identifier: row[4],
+        declaredType: row[5],
+        primaryKeyPosition: Number(row[6])
+      });
+    }
+  }
+
+  const identities = new Map<string, TableIdentity>();
+  for (const [table, entry] of metadata) {
+    if (entry.kind === 'rowid') {
+      identities.set(table, { kind: 'rowid' });
+      continue;
+    }
+    const columns = primaryKeyColumnsFromTableInfo(entry.columns);
+    if (columns.length === 0) {
+      throw new Error(`WITHOUT ROWID table ${table} has no declared primary key`);
+    }
+    identities.set(table, { kind: 'primaryKey', columns });
+  }
+  return identities;
 }
 
 export function primaryKeyColumnsFromTableInfo(

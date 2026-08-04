@@ -323,6 +323,61 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             );
         });
 
+        await testContext.test('loads and edits a native FTS5 virtual table through rowid identity', async (ftsContext) => {
+            try {
+                await engine.executeQuery(
+                    'CREATE VIRTUAL TABLE native_fts_identity USING fts5(body)'
+                );
+            } catch (error) {
+                if (/no such module:\s*fts5/i.test(String(error))) {
+                    ftsContext.skip('bundled native SQLite does not include FTS5');
+                    return;
+                }
+                throw error;
+            }
+
+            await engine.executeQuery(
+                "INSERT INTO native_fts_identity(rowid, body) VALUES (7, 'before')"
+            );
+            const schema = await engine.fetchSchema();
+            assert.deepStrictEqual(
+                schema.tables.find(table => table.identifier === 'native_fts_identity')?.identity,
+                { kind: 'rowid' }
+            );
+
+            const page = await engine.fetchTableData('native_fts_identity', {
+                columns: ['rowid', 'body'],
+                limit: 10,
+                offset: 0
+            });
+            assert.strictEqual(page.rows[0][0], 7);
+            await engine.updateCell('native_fts_identity', page.rows[0][0] as number, 'body', 'after');
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT rowid, body FROM native_fts_identity'
+                ))[0].rows,
+                [[7, 'after']]
+            );
+
+            const shadowPage = await engine.fetchTableData('native_fts_identity_content', {
+                columns: ['rowid', 'c0'],
+                limit: 10,
+                offset: 0
+            });
+            await engine.updateCell(
+                'native_fts_identity_content',
+                shadowPage.rows[0][0] as number,
+                'c0',
+                'shadow-after'
+            );
+            assert.strictEqual(
+                (await engine.executeQuery(
+                    'SELECT c0 FROM native_fts_identity_content'
+                ))[0].rows[0][0],
+                'shadow-after'
+            );
+        });
+
         await testContext.test('carries exact unsafe INTEGER text through native view previews', async () => {
             const preview = await engine.previewViewDefinition(
                 'native_unsafe_integer_preview',

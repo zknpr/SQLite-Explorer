@@ -55,9 +55,12 @@ import {
 import {
   buildRecordIdentitiesPredicate,
   buildRecordIdentityPredicate,
+  buildTableIdentityMap,
+  classifyTableIdentity,
   encodePrimaryKeyRecordId,
   isPrimaryKeyRecordId,
-  primaryKeyColumnsFromTableInfo
+  primaryKeyColumnsFromTableInfo,
+  TABLE_IDENTITY_METADATA_SQL
 } from './core/row-identity';
 import {
   buildExactNumericTextQuery,
@@ -725,12 +728,14 @@ export async function createNativeDatabaseConnection(
 
       const findNativeTableIdentity = async (table: string): Promise<TableIdentity | undefined> => {
         const metadata = await worker.call<NativeQueryResult>('query', [
-          `SELECT "wr" FROM pragma_table_list ` +
-          `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' LIMIT 1`,
+          `SELECT "type", "wr" FROM pragma_table_list ` +
+          `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
           [table]
         ]);
         if ((metadata.values?.length ?? 0) === 0) return undefined;
-        if (Number(metadata.values[0][0]) !== 1) return { kind: 'rowid' };
+        const kind = classifyTableIdentity(metadata.values[0][0], metadata.values[0][1]);
+        if (!kind) return undefined;
+        if (kind === 'rowid') return { kind: 'rowid' };
         const columns = primaryKeyColumnsFromTableInfo(await getNativeTableInfo(table));
         if (columns.length === 0) {
           throw new Error(`WITHOUT ROWID table ${table} has no declared primary key`);
@@ -1883,25 +1888,28 @@ export async function createNativeDatabaseConnection(
          * Fetch database schema.
          */
         fetchSchema: async () => {
-          // Batch all 3 schema queries into a single IPC round-trip for efficiency.
+          // Keep schema and identity discovery in one IPC round-trip.
           const queries = [
             { sql: "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name" },
             { sql: "SELECT name FROM sqlite_schema WHERE type='view' ORDER BY name" },
-            { sql: "SELECT name, tbl_name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name" }
+            { sql: "SELECT name, tbl_name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name" },
+            { sql: TABLE_IDENTITY_METADATA_SQL }
           ];
 
           const res = await worker.call<NativeQueryBatchResult>('queryBatch', [queries]);
 
           // Validate the response — throw instead of silently returning empty schema
-          if (!res || !res.results || res.results.length < 3) {
+          if (!res || !res.results || res.results.length < 4) {
             throw new Error('Schema fetch failed: queryBatch returned incomplete results');
           }
 
           const tableNames = mapRowsByName<TableMetadata>(res.results[0], { identifier: 'name' });
-          const tables = await Promise.all(tableNames.map(async table => ({
-            ...table,
-            identity: await resolveNativeTableIdentity(table.identifier)
-          })));
+          const identities = buildTableIdentityMap(res.results[3].values ?? []);
+          const tables = tableNames.map(table => {
+            const identity = identities.get(table.identifier);
+            if (!identity) throw new Error(`Table not found: ${table.identifier}`);
+            return { ...table, identity };
+          });
           const views = mapRowsByName<ViewMetadata>(res.results[1], { identifier: 'name' });
           const indexes = mapRowsByName<IndexMetadata>(res.results[2], { identifier: 'name', parentTable: 'tbl_name' });
 

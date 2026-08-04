@@ -133,7 +133,17 @@ export function validateRowId(rowId) {
     return Number.isSafeInteger(num) ? num : exact.toString();
 }
 
-/** Preserve decimal text when a declared PK INTEGER cannot survive a JS number round-trip. */
+/** Match SQLite's INTEGER and NUMERIC affinity rules for declared types. */
+export function hasIntegerOrNumericAffinity(declaredType) {
+    const type = String(declaredType ?? '').toUpperCase();
+    if (/INT/.test(type)) return true;
+    if (/(CHAR|CLOB|TEXT)/.test(type)) return false;
+    if (type === '' || /BLOB/.test(type)) return false;
+    if (/(REAL|FLOA|DOUB)/.test(type)) return false;
+    return true;
+}
+
+/** Preserve decimal text when a declared PK integer cannot survive a JS number round-trip. */
 export function parseGridInputValue(value, column, usesDeclaredPrimaryKey = false) {
     const declaredType = (column?.type ?? '').toUpperCase();
     if (
@@ -147,7 +157,7 @@ export function parseGridInputValue(value, column, usesDeclaredPrimaryKey = fals
     if (
         usesDeclaredPrimaryKey
         && column?.isPrimaryKey
-        && /INT/.test(declaredType)
+        && hasIntegerOrNumericAffinity(declaredType)
         && /^[+-]?\d+$/.test(value.trim())
         && !Number.isSafeInteger(numericValue)
     ) {

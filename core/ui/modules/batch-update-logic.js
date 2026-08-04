@@ -9,6 +9,8 @@
  * Types live in batch-update-logic.d.ts.
  */
 
+import { hasIntegerOrNumericAffinity } from './utils.js';
+
 /**
  * Group the selected cells by column index.
  * @returns Map of colIdx -> { name, type, values } where `values` is the set
@@ -89,16 +91,16 @@ export function prepareBatchUpdates(
             // Normalize case: SQLite stores the declared type verbatim, so a column
             // may report e.g. 'integer' rather than 'INTEGER'.
             const colType = (colDef.type || '').toUpperCase();
-            if ((colType === 'INTEGER' || colType === 'REAL' || colType === 'NUMERIC')
+            const numericValue = Number(value);
+            if (usesDeclaredPrimaryKey
+                && colDef.isPrimaryKey
+                && hasIntegerOrNumericAffinity(colType)
+                && /^[+-]?\d+$/.test(value.trim())
+                && !Number.isSafeInteger(numericValue)) {
+                finalValue = value.trim();
+            } else if ((colType === 'INTEGER' || colType === 'REAL' || colType === 'NUMERIC')
                 && !isNaN(Number(value)) && value.trim() !== '') {
-                const numericValue = Number(value);
-                finalValue = usesDeclaredPrimaryKey
-                    && colDef.isPrimaryKey
-                    && colType === 'INTEGER'
-                    && /^[+-]?\d+$/.test(value.trim())
-                    && !Number.isSafeInteger(numericValue)
-                    ? value.trim()
-                    : numericValue;
+                finalValue = numericValue;
             }
         }
 
