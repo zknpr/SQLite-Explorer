@@ -10,6 +10,8 @@ import {
     createNativeDatabaseConnection,
     NativeWorkerProcess
 } from '../../src/nativeWorker';
+import { cancelTokenToAbortSignal } from '../../src/core/cancellation-utils';
+import { InvocationTimeoutError } from '../../src/core/rpc';
 
 const BUNDLED_TXIKI_SQLITE_VERSION = '3.50.1';
 const DIVERGENT_REAL_TEXT_BY_NATIVE_SQLITE_VERSION: Record<string, string> = {
@@ -199,6 +201,133 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 assert.strictEqual(latest.values[0][0], 2.5);
             } finally {
                 externalWriter.stop();
+            }
+        });
+
+        const runawayQuery =
+            'WITH RECURSIVE runaway(value) AS (' +
+            'SELECT 1 UNION ALL SELECT value + 1 FROM runaway' +
+            ') SELECT max(value) AS value FROM runaway';
+        const boundedArgs = (sql: string, timeoutMs: number) => {
+            const boundary = '/*sqlite_explorer_boundary_native_interrupt_smoke*/';
+            return [
+                `${sql}\n${boundary}`,
+                sql,
+                boundary,
+                ['value'],
+                undefined,
+                10,
+                timeoutMs
+            ];
+        };
+
+        await testContext.test('interrupts a runaway bounded query at its worker deadline', async () => {
+            const timeoutMs = 100;
+            const startedAt = Date.now();
+            await assert.rejects(
+                activeRawWorker.call(
+                    'queryBounded',
+                    boundedArgs(runawayQuery, timeoutMs),
+                    timeoutMs + 2000
+                ),
+                (error: unknown) => {
+                    assert.ok(error instanceof Error);
+                    assert.strictEqual(
+                        error.message,
+                        `[queryBounded] Query execution timed out after ${timeoutMs}ms`
+                    );
+                    assert.strictEqual(error instanceof InvocationTimeoutError, false);
+                    return true;
+                }
+            );
+            assert.ok(
+                Date.now() - startedAt < 1500,
+                'the worker deadline must interrupt SQLite before the transport margin expires'
+            );
+        });
+
+        await testContext.test('interrupts a runaway bounded query from a host cancellation token', async () => {
+            let cancel: (() => void) | undefined;
+            const token = {
+                isCancellationRequested: false,
+                onCancellationRequested(callback: () => void) {
+                    cancel = callback;
+                    return { dispose() {} };
+                }
+            } as vscode.CancellationToken;
+            const signal = cancelTokenToAbortSignal(token);
+            const startedAt = Date.now();
+            const query = activeRawWorker.call(
+                'queryBounded',
+                boundedArgs(runawayQuery, 5000),
+                7000,
+                signal
+            );
+            const cancelTimer = setTimeout(() => cancel?.(), 100);
+            try {
+                await assert.rejects(query, (error: unknown) => {
+                    assert.ok(error instanceof Error);
+                    assert.strictEqual(error.name, 'AbortError');
+                    return true;
+                });
+            } finally {
+                clearTimeout(cancelTimer);
+            }
+            assert.ok(
+                Date.now() - startedAt < 1500,
+                'host cancellation must stop SQLite before the operation deadline'
+            );
+        });
+
+        await testContext.test('keeps the worker and edit connection healthy after interruptions', async () => {
+            const health = await activeRawWorker.call<{ values: unknown[][] }>('query', [
+                'SELECT 6 * 7 AS value'
+            ]);
+            assert.deepStrictEqual(health.values, [[42]]);
+
+            await activeRawWorker.call('run', [
+                'CREATE TABLE native_interrupt_health (id INTEGER PRIMARY KEY, value TEXT)'
+            ]);
+            await activeRawWorker.call('run', [
+                "INSERT INTO native_interrupt_health(value) VALUES ('before')"
+            ]);
+            await activeRawWorker.call('run', [
+                "UPDATE native_interrupt_health SET value = 'after' WHERE id = 1"
+            ]);
+            const edited = await activeRawWorker.call<{ values: unknown[][] }>('query', [
+                'SELECT id, value FROM native_interrupt_health'
+            ]);
+            assert.deepStrictEqual(edited.values, [[1, 'after']]);
+        });
+
+        await testContext.test('keeps bounded reads on the sync savepoint snapshot', async () => {
+            await activeRawWorker.call('run', [
+                'CREATE TABLE native_bounded_snapshot (value INTEGER)'
+            ]);
+            await activeRawWorker.call('run', [
+                'INSERT INTO native_bounded_snapshot VALUES (1)'
+            ]);
+            await activeRawWorker.call('run', ['SAVEPOINT native_bounded_snapshot_read']);
+            try {
+                await activeRawWorker.call('run', [
+                    'INSERT INTO native_bounded_snapshot VALUES (2)'
+                ]);
+                const sql = 'SELECT count(*) AS value FROM native_bounded_snapshot';
+                const result = await activeRawWorker.call<{ values: unknown[][] }>(
+                    'queryBounded',
+                    boundedArgs(sql, 1000),
+                    3000
+                );
+                assert.deepStrictEqual(
+                    result.values,
+                    [[2]],
+                    'a second connection would miss the uncommitted row'
+                );
+            } finally {
+                await activeRawWorker.call('run', [
+                    'ROLLBACK TO native_bounded_snapshot_read'
+                ]);
+                await activeRawWorker.call('run', ['RELEASE native_bounded_snapshot_read']);
             }
         });
         activeRawWorker.stop();

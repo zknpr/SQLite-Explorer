@@ -8,11 +8,14 @@
  * Protocol:
  * - Messages are length-prefixed: 4 bytes (big-endian) + V8 serialized data
  * - Request: { id: number, method: string, args: any[] }
- * - Response: { id: number, result?: any, error?: string }
+ * - Response: { id: number, result?: any, error?: string, cancelled?: boolean }
  */
 
-import { Database } from "tjs:sqlite";
+import * as sqlite from "tjs:sqlite";
 import * as v8 from "tjs:v8";
+
+const { Database } = sqlite;
+const AsyncDatabase = sqlite.AsyncDatabase;
 
 // ============================================================================
 // Constants
@@ -26,6 +29,14 @@ const HEADER_SIZE = 4;
 
 /** Currently open database instance */
 let db = null;
+
+/** Optional second connection used only for bounded reads outside transactions. */
+let asyncDb = null;
+let asyncCapabilityProbed = false;
+let asyncCapabilitySupported = false;
+
+/** AbortControllers for async operations addressable by their request id. */
+const activeOperations = new Map();
 
 /** Map of prepared statements by ID */
 const statements = new Map();
@@ -113,6 +124,113 @@ async function readMessage() {
   }
 
   return v8.deserialize(body);
+}
+
+/**
+ * Probe the exact AsyncDatabase surface used by this worker. Aborting a finite
+ * in-flight query must reject with the bundled binding's "Aborted" error, and
+ * the same connection must remain usable afterwards. The finite upper bound is
+ * essential: a binary that ignores signals must still complete the probe.
+ */
+function probeAsyncDatabase(candidate) {
+  return (async () => {
+    if (
+      !candidate ||
+      typeof candidate.close !== 'function' ||
+      typeof candidate.run !== 'function' ||
+      typeof candidate.all !== 'function'
+    ) {
+      return false;
+    }
+
+    const controller = new AbortController();
+    const probeSql =
+      'WITH RECURSIVE sqlite_explorer_probe(value) AS (' +
+      'SELECT 1 UNION ALL SELECT value + 1 FROM sqlite_explorer_probe WHERE value < 1000000' +
+      ') SELECT max(value) AS value FROM sqlite_explorer_probe';
+    const abortTimer = setTimeout(() => controller.abort(), 0);
+    try {
+      await candidate.all(probeSql, [], { signal: controller.signal });
+      return false;
+    } catch (err) {
+      if ((err && err.message) !== 'Aborted') return false;
+    } finally {
+      clearTimeout(abortTimer);
+    }
+
+    try {
+      const rows = await candidate.all('SELECT 1 AS value', []);
+      return Array.isArray(rows) && rows[0]?.value === 1;
+    } catch {
+      return false;
+    }
+  })();
+}
+
+/** Fail closed to the sync connection unless transaction absence is explicit. */
+function shouldUseAsyncDatabase(database, asyncDatabase) {
+  if (!asyncDatabase || !database) return false;
+  try {
+    const transactionState = typeof database.inTransaction === 'function'
+      ? database.inTransaction()
+      : database.inTransaction;
+    return transactionState === false;
+  } catch {
+    return false;
+  }
+}
+
+/** Abort one active async operation without affecting queued or future work. */
+function cancelOperation(correlationId) {
+  const operation = activeOperations.get(correlationId);
+  if (!operation) return false;
+  if (operation.reason === undefined) {
+    operation.reason = 'host';
+    operation.controller.abort();
+  }
+  return true;
+}
+
+function closeAsyncDatabase() {
+  return (async () => {
+    const connection = asyncDb;
+    asyncDb = null;
+    if (!connection || typeof connection.close !== 'function') return;
+    await connection.close();
+  })();
+}
+
+/** Open and probe the optional second connection without breaking sync use. */
+function openAsyncDatabase(path, readOnly) {
+  return (async () => {
+    await closeAsyncDatabase();
+    if (asyncCapabilityProbed && !asyncCapabilitySupported) return;
+    if (typeof AsyncDatabase !== 'function') {
+      asyncCapabilityProbed = true;
+      asyncCapabilitySupported = false;
+      return;
+    }
+
+    let candidate;
+    try {
+      candidate = new AsyncDatabase(path, { readonly: readOnly });
+      if (!asyncCapabilityProbed) {
+        asyncCapabilitySupported = await probeAsyncDatabase(candidate);
+        asyncCapabilityProbed = true;
+      }
+      if (!asyncCapabilitySupported) {
+        await candidate.close();
+        console.error('[native-worker] AsyncDatabase signal probe unavailable; using sync fallback');
+        return;
+      }
+      asyncDb = candidate;
+    } catch (err) {
+      if (candidate && typeof candidate.close === 'function') {
+        try { await candidate.close(); } catch { /* best-effort capability fallback */ }
+      }
+      console.error('[native-worker] AsyncDatabase unavailable; using sync fallback:', err?.message || String(err));
+    }
+  })();
 }
 
 // ============================================================================
@@ -382,14 +500,10 @@ function executeSingleStatement(db, markedSql, sql, params, requiredSuffix) {
 }
 
 /**
- * Read a generated SELECT with a best-effort elapsed-time bound. The bundled
- * txiki SQLite Database exposes only close/exec/prepare/inTransaction/
- * transaction/loadExtension; it has no sqlite3_interrupt or progress-handler
- * API, and Statement exposes all()/run() but no stepping API. Consequently
- * stmt.all() blocks the child event loop: the parent RPC deadline can reject
- * its promise, but neither it nor a queued rollback can preempt this call. The
- * checks below can only reject a result after SQLite returns. True interruption
- * remains deferred until the binding exposes a native cancellation primitive.
+ * Sync fallback for a generated SELECT. This remains necessary on older
+ * binaries and whenever the main connection has transaction-local state that a
+ * second connection cannot observe. Its elapsed checks retain the historical
+ * timeout contract even though they can only run after stmt.all() returns.
  */
 function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, valueColumnCount, limit, timeoutMs) {
   const validatedSql = assertSingleStatementPayload(db, markedSql, sql, requiredSuffix);
@@ -402,11 +516,10 @@ function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, valueC
   const startedAt = Date.now();
   const stmt = db.prepare(`${validatedSql}\nLIMIT ${limit}`);
   try {
-    // The disposable preview view gives duplicate aliases stable positional
-    // schema names (for example x and x:1), so row objects can be projected in
-    // PRAGMA order without re-running the SELECT for each OFFSET. txiki's
-    // statement API exposes all() but no step/iterator API, so SQLite executes
-    // once and the elapsed bound is checked while serializing each returned row.
+    // Generated transport aliases keep row-object projection positional even
+    // when the logical preview columns contain duplicates. txiki's statement
+    // API exposes all() but no step/iterator API, so SQLite executes once and
+    // the elapsed bound is checked while serializing each returned row.
     const rows = stmt.all();
     if (Date.now() - startedAt > timeoutMs) {
       throw new Error(`Query execution timed out after ${timeoutMs}ms`);
@@ -431,6 +544,69 @@ function executeBoundedQuery(db, markedSql, sql, requiredSuffix, columns, valueC
   );
 }
 
+/** Execute one bounded read on AsyncDatabase with deadline and host cancellation. */
+function executeBoundedQueryAsync(asyncDatabase, validationDb, requestId, markedSql, sql, requiredSuffix, columns, valueColumnCount, limit, timeoutMs) {
+  return (async () => {
+    const validatedSql = assertSingleStatementPayload(
+      validationDb,
+      markedSql,
+      sql,
+      requiredSuffix
+    );
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error('Preview row limit must be an integer between 1 and 100');
+    }
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new Error('Query timeout must be a positive finite number');
+    }
+
+    const operation = {
+      controller: new AbortController(),
+      reason: undefined
+    };
+    activeOperations.set(requestId, operation);
+    const deadline = setTimeout(() => {
+      if (operation.reason === undefined) {
+        operation.reason = 'deadline';
+        operation.controller.abort();
+      }
+    }, timeoutMs);
+
+    try {
+      const rows = await asyncDatabase.all(
+        `${validatedSql}\nLIMIT ${limit}`,
+        [],
+        { signal: operation.controller.signal }
+      );
+      const resultColumns = Array.isArray(rows) && rows.length > 0
+        ? Object.keys(rows[0])
+        : columns;
+      return compactExactNumericResult({
+        columns: resultColumns,
+        values: (rows || []).map(row => resultColumns.map(column => row[column])),
+        rowCount: rows?.length ?? 0
+      }, columns, valueColumnCount);
+    } catch (err) {
+      if ((err && err.message) !== 'Aborted') throw err;
+      if (operation.reason === 'deadline') {
+        throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+      }
+      if (operation.reason === 'host') {
+        const cancellationError = new Error('Operation cancelled');
+        cancellationError.name = 'AbortError';
+        cancellationError.cancelled = true;
+        throw cancellationError;
+      }
+      throw err;
+    } finally {
+      clearTimeout(deadline);
+      if (activeOperations.get(requestId) === operation) {
+        activeOperations.delete(requestId);
+      }
+    }
+  })();
+}
+
 /**
  * Handle incoming RPC request.
  *
@@ -452,10 +628,12 @@ async function handleRequest(request) {
         // Open a database file
         // args: [path: string, readOnly?: boolean]
         const [path, readOnly = false] = args;
+        await closeAsyncDatabase();
         if (db) {
           try { db.close(); } catch (e) { /* ignore */ }
         }
         db = new Database(path, { readonly: readOnly });
+        await openAsyncDatabase(path, readOnly);
         result = { success: true };
         break;
       }
@@ -463,6 +641,7 @@ async function handleRequest(request) {
       case "openMemory": {
         // Open an in-memory database with optional initial content
         // args: [content?: Uint8Array]
+        await closeAsyncDatabase();
         if (db) {
           try { db.close(); } catch (e) { /* ignore */ }
         }
@@ -473,6 +652,7 @@ async function handleRequest(request) {
 
       case "close": {
         // Close the database
+        await closeAsyncDatabase();
         if (db) {
           // Finalize all statements first
           for (const [stmtId, stmt] of statements) {
@@ -539,16 +719,38 @@ async function handleRequest(request) {
       case "queryBounded": {
         const [markedSql, sql, requiredSuffix, columns, valueColumnCount, limit, timeoutMs] = args;
         if (!db) throw new Error("Database not open");
-        result = executeBoundedQuery(
-          db,
-          markedSql,
-          sql,
-          requiredSuffix,
-          columns,
-          valueColumnCount,
-          limit,
-          timeoutMs
-        );
+        result = shouldUseAsyncDatabase(db, asyncDb)
+          ? await executeBoundedQueryAsync(
+              asyncDb,
+              db,
+              id,
+              markedSql,
+              sql,
+              requiredSuffix,
+              columns,
+              valueColumnCount,
+              limit,
+              timeoutMs
+            )
+          : executeBoundedQuery(
+              db,
+              markedSql,
+              sql,
+              requiredSuffix,
+              columns,
+              valueColumnCount,
+              limit,
+              timeoutMs
+            );
+        break;
+      }
+
+      case "cancel": {
+        const [correlationId] = args;
+        if (!Number.isInteger(correlationId)) {
+          throw new Error('Cancellation correlation id must be an integer');
+        }
+        result = { cancelled: cancelOperation(correlationId) };
         break;
       }
 
@@ -810,7 +1012,11 @@ async function handleRequest(request) {
   } catch (err) {
     const errorMsg = err.message || String(err);
     console.error(`[native-worker] ERROR in ${method}:`, errorMsg);
-    return { id, error: `[${method}] ${errorMsg}` };
+    return {
+      id,
+      error: `[${method}] ${errorMsg}`,
+      ...(err && err.cancelled === true ? { cancelled: true } : {})
+    };
   }
 }
 
@@ -820,7 +1026,17 @@ async function handleRequest(request) {
 
 async function main() {
   console.error("[native-worker] Starting...");
-  await writeMessage({ ready: true, version: "1.0.0" });
+  let writeTail = Promise.resolve();
+  const enqueueMessage = (message) => {
+    const write = writeTail.then(() => writeMessage(message));
+    writeTail = write.catch(err => {
+      console.error('[native-worker] Message write failed:', err?.message || String(err));
+    });
+    return write;
+  };
+  let requestTail = Promise.resolve();
+
+  await enqueueMessage({ ready: true, version: "1.0.0" });
   console.error("[native-worker] Sent ready signal");
 
   while (true) {
@@ -833,16 +1049,34 @@ async function main() {
       }
 
       console.error("[native-worker] Received request:", request?.method);
-      const response = await handleRequest(request);
-      console.error("[native-worker] Sending response for:", request?.method, response?.error ? "ERROR: " + response.error : "OK");
-      await writeMessage(response);
+      if (request?.method === 'cancel') {
+        // Cancel must bypass the normal FIFO tail so it can reach the
+        // AbortController while AsyncDatabase is executing SQLite work.
+        const response = await handleRequest(request);
+        console.error("[native-worker] Sending response for:", request?.method, response?.error ? "ERROR: " + response.error : "OK");
+        await enqueueMessage(response);
+        continue;
+      }
+
+      const queuedRequest = requestTail.then(async () => {
+        const response = await handleRequest(request);
+        console.error("[native-worker] Sending response for:", request?.method, response?.error ? "ERROR: " + response.error : "OK");
+        await enqueueMessage(response);
+      });
+      requestTail = queuedRequest.catch(err => {
+        console.error('[native-worker] Queued request failed:', err?.message || String(err));
+      });
 
     } catch (err) {
       console.error("[native-worker] Main loop error:", err.message || String(err));
-      await writeMessage({ id: -1, error: err.message || String(err) });
+      await enqueueMessage({ id: -1, error: err.message || String(err) });
     }
   }
 
+  await requestTail;
+  await writeTail;
+
+  await closeAsyncDatabase();
   if (db) {
     try { db.close(); } catch (e) { /* ignore */ }
   }

@@ -236,6 +236,8 @@ export class NativeWorkerProcess {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
     timeout: NodeJS.Timeout;
+    signal?: AbortSignal;
+    abortListener?: () => void;
   }>();
 
   private chunks: Buffer[] = [];
@@ -337,18 +339,34 @@ export class NativeWorkerProcess {
    *
    * @param method - Method name to call
    * @param args - Arguments to pass
+   * @param timeoutMs - Host-side transport deadline
+   * @param signal - Optional cancellation for preemptible worker calls
    * @returns Promise resolving to the result
    */
-  async call<T>(method: string, args: unknown[] = [], timeoutMs: number = QUERY_TIMEOUT): Promise<T> {
+  async call<T>(
+    method: string,
+    args: unknown[] = [],
+    timeoutMs: number = QUERY_TIMEOUT,
+    signal?: AbortSignal
+  ): Promise<T> {
     if (!this.process || !this.process.stdin) {
       throw new Error('Native worker not running');
+    }
+    if (signal?.aborted) {
+      throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
     }
 
     const id = ++this.messageId;
 
     return new Promise((resolve, reject) => {
+      const removeAbortListener = () => {
+        if (signal && abortListener) {
+          signal.removeEventListener('abort', abortListener);
+        }
+      };
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(id);
+        removeAbortListener();
         reject(new InvocationTimeoutError(
           method,
           method === 'queryBounded'
@@ -357,11 +375,27 @@ export class NativeWorkerProcess {
         ));
       }, timeoutMs);
 
+      const abortListener = signal && method === 'queryBounded'
+        ? () => {
+            if (!this.pendingRequests.has(id) || !this.process?.stdin) return;
+            const cancelId = ++this.messageId;
+            writeMessage(this.process.stdin, {
+              id: cancelId,
+              method: 'cancel',
+              args: [id]
+            });
+          }
+        : undefined;
+
       this.pendingRequests.set(id, {
         resolve: resolve as (value: unknown) => void,
         reject,
-        timeout
+        timeout,
+        signal,
+        abortListener
       });
+
+      if (abortListener) signal!.addEventListener('abort', abortListener, { once: true });
 
       writeMessage(this.process!.stdin!, { id, method, args });
     });
@@ -430,7 +464,12 @@ export class NativeWorkerProcess {
    * Handle a parsed message.
    */
   private handleMessage(msg: unknown): void {
-    const typedMsg = msg as { id?: number; result?: unknown; error?: string };
+    const typedMsg = msg as {
+      id?: number;
+      result?: unknown;
+      error?: string;
+      cancelled?: boolean;
+    };
 
     if (typedMsg.id === undefined) {
       return;
@@ -443,8 +482,15 @@ export class NativeWorkerProcess {
 
     this.pendingRequests.delete(typedMsg.id);
     clearTimeout(pending.timeout);
+    if (pending.signal && pending.abortListener) {
+      pending.signal.removeEventListener('abort', pending.abortListener);
+    }
 
-    if (typedMsg.error) {
+    if (typedMsg.cancelled) {
+      pending.reject(
+        pending.signal?.reason ?? new DOMException('The operation was aborted', 'AbortError')
+      );
+    } else if (typedMsg.error) {
       pending.reject(new Error(typedMsg.error));
     } else {
       pending.resolve(typedMsg.result);
@@ -457,6 +503,9 @@ export class NativeWorkerProcess {
   private cleanup(): void {
     for (const [, pending] of this.pendingRequests) {
       clearTimeout(pending.timeout);
+      if (pending.signal && pending.abortListener) {
+        pending.signal.removeEventListener('abort', pending.abortListener);
+      }
       pending.reject(new Error('Native worker stopped'));
     }
     this.pendingRequests.clear();
@@ -1624,6 +1673,7 @@ export async function createNativeDatabaseConnection(
           // so even schema-qualified self-references cannot resolve the old view.
           const savepointName = createSavepointName('sp_preview_view');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          let columns: string[];
           try {
             if (typeof existingSql === 'string') {
               await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
@@ -1632,32 +1682,38 @@ export async function createNativeDatabaseConnection(
               buildCreateViewSql(view, body, columnListSql)
             );
             await compileNativeView(view);
-            const columns = await getNativeColumnNames(view, true);
-            const result = await queryNativeBoundedStatement(
-              `SELECT * FROM ${escapeMainViewIdentifier(view)}`,
-              columns,
-              boundedLimit
-            );
-            const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
-              result.values,
-              undefined,
-              result.exactIntegerTexts
-            );
+            columns = await getNativeColumnNames(view, true);
             await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
             await worker.call('run', [`RELEASE ${savepointName}`]);
-            return {
-              headers: columns,
-              rows,
-              columns,
-              values: rows,
-              columnNames: columns,
-              records: rows,
-              exactIntegerTexts
-            };
           } catch (err) {
             await safeRollbackSavepoint(savepointName, 'previewViewDefinition');
             throw err;
           }
+
+          // The disposable view is needed only to validate CREATE VIEW context
+          // and derive stable positional names. Execute the normalized SELECT
+          // after rolling it back so queryBounded can use the second connection
+          // when no outer transaction is active. The worker falls back to the
+          // sync connection if an outer savepoint still owns uncommitted state.
+          const result = await queryNativeBoundedStatement(
+            body,
+            columns,
+            boundedLimit
+          );
+          const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+            result.values,
+            undefined,
+            result.exactIntegerTexts
+          );
+          return {
+            headers: columns,
+            rows,
+            columns,
+            values: rows,
+            columnNames: columns,
+            records: rows,
+            exactIntegerTexts
+          };
         },
 
         createView: async (view: string, selectSql: string): Promise<ViewDefinition> => {

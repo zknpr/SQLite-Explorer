@@ -61,7 +61,7 @@ interface RecordedNativeCall {
     args: unknown[];
 }
 
-type RecordedNativeResponse = { result?: unknown; error?: string };
+type RecordedNativeResponse = { result?: unknown; error?: string; cancelled?: boolean };
 type RecordedNativeResponder = (call: RecordedNativeCall) => RecordedNativeResponse | Promise<RecordedNativeResponse>;
 
 function encodeNativeMessage(message: unknown): Buffer {
@@ -1739,6 +1739,130 @@ describe('NativeWorkerProcess', () => {
         } finally {
             worker.stop();
         }
+    });
+
+    it('routes an in-flight bounded-query abort to the worker correlation id', async () => {
+        const calls: RecordedNativeCall[] = [];
+        const mockProcess = createRecordingNativeProcess(calls);
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        (worker as any).process = {
+            stdin: mockProcess.stdin,
+            kill: () => {}
+        };
+        const controller = new AbortController();
+        const cancellation = new DOMException('Cancelled by test', 'AbortError');
+        let queryPromise: Promise<unknown> | undefined;
+
+        try {
+            queryPromise = worker.call('queryBounded', [], 1000, controller.signal);
+            await new Promise(resolve => setImmediate(resolve));
+            const queryCall = calls.find(call => call.method === 'queryBounded');
+            assert.ok(queryCall, 'bounded query must be dispatched before cancellation');
+
+            controller.abort(cancellation);
+            await new Promise(resolve => setImmediate(resolve));
+
+            const cancelCall = calls.find(call => call.method === 'cancel');
+            assert.ok(cancelCall, 'aborting the host signal must send a cancel verb');
+            assert.deepStrictEqual(cancelCall.args, [queryCall.id]);
+
+            (worker as any).handleMessage({
+                id: queryCall.id,
+                error: '[queryBounded] Operation cancelled',
+                cancelled: true
+            });
+            await assert.rejects(queryPromise, error => error === cancellation);
+            queryPromise = undefined;
+        } finally {
+            if (queryPromise) {
+                const queryCall = calls.find(call => call.method === 'queryBounded');
+                if (queryCall) {
+                    (worker as any).handleMessage({ id: queryCall.id, error: 'test cleanup' });
+                }
+                await queryPromise.catch(() => {});
+            }
+            worker.stop();
+        }
+    });
+});
+
+describe('native async bounded-query capability routing', () => {
+    it('requires AsyncDatabase methods and a working per-operation signal', async () => {
+        const probeAsyncDatabase = loadNativeWorkerFunction(
+            'probeAsyncDatabase',
+            ['candidate']
+        );
+        const calls: string[] = [];
+        const candidate = {
+            close() {},
+            run() {},
+            async all(sql: string, _params: unknown[], options?: { signal?: AbortSignal }) {
+                calls.push(sql);
+                if (options?.signal) {
+                    await new Promise<void>((_resolve, reject) => {
+                        options.signal!.addEventListener(
+                            'abort',
+                            () => reject(new Error('Aborted')),
+                            { once: true }
+                        );
+                    });
+                }
+                return [{ value: 1 }];
+            }
+        };
+
+        assert.strictEqual(await probeAsyncDatabase(candidate), true);
+        assert.strictEqual(calls.length, 2);
+        assert.match(calls[0], /WITH RECURSIVE sqlite_explorer_probe/);
+        assert.strictEqual(calls[1], 'SELECT 1 AS value');
+        assert.strictEqual(await probeAsyncDatabase({ all() {}, run() {} }), false);
+
+        const ignoresSignal = {
+            close() {},
+            run() {},
+            async all() { return [{ value: 1 }]; }
+        };
+        assert.strictEqual(await probeAsyncDatabase(ignoresSignal), false);
+    });
+
+    it('keeps bounded reads on the sync connection unless no transaction is active', () => {
+        const shouldUseAsyncDatabase = loadNativeWorkerFunction(
+            'shouldUseAsyncDatabase',
+            ['database', 'asyncDatabase']
+        );
+        const asyncDatabase = {};
+
+        assert.strictEqual(shouldUseAsyncDatabase({ inTransaction: false }, asyncDatabase), true);
+        assert.strictEqual(shouldUseAsyncDatabase({ inTransaction: true }, asyncDatabase), false);
+        assert.strictEqual(shouldUseAsyncDatabase({ inTransaction: () => false }, asyncDatabase), true);
+        assert.strictEqual(shouldUseAsyncDatabase({ inTransaction: () => true }, asyncDatabase), false);
+        assert.strictEqual(shouldUseAsyncDatabase({}, asyncDatabase), false);
+        assert.strictEqual(shouldUseAsyncDatabase({ inTransaction: false }, null), false);
+    });
+
+    it('routes cancel only to the matching active operation', () => {
+        const activeOperations = new Map<number, {
+            controller: { abort(): void };
+            reason?: string;
+        }>();
+        const cancelOperation = loadNativeWorkerFunction(
+            'cancelOperation',
+            ['correlationId'],
+            { activeOperations }
+        );
+        let aborts = 0;
+        const operation = {
+            controller: { abort() { aborts++; } },
+            reason: undefined
+        };
+        activeOperations.set(41, operation);
+
+        assert.strictEqual(cancelOperation(99), false);
+        assert.strictEqual(cancelOperation(41), true);
+        assert.strictEqual(operation.reason, 'host');
+        assert.strictEqual(aborts, 1);
+        assert.strictEqual(cancelOperation(41), true);
+        assert.strictEqual(aborts, 1, 'duplicate cancel frames must not abort twice');
     });
 });
 
