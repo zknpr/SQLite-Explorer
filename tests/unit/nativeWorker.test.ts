@@ -1787,7 +1787,133 @@ describe('NativeWorkerProcess', () => {
 });
 
 describe('native async bounded-query capability routing', () => {
-    it('requires AsyncDatabase methods and a working per-operation signal', async () => {
+    const loadProbeAsyncDatabase = (dependencies: Record<string, unknown> = {}) => loadNativeWorkerFunction(
+        'probeAsyncDatabase',
+        ['candidate'],
+        dependencies
+    );
+
+    it('requires the complete AsyncDatabase surface', async () => {
+        const probeAsyncDatabase = loadProbeAsyncDatabase();
+
+        assert.strictEqual(await probeAsyncDatabase({ all() {}, run() {} }), false);
+    });
+
+    it('retries an inconclusive completion with a larger query before succeeding', async () => {
+        const probeAsyncDatabase = loadProbeAsyncDatabase();
+        const probeSql: string[] = [];
+        let probeCalls = 0;
+        let healthChecks = 0;
+        const candidate = {
+            close() {},
+            run() {},
+            async all(sql: string, _params: unknown[], options?: { signal?: AbortSignal }) {
+                if (!options?.signal) {
+                    healthChecks++;
+                    return [{ value: 1 }];
+                }
+
+                probeSql.push(sql);
+                probeCalls++;
+                if (probeCalls === 1) {
+                    // Simulate completion winning the event-loop race, so the
+                    // scheduled abort was never delivered in flight.
+                    return [{ value: 1 }];
+                }
+                await new Promise<void>((_resolve, reject) => {
+                    options.signal!.addEventListener(
+                        'abort',
+                        () => reject(new Error('Aborted')),
+                        { once: true }
+                    );
+                });
+                return [{ value: 1 }];
+            }
+        };
+
+        assert.strictEqual(await probeAsyncDatabase(candidate), true);
+        assert.strictEqual(probeCalls, 2);
+        assert.strictEqual(healthChecks, 1);
+        assert.match(probeSql[0], /value < 1000000/);
+        assert.match(probeSql[1], /value < 8000000/);
+    });
+
+    it('keeps a starved abort pending so it can land during the retry', async () => {
+        interface ProbeTimer {
+            callback: () => void;
+            cleared: boolean;
+        }
+        const timers: ProbeTimer[] = [];
+        const probeAsyncDatabase = loadProbeAsyncDatabase({
+            setTimeout(callback: () => void, delayMs: number) {
+                assert.strictEqual(delayMs, 10);
+                const timer = { callback, cleared: false };
+                timers.push(timer);
+                return timer;
+            },
+            clearTimeout(timer: ProbeTimer) {
+                timer.cleared = true;
+            }
+        });
+        let probeCalls = 0;
+        const candidate = {
+            close() {},
+            run() {},
+            async all(_sql: string, _params: unknown[], options?: { signal?: AbortSignal }) {
+                if (!options?.signal) return [{ value: 1 }];
+
+                probeCalls++;
+                if (probeCalls === 1) return [{ value: 1 }];
+                await new Promise<void>((resolve, reject) => {
+                    options.signal!.addEventListener(
+                        'abort',
+                        () => reject(new Error('Aborted')),
+                        { once: true }
+                    );
+                    const originalTimer = timers[0];
+                    if (originalTimer && !originalTimer.cleared) {
+                        originalTimer.callback();
+                    } else {
+                        resolve();
+                    }
+                });
+                return [{ value: 1 }];
+            }
+        };
+
+        assert.strictEqual(await probeAsyncDatabase(candidate), true);
+        assert.strictEqual(probeCalls, 2);
+        assert.strictEqual(timers.length, 1);
+        assert.strictEqual(timers[0].cleared, true);
+    });
+
+    it('reports unsupported when an in-flight abort is demonstrably ignored', async () => {
+        const probeAsyncDatabase = loadProbeAsyncDatabase();
+        let probeCalls = 0;
+        let healthChecks = 0;
+        const candidate = {
+            close() {},
+            run() {},
+            async all(_sql: string, _params: unknown[], options?: { signal?: AbortSignal }) {
+                if (!options?.signal) {
+                    healthChecks++;
+                    return [{ value: 1 }];
+                }
+
+                probeCalls++;
+                await new Promise<void>(resolve => {
+                    options.signal!.addEventListener('abort', () => resolve(), { once: true });
+                });
+                return [{ value: 1 }];
+            }
+        };
+
+        assert.strictEqual(await probeAsyncDatabase(candidate), false);
+        assert.strictEqual(probeCalls, 1);
+        assert.strictEqual(healthChecks, 0);
+    });
+
+    it('accepts first-try signal support and verifies connection health', async () => {
         const probeAsyncDatabase = loadNativeWorkerFunction(
             'probeAsyncDatabase',
             ['candidate']
@@ -1815,14 +1941,6 @@ describe('native async bounded-query capability routing', () => {
         assert.strictEqual(calls.length, 2);
         assert.match(calls[0], /WITH RECURSIVE sqlite_explorer_probe/);
         assert.strictEqual(calls[1], 'SELECT 1 AS value');
-        assert.strictEqual(await probeAsyncDatabase({ all() {}, run() {} }), false);
-
-        const ignoresSignal = {
-            close() {},
-            run() {},
-            async all() { return [{ value: 1 }]; }
-        };
-        assert.strictEqual(await probeAsyncDatabase(ignoresSignal), false);
     });
 
     it('keeps bounded reads on the sync connection unless no transaction is active', () => {

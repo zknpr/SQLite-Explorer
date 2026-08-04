@@ -196,8 +196,11 @@ async function readMessage() {
 /**
  * Probe the exact AsyncDatabase surface used by this worker. Aborting a finite
  * in-flight query must reject with the bundled binding's "Aborted" error, and
- * the same connection must remain usable afterwards. The finite upper bound is
- * essential: a binary that ignores signals must still complete the probe.
+ * the same connection must remain usable afterwards. Escalating finite bounds
+ * give a delayed timer a wider delivery window without making startup depend
+ * on an unbounded query: at most 41 million recursive rows are requested. Once
+ * the 10ms timer lands in flight, a signal-ignoring binary is rejected after
+ * that finite attempt (normally the first 1-million-row query).
  */
 function probeAsyncDatabase(candidate) {
   return (async () => {
@@ -211,18 +214,52 @@ function probeAsyncDatabase(candidate) {
     }
 
     const controller = new AbortController();
-    const probeSql =
-      'WITH RECURSIVE sqlite_explorer_probe(value) AS (' +
-      'SELECT 1 UNION ALL SELECT value + 1 FROM sqlite_explorer_probe WHERE value < 1000000' +
-      ') SELECT max(value) AS value FROM sqlite_explorer_probe';
-    const abortTimer = setTimeout(() => controller.abort(), 0);
+    let operationInFlight = false;
+    let abortFired = false;
+    let abortDeliveredInFlight = false;
+    const abortTimer = setTimeout(() => {
+      // Retain this timer across inconclusive attempts. Once overdue, it can
+      // land during the next larger query instead of being cleared and reset.
+      abortFired = true;
+      abortDeliveredInFlight = operationInFlight;
+      controller.abort();
+    }, 10);
+    let signalSupported = false;
     try {
-      await candidate.all(probeSql, [], { signal: controller.signal });
-      return false;
-    } catch (err) {
-      if ((err && err.message) !== 'Aborted') return false;
+      const rowBounds = [1000000, 8000000, 32000000];
+      for (const rowBound of rowBounds) {
+        const probeSql =
+          'WITH RECURSIVE sqlite_explorer_probe(value) AS (' +
+          `SELECT 1 UNION ALL SELECT value + 1 FROM sqlite_explorer_probe WHERE value < ${rowBound}` +
+          ') SELECT max(value) AS value FROM sqlite_explorer_probe';
+        operationInFlight = true;
+        try {
+          await candidate.all(probeSql, [], { signal: controller.signal });
+        } catch (err) {
+          if (!abortDeliveredInFlight || (err && err.message) !== 'Aborted') return false;
+          signalSupported = true;
+          break;
+        } finally {
+          operationInFlight = false;
+        }
+
+        if (abortDeliveredInFlight) {
+          // The operation stayed in flight through delivery but ignored it.
+          return false;
+        }
+        if (abortFired) return false;
+        // Completion beat the still-pending timer, so retry immediately with a
+        // larger finite query and give that overdue callback another window.
+      }
     } finally {
+      operationInFlight = false;
       clearTimeout(abortTimer);
+    }
+
+    if (!signalSupported) {
+      // All finite attempts completed before the abort callback ran. Capability
+      // remains inconclusive, so fail closed for this worker session.
+      return false;
     }
 
     try {
