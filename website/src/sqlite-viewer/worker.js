@@ -699,7 +699,9 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
     : getExportProjectionColumns(table);
   assertWebDemoExportWithinLimit(table, selectedColumns, whereSql, params);
 
-  const results = db.exec(sql, params);
+  // sql.js otherwise coerces signed int64 values through Number before any
+  // exporter sees them. Keep BigInt until each format emits exact decimals.
+  const results = db.exec(sql, params, { useBigInt: true });
 
   if (results.length === 0) {
     return { contentChunks: [], filename: `${table}.${format}`, mimeType: 'text/plain' };
@@ -893,7 +895,21 @@ function exportToJson(headers, rows, output) {
       obj[headers[i]] = val;
     }
     output.append(rowIndex === 0 ? '\n' : ',\n');
-    output.append(JSON.stringify(obj, null, 2).replace(/^/gm, '  '));
+    const keys = Object.keys(obj);
+    if (keys.length === 0) {
+      output.append('  {}');
+      continue;
+    }
+    output.append('  {\n');
+    keys.forEach((key, keyIndex) => {
+      if (keyIndex > 0) output.append(',\n');
+      const value = obj[key];
+      const serialized = typeof value === 'bigint'
+        ? value.toString()
+        : (JSON.stringify(value) ?? 'null');
+      output.append(`    ${JSON.stringify(key)}: ${serialized}`);
+    });
+    output.append('\n  }');
   }
   output.append(rows.length === 0 ? ']' : '\n]');
 }
@@ -908,7 +924,7 @@ function exportToSql(table, headers, rows, includeTableName, output) {
   const escapeValue = (val) => {
     if (val === null || val === undefined) return 'NULL';
     if (val instanceof Uint8Array) return 'NULL'; // Can't represent BLOB in SQL text
-    if (typeof val === 'number') return String(val);
+    if (typeof val === 'number' || typeof val === 'bigint') return String(val);
     return `'${String(val).replace(/'/g, "''")}'`;
   };
 

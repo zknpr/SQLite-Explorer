@@ -40,6 +40,85 @@ async function collectStreamingExport(
 }
 
 describe('streamTableExport golden parity', () => {
+    it('exports exact signed int64 bytes through CSV, Excel, JSON, and SQL', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_int64 (value); ' +
+            'INSERT INTO stage_e_int64 VALUES ' +
+            '(9007199254740993), (9223372036854775807), (-9223372036854775808)'
+        );
+        const decimalLines =
+            '9007199254740993\n' +
+            '9223372036854775807\n' +
+            '-9223372036854775808';
+
+        try {
+            const csv = await collectStreamingExport(
+                operations,
+                'stage_e_int64',
+                ['value'],
+                { format: 'csv' }
+            );
+            assert.strictEqual(csv.content, `value\n${decimalLines}`);
+
+            const excel = await collectStreamingExport(
+                operations,
+                'stage_e_int64',
+                ['value'],
+                { format: 'excel' }
+            );
+            assert.strictEqual(excel.content, `\uFEFFvalue\n${decimalLines}`);
+
+            const json = await collectStreamingExport(
+                operations,
+                'stage_e_int64',
+                ['value'],
+                { format: 'json' }
+            );
+            assert.strictEqual(
+                json.content,
+                '[\n' +
+                '  {\n    "value": 9007199254740993\n  },\n' +
+                '  {\n    "value": 9223372036854775807\n  },\n' +
+                '  {\n    "value": -9223372036854775808\n  }\n' +
+                ']'
+            );
+
+            const sql = await collectStreamingExport(
+                operations,
+                'stage_e_int64',
+                ['value'],
+                { format: 'sql' }
+            );
+            assert.strictEqual(
+                sql.content,
+                'INSERT INTO "stage_e_int64" ("value") VALUES (9007199254740993);\n' +
+                'INSERT INTO "stage_e_int64" ("value") VALUES (9223372036854775807);\n' +
+                'INSERT INTO "stage_e_int64" ("value") VALUES (-9223372036854775808);'
+            );
+
+            await operations.executeQuery('CREATE TABLE stage_e_int64_copy (value)');
+            await operations.executeQuery(
+                sql.content.replaceAll('"stage_e_int64"', '"stage_e_int64_copy"')
+            );
+            const restored = await operations.executeQuery(
+                'SELECT typeof(value), CAST(value AS TEXT) FROM stage_e_int64_copy ORDER BY rowid'
+            );
+            assert.deepStrictEqual(restored[0].rows, [
+                ['integer', '9007199254740993'],
+                ['integer', '9223372036854775807'],
+                ['integer', '-9223372036854775808']
+            ]);
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('preserves bounded CSV, JSON, and SQL bytes including options and NUL text', async () => {
         const database = await createDatabaseEngine({
             content: null,
@@ -423,6 +502,67 @@ describe('streamTableExport cell boundaries', () => {
                 ),
                 /has no stable row identity/
             );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('does not zip a selected WITHOUT ROWID identity to values from a later snapshot', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_pk_race (' +
+            'id TEXT PRIMARY KEY, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO stage_e_pk_race VALUES ('a', 'selected'), ('b', 'other')"
+        );
+        const identityPage = await operations.fetchTableData('stage_e_pk_race', {
+            columns: ['rowid', 'value'],
+            orderBy: 'rowid',
+            limit: 10,
+            offset: 0
+        });
+        const selectedId = identityPage.rows[0][0];
+        assert.ok(typeof selectedId === 'string' || typeof selectedId === 'number');
+        let mutationInjected = false;
+        const racingOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'executeQuery') {
+                    return async (...args: Parameters<DatabaseOperations['executeQuery']>) => {
+                        const sql = String(args[0]);
+                        if (
+                            !mutationInjected &&
+                            sql.includes('FROM "stage_e_pk_race"') &&
+                            sql.includes('__export_type_0')
+                        ) {
+                            mutationInjected = true;
+                            await target.executeQuery(
+                                "DELETE FROM stage_e_pk_race WHERE id = 'a'; " +
+                                "INSERT INTO stage_e_pk_race VALUES ('c', 'unselected replacement')"
+                            );
+                        }
+                        return target.executeQuery(...args);
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+
+        try {
+            const exported = await collectStreamingExport(
+                racingOperations,
+                'stage_e_pk_race',
+                ['value'],
+                { format: 'csv', rowIds: [selectedId] }
+            );
+            assert.strictEqual(mutationInjected, true);
+            assert.strictEqual(exported.content, '');
+            assert.doesNotMatch(exported.content, /other|unselected replacement/);
         } finally {
             (operations as WasmDatabaseEngine).shutdown();
         }

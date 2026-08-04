@@ -75,6 +75,12 @@ describe('SQL Utils', () => {
       assert.strictEqual(cellValueToSql(12.34), '12.34');
     });
 
+    it('emits signed int64 BigInts as bare INTEGER literals', () => {
+      assert.strictEqual(cellValueToSql(9007199254740993n), '9007199254740993');
+      assert.strictEqual(cellValueToSql(9223372036854775807n), '9223372036854775807');
+      assert.strictEqual(cellValueToSql(-9223372036854775808n), '-9223372036854775808');
+    });
+
     it('should handle strings', () => {
       assert.strictEqual(cellValueToSql('foo'), "'foo'");
       assert.strictEqual(cellValueToSql('foo bar'), "'foo bar'");

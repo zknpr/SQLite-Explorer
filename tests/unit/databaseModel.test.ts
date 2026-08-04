@@ -925,6 +925,18 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             newValue: 'bounded',
             undoPolicy: 'barrier'
         });
+        for (let index = 0; index < 200; index++) {
+            doc.recordExternalModification({
+                label: `Later edit ${index}`,
+                description: `Later edit ${index}`,
+                modificationType: 'cell_update',
+                targetTable: 'items',
+                targetRowId: index + 2,
+                targetColumn: 'name',
+                priorValue: 'before',
+                newValue: 'after'
+            });
+        }
 
         const originalShowWarningMessage = mockVscode.window.showWarningMessage;
         const warnings: string[] = [];

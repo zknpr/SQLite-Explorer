@@ -10,6 +10,45 @@ interface MockMod extends LabeledModification {
 }
 
 describe('Undo/Redo Memory Limit', () => {
+    it('keeps the complete barrier segment until save, then resumes memory eviction', async () => {
+        const tracker = new ModificationTracker<MockMod>(100, 700);
+        const barrier = {
+            label: 'barrier',
+            description: 'forward-only oversized replacement',
+            modificationType: 'cell_update' as ModificationType,
+            payload: 'bounded',
+            undoPolicy: 'barrier' as const
+        } as MockMod;
+        tracker.recordBarrier(barrier);
+
+        for (let index = 0; index < 10; index++) {
+            tracker.record({
+                label: `normal-${index}`,
+                description: `normal-${index}`,
+                modificationType: 'cell_update',
+                payload: 'x'.repeat(200)
+            } as MockMod);
+        }
+
+        assert.strictEqual(tracker.hasUncommittedHistoryBarrier, true);
+        assert.deepStrictEqual(
+            tracker.getUncommittedEntries().map(candidate => candidate.label),
+            ['barrier', ...Array.from({ length: 10 }, (_, index) => `normal-${index}`)]
+        );
+
+        await tracker.createCheckpoint();
+        for (let index = 10; index < 20; index++) {
+            tracker.record({
+                label: `normal-${index}`,
+                description: `normal-${index}`,
+                modificationType: 'cell_update',
+                payload: 'x'.repeat(200)
+            } as MockMod);
+        }
+        assert.strictEqual(tracker.hasUncommittedHistoryBarrier, false);
+        assert.strictEqual(tracker.entryCount, 1, 'memory retention must resume after saving the barrier');
+    });
+
     it('should respect memory limit', () => {
         // Limit to 200 bytes.
         // Each entry overhead is ~8 bytes.

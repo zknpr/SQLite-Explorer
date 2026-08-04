@@ -10,6 +10,58 @@ const entry = (label: string): LabeledModification => ({
 });
 
 describe('ModificationTracker hot-exit persistence', () => {
+  it('keeps an unsaved barrier pinned through 200 later edits and hot-exit serialization', () => {
+    const tracker = new ModificationTracker<LabeledModification>(100);
+    const barrier: LabeledModification = {
+      ...entry('oversized replacement'),
+      targetTable: 'items',
+      targetRowId: 1,
+      targetColumn: 'payload',
+      newValue: 'bounded replacement',
+      undoPolicy: 'barrier'
+    };
+    tracker.recordBarrier(barrier);
+    for (let index = 0; index < 200; index++) {
+      tracker.record({
+        ...entry(`later edit ${index}`),
+        priorValue: index,
+        newValue: index + 1
+      });
+    }
+
+    assert.strictEqual(tracker.hasUncommittedHistoryBarrier, true);
+    assert.deepStrictEqual(
+      tracker.getUncommittedEntries().map(candidate => candidate.label),
+      ['oversized replacement', ...Array.from({ length: 200 }, (_, index) => `later edit ${index}`)]
+    );
+
+    const restored = ModificationTracker.deserialize<LabeledModification>(tracker.serialize());
+    assert.strictEqual(restored.hasUncommittedHistoryBarrier, true);
+    assert.deepStrictEqual(
+      restored.getUncommittedEntries().map(candidate => candidate.label),
+      tracker.getUncommittedEntries().map(candidate => candidate.label)
+    );
+  });
+
+  it('releases saved barriers back to ordinary front retention', async () => {
+    const tracker = new ModificationTracker<LabeledModification>(2);
+    for (let index = 0; index < 5; index++) {
+      tracker.recordBarrier({
+        ...entry(`saved barrier ${index}`),
+        newValue: index,
+        undoPolicy: 'barrier'
+      });
+      await tracker.createCheckpoint();
+    }
+
+    assert.strictEqual(tracker.hasUncommittedHistoryBarrier, false);
+    assert.strictEqual(tracker.entryCount, 2);
+    assert.deepStrictEqual(
+      tracker['timeline'].map((candidate: LabeledModification) => candidate.label),
+      ['saved barrier 3', 'saved barrier 4']
+    );
+  });
+
   it('records a forward-only barrier that preserves replay state but cannot be crossed by undo', async () => {
     const t = new ModificationTracker<LabeledModification>();
     t.record(entry('saved'));

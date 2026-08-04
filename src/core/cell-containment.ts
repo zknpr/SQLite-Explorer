@@ -14,6 +14,16 @@ import {
 
 export const DEFAULT_MAX_INLINE_CELL_BYTES = 1024 * 1024;
 export const DEFAULT_MAX_PAGE_RESPONSE_BYTES = 16 * 1024 * 1024;
+export const DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES =
+  2 * DEFAULT_MAX_PAGE_RESPONSE_BYTES;
+export const WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES = 40;
+
+// Reserve space outside the per-cell model for response/header keys, row-map
+// keys, and future DTO fields. The exact 500x560 worst case retains more than
+// this margin when measured by Stage C's estimator.
+const WEBVIEW_GRID_RESPONSE_HEADROOM_BYTES = 512 * 1024;
+const OVERSIZED_CELL_METADATA_VALUE_BYTES = 45;
+const PER_CELL_COLLECTION_FRAMING_BYTES = 2;
 
 const CELL_SOURCE_ALIAS = '__sqlite_explorer_cell_source';
 const CELL_VALUE_PREFIX = '__sqlite_explorer_cell_value_';
@@ -65,10 +75,32 @@ export function deriveEffectiveInlineCellBytes(
   );
   const requestedRows = positiveIntegerOr(options.limit, 1);
   const pageSlots = requestedRows * projectedColumnCount;
-  const pageWindow = Number.isSafeInteger(pageSlots)
+  const rawPageWindow = Number.isSafeInteger(pageSlots)
     ? Math.floor(maxPageResponseBytes / pageSlots)
     : 0;
-  return Math.min(maxInlineCellBytes, pageWindow);
+  if (!Number.isSafeInteger(pageSlots)) return 0;
+
+  // Model the worst transported slot: a clipped BLOB becomes a Base64 marker
+  // in rows and also gains a sparse oversizedCells entry. Round the remaining
+  // Base64 body down to complete four-byte quanta before converting it back to
+  // source bytes.
+  const columnKeyBytes = String(projectedColumnCount - 1).length + 3;
+  const nonBase64WireBytes =
+    WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES +
+    OVERSIZED_CELL_METADATA_VALUE_BYTES +
+    columnKeyBytes +
+    PER_CELL_COLLECTION_FRAMING_BYTES;
+  const modeledWireBudget =
+    DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES -
+    WEBVIEW_GRID_RESPONSE_HEADROOM_BYTES;
+  const wireBytesPerSlot = Math.floor(modeledWireBudget / pageSlots);
+  const base64BytesPerSlot = Math.max(
+    0,
+    Math.floor((wireBytesPerSlot - nonBase64WireBytes) / 4) * 4
+  );
+  const wirePageWindow = Math.floor(base64BytesPerSlot / 4) * 3;
+
+  return Math.min(maxInlineCellBytes, rawPageWindow, wirePageWindow);
 }
 
 function oversizedPredicate(column: string, byteLimit: number): string {

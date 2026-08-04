@@ -475,12 +475,17 @@ export class NativeWorkerProcess {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(id);
         removeAbortListener();
-        reject(new InvocationTimeoutError(
+        const timeoutError = new InvocationTimeoutError(
           method,
           method === 'queryBounded'
             ? `Query execution timed out after ${timeoutMs}ms`
             : `Request ${method} timed out`
-        ));
+        );
+        // open performs the capability probe before serving any useful work.
+        // Once its caller has abandoned the request, the process has no valid
+        // consumer and may otherwise keep running the probe to 41M rows.
+        if (method === 'open') this.stop();
+        reject(timeoutError);
       }, timeoutMs);
 
       const abortListener = signal && method === 'queryBounded'

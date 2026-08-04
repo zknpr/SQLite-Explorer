@@ -286,9 +286,17 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
       (this.timeline.length > 0) &&
       (this.timeline.length > this.maxEntries || this.currentSize > this.maxMemory)
     ) {
-      // Don't remove the just-added entry if it's the only one, to preserve ability to undo at least one step if possible.
-      // However, if strict memory limit is required, we might need to, but let's be practical.
+      // Preserve the existing guarantee that even an individually oversized
+      // edit remains available as the sole undo entry.
       if (this.timeline.length === 1) {
+        break;
+      }
+
+      // History replay is ordered: retaining a barrier while evicting entries
+      // after it would create a non-contiguous replay and silently lose later
+      // edits. Once an unsaved barrier reaches the front, pin the complete
+      // uncommitted segment until a save establishes a new checkpoint.
+      if (this.checkpointIndex === 0 && this.hasUncommittedHistoryBarrier) {
         break;
       }
 
@@ -299,7 +307,6 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
         this.currentSize -= removedEntrySize;
       }
 
-      // Adjust checkpoint index since we shifted the array
       this.checkpointIndex = Math.max(0, this.checkpointIndex - 1);
       this.timelineOffset++;
       this.invalidateCapturedCheckpointPositions();

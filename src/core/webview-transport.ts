@@ -1,4 +1,8 @@
-import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './cell-containment';
+import {
+  DEFAULT_MAX_PAGE_RESPONSE_BYTES,
+  DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES,
+  WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES
+} from './cell-containment';
 
 /** Stable machine-readable identity used on both sides of every webview boundary. */
 export const WEBVIEW_PAYLOAD_LIMIT_ERROR_CODE = 'ERR_WEBVIEW_PAYLOAD_LIMIT' as const;
@@ -14,7 +18,8 @@ export const MAX_WEBVIEW_BINARY_VALUE_BYTES = DEFAULT_MAX_PAGE_RESPONSE_BYTES;
  * ceiling leaves room for headers and sidecars while rejecting duplicated
  * rows/values matrices and multi-value amplification before encoding or cloning.
  */
-export const MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES = 2 * DEFAULT_MAX_PAGE_RESPONSE_BYTES;
+export const MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES =
+  DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES;
 
 export const WEBVIEW_TRANSPORT_SURFACES = {
   coreSerialization: 'core RPC serialization',
@@ -175,7 +180,7 @@ export function assertWebviewTransportPayload(
   const addBinary = (byteLength: number, encodedLength: number): void => {
     if (byteLength > limits.maxBinaryBytes) rejectBinary(byteLength);
     // Include the marker keys and punctuation in addition to the Base64 body.
-    add(encodedLength + 40);
+    add(encodedLength + WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES);
   };
 
   const visit = (candidate: unknown): void => {

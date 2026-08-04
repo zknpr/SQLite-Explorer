@@ -3,6 +3,11 @@ import './vscode_mock_setup';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+import {
+    WEBVIEW_TRANSPORT_SURFACES,
+    WebviewPayloadLimitError,
+    assertWebviewTransportPayload
+} from '../../src/core/webview-transport';
 
 const containmentModulePath = '../../src/core/cell-containment.ts';
 
@@ -31,6 +36,70 @@ describe('grid cell containment limits', () => {
             maxPageResponseBytes: 16 * 1024 * 1024,
             limit: 500
         }, 8), 4194);
+    });
+
+    it('keeps a 500 by 560 BLOB page and its oversized sidecars below the wire cap', async () => {
+        const { deriveEffectiveInlineCellBytes } = await loadContainmentModule();
+        const rowCount = 500;
+        const columnCount = 560;
+        const effectiveBytes = deriveEffectiveInlineCellBytes({
+            maxInlineCellBytes: 1024 * 1024,
+            maxPageResponseBytes: 16 * 1024 * 1024,
+            limit: rowCount
+        }, columnCount);
+
+        const buildResponse = (previewBytes: number) => {
+            // Aliases are intentional: the transport estimator counts each
+            // serialized path, so this models 280,000 cells without allocating
+            // 280,000 separate byte arrays and metadata objects.
+            const preview = new Uint8Array(previewBytes);
+            const row = Array(columnCount).fill(preview);
+            const rows = Array(rowCount).fill(row);
+            const cellMetadata = {
+                storageClass: 'blob',
+                byteLength: previewBytes + 1
+            };
+            const metadataRow: Record<number, typeof cellMetadata> = {};
+            for (let column = 0; column < columnCount; column++) {
+                metadataRow[column] = cellMetadata;
+            }
+            const oversizedCells: Record<number, typeof metadataRow> = {};
+            for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+                oversizedCells[rowIndex] = metadataRow;
+            }
+            return {
+                channel: 'rpc',
+                content: {
+                    kind: 'response',
+                    messageId: 'wire-aware-grid-margin',
+                    success: true,
+                    data: {
+                        headers: Array.from(
+                            { length: columnCount },
+                            (_, column) => `column_${column}`
+                        ),
+                        rows,
+                        oversizedCells
+                    }
+                }
+            };
+        };
+
+        assert.strictEqual(effectiveBytes, 18);
+        assert.doesNotThrow(() => assertWebviewTransportPayload(
+            buildResponse(effectiveBytes),
+            { surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse }
+        ));
+        assert.throws(
+            () => assertWebviewTransportPayload(
+                buildResponse(effectiveBytes + 1),
+                { surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse }
+            ),
+            (error: unknown) => (
+                error instanceof WebviewPayloadLimitError &&
+                error.kind === 'aggregate-payload'
+            )
+        );
     });
 
     it('returns bounded WASM previews and exact sparse metadata without changing small DTOs', async () => {

@@ -16,6 +16,7 @@ import {
     CellEditPolicyError,
     OversizedCellReplacementRequiredError
 } from '../../src/core/cell-edit-policy';
+import { streamTableExport } from '../../src/tableExporter';
 
 const BUNDLED_TXIKI_SQLITE_VERSION = '3.51.2';
 const DIVERGENT_REAL_TEXT_BY_NATIVE_SQLITE_VERSION: Record<string, string> = {
@@ -356,8 +357,9 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
 
         await testContext.test('carries exact unsafe INTEGER text through native table fetches', async () => {
             await engine.executeQuery(
-                'CREATE TABLE native_unsafe_integers (value INTEGER); ' +
-                'INSERT INTO native_unsafe_integers(value) VALUES (9007199254740993)'
+                'CREATE TABLE native_unsafe_integers (value); ' +
+                'INSERT INTO native_unsafe_integers(value) VALUES ' +
+                '(9007199254740993), (9223372036854775807), (-9223372036854775808)'
             );
             const result = await engine.fetchTableData('native_unsafe_integers', {
                 columns: ['value'],
@@ -369,6 +371,52 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
 
             assert.strictEqual(result.rows[0][0], 9007199254740992);
             assert.strictEqual(result.exactIntegerTexts?.[0]?.[0], '9007199254740993');
+
+            const collect = async (format: 'csv' | 'excel' | 'json' | 'sql') => {
+                const chunks: string[] = [];
+                await streamTableExport(
+                    engine,
+                    'native_unsafe_integers',
+                    ['value'],
+                    { format },
+                    { write: async chunk => { chunks.push(chunk); } }
+                );
+                return chunks.join('');
+            };
+            const decimalLines =
+                '9007199254740993\n' +
+                '9223372036854775807\n' +
+                '-9223372036854775808';
+            assert.strictEqual(await collect('csv'), `value\n${decimalLines}`);
+            assert.strictEqual(await collect('excel'), `\uFEFFvalue\n${decimalLines}`);
+            assert.strictEqual(
+                await collect('json'),
+                '[\n' +
+                '  {\n    "value": 9007199254740993\n  },\n' +
+                '  {\n    "value": 9223372036854775807\n  },\n' +
+                '  {\n    "value": -9223372036854775808\n  }\n' +
+                ']'
+            );
+            const sql = await collect('sql');
+            assert.strictEqual(
+                sql,
+                'INSERT INTO "native_unsafe_integers" ("value") VALUES (9007199254740993);\n' +
+                'INSERT INTO "native_unsafe_integers" ("value") VALUES (9223372036854775807);\n' +
+                'INSERT INTO "native_unsafe_integers" ("value") VALUES (-9223372036854775808);'
+            );
+            await engine.executeQuery('CREATE TABLE native_unsafe_integer_copy (value)');
+            await engine.executeQuery(
+                sql.replaceAll('"native_unsafe_integers"', '"native_unsafe_integer_copy"')
+            );
+            const restored = await engine.executeQuery(
+                'SELECT typeof(value), CAST(value AS TEXT) ' +
+                'FROM native_unsafe_integer_copy ORDER BY rowid'
+            );
+            assert.deepStrictEqual(restored[0].rows, [
+                ['integer', '9007199254740993'],
+                ['integer', '9223372036854775807'],
+                ['integer', '-9223372036854775808']
+            ]);
         });
 
         await testContext.test('matches WASM/demo bounded TEXT and BLOB grid previews', async () => {

@@ -12,6 +12,7 @@ import type {
 import { cellValueToSql, escapeIdentifier } from './core/sql-utils';
 import { normalizeCellTextEncoding } from './core/cell-read';
 import {
+  buildRecordIdentityPredicate,
   buildRecordIdentitiesPredicate,
   isPrimaryKeyRecordId,
   isReadOnlyPrimaryKeyRecordId
@@ -105,7 +106,11 @@ function buildCellProjection(columns: readonly string[], inlineBytes: number, in
     const storageClass = `typeof(${escaped})`;
     const value =
       `CASE ` +
-      `WHEN ${storageClass} IN ('integer', 'real') THEN ${escaped} ` +
+      // Export INTEGERs through SQLite's canonical decimal text. Returning the
+      // raw value lets WASM round int64 and gives native callers a BigInt that
+      // JSON.stringify cannot handle.
+      `WHEN ${storageClass} = 'integer' THEN CAST(${escaped} AS TEXT) ` +
+      `WHEN ${storageClass} = 'real' THEN ${escaped} ` +
       `WHEN ${storageClass} = 'text' AND octet_length(${escaped}) <= ${inlineBytes} ` +
       `THEN CAST(${escaped} AS BLOB) ` +
       (includeInlineBlobs
@@ -143,9 +148,23 @@ function parseCells(
     const storageClass = parseStorageClass(row[offset], `${table}.${column}`);
     const sourceBytes = byteLength(row[offset + 2], `${table}.${column}`);
     const transportedValue = row[offset + 1];
-    const value = storageClass === 'text' && transportedValue instanceof Uint8Array
+    let value = storageClass === 'text' && transportedValue instanceof Uint8Array
       ? new TextDecoder(textEncoding, { fatal: true }).decode(transportedValue)
       : transportedValue;
+
+    if (storageClass === 'integer') {
+      if (typeof transportedValue !== 'string') {
+        throw new Error(`SQLite returned invalid exact INTEGER text for ${table}.${column}`);
+      }
+      try {
+        if (BigInt(transportedValue).toString() !== transportedValue) {
+          throw new Error();
+        }
+      } catch {
+        throw new Error(`SQLite returned non-canonical INTEGER text for ${table}.${column}`);
+      }
+      value = transportedValue;
+    }
 
     if (storageClass === 'text' && sourceBytes <= EXPORT_INLINE_TEXT_BYTES && typeof value !== 'string') {
       throw new Error(`SQLite omitted bounded TEXT for ${table}.${column}`);
@@ -270,9 +289,34 @@ async function* readPrimaryKeyTableRows(
   cancellation?: ExportCancellation
 ): AsyncGenerator<ExportRow> {
   const projection = buildCellProjection(columns, EXPORT_INLINE_TEXT_BYTES, false);
-  const selectedKeys = selectedRowIds.length > 0
-    ? new Set(selectedRowIds.map(recordIdKey))
-    : undefined;
+  if (selectedRowIds.length > 0) {
+    const seen = new Set<string>();
+    for (const rowId of selectedRowIds) {
+      assertNotCancelled(cancellation);
+      const key = recordIdKey(rowId);
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      // Bind the values to the opaque identity in the same statement. The old
+      // two-query/index zip could pair a retained identity with an unrelated
+      // replacement row after a concurrent delete+insert of equal cardinality.
+      const predicate = buildRecordIdentityPredicate(rowId, identity);
+      const result = await operations.executeQuery(
+        `SELECT ${projection} FROM ${escapeIdentifier(table)} ` +
+        `WHERE ${predicate.sql} LIMIT 2`,
+        predicate.params
+      );
+      const rows = result[0]?.rows ?? [];
+      if (rows.length > 1) {
+        throw new Error(`Primary-key identity matched multiple rows in ${table}`);
+      }
+      if (rows.length === 1) {
+        yield { cells: parseCells(table, columns, rows[0], 0, textEncoding, rowId) };
+      }
+    }
+    return;
+  }
+
   const orderBy = identity.columns
     .map(column => `${escapeIdentifier(column.identifier)} ASC`)
     .join(', ');
@@ -309,7 +353,6 @@ async function* readPrimaryKeyTableRows(
       if (typeof rowId !== 'string' && typeof rowId !== 'number') {
         throw new Error(`SQLite returned an invalid primary-key identity for ${table}`);
       }
-      if (selectedKeys && !selectedKeys.has(recordIdKey(rowId))) continue;
       yield { cells: parseCells(table, columns, rows[rowIndex], 0, textEncoding, rowId) };
     }
 
@@ -706,6 +749,8 @@ async function writeJsonCell(
     if (cell.storageClass === 'blob') {
       const bytes = cell.value as Uint8Array;
       await emit(sink, JSON.stringify(Buffer.from(bytes).toString('base64')), cancellation);
+    } else if (cell.storageClass === 'integer') {
+      await emit(sink, String(cell.value), cancellation);
     } else {
       await emit(sink, JSON.stringify(cell.value) ?? 'null', cancellation);
     }
@@ -730,7 +775,11 @@ async function writeSqlCell(
   cancellation?: ExportCancellation
 ): Promise<void> {
   if (!needsCellStream(cell)) {
-    await emit(sink, cellValueToSql(cell.value), cancellation);
+    await emit(
+      sink,
+      cell.storageClass === 'integer' ? String(cell.value) : cellValueToSql(cell.value),
+      cancellation
+    );
     return;
   }
 

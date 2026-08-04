@@ -1986,10 +1986,12 @@ describe('NativeWorkerProcess', () => {
 
     it('marks native request deadlines as invocation timeouts for recovery', async () => {
         const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
-        (worker as any).process = {
+        let killCount = 0;
+        const fakeProcess = {
             stdin: { write: () => true },
-            kill: () => {}
+            kill: () => { killCount++; }
         };
+        (worker as any).process = fakeProcess;
 
         try {
             await assert.rejects(
@@ -2001,9 +2003,33 @@ describe('NativeWorkerProcess', () => {
                     return true;
                 }
             );
+            assert.strictEqual(killCount, 0);
+            assert.strictEqual((worker as any).process, fakeProcess);
         } finally {
             worker.stop();
         }
+    });
+
+    it('kills abandoned native open work when its host deadline expires', async () => {
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        let killCount = 0;
+        (worker as any).process = {
+            stdin: { write: () => true },
+            kill: () => { killCount++; }
+        };
+
+        await assert.rejects(
+            worker.call('open', [], 1),
+            (error: unknown) => {
+                assert.ok(error instanceof InvocationTimeoutError);
+                assert.strictEqual(error.methodName, 'open');
+                assert.strictEqual(error.message, 'Request open timed out');
+                return true;
+            }
+        );
+        assert.strictEqual(killCount, 1);
+        assert.strictEqual((worker as any).process, null);
+        assert.strictEqual((worker as any).pendingRequests.size, 0);
     });
 
     it('routes an in-flight bounded-query abort to the worker correlation id', async () => {

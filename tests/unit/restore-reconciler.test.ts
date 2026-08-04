@@ -39,6 +39,34 @@ const roundTripTracker = (
   ModificationTracker.deserialize<LabeledModification>(tracker.serialize());
 
 describe('reconcileRestoredDatabase', () => {
+  it('hot-exit round-trip retains an evicted-scenario barrier for conservative WASM replay', async () => {
+    const applied: LabeledModification[] = [];
+    const operations = {
+      applyModifications: async (entries: LabeledModification[]) => {
+        applied.push(...entries);
+      },
+      undoModification: async () => {}
+    } as unknown as DatabaseOperations;
+    const tracker = new ModificationTracker<LabeledModification>(100);
+    tracker.recordBarrier({
+      ...cellEdit('oversized replacement', 'unretained', 'bounded'),
+      priorValue: undefined,
+      undoPolicy: 'barrier'
+    });
+    for (let index = 0; index < 200; index++) {
+      tracker.record(cellEdit(`later edit ${index}`, String(index), String(index + 1)));
+    }
+
+    const restored = roundTripTracker(tracker);
+    await reconcileRestoredDatabase(operations, restored, 'wasm');
+
+    assert.strictEqual(restored.hasUncommittedHistoryBarrier, true);
+    assert.deepStrictEqual(
+      applied.map(entry => entry.label),
+      ['oversized replacement', ...Array.from({ length: 200 }, (_, index) => `later edit ${index}`)]
+    );
+  });
+
   it('W1: WASM restore reverts a saved-then-undone edit to the undone value', async () => {
     const ops = await freshEngine();
     await ops.insertRow('t', { id: 1, data: 'original' });

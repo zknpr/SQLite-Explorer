@@ -232,6 +232,63 @@ describe('web demo view worker', () => {
             '(1, \'comma, "quote"\nline\', NULL);\n' +
             'INSERT INTO "table_name" ("id", "note", "payload") VALUES (2, NULL, NULL);'
         );
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_export_int64 (value); ' +
+            'INSERT INTO demo_export_int64 VALUES ' +
+            '(9007199254740993), (9223372036854775807), (-9223372036854775808)'
+        );
+        const invokeInt64Export = (format: string) => worker.invoke(
+            'exportTable',
+            { table: 'demo_export_int64' },
+            ['value'],
+            {},
+            {},
+            { format }
+        );
+        const decimalLines =
+            '9007199254740993\n' +
+            '9223372036854775807\n' +
+            '-9223372036854775808';
+        for (const format of ['csv', 'excel']) {
+            const exported = await invokeInt64Export(format);
+            assert.strictEqual(Array.from(exported.contentChunks).join(''), `value\n${decimalLines}`);
+        }
+        const int64Json = await invokeInt64Export('json');
+        assert.strictEqual(
+            Array.from(int64Json.contentChunks).join(''),
+            '[\n' +
+            '  {\n    "value": 9007199254740993\n  },\n' +
+            '  {\n    "value": 9223372036854775807\n  },\n' +
+            '  {\n    "value": -9223372036854775808\n  }\n' +
+            ']'
+        );
+        const int64Sql = await invokeInt64Export('sql');
+        const int64SqlText = Array.from(int64Sql.contentChunks).join('');
+        assert.strictEqual(
+            int64SqlText,
+            'INSERT INTO "demo_export_int64" ("value") VALUES (9007199254740993);\n' +
+            'INSERT INTO "demo_export_int64" ("value") VALUES (9223372036854775807);\n' +
+            'INSERT INTO "demo_export_int64" ("value") VALUES (-9223372036854775808);'
+        );
+        await worker.invoke('runQuery', 'CREATE TABLE demo_export_int64_copy (value)');
+        await worker.invoke(
+            'runQuery',
+            int64SqlText.replaceAll('"demo_export_int64"', '"demo_export_int64_copy"')
+        );
+        const restoredInt64 = await worker.invoke(
+            'runQuery',
+            'SELECT typeof(value), CAST(value AS TEXT) FROM demo_export_int64_copy ORDER BY rowid'
+        );
+        assert.deepStrictEqual(
+            Array.from(restoredInt64[0].rows, (row: unknown[]) => Array.from(row)),
+            [
+                ['integer', '9007199254740993'],
+                ['integer', '9223372036854775807'],
+                ['integer', '-9223372036854775808']
+            ]
+        );
     });
 
     it('splits bounded web-demo output into assembly chunks instead of one response string', async () => {
