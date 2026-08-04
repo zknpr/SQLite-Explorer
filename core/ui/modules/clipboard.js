@@ -5,7 +5,12 @@ import { state } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus, updateToolbarButtons } from './ui.js';
 import { loadTableData } from './grid.js';
-import { getCellValueForDisplay, getRowDataOffset } from './data-utils.js';
+import {
+    getCellValueForDisplay,
+    getRowDataOffset,
+    remapDisplayedRowIdentity,
+    resolveDisplayedCell
+} from './data-utils.js';
 import { validateRowId, escapeIdentifier } from './utils.js';
 
 export async function copyCellsToClipboard() {
@@ -141,7 +146,26 @@ export async function clearSelectedCellValues() {
         }
 
         const label = `Clear ${updates.length} cell${updates.length > 1 ? 's' : ''}`;
-        await backendApi.updateCellBatch(state.selectedTable, updates, label);
+        const outcomes = await backendApi.updateCellBatch(state.selectedTable, updates, label);
+        for (const outcome of outcomes ?? []) {
+            const currentCell = resolveDisplayedCell(
+                state.selectedTable,
+                outcome.rowId,
+                outcome.columnName
+            ) ?? (outcome.newRowId !== undefined
+                ? resolveDisplayedCell(
+                    state.selectedTable,
+                    outcome.newRowId,
+                    outcome.columnName
+                )
+                : null);
+            remapDisplayedRowIdentity(
+                state.selectedTable,
+                outcome.rowId,
+                outcome.newRowId,
+                currentCell
+            );
+        }
 
         // Update local grid
         for (const update of updates) {

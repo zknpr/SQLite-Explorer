@@ -15,6 +15,26 @@ export function getRowId(row, rowIdx) {
     return state.currentPageIndex * state.rowsPerPage + rowIdx;
 }
 
+export function resolveDisplayedCell(targetTable, rowId, columnName) {
+    if (state.selectedTable !== targetTable) return null;
+    const rowIdx = state.gridData.findIndex((row, index) => getRowId(row, index) === rowId);
+    const colIdx = state.tableColumns.findIndex(column => column.name === columnName);
+    return rowIdx >= 0 && colIdx >= 0 ? { rowIdx, colIdx } : null;
+}
+
+export function remapDisplayedRowIdentity(targetTable, oldRowId, newRowId, currentCell) {
+    if (newRowId === undefined || newRowId === oldRowId || state.selectedTable !== targetTable) return;
+    if (currentCell && state.selectedTableType === 'table') {
+        state.gridData[currentCell.rowIdx][0] = newRowId;
+    }
+    for (const ids of [state.selectedRowIds, state.pinnedRowIds]) {
+        if (ids.delete(oldRowId)) ids.add(newRowId);
+    }
+    for (const cell of state.selectedCells) {
+        if (cell.rowId === oldRowId) cell.rowId = newRowId;
+    }
+}
+
 export function getCellValue(row, colIdx) {
     return row[colIdx + getRowDataOffset()];
 }

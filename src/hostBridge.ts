@@ -14,8 +14,15 @@ import { ConfigurationSection, ExtensionId, SidebarLeft, SidebarRight, UriScheme
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity } from './core/types';
 import { prepareCellUpdateForStorage } from './core/json-utils';
+import {
+  buildRecordIdentityPredicate,
+  classifyTableIdentity,
+  decodePrimaryKeyRecordId,
+  isPrimaryKeyRecordId,
+  primaryKeyColumnsFromTableInfo
+} from './core/row-identity';
 import { escapeIdentifier, validateRowId, validateRowIds } from './core/sql-utils';
 import { isViewDefinitionConflictError } from './core/view-utils';
 
@@ -80,26 +87,25 @@ export class HostBridge implements ToastService {
     }
   }
 
-  /**
-   * The grid currently identifies rows through SQLite's hidden rowid. A
-   * WITHOUT ROWID table needs a primary-key identity protocol end-to-end;
-   * reject it before opening a write savepoint until that post-release work
-   * is implemented, rather than leaking a raw "no such column: rowid" error.
-   */
-  private async assertTableSupportsRowIdEdits(
+  /** Resolve declared table identity before interpreting an untrusted RecordId. */
+  private async resolveTableIdentity(
     dbOps: ReturnType<HostBridge['ensureDatabaseInitialized']>,
     table: string
-  ): Promise<void> {
+  ): Promise<TableIdentity> {
     const metadata = await dbOps.executeQuery(
-      `SELECT "wr" FROM pragma_table_list ` +
-      `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' LIMIT 1`,
+      `SELECT "type", "wr" FROM pragma_table_list ` +
+      `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
       [table]
     );
-    if (Number(metadata[0]?.rows[0]?.[0]) === 1) {
-      throw new Error(vsc.l10n.t(
-        'WITHOUT ROWID tables are not editable yet. Primary-key identity editing is planned for a future release.'
-      ));
+    if ((metadata[0]?.rows.length ?? 0) === 0) {
+      throw new Error(`Table not found: ${table}`);
     }
+    const kind = classifyTableIdentity(metadata[0].rows[0][0], metadata[0].rows[0][1]);
+    if (!kind) throw new Error(`Table not found: ${table}`);
+    if (kind === 'rowid') return { kind: 'rowid' };
+    const columns = primaryKeyColumnsFromTableInfo(await dbOps.getTableInfo(table));
+    if (columns.length === 0) throw new Error(`WITHOUT ROWID table ${table} has no declared primary key`);
+    return { kind: 'primaryKey', columns };
   }
 
   /**
@@ -161,7 +167,8 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
-    await this.assertTableSupportsRowIdEdits(dbOps, table);
+    const identity = await this.resolveTableIdentity(dbOps, table);
+    const predicate = buildRecordIdentityPredicate(rowId, identity);
     this.assertConnectionGeneration(connectionGeneration);
 
     // The caller's original value may have been captured before asynchronous
@@ -169,14 +176,20 @@ export class HostBridge implements ToastService {
     // close to the write as possible so undo and JSON patches are based on the
     // database value that this update actually replaces.
     const current = await dbOps.executeQuery(
-      `SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} WHERE rowid = ? LIMIT 1`,
-      [rowId]
+      `SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} ` +
+      `WHERE ${predicate.sql} LIMIT 1`,
+      predicate.params
     );
     const currentRow = current[0]?.rows[0];
     if (!currentRow) {
       throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
     }
-    const priorValue = currentRow[0];
+    const primaryKeyIndex = identity.kind === 'primaryKey'
+      ? identity.columns.findIndex(keyColumn => keyColumn.identifier === column)
+      : -1;
+    const priorValue = primaryKeyIndex >= 0
+      ? predicate.primaryKey!.values[primaryKeyIndex]
+      : currentRow[0];
     const prepared = prepareCellUpdateForStorage(value, priorValue);
     const patch = prepared.operation === 'json_patch' ? String(prepared.value) : undefined;
 
@@ -185,24 +198,28 @@ export class HostBridge implements ToastService {
     // Use specific method instead of generic exec
     // This allows the backend to handle safe SQL construction
     if ('updateCell' in dbOps) {
-      await dbOps.updateCell(table, rowId, column, value, patch);
+      const updatedRowId = await dbOps.updateCell(table, rowId, column, value, patch);
+      const newTargetRowId = updatedRowId ?? rowId;
+
+      // Fire edit event
+      this.document.recordExternalModification({
+        label: 'Update Cell',
+        description: `Update ${table}.${column}`,
+        modificationType: 'cell_update',
+        targetTable: table,
+        targetRowId: rowId,
+        ...(isPrimaryKeyRecordId(rowId) ? { newTargetRowId } : {}),
+        targetColumn: column,
+        newValue: prepared.value,
+        operation: prepared.operation,
+        priorValue
+      });
+      return newTargetRowId;
     } else {
       // Fallback for older backend versions (shouldn't happen if built correctly)
       throw new Error("Backend does not support updateCell");
     }
 
-    // Fire edit event
-    this.document.recordExternalModification({
-      label: 'Update Cell',
-      description: `Update ${table}.${column}`,
-      modificationType: 'cell_update',
-      targetTable: table,
-      targetRowId: rowId,
-      targetColumn: column,
-      newValue: prepared.value,
-      operation: prepared.operation,
-      priorValue
-    });
   }
 
   /**
@@ -223,6 +240,14 @@ export class HostBridge implements ToastService {
       throw new Error("Backend does not support insertRow");
     }
 
+    let historyRowData: Record<string, CellValue> = {};
+    if (rowId !== undefined && isPrimaryKeyRecordId(rowId)) {
+      const primaryKey = decodePrimaryKeyRecordId(rowId);
+      historyRowData = Object.fromEntries(
+        primaryKey.columns.map((column, index) => [column, primaryKey.values[index]])
+      );
+    }
+
     // Fire edit event
     this.document.recordExternalModification({
       label: 'Insert Row',
@@ -230,7 +255,7 @@ export class HostBridge implements ToastService {
       modificationType: 'row_insert',
       targetTable: table,
       targetRowId: rowId,
-      rowData: data
+      rowData: { ...data, ...historyRowData }
     });
 
     return rowId;
@@ -247,9 +272,10 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
-    // Capture row data before deletion for undo
+    // Capture row data before deletion for rowid engines. PK-capable engines
+    // return their atomically captured rows from deleteRows below.
     let deletedRowsData: { rowId: RecordId; row: Record<string, CellValue> }[] = [];
-    try {
+    if (!rowIds.some(isPrimaryKeyRecordId)) {
         const validIds = validateRowIds(rowIds);
         if (validIds.length > 0) {
             const placeholders = validIds.map(() => '?').join(', ');
@@ -283,13 +309,12 @@ export class HostBridge implements ToastService {
                 });
             }
         }
-    } catch (e) {
-        console.warn('Failed to fetch rows for undo history:', e);
     }
 
     this.assertConnectionGeneration(connectionGeneration);
     if ('deleteRows' in dbOps) {
-      await dbOps.deleteRows(table, rowIds);
+      const deletedRows = await dbOps.deleteRows(table, rowIds);
+      if (deletedRows) deletedRowsData = deletedRows;
     } else {
       throw new Error("Backend does not support deleteRows");
     }
@@ -615,9 +640,7 @@ export class HostBridge implements ToastService {
 
     if (updates.length === 0) return;
 
-    await this.assertTableSupportsRowIdEdits(dbOps, table);
     this.assertConnectionGeneration(connectionGeneration);
-
     const historyCells = await dbOps.updateCellBatch(table, updates);
     this.assertConnectionGeneration(connectionGeneration);
 
@@ -629,6 +652,7 @@ export class HostBridge implements ToastService {
       targetTable: table,
       affectedCells: historyCells
     });
+    return historyCells;
   }
 
   /**

@@ -14,6 +14,7 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
   const {
     columns = ['*'],
     orderBy,
+    orderByColumns,
     orderDir = 'ASC',
     limit,
     offset,
@@ -45,8 +46,14 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
     sql += ` WHERE ${whereClauses.join(' AND ')}`;
   }
 
-  if (orderBy) {
-    sql += ` ORDER BY ${escapeIdentifier(orderBy)} ${orderDir === 'DESC' ? 'DESC' : 'ASC'}`;
+  const orderedColumns = orderByColumns?.length
+    ? orderByColumns
+    : (orderBy ? [orderBy] : []);
+  if (orderedColumns.length > 0) {
+    const direction = orderDir === 'DESC' ? 'DESC' : 'ASC';
+    sql += ` ORDER BY ${orderedColumns
+      .map(column => `${escapeIdentifier(column)} ${direction}`)
+      .join(', ')}`;
   }
 
   if (typeof limit === 'number') {

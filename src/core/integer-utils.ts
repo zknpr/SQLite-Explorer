@@ -16,7 +16,8 @@ const SQLITE_MAX_VARIABLE_NUMBER = 32766;
 /** Authoritative main-schema capability check required before companion reads. */
 export const ROWID_TABLE_AUTHORITY_SQL =
   `SELECT 1 FROM pragma_table_list ` +
-  `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' AND "wr" = 0 LIMIT 1`;
+  `WHERE "schema" = 'main' AND "name" = ? AND (` +
+  `("type" = 'table' AND "wr" = 0) OR "type" IN ('virtual', 'shadow')) LIMIT 1`;
 
 export interface ExactNumericTextQuery {
   sql: string;

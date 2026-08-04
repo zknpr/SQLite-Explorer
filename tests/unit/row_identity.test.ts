@@ -1,0 +1,76 @@
+import './vscode_mock_setup';
+
+import assert from 'node:assert';
+import { describe, it } from 'node:test';
+
+import {
+    buildRecordIdentitiesPredicate,
+    decodePrimaryKeyRecordId,
+    encodePrimaryKeyRecordId
+} from '../../src/core/row-identity';
+import type { PrimaryKeyColumn } from '../../src/core/types';
+
+const integerColumn: PrimaryKeyColumn[] = [
+    { identifier: 'id', declaredType: 'INTEGER', position: 1 }
+];
+
+function rawIntegerIdentity(text: string): string {
+    return 'pk:' + encodeURIComponent(JSON.stringify({
+        v: 1,
+        c: [['id', ['integer', text]]]
+    }));
+}
+
+describe('primary-key RecordId canonicalization', () => {
+    it('rejects noncanonical INTEGER spellings while accepting normalized decimal text', () => {
+        for (const alias of ['01', '+1', '-0', ' 1 ']) {
+            assert.throws(
+                () => decodePrimaryKeyRecordId(rawIntegerIdentity(alias)),
+                /canonical|INTEGER identity/,
+                alias
+            );
+        }
+
+        const canonical = rawIntegerIdentity('1');
+        assert.deepStrictEqual(decodePrimaryKeyRecordId(canonical), {
+            columns: ['id'],
+            values: [1]
+        });
+        assert.strictEqual(encodePrimaryKeyRecordId(integerColumn, [1n]), canonical);
+    });
+});
+
+describe('bulk primary-key predicates', () => {
+    it('uses one IN predicate for a single-column primary key', () => {
+        const columns: PrimaryKeyColumn[] = [
+            { identifier: 'key', declaredType: 'TEXT', position: 1 }
+        ];
+        const predicate = buildRecordIdentitiesPredicate(
+            ['alpha', 'beta', 'gamma'].map(value => encodePrimaryKeyRecordId(columns, [value])),
+            { kind: 'primaryKey', columns }
+        );
+
+        assert.strictEqual(predicate.sql, '"key" IN (?, ?, ?)');
+        assert.deepStrictEqual(predicate.params, ['alpha', 'beta', 'gamma']);
+    });
+
+    it('uses a row-value VALUES predicate for a composite primary key', () => {
+        const columns: PrimaryKeyColumn[] = [
+            { identifier: 'tenant', declaredType: 'TEXT', position: 1 },
+            { identifier: 'sequence', declaredType: 'INTEGER', position: 2 }
+        ];
+        const predicate = buildRecordIdentitiesPredicate(
+            [
+                encodePrimaryKeyRecordId(columns, ['north', 1n]),
+                encodePrimaryKeyRecordId(columns, ['south', 2n])
+            ],
+            { kind: 'primaryKey', columns }
+        );
+
+        assert.strictEqual(
+            predicate.sql,
+            '("tenant", "sequence") IN (VALUES (?, ?), (?, ?))'
+        );
+        assert.deepStrictEqual(predicate.params, ['north', 1, 'south', 2]);
+    });
+});

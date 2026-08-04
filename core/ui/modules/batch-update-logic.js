@@ -9,6 +9,8 @@
  * Types live in batch-update-logic.d.ts.
  */
 
+import { hasIntegerOrNumericAffinity } from './utils.js';
+
 /**
  * Group the selected cells by column index.
  * @returns Map of colIdx -> { name, type, values } where `values` is the set
@@ -55,7 +57,12 @@ export function summarizeColumnValue(values) {
  * batch form's rules: skip cells left blank (unless explicitly NULL), tag
  * json_patch operations, and coerce numeric column types.
  */
-export function prepareBatchUpdates(selectedCells, inputsByCol, tableColumns) {
+export function prepareBatchUpdates(
+    selectedCells,
+    inputsByCol,
+    tableColumns,
+    usesDeclaredPrimaryKey = false
+) {
     const updates = [];
     for (const cell of selectedCells) {
         const input = inputsByCol.get(cell.colIdx);
@@ -84,9 +91,16 @@ export function prepareBatchUpdates(selectedCells, inputsByCol, tableColumns) {
             // Normalize case: SQLite stores the declared type verbatim, so a column
             // may report e.g. 'integer' rather than 'INTEGER'.
             const colType = (colDef.type || '').toUpperCase();
-            if ((colType === 'INTEGER' || colType === 'REAL' || colType === 'NUMERIC')
+            const numericValue = Number(value);
+            if (usesDeclaredPrimaryKey
+                && colDef.isPrimaryKey
+                && hasIntegerOrNumericAffinity(colType)
+                && /^[+-]?\d+$/.test(value.trim())
+                && !Number.isSafeInteger(numericValue)) {
+                finalValue = value.trim();
+            } else if ((colType === 'INTEGER' || colType === 'REAL' || colType === 'NUMERIC')
                 && !isNaN(Number(value)) && value.trim() !== '') {
-                finalValue = Number(value);
+                finalValue = numericValue;
             }
         }
 

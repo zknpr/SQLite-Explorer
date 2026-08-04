@@ -7,7 +7,7 @@ import { updateStatus, updateToolbarButtons } from './ui.js';
 import { openModal, closeModal } from './modals.js';
 import { loadTableData, loadTableColumns } from './grid.js';
 import { refreshSchema } from './sidebar.js';
-// No utils imports needed — CRUD operations delegate to backendApi
+import { parseGridInputValue } from './utils.js';
 
 export function initCrud() {
     // --- Toolbar Buttons ---
@@ -49,7 +49,9 @@ export function openAddRowModal() {
     form.replaceChildren(); // Clear existing content
 
     state.tableColumns.forEach(col => {
-        const isRequired = col.notnull === 1 && !col.isPrimaryKey;
+        const usesDeclaredPrimaryKey = state.selectedTableIdentity?.kind === 'primaryKey';
+        const isRequired = (col.notnull === 1 && !col.isPrimaryKey)
+            || (usesDeclaredPrimaryKey && col.isPrimaryKey && col.dflt_value == null);
 
         const div = document.createElement('div');
         div.className = 'form-field';
@@ -76,7 +78,7 @@ export function openAddRowModal() {
         input.dataset.column = col.name;
         input.dataset.required = isRequired.toString();
 
-        if (col.isPrimaryKey) {
+        if (col.isPrimaryKey && !usesDeclaredPrimaryKey) {
             input.placeholder = 'Auto (Primary Key)';
             input.disabled = true;
         } else if (isRequired) {
@@ -126,7 +128,12 @@ export async function submitAddRow() {
             if (value.toLowerCase() === 'null') {
                 rowData[colName] = null;
             } else if (!isNaN(Number(value)) && value !== '') {
-                rowData[colName] = Number(value);
+                const column = state.tableColumns.find(candidate => candidate.name === colName);
+                rowData[colName] = parseGridInputValue(
+                    value,
+                    column,
+                    state.selectedTableIdentity?.kind === 'primaryKey'
+                );
             } else {
                 rowData[colName] = value;
             }

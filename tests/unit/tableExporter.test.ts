@@ -183,6 +183,62 @@ describe('exportTableCommand Fallback', () => {
         }
     });
 
+    it('exports only selected WITHOUT ROWID identities', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE export_pk (tenant TEXT, id INTEGER, value TEXT, PRIMARY KEY (tenant, id)) WITHOUT ROWID'
+        );
+        await operations.executeQuery(
+            'INSERT INTO export_pk VALUES (?, ?, ?), (?, ?, ?)',
+            ['one', '9007199254740993', 'selected', 'two', '9007199254740994', 'excluded']
+        );
+        const fetched = await operations.fetchTableData('export_pk', {
+            columns: ['rowid', 'tenant', 'id', 'value'],
+            orderBy: 'rowid'
+        });
+        const selectedId = fetched.rows.find(row => row[1] === 'one')![0] as string;
+
+        const uri = mockVscode.Uri.file('/test/export-pk.csv');
+        const originalShowSaveDialog = mockVscode.window.showSaveDialog;
+        mockVscode.window.showSaveDialog = async (): Promise<any> => uri;
+        const fs = require('fs');
+        const originalCreateWriteStream = fs.createWriteStream;
+        let exported = '';
+        DocumentRegistry.set('export-pk', {
+            uri: mockVscode.Uri.parse('vscode-sqlite://export-pk.db'),
+            databaseOperations: operations
+        } as any);
+
+        try {
+            fs.createWriteStream = () => ({
+                write: (chunk: string) => { exported += chunk; },
+                end: () => {}
+            });
+            await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'export_pk', uri: 'vscode-sqlite://export-pk.db' },
+                ['tenant', 'id', 'value'],
+                undefined,
+                undefined,
+                { format: 'csv', rowIds: [selectedId] }
+            );
+
+            assert.match(exported, /selected/);
+            assert.doesNotMatch(exported, /excluded/);
+        } finally {
+            fs.createWriteStream = originalCreateWriteStream;
+            mockVscode.window.showSaveDialog = originalShowSaveDialog;
+            DocumentRegistry.delete('export-pk');
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('should use fallback memory export if stream write fails', async () => {
         const docUri = mockVscode.Uri.parse('vscode-sqlite://test.db');
         const uri = mockVscode.Uri.file('/test/export.csv');

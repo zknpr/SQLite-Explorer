@@ -5,7 +5,8 @@ import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus } from './ui.js';
 import { loadTableData, loadTableColumns } from './grid.js';
-import { getCellValueForDisplay, getRowDataOffset } from './data-utils.js';
+import { getCellValueForDisplay, getRowDataOffset, getRowId } from './data-utils.js';
+import { updateSelectionStates } from './grid-selection.js';
 import { openCreateTableModal } from './crud.js';
 import { openSettingsModal } from './settings.js';
 import { openCreateViewModal, openEditViewModal, dropViewFromSidebar } from './views.js';
@@ -131,9 +132,15 @@ export async function refreshSchema() {
     try {
         const schema = await backendApi.fetchSchema();
 
-        state.schemaCache.tables = (schema.tables || []).map(t => ({ name: t.identifier }));
+        state.schemaCache.tables = (schema.tables || []).map(t => ({
+            name: t.identifier,
+            ...(t.identity ? { identity: t.identity } : {})
+        }));
         state.schemaCache.views = (schema.views || []).map(v => ({ name: v.identifier }));
         state.schemaCache.indexes = (schema.indexes || []).map(i => ({ name: i.identifier, table: i.parentTable }));
+        state.selectedTableIdentity = state.selectedTableType === 'table'
+            ? state.schemaCache.tables.find(table => table.name === state.selectedTable)?.identity ?? null
+            : null;
 
         renderSidebar();
 
@@ -398,7 +405,12 @@ export async function applyBatchUpdate() {
     }
 
     // 2. Processing Phase — value coercion / NULL / json_patch (see batch-update-logic.js)
-    const updates = prepareBatchUpdates(state.selectedCells, inputsByCol, state.tableColumns);
+    const updates = prepareBatchUpdates(
+        state.selectedCells,
+        inputsByCol,
+        state.tableColumns,
+        state.selectedTableIdentity?.kind === 'primaryKey'
+    );
 
     if (updates.length === 0) {
         updateStatus('No values entered for batch update');
@@ -418,7 +430,25 @@ export async function applyBatchUpdate() {
             operation: u.operation
         }));
 
-        await backendApi.updateCellBatch(state.selectedTable, backendUpdates, label);
+        const outcomes = await backendApi.updateCellBatch(state.selectedTable, backendUpdates, label);
+        const identityChanges = new Map();
+        for (const outcome of outcomes ?? []) {
+            if (outcome.newRowId === undefined || outcome.newRowId === outcome.rowId) continue;
+            const existing = identityChanges.get(outcome.rowId);
+            if (existing !== undefined && existing !== outcome.newRowId) {
+                throw new Error('Batch update returned inconsistent row identities');
+            }
+            identityChanges.set(outcome.rowId, outcome.newRowId);
+        }
+        for (const identities of [state.selectedRowIds, state.pinnedRowIds]) {
+            for (const [oldIdentity, newIdentity] of identityChanges) {
+                if (identities.delete(oldIdentity)) identities.add(newIdentity);
+            }
+        }
+        const selectedCellTargets = state.selectedCells.map(cell => ({
+            rowId: identityChanges.get(cell.rowId) ?? cell.rowId,
+            columnName: state.tableColumns[cell.colIdx]?.name
+        }));
 
         // Update local grid data
         const hasPatch = updates.some(u => u.operation === 'json_patch');
@@ -429,15 +459,34 @@ export async function applyBatchUpdate() {
             }
         }
 
-        // Refresh grid and sidebar
+        // Refresh by identity because a PK edit can also move the row in the
+        // table's default ordering.
+        state.selectedCells = [];
         await loadTableData(false);
 
         const freshSelectedCells = [];
-        for (const oldCell of state.selectedCells) {
-            const newValue = state.gridData[oldCell.rowIdx][oldCell.colIdx + getRowDataOffset()];
-            freshSelectedCells.push({ ...oldCell, value: newValue });
+        for (const target of selectedCellTargets) {
+            if (!target.columnName) continue;
+            const rowIdx = state.gridData.findIndex((row, index) => (
+                getRowId(row, index) === target.rowId
+            ));
+            const colIdx = state.tableColumns.findIndex(column => column.name === target.columnName);
+            if (rowIdx < 0 || colIdx < 0) continue;
+            freshSelectedCells.push({
+                rowIdx,
+                colIdx,
+                rowId: target.rowId,
+                value: getCellValueForDisplay(state.gridData[rowIdx], rowIdx, colIdx)
+            });
         }
         state.selectedCells = freshSelectedCells;
+        state.lastSelectedCell = freshSelectedCells.length > 0
+            ? {
+                rowIdx: freshSelectedCells[freshSelectedCells.length - 1].rowIdx,
+                colIdx: freshSelectedCells[freshSelectedCells.length - 1].colIdx
+            }
+            : null;
+        updateSelectionStates();
 
         updateBatchSidebar();
 
@@ -500,6 +549,9 @@ export function toggleSection(section) {
 export async function selectTableItem(name, type) {
     state.selectedTable = name;
     state.selectedTableType = type;
+    state.selectedTableIdentity = type === 'table'
+        ? state.schemaCache.tables.find(table => table.name === name)?.identity ?? null
+        : null;
     state.currentPageIndex = 0;
     state.sortedColumn = null;
     state.sortAscending = true;
