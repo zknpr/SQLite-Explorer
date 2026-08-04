@@ -5,6 +5,16 @@
  * specifically handling Uint8Array to Base64 conversion for efficient transfer.
  */
 
+import {
+  WEBVIEW_TRANSPORT_SURFACES,
+  assertWebviewTransportPayload,
+  type WebviewTransportLimits
+} from './webview-transport';
+
+const DEFAULT_SERIALIZATION_LIMITS: WebviewTransportLimits = {
+  surface: WEBVIEW_TRANSPORT_SURFACES.coreSerialization
+};
+
 /**
  * Encode Uint8Array to Base64 string.
  * Uses Buffer for efficient encoding in Node.js environment.
@@ -12,7 +22,11 @@
  * @param bytes - Binary data to encode
  * @returns Base64 encoded string
  */
-export function uint8ArrayToBase64(bytes: Uint8Array): string {
+export function uint8ArrayToBase64(
+  bytes: Uint8Array,
+  limits: WebviewTransportLimits = DEFAULT_SERIALIZATION_LIMITS
+): string {
+  assertWebviewTransportPayload(bytes, limits);
   return Buffer.from(bytes).toString('base64');
 }
 
@@ -22,7 +36,11 @@ export function uint8ArrayToBase64(bytes: Uint8Array): string {
  * @param base64 - Base64 encoded string
  * @returns Decoded binary data
  */
-export function base64ToUint8Array(base64: string): Uint8Array {
+export function base64ToUint8Array(
+  base64: string,
+  limits: WebviewTransportLimits = DEFAULT_SERIALIZATION_LIMITS
+): Uint8Array {
+  assertWebviewTransportPayload({ __type: 'Uint8Array', base64 }, limits);
   return new Uint8Array(Buffer.from(base64, 'base64'));
 }
 
@@ -36,15 +54,23 @@ export function base64ToUint8Array(base64: string): Uint8Array {
  * @param value - Value to serialize
  * @returns Serialized value safe for postMessage
  */
-export function serializeValue(value: unknown): unknown {
+export function serializeValue(
+  value: unknown,
+  limits: WebviewTransportLimits = DEFAULT_SERIALIZATION_LIMITS
+): unknown {
+  assertWebviewTransportPayload(value, limits);
+  return serializeValueUnchecked(value);
+}
+
+function serializeValueUnchecked(value: unknown): unknown {
   // Handle Uint8Array by converting to Base64 marker object
   if (value instanceof Uint8Array) {
-    return { __type: 'Uint8Array', base64: uint8ArrayToBase64(value) };
+    return { __type: 'Uint8Array', base64: Buffer.from(value).toString('base64') };
   }
   // Handle other ArrayBuffer views (like DataView)
   if (ArrayBuffer.isView(value)) {
     const uint8 = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-    return { __type: 'Uint8Array', base64: uint8ArrayToBase64(uint8) };
+    return { __type: 'Uint8Array', base64: Buffer.from(uint8).toString('base64') };
   }
   // Recursively serialize plain object properties only
   // Using Object.prototype.toString for robust object detection (handles null prototype)
@@ -53,14 +79,14 @@ export function serializeValue(value: unknown): unknown {
     const result: Record<string, unknown> = {};
     for (const key in obj) {
       if (Object.prototype.hasOwnProperty.call(obj, key)) {
-        result[key] = serializeValue(obj[key]);
+        result[key] = serializeValueUnchecked(obj[key]);
       }
     }
     return result;
   }
   // Recursively serialize arrays
   if (Array.isArray(value)) {
-    return value.map(serializeValue);
+    return value.map(serializeValueUnchecked);
   }
   return value;
 }
@@ -76,7 +102,15 @@ export function serializeValue(value: unknown): unknown {
  * @param value - Value to deserialize
  * @returns Deserialized value
  */
-export function deserializeValue(value: unknown): unknown {
+export function deserializeValue(
+  value: unknown,
+  limits: WebviewTransportLimits = DEFAULT_SERIALIZATION_LIMITS
+): unknown {
+  assertWebviewTransportPayload(value, limits);
+  return deserializeValueUnchecked(value);
+}
+
+function deserializeValueUnchecked(value: unknown): unknown {
   // Check for our Uint8Array serialization marker
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     const obj = value as Record<string, unknown>;
@@ -86,7 +120,7 @@ export function deserializeValue(value: unknown): unknown {
       // Check for Base64 format (new, preferred): { __type: 'Uint8Array', base64: '...' }
       if (typeof obj.base64 === 'string') {
         if (keys.length === 2 && keys.includes('__type') && keys.includes('base64')) {
-          return base64ToUint8Array(obj.base64);
+          return new Uint8Array(Buffer.from(obj.base64, 'base64'));
         }
       }
 
@@ -102,13 +136,13 @@ export function deserializeValue(value: unknown): unknown {
     const result: Record<string, unknown> = {};
     for (const key in obj) {
       if (Object.prototype.hasOwnProperty.call(obj, key)) {
-        result[key] = deserializeValue(obj[key]);
+        result[key] = deserializeValueUnchecked(obj[key]);
       }
     }
     return result;
   }
   if (Array.isArray(value)) {
-    return value.map(deserializeValue);
+    return value.map(deserializeValueUnchecked);
   }
   return value;
 }
@@ -118,6 +152,9 @@ export function deserializeValue(value: unknown): unknown {
  * @param args - Arguments to deserialize
  * @returns Deserialized arguments
  */
-export function deserializeArgs(args: unknown[]): unknown[] {
-  return args.map(deserializeValue);
+export function deserializeArgs(
+  args: unknown[],
+  limits: WebviewTransportLimits = DEFAULT_SERIALIZATION_LIMITS
+): unknown[] {
+  return deserializeValue(args, limits) as unknown[];
 }

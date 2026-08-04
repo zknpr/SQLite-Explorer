@@ -18,6 +18,7 @@ import { WebviewCollection } from './webview-collection';
 import { SupportsWriteMode, IsRemoteWorkspaceMode, DatabaseDocument, isAutoCommitEnabled } from './databaseModel';
 
 import { buildMethodProxy } from './core/rpc';
+import { WEBVIEW_TRANSPORT_SURFACES, assertWebviewTransportPayload } from './core/webview-transport';
 import { WebviewMessageHandler } from './webviewMessageHandler';
 import type { CellMaterializationService } from './cellMaterialization';
 
@@ -187,7 +188,12 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
 
     // Create RPC proxy for webview communication
     const webviewBridge = buildMethodProxy<WebviewBridgeFunctions>(
-      (msg) => webviewPanel.webview.postMessage(msg),
+      (msg) => {
+        assertWebviewTransportPayload(msg, {
+          surface: WEBVIEW_TRANSPORT_SURFACES.hostRequest
+        });
+        webviewPanel.webview.postMessage(msg);
+      },
       ['updateColorScheme', 'updateCellEditBehavior', 'refreshContent']
     );
     this.webviewBridges.set(webviewPanel, webviewBridge);
@@ -203,7 +209,20 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     );
     webviewPanel.webview.onDidReceiveMessage((message) => messageHandler.handleMessage(message));
 
-    webviewPanel.webview.options = { enableScripts: true };
+    // Keep the default file grant to the one extension asset directory the
+    // page loads. HostBridge temporarily adds exactly one Stage-B run
+    // directory while an oversized media URI lease is active.
+    const codiconsRoot = vsc.Uri.joinPath(
+      this.context.extensionUri,
+      'node_modules',
+      '@vscode',
+      'codicons',
+      'dist'
+    );
+    webviewPanel.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [codiconsRoot]
+    };
     webviewPanel.webview.html = await this.#generateWebviewHtml(webviewPanel, document, webviewId);
 
     document.hasActiveViewer = webviewPanel.active;
@@ -246,9 +265,11 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       [cspUtil.styleSrc]: [webview.cspSource, `'nonce-${nonce}'`],
       [cspUtil.imgSrc]: [webview.cspSource, cspUtil.data, cspUtil.blob],
       [cspUtil.fontSrc]: [webview.cspSource],
-      [cspUtil.frameSrc]: [cspUtil.none],
-      [cspUtil.childSrc]: [cspUtil.blob],
-      [cspUtil.mediaSrc]: [cspUtil.blob],  // Required for video/audio blob playback in blob inspector
+      // Oversized media uses asWebviewUri for a 0600 Stage-B file. PDFs are
+      // additionally rendered in an empty-sandbox iframe in the inspector.
+      [cspUtil.frameSrc]: [webview.cspSource],
+      [cspUtil.childSrc]: [webview.cspSource, cspUtil.blob],
+      [cspUtil.mediaSrc]: [webview.cspSource, cspUtil.blob],
     };
 
     // Only set csp for hosts that are known to correctly set `webview.cspSource`

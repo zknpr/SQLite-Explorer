@@ -4,6 +4,12 @@
  */
 
 import { RPC_TIMEOUT_MS, getRpcTimeoutMs } from './rpc-constants.js';
+import {
+    WEBVIEW_TRANSPORT_SURFACES,
+    assertWebviewTransportPayload,
+    errorFromRpcResponse,
+    rpcErrorFields
+} from './transport.js';
 
 export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
 
@@ -153,6 +159,9 @@ async function serializeValueAsync(value) {
  * @returns {Promise<Array>} Serialized arguments
  */
 async function serializeArgsAsync(args) {
+    assertWebviewTransportPayload(args, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
+    });
     return Promise.all(args.map(serializeValueAsync));
 }
 
@@ -168,6 +177,10 @@ async function serializeArgsAsync(args) {
  * @returns {*} Deserialized value
  */
 function deserializeValue(value) {
+    if (value instanceof Uint8Array) return value;
+    if (ArrayBuffer.isView(value)) {
+        return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    }
     // Check for Uint8Array serialization marker from extension host
     if (value && typeof value === 'object' && !Array.isArray(value)) {
         const keys = Object.keys(value);
@@ -206,9 +219,30 @@ function deserializeValue(value) {
 export async function sendRpcRequest(method, args) {
     const messageId = `rpc_${++rpcMessageId}_${Date.now()}`;
 
+    // Measure the complete raw envelope before Base64 can allocate an expanded
+    // copy of any binary argument.
+    assertWebviewTransportPayload({
+        channel: 'rpc',
+        content: { kind: 'invoke', messageId, targetMethod: method, payload: args }
+    }, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
+    });
+
     // Serialize args asynchronously to handle Uint8Array without blocking UI
     // This is done before setting up the timeout to ensure encoding time is included
     const serializedArgs = await serializeArgsAsync(args);
+    const outboundMessage = {
+        channel: 'rpc',
+        content: {
+            kind: 'invoke',
+            messageId,
+            targetMethod: method,
+            payload: serializedArgs
+        }
+    };
+    assertWebviewTransportPayload(outboundMessage, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
+    });
 
     return new Promise((resolve, reject) => {
         const timeoutMs = getRpcTimeoutMs(method);
@@ -222,15 +256,7 @@ export async function sendRpcRequest(method, args) {
         pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
 
         if (vscodeApi) {
-            vscodeApi.postMessage({
-                channel: 'rpc',
-                content: {
-                    kind: 'invoke',
-                    messageId,
-                    targetMethod: method,
-                    payload: serializedArgs
-                }
-            });
+            vscodeApi.postMessage(outboundMessage);
         } else {
             console.warn('VS Code API not available');
         }
@@ -249,12 +275,18 @@ export function handleRpcResponse(message) {
         if (pending.timeoutId !== undefined) clearTimeout(pending.timeoutId);
         pendingRpcCalls.delete(message.messageId);
 
-        if (message.success) {
-            // Deserialize the response data to restore Uint8Array instances
-            const deserializedData = deserializeValue(message.data);
-            pending.resolve(deserializedData);
-        } else {
-            pending.reject(new Error(message.errorMessage || 'RPC failed'));
+        try {
+            assertWebviewTransportPayload(message, {
+                surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
+            });
+            if (message.success) {
+                const deserializedData = deserializeValue(message.data);
+                pending.resolve(deserializedData);
+            } else {
+                pending.reject(errorFromRpcResponse(message));
+            }
+        } catch (error) {
+            pending.reject(error);
         }
     }
 }
@@ -264,25 +296,34 @@ export function handleRpcResponse(message) {
  * Called when the host invokes a method on the webview.
  */
 export function sendRpcResult(correlationId, result) {
+    const message = {
+        kind: 'result',
+        correlationId,
+        payload: result
+    };
+    assertWebviewTransportPayload(message, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.webviewResponse
+    });
     if (vscodeApi) {
-        vscodeApi.postMessage({
-            kind: 'result',
-            correlationId,
-            payload: result
-        });
+        vscodeApi.postMessage(message);
     }
 }
 
 /**
  * Send an RPC error back to the extension host.
  */
-export function sendRpcError(correlationId, errorText) {
+export function sendRpcError(correlationId, error) {
+    const message = {
+        kind: 'result',
+        correlationId,
+        errorText: error instanceof Error ? error.message : String(error),
+        ...rpcErrorFields(error)
+    };
+    assertWebviewTransportPayload(message, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.webviewResponse
+    });
     if (vscodeApi) {
-        vscodeApi.postMessage({
-            kind: 'result',
-            correlationId,
-            errorText
-        });
+        vscodeApi.postMessage(message);
     }
 }
 
@@ -326,6 +367,10 @@ export const backendApi = {
     getExtensionSettings: () => sendRpcRequest('getExtensionSettings', []),
     updateExtensionSetting: (key, value) => sendRpcRequest('updateExtensionSetting', [key, value]),
     ping: () => sendRpcRequest('ping', []),
+    prepareCellMediaPreview: (params, rowId, colName, options) =>
+        sendRpcRequest('prepareCellMediaPreview', [params, rowId, colName, options]),
+    releaseCellMediaPreview: (webviewId, previewId) =>
+        sendRpcRequest('releaseCellMediaPreview', [webviewId, previewId]),
     openCellEditor: (params, rowId, colName, colTypes, options) => sendRpcRequest('openCellEditor', [params, rowId, colName, colTypes, options]),
     openViewEditor: (view, webviewId) => sendRpcRequest('openViewEditor', [view, webviewId]),
     readWorkspaceFileUri: (uri) => sendRpcRequest('readWorkspaceFileUri', [uri]),

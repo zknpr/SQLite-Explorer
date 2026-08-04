@@ -156,6 +156,17 @@ describe('RPC', () => {
       assert.strictEqual(transfer.length, 1);
       assert.strictEqual(transfer[0], buffer);
     });
+
+    it('rejects and removes pending state when a transport dispatcher throws', async () => {
+      const boundaryError = new Error('boundary rejected request');
+      const proxy = buildMethodProxy<{ sendData: (data: unknown) => Promise<void> }>(
+        () => { throw boundaryError; },
+        ['sendData']
+      );
+
+      await assert.rejects(proxy.sendData('payload'), error => error === boundaryError);
+      assert.strictEqual(proxy.__pendingInvocations.size, 0);
+    });
   });
 
   it('preserves invocation-timeout identity across a worker response', async () => {

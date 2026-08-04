@@ -7,6 +7,13 @@
  */
 
 import { RPC_TIMEOUT_MS, getRpcTimeoutMs } from './rpc-constants.js';
+import {
+    MAX_WEBVIEW_BINARY_VALUE_BYTES,
+    WEBVIEW_TRANSPORT_SURFACES,
+    assertWebviewTransportPayload,
+    errorFromRpcResponse,
+    rpcErrorFields
+} from './transport.js';
 
 export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
 
@@ -197,6 +204,9 @@ async function serializeValueAsync(value) {
  * @returns {Promise<Array>} Serialized arguments
  */
 async function serializeArgsAsync(args) {
+    assertWebviewTransportPayload(args, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeRequest
+    });
     return Promise.all(args.map(serializeValueAsync));
 }
 
@@ -212,6 +222,10 @@ async function serializeArgsAsync(args) {
  * @returns {*} Deserialized value
  */
 function deserializeValue(value) {
+    if (value instanceof Uint8Array) return value;
+    if (ArrayBuffer.isView(value)) {
+        return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    }
     // Check for Uint8Array serialization marker
     if (value && typeof value === 'object' && !Array.isArray(value)) {
         const keys = Object.keys(value);
@@ -253,10 +267,29 @@ function deserializeValue(value) {
 export async function sendRpcRequest(method, args) {
     const messageId = `rpc_${++rpcMessageId}_${Date.now()}`;
 
+    assertWebviewTransportPayload({
+        channel: 'rpc',
+        content: { kind: 'invoke', messageId, targetMethod: method, payload: args }
+    }, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeRequest
+    });
+
     // Serialize args asynchronously to handle Uint8Array without blocking UI
     // This is done before setting up the timeout to ensure encoding time is included
     const serializedArgs = await serializeArgsAsync(args);
     const targetOrigin = await parentOriginReady;
+    const outboundMessage = {
+        channel: 'rpc',
+        content: {
+            kind: 'invoke',
+            messageId,
+            targetMethod: method,
+            payload: serializedArgs
+        }
+    };
+    assertWebviewTransportPayload(outboundMessage, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeRequest
+    });
 
     return new Promise((resolve, reject) => {
         const timeoutMs = getRpcTimeoutMs(method);
@@ -270,15 +303,7 @@ export async function sendRpcRequest(method, args) {
         pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
 
         // Post message to parent window instead of VS Code API
-        parentWindow.postMessage({
-            channel: 'rpc',
-            content: {
-                kind: 'invoke',
-                messageId,
-                targetMethod: method,
-                payload: serializedArgs
-            }
-        }, targetOrigin);
+        parentWindow.postMessage(outboundMessage, targetOrigin);
     });
 }
 
@@ -294,12 +319,18 @@ export function handleRpcResponse(message) {
         if (pending.timeoutId !== undefined) clearTimeout(pending.timeoutId);
         pendingRpcCalls.delete(message.messageId);
 
-        if (message.success) {
-            // Deserialize the response data to restore Uint8Array instances
-            const deserializedData = deserializeValue(message.data);
-            pending.resolve(deserializedData);
-        } else {
-            pending.reject(new Error(message.errorMessage || 'RPC failed'));
+        try {
+            assertWebviewTransportPayload(message, {
+                surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeResponse
+            });
+            if (message.success) {
+                const deserializedData = deserializeValue(message.data);
+                pending.resolve(deserializedData);
+            } else {
+                pending.reject(errorFromRpcResponse(message));
+            }
+        } catch (error) {
+            pending.reject(error);
         }
     }
 }
@@ -311,11 +342,15 @@ export function handleRpcResponse(message) {
  * @param {*} result - Result to send
  */
 export function sendRpcResult(correlationId, result) {
-    parentWindow.postMessage({
+    const message = {
         kind: 'result',
         correlationId,
         payload: result
-    }, requireTargetOrigin());
+    };
+    assertWebviewTransportPayload(message, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeResult
+    });
+    parentWindow.postMessage(message, requireTargetOrigin());
 }
 
 /**
@@ -323,12 +358,17 @@ export function sendRpcResult(correlationId, result) {
  * @param {string} correlationId - Message ID
  * @param {string} errorText - Error message
  */
-export function sendRpcError(correlationId, errorText) {
-    parentWindow.postMessage({
+export function sendRpcError(correlationId, error) {
+    const message = {
         kind: 'result',
         correlationId,
-        errorText
-    }, requireTargetOrigin());
+        errorText: error instanceof Error ? error.message : String(error),
+        ...rpcErrorFields(error)
+    };
+    assertWebviewTransportPayload(message, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeResult
+    });
+    parentWindow.postMessage(message, requireTargetOrigin());
 }
 
 // Backend API proxy
@@ -409,7 +449,25 @@ export const backendApi = {
     ping: () => sendRpcRequest('ping', []),
 
     // VS Code specific - disabled in web mode
-    openCellEditor: () => Promise.resolve({ success: false, message: 'Not available in web mode' }),
+    prepareCellMediaPreview: (_params, _rowId, _colName, options = {}) => {
+        const sourceBytes = Number.isSafeInteger(options.sourceByteLength)
+            ? options.sourceByteLength
+            : 'unknown';
+        return Promise.resolve({
+            success: false,
+            message:
+                `Oversized media preview refused in the web demo: ${sourceBytes} bytes ` +
+                `exceeds the ${MAX_WEBVIEW_BINARY_VALUE_BYTES}-byte webview binary limit. ` +
+                'Only the bounded Text/Hex preview is available; transferable streaming is not implemented.'
+        });
+    },
+    releaseCellMediaPreview: () => Promise.resolve(),
+    openCellEditor: (_params, _rowId, _colName, _colTypes, options = {}) => Promise.resolve({
+        success: false,
+        message:
+            `Full oversized content (${options.sourceByteLength ?? 'unknown'} bytes) is unavailable ` +
+            'in the web demo; use the bounded Text/Hex preview.'
+    }),
     openViewEditor: () => Promise.resolve({ success: false, message: 'Not available in web mode' }),
     readWorkspaceFileUri: () => Promise.resolve(null),
     triggerUndo: () => Promise.resolve(),

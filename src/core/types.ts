@@ -111,10 +111,10 @@ export type TableIdentity =
 /**
  * Result set from a database query execution.
  * Contains column headers and row data.
- * Includes multiple naming conventions for compatibility:
+ * Internal engines retain multiple naming conventions for compatibility:
  * - headers/rows: Primary naming convention
  * - columns/values: sql.js compatible aliases
- * - columnNames/records: Used by webview (core/ui/viewer.html) for schema queries
+ * HostBridge projects webview-bound results to the canonical headers/rows pair.
  */
 export interface QueryResultSet {
   /** Column names in order (primary naming) */
@@ -127,15 +127,18 @@ export interface QueryResultSet {
   oversizedCells?: OversizedCellMap;
   /** Rows whose database identity was deliberately not transported. */
   readOnlyRowReasons?: ReadOnlyRowReasonMap;
-  /** Column names - sql.js compatible alias for webview */
+  /** Column names - sql.js compatible internal alias */
   columns?: string[];
-  /** Row data - sql.js compatible alias for webview */
+  /** Row data - sql.js compatible internal alias */
   values?: CellValue[][];
   /** Column names - webview schema query compatibility */
   columnNames?: string[];
   /** Row data - webview schema query compatibility (core/ui/viewer.html) */
   records?: CellValue[][];
 }
+
+/** Canonical result DTO crossing from HostBridge into the webview. */
+export type WebviewQueryResultSet = Omit<QueryResultSet, 'values' | 'records'>;
 
 /**
  * Column metadata from PRAGMA table_info.

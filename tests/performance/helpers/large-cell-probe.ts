@@ -10,8 +10,12 @@ import * as vscode from 'vscode';
 import { createNativeDatabaseConnection } from '../../../src/nativeWorker';
 import { serializeValue } from '../../../src/core/serialization';
 import { ModificationTracker } from '../../../src/core/undo-history';
-import { HostBridge } from '../../../src/hostBridge';
+import { HostBridge, toWebviewQueryResultSet } from '../../../src/hostBridge';
 import { CellMaterializationService } from '../../../src/cellMaterialization';
+import {
+  WEBVIEW_TRANSPORT_SURFACES,
+  toWebviewPayloadLimitErrorData
+} from '../../../src/core/webview-transport';
 import { DocumentRegistry } from '../../../src/documentRegistry';
 import { exportTableCommand } from '../../../src/tableExporter';
 import type { DatabaseConnectionBundle } from '../../../src/connectionTypes';
@@ -110,6 +114,21 @@ function emit(payload: Record<string, unknown>): void {
   process.stdout.write(`LARGE_CELL_PROBE ${JSON.stringify(payload)}\n`);
 }
 
+function transportErrorFields(error: unknown): Record<string, unknown> {
+  const typed = toWebviewPayloadLimitErrorData(error);
+  return typed
+    ? {
+      errorName: typed.name,
+      errorCode: typed.code,
+      errorSurface: typed.surface,
+      errorKind: typed.kind,
+      errorActualBytes: typed.actualBytes,
+      errorLimitBytes: typed.limitBytes,
+      errorMessage: typed.message
+    }
+    : { error: diagnostic(error) };
+}
+
 async function openNative(
   databasePath: string,
   readOnly: boolean
@@ -179,7 +198,8 @@ async function probeGridFetch(options: ProbeOptions): Promise<Record<string, unk
   return withNative(options.fixture, true, async operations => {
     const { result, value } = await fetchGridCell(operations, options.kind);
     const metadata = result.oversizedCells?.[0]?.[2];
-    const serializedResponseChars = JSON.stringify(serializeValue(result)).length;
+    const webviewResult = toWebviewQueryResultSet(result);
+    const serializedResponseChars = JSON.stringify(serializeValue(webviewResult)).length;
     const after = memorySnapshot();
     return {
       mode: options.mode,
@@ -191,6 +211,8 @@ async function probeGridFetch(options: ProbeOptions): Promise<Record<string, unk
       storageClass: metadata?.storageClass,
       sourceCellBytes: metadata?.byteLength,
       serializedResponseChars,
+      hasValuesAlias: 'values' in webviewResult,
+      hasRecordsAlias: 'records' in webviewResult,
       maxRssBytes: after.maxRssBytes,
       elapsedMs: performance.now() - startedAt,
       memoryBefore: before,
@@ -225,55 +247,35 @@ async function probeWindowedRead(options: ProbeOptions): Promise<Record<string, 
 async function probeHostWebviewResponse(options: ProbeOptions): Promise<Record<string, unknown>> {
   const before = memorySnapshot();
   const startedAt = performance.now();
-  return withNative(options.fixture, true, async operations => {
-    const { result, value } = await fetchGridCell(operations, 'blob');
-    let serialized: any;
-    try {
-      serialized = serializeValue(result);
-    } catch (error) {
-      return {
-        mode: options.mode,
-        rawCellBytes: cellByteLength(value),
-        failureStage: 'base64-serialize',
-        error: diagnostic(error),
-        elapsedMs: performance.now() - startedAt,
-        memoryBefore: before,
-        memoryAfter: memorySnapshot()
-      };
-    }
-
-    const rowsBase64Chars = serialized?.rows?.[0]?.[2]?.base64?.length ?? 0;
-    const valuesBase64Chars = serialized?.values?.[0]?.[2]?.base64?.length ?? 0;
-    try {
-      const json = JSON.stringify({
-        channel: 'rpc',
-        content: { kind: 'response', success: true, data: serialized }
-      });
-      return {
-        mode: options.mode,
-        rawCellBytes: cellByteLength(value),
-        failureStage: 'unbounded-success',
-        rowsBase64Chars,
-        valuesBase64Chars,
-        jsonChars: json.length,
-        elapsedMs: performance.now() - startedAt,
-        memoryBefore: before,
-        memoryAfter: memorySnapshot()
-      };
-    } catch (error) {
-      return {
-        mode: options.mode,
-        rawCellBytes: cellByteLength(value),
-        failureStage: 'json-stringify',
-        rowsBase64Chars,
-        valuesBase64Chars,
-        error: diagnostic(error),
-        elapsedMs: performance.now() - startedAt,
-        memoryBefore: before,
-        memoryAfter: memorySnapshot()
-      };
-    }
-  });
+  const raw = new Uint8Array(options.sizeBytes);
+  raw.fill(0x42);
+  try {
+    serializeValue({ headers: ['payload'], rows: [[raw]] }, {
+      surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
+    });
+    const after = memorySnapshot();
+    return {
+      mode: options.mode,
+      rawCellBytes: raw.byteLength,
+      failureStage: 'unbounded-success',
+      maxRssBytes: after.maxRssBytes,
+      elapsedMs: performance.now() - startedAt,
+      memoryBefore: before,
+      memoryAfter: after
+    };
+  } catch (error) {
+    const after = memorySnapshot();
+    return {
+      mode: options.mode,
+      rawCellBytes: raw.byteLength,
+      failureStage: toWebviewPayloadLimitErrorData(error) ? 'size-guard' : 'serialize-error',
+      ...transportErrorFields(error),
+      maxRssBytes: after.maxRssBytes,
+      elapsedMs: performance.now() - startedAt,
+      memoryBefore: before,
+      memoryAfter: after
+    };
+  }
 }
 
 async function probeWebviewUpdateRequest(options: ProbeOptions): Promise<Record<string, unknown>> {
@@ -281,35 +283,42 @@ async function probeWebviewUpdateRequest(options: ProbeOptions): Promise<Record<
   const startedAt = performance.now();
   const bytes = new Uint8Array(options.sizeBytes);
   bytes.fill(0x42);
-  let resolvePosted!: (message: any) => void;
-  const posted = new Promise<any>(resolve => { resolvePosted = resolve; });
+  let posted = false;
   (globalThis as any).acquireVsCodeApi = () => ({
     getState: () => undefined,
     setState: () => undefined,
-    postMessage: (message: unknown) => resolvePosted(message)
+    postMessage: () => { posted = true; }
   });
 
   const apiPath = pathToFileURL(path.join(REPO_ROOT, 'core', 'ui', 'modules', 'api.js')).href;
   const api = await import(`${apiPath}?large-cell-probe=${process.pid}`);
-  const request = api.backendApi.updateCell('large_cells', 1, 'payload', bytes, null);
-  const message = await posted;
-  const base64Chars = message?.content?.payload?.[3]?.base64?.length ?? 0;
-  api.handleRpcResponse({
-    kind: 'response',
-    messageId: message.content.messageId,
-    success: true,
-    data: null
-  });
-  await request;
-  return {
-    mode: options.mode,
-    rawCellBytes: bytes.byteLength,
-    failureStage: 'unbounded-success',
-    base64Chars,
-    elapsedMs: performance.now() - startedAt,
-    memoryBefore: before,
-    memoryAfter: memorySnapshot()
-  };
+  try {
+    await api.backendApi.updateCell('large_cells', 1, 'payload', bytes, null);
+    const after = memorySnapshot();
+    return {
+      mode: options.mode,
+      rawCellBytes: bytes.byteLength,
+      failureStage: 'unbounded-success',
+      posted,
+      maxRssBytes: after.maxRssBytes,
+      elapsedMs: performance.now() - startedAt,
+      memoryBefore: before,
+      memoryAfter: after
+    };
+  } catch (error) {
+    const after = memorySnapshot();
+    return {
+      mode: options.mode,
+      rawCellBytes: bytes.byteLength,
+      failureStage: toWebviewPayloadLimitErrorData(error) ? 'size-guard' : 'request-error',
+      posted,
+      ...transportErrorFields(error),
+      maxRssBytes: after.maxRssBytes,
+      elapsedMs: performance.now() - startedAt,
+      memoryBefore: before,
+      memoryAfter: after
+    };
+  }
 }
 
 async function probeBlobInspector(options: ProbeOptions): Promise<Record<string, unknown>> {
@@ -563,47 +572,54 @@ async function probeExportJson(options: ProbeOptions): Promise<Record<string, un
 async function probeWebDemoResponse(options: ProbeOptions): Promise<Record<string, unknown>> {
   const before = memorySnapshot();
   const startedAt = performance.now();
-  let postedRequest: any;
-  let resolvePosted!: () => void;
-  const posted = new Promise<void>(resolve => { resolvePosted = resolve; });
-  const parentWindow = {
-    postMessage(message: unknown) {
-      postedRequest = message;
-      resolvePosted();
-    }
-  };
-  (globalThis as any).window = {
-    parent: parentWindow,
-    location: { ancestorOrigins: ['https://demo.test'] },
-    addEventListener: () => undefined
-  };
   const modulePath = pathToFileURL(
-    path.join(REPO_ROOT, 'core', 'ui', 'modules', 'web-api.js')
+    path.join(REPO_ROOT, 'website', 'app', 'demo', 'transport.ts')
   ).href;
-  const webApi = await import(`${modulePath}?large-cell-probe=${process.pid}`);
-  const pending = webApi.sendRpcRequest('fetchTableData', []);
-  await posted;
-  const messageId = postedRequest?.content?.messageId;
-  if (!messageId) throw new Error('Web demo API did not post an RPC request');
+  const { guardDemoWorkerResponse } = await import(
+    `${modulePath}?large-cell-probe=${process.pid}`
+  );
 
   const raw = new Uint8Array(options.sizeBytes);
-  webApi.handleRpcResponse({
-    kind: 'response',
-    messageId,
-    success: true,
-    data: { rows: [[1, 'blob', raw]] }
-  });
-  const result = await pending;
-  const returned = result?.rows?.[0]?.[2];
-  return {
-    mode: options.mode,
-    rawCellBytes: raw.byteLength,
-    failureStage: 'typed-array-enumeration',
-    returnedType: returned instanceof Uint8Array ? 'Uint8Array' : typeof returned,
-    elapsedMs: performance.now() - startedAt,
-    memoryBefore: before,
-    memoryAfter: memorySnapshot()
-  };
+  raw.fill(0x42);
+  let forwardedToIframe = false;
+  try {
+    guardDemoWorkerResponse({
+      channel: 'rpc',
+      content: {
+        kind: 'response',
+        messageId: 'worker-large-cell',
+        success: true,
+        data: { rows: [[1, 'blob', raw]] }
+      }
+    });
+    // This assignment stands at the DemoClient forwarding seam. A successful
+    // Stage-C guard would otherwise permit postMessage to the iframe.
+    forwardedToIframe = true;
+    const after = memorySnapshot();
+    return {
+      mode: options.mode,
+      rawCellBytes: raw.byteLength,
+      failureStage: 'unbounded-success',
+      forwardedToIframe,
+      maxRssBytes: after.maxRssBytes,
+      elapsedMs: performance.now() - startedAt,
+      memoryBefore: before,
+      memoryAfter: after
+    };
+  } catch (error) {
+    const after = memorySnapshot();
+    return {
+      mode: options.mode,
+      rawCellBytes: raw.byteLength,
+      failureStage: toWebviewPayloadLimitErrorData(error) ? 'size-guard' : 'response-error',
+      forwardedToIframe,
+      ...transportErrorFields(error),
+      maxRssBytes: after.maxRssBytes,
+      elapsedMs: performance.now() - startedAt,
+      memoryBefore: before,
+      memoryAfter: after
+    };
+  }
 }
 
 async function main(): Promise<void> {

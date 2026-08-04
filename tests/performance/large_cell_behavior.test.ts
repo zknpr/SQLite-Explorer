@@ -4,6 +4,10 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import {
+  MAX_WEBVIEW_BINARY_VALUE_BYTES,
+  WEBVIEW_PAYLOAD_LIMIT_ERROR_CODE
+} from '../../src/core/webview-transport';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const RUN_LARGE_CELL_TESTS = process.env.SQLITE_EXPLORER_RUN_LARGE_CELL_TESTS === '1';
@@ -11,10 +15,9 @@ const SIZE_MIB = Number(process.env.SQLITE_EXPLORER_LARGE_CELL_MIB ?? '256');
 const MIB = 1024 * 1024;
 const EXPECTED_CELL_BYTES = SIZE_MIB * MIB;
 const MAX_INLINE_CELL_BYTES = MIB;
-// QueryResultSet retains rows/values compatibility aliases, and BLOBs expand to
-// base64 in the existing RPC serializer. One 1 MiB bounded BLOB therefore stays
-// below 3 MiB on the wire instead of amplifying the 256 MiB source cell.
-const MAX_GRID_RESPONSE_CHARS = 3 * MIB;
+// The webview DTO has one row matrix. One full 1 MiB inline BLOB expands to
+// roughly 1.34 MiB in Base64, leaving metadata headroom below this bound.
+const MAX_GRID_RESPONSE_CHARS = 2 * MIB;
 // The pinned pre-containment probes peaked at 609–896 MiB RSS. Keep this well
 // below that lower bound while leaving headroom for native SQLite and test setup.
 const MAX_GRID_PROBE_RSS_BYTES = 384 * MIB;
@@ -175,6 +178,17 @@ function knownFailure(
   test(name, options, body);
 }
 
+function stageCTest(
+  name: string,
+  body: (t: TestContext) => Promise<void>
+): void {
+  test(name, {
+    skip: !RUN_LARGE_CELL_TESTS
+      && `set SQLITE_EXPLORER_RUN_LARGE_CELL_TESTS=1 to run the ${SIZE_MIB} MiB probes`,
+    timeout: 300_000
+  }, body);
+}
+
 before(async () => {
   if (!RUN_LARGE_CELL_TESTS) return;
   validateSize();
@@ -234,30 +248,44 @@ describe('very large single-cell behavior (opt-in)', () => {
         assert.equal(result.sourceCellBytes, EXPECTED_CELL_BYTES);
         assert.ok(Number(result.transportedCellBytes) <= MAX_INLINE_CELL_BYTES);
         assert.ok(Number(result.serializedResponseChars) <= MAX_GRID_RESPONSE_CHARS);
+        assert.equal(result.hasValuesAlias, false);
+        assert.equal(result.hasRecordsAlias, false);
         assert.ok(Number(result.maxRssBytes) <= MAX_GRID_PROBE_RSS_BYTES);
       }
     );
   }
 
-  knownFailure(
+  stageCTest(
     'extension-host response refuses an oversized BLOB before base64 webview serialization',
-    'fetchTableData currently base64-encodes the complete BLOB response',
     async t => {
       const result = await runProbe('host-webview-response', { kind: 'blob', heapMib: 2560 });
       diagnose(t, result);
       assert.equal(result.failureStage, 'size-guard');
       assert.equal(result.rawCellBytes, EXPECTED_CELL_BYTES);
+      assert.equal(result.errorCode, WEBVIEW_PAYLOAD_LIMIT_ERROR_CODE);
+      assert.equal(result.errorName, 'WebviewPayloadLimitError');
+      assert.equal(result.errorSurface, 'extension host -> webview response');
+      assert.equal(result.errorKind, 'binary-value');
+      assert.equal(result.errorLimitBytes, MAX_WEBVIEW_BINARY_VALUE_BYTES);
+      assert.equal(result.errorActualBytes, EXPECTED_CELL_BYTES);
+      assert.ok(Number(result.maxRssBytes) <= MAX_STAGE_B_SURFACE_RSS_BYTES);
     }
   );
 
-  knownFailure(
+  stageCTest(
     'webview request refuses an oversized replacement BLOB before base64 encoding',
-    'blob replacement currently builds one full base64 request in the webview',
     async t => {
       const result = await runProbe('webview-update-request', { kind: 'blob', heapMib: 2048 });
       diagnose(t, result);
       assert.equal(result.failureStage, 'size-guard');
       assert.equal(result.rawCellBytes, EXPECTED_CELL_BYTES);
+      assert.equal(result.posted, false);
+      assert.equal(result.errorCode, WEBVIEW_PAYLOAD_LIMIT_ERROR_CODE);
+      assert.equal(result.errorSurface, 'webview -> extension host request');
+      assert.equal(result.errorKind, 'binary-value');
+      assert.equal(result.errorLimitBytes, MAX_WEBVIEW_BINARY_VALUE_BYTES);
+      assert.equal(result.errorActualBytes, EXPECTED_CELL_BYTES);
+      assert.ok(Number(result.maxRssBytes) <= MAX_STAGE_B_SURFACE_RSS_BYTES);
     }
   );
 
@@ -323,14 +351,20 @@ describe('very large single-cell behavior (opt-in)', () => {
     }
   );
 
-  knownFailure(
+  stageCTest(
     'web demo rejects a raw oversized worker BLOB before forwarding it to the iframe',
-    'the demo currently structured-clones raw cells and its iframe deserializer enumerates typed-array keys',
     async t => {
       const result = await runProbe('web-demo-response', { kind: 'blob', heapMib: 1024 });
       diagnose(t, result);
       assert.equal(result.failureStage, 'size-guard');
       assert.equal(result.rawCellBytes, EXPECTED_CELL_BYTES);
+      assert.equal(result.errorCode, WEBVIEW_PAYLOAD_LIMIT_ERROR_CODE);
+      assert.equal(result.forwardedToIframe, false);
+      assert.equal(result.errorSurface, 'web demo worker -> parent response');
+      assert.equal(result.errorKind, 'binary-value');
+      assert.equal(result.errorLimitBytes, MAX_WEBVIEW_BINARY_VALUE_BYTES);
+      assert.equal(result.errorActualBytes, EXPECTED_CELL_BYTES);
+      assert.ok(Number(result.maxRssBytes) <= MAX_STAGE_B_SURFACE_RSS_BYTES);
     }
   );
 });

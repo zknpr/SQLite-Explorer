@@ -91,7 +91,7 @@ export function initRpc() {
                         sendRpcResult(correlationId, result);
                     })
                     .catch(err => {
-                        sendRpcError(correlationId, err instanceof Error ? err.message : String(err));
+                        sendRpcError(correlationId, err);
                     });
             } else {
                 sendRpcError(correlationId, `Unknown method: ${methodName}`);

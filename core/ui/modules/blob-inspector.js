@@ -33,6 +33,13 @@ const FILE_SIGNATURES = {
 
 export const MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES = 64 * 1024;
 
+function isOversizedMediaType(type) {
+    return type?.type === 'image'
+        || type?.type === 'audio'
+        || type?.type === 'video'
+        || type?.type === 'pdf';
+}
+
 /** Keep inspector DOM work bounded and preserve a valid UTF-8 prefix for TEXT. */
 export function capOversizedInspectorPreview(value, storageClass) {
     const bytes = storageClass === 'text'
@@ -54,6 +61,8 @@ export function capOversizedInspectorPreview(value, storageClass) {
 export class BlobInspector {
     constructor() {
         this.currentObjectUrl = null;
+        this.currentMediaPreview = null;
+        this.previewGeneration = 0;
         this.modal = document.getElementById('blob-inspector-modal');
         this.previewContainer = document.getElementById('tab-preview');
         this.hexContainer = document.querySelector('.hex-dump');
@@ -297,6 +306,19 @@ export class BlobInspector {
     }
 
     cleanup() {
+        this.previewGeneration++;
+        const mediaPreview = this.currentMediaPreview;
+        this.currentMediaPreview = null;
+        if (mediaPreview) {
+            // Cleanup races are expected when a modal closes or a new cell is
+            // selected. The host release is idempotent, and a failed release is
+            // surfaced in diagnostics without making close() throw.
+            void backendApi.releaseCellMediaPreview(
+                mediaPreview.webviewId,
+                mediaPreview.previewId
+            ).catch(error => console.warn('Failed to release media preview:', error));
+        }
+
         // Reset upload state to ensure buttons are re-enabled
         this.currentOversizedMetadata = null;
         this.setUploadState(false);
@@ -384,9 +406,9 @@ export class BlobInspector {
                 this.currentColName,
                 {},
                 {
-                    value: this.currentData,
                     type: this.currentType,
-                    webviewId
+                    webviewId,
+                    sourceByteLength: this.currentOversizedMetadata.byteLength
                 }
             );
             if (result?.success === false) {
@@ -466,8 +488,148 @@ export class BlobInspector {
             `Preview ${this.formatSize(data.byteLength)} of ${this.formatSize(metadata.byteLength)} | ` +
             'Full content opens from a desktop temporary file; web is preview-only';
 
-        this.renderPreview(data, type);
         this.renderHex(data);
+        if (isOversizedMediaType(type)) {
+            const generation = this.previewGeneration;
+            this.renderOversizedMediaStatus('Preparing a private desktop media URI...');
+            void this.loadOversizedMediaPreview(type, metadata, generation);
+        } else {
+            // Bounded text/binary previews keep the existing byte path.
+            this.renderPreview(data, type);
+        }
+    }
+
+    async loadOversizedMediaPreview(type, metadata, generation) {
+        const table = state.selectedTable;
+        const rowId = this.currentRowId;
+        const colName = this.currentColName;
+        const webviewId = document.getElementById('vscode-env')?.dataset.webviewId || 'default';
+        if (!table || rowId === null || !colName) {
+            this.renderOversizedMediaStatus(
+                'Oversized media is unavailable because the cell identity changed. ' +
+                'The bounded Hex preview remains available.'
+            );
+            return;
+        }
+
+        try {
+            const result = await backendApi.prepareCellMediaPreview(
+                { table, name: '' },
+                rowId,
+                colName,
+                {
+                    type,
+                    webviewId,
+                    sourceByteLength: metadata.byteLength
+                }
+            );
+            if (
+                generation !== this.previewGeneration
+                || this.currentRowId !== rowId
+                || this.currentColName !== colName
+            ) {
+                if (result?.success) {
+                    await backendApi.releaseCellMediaPreview(webviewId, result.previewId);
+                }
+                return;
+            }
+            if (!result?.success) {
+                this.renderOversizedMediaStatus(
+                    `${result?.message || 'Oversized media preview is unavailable'} ` +
+                    'The bounded Hex preview remains available.'
+                );
+                return;
+            }
+
+            this.currentMediaPreview = { webviewId, previewId: result.previewId };
+            try {
+                this.renderMediaUri(result.uri, type, generation);
+            } catch (error) {
+                this.currentMediaPreview = null;
+                await backendApi.releaseCellMediaPreview(webviewId, result.previewId);
+                throw error;
+            }
+        } catch (error) {
+            if (generation !== this.previewGeneration) return;
+            const details = error instanceof Error ? error.message : String(error);
+            this.renderOversizedMediaStatus(
+                `Oversized media preview unavailable: ${details}. ` +
+                'The bounded Hex preview remains available.'
+            );
+        }
+    }
+
+    renderOversizedMediaStatus(message) {
+        this.previewContainer.innerHTML = '';
+        const container = document.createElement('div');
+        container.className = 'empty-view';
+
+        const text = document.createElement('span');
+        text.textContent = message;
+
+        const hexButton = document.createElement('button');
+        hexButton.className = 'btn-primary';
+        hexButton.textContent = 'View bounded Hex preview';
+        hexButton.addEventListener('click', () => this.switchTab('hex'));
+
+        container.appendChild(text);
+        container.appendChild(hexButton);
+        this.previewContainer.appendChild(container);
+    }
+
+    renderMediaUri(uri, type, generation) {
+        let protocol;
+        try {
+            protocol = new URL(uri).protocol;
+        } catch {
+            throw new Error('The host returned an invalid media URI');
+        }
+        if (protocol !== 'https:' && protocol !== 'vscode-webview-resource:') {
+            throw new Error(`The host returned a disallowed media URI scheme: ${protocol}`);
+        }
+
+        this.previewContainer.innerHTML = '';
+        let mediaElement;
+        if (type.type === 'image') {
+            mediaElement = document.createElement('img');
+            mediaElement.style.maxWidth = '100%';
+            mediaElement.style.maxHeight = '100%';
+            mediaElement.style.objectFit = 'contain';
+            mediaElement.style.boxShadow = '0 0 10px rgba(0,0,0,0.5)';
+        } else if (type.type === 'audio') {
+            mediaElement = document.createElement('audio');
+            mediaElement.controls = true;
+            mediaElement.style.width = '100%';
+            mediaElement.style.maxWidth = '400px';
+        } else if (type.type === 'video') {
+            mediaElement = document.createElement('video');
+            mediaElement.controls = true;
+            mediaElement.style.maxWidth = '100%';
+            mediaElement.style.maxHeight = '100%';
+            mediaElement.style.objectFit = 'contain';
+        } else if (type.type === 'pdf') {
+            mediaElement = document.createElement('iframe');
+            // A PDF resource is untrusted database content. An empty iframe
+            // sandbox prevents scripts, navigation, downloads, and same-origin
+            // access even if the renderer misclassifies the bytes.
+            mediaElement.setAttribute('sandbox', '');
+            mediaElement.title = 'Oversized PDF preview';
+            mediaElement.style.width = '100%';
+            mediaElement.style.height = '100%';
+            mediaElement.style.border = '0';
+        } else {
+            throw new Error(`Unsupported oversized media category: ${type.type}`);
+        }
+
+        mediaElement.addEventListener('error', () => {
+            if (generation !== this.previewGeneration) return;
+            this.renderOversizedMediaStatus(
+                'The temporary preview file was cleaned up while this preview was open. ' +
+                'The bounded Hex preview remains available.'
+            );
+        }, { once: true });
+        mediaElement.src = uri;
+        this.previewContainer.appendChild(mediaElement);
     }
 
     detectType(data) {

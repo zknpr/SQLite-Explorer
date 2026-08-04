@@ -14,7 +14,7 @@ import { ConfigurationSection, ExtensionId, getMaxInlineCellBytes, SidebarLeft, 
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, WebviewQueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity } from './core/types';
 import { prepareCellUpdateForStorage } from './core/json-utils';
 import {
   assertMutableRecordId,
@@ -28,6 +28,45 @@ import { escapeIdentifier, validateRowId, validateRowIds } from './core/sql-util
 import { isViewDefinitionConflictError } from './core/view-utils';
 import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './core/cell-containment';
 import type { CellMaterializationService } from './cellMaterialization';
+
+interface ActiveCellMediaPreview {
+  previewId: string;
+  uri: vsc.Uri;
+  panel: vsc.WebviewPanel;
+}
+
+interface CellMediaPreviewOptions {
+  type: CellContentType;
+  webviewId: string;
+  /** Informational only; the host re-reads authoritative cell metadata. */
+  sourceByteLength?: number;
+}
+
+const OVERSIZED_MEDIA_TYPES: Readonly<Record<string, {
+  type: 'image' | 'audio' | 'video' | 'pdf';
+  extension: string;
+}>> = {
+  'image/png': { type: 'image', extension: 'png' },
+  'image/jpeg': { type: 'image', extension: 'jpg' },
+  'image/gif': { type: 'image', extension: 'gif' },
+  'image/bmp': { type: 'image', extension: 'bmp' },
+  'image/webp': { type: 'image', extension: 'webp' },
+  'audio/mpeg': { type: 'audio', extension: 'mp3' },
+  'audio/ogg': { type: 'audio', extension: 'ogg' },
+  'audio/wav': { type: 'audio', extension: 'wav' },
+  'audio/flac': { type: 'audio', extension: 'flac' },
+  'video/mp4': { type: 'video', extension: 'mp4' },
+  'video/quicktime': { type: 'video', extension: 'mov' },
+  'video/webm': { type: 'video', extension: 'webm' },
+  'video/avi': { type: 'video', extension: 'avi' },
+  'application/pdf': { type: 'pdf', extension: 'pdf' }
+};
+
+/** A webview result has one canonical row matrix; sql.js aliases stay internal. */
+export function toWebviewQueryResultSet(result: QueryResultSet): WebviewQueryResultSet {
+  const { values: _values, records: _records, ...webviewResult } = result;
+  return webviewResult;
+}
 
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
@@ -53,6 +92,9 @@ interface ToastService {
 export class HostBridge implements ToastService {
   private activePreviewController: AbortController | undefined;
   private activeCellMaterializationController: AbortController | undefined;
+  private readonly activeCellMediaPreviews = new Map<string, ActiveCellMediaPreview>();
+  private readonly activeCellMediaControllers = new Map<string, AbortController>();
+  private readonly mediaPanelSubscriptions = new Map<vsc.WebviewPanel, vsc.Disposable>();
 
   constructor(
     private readonly viewerProvider: DatabaseEditorProvider | DatabaseViewerProvider,
@@ -507,13 +549,13 @@ export class HostBridge implements ToastService {
     const controller = new AbortController();
     this.activePreviewController = controller;
     try {
-      return await this.ensureDatabaseInitialized().previewViewDefinition(
+      return toWebviewQueryResultSet(await this.ensureDatabaseInitialized().previewViewDefinition(
         view,
         selectSql,
         limit,
         intent,
         controller.signal
-      );
+      ));
     } finally {
       if (this.activePreviewController === controller) {
         this.activePreviewController = undefined;
@@ -716,7 +758,7 @@ export class HostBridge implements ToastService {
   /**
    * Fetch table data (SELECT).
    */
-  async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
+  async fetchTableData(table: string, options: TableQueryOptions): Promise<WebviewQueryResultSet> {
     const dbOps = this.ensureDatabaseInitialized();
 
     if ('fetchTableData' in dbOps) {
@@ -729,11 +771,11 @@ export class HostBridge implements ToastService {
         && (options.maxPageResponseBytes ?? 0) > 0
         ? options.maxPageResponseBytes!
         : DEFAULT_MAX_PAGE_RESPONSE_BYTES;
-      return await dbOps.fetchTableData(table, {
+      return toWebviewQueryResultSet(await dbOps.fetchTableData(table, {
         ...options,
         maxInlineCellBytes: Math.min(configuredCellLimit, requestedCellLimit),
         maxPageResponseBytes: Math.min(DEFAULT_MAX_PAGE_RESPONSE_BYTES, requestedPageLimit)
-      });
+      }));
     } else {
       throw new Error("Backend does not support fetchTableData");
     }
@@ -1051,6 +1093,162 @@ export class HostBridge implements ToastService {
     }
   }
 
+  /**
+   * Materialize an oversized media cell and expose only its webview-local URI.
+   * The complete value never enters the RPC response or a structured clone.
+   */
+  async prepareCellMediaPreview(
+    params: DbParams,
+    rowId: RecordId,
+    colName: string,
+    options: CellMediaPreviewOptions
+  ): Promise<
+    | {
+      success: true;
+      previewId: string;
+      uri: string;
+      mime: string;
+      byteLength: number;
+    }
+    | { success: false; message: string }
+  > {
+    assertMutableRecordId(rowId);
+    if (!params || typeof params.table !== 'string' || params.table.length === 0) {
+      throw new TypeError('Oversized media preview requires a table name');
+    }
+    if (typeof colName !== 'string' || colName.length === 0) {
+      throw new TypeError('Oversized media preview requires a column name');
+    }
+    if (!options || typeof options.webviewId !== 'string' || options.webviewId.length === 0) {
+      throw new TypeError('Oversized media preview requires a webview ID');
+    }
+
+    const media = resolveOversizedMediaType(options.type);
+    const materializer = this.cellMaterializer;
+    if (!materializer) {
+      return {
+        success: false,
+        message: 'Oversized media previews are available only in VS Code Desktop'
+      };
+    }
+
+    const panel = this.webviews.getByWebviewId(options.webviewId);
+    if (!panel || ![...this.webviews.get(this.document.uri)].includes(panel)) {
+      throw new Error('Oversized media preview webview does not belong to this database document');
+    }
+
+    const target = { table: params.table, rowId, column: colName };
+    const operations = this.ensureDatabaseInitialized();
+    const metadata = await operations.getCellMetadata(target);
+    if (metadata.storageClass !== 'blob') {
+      throw new Error('Oversized media preview requires a BLOB cell');
+    }
+    if (metadata.byteLength <= getMaxInlineCellBytes()) {
+      return {
+        success: false,
+        message: 'This media cell is within the inline transport budget and does not need a temp URI'
+      };
+    }
+
+    this.activeCellMediaControllers.get(options.webviewId)?.abort();
+    const controller = new AbortController();
+    this.activeCellMediaControllers.set(options.webviewId, controller);
+    const panelDisposeSubscription = panel.onDidDispose(() => controller.abort());
+
+    let materialized;
+    try {
+      materialized = await materializer.materialize(operations, target, {
+        signal: controller.signal,
+        fileExtension: media.extension,
+        owner: panel
+      });
+    } finally {
+      panelDisposeSubscription.dispose();
+      if (this.activeCellMediaControllers.get(options.webviewId) === controller) {
+        this.activeCellMediaControllers.delete(options.webviewId);
+      }
+    }
+
+    if (this.webviews.getByWebviewId(options.webviewId) !== panel) {
+      materializer.release(materialized.uri);
+      throw new Error('Oversized media preview was cancelled because its webview closed');
+    }
+
+    const previewId = crypto.randomUUID();
+    const runDirectory = vsc.Uri.file(path.dirname(materialized.uri.fsPath));
+    let resourceUri: string;
+    try {
+      resourceUri = panel.webview.asWebviewUri(materialized.uri).toString();
+      panel.webview.options = {
+        ...panel.webview.options,
+        localResourceRoots: [this.codiconsResourceRoot(), runDirectory]
+      };
+    } catch (error) {
+      materializer.release(materialized.uri);
+      throw error;
+    }
+
+    const previous = this.activeCellMediaPreviews.get(options.webviewId);
+    try {
+      if (previous) materializer.release(previous.uri);
+    } catch (error) {
+      materializer.release(materialized.uri);
+      throw error;
+    }
+    this.activeCellMediaPreviews.set(options.webviewId, {
+      previewId,
+      uri: materialized.uri,
+      panel
+    });
+    this.trackMediaPanel(panel);
+
+    return {
+      success: true,
+      previewId,
+      uri: resourceUri,
+      mime: options.type.mime!,
+      byteLength: materialized.byteLength
+    };
+  }
+
+  /** Release a URI lease. Stale cleanup calls are intentionally idempotent. */
+  async releaseCellMediaPreview(webviewId: string, previewId: string): Promise<void> {
+    const active = this.activeCellMediaPreviews.get(webviewId);
+    if (!active || active.previewId !== previewId) return;
+
+    this.activeCellMediaPreviews.delete(webviewId);
+    this.cellMaterializer?.release(active.uri);
+    if (this.webviews.getByWebviewId(webviewId) === active.panel) {
+      active.panel.webview.options = {
+        ...active.panel.webview.options,
+        localResourceRoots: [this.codiconsResourceRoot()]
+      };
+    }
+  }
+
+  private codiconsResourceRoot(): vsc.Uri {
+    return vsc.Uri.joinPath(
+      this.context.extensionUri,
+      'node_modules',
+      '@vscode',
+      'codicons',
+      'dist'
+    );
+  }
+
+  private trackMediaPanel(panel: vsc.WebviewPanel): void {
+    if (this.mediaPanelSubscriptions.has(panel)) return;
+    const subscription = panel.onDidDispose(() => {
+      for (const [webviewId, active] of this.activeCellMediaPreviews) {
+        if (active.panel === panel) this.activeCellMediaPreviews.delete(webviewId);
+      }
+      this.mediaPanelSubscriptions.delete(panel);
+      // Stage B owns panel-disposal file removal. This listener only drops the
+      // RPC lease so a later stale release cannot affect another preview.
+    });
+    this.mediaPanelSubscriptions.set(panel, subscription);
+  }
+
   /** Open a view's SELECT body in the writable virtual filesystem as SQL. */
   async openViewEditor(view: string, webviewId?: string) {
     if (this.isReadOnly) {
@@ -1332,4 +1530,17 @@ async function determineCellExtension(value?: CellValue, type?: CellContentType)
     return '.bin';
   }
   return '.txt';
+}
+
+function resolveOversizedMediaType(type: CellContentType | undefined): {
+  type: 'image' | 'audio' | 'video' | 'pdf';
+  extension: string;
+} {
+  const media = type?.mime ? OVERSIZED_MEDIA_TYPES[type.mime] : undefined;
+  if (!media || type?.type !== media.type) {
+    throw new Error(
+      `Unsupported oversized media type: ${type?.mime ?? 'unknown'} (${type?.type ?? 'unknown'})`
+    );
+  }
+  return media;
 }

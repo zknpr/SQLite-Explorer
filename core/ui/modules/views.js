@@ -57,8 +57,8 @@ function renderPreview(result) {
     if (!preview) return;
     preview.replaceChildren();
 
-    const headers = result?.headers ?? result?.columns ?? [];
-    const rows = result?.rows ?? result?.values ?? [];
+    const headers = result?.headers ?? [];
+    const rows = result?.rows ?? [];
     const table = document.createElement('table');
     table.className = 'view-preview-table';
 
@@ -257,7 +257,7 @@ async function previewDraft() {
         );
         if (!isCurrentPreview()) return;
         renderPreview(result);
-        const rowCount = result?.rows?.length ?? result?.values?.length ?? 0;
+        const rowCount = result?.rows?.length ?? 0;
         setFeedback(`Preview returned ${rowCount} row${rowCount === 1 ? '' : 's'} (maximum 50).`);
     } catch (err) {
         if (!isCurrentPreview()) return;

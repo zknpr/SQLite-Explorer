@@ -14,6 +14,15 @@
 
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { Upload, Database, FileUp, ArrowLeft, Download, RefreshCw, AlertCircle } from 'lucide-react';
+import {
+  demoRpcErrorFields,
+  demoRpcErrorFromResponse,
+  deserializeDemoIframeRequest,
+  guardDemoIframeRequest,
+  guardDemoIframeResponse,
+  guardDemoWorkerRequest,
+  guardDemoWorkerResponse
+} from './transport';
 
 // ============================================================================
 // Types
@@ -33,7 +42,33 @@ interface RpcMessage {
     success?: boolean;
     data?: unknown;
     errorMessage?: string;
+    error?: unknown;
   };
+}
+
+function postIframeRpcResponse(
+  target: MessageEventSource | null,
+  targetOrigin: string,
+  content: RpcMessage['content']
+): void {
+  let envelope: RpcMessage = { channel: 'rpc', content };
+  try {
+    guardDemoIframeResponse(envelope);
+  } catch (error) {
+    envelope = {
+      channel: 'rpc',
+      content: {
+        kind: 'response',
+        messageId: content.messageId,
+        success: false,
+        ...demoRpcErrorFields(error)
+      }
+    };
+    // The replacement is a fixed-shape, scalar error, but keep the same guard
+    // invariant at the actual structured-clone boundary.
+    guardDemoIframeResponse(envelope);
+  }
+  target?.postMessage(envelope, { targetOrigin });
 }
 
 // ============================================================================
@@ -188,7 +223,6 @@ export default function DemoClient() {
       }
 
       const messageId = `rpc_${++messageIdCounter.current}_${Date.now()}`;
-      pendingCalls.current.set(messageId, { resolve, reject });
 
       const message: RpcMessage = {
         channel: 'rpc',
@@ -200,6 +234,14 @@ export default function DemoClient() {
         }
       };
 
+      try {
+        guardDemoWorkerRequest(message);
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+
+      pendingCalls.current.set(messageId, { resolve, reject });
       workerRef.current.postMessage(message);
     });
     return invocation.then(
@@ -235,43 +277,53 @@ export default function DemoClient() {
     if (envelope?.channel === 'rpc' && envelope.content?.kind === 'invoke') {
       const { messageId, targetMethod, payload } = envelope.content;
 
+      let deserializedPayload: unknown[];
+      try {
+        guardDemoIframeRequest(envelope);
+        const decoded = deserializeDemoIframeRequest(payload ?? []);
+        if (!Array.isArray(decoded)) throw new TypeError('RPC payload must be an array');
+        deserializedPayload = decoded;
+      } catch (error) {
+        postIframeRpcResponse(event.source, event.origin, {
+          kind: 'response',
+          messageId,
+          success: false,
+          ...demoRpcErrorFields(error)
+        });
+        return;
+      }
+
       // Special handling for extension-specific methods
       if (targetMethod === 'initialize') {
         // Already initialized, just return success
-        event.source?.postMessage({
-          channel: 'rpc',
-          content: {
-            kind: 'response',
-            messageId,
-            success: true,
-            data: { connected: true, isReadOnly: false }
-          }
-        }, { targetOrigin: event.origin });
+        postIframeRpcResponse(event.source, event.origin, {
+          kind: 'response',
+          messageId,
+          success: true,
+          data: { connected: true, isReadOnly: false }
+        });
         return;
       }
 
       if (targetMethod === 'getExtensionSettings') {
         // Return default settings for web mode
-        event.source?.postMessage({
-          channel: 'rpc',
-          content: {
-            kind: 'response',
-            messageId,
-            success: true,
-            data: {
-              maxRows: 0,
-              defaultPageSize: 1000,
-              instantCommit: 'never',
-              doubleClickBehavior: 'inline'
-            }
+        postIframeRpcResponse(event.source, event.origin, {
+          kind: 'response',
+          messageId,
+          success: true,
+          data: {
+            maxRows: 0,
+            defaultPageSize: 1000,
+            instantCommit: 'never',
+            doubleClickBehavior: 'inline'
           }
-        }, { targetOrigin: event.origin });
+        });
         return;
       }
 
       // Special handling for exportTable - trigger download after getting result
       if (targetMethod === 'exportTable') {
-        callWorker(targetMethod, payload as unknown[] || [])
+        callWorker(targetMethod, deserializedPayload)
           .then((result) => {
             const exportResult = result as { content: string; filename: string; mimeType: string };
             // Trigger download
@@ -285,26 +337,20 @@ export default function DemoClient() {
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
 
-            event.source?.postMessage({
-              channel: 'rpc',
-              content: {
-                kind: 'response',
-                messageId,
-                success: true,
-                data: { success: true }
-              }
-            }, { targetOrigin: event.origin });
+            postIframeRpcResponse(event.source, event.origin, {
+              kind: 'response',
+              messageId,
+              success: true,
+              data: { success: true }
+            });
           })
           .catch((error) => {
-            event.source?.postMessage({
-              channel: 'rpc',
-              content: {
-                kind: 'response',
-                messageId,
-                success: false,
-                errorMessage: error.message
-              }
-            }, { targetOrigin: event.origin });
+            postIframeRpcResponse(event.source, event.origin, {
+              kind: 'response',
+              messageId,
+              success: false,
+              ...demoRpcErrorFields(error)
+            });
           });
         return;
       }
@@ -318,30 +364,24 @@ export default function DemoClient() {
       }
       callWorker(
         targetMethod as string,
-        payload as unknown[] || [],
+        deserializedPayload,
         previewController?.signal
       )
         .then((result) => {
-          event.source?.postMessage({
-            channel: 'rpc',
-            content: {
-              kind: 'response',
-              messageId,
-              success: true,
-              data: result
-            }
-          }, { targetOrigin: event.origin });
+          postIframeRpcResponse(event.source, event.origin, {
+            kind: 'response',
+            messageId,
+            success: true,
+            data: result
+          });
         })
         .catch((error) => {
-          event.source?.postMessage({
-            channel: 'rpc',
-            content: {
-              kind: 'response',
-              messageId,
-              success: false,
-              errorMessage: error.message
-            }
-          }, { targetOrigin: event.origin });
+          postIframeRpcResponse(event.source, event.origin, {
+            kind: 'response',
+            messageId,
+            success: false,
+            ...demoRpcErrorFields(error)
+          });
         })
         .finally(() => {
           if (activePreviewController.current === previewController) {
@@ -394,14 +434,20 @@ export default function DemoClient() {
     worker.onmessage = (event) => {
       const envelope = event.data as RpcMessage;
       if (envelope?.channel === 'rpc' && envelope.content?.kind === 'response') {
-        const { messageId, success, data, errorMessage } = envelope.content;
+        const { messageId, success, data } = envelope.content;
         const pending = pendingCalls.current.get(messageId);
         if (pending) {
           pendingCalls.current.delete(messageId);
+          try {
+            guardDemoWorkerResponse(envelope);
+          } catch (error) {
+            pending.reject(error instanceof Error ? error : new Error(String(error)));
+            return;
+          }
           if (success) {
             pending.resolve(data);
           } else {
-            pending.reject(new Error(errorMessage || 'RPC failed'));
+            pending.reject(demoRpcErrorFromResponse(envelope.content));
           }
         }
       }

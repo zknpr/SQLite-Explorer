@@ -2,17 +2,36 @@
 import './vscode_mock_setup';
 import { describe, it, mock, afterEach } from 'node:test';
 import assert from 'node:assert';
-import { HostBridge } from '../../src/hostBridge';
+import { HostBridge, toWebviewQueryResultSet } from '../../src/hostBridge';
 import * as vscode from 'vscode';
 import { createDeferred } from './helpers/deferred';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { serializeOperations } from '../../src/core/operation-serializer';
+import { deserializeValue, serializeValue } from '../../src/core/serialization';
 import {
     encodePrimaryKeyRecordId,
     encodeReadOnlyPrimaryKeyRecordId
 } from '../../src/core/row-identity';
 
 describe('HostBridge', () => {
+    it('projects one canonical row matrix without changing bounded consumer bytes', () => {
+        const bytes = Uint8Array.from([0, 1, 2, 127, 255]);
+        const rows = [[bytes]];
+        const projected = toWebviewQueryResultSet({
+            headers: ['payload'],
+            rows,
+            columns: ['payload'],
+            values: rows,
+            records: rows
+        });
+
+        assert.strictEqual(projected.rows, rows);
+        assert.strictEqual('values' in projected, false);
+        assert.strictEqual('records' in projected, false);
+        const consumer = deserializeValue(serializeValue(projected)) as typeof projected;
+        assert.deepStrictEqual(consumer.rows[0][0], bytes);
+    });
+
     it('rejects every cell/row mutation for an oversized primary-key identity with its precise reason', async () => {
         const reason = 'Row is read-only because primary-key column "key" is 32 bytes.';
         const rowId = encodeReadOnlyPrimaryKeyRecordId(reason, 0);
@@ -93,6 +112,10 @@ describe('HostBridge', () => {
             assert.deepStrictEqual((page as any).oversizedCells, {
                 0: { 0: { storageClass: 'text', byteLength: 2048 } }
             });
+            assert.strictEqual('values' in page, false);
+            assert.strictEqual('records' in page, false);
+            const transported = deserializeValue(serializeValue(page)) as typeof page;
+            assert.strictEqual(transported.rows[0][0], page.rows[0][0]);
         } finally {
             configStore.clear();
             (dbOps as WasmDatabaseEngine).shutdown();
@@ -320,6 +343,95 @@ describe('HostBridge', () => {
         assert.strictEqual(
             executeCommandMock.mock.calls[1].arguments[0],
             'workbench.action.files.setActiveEditorReadonlyInSession'
+        );
+    });
+
+    it('serves oversized media from a panel-owned temp URI within narrowed roots', async () => {
+        const tempUri = vscode.Uri.file(
+            '/private/materialized/sqlite-explorer-cell-materializations-run/random.png'
+        );
+        const webview = {
+            options: { enableScripts: true, localResourceRoots: [] as vscode.Uri[] },
+            asWebviewUri: mock.fn((uri: vscode.Uri) => ({
+                toString: () => `https://wv-resource.test${uri.path}`
+            }))
+        };
+        const panel = {
+            webview,
+            onDidDispose: () => ({ dispose() {} })
+        };
+        const documentUri = vscode.Uri.parse('file:///test.db');
+        const webviews = {
+            getByWebviewId: (id: string) => id === 'wv-media' ? panel : undefined,
+            *get(uri: vscode.Uri) {
+                if (uri.toString() === documentUri.toString()) yield panel;
+            }
+        };
+        const materializer = {
+            materialize: mock.fn(async (_operations: any, _target: any, _options: any) => ({
+                uri: tempUri,
+                metadata: { storageClass: 'blob', byteLength: 32 * 1024 * 1024 },
+                byteLength: 32 * 1024 * 1024,
+                checksumSha256: '0'.repeat(64)
+            })),
+            release: mock.fn((_uri: vscode.Uri) => {})
+        };
+        const dbOps = {
+            getCellMetadata: mock.fn(async () => ({
+                storageClass: 'blob',
+                byteLength: 32 * 1024 * 1024
+            }))
+        };
+        const bridge = new HostBridge({
+            webviews,
+            context: { extensionUri: vscode.Uri.file('/extension') },
+            cellMaterializer: materializer
+        } as any, {
+            uri: documentUri,
+            databaseOperations: dbOps
+        } as any);
+
+        const result = await (bridge as any).prepareCellMediaPreview(
+            { table: 'large_cells' },
+            1,
+            'payload',
+            {
+                type: { type: 'image', mime: 'image/png', ext: 'png' },
+                webviewId: 'wv-media',
+                sourceByteLength: 32 * 1024 * 1024
+            }
+        );
+
+        assert.strictEqual(result.success, true);
+        assert.strictEqual(
+            result.uri,
+            'https://wv-resource.test/private/materialized/sqlite-explorer-cell-materializations-run/random.png'
+        );
+        assert.strictEqual(result.byteLength, 32 * 1024 * 1024);
+        assert.strictEqual('bytes' in result, false);
+        assert.strictEqual('data' in result, false);
+        assert.strictEqual('value' in result, false);
+        assert.deepStrictEqual(materializer.materialize.mock.calls[0].arguments[1], {
+            table: 'large_cells',
+            rowId: 1,
+            column: 'payload'
+        });
+        assert.strictEqual(materializer.materialize.mock.calls[0].arguments[2].owner, panel);
+        assert.strictEqual(materializer.materialize.mock.calls[0].arguments[2].fileExtension, 'png');
+        assert.deepStrictEqual(
+            webview.options.localResourceRoots.map(uri => uri.fsPath),
+            [
+                '/extension/node_modules/@vscode/codicons/dist',
+                '/private/materialized/sqlite-explorer-cell-materializations-run'
+            ]
+        );
+
+        await (bridge as any).releaseCellMediaPreview('wv-media', result.previewId);
+        assert.strictEqual(materializer.release.mock.callCount(), 1);
+        assert.strictEqual(materializer.release.mock.calls[0].arguments[0], tempUri);
+        assert.deepStrictEqual(
+            webview.options.localResourceRoots.map(uri => uri.fsPath),
+            ['/extension/node_modules/@vscode/codicons/dist']
         );
     });
 

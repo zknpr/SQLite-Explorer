@@ -246,13 +246,20 @@ export function buildMethodProxy<T extends object>(
           expirationTimer
         });
 
-        // Dispatch the invocation
-        dispatcher({
-          kind: 'invoke',
-          correlationId,
-          methodName,
-          parameters: cleanParameters
-        }, transferList);
+        // A synchronous boundary guard/dispatcher failure must not leave a
+        // pending call and timer behind after the Promise has rejected.
+        try {
+          dispatcher({
+            kind: 'invoke',
+            correlationId,
+            methodName,
+            parameters: cleanParameters
+          }, transferList);
+        } catch (error) {
+          clearTimeout(expirationTimer);
+          pendingInvocations.delete(correlationId);
+          reject(error);
+        }
       });
     };
   }

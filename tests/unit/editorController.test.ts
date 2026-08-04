@@ -158,6 +158,22 @@ describe('registerEditorProvider', () => {
         assert.strictEqual(options.webviewOptions.retainContextWhenHidden, false);
     });
 
+    it('narrows webview resources and permits CSP-compatible temp media URIs', () => {
+        assert.match(editorControllerSource, /localResourceRoots:\s*\[codiconsRoot\]/);
+        assert.match(
+            editorControllerSource,
+            /\[cspUtil\.frameSrc\]:\s*\[webview\.cspSource\]/
+        );
+        assert.match(
+            editorControllerSource,
+            /\[cspUtil\.mediaSrc\]:\s*\[webview\.cspSource, cspUtil\.blob\]/
+        );
+        assert.doesNotMatch(
+            editorControllerSource,
+            /localResourceRoots:\s*\[this\.context\.extensionUri\]/
+        );
+    });
+
     it('returns a disposable from registerCustomEditorProvider', () => {
         const result = registerEditorProvider('sqlite-explorer.view', ctx, undefined, null, { verified: true, readOnly: true });
 
