@@ -194,6 +194,10 @@ npm run package      # Package as .vsix
 
 Contributions are welcome! Please feel free to submit issues and pull requests on [GitHub](https://github.com/zknpr/sqlite-explorer).
 
+Before tagging a release, work through [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md) — the
+release gate covering both engines (native and WebAssembly) and all three surfaces (desktop
+VS Code, VS Code Web, and the web demo).
+
 ## Support
 
 If you find this extension useful, consider supporting development:
