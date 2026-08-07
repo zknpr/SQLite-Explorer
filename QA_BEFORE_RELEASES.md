@@ -480,8 +480,15 @@ clean rerun and an explanation. A repeatable **10%+ regression** is a release bl
 it is a documented, deliberate trade — cold start already carries one (the load-safe native
 capability probe costs ~10 ms and is accepted).
 
-Deep-OFFSET paging is ~60× slower than page one. That is a known engine characteristic, not
-a regression; flag only movement against the baseline.
+Deep-OFFSET paging is ~60× slower than page one. This is a property of **our current
+query shape**, not an unavoidable engine limit: `OFFSET n` makes SQLite walk and discard n
+rows, so the cost grows with depth. Measured on the 1.39 GB fixture at offset 3.5 M
+(process startup subtracted): plain OFFSET ~97 ms, index-assisted OFFSET ~95 ms (no help —
+the primary key *is* the rowid, so its index is the table), keyset/seek **~3 ms**, first
+page ~3 ms. Keyset does not shrink the cliff, it removes it.
+
+Until that lands, treat the deep-page number as a baseline to compare against rather than a
+target, and flag only movement.
 
 Also compare startup time and peak RSS when loading, caching, streaming or temporary
 buffers changed. **[unverified]** — WASM-side performance has no tracked baseline at all.
