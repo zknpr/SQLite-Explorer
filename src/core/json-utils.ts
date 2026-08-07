@@ -41,12 +41,26 @@ export function prepareCellUpdateForStorage(
             return { value, operation: 'set' };
         }
         const patch = generateMergePatch(originalObject, newObject);
-        return patch === undefined
+        // Applying a patch that carries null would delete keys instead of
+        // storing the user's explicit null (RFC 7396) — store the full value.
+        return patch === undefined || mergePatchContainsNull(patch)
             ? { value, operation: 'set' }
             : { value: JSON.stringify(patch), operation: 'json_patch' };
     } catch {
         return { value, operation: 'set' };
     }
+}
+
+/**
+ * True when a merge patch holds null as an object member at any depth. Arrays
+ * are exempt: RFC 7396 copies them verbatim (both SQLite's json_patch and
+ * applyMergePatch), so nulls inside them are data, not delete markers.
+ * Depth is bounded because generateMergePatch already enforced MAX_DEPTH.
+ */
+function mergePatchContainsNull(patch: unknown): boolean {
+    if (patch === null) return true;
+    if (!isObject(patch)) return false;
+    return Object.values(patch).some(mergePatchContainsNull);
 }
 
 export function generateMergePatch(original: unknown, modified: unknown, depth = 0): unknown {

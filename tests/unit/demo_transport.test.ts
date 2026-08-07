@@ -1,4 +1,6 @@
 import assert from 'node:assert';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { describe, it } from 'node:test';
 
 import {
@@ -6,6 +8,7 @@ import {
     MAX_WEBVIEW_BINARY_VALUE_BYTES,
     WebviewPayloadLimitError
 } from '../../src/core/webview-transport';
+import { isTrustedViewerMessage } from '../../website/app/demo/messageGuard';
 import {
     guardDemoIframeRequest,
     guardDemoIframeResponse,
@@ -66,6 +69,114 @@ describe('DemoClient transport guards', () => {
         rejectsAggregateAt(
             'web demo worker -> parent response',
             () => guardDemoWorkerResponse(amplified)
+        );
+    });
+});
+
+describe('DemoClient viewer message trust gate', () => {
+    const viewerOrigin = 'https://sqlite-explorer.zknpr.xyz';
+    const viewerWindow = { name: 'viewer' };
+
+    it('accepts the viewer window posting from the demo origin', () => {
+        assert.strictEqual(
+            isTrustedViewerMessage(
+                { source: viewerWindow, origin: viewerOrigin },
+                viewerWindow,
+                viewerOrigin
+            ),
+            true
+        );
+    });
+
+    it('rejects the viewer WindowProxy once an ancestor navigated it cross-origin', () => {
+        // Ancestor navigation preserves the WindowProxy identity, so only the
+        // browser-verified origin distinguishes the attacker's document.
+        assert.strictEqual(
+            isTrustedViewerMessage(
+                { source: viewerWindow, origin: 'https://attacker.vercel.app' },
+                viewerWindow,
+                viewerOrigin
+            ),
+            false
+        );
+    });
+
+    it('rejects opaque-origin senders', () => {
+        assert.strictEqual(
+            isTrustedViewerMessage(
+                { source: viewerWindow, origin: 'null' },
+                viewerWindow,
+                viewerOrigin
+            ),
+            false
+        );
+    });
+
+    it('rejects a foreign source even on a matching origin', () => {
+        assert.strictEqual(
+            isTrustedViewerMessage(
+                { source: { name: 'other' }, origin: viewerOrigin },
+                viewerWindow,
+                viewerOrigin
+            ),
+            false
+        );
+    });
+
+    it('rejects nullish sources while no viewer iframe is mounted', () => {
+        assert.strictEqual(
+            isTrustedViewerMessage(
+                { source: null, origin: viewerOrigin },
+                null,
+                viewerOrigin
+            ),
+            false
+        );
+        assert.strictEqual(
+            isTrustedViewerMessage(
+                { source: undefined, origin: viewerOrigin },
+                undefined,
+                viewerOrigin
+            ),
+            false
+        );
+    });
+});
+
+describe('demo frame-ancestors policy', () => {
+    const requireConfig = createRequire(import.meta.url);
+
+    type HeaderRule = { headers?: { key: string; value: string }[] };
+
+    function contentSecurityPolicyOf(rules: HeaderRule[]): string {
+        const values = rules
+            .flatMap(rule => rule.headers ?? [])
+            .filter(header => header.key === 'Content-Security-Policy')
+            .map(header => header.value);
+        assert.strictEqual(values.length, 1);
+        return values[0];
+    }
+
+    // The only first-party framing is the demo page embedding its same-origin
+    // viewer, so 'self' covers production, previews and localhost alike;
+    // https://*.vercel.app would trust an origin space anyone can register.
+    const expectedPolicy = "frame-ancestors 'self'";
+
+    it('next.config.js does not trust registrable origin spaces', async () => {
+        const nextConfig = requireConfig('../../website/next.config.js');
+        assert.strictEqual(
+            contentSecurityPolicyOf(await nextConfig.headers()),
+            expectedPolicy
+        );
+    });
+
+    it('vercel.json stays in lockstep with next.config.js', () => {
+        const vercelConfig = JSON.parse(
+            readFileSync(new URL('../../website/vercel.json', import.meta.url), 'utf8')
+        );
+        assert.strictEqual(
+            contentSecurityPolicyOf(vercelConfig.headers),
+            expectedPolicy
         );
     });
 });

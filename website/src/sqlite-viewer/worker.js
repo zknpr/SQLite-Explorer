@@ -1122,7 +1122,7 @@ async function fetchTableData(table, options = {}) {
     (needsRowIdCompanions || needsExactRowIdIdentity)
     && sourceRows.length > 0
   ) {
-    const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table]);
+    const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
     isRowIdTable = (authority[0]?.values.length ?? 0) > 0;
   }
   if (isRowIdTable && needsRowIdCompanions) {

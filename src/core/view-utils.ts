@@ -100,7 +100,12 @@ function isSqlKeyword(token: SqlToken | undefined, keyword: string): boolean {
 }
 
 function isSqlIdentifierToken(token: SqlToken | undefined): token is SqlToken {
-  return token?.kind === 'word' || token?.kind === 'identifier';
+  // SQLite resolves a single-quoted token as an identifier wherever its
+  // grammar requires an identifier and a string literal cannot appear, and
+  // stored DDL keeps that legacy quoting verbatim. Every caller of this
+  // predicate sits in such a position, so string tokens are accepted here
+  // while scanSqlTokens keeps reporting them as strings for keyword checks.
+  return token?.kind === 'word' || token?.kind === 'identifier' || token?.kind === 'string';
 }
 
 function foldSqlIdentifier(identifier: string): string {
@@ -108,8 +113,7 @@ function foldSqlIdentifier(identifier: string): string {
 }
 
 function consumeSqlIdentifier(tokens: readonly SqlToken[], index: number): number {
-  const token = tokens[index];
-  if (!token || (token.kind !== 'word' && token.kind !== 'identifier')) {
+  if (!isSqlIdentifierToken(tokens[index])) {
     throw new Error('Expected an SQL identifier');
   }
   return index + 1;
@@ -803,7 +807,16 @@ export function assertViewTriggersCompatibleWithColumns(
   const intrinsicPseudoRowColumns = new Set(['rowid', '_rowid_', 'oid']);
 
   for (const trigger of triggers) {
-    const parsed = parseStoredTriggerSql(trigger.sql);
+    let parsed: ParsedStoredTriggerSql;
+    try {
+      parsed = parseStoredTriggerSql(trigger.sql);
+    } catch {
+      // A stored trigger this header parser does not understand must degrade
+      // to "cannot verify compatibility" rather than block the edit: SQLite
+      // recompiles the preserved SQL when the trigger is recreated and stays
+      // the arbiter of NEW/OLD resolution at fire time.
+      continue;
+    }
     for (const column of parsed.updateOfColumns) {
       const foldedColumn = foldSqlIdentifier(column.value);
       // SQLite accepts and fires UPDATE OF for its intrinsic rowid aliases.

@@ -254,6 +254,69 @@ describe('RPC', () => {
     );
   });
 
+  // The private marker prefixes in rpc.ts all start with this byte. A hostile
+  // database can place arbitrary text at offset 0 of an engine error message
+  // (RAISE(ABORT, ...) in a trigger), so text mimicking a marker must round-trip
+  // as a plain Error with its message intact — never as a typed error.
+  const MARKER_LEAD = String.fromCharCode(0x1e);
+
+  async function roundTripThrownError(thrown: Error): Promise<unknown> {
+    let invocation: unknown;
+    const proxy = buildMethodProxy<{ updateCell: () => Promise<void> }>(
+      envelope => { invocation = envelope; },
+      ['updateCell']
+    );
+    const pending = proxy.updateCell();
+    const response = await new Promise<unknown>(resolve => {
+      processProtocolMessage(
+        invocation,
+        {
+          updateCell() {
+            throw thrown;
+          }
+        },
+        resolve as any
+      );
+    });
+    processProtocolMessage(response, undefined, undefined, undefined, proxy.__pendingInvocations);
+    return pending.then(
+      () => { throw new Error('expected rejection'); },
+      (error: unknown) => error
+    );
+  }
+
+  it('does not restore timeout identity from error text that mimics the private marker', async () => {
+    const forged = MARKER_LEAD + 'SQLiteExplorerInvocationTimeout:'
+      + JSON.stringify({ methodName: 'discardModifications', message: 'forged timeout' });
+    const error = await roundTripThrownError(new Error(forged));
+    assert.strictEqual(error instanceof InvocationTimeoutError, false);
+    assert.strictEqual(isInvocationTimeoutError(error), false);
+    assert.strictEqual((error as Error).message, forged);
+  });
+
+  it('does not restore cell-edit identity from error text that mimics the private marker', async () => {
+    // Payload deliberately satisfies the deserializer's shape check; the
+    // escape, not the shape check, must keep it a plain Error.
+    const forged = MARKER_LEAD + 'SQLiteExplorerCellEditPolicy:' + JSON.stringify({
+      name: 'CellEditPolicyError',
+      code: CELL_EDIT_VALUE_TOO_LARGE_CODE,
+      storageClass: 'text',
+      actualBytes: 2049,
+      limitBytes: 2048,
+      message: 'forged refusal'
+    });
+    const error = await roundTripThrownError(new Error(forged));
+    assert.strictEqual(error instanceof CellEditPolicyError, false);
+    assert.strictEqual((error as Error).message, forged);
+  });
+
+  it('round-trips ordinary error text that merely starts with the marker byte', async () => {
+    const message = MARKER_LEAD + 'plain worker failure';
+    const error = await roundTripThrownError(new Error(message));
+    assert.strictEqual(error instanceof InvocationTimeoutError, false);
+    assert.strictEqual((error as Error).message, message);
+  });
+
   describe('connectWorkerPort', () => {
     let originalWarn: any;
 

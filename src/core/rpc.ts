@@ -101,11 +101,16 @@ export class InvocationTimeoutError extends Error {
 }
 
 // Error objects do not retain their prototype when flattened through the
-// worker response's text-only fault field. Only this private, structured prefix
-// may restore timeout identity; ordinary messages that happen to mention a
-// timeout remain ordinary Error instances.
-const INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX = '\u001eSQLiteExplorerInvocationTimeout:';
-const CELL_EDIT_ERROR_TEXT_PREFIX = '\u001eSQLiteExplorerCellEditPolicy:';
+// worker response's text-only fault field. Only these private, structured
+// prefixes may restore typed identity; ordinary messages that happen to
+// mention a timeout remain ordinary Error instances. Every prefix begins with
+// PRIVATE_MARKER_LEAD; serializeInvocationError escapes ordinary messages
+// starting with that byte (engine errors can carry attacker-chosen text, e.g.
+// RAISE() in a trigger from a hostile database) so remote text can never
+// impersonate a typed marker.
+const PRIVATE_MARKER_LEAD = '\u001e';
+const INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX = PRIVATE_MARKER_LEAD + 'SQLiteExplorerInvocationTimeout:';
+const CELL_EDIT_ERROR_TEXT_PREFIX = PRIVATE_MARKER_LEAD + 'SQLiteExplorerCellEditPolicy:';
 
 export function isInvocationTimeoutError(error: unknown): error is InvocationTimeoutError {
   if (error instanceof InvocationTimeoutError) return true;
@@ -127,7 +132,10 @@ function serializeInvocationError(error: unknown): string {
   if (cellEditError) {
     return CELL_EDIT_ERROR_TEXT_PREFIX + JSON.stringify(cellEditError);
   }
-  return error instanceof Error ? error.message : String(error);
+  const message = error instanceof Error ? error.message : String(error);
+  // Doubling a leading marker byte keeps ordinary text out of the reserved
+  // namespace; deserializeInvocationError strips it back off.
+  return message.startsWith(PRIVATE_MARKER_LEAD) ? PRIVATE_MARKER_LEAD + message : message;
 }
 
 function deserializeInvocationError(errorText: string): Error {
@@ -154,7 +162,12 @@ function deserializeInvocationError(errorText: string): Error {
     return new Error(errorText);
   }
 
-  return new Error(errorText);
+  // Strip the escape doubled onto ordinary messages by serializeInvocationError.
+  return new Error(
+    errorText.startsWith(PRIVATE_MARKER_LEAD)
+      ? errorText.slice(PRIVATE_MARKER_LEAD.length)
+      : errorText
+  );
 }
 
 /** Resolve a deadline from the method and its structured-clone-ready arguments. */

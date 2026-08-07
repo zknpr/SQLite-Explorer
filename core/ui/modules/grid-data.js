@@ -34,6 +34,13 @@ export async function loadTableColumns() {
                 delete state.columnFilters[col];
             }
         }
+
+        // 3. Drop shift-range anchors: they index the previous column set (and
+        // the page rendered against it), so they must not seed a range here even
+        // if the follow-up data reload fails before its own anchor reset.
+        state.lastSelectedCell = null;
+        state.lastSelectedColumnIndex = null;
+        state.lastSelectedRowIndex = null;
     } catch (err) {
         console.error('Error loading columns:', err);
         updateStatus('Error loading columns');
@@ -192,6 +199,12 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             columnFilters: requestedColumnFilters
         };
         state.lastGridLoadError = null;
+        // Shift-range anchors are indices into the rows/columns just replaced;
+        // a stale anchor would make the next shift-click select the wrong block
+        // of rows, or read past the new page's bounds.
+        state.lastSelectedCell = null;
+        state.lastSelectedColumnIndex = null;
+        state.lastSelectedRowIndex = null;
         resetMatchNav();
 
         // When preserving scroll, re-capture the latest position right before

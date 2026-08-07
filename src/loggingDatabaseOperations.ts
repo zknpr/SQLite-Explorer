@@ -81,7 +81,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
     ): Promise<ReturnType<Extract<DatabaseOperations[T], (...args: never[]) => unknown>>> {
         this.log(message, isWrite);
         const func = this.wrapped[method] as unknown as (...args: unknown[]) => unknown;
-        return func(...args) as ReturnType<Extract<DatabaseOperations[T], (...args: never[]) => unknown>>;
+        // Invoke through the receiver: implementations may rely on `this`.
+        return func.apply(this.wrapped, args) as ReturnType<Extract<DatabaseOperations[T], (...args: never[]) => unknown>>;
     }
 
     private log(message: string, isWrite: boolean = false) {

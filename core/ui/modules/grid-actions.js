@@ -393,7 +393,13 @@ export function onColumnHeaderClick(event, columnName) {
         }
 
         const start = Math.min(state.lastSelectedColumnIndex, colIdx);
-        const end = Math.max(state.lastSelectedColumnIndex, colIdx);
+        // Clamp so a stale anchor degrades to a shorter range instead of
+        // reading past the current column set. (start is safe: the clicked
+        // index always lies within the rendered columns.)
+        const end = Math.min(
+            Math.max(state.lastSelectedColumnIndex, colIdx),
+            state.tableColumns.length - 1
+        );
 
         const existingRows = new Array();
         // If appending, index existing selected cells for efficiency
@@ -599,7 +605,12 @@ export function onRowNumberClick(event, rowId, rowIdx) {
         }
 
         const start = Math.min(state.lastSelectedRowIndex, rowIdx);
-        const end = Math.max(state.lastSelectedRowIndex, rowIdx);
+        // Clamp so a stale anchor degrades to a shorter range instead of
+        // reading past the current page's rows.
+        const end = Math.min(
+            Math.max(state.lastSelectedRowIndex, rowIdx),
+            state.gridData.length - 1
+        );
 
         for (let i = start; i <= end; i++) {
             const id = getRowId(state.gridData[i], i);

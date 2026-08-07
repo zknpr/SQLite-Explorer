@@ -224,4 +224,13 @@ describe('LoggingDatabaseOperations', () => {
             assert.ok(!line.includes('user@example.com'));
         });
     });
+
+    describe('delegation', () => {
+        it('invokes the wrapped implementation with its own receiver', async () => {
+            // MockDatabaseOperations.dropView calls this.getViewDefinition, so
+            // it throws if the delegate is called without the wrapped receiver.
+            const result = await logger.dropView('customers');
+            assert.strictEqual(result.identifier, 'customers');
+        });
+    });
 });

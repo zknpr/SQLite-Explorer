@@ -2267,7 +2267,7 @@ export async function createNativeDatabaseConnection(
               // one committed database state.
               const authority = await worker.call<NativeQueryResult>('query', [
                 ROWID_TABLE_AUTHORITY_SQL,
-                [table]
+                [table, table]
               ]);
               isRowIdTable = authority.values.length > 0;
             }

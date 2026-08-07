@@ -14,7 +14,7 @@ import { ConfigurationSection, ExtensionId, getMaxInlineCellBytes, SidebarLeft, 
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument, DocumentModification } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, WebviewQueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, WebviewQueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity } from './core/types';
 import { prepareCellUpdateForStorage } from './core/json-utils';
 import {
   assertMutableRecordId,
@@ -960,47 +960,9 @@ export class HostBridge implements ToastService {
     }
   }
 
-
-
-  /**
-   * Apply edits to the database.
-   */
-  async applyEdits(edits: ModificationEntry[], signal?: AbortSignal) {
-    const dbOps = this.ensureDatabaseInitialized();
-    return dbOps.applyModifications(edits, signal);
-  }
-
-  /**
-   * Undo a database edit.
-   */
-  async undo(edit: ModificationEntry) {
-    const dbOps = this.ensureDatabaseInitialized();
-    return dbOps.undoModification(edit);
-  }
-
-  /**
-   * Redo a database edit.
-   */
-  async redo(edit: ModificationEntry) {
-    const dbOps = this.ensureDatabaseInitialized();
-    return dbOps.redoModification(edit);
-  }
-
-  /**
-   * Commit changes to the database.
-   */
-  async commit(signal?: AbortSignal) {
-    const dbOps = this.ensureDatabaseInitialized();
-    return dbOps.flushChanges(signal);
-  }
-
-  /**
-   * Rollback changes to the database.
-   */
-  async rollback(edits: ModificationEntry[], signal?: AbortSignal) {
-    const dbOps = this.ensureDatabaseInitialized();
-    return dbOps.discardModifications(edits, signal);
-  }
+  // History replay (undo/redo/commit/rollback) is driven by DatabaseDocument on the
+  // extension side, never by the webview — do not re-add bridge methods for it here:
+  // every function-valued property on this class is dispatchable by name over RPC.
 
   /**
    * Trigger VS Code Undo command.
@@ -1486,54 +1448,64 @@ export class HostBridge implements ToastService {
   async readWorkspaceFileUri(uriString: string): Promise<Uint8Array> {
     const uri = vsc.Uri.parse(uriString);
 
-    // SECURITY: Block dangerous URI schemes that could execute code or fetch remote resources
-    const blockedSchemes = ['http', 'https', 'command', 'javascript', 'data', 'vbscript', 'vscode-command'];
+    // SECURITY: Block dangerous URI schemes that could execute code or fetch remote
+    // resources. Our own virtual scheme is blocked too: it resolves through the global
+    // DocumentRegistry, so it would let this webview read cells out of a different
+    // open database.
+    const blockedSchemes = ['http', 'https', 'command', 'javascript', 'data', 'vbscript', 'vscode-command', UriScheme];
     if (blockedSchemes.includes(uri.scheme)) {
       throw new Error(`Access denied: Cannot read from scheme "${uri.scheme}"`);
     }
 
-    // SECURITY: For file:// URIs, validate the path to prevent directory traversal attacks
-    // and restrict access to sensitive system locations
-    if (uri.scheme === 'file') {
-      const filePath = uri.fsPath;
+    // SECURITY: Whitelist approach for every scheme — workspace.fs applies per-provider
+    // ACLs, not a workspace boundary, so non-file schemes (vscode-userdata:,
+    // vscode-vfs:, ...) must not bypass containment. Only allow access to files in:
+    // 1. Explicit workspace folders
+    // 2. The same directory as the open database (or subdirectories)
 
-      // SECURITY: Whitelist approach
-      // Only allow access to files in:
-      // 1. Explicit workspace folders
-      // 2. The same directory as the open database (or subdirectories)
-
-      // 1. Check if file is within workspace folders
-      const workspaceFolder = vsc.workspace.getWorkspaceFolder(uri);
-      if (workspaceFolder) {
-        return await vsc.workspace.fs.readFile(uri);
-      }
-
-      // 2. Check if file is in the same directory tree as the open document
-      // This allows drag-and-drop from the same directory tree in single-file mode
-      const docDir = path.dirname(this.document.uri.fsPath);
-
-      // Use path.resolve to fully resolve both paths
-      // This automatically normalizes paths, resolves any '..' or '.',
-      // and creates an absolute path, mitigating path traversal attacks.
-      const resolvedDocDir = path.resolve(docDir);
-      const resolvedFilePath = path.resolve(filePath);
-
-      // Ensure the resolved target path is either the document directory itself
-      // or strictly inside it by checking if it starts with the directory path plus a separator.
-      // This prevents prefix spoofing (e.g., '/path/to/dir-fake') and directory traversal.
-      // Note: If resolvedDocDir is root (e.g., '/'), we don't need to append an extra separator.
-      const prefix = resolvedDocDir.endsWith(path.sep) ? resolvedDocDir : resolvedDocDir + path.sep;
-      const isInside = resolvedFilePath === resolvedDocDir || resolvedFilePath.startsWith(prefix);
-
-      if (!isInside) {
-         throw new Error(`Access denied: File "${filePath}" is not in the current workspace or document directory.`);
-      }
-
+    // 1. Check if file is within workspace folders. getWorkspaceFolder matches
+    // scheme/authority/path, so vscode-remote and vscode-vfs workspace folders resolve
+    // here — this is what keeps explorer drag-and-drop working in remote workspaces.
+    const workspaceFolder = vsc.workspace.getWorkspaceFolder(uri);
+    if (workspaceFolder) {
       return await vsc.workspace.fs.readFile(uri);
     }
 
-    // For other schemes (vscode-remote, ssh, etc.), delegate to VS Code's fs API
-    // which will enforce its own access controls
+    // 2. Check if file is in the same directory tree as the open document
+    // This allows drag-and-drop from the same directory tree in single-file mode.
+    // The candidate must live on the document's own scheme and authority: an equal
+    // path on a different provider is a different resource space entirely.
+    const docUri = this.document.uri;
+    let isInside = false;
+    if (uri.scheme === docUri.scheme && uri.authority === docUri.authority) {
+      if (uri.scheme === 'file') {
+        // Use path.resolve to fully resolve both paths
+        // This automatically normalizes paths, resolves any '..' or '.',
+        // and creates an absolute path, mitigating path traversal attacks.
+        const resolvedDocDir = path.resolve(path.dirname(docUri.fsPath));
+        const resolvedFilePath = path.resolve(uri.fsPath);
+
+        // Ensure the resolved target path is either the document directory itself
+        // or strictly inside it by checking if it starts with the directory path plus a separator.
+        // This prevents prefix spoofing (e.g., '/path/to/dir-fake') and directory traversal.
+        // Note: If resolvedDocDir is root (e.g., '/'), we don't need to append an extra separator.
+        const prefix = resolvedDocDir.endsWith(path.sep) ? resolvedDocDir : resolvedDocDir + path.sep;
+        isInside = resolvedFilePath === resolvedDocDir || resolvedFilePath.startsWith(prefix);
+      } else {
+        // Virtual providers address resources by POSIX-style uri.path (fsPath is
+        // meaningless there); posix.resolve collapses '.' and '..' segments the same
+        // way path.resolve does in the local branch above.
+        const resolvedDocDir = path.posix.resolve('/', path.posix.dirname(docUri.path));
+        const resolvedFilePath = path.posix.resolve('/', uri.path);
+        const prefix = resolvedDocDir.endsWith('/') ? resolvedDocDir : resolvedDocDir + '/';
+        isInside = resolvedFilePath === resolvedDocDir || resolvedFilePath.startsWith(prefix);
+      }
+    }
+
+    if (!isInside) {
+      throw new Error(`Access denied: File "${uri.toString()}" is not in the current workspace or document directory.`);
+    }
+
     return await vsc.workspace.fs.readFile(uri);
   }
 

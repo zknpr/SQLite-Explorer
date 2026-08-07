@@ -1123,6 +1123,32 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('treats a declared demo rowid column with duplicate unsafe values as data', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_declared_rowid_dupes ("rowid" INTEGER, value TEXT); ' +
+            'INSERT INTO demo_declared_rowid_dupes("rowid", value) VALUES ' +
+            "(9007199254740993, 'first'), (9007199254740993, 'second')"
+        );
+
+        const data = await worker.invoke('fetchTableData', 'demo_declared_rowid_dupes', {
+            columns: ['rowid', 'value'],
+            limit: 10,
+            offset: 0
+        });
+
+        // The declared column shadows the intrinsic rowid, so it must never be
+        // promoted to an exact row identity; both rows keep the rounded number
+        // plus sidecar text.
+        assert.deepStrictEqual(
+            data.rows.map((row: unknown[]) => row[0]),
+            [9007199254740992, 9007199254740992]
+        );
+        assert.strictEqual(data.exactIntegerTexts[0][0], '9007199254740993');
+        assert.strictEqual(data.exactIntegerTexts[1][0], '9007199254740993');
+    });
+
     it('edits and deletes rows through WITHOUT ROWID primary-key identities', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

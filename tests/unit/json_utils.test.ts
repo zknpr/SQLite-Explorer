@@ -1,7 +1,12 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { generateMergePatch, applyMergePatch, computeJsonPatchUndo } from '../../src/core/json-utils';
+import {
+    generateMergePatch,
+    applyMergePatch,
+    computeJsonPatchUndo,
+    prepareCellUpdateForStorage
+} from '../../src/core/json-utils';
 
 describe('JSON Merge Patch (RFC 7396)', () => {
     describe('generateMergePatch', () => {
@@ -133,6 +138,88 @@ describe('JSON Merge Patch (RFC 7396)', () => {
             patch.own = 2;
             assert.deepStrictEqual(applyMergePatch({ a: 1 }, patch), { a: 1, own: 2 });
         });
+    });
+});
+
+describe('prepareCellUpdateForStorage', () => {
+    it('emits a merge patch for a plain object edit that round-trips through apply', () => {
+        const prior = '{"a":1,"b":2}';
+        const next = '{"a":5,"b":2}';
+        const prepared = prepareCellUpdateForStorage(next, prior);
+        assert.strictEqual(prepared.operation, 'json_patch');
+        assert.deepStrictEqual(JSON.parse(prepared.value as string), { a: 5 });
+        assert.deepStrictEqual(
+            applyMergePatch(JSON.parse(prior), JSON.parse(prepared.value as string)),
+            JSON.parse(next)
+        );
+    });
+
+    it('stores the full value when the edit sets a key to null', () => {
+        // The patch would be {"a":null}, which applies as a key DELETION
+        // (RFC 7396) — the user's explicit null must survive as a set.
+        const prepared = prepareCellUpdateForStorage('{"a":null,"b":2}', '{"a":1,"b":2}');
+        assert.deepStrictEqual(prepared, { value: '{"a":null,"b":2}', operation: 'set' });
+    });
+
+    it('stores the full value when a key becomes null at any depth', () => {
+        const next = '{"a":{"b":{"c":null}},"d":1}';
+        const prepared = prepareCellUpdateForStorage(next, '{"a":{"b":{"c":1}},"d":1}');
+        assert.deepStrictEqual(prepared, { value: next, operation: 'set' });
+    });
+
+    it('stores the full value when an added subtree contains null', () => {
+        // Merge-patch application strips nulls even inside newly added objects.
+        const next = '{"a":1,"b":{"c":null,"d":2}}';
+        const prepared = prepareCellUpdateForStorage(next, '{"a":1}');
+        assert.deepStrictEqual(prepared, { value: next, operation: 'set' });
+    });
+
+    it('stores the full value when the edit deletes a key', () => {
+        // The patch would be the ambiguous {"b":null}; correctness beats the
+        // optimization.
+        const prepared = prepareCellUpdateForStorage('{"a":1}', '{"a":1,"b":2}');
+        assert.deepStrictEqual(prepared, { value: '{"a":1}', operation: 'set' });
+    });
+
+    it('still patches when null appears only inside an array', () => {
+        // Merge patch copies arrays verbatim, so nulls inside them are data,
+        // not delete markers — the optimization stays safe here.
+        const prior = '{"a":[1,2],"b":1}';
+        const next = '{"a":[1,null,{"c":null}],"b":1}';
+        const prepared = prepareCellUpdateForStorage(next, prior);
+        assert.strictEqual(prepared.operation, 'json_patch');
+        assert.deepStrictEqual(
+            applyMergePatch(JSON.parse(prior), JSON.parse(prepared.value as string)),
+            JSON.parse(next)
+        );
+    });
+
+    it('keeps pre-built history-replay patches verbatim, including nulls', () => {
+        const prepared = prepareCellUpdateForStorage('{"a":null}', '{"a":1}', 'json_patch');
+        assert.deepStrictEqual(prepared, { value: '{"a":null}', operation: 'json_patch' });
+    });
+
+    it('falls back to set for non-object or unparseable values', () => {
+        assert.deepStrictEqual(prepareCellUpdateForStorage(5, 4), { value: 5, operation: 'set' });
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage('plain', '{"a":1}'),
+            { value: 'plain', operation: 'set' }
+        );
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage('[1,2]', '[1]'),
+            { value: '[1,2]', operation: 'set' }
+        );
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage('{"a":}', '{"a":1}'),
+            { value: '{"a":}', operation: 'set' }
+        );
+    });
+
+    it('falls back to set when nothing changed', () => {
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage('{"a":1}', '{ "a" : 1 }'),
+            { value: '{"a":1}', operation: 'set' }
+        );
     });
 });
 

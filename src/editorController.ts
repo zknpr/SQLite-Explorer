@@ -12,7 +12,7 @@ import * as vsc from 'vscode';
 import { crypto } from './platform/cryptoShim';
 import { ConfigurationSection, CopilotChatId, ExtensionId, FirstInstallMs, FullExtensionId, Ns, SidebarLeft, SidebarRight } from './config';
 import { Disposable } from './lifecycle';
-import { IsVSCode, IsVSCodium, cspUtil, doTry, toDatasetAttrs, themeToCss, uiKindToString, BoolString, toBoolString, IsCursorIDE, lang } from './helpers';
+import { cspUtil, doTry, toDatasetAttrs, themeToCss, uiKindToString, BoolString, toBoolString, IsCursorIDE, lang } from './helpers';
 import { WebviewCollection } from './webview-collection';
 
 import { SupportsWriteMode, IsRemoteWorkspaceMode, DatabaseDocument, isAutoCommitEnabled } from './databaseModel';
@@ -272,8 +272,13 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       [cspUtil.mediaSrc]: [webview.cspSource, cspUtil.blob],
     };
 
-    // Only set csp for hosts that are known to correctly set `webview.cspSource`
-    const cspStr = IsVSCode || IsVSCodium
+    // Only set csp for hosts that actually populate `webview.cspSource`. The
+    // former VS Code/VSCodium brand check approximated this capability but left
+    // Open VSX hosts (Cursor, Windsurf, ...) that report neither brand yet set
+    // cspSource correctly with no CSP at all. A host that leaves it empty still
+    // falls back to no CSP rather than a policy whose blank source lists would
+    // block the webview's own scripts and styles.
+    const cspStr = webview.cspSource
       ? cspUtil.build(cspObj)
       : '';
 

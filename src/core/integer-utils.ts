@@ -13,11 +13,19 @@ const SQLITE_MAX_RESULT_COLUMNS = 2000;
 const ROWID_COMPANION_COLUMNS_PER_QUERY = 999;
 const SQLITE_MAX_VARIABLE_NUMBER = 32766;
 
-/** Authoritative main-schema capability check required before companion reads. */
+/**
+ * Authoritative main-schema capability check required before companion reads.
+ * A declared column named rowid/_rowid_/oid shadows the intrinsic rowid, so
+ * "rowid" in the companion queries would read (possibly duplicated) table data
+ * instead of stable row identity; such tables keep the values-only degradation.
+ * Binds the table name twice.
+ */
 export const ROWID_TABLE_AUTHORITY_SQL =
   `SELECT 1 FROM pragma_table_list ` +
   `WHERE "schema" = 'main' AND "name" = ? AND (` +
-  `("type" = 'table' AND "wr" = 0) OR "type" IN ('virtual', 'shadow')) LIMIT 1`;
+  `("type" = 'table' AND "wr" = 0) OR "type" IN ('virtual', 'shadow')) ` +
+  `AND NOT EXISTS (SELECT 1 FROM pragma_table_info(?, 'main') ` +
+  `WHERE lower("name") IN ('rowid', '_rowid_', 'oid')) LIMIT 1`;
 
 export interface ExactNumericTextQuery {
   sql: string;
@@ -193,7 +201,14 @@ export function collectRowIdExactRealTexts(
     if (!['bigint', 'number', 'string'].includes(typeof rowId)) {
       throw new Error(`Invalid rowid identity at source row ${rowIndex}`);
     }
-    sourceRowById.set(String(rowId), rowIndex);
+    const rowIdKey = String(rowId);
+    // Intrinsic rowids are unique. A duplicate means the leading column is
+    // table data, and a last-write-wins map would attribute companion text to
+    // the wrong row.
+    if (sourceRowById.has(rowIdKey)) {
+      throw new Error(`Duplicate rowid identity at source row ${rowIndex}`);
+    }
+    sourceRowById.set(rowIdKey, rowIndex);
   });
 
   let exactTexts: ExactIntegerTextMap | undefined;

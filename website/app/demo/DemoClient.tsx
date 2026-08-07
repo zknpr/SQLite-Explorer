@@ -14,6 +14,7 @@
 
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { Upload, Database, FileUp, ArrowLeft, Download, RefreshCw, AlertCircle } from 'lucide-react';
+import { isTrustedViewerMessage } from './messageGuard';
 import {
   demoRpcErrorFields,
   demoRpcErrorFromResponse,
@@ -260,15 +261,19 @@ export default function DemoClient() {
    * Forward RPC calls from iframe to worker and back.
    */
   const handleIframeMessage = useCallback((event: MessageEvent) => {
-    // Only handle messages from our iframe
-    if (event.source !== iframeRef.current?.contentWindow) return;
+    // The viewer iframe is same-origin, and an ancestor can navigate it to a
+    // foreign document without changing its WindowProxy — so require the
+    // browser-verified origin alongside the source identity, and reply only
+    // to our own origin, never to event.origin.
+    const viewerOrigin = window.location.origin;
+    if (!isTrustedViewerMessage(event, iframeRef.current?.contentWindow, viewerOrigin)) return;
 
     const envelope = event.data;
 
     if (envelope?.kind === 'sqlite-explorer-ready') {
       event.source?.postMessage(
         { kind: 'sqlite-explorer-origin' },
-        { targetOrigin: event.origin }
+        { targetOrigin: viewerOrigin }
       );
       return;
     }
@@ -284,7 +289,7 @@ export default function DemoClient() {
         if (!Array.isArray(decoded)) throw new TypeError('RPC payload must be an array');
         deserializedPayload = decoded;
       } catch (error) {
-        postIframeRpcResponse(event.source, event.origin, {
+        postIframeRpcResponse(event.source, viewerOrigin, {
           kind: 'response',
           messageId,
           success: false,
@@ -296,7 +301,7 @@ export default function DemoClient() {
       // Special handling for extension-specific methods
       if (targetMethod === 'initialize') {
         // Already initialized, just return success
-        postIframeRpcResponse(event.source, event.origin, {
+        postIframeRpcResponse(event.source, viewerOrigin, {
           kind: 'response',
           messageId,
           success: true,
@@ -307,7 +312,7 @@ export default function DemoClient() {
 
       if (targetMethod === 'getExtensionSettings') {
         // Return default settings for web mode
-        postIframeRpcResponse(event.source, event.origin, {
+        postIframeRpcResponse(event.source, viewerOrigin, {
           kind: 'response',
           messageId,
           success: true,
@@ -341,7 +346,7 @@ export default function DemoClient() {
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
 
-            postIframeRpcResponse(event.source, event.origin, {
+            postIframeRpcResponse(event.source, viewerOrigin, {
               kind: 'response',
               messageId,
               success: true,
@@ -349,7 +354,7 @@ export default function DemoClient() {
             });
           })
           .catch((error) => {
-            postIframeRpcResponse(event.source, event.origin, {
+            postIframeRpcResponse(event.source, viewerOrigin, {
               kind: 'response',
               messageId,
               success: false,
@@ -372,7 +377,7 @@ export default function DemoClient() {
         previewController?.signal
       )
         .then((result) => {
-          postIframeRpcResponse(event.source, event.origin, {
+          postIframeRpcResponse(event.source, viewerOrigin, {
             kind: 'response',
             messageId,
             success: true,
@@ -380,7 +385,7 @@ export default function DemoClient() {
           });
         })
         .catch((error) => {
-          postIframeRpcResponse(event.source, event.origin, {
+          postIframeRpcResponse(event.source, viewerOrigin, {
             kind: 'response',
             messageId,
             success: false,

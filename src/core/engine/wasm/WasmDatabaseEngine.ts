@@ -971,16 +971,19 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         // e.g. UPDATE table SET col1 = ?, col2 = ? WHERE rowid = ?
 
         // First, transform the data into a row-centric map
-        const rowUpdates = new Map<RecordId, Record<string, CellValue | null>>();
+        // Keyed by Map, not by object literal: a column may legally be named
+        // "__proto__", where assignment hits the legacy prototype accessor and
+        // reads back as Object.prototype instead of the stored cell value.
+        const rowUpdates = new Map<RecordId, Map<string, CellValue | null>>();
         for (const col of deletedColumns) {
           for (const cell of col.data) {
             const rId = validateRowId(cell.rowId);
             let rowObj = rowUpdates.get(rId);
             if (!rowObj) {
-              rowObj = {};
+              rowObj = new Map();
               rowUpdates.set(rId, rowObj);
             }
-            rowObj[col.name] = cell.value ?? null;
+            rowObj.set(col.name, cell.value ?? null);
           }
         }
 
@@ -988,7 +991,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           const statements = new Map<string, WasmPreparedStatement>();
           try {
             for (const [rId, rowObj] of rowUpdates.entries()) {
-              const params: CellValue[] = deletedColumns.map(c => rowObj[c.name] ?? null);
+              const params: CellValue[] = deletedColumns.map(c => rowObj.get(c.name) ?? null);
               const setClause = deletedColumns.map((column, index) => (
                 `${escapeIdentifier(column.name)} = ${wasmBindPlaceholder(params[index])}`
               )).join(', ');
@@ -2366,8 +2369,15 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           updatesByColumn.get(key)!.push(update);
       }
 
-      for (const [key, columnUpdates] of updatesByColumn.entries()) {
-          const [column, op, valuePlaceholder] = key.split('|');
+      for (const columnUpdates of updatesByColumn.values()) {
+          // Recover the tuple from the group itself, never by re-parsing the key:
+          // SQLite identifiers may legally contain '|', so splitting it would
+          // truncate a column named e.g. `notes|set|?` and write the wrong column.
+          // Every member of a group shares one column/operation/placeholder by
+          // construction, so the first entry is authoritative.
+          const column = columnUpdates[0].column;
+          const op = columnUpdates[0].operation || 'set';
+          const valuePlaceholder = wasmBindPlaceholder(columnUpdates[0].value);
           const escapedColumn = escapeIdentifier(column);
 
           // For json_patch operations, choose between native SQLite json_patch()
@@ -2478,10 +2488,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Fetch table data using options.
    *
-   * NOTE: This method intentionally bypasses the query timeout mechanism.
-   * Unlike raw executeQuery(), fetchTableData() always includes pagination
-   * (LIMIT/OFFSET) which naturally bounds the result size and execution time.
-   * The query builder enforces these limits, making timeout unnecessary here.
+   * Runs under the same progress-handler deadline as executeQuery():
+   * LIMIT/OFFSET bound the rows returned, not the work performed, so an
+   * expensive view, CTE or unindexed ORDER BY still hits queryTimeout.
    */
   async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
     const queryOptions = { ...options };
@@ -2511,21 +2520,38 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
     // Use prepare/step/get to avoid overhead of exec() which builds intermediate objects
     // and to allow for potentially better memory management in the future
-    let headerStmt: WasmPreparedStatement | null = null;
-    let stmt: WasmPreparedStatement | null = null;
+    const executionState: {
+      headerStmt?: WasmPreparedStatement;
+      stmt?: WasmPreparedStatement;
+    } = {};
     try {
+      // executeWithProgressHandler is strictly synchronous and its handler is
+      // connection-global, so the awaited authority read must resolve before
+      // the guarded span below. This engine owns a private in-memory copy, so
+      // no external process can commit between this read and the page and
+      // companion reads it authorizes.
+      const firstColumn = queryOptions.columns?.[0]?.toLowerCase();
+      let isRowIdTable = false;
+      if (firstColumn === undefined || firstColumn === '*' || firstColumn === 'rowid') {
+        const authority = await this.executeQuery(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
+        isRowIdTable = (authority[0]?.rows.length ?? 0) > 0;
+      }
+
+      return this.executeWithProgressHandler(() => {
         const bindParams = normalizeWasmBindParams(params);
-        headerStmt = this.instance.prepare(sql, bindParams);
+        const headerStmt = this.instance.prepare(sql, bindParams);
+        executionState.headerStmt = headerStmt;
         const headers = headerStmt.getColumnNames();
         headerStmt.free();
-        headerStmt = null;
+        executionState.headerStmt = undefined;
 
         const containmentQuery = buildCellContainmentQuery(sql, headers.length, queryOptions);
         const transportQuery = buildExactNumericTextQuery(
           containmentQuery.sql,
           headers.length + 1
         );
-        stmt = this.instance.prepare(transportQuery.sql, bindParams);
+        const stmt = this.instance.prepare(transportQuery.sql, bindParams);
+        executionState.stmt = stmt;
         const sourceRows: Array<Array<CellValue | bigint>> = [];
 
         while (stmt.step()) {
@@ -2537,21 +2563,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
 
         const companionResults = [];
-        let isRowIdTable = false;
         const hasRowIdShape = headers[0]?.toLowerCase() === 'rowid';
         const needsExactRowIdIdentity = hasRowIdShape
           && hasUnsafeBigIntAtColumn(sourceRows, 0);
         const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
           && hasRowIdShape;
-        // This engine owns a private in-memory copy, so no external process can
-        // commit between the source read and this authority/companion work.
-        if (
-          (needsRowIdCompanions || needsExactRowIdIdentity)
-          && sourceRows.length > 0
-        ) {
-          const authority = await this.executeQuery(ROWID_TABLE_AUTHORITY_SQL, [table]);
-          isRowIdTable = (authority[0]?.rows.length ?? 0) > 0;
-        }
         if (isRowIdTable && needsRowIdCompanions) {
           for (const query of buildRowIdExactRealTextQueries(
             table,
@@ -2626,12 +2642,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             exactIntegerTexts,
             ...(oversizedCells ? { oversizedCells } : {})
         };
+      });
     } catch (err) {
         const errorDetail = err instanceof Error ? err.message : String(err);
         throw new Error(`Fetch failed: ${errorDetail}`);
     } finally {
-        if (headerStmt) headerStmt.free();
-        if (stmt) stmt.free();
+        executionState.headerStmt?.free();
+        executionState.stmt?.free();
     }
   }
 

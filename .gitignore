@@ -41,3 +41,7 @@ _endpoint_bundle.mjs
 vscode-web-test-db.png
 docs/superpowers/
 test_db/
+
+# Security scan exports. These enumerate unfixed vulnerabilities in a shipped
+# extension; publishing one to a public repo would disclose them before a fix ships.
+c-sec-scan/

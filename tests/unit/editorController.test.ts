@@ -174,6 +174,17 @@ describe('registerEditorProvider', () => {
         );
     });
 
+    it('gates CSP emission on the cspSource capability, not the editor brand', () => {
+        // Open VSX hosts (Cursor, Windsurf, ...) report neither the vscode nor
+        // vscodium uriScheme but do populate webview.cspSource; a brand check
+        // would serve their webviews with no CSP at all.
+        assert.match(
+            editorControllerSource,
+            /const cspStr = webview\.cspSource\s*\?\s*cspUtil\.build\(cspObj\)\s*:\s*''/
+        );
+        assert.doesNotMatch(editorControllerSource, /IsVSCode \|\| IsVSCodium/);
+    });
+
     it('returns a disposable from registerCustomEditorProvider', () => {
         const result = registerEditorProvider('sqlite-explorer.view', ctx, undefined, null, { verified: true, readOnly: true });
 
