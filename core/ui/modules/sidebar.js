@@ -585,6 +585,10 @@ export async function selectTableItem(name, type) {
 
     // Update UI
     renderSidebar();
+    // The cell selection was just cleared; hide the Batch Update panel with it
+    // now, synchronously — the loads below can fail before any commit-time
+    // refresh, which would leave the previous table's staged columns on screen.
+    updateBatchSidebar();
 
     const tableNameLabel = document.getElementById('tableNameLabel');
     if (tableNameLabel) tableNameLabel.textContent = name;

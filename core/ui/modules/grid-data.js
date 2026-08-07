@@ -2,6 +2,10 @@ import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus, showLoading, showErrorState, updateToolbarButtons } from './ui.js';
 import { updatePagination, renderDataGrid } from './grid-render.js';
+// Closes a module cycle (grid-selection → sidebar → grid.js → here), which is
+// safe because the binding is a hoisted function declaration only called at
+// runtime — the same shape grid-actions.js already relies on.
+import { clearCellSelection } from './grid-selection.js';
 import { resetMatchNav } from './match-nav.js';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 
@@ -41,6 +45,13 @@ export async function loadTableColumns() {
         state.lastSelectedCell = null;
         state.lastSelectedColumnIndex = null;
         state.lastSelectedRowIndex = null;
+
+        // 4. Drop the staged cell selection for the same reason: its colIdx
+        // indexes the previous column set, so a batch Apply after this commit
+        // would write whichever column now sits at that index. Table switches
+        // clear it upstream, but same-table schema reloads (undo/redo
+        // broadcasts, reload-from-disk) reach here with it still staged.
+        clearCellSelection();
     } catch (err) {
         console.error('Error loading columns:', err);
         updateStatus('Error loading columns');
@@ -205,6 +216,10 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         state.lastSelectedCell = null;
         state.lastSelectedColumnIndex = null;
         state.lastSelectedRowIndex = null;
+        // The staged cell selection is index-bearing in the same way, so it
+        // must not survive the commit either. Flows that need a selection
+        // across a reload rebuild it by identity afterwards (applyBatchUpdate).
+        clearCellSelection();
         resetMatchNav();
 
         // When preserving scroll, re-capture the latest position right before
