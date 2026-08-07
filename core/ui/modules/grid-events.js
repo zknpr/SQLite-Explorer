@@ -37,10 +37,12 @@ export function initGridControls() {
     document.getElementById('pageSizeSelect')?.addEventListener('change', onPageSizeChange);
     document.getElementById('dateFormatSelect')?.addEventListener('change', onDateFormatChange);
 
-    document.getElementById('btnFirst')?.addEventListener('click', () => goToPage(0));
-    document.getElementById('btnPrev')?.addEventListener('click', () => goToPage(state.currentPageIndex - 1));
-    document.getElementById('btnNext')?.addEventListener('click', () => goToPage(state.currentPageIndex + 1));
-    document.getElementById('btnLast')?.addEventListener('click', () => goToPage(state.totalPageCount - 1));
+    // The nav intent names the page's relationship to the current anchors so
+    // loadTableData can seek (keyset) instead of scanning to OFFSET.
+    document.getElementById('btnFirst')?.addEventListener('click', () => goToPage(0, 'first'));
+    document.getElementById('btnPrev')?.addEventListener('click', () => goToPage(state.currentPageIndex - 1, 'prev'));
+    document.getElementById('btnNext')?.addEventListener('click', () => goToPage(state.currentPageIndex + 1, 'next'));
+    document.getElementById('btnLast')?.addEventListener('click', () => goToPage(state.totalPageCount - 1, 'last'));
 }
 
 export function initGridInteraction() {

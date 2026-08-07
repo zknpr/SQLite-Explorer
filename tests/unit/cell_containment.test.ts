@@ -141,7 +141,11 @@ describe('grid cell containment limits', () => {
                 maxInlineCellBytes: 8,
                 maxPageResponseBytes: 64
             });
-            assert.deepStrictEqual(small, {
+            // Keyset anchors are the one deliberate DTO addition: every rowid
+            // grid page re-anchors itself for seek pagination.
+            const { keysetAnchors, ...smallDto } = small;
+            assert.ok(keysetAnchors?.first && keysetAnchors?.last);
+            assert.deepStrictEqual(smallDto, {
                 headers: ['rowid', 'text_value', 'blob_value'],
                 rows: [[2, 'ok', Uint8Array.from([1, 2])]],
                 columns: ['rowid', 'text_value', 'blob_value'],

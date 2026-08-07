@@ -294,12 +294,13 @@ export function onDateFormatChange() {
     }
 }
 
-export function goToPage(pageIndex) {
+export function goToPage(pageIndex, navIntent) {
     if (pageIndex >= 0 && pageIndex < state.totalPageCount) {
         state.currentPageIndex = pageIndex;
         state.scrollPosition = { top: 0, left: 0 };
         resetMatchNav();
-        loadTableData(true, false);
+        // Callers without an intent (arbitrary jumps) load via OFFSET.
+        loadTableData(true, false, navIntent);
     }
 }
 

@@ -332,6 +332,10 @@ The webview provides a UI to configure SQLite PRAGMAs (e.g., WAL mode, Foreign K
 
 `queryBatch` in `nativeWorker.ts` sends multiple SQL queries in a single IPC round-trip. Used for schema fetching (3 queries → 1 call) and pragma reads.
 
+### Keyset Pagination
+
+Grid page turns seek instead of scanning (deep page = first-page cost on every engine). Engines mint opaque anchor tokens (`ksa:` + canonical JSON, `src/core/keyset-pagination.ts`) for the first/last row of every page of an anchorable table (authority-confirmed unshadowed rowid, or WITHOUT ROWID primary key). The webview commits them atomically with the grid rows (inside the superseded-load gate in `grid-data.js`) and round-trips them verbatim with a navigation intent (`first`/`after`/`atOrAfter`/`before`/`last`). Engines strictly re-validate every received anchor — canonical decode, embedded query-identity tag (table, sort, filters, page size), key arity — and fall back to the LIMIT/OFFSET query on any legitimate staleness; structurally malformed tokens throw (engines never mint them, so they signal tampering, not staleness). Both paths emit one deterministic total order — the identity tiebreak is appended to sorts, and the OFFSET fallback adopts the full key ordering via `keysetFallbackOrder` — so mixed OFFSET/keyset sequences can never skip or duplicate rows. NULL sort boundaries decompose per direction (NULLs first ASC / last DESC); INTEGER-class anchor values bind through `CAST(? AS INTEGER)` so int64 beyond 2^53 seeks exactly even on NONE-affinity columns. Views and keyless objects always use OFFSET. `before`/`last` execute reversed with a bounded SQL-side re-sort so row-indexed sidecars (oversizedCells, exactIntegerTexts) stay aligned.
+
 ### Blob Inspector
 
 The Blob Inspector (`core/ui/modules/blob-inspector.js`) provides preview and editing for BLOB data:

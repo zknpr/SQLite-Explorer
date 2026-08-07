@@ -550,7 +550,7 @@ async function runCandidate(
       });
       return elapsedMeasurement(startedAt, { rows: result.rows.length });
     });
-    workloads.deepPage = await measure('deep page', iterations, async () => {
+    workloads.deepPage = await measure('deep page OFFSET', iterations, async () => {
       const startedAt = performance.now();
       const result = await connection.operations.fetchTableData(plan.largestTable, {
         ...pageOptions,
@@ -558,6 +558,68 @@ async function runCandidate(
       });
       return elapsedMeasurement(startedAt, { rows: result.rows.length });
     });
+
+    // The grid's deep navigation shape: seek by engine-issued anchor instead
+    // of scanning to OFFSET. Preparation replays a Last -> Prev navigation to
+    // hold the second-to-last page's anchor; the measured operation is the
+    // Next page turn at depth (the workload that hits the OFFSET cliff above).
+    const totalPages = Math.max(1, Math.ceil(plan.largestTableRows / PAGE_SIZE));
+    const lastPageRows = plan.largestTableRows - (totalPages - 1) * PAGE_SIZE;
+    if (totalPages < 2) {
+      process.stderr.write('[bench-native] deep page keyset: skipped (single-page table)\n');
+    } else {
+      const lastPage = await connection.operations.fetchTableData(plan.largestTable, {
+        ...pageOptions,
+        offset: (totalPages - 1) * PAGE_SIZE,
+        keyset: { mode: 'last', lastPageRowCount: lastPageRows }
+      });
+      const previousPage = lastPage.keysetAnchors?.first
+        ? await connection.operations.fetchTableData(plan.largestTable, {
+            ...pageOptions,
+            offset: (totalPages - 2) * PAGE_SIZE,
+            keyset: { mode: 'before', anchor: lastPage.keysetAnchors.first }
+          })
+        : undefined;
+      const anchor = previousPage?.keysetAnchors?.last;
+      if (!anchor) {
+        process.stderr.write(
+          '[bench-native] deep page keyset: skipped (table did not issue anchors)\n'
+        );
+      } else {
+        workloads.deepPageKeyset = await measure('deep page keyset', iterations, async () => {
+          const startedAt = performance.now();
+          const result = await connection.operations.fetchTableData(plan.largestTable, {
+            ...pageOptions,
+            offset: (totalPages - 1) * PAGE_SIZE,
+            keyset: { mode: 'after', anchor }
+          });
+          if (result.rows.length !== lastPageRows) {
+            throw new Error(
+              `Keyset deep page returned ${result.rows.length} rows; expected ${lastPageRows}`
+            );
+          }
+          return elapsedMeasurement(startedAt, { rows: result.rows.length });
+        });
+      }
+    }
+
+    // A keyset request that silently degrades to the OFFSET fallback returns
+    // the exact same rows, so row comparison cannot expose it — only timing
+    // can: at depth the seek must be clearly cheaper than the OFFSET scan
+    // once the scan itself is non-trivial. Warn only; timing is environment-
+    // sensitive and must never fail a benchmark run.
+    if (
+      workloads.deepPage && workloads.deepPageKeyset
+      && workloads.deepPage.medianMs >= 20
+      && workloads.deepPageKeyset.medianMs >= 0.5 * workloads.deepPage.medianMs
+    ) {
+      process.stderr.write(
+        '[bench-native] WARNING: deep page keyset median ' +
+        `(${workloads.deepPageKeyset.medianMs.toFixed(2)} ms) is not clearly below ` +
+        `deep page OFFSET (${workloads.deepPage.medianMs.toFixed(2)} ms); ` +
+        'the keyset request may be silently falling back to the OFFSET query\n'
+      );
+    }
 
     workloads.wideResult = await measure('wide result', iterations, async () => {
       const startedAt = performance.now();

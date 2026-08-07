@@ -17,6 +17,7 @@ import {
     OversizedCellReplacementRequiredError
 } from '../../src/core/cell-edit-policy';
 import { streamTableExport } from '../../src/tableExporter';
+import type { TableQueryOptions } from '../../src/core/types';
 
 const BUNDLED_TXIKI_SQLITE_VERSION = '3.51.2';
 const DIVERGENT_REAL_TEXT_BY_NATIVE_SQLITE_VERSION: Record<string, string> = {
@@ -622,6 +623,211 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 ['9007199254740992', 'lower'],
                 ['9007199254740993', 'edited']
             ]);
+        });
+
+        await testContext.test('pages native tables by keyset without OFFSET', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_keyset_pages (value TEXT); ' +
+                'WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 23) ' +
+                "INSERT INTO native_keyset_pages(value) SELECT 'row-' || n FROM seq"
+            );
+            const options = (pageIndex: number, keyset?: TableQueryOptions['keyset']) => ({
+                columns: ['rowid', 'value'],
+                globalFilterColumns: ['value'],
+                limit: 5,
+                offset: pageIndex * 5,
+                ...(keyset ? { keyset } : {})
+            });
+            const offsetPages = [];
+            for (let index = 0; index < 5; index++) {
+                offsetPages.push(
+                    await engine.fetchTableData('native_keyset_pages', options(index))
+                );
+            }
+            assert.strictEqual(offsetPages[4].rows.length, 3, 'short remainder page expected');
+
+            // Forward: 'first' then an after-chain; each page must byte-match
+            // the OFFSET page and carry anchors minted across the native IPC.
+            let page = await engine.fetchTableData(
+                'native_keyset_pages',
+                options(0, { mode: 'first' })
+            );
+            assert.deepStrictEqual(page.rows, offsetPages[0].rows);
+            for (let index = 1; index < 5; index++) {
+                assert.ok(page.keysetAnchors?.last, `missing anchor for page ${index - 1}`);
+                page = await engine.fetchTableData(
+                    'native_keyset_pages',
+                    options(index, { mode: 'after', anchor: page.keysetAnchors.last })
+                );
+                assert.deepStrictEqual(page.rows, offsetPages[index].rows);
+            }
+
+            // Reversed executions: 'last' returns the same short remainder
+            // page as OFFSET; 'before' walks back; refetch reproduces itself.
+            page = await engine.fetchTableData(
+                'native_keyset_pages',
+                options(4, { mode: 'last', lastPageRowCount: 3 })
+            );
+            assert.deepStrictEqual(page.rows, offsetPages[4].rows);
+            assert.ok(page.keysetAnchors?.first);
+            const prev = await engine.fetchTableData(
+                'native_keyset_pages',
+                options(3, { mode: 'before', anchor: page.keysetAnchors.first })
+            );
+            assert.deepStrictEqual(prev.rows, offsetPages[3].rows);
+            assert.ok(prev.keysetAnchors?.first);
+            const refetch = await engine.fetchTableData(
+                'native_keyset_pages',
+                options(3, { mode: 'atOrAfter', anchor: prev.keysetAnchors.first })
+            );
+            assert.deepStrictEqual(refetch.rows, offsetPages[3].rows);
+
+            // Anchors carry unsafe int64 rowids exactly through the native IPC.
+            await engine.executeQuery(
+                'CREATE TABLE native_keyset_bigint (value TEXT); ' +
+                'INSERT INTO native_keyset_bigint(rowid, value) VALUES ' +
+                "(11, 'safe'), (9007199254740992, 'lower'), (9007199254740993, 'higher')"
+            );
+            const bigFirst = await engine.fetchTableData('native_keyset_bigint', {
+                columns: ['rowid', 'value'],
+                limit: 2,
+                offset: 0,
+                keyset: { mode: 'first' }
+            });
+            assert.deepStrictEqual(
+                bigFirst.rows.map(row => row[0]),
+                [11, '9007199254740992']
+            );
+            assert.ok(bigFirst.keysetAnchors?.last);
+            const bigNext = await engine.fetchTableData('native_keyset_bigint', {
+                columns: ['rowid', 'value'],
+                limit: 2,
+                offset: 2,
+                keyset: { mode: 'after', anchor: bigFirst.keysetAnchors.last }
+            });
+            assert.deepStrictEqual(bigNext.rows, [['9007199254740993', 'higher']]);
+
+            // WITHOUT ROWID composite keys page through pk: identities.
+            await engine.executeQuery(
+                'CREATE TABLE native_keyset_wr (tenant TEXT, seq INTEGER, v TEXT, ' +
+                'PRIMARY KEY (tenant, seq)) WITHOUT ROWID; ' +
+                'WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 9) ' +
+                "INSERT INTO native_keyset_wr " +
+                "SELECT CASE WHEN n % 2 THEN 'a' ELSE 'b' END, n, 'v' || n FROM s"
+            );
+            const wrOptions = (pageIndex: number, keyset?: TableQueryOptions['keyset']) => ({
+                columns: ['rowid', 'tenant', 'seq', 'v'],
+                limit: 4,
+                offset: pageIndex * 4,
+                ...(keyset ? { keyset } : {})
+            });
+            const wrOffset = [];
+            for (let index = 0; index < 3; index++) {
+                wrOffset.push(await engine.fetchTableData('native_keyset_wr', wrOptions(index)));
+            }
+            let wrPage = await engine.fetchTableData(
+                'native_keyset_wr',
+                wrOptions(0, { mode: 'first' })
+            );
+            assert.match(String(wrPage.rows[0][0]), /^pk:/);
+            assert.deepStrictEqual(wrPage.rows, wrOffset[0].rows);
+            for (let index = 1; index < 3; index++) {
+                assert.ok(wrPage.keysetAnchors?.last);
+                wrPage = await engine.fetchTableData(
+                    'native_keyset_wr',
+                    wrOptions(index, { mode: 'after', anchor: wrPage.keysetAnchors.last })
+                );
+                assert.deepStrictEqual(wrPage.rows, wrOffset[index].rows);
+            }
+
+            // A stale anchor (minted under a sort) falls back to the exact
+            // OFFSET page for the request; hostile tokens are rejected loudly.
+            const sorted = await engine.fetchTableData('native_keyset_pages', {
+                ...options(0, { mode: 'first' }),
+                orderBy: 'value'
+            });
+            assert.ok(sorted.keysetAnchors?.last);
+            const fallback = await engine.fetchTableData(
+                'native_keyset_pages',
+                options(2, { mode: 'after', anchor: sorted.keysetAnchors.last })
+            );
+            assert.deepStrictEqual(fallback.rows, offsetPages[2].rows);
+            await assert.rejects(
+                engine.fetchTableData(
+                    'native_keyset_pages',
+                    options(1, { mode: 'after', anchor: 'ksa:garbage' })
+                ),
+                /keyset anchor/i
+            );
+
+            // Mixed session under duplicate DESC sort values: an OFFSET page's
+            // anchors must seek in exactly the order the OFFSET page was
+            // produced in — the fallback ORDER BY carries the identity
+            // tiebreak through the native worker (which resolves plan, page,
+            // and anchors under one snapshot savepoint).
+            await engine.executeQuery(
+                'CREATE TABLE native_keyset_ties (s TEXT, v TEXT); ' +
+                'WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 12) ' +
+                "INSERT INTO native_keyset_ties(s, v) SELECT 'dup-' || (n % 2), 'v' || n FROM seq"
+            );
+            const tieOptions = (pageIndex: number, keyset?: TableQueryOptions['keyset']) => ({
+                columns: ['rowid', 's', 'v'],
+                orderBy: 's',
+                orderDir: 'DESC' as const,
+                limit: 4,
+                offset: pageIndex * 4,
+                ...(keyset ? { keyset } : {})
+            });
+            const tieOffset = [];
+            for (let index = 0; index < 3; index++) {
+                tieOffset.push(
+                    await engine.fetchTableData('native_keyset_ties', tieOptions(index))
+                );
+            }
+            assert.ok(tieOffset[1].keysetAnchors?.last);
+            const tieNext = await engine.fetchTableData(
+                'native_keyset_ties',
+                tieOptions(2, { mode: 'after', anchor: tieOffset[1].keysetAnchors.last })
+            );
+            assert.deepStrictEqual(tieNext.rows, tieOffset[2].rows);
+
+            // NONE-affinity sort column: int64 anchor values beyond 2^53
+            // travel as decimal strings across the native IPC and must seek
+            // exactly through CAST(? AS INTEGER) in both directions.
+            await engine.executeQuery(
+                'CREATE TABLE native_keyset_none_affinity (x, v TEXT); ' +
+                'INSERT INTO native_keyset_none_affinity(x, v) VALUES ' +
+                "(9007199254740992, 'a'), (9007199254740993, 'b'), " +
+                "(9007199254740995, 'c'), (2, 'small')"
+            );
+            const noneOptions = (pageIndex: number, keyset?: TableQueryOptions['keyset']) => ({
+                columns: ['rowid', 'x', 'v'],
+                orderBy: 'x',
+                orderDir: 'ASC' as const,
+                limit: 2,
+                offset: pageIndex * 2,
+                ...(keyset ? { keyset } : {})
+            });
+            const nonePage0 = await engine.fetchTableData(
+                'native_keyset_none_affinity',
+                noneOptions(0)
+            );
+            const nonePage1 = await engine.fetchTableData(
+                'native_keyset_none_affinity',
+                noneOptions(1)
+            );
+            assert.ok(nonePage0.keysetAnchors?.last);
+            const noneNext = await engine.fetchTableData(
+                'native_keyset_none_affinity',
+                noneOptions(1, { mode: 'after', anchor: nonePage0.keysetAnchors.last })
+            );
+            assert.deepStrictEqual(noneNext.rows, nonePage1.rows);
+            assert.ok(nonePage1.keysetAnchors?.first);
+            const nonePrev = await engine.fetchTableData(
+                'native_keyset_none_affinity',
+                noneOptions(0, { mode: 'before', anchor: nonePage1.keysetAnchors.first })
+            );
+            assert.deepStrictEqual(nonePrev.rows, nonePage0.rows);
         });
 
         await testContext.test('edits and replays a WITHOUT ROWID primary-key identity', async () => {

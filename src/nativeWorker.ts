@@ -52,6 +52,13 @@ import type {
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 import {
+  computeKeysetKey,
+  computeKeysetQueryTag,
+  keysetFallbackOrder,
+  mintKeysetAnchors,
+  resolveKeysetPlan
+} from './core/keyset-pagination';
+import {
   applyMergePatch,
   computeJsonPatchUndo,
   parseJsonValueForPatching,
@@ -2213,6 +2220,7 @@ export async function createNativeDatabaseConnection(
           if (!columns || (columns.length === 1 && columns[0] === '*')) {
             columns = await getNativeColumnNames(table);
           }
+          let identity: TableIdentity | undefined;
           let primaryKeyContext: {
             identity: Extract<TableIdentity, { kind: 'primaryKey' }>;
             visibleColumns: string[];
@@ -2220,7 +2228,7 @@ export async function createNativeDatabaseConnection(
           let effectiveOrderBy = options.orderBy;
           let identityOrderBy: string[] | undefined;
           if (columns[0]?.toLowerCase() === 'rowid') {
-            const identity = await findNativeTableIdentity(table);
+            identity = await findNativeTableIdentity(table);
             if (identity?.kind === 'primaryKey') {
               const visibleColumns = columns.slice(1);
               const hiddenPrimaryKeyColumns = identity.columns
@@ -2234,28 +2242,15 @@ export async function createNativeDatabaseConnection(
               }
             }
           }
-          const queryOptions = {
-            ...options,
-            columns,
-            orderBy: effectiveOrderBy,
-            orderByColumns: identityOrderBy
-          };
-          const { sql, params } = buildSelectQuery(table, queryOptions);
-          const containmentQuery = buildCellContainmentQuery(sql, columns.length, queryOptions);
-          const transportQuery = buildExactNumericTextQuery(
-            containmentQuery.sql,
-            columns.length + 1
-          );
           const hasRowIdShape = columns[0]?.toLowerCase() === 'rowid';
-          const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
-            && hasRowIdShape;
           const snapshotName = hasRowIdShape
             ? createSavepointName('sp_numeric_snapshot')
             : undefined;
           if (snapshotName) {
             // Unlike the private WASM databases, the native file can receive a
-            // WAL commit from another process between RPCs. The first read below
-            // fixes one SQLite snapshot for both values and companion text.
+            // WAL commit from another process between RPCs. The first read
+            // inside this savepoint fixes one SQLite snapshot for the rowid
+            // authority, the page values, and any companion text alike.
             await worker.call('run', [`SAVEPOINT ${snapshotName}`]);
           }
 
@@ -2264,13 +2259,55 @@ export async function createNativeDatabaseConnection(
             if (hasRowIdShape) {
               // This authority read fixes the WAL snapshot before the main data
               // read, so both exact identities and any companion text describe
-              // one committed database state.
+              // one committed database state. It is also the single authority
+              // for rowid keyset eligibility: the seek plan (or the fallback
+              // ORDER BY), the page execution, and the anchor minting below all
+              // derive from this one in-savepoint answer, so an external WAL
+              // commit between reads can never desynchronize them.
               const authority = await worker.call<NativeQueryResult>('query', [
                 ROWID_TABLE_AUTHORITY_SQL,
                 [table, table]
               ]);
               isRowIdTable = authority.values.length > 0;
             }
+
+            // Keyset eligibility: a declared WITHOUT ROWID key (needs no
+            // authority — that path never opens this savepoint), or an
+            // authority-confirmed unshadowed rowid. Key/tag derive from the
+            // untransformed options so minting and validation agree.
+            const keysetIdentity = identity?.kind === 'primaryKey'
+              ? identity
+              : (identity?.kind === 'rowid' && isRowIdTable ? identity : undefined);
+            const keysetKey = computeKeysetKey(options, keysetIdentity);
+            const keysetTag = keysetKey ? computeKeysetQueryTag(table, options) : undefined;
+            const keysetPlan = keysetKey
+              ? resolveKeysetPlan(table, options, keysetIdentity)
+              : undefined;
+            const queryOptions = {
+              ...options,
+              columns,
+              orderBy: effectiveOrderBy,
+              orderByColumns: identityOrderBy
+            };
+            const fallbackOrder = keysetFallbackOrder(keysetKey, keysetPlan);
+            if (fallbackOrder) {
+              // One total order for both paths: this OFFSET/fallback page
+              // re-anchors the grid, so its row order must match what those
+              // anchors will seek. keysetKey is gated on the in-savepoint
+              // authority above, so a shadowed rowid table keeps the
+              // pre-keyset SQL unchanged.
+              queryOptions.orderBy = undefined;
+              queryOptions.orderByColumns = fallbackOrder.orderByColumns;
+              queryOptions.orderDir = fallbackOrder.orderDir;
+            }
+            const { sql, params } = buildSelectQuery(table, queryOptions, keysetPlan);
+            const containmentQuery = buildCellContainmentQuery(sql, columns.length, queryOptions);
+            const transportQuery = buildExactNumericTextQuery(
+              containmentQuery.sql,
+              columns.length + 1
+            );
+            const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
+              && hasRowIdShape;
             const result = await worker.call<NativeQueryResult>('queryNumeric', [
               transportQuery.sql,
               params,
@@ -2321,6 +2358,19 @@ export async function createNativeDatabaseConnection(
             );
             const { rows, oversizedCells, exactIntegerTexts } = contained;
 
+            // Anchors come from the exact source rows (BigInt-preserving,
+            // display order); keysetKey exists only when the in-savepoint
+            // shadowing authority (or the declared PK) authorized seeking.
+            const keysetAnchors = keysetKey && keysetTag !== undefined
+              ? mintKeysetAnchors({
+                  tag: keysetTag,
+                  key: keysetKey,
+                  projectionColumns: columns,
+                  rows: result.values,
+                  oversizedCells
+                })
+              : undefined;
+
             if (primaryKeyContext) {
               const visibleColumnCount = primaryKeyContext.visibleColumns.length;
               const remapped = remapPrimaryKeyContainment({
@@ -2347,7 +2397,8 @@ export async function createNativeDatabaseConnection(
                 ...(remapped.oversizedCells ? { oversizedCells: remapped.oversizedCells } : {}),
                 ...(remapped.readOnlyRowReasons
                   ? { readOnlyRowReasons: remapped.readOnlyRowReasons }
-                  : {})
+                  : {}),
+                ...(keysetAnchors ? { keysetAnchors } : {})
               };
             }
 
@@ -2360,7 +2411,8 @@ export async function createNativeDatabaseConnection(
               columns,
               values: rows,
               exactIntegerTexts,
-              ...(oversizedCells ? { oversizedCells } : {})
+              ...(oversizedCells ? { oversizedCells } : {}),
+              ...(keysetAnchors ? { keysetAnchors } : {})
             };
           } catch (err) {
             if (snapshotName) {

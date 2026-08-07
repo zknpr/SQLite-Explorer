@@ -1,4 +1,4 @@
-import { state, persistState } from './state.js';
+import { state } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus, showLoading, showErrorState, updateToolbarButtons } from './ui.js';
 import { updatePagination, renderDataGrid } from './grid-render.js';
@@ -76,7 +76,60 @@ export function getGridReloadOwner() {
     return { token: activeLoadToken, startedAt: activeLoadStartedAt };
 }
 
-export async function loadTableData(showSpinner = true, saveScrollPosition = true) {
+/**
+ * Build the keyset (seek) request for this load, or undefined for the plain
+ * OFFSET query. `nav` is the page's relationship to the committed grid
+ * ('first'/'next'/'prev'/'last' from the nav buttons, 'refetch' otherwise).
+ * Anchors are only usable when they describe the exact page the intent
+ * expects for this table — a clamped index after a shrunken count, a table
+ * switch, or a rapid double-click whose first load never committed all fail
+ * these checks and fall back to OFFSET. The engine independently re-validates
+ * the anchor's embedded query tag, so sort/filter/page-size staleness needs no
+ * tracking here.
+ */
+function buildKeysetRequest(nav, pageIndex, pageCount, recordCount, table) {
+    // Page 0 needs no anchor and no OFFSET scan; covers 'first', 'prev' to 0,
+    // any refetch at 0, and single-page tables.
+    if (pageIndex === 0) return { mode: 'first' };
+    const anchors = state.keysetAnchors;
+    const usable = anchors && anchors.table === table;
+    if (nav === 'next' && usable && anchors.pageIndex === pageIndex - 1 && anchors.last) {
+        return { mode: 'after', anchor: anchors.last };
+    }
+    if (nav === 'prev' && usable && anchors.pageIndex === pageIndex + 1 && anchors.first) {
+        return { mode: 'before', anchor: anchors.first };
+    }
+    if (nav === 'last' && pageIndex === pageCount - 1) {
+        // The reversed query must return the same short remainder page as
+        // OFFSET so the page phase never shifts; computed from the count
+        // fetched moments ago in this same load.
+        return { mode: 'last', lastPageRowCount: recordCount - pageIndex * state.rowsPerPage };
+    }
+    if (nav === 'refetch' && usable && anchors.pageIndex === pageIndex && anchors.first) {
+        return { mode: 'atOrAfter', anchor: anchors.first };
+    }
+    return undefined;
+}
+
+/**
+ * True when a keyset page disagrees with the count fetched in the same load —
+ * rows past the anchor were deleted (or filtered away) since it was minted.
+ * The caller re-runs the load once with the OFFSET query, which both restores
+ * today's exact behavior for the race and re-anchors from its result. 'first'
+ * and 'last' are self-consistent and never retried.
+ */
+function keysetResultNeedsOffsetRetry(keyset, dataResult, recordCount, pageIndex) {
+    if (keyset.mode === 'first' || keyset.mode === 'last') return false;
+    const rowCount = (dataResult.rows || []).length;
+    const expectedRows = recordCount - pageIndex * state.rowsPerPage;
+    if (rowCount === 0) return expectedRows > 0;
+    // 'before' targets an interior page, which the fresh count says is full; a
+    // short result would shift the page phase, so prefer the OFFSET truth.
+    if (keyset.mode === 'before') return rowCount < Math.min(state.rowsPerPage, expectedRows);
+    return false;
+}
+
+export async function loadTableData(showSpinner = true, saveScrollPosition = true, navIntent) {
     if (!state.selectedTable) return;
 
     const loadToken = ++activeLoadToken;
@@ -192,8 +245,29 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             globalFilter
         };
 
-        const dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
+        // OFFSET always stays in the request: it is the engine's validated
+        // fallback whenever the keyset request does not hold up.
+        const keyset = isTable
+            ? buildKeysetRequest(
+                navIntent ?? 'refetch',
+                currentPageIndex,
+                totalPageCount,
+                totalRecordCount,
+                requestedTable
+              )
+            : undefined;
+        if (keyset) queryOptions.keyset = keyset;
+
+        let dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
         if (isSuperseded()) return; // superseded (newer load or table switch) during the fetch
+        if (keyset && keysetResultNeedsOffsetRetry(keyset, dataResult, totalRecordCount, currentPageIndex)) {
+            // Concurrent writes invalidated the anchor's position. One retry
+            // with the plain OFFSET query (identical to the pre-keyset SQL)
+            // restores today's behavior and re-anchors from its result.
+            delete queryOptions.keyset;
+            dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
+            if (isSuperseded()) return;
+        }
 
         // Commit count, page, rows, and their filter identity together. A data
         // query failure therefore leaves the prior successful grid coherent.
@@ -204,6 +278,16 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         state.gridExactIntegerTexts = dataResult.exactIntegerTexts || {};
         state.gridOversizedCells = dataResult.oversizedCells || {};
         state.gridReadOnlyRowReasons = dataResult.readOnlyRowReasons || {};
+        // Anchors commit atomically with the rows they describe; a superseded
+        // load bailed above, so its anchors can never survive into state. On
+        // error paths the previous grid stays mounted together with the
+        // anchors that still describe it. Views/keyless objects store nulls.
+        state.keysetAnchors = {
+            table: requestedTable,
+            pageIndex: currentPageIndex,
+            first: dataResult.keysetAnchors?.first ?? null,
+            last: dataResult.keysetAnchors?.last ?? null
+        };
         state.lastSuccessfulFilterState = {
             table: requestedTable,
             filterQuery: requestedFilterQuery,

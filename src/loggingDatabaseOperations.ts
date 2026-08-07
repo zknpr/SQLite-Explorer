@@ -376,7 +376,10 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
     async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
         const { sql, params } = buildSelectQuery(table, options);
         const paramStr = params && params.length > 0 ? ` -- params: [${params.map(p => this.sanitizeValue(p)).join(', ')}]` : '';
-        this.log(`${sql}${paramStr}`, false);
+        // The engine resolves keyset requests itself (identity lookup +
+        // anchor validation), so this preview can only show the OFFSET shape.
+        const keysetStr = options.keyset ? ` -- keyset ${options.keyset.mode} requested; OFFSET shape shown` : '';
+        this.log(`${sql}${paramStr}${keysetStr}`, false);
         return this.wrapped.fetchTableData(table, options);
     }
 

@@ -61,6 +61,14 @@ import {
   remapPrimaryKeyContainment
 } from '../../../src/core/cell-containment.ts';
 import {
+  assembleKeysetSelect,
+  computeKeysetKey,
+  computeKeysetQueryTag,
+  keysetFallbackOrder,
+  mintKeysetAnchors,
+  resolveKeysetPlan
+} from '../../../src/core/keyset-pagination.ts';
+import {
   buildCellChunkQuery,
   buildCellMetadataQuery,
   decodeCellMetadata,
@@ -1007,9 +1015,12 @@ async function fetchTableData(table, options = {}) {
   let effectiveOrderBy = orderBy;
   let identityOrderBy = null;
   let primaryKeyContext;
+  let tableIdentity;
+  let isRowIdTable = false;
   if (columns?.[0]?.toLowerCase() === 'rowid') {
-    const identity = await findTableIdentity(table);
-    if (identity?.kind === 'primaryKey') {
+    tableIdentity = await findTableIdentity(table);
+    if (tableIdentity?.kind === 'primaryKey') {
+      const identity = tableIdentity;
       const visibleColumns = columns.slice(1);
       const hiddenPrimaryKeyColumns = identity.columns
         .map(column => column.identifier)
@@ -1020,8 +1031,21 @@ async function fetchTableData(table, options = {}) {
         effectiveOrderBy = null;
         identityOrderBy = identity.columns.map(column => column.identifier);
       }
+    } else if (tableIdentity?.kind === 'rowid') {
+      // Keyset seeks and anchors require an unshadowed intrinsic rowid; a
+      // declared rowid/_rowid_/oid column would make "rowid" nullable,
+      // non-unique table data. The demo owns a private in-memory database,
+      // so this early read matches the fetch below.
+      const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
+      isRowIdTable = (authority[0]?.values.length ?? 0) > 0;
     }
   }
+  const keysetIdentity = tableIdentity?.kind === 'primaryKey'
+    ? tableIdentity
+    : (isRowIdTable ? tableIdentity : undefined);
+  const keysetKey = computeKeysetKey(options, keysetIdentity);
+  const keysetTag = keysetKey ? computeKeysetQueryTag(table, options) : undefined;
+  const keysetPlan = keysetKey ? resolveKeysetPlan(table, options, keysetIdentity) : undefined;
 
   // Build column list - if columns specified, use them; otherwise SELECT *
   let columnList;
@@ -1035,7 +1059,7 @@ async function fetchTableData(table, options = {}) {
 
   // Build WHERE clause from filters array and globalFilter
   const whereClauses = [];
-  const params = [];
+  let params = [];
 
   // Column-specific filters: [{column: 'name', value: 'foo'}, ...]
   if (filters && filters.length > 0) {
@@ -1065,21 +1089,46 @@ async function fetchTableData(table, options = {}) {
     }
   }
 
-  if (whereClauses.length > 0) {
-    sql += ` WHERE ${whereClauses.join(' AND ')}`;
-  }
+  if (keysetPlan) {
+    // Validated seek: the shared assembly owns WHERE, ORDER BY, and LIMIT so
+    // this worker cannot drift from the extension engines. Any invalid or
+    // stale request resolved to no plan and takes the unchanged path below.
+    const assembled = assembleKeysetSelect({
+      selectListSql: columnList,
+      escapedTable: escapeIdentifier(table),
+      whereClauses,
+      filterParams: params,
+      plan: keysetPlan
+    });
+    sql = assembled.sql;
+    params = assembled.params;
+  } else {
+    if (whereClauses.length > 0) {
+      sql += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
 
-  // Add ordering
-  const orderedColumns = identityOrderBy ?? (effectiveOrderBy ? [effectiveOrderBy] : []);
-  if (orderedColumns.length > 0) {
-    const direction = orderDir === 'DESC' ? 'DESC' : 'ASC';
-    sql += ` ORDER BY ${orderedColumns
-      .map(column => `${escapeIdentifier(column)} ${direction}`)
-      .join(', ')}`;
-  }
+    // Add ordering. One total order for both paths: an anchorable query's
+    // OFFSET fallback adopts the exact keyset ORDER BY (full key columns,
+    // key direction) so keyset and OFFSET pages interleave in one session
+    // without skips or duplicates. keysetKey is gated on the early authority
+    // read above, so shadowed-rowid tables and views keep the pre-keyset SQL
+    // byte-identical.
+    const fallbackOrder = keysetFallbackOrder(keysetKey, keysetPlan);
+    const orderedColumns = fallbackOrder
+      ? fallbackOrder.orderByColumns
+      : (identityOrderBy ?? (effectiveOrderBy ? [effectiveOrderBy] : []));
+    if (orderedColumns.length > 0) {
+      const direction = fallbackOrder
+        ? fallbackOrder.orderDir
+        : (orderDir === 'DESC' ? 'DESC' : 'ASC');
+      sql += ` ORDER BY ${orderedColumns
+        .map(column => `${escapeIdentifier(column)} ${direction}`)
+        .join(', ')}`;
+    }
 
-  // Add pagination
-  sql += ` LIMIT ${parseInt(limit, 10)} OFFSET ${parseInt(offset, 10)}`;
+    // Add pagination
+    sql += ` LIMIT ${parseInt(limit, 10)} OFFSET ${parseInt(offset, 10)}`;
+  }
 
   const sourceStatement = db.prepare(sql, params);
   const headers = sourceStatement.getColumnNames();
@@ -1110,16 +1159,17 @@ async function fetchTableData(table, options = {}) {
 
   const sourceRows = results[0]?.values ?? [];
   const companionResults = [];
-  let isRowIdTable = false;
   const hasRowIdShape = headers[0]?.toLowerCase() === 'rowid';
   const needsExactRowIdIdentity = hasRowIdShape
     && hasUnsafeBigIntAtColumn(sourceRows, 0);
   const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
     && hasRowIdShape;
   // The demo owns a private in-memory database, so no external process can
-  // commit between the source read and this authority/companion work.
+  // commit between the source read and this authority/companion work. The
+  // early keyset-eligibility read above may have settled isRowIdTable already.
   if (
-    (needsRowIdCompanions || needsExactRowIdIdentity)
+    !isRowIdTable
+    && (needsRowIdCompanions || needsExactRowIdIdentity)
     && sourceRows.length > 0
   ) {
     const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
@@ -1148,6 +1198,17 @@ async function fetchTableData(table, options = {}) {
     normalized.exactIntegerTexts
   );
   const { rows, oversizedCells, exactIntegerTexts } = contained;
+  // Anchors come from the exact source rows (BigInt-preserving, display order)
+  // so every OFFSET or keyset page re-anchors itself.
+  const keysetAnchors = keysetKey && keysetTag !== undefined
+    ? mintKeysetAnchors({
+        tag: keysetTag,
+        key: keysetKey,
+        projectionColumns: headers,
+        rows: sourceRows,
+        oversizedCells
+      })
+    : undefined;
   if (primaryKeyContext) {
     const visibleColumnCount = primaryKeyContext.visibleColumns.length;
     const remapped = remapPrimaryKeyContainment({
@@ -1168,14 +1229,16 @@ async function fetchTableData(table, options = {}) {
       ...(remapped.oversizedCells ? { oversizedCells: remapped.oversizedCells } : {}),
       ...(remapped.readOnlyRowReasons
         ? { readOnlyRowReasons: remapped.readOnlyRowReasons }
-        : {})
+        : {}),
+      ...(keysetAnchors ? { keysetAnchors } : {})
     };
   }
   return {
     headers,
     rows,
     exactIntegerTexts,
-    ...(oversizedCells ? { oversizedCells } : {})
+    ...(oversizedCells ? { oversizedCells } : {}),
+    ...(keysetAnchors ? { keysetAnchors } : {})
   };
 }
 

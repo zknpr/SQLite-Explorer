@@ -39,6 +39,13 @@ import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from
 import { crypto } from '../../../platform/cryptoShim';
 import { buildSelectQuery, buildCountQuery } from '../../query-builder';
 import {
+  computeKeysetKey,
+  computeKeysetQueryTag,
+  keysetFallbackOrder,
+  mintKeysetAnchors,
+  resolveKeysetPlan
+} from '../../keyset-pagination';
+import {
   applyMergePatch,
   computeJsonPatchUndo,
   parseJsonValueForPatching,
@@ -64,7 +71,6 @@ import {
   buildRecordIdentityPredicate,
   buildTableIdentityMap,
   classifyTableIdentity,
-  decodePrimaryKeyRecordId,
   encodePrimaryKeyRecordId,
   isPrimaryKeyRecordId,
   primaryKeyColumnsFromTableInfo,
@@ -2496,12 +2502,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const queryOptions = { ...options };
     queryOptions.columns = await this.resolveQueryColumns(table, queryOptions.columns, queryOptions.globalFilter);
 
+    let identity: TableIdentity | undefined;
     let primaryKeyContext: {
       identity: Extract<TableIdentity, { kind: 'primaryKey' }>;
       visibleColumns: string[];
     } | undefined;
     if (queryOptions.columns?.[0]?.toLowerCase() === 'rowid') {
-      const identity = await this.findTableIdentity(table);
+      identity = await this.findTableIdentity(table);
       if (identity?.kind === 'primaryKey') {
         const visibleColumns = queryOptions.columns.slice(1);
         const hiddenPrimaryKeyColumns = identity.columns
@@ -2515,8 +2522,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
       }
     }
-
-    const { sql, params } = buildSelectQuery(table, queryOptions);
 
     // Use prepare/step/get to avoid overhead of exec() which builds intermediate objects
     // and to allow for potentially better memory management in the future
@@ -2536,6 +2541,30 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const authority = await this.executeQuery(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
         isRowIdTable = (authority[0]?.rows.length ?? 0) > 0;
       }
+
+      // Keyset eligibility: a declared WITHOUT ROWID key, or an authority-
+      // confirmed unshadowed rowid. Key/tag derive from the untransformed
+      // request options so minting and validation always agree.
+      const keysetIdentity = identity?.kind === 'primaryKey'
+        ? identity
+        : (identity?.kind === 'rowid' && isRowIdTable ? identity : undefined);
+      const keysetKey = computeKeysetKey(options, keysetIdentity);
+      const keysetTag = keysetKey ? computeKeysetQueryTag(table, options) : undefined;
+      const keysetPlan = keysetKey
+        ? resolveKeysetPlan(table, options, keysetIdentity)
+        : undefined;
+      const fallbackOrder = keysetFallbackOrder(keysetKey, keysetPlan);
+      if (fallbackOrder) {
+        // One total order for both paths: this OFFSET/fallback page re-anchors
+        // the grid (anchors minted below), so its row order must match what
+        // those anchors will seek. keysetKey is authority-gated above, so a
+        // shadowed rowid table keeps the pre-keyset SQL unchanged.
+        queryOptions.orderBy = undefined;
+        queryOptions.orderByColumns = fallbackOrder.orderByColumns;
+        queryOptions.orderDir = fallbackOrder.orderDir;
+      }
+
+      const { sql, params } = buildSelectQuery(table, queryOptions, keysetPlan);
 
       return this.executeWithProgressHandler(() => {
         const bindParams = normalizeWasmBindParams(params);
@@ -2608,6 +2637,17 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           normalized.exactIntegerTexts
         );
         const { rows, oversizedCells, exactIntegerTexts } = contained;
+        // Anchors come from the exact source rows (BigInt-preserving, already
+        // in display order) so every OFFSET or keyset page re-anchors itself.
+        const keysetAnchors = keysetKey && keysetTag !== undefined
+          ? mintKeysetAnchors({
+              tag: keysetTag,
+              key: keysetKey,
+              projectionColumns: headers,
+              rows: sourceRows,
+              oversizedCells
+            })
+          : undefined;
         if (primaryKeyContext) {
           const visibleColumnCount = primaryKeyContext.visibleColumns.length;
           const remapped = remapPrimaryKeyContainment({
@@ -2631,7 +2671,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             ...(remapped.oversizedCells ? { oversizedCells: remapped.oversizedCells } : {}),
             ...(remapped.readOnlyRowReasons
               ? { readOnlyRowReasons: remapped.readOnlyRowReasons }
-              : {})
+              : {}),
+            ...(keysetAnchors ? { keysetAnchors } : {})
           };
         }
         return {
@@ -2640,7 +2681,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             columns: headers,
             values: rows,
             exactIntegerTexts,
-            ...(oversizedCells ? { oversizedCells } : {})
+            ...(oversizedCells ? { oversizedCells } : {}),
+            ...(keysetAnchors ? { keysetAnchors } : {})
         };
       });
     } catch (err) {

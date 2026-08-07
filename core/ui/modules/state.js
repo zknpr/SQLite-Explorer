@@ -33,6 +33,12 @@ export const state = {
     // Sparse reasons for WITHOUT ROWID rows whose complete primary-key identity
     // was intentionally not transported because a key member was oversized.
     gridReadOnlyRowReasons: {},
+    // Engine-issued keyset anchors describing the committed grid page:
+    // { table, pageIndex, first, last }. Owned by loadTableData, which commits
+    // them atomically with gridData inside its superseded-load gate, so they
+    // always describe the rows on screen. Deliberately NOT persisted: restored
+    // webviews re-anchor from their first OFFSET load.
+    keysetAnchors: null,
 
     // Cell editing state
     editingCellInfo: null,

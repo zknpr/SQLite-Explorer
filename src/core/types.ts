@@ -86,6 +86,29 @@ export interface CellReadChunk {
 /** Sparse reasons for rows that cannot safely be mutated from their grid identity. */
 export type ReadOnlyRowReasonMap = Record<number, string>;
 
+/** Page relationship of a keyset (seek) fetch to its anchor row. */
+export type KeysetNavigationMode = 'first' | 'after' | 'atOrAfter' | 'before' | 'last';
+
+/**
+ * Webview request to fetch a page by seeking from an engine-issued anchor
+ * instead of scanning to OFFSET. The webview is untrusted: engines strictly
+ * re-validate the anchor (canonical decode + query-identity tag) and fall back
+ * to the unchanged LIMIT/OFFSET query on any mismatch.
+ */
+export interface KeysetPaginationRequest {
+  mode: KeysetNavigationMode;
+  /** Opaque anchor token from a prior page; required for after/atOrAfter/before. */
+  anchor?: string;
+  /** Row count of the final page (from the fresh total count); required for 'last'. */
+  lastPageRowCount?: number;
+}
+
+/** Opaque seek anchors for the first and last rows of a fetched page. */
+export interface KeysetAnchorSet {
+  first?: string;
+  last?: string;
+}
+
 /**
  * Unique identifier for a database row.
  * Can be numeric ROWID or string for compatibility.
@@ -127,6 +150,8 @@ export interface QueryResultSet {
   oversizedCells?: OversizedCellMap;
   /** Rows whose database identity was deliberately not transported. */
   readOnlyRowReasons?: ReadOnlyRowReasonMap;
+  /** Engine-issued seek anchors for this page; present only for anchorable tables. */
+  keysetAnchors?: KeysetAnchorSet;
   /** Column names - sql.js compatible internal alias */
   columns?: string[];
   /** Row data - sql.js compatible internal alias */
@@ -574,6 +599,12 @@ export interface TableQueryOptions {
     value: string;
   }[];
   globalFilter?: string;
+  /**
+   * Keyset (seek) navigation request. When the engine validates it, the page
+   * is fetched by anchor predicate and `offset` is ignored; otherwise the
+   * LIMIT/OFFSET query runs byte-identical to a request without this field.
+   */
+  keyset?: KeysetPaginationRequest;
   /** Maximum source bytes transported inline for any one TEXT/BLOB grid cell. */
   maxInlineCellBytes?: number;
   /** Maximum aggregate inline-cell preview bytes allocated across one page. */

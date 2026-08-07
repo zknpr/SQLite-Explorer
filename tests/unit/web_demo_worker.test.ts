@@ -1027,6 +1027,196 @@ describe('web demo view worker', () => {
         assert.strictEqual(count, 0);
     });
 
+    it('pages the demo grid by keyset and re-anchors every page', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_keyset (value TEXT); ' +
+            'WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 11) ' +
+            "INSERT INTO demo_keyset(value) SELECT 'row-' || n FROM seq"
+        );
+        const options = (pageIndex: number, keyset?: object) => ({
+            columns: ['rowid', 'value'],
+            globalFilterColumns: ['value'],
+            limit: 4,
+            offset: pageIndex * 4,
+            ...(keyset ? { keyset } : {})
+        });
+        const offsetPages = [];
+        for (let index = 0; index < 3; index++) {
+            offsetPages.push(await worker.invoke('fetchTableData', 'demo_keyset', options(index)));
+        }
+        assert.strictEqual(offsetPages[2].rows.length, 3, 'short remainder page expected');
+
+        // Forward after-chain, reversed 'last', and 'before' must reproduce
+        // the OFFSET pages exactly through the real bundled worker.
+        let page = await worker.invoke('fetchTableData', 'demo_keyset', options(0, { mode: 'first' }));
+        assert.deepStrictEqual(Array.from(page.rows), Array.from(offsetPages[0].rows));
+        for (let index = 1; index < 3; index++) {
+            assert.ok(page.keysetAnchors?.last, `missing anchor for page ${index - 1}`);
+            page = await worker.invoke(
+                'fetchTableData',
+                'demo_keyset',
+                options(index, { mode: 'after', anchor: page.keysetAnchors.last })
+            );
+            assert.deepStrictEqual(Array.from(page.rows), Array.from(offsetPages[index].rows));
+        }
+        const last = await worker.invoke(
+            'fetchTableData',
+            'demo_keyset',
+            options(2, { mode: 'last', lastPageRowCount: 3 })
+        );
+        assert.deepStrictEqual(Array.from(last.rows), Array.from(offsetPages[2].rows));
+        assert.ok(last.keysetAnchors?.first);
+        const previous = await worker.invoke(
+            'fetchTableData',
+            'demo_keyset',
+            options(1, { mode: 'before', anchor: last.keysetAnchors.first })
+        );
+        assert.deepStrictEqual(Array.from(previous.rows), Array.from(offsetPages[1].rows));
+
+        // A stale anchor (minted under a sort) falls back to the OFFSET page.
+        const sorted = await worker.invoke('fetchTableData', 'demo_keyset', {
+            ...options(0, { mode: 'first' }),
+            orderBy: 'value',
+            orderDir: 'ASC'
+        });
+        assert.ok(sorted.keysetAnchors?.last);
+        const fallback = await worker.invoke(
+            'fetchTableData',
+            'demo_keyset',
+            options(1, { mode: 'after', anchor: sorted.keysetAnchors.last })
+        );
+        assert.deepStrictEqual(Array.from(fallback.rows), Array.from(offsetPages[1].rows));
+
+        // A declared rowid column shadows real row identity: such tables never
+        // anchor, and their keyset requests degrade to the OFFSET query.
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_keyset_shadow (rowid TEXT); " +
+            "INSERT INTO demo_keyset_shadow(rowid) VALUES ('a'), ('b')"
+        );
+        const shadow = await worker.invoke('fetchTableData', 'demo_keyset_shadow', {
+            columns: ['rowid', 'rowid'],
+            globalFilterColumns: ['rowid'],
+            limit: 1,
+            offset: 0,
+            keyset: { mode: 'first' }
+        });
+        assert.strictEqual(shadow.rows.length, 1);
+        assert.strictEqual(shadow.keysetAnchors, undefined);
+    });
+
+    it('seeks int64 anchors beyond 2^53 exactly on NONE-affinity sort columns', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_none_affinity (x, v TEXT); ' +
+            'INSERT INTO demo_none_affinity(x, v) VALUES ' +
+            "(9007199254740992, 'a'), (9007199254740993, 'b'), (9007199254740995, 'c'), " +
+            "(2, 'small'), (9007199254740997, 'd'), (12, 'safe')"
+        );
+        const options = (pageIndex: number, keyset?: object) => ({
+            columns: ['rowid', 'x', 'v'],
+            globalFilterColumns: ['x', 'v'],
+            orderBy: 'x',
+            orderDir: 'ASC',
+            limit: 2,
+            offset: pageIndex * 2,
+            ...(keyset ? { keyset } : {})
+        });
+        const offsetPages = [];
+        for (let index = 0; index < 3; index++) {
+            offsetPages.push(
+                await worker.invoke('fetchTableData', 'demo_none_affinity', options(index))
+            );
+        }
+        // 'after' across the 2^53 boundary used to return an empty page: the
+        // anchor value decoded to a decimal string, and a TEXT bind never
+        // compares equal-class with INTEGER storage on a NONE-affinity column.
+        assert.ok(offsetPages[1].keysetAnchors?.last);
+        const next = await worker.invoke(
+            'fetchTableData',
+            'demo_none_affinity',
+            options(2, { mode: 'after', anchor: offsetPages[1].keysetAnchors.last })
+        );
+        assert.deepStrictEqual(Array.from(next.rows), Array.from(offsetPages[2].rows));
+        // 'before' was worse: its predicate held for every INTEGER row, so it
+        // returned a full-length WRONG page that passed the grid retry check.
+        assert.ok(offsetPages[1].keysetAnchors?.first);
+        const previous = await worker.invoke(
+            'fetchTableData',
+            'demo_none_affinity',
+            options(0, { mode: 'before', anchor: offsetPages[1].keysetAnchors.first })
+        );
+        assert.deepStrictEqual(Array.from(previous.rows), Array.from(offsetPages[0].rows));
+    });
+
+    it('orders anchorable OFFSET pages by the full keyset key and leaves shadowed tables unchanged', async () => {
+        const observed: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (kind, sql) => { if (kind === 'prepare') observed.push(sql); }
+        });
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_ties (s TEXT, v TEXT); ' +
+            'WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 12) ' +
+            "INSERT INTO demo_ties(s, v) SELECT 'dup-' || (n % 2), 'v' || n FROM seq"
+        );
+        const options = (pageIndex: number, keyset?: object) => ({
+            columns: ['rowid', 's', 'v'],
+            globalFilterColumns: ['s', 'v'],
+            orderBy: 's',
+            orderDir: 'DESC',
+            limit: 4,
+            offset: pageIndex * 4,
+            ...(keyset ? { keyset } : {})
+        });
+        // Mixed session on duplicate DESC sort values: OFFSET pages, then a
+        // keyset Next from the OFFSET page's anchor, must continue the same
+        // total order (no skipped and no repeated rows).
+        const offsetPages = [];
+        for (let index = 0; index < 3; index++) {
+            offsetPages.push(await worker.invoke('fetchTableData', 'demo_ties', options(index)));
+        }
+        assert.ok(offsetPages[1].keysetAnchors?.last);
+        const next = await worker.invoke(
+            'fetchTableData',
+            'demo_ties',
+            options(2, { mode: 'after', anchor: offsetPages[1].keysetAnchors.last })
+        );
+        assert.deepStrictEqual(Array.from(next.rows), Array.from(offsetPages[2].rows));
+        // The fallback SELECT itself carries the full deterministic key order.
+        assert.ok(
+            observed.some(sql => sql.includes(
+                'FROM "demo_ties" ORDER BY "s" DESC, "rowid" DESC LIMIT 4 OFFSET 4'
+            )),
+            `expected the deterministic fallback ORDER BY, saw:\n${observed.join('\n')}`
+        );
+
+        // A declared rowid column shadows real identity: no key derives, and
+        // the emitted SQL stays byte-identical to the pre-keyset shape.
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_shadow_order (rowid TEXT); " +
+            "INSERT INTO demo_shadow_order(rowid) VALUES ('b'), ('a')"
+        );
+        observed.length = 0;
+        const shadow = await worker.invoke('fetchTableData', 'demo_shadow_order', {
+            columns: ['rowid', 'rowid'],
+            globalFilterColumns: ['rowid'],
+            limit: 10,
+            offset: 0
+        });
+        assert.strictEqual(shadow.keysetAnchors, undefined);
+        assert.ok(
+            observed.some(sql =>
+                sql === 'SELECT "rowid", "rowid" FROM "demo_shadow_order" LIMIT 10 OFFSET 0'
+            ),
+            `expected the unchanged shadowed-table SQL, saw:\n${observed.join('\n')}`
+        );
+    });
+
     it('keeps a declared rowid column in demo data and count global filters', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

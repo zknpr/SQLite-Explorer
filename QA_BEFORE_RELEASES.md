@@ -461,34 +461,39 @@ npx tsx --tsconfig tsconfig.test.json scripts/bench-native.ts \
   --db <large fixture> --iterations 7
 ```
 
-Reference (aarch64-macos, 1.39 GB fixture, 7 iterations, 2026-08-07):
+Reference (aarch64-macos, 1.39 GB fixture, 9 iterations, 2026-08-08):
 
 | Workload | Median | Throughput |
 |---|---:|---:|
-| cold start | 17.51 ms | — |
+| cold start | 17.30 ms | — |
 | schema refresh | 0.18 ms | — |
-| first page (500) | 3.04 ms | 164k rows/s |
-| deep page (500) | 186.23 ms | 2.68k rows/s |
-| wide result (~100k) | 175.66 ms | 569k rows/s |
-| aggregate `COUNT(*)` | 11.88 ms | — |
-| blob/text heavy | 0.79 ms | 76.8 MiB/s |
-| edit round-trip | 0.41 ms | — |
-| cancellation overhead | 0.10 ms | — |
+| first page (500) | 3.15 ms | 159k rows/s |
+| deep page OFFSET (500) | 208.12 ms | 2.40k rows/s |
+| deep page keyset (500) | 3.18 ms | 157k rows/s |
+| wide result (~100k) | 171.92 ms | 582k rows/s |
+| aggregate `COUNT(*)` | 11.76 ms | — |
+| blob/text heavy | 0.87 ms | 70.2 MiB/s |
+| edit round-trip | 0.43 ms | — |
+| cancellation overhead | 0.11 ms | — |
 
 Rules: discard the warm-up, take the median of the remainder. A **5%+ regression** needs a
 clean rerun and an explanation. A repeatable **10%+ regression** is a release blocker unless
 it is a documented, deliberate trade — cold start already carries one (the load-safe native
 capability probe costs ~10 ms and is accepted).
 
-Deep-OFFSET paging is ~60× slower than page one. This is a property of **our current
-query shape**, not an unavoidable engine limit: `OFFSET n` makes SQLite walk and discard n
-rows, so the cost grows with depth. Measured on the 1.39 GB fixture at offset 3.5 M
-(process startup subtracted): plain OFFSET ~97 ms, index-assisted OFFSET ~95 ms (no help —
-the primary key *is* the rowid, so its index is the table), keyset/seek **~3 ms**, first
-page ~3 ms. Keyset does not shrink the cliff, it removes it.
+Keyset (seek) pagination shipped 2026-08-08: grid navigation and current-page refetches
+seek from engine-minted anchors instead of scanning to OFFSET, so a deep page turn costs
+the same as the first page (3.18 vs 3.15 ms above — 65× below the OFFSET shape, which
+`OFFSET n` pays by walking and discarding n rows). The OFFSET query remains as the
+engine-validated fallback (first load of a table, restored webview state, any anchor
+staleness), and both paths emit one deterministic total order — identity tiebreak
+appended to sorts — so mixed OFFSET/keyset sequences cannot skip or duplicate rows.
 
-Until that lands, treat the deep-page number as a baseline to compare against rather than a
-target, and flag only movement.
+Gate on both deep-page rows: keyset must sit at first-page cost, and the harness prints a
+stderr warning when the keyset workload's timing suggests it silently fell back to OFFSET
+— treat that warning as a failure. First page carries one rowid-authority read per grid
+load (deliberate: the same in-snapshot answer gates seek eligibility, fallback ordering,
+and anchor minting).
 
 Also compare startup time and peak RSS when loading, caching, streaming or temporary
 buffers changed. **[unverified]** — WASM-side performance has no tracked baseline at all.
@@ -517,8 +522,8 @@ All times ms. What the curve says:
 - **Keyset is O(1)** — 0.0 ms at 100 M rows. This is why §20's cliff is a query-shape
   problem, not an engine limit.
 - **`COUNT(*)` is linear** — 376 ms at 100 M rows, and it is paid on every table load to
-  compute the page count. Once pagination is keyset-based this becomes the dominant cost of
-  opening a large table.
+  compute the page count. Now that pagination seeks instead of scanning (2026-08-08), this
+  is the dominant per-load cost on a large table — the next optimization target.
 - **An unindexed filter is linear and brutal** — 2.24 s at 100 M rows. Not fixable by query
   shape; it is what cancellation exists for.
 
@@ -551,8 +556,8 @@ there are no page-cache misses), unindexed scan 376 vs 216 ms.
 
 **The conclusion that matters: WASM's limits are memory and load time, not query speed.**
 Once loaded it is within ~2× of native on a full scan and comparable or better elsewhere,
-and **keyset is O(1) on both engines**, so the pagination work in §20 pays off identically
-on each.
+and **keyset is O(1) on both engines**, so the keyset pagination gated in §20 pays off
+identically on each.
 
 Where they genuinely differ:
 

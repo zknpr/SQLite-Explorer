@@ -27,7 +27,7 @@ LEFT JOIN pragma_table_info(tl."name", tl."schema") AS ti
 WHERE tl."schema" = 'main' AND tl."name" NOT LIKE 'sqlite_%'
 ORDER BY tl."name", ti."cid"`;
 
-type EncodedPrimaryKeyValue =
+export type EncodedPrimaryKeyValue =
   | ['integer', string]
   | ['real', number]
   | ['text', string]
@@ -67,7 +67,8 @@ function hexToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
-function encodePrimaryKeyValue(value: CellValue | bigint): EncodedPrimaryKeyValue {
+/** Canonical per-storage-class value codec, shared with keyset anchor tokens. */
+export function encodePrimaryKeyValue(value: CellValue | bigint): EncodedPrimaryKeyValue {
   if (typeof value === 'bigint') return ['integer', value.toString()];
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) {
@@ -80,7 +81,7 @@ function encodePrimaryKeyValue(value: CellValue | bigint): EncodedPrimaryKeyValu
   throw new Error('WITHOUT ROWID primary-key identity cannot contain NULL');
 }
 
-function decodePrimaryKeyValue(encoded: unknown): CellValue {
+export function decodePrimaryKeyValue(encoded: unknown): CellValue {
   if (!Array.isArray(encoded) || encoded.length !== 2 || typeof encoded[0] !== 'string') {
     throw new Error('Invalid primary-key identity value');
   }
