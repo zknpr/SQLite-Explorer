@@ -529,6 +529,49 @@ product's cost.
 Generate the fixtures with the scaling harness rather than by hand; a 100 M-row file builds
 in well under a minute by doubling, and 2.4 GB is worth deleting afterwards.
 
+### The two engines compared
+
+`scripts/bench-wasm-scaling.mjs` runs the same query set as the native harness against the
+vendored sql.js build, so the curves are directly comparable. Same narrow fixtures.
+
+| Rows | File | WASM open¹ | first | OFFSET | keyset | `COUNT(*)` | scan | RSS |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10 K | 216 K | 8.0 | 0.4 | 0.4 | 0.3 | 0.0 | 0.7 | 89 M |
+| 100 K | 2.2 M | 0.2 | 0.2 | 1.5 | 0.2 | 0.2 | 5.8 | 109 M |
+| 1 M | 23 M | 13 | 0.1 | 7.4 | 0.2 | 1.2 | 37.1 | 82 M |
+| 10 M | 242 M | 37 | 0.1 | 74.3 | 0.1 | 12.1 | 376.2 | 347 M |
+| — | 1.39 G | 260 | — | — | — | — | — | 1735 M |
+| — | 2.61 G | **fails** | — | — | — | — | — | — |
+
+¹ open includes reading the file into memory, which for WASM is unavoidable.
+
+Head-to-head at 10 M rows (WASM vs raw `sqlite3`): deep OFFSET 74.3 vs 67.2 ms, keyset 0.1
+vs 0.0, `COUNT(*)` **12.1 vs 31.4** (WASM wins — the whole database is already resident, so
+there are no page-cache misses), unindexed scan 376 vs 216 ms.
+
+**The conclusion that matters: WASM's limits are memory and load time, not query speed.**
+Once loaded it is within ~2× of native on a full scan and comparable or better elsewhere,
+and **keyset is O(1) on both engines**, so the pagination work in §20 pays off identically
+on each.
+
+Where they genuinely differ:
+
+| | Native (txiki) | WASM (sql.js) |
+|---|---|---|
+| Open | by path, O(1) — ~20 ms at any size | must materialise the whole file |
+| Open cost vs size | flat | ~187 MB/s (260 ms for 1.39 GB) |
+| RSS vs database size | independent | **≈ 1:1** (a 1.39 GB file costs 1.39 GB) |
+| Practical size ceiling | none observed | fails above ~2 GiB |
+
+The 2.61 GB failure is Node's 2 GiB `Buffer` limit, a *host* limit rather than a WASM one —
+in a browser the binding ceiling is the WASM32 address space and whatever the host allows
+for one ArrayBuffer. Either way a browser tab holding 1.4 GB is hostile, which is what the
+WASM-only `maxFileSize` gate (200 MB default) exists to prevent. Worth knowing that the
+engine itself handled 1.39 GB fine, so that default is conservative rather than a hard
+technical bound — revisit it deliberately rather than assuming it is load-bearing.
+
+Re-run both harnesses whenever query shape, pagination or either engine changes.
+
 ### Scaling with page size
 
 End-to-end page turn in the web demo (WASM engine + IPC + DOM), 8-column table, measured
