@@ -529,6 +529,34 @@ product's cost.
 Generate the fixtures with the scaling harness rather than by hand; a 100 M-row file builds
 in well under a minute by doubling, and 2.4 GB is worth deleting afterwards.
 
+### Scaling with page size
+
+End-to-end page turn in the web demo (WASM engine + IPC + DOM), 8-column table, measured
+from the page-size change to the last row appearing:
+
+| Page size | Total | Cells | DOM nodes | ms / 1000 rows |
+|---:|---:|---:|---:|---:|
+| 100 | 32 ms | 900 | 2,700 | 320 |
+| 250 | 57 ms | 2,250 | 6,750 | 228 |
+| **500 (default)** | **92 ms** | 4,500 | 13,500 | 184 |
+| 1,000 | 157 ms | 9,000 | 27,000 | 157 |
+| 2,500 | 324 ms | 22,500 | 67,500 | 130 |
+| 5,000 | 621 ms | 45,000 | 135,000 | 124 |
+| 10,000 | 1,197 ms | 90,000 | 270,000 | 120 |
+| 25,000 | 3,087 ms | 225,000 | 675,000 | 123 |
+
+Linear at **~0.12 ms/row** beyond 500, over ~20 ms of fixed overhead. For comparison the
+engine alone returns 10,000 wide rows (1.57 MB, 6 columns incl. BLOB) in **6.1 ms** and
+25,000 in 16.7 ms — so **over 90% of a page turn is IPC and DOM, not SQL**.
+
+The grid does not virtualize: `grid-render.js` builds DOM for every row in the page, at
+`<td>` → `<span class="cell-text">` → text node, i.e. **27 nodes per row** for 8 columns.
+That is the wall, and it is why the default page size cannot simply be raised: 500 rows is
+92 ms (about the edge of feeling instant), 1,000 is 157 ms, and 2,500 is visibly janky.
+
+Re-measure this curve if cell rendering, highlighting, or the transport changes. A
+regression here is felt on every single page turn.
+
 ---
 
 ## 21. Vendored binaries and WASM **(repeat offender)**
