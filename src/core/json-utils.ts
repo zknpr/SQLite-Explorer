@@ -81,12 +81,20 @@ export function generateMergePatch(original: unknown, modified: unknown, depth =
         return modified;
     }
 
-    const patch: Record<string, unknown> = {};
+    // Null-prototype accumulator: on a plain object, patch["__proto__"] = x hits
+    // the legacy prototype setter and creates NO own property, so the key would
+    // silently vanish from the emitted patch (cf. restoreInto).
+    const patch: Record<string, unknown> = Object.create(null);
     let hasChanges = false;
 
-    // Check for modifications and additions
+    // Check for modifications and additions. Reads must be own-property reads:
+    // obj["__proto__"]/"constructor"/... on a key the object does NOT carry
+    // returns the inherited Object.prototype member instead of undefined, which
+    // would misclassify additions and mask deletions of such keys.
     for (const key of Object.keys(modified)) {
-        const originalVal = original[key];
+        const originalVal = Object.prototype.hasOwnProperty.call(original, key)
+            ? original[key]
+            : undefined;
         const modifiedVal = modified[key];
 
         if (originalVal === undefined) {
@@ -105,7 +113,7 @@ export function generateMergePatch(original: unknown, modified: unknown, depth =
 
     // Check for deletions
     for (const key of Object.keys(original)) {
-        if (modified[key] === undefined) {
+        if (!Object.prototype.hasOwnProperty.call(modified, key)) {
             patch[key] = null; // Deletion indicator in Merge Patch
             hasChanges = true;
         }
@@ -140,11 +148,14 @@ export function applyMergePatch(target: unknown, patch: unknown, depth = 0): unk
     let targetObj: Record<string, unknown>;
     if (typeof target !== 'object' || target === null || Array.isArray(target)) {
         // If target is not an object (or is null/array), it is treated as empty object for patching.
-        targetObj = {};
+        targetObj = Object.create(null);
     } else {
-        // Clone target to avoid mutation if we want immutability,
-        // Clone shallowly for safety.
-        targetObj = { ...(target as Record<string, unknown>) };
+        // Shallow null-prototype clone (cf. restoreInto): keeps "__proto__" and
+        // friends as ordinary own data keys, so the reads, writes and deletes
+        // below cannot fall through to (or write through) Object.prototype —
+        // on a plain clone, targetObj["__proto__"] = x would silently swap the
+        // prototype instead of storing the patched key.
+        targetObj = Object.assign(Object.create(null), target);
     }
 
     const patchObj = patch as Record<string, unknown>;

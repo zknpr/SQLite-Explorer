@@ -65,6 +65,30 @@ type MutableWorkspace = {
 const uriApi = vscode.Uri as unknown as { parse: (value: string) => unknown };
 const workspaceApi = vscode.workspace as unknown as MutableWorkspace;
 
+/**
+ * Faithful emulation of vscode's getWorkspaceFolder: exact scheme+authority
+ * match, then a literal segment-boundary prefix match on the path. Crucially it
+ * does NOT collapse dot segments — '..' is an ordinary segment to the real
+ * lookup too — so a traversal URI still "matches" its folder. Tests that stub
+ * this to a constant are blind to exactly that property, so containment tests
+ * must use this matcher instead.
+ */
+function installWorkspaceFolders(folderUriStrings: string[]) {
+    const folders = folderUriStrings.map((value, index) => ({
+        uri: parseUriForTest(value),
+        name: `ws${index}`,
+        index
+    }));
+    workspaceApi.getWorkspaceFolder = (raw: unknown) => {
+        const uri = raw as FakeUri;
+        return folders.find(folder => {
+            if (folder.uri.scheme !== uri.scheme || folder.uri.authority !== uri.authority) return false;
+            const prefix = folder.uri.path.endsWith('/') ? folder.uri.path : folder.uri.path + '/';
+            return uri.path === folder.uri.path || uri.path.startsWith(prefix);
+        });
+    };
+}
+
 const FILE_PAYLOAD = new Uint8Array([0xDB, 0x01]);
 
 describe('HostBridge.readWorkspaceFileUri containment', () => {
@@ -92,7 +116,9 @@ describe('HostBridge.readWorkspaceFileUri containment', () => {
     });
 
     it('allows a file: URI inside a workspace folder', async () => {
-        workspaceApi.getWorkspaceFolder = () => ({ name: 'workspace' });
+        // Folder deliberately disjoint from the document directory: the allow
+        // decision can only come from the workspace-folder branch.
+        installWorkspaceFolders(['file:///home/user/elsewhere']);
         const bridge = createBridge('file:///home/user/data/main.db');
 
         const result = await bridge.readWorkspaceFileUri('file:///home/user/elsewhere/blob.bin');
@@ -101,12 +127,80 @@ describe('HostBridge.readWorkspaceFileUri containment', () => {
     });
 
     it('allows a non-file URI inside a workspace folder (remote/virtual workspaces)', async () => {
-        workspaceApi.getWorkspaceFolder = () => ({ name: 'repo' });
+        installWorkspaceFolders(['vscode-vfs://github/owner/repo']);
         const bridge = createBridge('vscode-vfs://github/owner/repo/main.db');
 
         const result = await bridge.readWorkspaceFileUri('vscode-vfs://github/owner/repo/assets/logo.png');
         assert.strictEqual(result, FILE_PAYLOAD);
         assert.strictEqual(readUris.length, 1);
+    });
+
+    it('rejects file: traversal that getWorkspaceFolder still prefix-matches (F1)', async () => {
+        installWorkspaceFolders(['file:///home/user/project']);
+        const bridge = createBridge('file:///home/user/project/main.db');
+        const escape = 'file:///home/user/project/../../../etc/passwd';
+
+        // Precondition of the attack — and of this test being able to see the
+        // bug at all: the folder lookup DOES return the workspace folder for
+        // the traversal URI, exactly as VS Code's literal-segment matcher does.
+        assert.ok(workspaceApi.getWorkspaceFolder(parseUriForTest(escape)));
+
+        await assert.rejects(bridge.readWorkspaceFileUri(escape), /Access denied/);
+        assert.strictEqual(readUris.length, 0);
+    });
+
+    it('rejects vscode-remote traversal that getWorkspaceFolder still prefix-matches (F1)', async () => {
+        installWorkspaceFolders(['vscode-remote://ssh-remote+box/home/user/project']);
+        const bridge = createBridge('vscode-remote://ssh-remote+box/home/user/project/main.db');
+        const escape = 'vscode-remote://ssh-remote+box/home/user/project/../../../etc/shadow';
+
+        assert.ok(workspaceApi.getWorkspaceFolder(parseUriForTest(escape)));
+
+        await assert.rejects(bridge.readWorkspaceFileUri(escape), /Access denied/);
+        assert.strictEqual(readUris.length, 0);
+    });
+
+    it('rejects vscode-vfs traversal into a sibling repository (F1)', async () => {
+        installWorkspaceFolders(['vscode-vfs://github/owner/repo']);
+        const bridge = createBridge('vscode-vfs://github/owner/repo/main.db');
+        const escape = 'vscode-vfs://github/owner/repo/../../other/private-repo/secrets.env';
+
+        assert.ok(workspaceApi.getWorkspaceFolder(parseUriForTest(escape)));
+
+        await assert.rejects(bridge.readWorkspaceFileUri(escape), /Access denied/);
+        assert.strictEqual(readUris.length, 0);
+    });
+
+    it('still allows a workspace candidate whose dot segments resolve inside the folder', async () => {
+        installWorkspaceFolders(['file:///home/user/project']);
+        const bridge = createBridge('file:///home/user/data/main.db');
+
+        const result = await bridge.readWorkspaceFileUri('file:///home/user/project/sub/../assets/logo.png');
+        assert.strictEqual(result, FILE_PAYLOAD);
+        assert.deepStrictEqual(readUris, ['file:///home/user/project/sub/../assets/logo.png']);
+    });
+
+    it('rejects backslash traversal through a Windows-remote workspace folder (F2)', async () => {
+        installWorkspaceFolders(['vscode-remote://ssh-remote+winbox/c:/proj']);
+        const bridge = createBridge('vscode-remote://ssh-remote+winbox/c:/proj/main.db');
+        // posix.resolve treats '\' as an ordinary character, but a Windows-backed
+        // remote provider treats it as a separator: the path escapes c:/proj.
+        const escape = 'vscode-remote://ssh-remote+winbox/c:/proj/..\\..\\Windows\\win.ini';
+
+        assert.ok(workspaceApi.getWorkspaceFolder(parseUriForTest(escape)));
+
+        await assert.rejects(bridge.readWorkspaceFileUri(escape), /Access denied/);
+        assert.strictEqual(readUris.length, 0);
+    });
+
+    it('rejects backslash traversal against a Windows-remote document directory (F2)', async () => {
+        const bridge = createBridge('vscode-remote://ssh-remote+winbox/c:/data/main.db');
+
+        await assert.rejects(
+            bridge.readWorkspaceFileUri('vscode-remote://ssh-remote+winbox/c:/data/..\\..\\Users\\me\\.ssh\\id_rsa'),
+            /Access denied/
+        );
+        assert.strictEqual(readUris.length, 0);
     });
 
     it('allows a file: URI inside the document directory without a workspace', async () => {

@@ -690,9 +690,18 @@ export function onCellClick(event, rowIdx, colIdx, rowId) {
         state.selectedRowIds.clear();
 
         const minRow = Math.min(state.lastSelectedCell.rowIdx, rowIdx);
-        const maxRow = Math.max(state.lastSelectedCell.rowIdx, rowIdx);
+        // Clamp so a stale anchor degrades to a shorter range instead of
+        // reading past the current page's rows/columns. (min is safe: the
+        // clicked cell always lies within the rendered grid.)
+        const maxRow = Math.min(
+            Math.max(state.lastSelectedCell.rowIdx, rowIdx),
+            state.gridData.length - 1
+        );
         const minCol = Math.min(state.lastSelectedCell.colIdx, colIdx);
-        const maxCol = Math.max(state.lastSelectedCell.colIdx, colIdx);
+        const maxCol = Math.min(
+            Math.max(state.lastSelectedCell.colIdx, colIdx),
+            state.tableColumns.length - 1
+        );
 
         // Optimization: Map rowIdx -> Set of colIdx using a sparse array
         const existingRows = new Array();
@@ -733,9 +742,18 @@ export function onCellClick(event, rowIdx, colIdx, rowId) {
         state.selectedCells = []; // Reset and select range
 
         const minRow = Math.min(state.lastSelectedCell.rowIdx, rowIdx);
-        const maxRow = Math.max(state.lastSelectedCell.rowIdx, rowIdx);
+        // Clamp so a stale anchor degrades to a shorter range instead of
+        // reading past the current page's rows/columns. (min is safe: the
+        // clicked cell always lies within the rendered grid.)
+        const maxRow = Math.min(
+            Math.max(state.lastSelectedCell.rowIdx, rowIdx),
+            state.gridData.length - 1
+        );
         const minCol = Math.min(state.lastSelectedCell.colIdx, colIdx);
-        const maxCol = Math.max(state.lastSelectedCell.colIdx, colIdx);
+        const maxCol = Math.min(
+            Math.max(state.lastSelectedCell.colIdx, colIdx),
+            state.tableColumns.length - 1
+        );
 
         for (let r = minRow; r <= maxRow; r++) {
             for (let c = minCol; c <= maxCol; c++) {

@@ -78,6 +78,55 @@ export function toWebviewQueryResultSet(result: QueryResultSet): WebviewQueryRes
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
 
+/**
+ * SECURITY: true when `candidate` names the base directory itself or a resource
+ * inside it, decided on fully normalized paths. This is the single containment
+ * implementation for readWorkspaceFileUri — both the workspace-folder branch
+ * and the document-directory branch must go through it, because two subtly
+ * different checks are exactly what allowed traversal bypasses in the past.
+ *
+ * `base` is either the directory itself (a workspace folder) or a file whose
+ * parent directory is the boundary (the open database document).
+ *
+ * file: URIs compare with the platform path rules on fsPath — path.resolve
+ * collapses dot segments and, on Windows, honours `\` as a separator. Every
+ * other provider addresses resources by POSIX uri.path; there a candidate
+ * containing `\` is rejected outright, because posix.resolve treats `\` as an
+ * ordinary filename character while Windows-backed remote providers treat it
+ * as a separator — normalizing instead of rejecting would misjudge either kind
+ * of provider. (Module-level on purpose: webviewMessageHandler dispatches any
+ * function-valued HostBridge property by name, and this must not be callable.)
+ */
+function isUriContainedInDirectory(
+  candidate: vsc.Uri,
+  base: vsc.Uri,
+  baseKind: 'directory' | 'parent-of-file'
+): boolean {
+  // An equal path on a different provider/authority is a different resource
+  // space entirely.
+  if (candidate.scheme !== base.scheme || candidate.authority !== base.authority) {
+    return false;
+  }
+  if (candidate.scheme === 'file') {
+    const baseDir = baseKind === 'directory' ? base.fsPath : path.dirname(base.fsPath);
+    const resolvedDir = path.resolve(baseDir);
+    const resolvedCandidate = path.resolve(candidate.fsPath);
+    // Match the directory itself or require the separator after the prefix:
+    // this prevents prefix spoofing (e.g. '/path/to/dir-fake'). If resolvedDir
+    // is root it already ends with the separator.
+    const prefix = resolvedDir.endsWith(path.sep) ? resolvedDir : resolvedDir + path.sep;
+    return resolvedCandidate === resolvedDir || resolvedCandidate.startsWith(prefix);
+  }
+  if (candidate.path.includes('\\')) {
+    return false;
+  }
+  const baseDir = baseKind === 'directory' ? base.path : path.posix.dirname(base.path);
+  const resolvedDir = path.posix.resolve('/', baseDir);
+  const resolvedCandidate = path.posix.resolve('/', candidate.path);
+  const prefix = resolvedDir.endsWith('/') ? resolvedDir : resolvedDir + '/';
+  return resolvedCandidate === resolvedDir || resolvedCandidate.startsWith(prefix);
+}
+
 // Column type information
 interface ColumnTypeInfo {
   [key: string]: unknown;
@@ -1462,47 +1511,24 @@ export class HostBridge implements ToastService {
     // vscode-vfs:, ...) must not bypass containment. Only allow access to files in:
     // 1. Explicit workspace folders
     // 2. The same directory as the open database (or subdirectories)
+    // Both branches run the same normalized containment check
+    // (isUriContainedInDirectory); membership lookups alone never authorize a read.
 
     // 1. Check if file is within workspace folders. getWorkspaceFolder matches
     // scheme/authority/path, so vscode-remote and vscode-vfs workspace folders resolve
     // here — this is what keeps explorer drag-and-drop working in remote workspaces.
+    // It is only a lookup, though: it prefix-matches literal path segments without
+    // collapsing dot segments ('..' is just another segment to it), so
+    // '<folder>/../../etc/passwd' still returns the folder. Containment must be
+    // re-verified on normalized paths before the read.
     const workspaceFolder = vsc.workspace.getWorkspaceFolder(uri);
-    if (workspaceFolder) {
+    if (workspaceFolder && isUriContainedInDirectory(uri, workspaceFolder.uri, 'directory')) {
       return await vsc.workspace.fs.readFile(uri);
     }
 
-    // 2. Check if file is in the same directory tree as the open document
+    // 2. Check if file is in the same directory tree as the open document.
     // This allows drag-and-drop from the same directory tree in single-file mode.
-    // The candidate must live on the document's own scheme and authority: an equal
-    // path on a different provider is a different resource space entirely.
-    const docUri = this.document.uri;
-    let isInside = false;
-    if (uri.scheme === docUri.scheme && uri.authority === docUri.authority) {
-      if (uri.scheme === 'file') {
-        // Use path.resolve to fully resolve both paths
-        // This automatically normalizes paths, resolves any '..' or '.',
-        // and creates an absolute path, mitigating path traversal attacks.
-        const resolvedDocDir = path.resolve(path.dirname(docUri.fsPath));
-        const resolvedFilePath = path.resolve(uri.fsPath);
-
-        // Ensure the resolved target path is either the document directory itself
-        // or strictly inside it by checking if it starts with the directory path plus a separator.
-        // This prevents prefix spoofing (e.g., '/path/to/dir-fake') and directory traversal.
-        // Note: If resolvedDocDir is root (e.g., '/'), we don't need to append an extra separator.
-        const prefix = resolvedDocDir.endsWith(path.sep) ? resolvedDocDir : resolvedDocDir + path.sep;
-        isInside = resolvedFilePath === resolvedDocDir || resolvedFilePath.startsWith(prefix);
-      } else {
-        // Virtual providers address resources by POSIX-style uri.path (fsPath is
-        // meaningless there); posix.resolve collapses '.' and '..' segments the same
-        // way path.resolve does in the local branch above.
-        const resolvedDocDir = path.posix.resolve('/', path.posix.dirname(docUri.path));
-        const resolvedFilePath = path.posix.resolve('/', uri.path);
-        const prefix = resolvedDocDir.endsWith('/') ? resolvedDocDir : resolvedDocDir + '/';
-        isInside = resolvedFilePath === resolvedDocDir || resolvedFilePath.startsWith(prefix);
-      }
-    }
-
-    if (!isInside) {
+    if (!isUriContainedInDirectory(uri, this.document.uri, 'parent-of-file')) {
       throw new Error(`Access denied: File "${uri.toString()}" is not in the current workspace or document directory.`);
     }
 

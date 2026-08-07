@@ -8,6 +8,12 @@ import {
     prepareCellUpdateForStorage
 } from '../../src/core/json-utils';
 
+// generateMergePatch/applyMergePatch build their results on null-prototype
+// objects so keys like "__proto__" stay ordinary own data. deepStrictEqual is
+// prototype-sensitive, and every production consumer JSON.stringifys these
+// results, so tests compare the serialized shape.
+const asPlain = (value: unknown) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+
 describe('JSON Merge Patch (RFC 7396)', () => {
     describe('generateMergePatch', () => {
         it('should return undefined if objects are identical', () => {
@@ -19,37 +25,37 @@ describe('JSON Merge Patch (RFC 7396)', () => {
         it('should detect added keys', () => {
             const original = { a: 1 };
             const modified = { a: 1, b: 2 };
-            assert.deepStrictEqual(generateMergePatch(original, modified), { b: 2 });
+            assert.deepStrictEqual(asPlain(generateMergePatch(original, modified)), { b: 2 });
         });
 
         it('should detect modified keys', () => {
             const original = { a: 1 };
             const modified = { a: 2 };
-            assert.deepStrictEqual(generateMergePatch(original, modified), { a: 2 });
+            assert.deepStrictEqual(asPlain(generateMergePatch(original, modified)), { a: 2 });
         });
 
         it('should detect deleted keys', () => {
             const original = { a: 1, b: 2 };
             const modified = { a: 1 };
-            assert.deepStrictEqual(generateMergePatch(original, modified), { b: null });
+            assert.deepStrictEqual(asPlain(generateMergePatch(original, modified)), { b: null });
         });
 
         it('should handle nested objects', () => {
             const original = { a: { x: 1, y: 2 } };
             const modified = { a: { x: 1, y: 3 } };
-            assert.deepStrictEqual(generateMergePatch(original, modified), { a: { y: 3 } });
+            assert.deepStrictEqual(asPlain(generateMergePatch(original, modified)), { a: { y: 3 } });
         });
 
         it('should replace arrays entirely', () => {
             const original = { a: [1, 2] };
             const modified = { a: [1, 3] };
-            assert.deepStrictEqual(generateMergePatch(original, modified), { a: [1, 3] });
+            assert.deepStrictEqual(asPlain(generateMergePatch(original, modified)), { a: [1, 3] });
         });
 
         it('should handle complex nesting', () => {
             const original = { a: { b: { c: 1 } }, d: 2 };
             const modified = { a: { b: { c: 2 } } }; // d deleted, c modified
-            assert.deepStrictEqual(generateMergePatch(original, modified), {
+            assert.deepStrictEqual(asPlain(generateMergePatch(original, modified)), {
                 a: { b: { c: 2 } },
                 d: null
             });
@@ -68,35 +74,35 @@ describe('JSON Merge Patch (RFC 7396)', () => {
             const target = { a: 1, b: 2 };
             const patch = { a: 3 };
             const result = applyMergePatch(target, patch);
-            assert.deepStrictEqual(result, { a: 3, b: 2 });
+            assert.deepStrictEqual(asPlain(result), { a: 3, b: 2 });
         });
 
         it('should add property', () => {
             const target = { a: 1 };
             const patch = { b: 2 };
             const result = applyMergePatch(target, patch);
-            assert.deepStrictEqual(result, { a: 1, b: 2 });
+            assert.deepStrictEqual(asPlain(result), { a: 1, b: 2 });
         });
 
         it('should remove property', () => {
             const target = { a: 1, b: 2 };
             const patch = { b: null };
             const result = applyMergePatch(target, patch);
-            assert.deepStrictEqual(result, { a: 1 });
+            assert.deepStrictEqual(asPlain(result), { a: 1 });
         });
 
         it('should handle nested patches', () => {
             const target = { a: { x: 1, y: 2 } };
             const patch = { a: { y: 3 } };
             const result = applyMergePatch(target, patch);
-            assert.deepStrictEqual(result, { a: { x: 1, y: 3 } });
+            assert.deepStrictEqual(asPlain(result), { a: { x: 1, y: 3 } });
         });
 
         it('should replace arrays', () => {
             const target = { a: [1, 2] };
             const patch = { a: [3, 4] };
             const result = applyMergePatch(target, patch);
-            assert.deepStrictEqual(result, { a: [3, 4] });
+            assert.deepStrictEqual(asPlain(result), { a: [3, 4] });
         });
 
         it('should not mutate original object deeply', () => {
@@ -105,7 +111,7 @@ describe('JSON Merge Patch (RFC 7396)', () => {
             const result = applyMergePatch(target, patch);
 
             // Result should have both
-            assert.deepStrictEqual(result, { a: { x: 1, y: 2 } });
+            assert.deepStrictEqual(asPlain(result), { a: { x: 1, y: 2 } });
         });
 
         it('should throw error if depth limit is exceeded', () => {
@@ -119,25 +125,91 @@ describe('JSON Merge Patch (RFC 7396)', () => {
         });
 
         it('should treat target as empty object if it is primitive, null, or array', () => {
-            assert.deepStrictEqual(applyMergePatch(null, { a: 1 }), { a: 1 });
-            assert.deepStrictEqual(applyMergePatch('str', { a: 1 }), { a: 1 });
-            assert.deepStrictEqual(applyMergePatch([1, 2], { a: 1 }), { a: 1 });
+            assert.deepStrictEqual(asPlain(applyMergePatch(null, { a: 1 })), { a: 1 });
+            assert.deepStrictEqual(asPlain(applyMergePatch('str', { a: 1 })), { a: 1 });
+            assert.deepStrictEqual(asPlain(applyMergePatch([1, 2], { a: 1 })), { a: 1 });
         });
 
         it('should handle deletion of non-existent property', () => {
-            assert.deepStrictEqual(applyMergePatch({ a: 1 }, { b: null }), { a: 1 });
+            assert.deepStrictEqual(asPlain(applyMergePatch({ a: 1 }, { b: null })), { a: 1 });
         });
 
         it('should correctly apply nested patch when target property is not an object', () => {
-            assert.deepStrictEqual(applyMergePatch({ a: 1 }, { a: { b: 2 } }), { a: { b: 2 } });
+            assert.deepStrictEqual(asPlain(applyMergePatch({ a: 1 }, { a: { b: 2 } })), { a: { b: 2 } });
         });
 
         it('should only process patch own properties', () => {
             const proto = { inherited: 1 };
             const patch = Object.create(proto);
             patch.own = 2;
-            assert.deepStrictEqual(applyMergePatch({ a: 1 }, patch), { a: 1, own: 2 });
+            assert.deepStrictEqual(asPlain(applyMergePatch({ a: 1 }, patch)), { a: 1, own: 2 });
         });
+    });
+});
+
+describe('literal prototype-member JSON keys ("__proto__", "constructor")', () => {
+    // JSON.parse creates OWN properties for these keys, but on plain objects a
+    // patch["__proto__"] assignment hits the inherited setter (no own key ->
+    // empty patch -> silently dropped edit), and reads of an ABSENT key fall
+    // back to Object.prototype members instead of undefined (masking
+    // additions/deletions). These tests pin the own-property semantics.
+
+    it('generateMergePatch emits a __proto__ key modification instead of an empty patch', () => {
+        const original = JSON.parse('{"__proto__":{"a":1},"k":1}');
+        const modified = JSON.parse('{"__proto__":{"a":2},"k":1}');
+        const patch = generateMergePatch(original, modified);
+        assert.strictEqual(JSON.stringify(patch), '{"__proto__":{"a":2}}');
+        // No pollution of the global Object prototype.
+        assert.strictEqual(({} as Record<string, unknown>).a, undefined);
+    });
+
+    it('generateMergePatch emits a __proto__ key addition', () => {
+        const patch = generateMergePatch(JSON.parse('{"k":1}'), JSON.parse('{"k":1,"__proto__":{"a":1}}'));
+        assert.strictEqual(JSON.stringify(patch), '{"__proto__":{"a":1}}');
+        assert.strictEqual(({} as Record<string, unknown>).a, undefined);
+    });
+
+    it('generateMergePatch emits a deletion marker for a removed constructor key', () => {
+        // Pre-fix, modified["constructor"] returned the inherited Object
+        // constructor (never undefined), so the deletion was silently missed.
+        const patch = generateMergePatch(
+            JSON.parse('{"constructor":{"x":1},"k":1}'),
+            JSON.parse('{"k":2}')
+        );
+        assert.strictEqual(JSON.stringify(patch), '{"k":2,"constructor":null}');
+    });
+
+    it('applyMergePatch adds a __proto__ data key without touching prototypes', () => {
+        const result = applyMergePatch(JSON.parse('{"k":1}'), JSON.parse('{"__proto__":{"a":1}}'));
+        assert.strictEqual(JSON.stringify(result), '{"k":1,"__proto__":{"a":1}}');
+        assert.strictEqual(
+            Object.prototype.hasOwnProperty.call(result, '__proto__'),
+            true
+        );
+        assert.strictEqual(({} as Record<string, unknown>).a, undefined);
+    });
+
+    it('prepareCellUpdateForStorage round-trips a __proto__ key edit', () => {
+        const prior = '{"__proto__":{"a":1},"k":1}';
+        const next = '{"__proto__":{"a":2},"k":1}';
+        const prepared = prepareCellUpdateForStorage(next, prior);
+        // Either representation is acceptable, but applying it must yield
+        // `next` — the pre-fix defect emitted an EMPTY json_patch here, so the
+        // edit was silently discarded while the UI reported success.
+        if (prepared.operation === 'json_patch') {
+            const applied = applyMergePatch(JSON.parse(prior), JSON.parse(prepared.value as string));
+            assert.deepStrictEqual(asPlain(applied), JSON.parse(next));
+        } else {
+            assert.strictEqual(prepared.value, next);
+        }
+        assert.strictEqual(({} as Record<string, unknown>).a, undefined);
+    });
+
+    it('prepareCellUpdateForStorage falls back to set when a __proto__ key is deleted', () => {
+        // The patch would carry "__proto__": null, and null members always
+        // force the full-value set path.
+        const prepared = prepareCellUpdateForStorage('{"k":1}', '{"__proto__":{"a":1},"k":1}');
+        assert.deepStrictEqual(prepared, { value: '{"k":1}', operation: 'set' });
     });
 });
 
@@ -149,7 +221,7 @@ describe('prepareCellUpdateForStorage', () => {
         assert.strictEqual(prepared.operation, 'json_patch');
         assert.deepStrictEqual(JSON.parse(prepared.value as string), { a: 5 });
         assert.deepStrictEqual(
-            applyMergePatch(JSON.parse(prior), JSON.parse(prepared.value as string)),
+            asPlain(applyMergePatch(JSON.parse(prior), JSON.parse(prepared.value as string))),
             JSON.parse(next)
         );
     });
@@ -189,7 +261,7 @@ describe('prepareCellUpdateForStorage', () => {
         const prepared = prepareCellUpdateForStorage(next, prior);
         assert.strictEqual(prepared.operation, 'json_patch');
         assert.deepStrictEqual(
-            applyMergePatch(JSON.parse(prior), JSON.parse(prepared.value as string)),
+            asPlain(applyMergePatch(JSON.parse(prior), JSON.parse(prepared.value as string))),
             JSON.parse(next)
         );
     });

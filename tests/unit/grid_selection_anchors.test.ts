@@ -152,6 +152,49 @@ describe('grid selection anchors', () => {
         assert.deepStrictEqual([...state.selectedRowIds].sort(), [2, 3]);
     });
 
+    it('clamps a stale cell anchor in the shift cell-range instead of throwing', async () => {
+        installDocumentStub();
+        const { state } = await import(stateModulePath);
+        const { onCellClick } = await import(gridActionsModulePath);
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [
+            { name: 'first', type: 'TEXT' },
+            { name: 'second', type: 'TEXT' }
+        ];
+        state.gridData = [[1, 'a', 'b'], [2, 'c', 'd']];
+        // Anchor left over from a larger, since-replaced page and column set.
+        state.lastSelectedCell = { rowIdx: 9, colIdx: 7 };
+
+        onCellClick(createMouseEvent({ shiftKey: true }), 1, 0, 2);
+
+        assert.deepStrictEqual(state.selectedCells, [
+            { rowIdx: 1, colIdx: 0, rowId: 2, value: 'c' },
+            { rowIdx: 1, colIdx: 1, rowId: 2, value: 'd' }
+        ]);
+    });
+
+    it('clamps a stale cell anchor in the cmd+shift cell-range instead of throwing', async () => {
+        installDocumentStub();
+        const { state } = await import(stateModulePath);
+        const { onCellClick } = await import(gridActionsModulePath);
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [
+            { name: 'first', type: 'TEXT' },
+            { name: 'second', type: 'TEXT' }
+        ];
+        state.gridData = [[1, 'a', 'b'], [2, 'c', 'd']];
+        state.lastSelectedCell = { rowIdx: 9, colIdx: 7 };
+
+        onCellClick(createMouseEvent({ shiftKey: true, metaKey: true }), 1, 0, 2);
+
+        assert.deepStrictEqual(state.selectedCells, [
+            { rowIdx: 1, colIdx: 0, rowId: 2, value: 'c' },
+            { rowIdx: 1, colIdx: 1, rowId: 2, value: 'd' }
+        ]);
+    });
+
     it('clamps a stale column anchor to the current column set instead of throwing', async () => {
         installDocumentStub();
         (globalThis as any).CSS = { escape: (value: string) => value };
