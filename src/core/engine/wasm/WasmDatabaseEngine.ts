@@ -66,6 +66,10 @@ import {
 } from '../../cell-containment';
 import { getNodeFs } from '../../platform/fs';
 import {
+  buildCountUpperBoundSql,
+  shouldAnswerCountWithUpperBound
+} from '../../paged-count';
+import {
   assertMutableRecordId,
   buildRecordIdentitiesPredicate,
   buildRecordIdentityPredicate,
@@ -148,8 +152,25 @@ export interface WasmDatabaseInstance {
   close(): void;
 }
 
+/**
+ * Host I/O contract for `Database.openPaged`: absolute-offset synchronous
+ * reads over an immutable snapshot whose size is pinned at open. Reads
+ * must return exactly `length` bytes, short only past EOF.
+ */
+export interface WasmPagedHostIo {
+  size(): number;
+  read(offset: number, length: number): Uint8Array;
+}
+
 export interface WasmEngineModule {
-  Database: new (data?: ArrayLike<number>) => WasmDatabaseInstance;
+  Database: (new (data?: ArrayLike<number>) => WasmDatabaseInstance) & {
+    /**
+     * Page-on-demand read-only open, present only in the patched sql.js
+     * fork (stage 0 of the paged-VFS program). Optional so a stale
+     * vendored build degrades to the buffer paths instead of crashing.
+     */
+    openPaged?: (hostIo: WasmPagedHostIo) => WasmDatabaseInstance;
+  };
 }
 
 export type WasmEngineLogHandler = (
@@ -208,6 +229,24 @@ interface WasmCellReadSessionState {
   absoluteTimer: ReturnType<typeof setTimeout>;
 }
 
+/**
+ * State a page-on-demand (openPaged) open hands the engine. Presence of
+ * this object is what marks the engine as paged: counts consult the
+ * shared paged count policy, serialization surfaces a clear unsupported
+ * error, and shutdown releases the host read resources (the file
+ * descriptor behind the hostIo) after the WASM instance closes.
+ */
+export interface WasmEnginePagedState {
+  /** Size of the snapshot; upper-bounds any table scan within it. */
+  fileSizeBytes: number;
+  /** Resolved exact-count gate (resolvePagedExactCountMaxFileBytes). */
+  exactCountMaxFileBytes: number;
+  /** Persistent host-read failure, used to replace SQLite's generic I/O error. */
+  getReadError?: () => Error | undefined;
+  /** Release host read resources; called once from shutdown(). */
+  dispose?: () => void;
+}
+
 export class WasmDatabaseEngine implements DatabaseOperations {
   private readonly instance: WasmDatabaseInstance;
   private readonly queryTimeout: number;
@@ -220,6 +259,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private cellReadSession: WasmCellReadSessionState | undefined;
   private readonly closedCellReadSessionIds = new Set<string>();
   private instanceClosed = false;
+  /** Set only for page-on-demand opens; undefined for buffer opens. */
+  private readonly pagedState: WasmEnginePagedState | undefined;
   readonly engineKind = Promise.resolve('wasm' as const);
 
   constructor(
@@ -230,9 +271,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     cellReadOptions: {
       idleTimeoutMs?: number;
       absoluteTimeoutMs?: number;
-    } = {}
+    } = {},
+    pagedState?: WasmEnginePagedState
   ) {
     this.instance = instance;
+    this.pagedState = pagedState;
     this.queryTimeout = timeoutMs;
     this.readOnlyMode = readOnlyMode;
     this.logger = logger ?? ((level, ...args) => console[level](...args));
@@ -374,6 +417,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     try {
       return operation();
     } catch (error) {
+      const pagedReadError = this.pagedState?.getReadError?.();
+      if (pagedReadError) throw pagedReadError;
       if (termination === 'timeout') {
         throw new Error(`Query execution timed out after ${this.queryTimeout}ms`);
       }
@@ -726,7 +771,26 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * @returns Database binary content
    */
   async serializeDatabase(): Promise<Uint8Array> {
+    this.assertSerializable();
     return this.instance.export();
+  }
+
+  /**
+   * Surface a clear, actionable error for whole-database serialization on
+   * a paged open instead of the fork's terser stage-0 export() message.
+   * Save/Save As are already gated by the document's read-only flag; this
+   * covers the remaining desktop surfaces that reach export() directly
+   * (the webview's exportDb RPC, future callers).
+   */
+  private assertSerializable(): void {
+    if (this.pagedState) {
+      throw new Error(
+        'Database export is unavailable: this file exceeds the in-memory limit '
+        + 'for the WebAssembly backend and is opened page-on-demand as a '
+        + "read-only snapshot. Raise 'sqliteExplorer.maxFileSize' (or set it "
+        + 'to 0 for unlimited) to open it in memory.'
+      );
+    }
   }
 
   /**
@@ -2634,7 +2698,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const contained = decodeCellContainment(
           normalized.rows,
           headers.length,
-          normalized.exactIntegerTexts
+          normalized.exactIntegerTexts,
+          queryOptions.maxPageResponseBytes
         );
         const { rows, oversizedCells, exactIntegerTexts } = contained;
         // Anchors come from the exact source rows (BigInt-preserving, already
@@ -2702,6 +2767,37 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     queryOptions.columns = await this.resolveQueryColumns(table, queryOptions.columns, queryOptions.globalFilter);
 
     const { sql, params } = buildCountQuery(table, queryOptions);
+    // Shared paged count policy (see src/core/paged-count.ts): large paged
+    // opens answer unfiltered counts with the intrinsic-rowid span bound —
+    // OP_Count never yields to the progress handler and a full scan through
+    // per-page host reads starves RPC deadlines. Every WHERE condition
+    // buildCountQuery emits binds at least one parameter, so params.length
+    // is exactly the "filtered" signal the demo worker derives from its own
+    // WHERE clauses.
+    const countPolicyInput = this.pagedState && {
+        storage: 'paged',
+        filtered: params.length > 0,
+        // Stage the cheap size/filter decision before paying for authority.
+        authorityConfirmedRowIdTable: true,
+        pagedFileSizeBytes: this.pagedState.fileSizeBytes,
+        exactCountMaxFileBytes: this.pagedState.exactCountMaxFileBytes
+      } as const;
+    if (countPolicyInput && shouldAnswerCountWithUpperBound(countPolicyInput)) {
+      try {
+        const authority = await this.executeQuery(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
+        const authorityConfirmedRowIdTable = (authority[0]?.rows.length ?? 0) > 0;
+        if (shouldAnswerCountWithUpperBound({
+          ...countPolicyInput,
+          authorityConfirmedRowIdTable
+        })) {
+          const bound = await this.executeQuery(buildCountUpperBoundSql(table));
+          const upperBound = bound[0]?.rows?.[0]?.[0];
+          if (typeof upperBound === 'number') return upperBound;
+        }
+      } catch {
+        // Authority or bound failures retain exact semantics.
+      }
+    }
     const result = await this.executeQuery(sql, params);
     if (result && result.length > 0 && result[0].rows.length > 0) {
       const count = result[0].rows[0][0];
@@ -2791,6 +2887,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * Set PRAGMA value.
    */
   async setPragma(pragma: string, value: CellValue): Promise<void> {
+    this.assertWritableMutation('PRAGMA changes');
     // Validate pragma name to prevent SQL injection
     const allowedPragmas = [
       'foreign_keys',
@@ -2856,6 +2953,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     if (!this.instanceClosed) {
       this.instance.close();
       this.instanceClosed = true;
+      // Release host read resources (the fd behind a paged open) only after
+      // the WASM instance has closed, so no read callback can race a closed
+      // descriptor. Failures must not mask the shutdown itself.
+      try {
+        this.pagedState?.dispose?.();
+      } catch (error) {
+        this.logger('error', 'Failed to release paged host I/O during shutdown:', error);
+      }
     }
   }
 
@@ -2863,6 +2968,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * Write database directly to file system.
    */
   async writeToFile(path: string): Promise<void> {
+    // Same serialization surface as serializeDatabase: unsupported on a
+    // paged snapshot, and the fallback path callers use is serializeDatabase
+    // which raises the identical actionable error.
+    this.assertSerializable();
     const data = this.instance.export();
 
     const fs = getNodeFs();

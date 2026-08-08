@@ -45,6 +45,25 @@ export const SQLITE_HEADER_PROBE_BYTES = 100;
 const HEADER_OFFSET_WRITE_VERSION = 18;
 const HEADER_OFFSET_READ_VERSION = 19;
 const FORMAT_VERSION_WAL = 2;
+const FORMAT_VERSION_ROLLBACK = 1;
+
+/**
+ * Size of the SQLite write-ahead log header in bytes.
+ *
+ * A -wal file is a 32-byte header followed by frames of 24 + page_size
+ * bytes each (page_size >= 512), so anything larger than the bare header
+ * holds at least one (possibly torn) frame. Observed with sqlite3 3.51: a
+ * database with uncheckpointed commits leaves a frame-bearing -wal (e.g.
+ * 12392 bytes for 3 pages), `PRAGMA wal_checkpoint(TRUNCATE)` leaves a
+ * 0-byte file, and macOS system SQLite keeps a persistent empty -wal
+ * after a clean close. Sizes <= 32 therefore must NOT count as WAL data
+ * or every cleanly checkpointed database on macOS would be forced
+ * read-only. A fully backfilled but untruncated WAL keeps its size and
+ * still trips gates built on this constant; that false positive degrades
+ * to read-only (or a checkpoint-first rejection), the safe direction when
+ * frame state cannot be inspected without a WAL-aware SQLite.
+ */
+export const WAL_HEADER_SIZE_BYTES = 32;
 
 /**
  * Largest database the demo page still posts to the worker as inline
@@ -120,6 +139,31 @@ export function isWalMarkedHeader(header: Uint8Array): boolean {
   return header.length > HEADER_OFFSET_READ_VERSION
     && header[HEADER_OFFSET_WRITE_VERSION] === FORMAT_VERSION_WAL
     && header[HEADER_OFFSET_READ_VERSION] === FORMAT_VERSION_WAL;
+}
+
+/**
+ * In-place: rewrite the file-format write/read version bytes (offsets
+ * 18/19 of the database file) to 1 (rollback journal) wherever they fall
+ * inside a read window that starts at absolute file offset
+ * `viewFileOffset`. Used by paged (read-only snapshot) opens of
+ * WAL-at-rest databases whose sibling `-wal` is known to hold no frames:
+ * with no frames to merge, the main image already is the complete
+ * committed state, and presenting it as a rollback-journal database is
+ * the same byte-level rewrite `PRAGMA journal_mode=DELETE` would persist.
+ * The patch is applied to read results only and never touches disk.
+ */
+export function patchWalHeaderToRollback(
+  view: Uint8Array,
+  viewFileOffset: number
+): void {
+  const writeIndex = HEADER_OFFSET_WRITE_VERSION - viewFileOffset;
+  const readIndex = HEADER_OFFSET_READ_VERSION - viewFileOffset;
+  if (writeIndex >= 0 && writeIndex < view.length) {
+    view[writeIndex] = FORMAT_VERSION_ROLLBACK;
+  }
+  if (readIndex >= 0 && readIndex < view.length) {
+    view[readIndex] = FORMAT_VERSION_ROLLBACK;
+  }
 }
 
 function resolveLimit(

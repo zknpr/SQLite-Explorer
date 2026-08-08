@@ -676,6 +676,16 @@ export interface DatabaseInitConfig {
   readOnlyMode?: boolean;
   /** Query execution timeout in milliseconds */
   queryTimeout?: number;
+  /**
+   * Desktop worker only: permit the page-on-demand read-only fallback when
+   * the file at `filePath` exceeds `maxSize`. Set by workerFactory after its
+   * sibling `-wal` gate has confirmed no frames exist that a paged snapshot
+   * would miss; without it (or without engine support) an over-limit file
+   * keeps today's size-gate rejection.
+   */
+  allowPagedFallback?: boolean;
+  /** Internal/test override for the paged exact-count gate; not a user setting. */
+  pagedExactCountMaxFileBytes?: number;
   /** Internal/test override; not exposed as a user setting. */
   cellReadSessionIdleTimeoutMs?: number;
   /** Internal/test override; not exposed as a user setting. */
@@ -690,6 +700,12 @@ export interface DatabaseInitResult {
   operations?: DatabaseOperations;
   /** Whether opened in read-only mode */
   isReadOnly: boolean;
+  /**
+   * How the database is backed: 'memory' (bytes in the WASM filesystem —
+   * the editable buffer path) or 'paged' (page-on-demand host reads;
+   * read-only snapshot). Absent from older workers; treat as 'memory'.
+   */
+  storage?: 'memory' | 'paged';
 }
 
 // ============================================================================

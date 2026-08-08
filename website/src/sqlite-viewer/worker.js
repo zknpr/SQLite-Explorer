@@ -92,6 +92,12 @@ import {
   isWalMarkedHeader,
   SQLITE_HEADER_PROBE_BYTES
 } from '../../../src/core/paged-open.ts';
+import {
+  buildCountUpperBoundSql,
+  resolvePagedExactCountMaxFileBytes,
+  shouldAnswerCountWithUpperBound
+} from '../../../src/core/paged-count.ts';
+import { createChunkedReadCache } from '../../../src/core/chunked-read-cache.ts';
 
 // ============================================================================
 // Configuration
@@ -101,20 +107,6 @@ const SQL_JS_GLUE_URL = './sql-wasm.js';
 const SQL_JS_WASM_URL = './sql-wasm.wasm';
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 const PROGRESS_HANDLER_INTERVAL = 1000;
-/**
- * Largest page-on-demand database whose unfiltered COUNT(*) still runs
- * exactly. An exact count full-scans the table's B-tree through per-4KB
- * host callbacks at a measured ~25-35 MB/s (~2 minutes for a 3.5 GiB /
- * 128M-row table), starving every queued RPC past the webview's 60s
- * deadline — and it cannot be interrupted mid-flight, because SQLite
- * serves `SELECT COUNT(*)` with the single OP_Count opcode, which never
- * yields to the progress handler. The gate is therefore decided up front
- * from the file size (the upper bound on any table scan within it): at
- * 64 MiB the worst-case exact scan stays around two seconds. Larger paged
- * databases answer unfiltered counts with the max(rowid) upper bound
- * instead (see fetchTableCount).
- */
-const PAGED_EXACT_COUNT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 const WEB_DEMO_EXPORT_MAX_BYTES = 16 * 1024 * 1024;
 const WEB_DEMO_EXPORT_CHUNK_CHARS = 64 * 1024;
 const WEB_DEMO_EXPORT_LIMIT_DESCRIPTION = '16 MiB (16,777,216 bytes)';
@@ -149,7 +141,11 @@ let readOnlyMode = false;
 let storageMode = 'memory';
 /** File size behind the current paged open; 0 for buffer opens. */
 let pagedFileSizeBytes = 0;
-let pagedExactCountMaxFileBytes = PAGED_EXACT_COUNT_MAX_FILE_BYTES;
+/**
+ * Exact-count gate for paged opens; policy and default live in the shared
+ * src/core/paged-count.ts module (also consumed by the desktop engine).
+ */
+let pagedExactCountMaxFileBytes = resolvePagedExactCountMaxFileBytes(undefined);
 let cellReadSessionIdleTimeoutMs = DEFAULT_CELL_READ_SESSION_IDLE_TIMEOUT_MS;
 let cellReadSessionAbsoluteTimeoutMs = DEFAULT_CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS;
 let activeCellReadSession = null;
@@ -599,16 +595,23 @@ function isFileLike(candidate) {
  * changes on disk, making later reads throw, which the VFS surfaces as
  * an I/O error rather than serving torn pages.
  *
+ * Reads go through the shared chunked read cache
+ * (src/core/chunked-read-cache.ts): the flat FileReaderSync per-call cost
+ * dominates per-4KB-page reads, so SQLite's page requests are coalesced
+ * into 64KiB host reads. The cache is created per open (this function is
+ * called once per initializeDatabase) and dropped with the handle.
+ *
  * @param {File} file
  * @param {FileReaderSync} reader
  */
 function createFileHostIo(file, reader) {
   const size = file.size;
+  const read = createChunkedReadCache((offset, length) => new Uint8Array(
+    reader.readAsArrayBuffer(file.slice(offset, offset + length))
+  ));
   return {
     size: () => size,
-    read: (offset, length) => new Uint8Array(
-      reader.readAsArrayBuffer(file.slice(offset, offset + length))
-    )
+    read
   };
 }
 
@@ -656,10 +659,9 @@ async function initializeDatabase(filename, config) {
   readOnlyMode = config.readOnlyMode === true;
   storageMode = 'memory';
   pagedFileSizeBytes = 0;
-  pagedExactCountMaxFileBytes = Number.isFinite(config.pagedExactCountMaxFileBytes)
-    && config.pagedExactCountMaxFileBytes >= 0
-    ? config.pagedExactCountMaxFileBytes
-    : PAGED_EXACT_COUNT_MAX_FILE_BYTES;
+  pagedExactCountMaxFileBytes = resolvePagedExactCountMaxFileBytes(
+    config.pagedExactCountMaxFileBytes
+  );
   cellReadSessionIdleTimeoutMs = normalizeCellReadTimeout(
     config.cellReadSessionIdleTimeoutMs,
     DEFAULT_CELL_READ_SESSION_IDLE_TIMEOUT_MS
@@ -1349,7 +1351,8 @@ async function fetchTableData(table, options = {}) {
   const contained = decodeCellContainment(
     normalized.rows,
     headers.length,
-    normalized.exactIntegerTexts
+    normalized.exactIntegerTexts,
+    containmentOptions.maxPageResponseBytes
   );
   const { rows, oversizedCells, exactIntegerTexts } = contained;
   // Anchors come from the exact source rows (BigInt-preserving, display order)
@@ -1450,29 +1453,33 @@ async function fetchTableCount(table, options = {}) {
     sql += ` WHERE ${whereClauses.join(' AND ')}`;
   }
 
-  // Page-on-demand storage answers large unfiltered counts with the
-  // max(rowid) upper bound instead of an exact scan. The exact COUNT(*)
-  // full-scans the B-tree through per-page host callbacks — minutes on
-  // multi-GB files, wedging every queued RPC past the webview deadline —
-  // and SQLite's OP_Count opcode never yields to the progress handler, so
-  // the scan cannot be interrupted once started. The file size decides up
-  // front (it upper-bounds any scan within the file). The bound equals the
-  // exact count for gap-free rowid tables and otherwise overshoots, which
-  // only renders trailing pages short or empty — never a dead end.
-  // Filtered counts have no cheap bound and keep exact semantics.
-  if (
-    storageMode === 'paged'
-    && whereClauses.length === 0
-    && pagedFileSizeBytes > pagedExactCountMaxFileBytes
-  ) {
+  // Shared paged count policy (src/core/paged-count.ts, also consumed by
+  // the desktop WASM engine): large paged opens answer unfiltered counts
+  // with the intrinsic-rowid span upper bound instead of an exact scan — OP_Count
+  // never yields to the progress handler and a full b-tree scan through
+  // per-page host callbacks wedges every queued RPC past the webview
+  // deadline. Filtered counts have no cheap bound and keep exact semantics.
+  const countPolicyInput = {
+    storage: storageMode,
+    filtered: whereClauses.length > 0,
+    // Stage the cheap size/filter decision before paying for authority.
+    authorityConfirmedRowIdTable: true,
+    pagedFileSizeBytes,
+    exactCountMaxFileBytes: pagedExactCountMaxFileBytes
+  };
+  if (shouldAnswerCountWithUpperBound(countPolicyInput)) {
     try {
-      const upperBound = db.exec(
-        `SELECT COALESCE(max(rowid), 0) FROM ${escapeIdentifier(table)}`
-      );
-      return upperBound[0].values[0][0];
+      const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
+      const authorityConfirmedRowIdTable = (authority[0]?.values.length ?? 0) > 0;
+      if (shouldAnswerCountWithUpperBound({
+        ...countPolicyInput,
+        authorityConfirmedRowIdTable
+      })) {
+        const upperBound = db.exec(buildCountUpperBoundSql(table));
+        return upperBound[0].values[0][0];
+      }
     } catch {
-      // Views and WITHOUT ROWID relations have no rowid to bound with;
-      // fall through to the exact count for them.
+      // Authority or bound failures retain exact semantics.
     }
   }
 

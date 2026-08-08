@@ -5,7 +5,6 @@ import { describe, it } from 'node:test';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import {
     WEBVIEW_TRANSPORT_SURFACES,
-    WebviewPayloadLimitError,
     assertWebviewTransportPayload
 } from '../../src/core/webview-transport';
 
@@ -28,78 +27,92 @@ describe('grid cell containment limits', () => {
         }, 4), 1024 * 1024);
     });
 
-    it('divides the 16 MiB page budget across every requested row and column', async () => {
+    it('keeps a 256-byte SQL clipping floor for a 50-column 5000-row page', async () => {
         const { deriveEffectiveInlineCellBytes } = await loadContainmentModule();
 
         assert.strictEqual(deriveEffectiveInlineCellBytes({
             maxInlineCellBytes: 1024 * 1024,
             maxPageResponseBytes: 16 * 1024 * 1024,
-            limit: 500
-        }, 8), 4194);
+            limit: 5000
+        }, 50), 256);
     });
 
-    it('keeps a 500 by 560 BLOB page and its oversized sidecars below the wire cap', async () => {
-        const { deriveEffectiveInlineCellBytes } = await loadContainmentModule();
-        const rowCount = 500;
-        const columnCount = 560;
-        const effectiveBytes = deriveEffectiveInlineCellBytes({
-            maxInlineCellBytes: 1024 * 1024,
-            maxPageResponseBytes: 16 * 1024 * 1024,
-            limit: rowCount
-        }, columnCount);
+    it('downgrades the payload tail after actual UTF-8 bytes exhaust the page budget', async () => {
+        const { decodeCellContainment } = await loadContainmentModule();
+        const decoded = decodeCellContainment([
+            ['early', ''],
+            ['😀', ''],
+            ['late', ''],
+            ['x', '']
+        ], 1, undefined, 9);
 
-        const buildResponse = (previewBytes: number) => {
-            // Aliases are intentional: the transport estimator counts each
-            // serialized path, so this models 280,000 cells without allocating
-            // 280,000 separate byte arrays and metadata objects.
-            const preview = new Uint8Array(previewBytes);
-            const row = Array(columnCount).fill(preview);
-            const rows = Array(rowCount).fill(row);
-            const cellMetadata = {
-                storageClass: 'blob',
-                byteLength: previewBytes + 1
-            };
-            const metadataRow: Record<number, typeof cellMetadata> = {};
-            for (let column = 0; column < columnCount; column++) {
-                metadataRow[column] = cellMetadata;
-            }
-            const oversizedCells: Record<number, typeof metadataRow> = {};
-            for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
-                oversizedCells[rowIndex] = metadataRow;
-            }
-            return {
-                channel: 'rpc',
-                content: {
-                    kind: 'response',
-                    messageId: 'wire-aware-grid-margin',
-                    success: true,
-                    data: {
-                        headers: Array.from(
-                            { length: columnCount },
-                            (_, column) => `column_${column}`
-                        ),
-                        rows,
-                        oversizedCells
-                    }
+        assert.deepStrictEqual(decoded.rows, [['early'], ['😀'], [''], ['']]);
+        assert.deepStrictEqual(decoded.oversizedCells, {
+            2: { 0: { storageClass: 'text', byteLength: 4 } },
+            3: { 0: { storageClass: 'text', byteLength: 1 } }
+        });
+        assert.strictEqual(
+            decoded.rows.reduce(
+                (total: number, row: string[]) => total + Buffer.byteLength(row[0]),
+                0
+            ),
+            9
+        );
+    });
+
+    it('keeps the 32 MiB aggregate transport guard unreachable for contained pages', async () => {
+        const { decodeCellContainment } = await loadContainmentModule();
+        const rowCount = 5000;
+        const columnCount = 50;
+        const value = new Uint8Array(256);
+        const packedMetadata = Array(columnCount).fill('b257').join('|');
+        const transportedRow = [...Array(columnCount).fill(value), packedMetadata];
+        const decoded = decodeCellContainment(
+            Array(rowCount).fill(transportedRow),
+            columnCount,
+            undefined,
+            16 * 1024 * 1024
+        );
+        const response = {
+            channel: 'rpc',
+            content: {
+                kind: 'response',
+                messageId: 'contained-wide-grid',
+                success: true,
+                data: {
+                    headers: Array.from(
+                        { length: columnCount },
+                        (_, column) => `column_${column}`
+                    ),
+                    rows: decoded.rows,
+                    oversizedCells: decoded.oversizedCells
                 }
-            };
+            }
         };
 
-        assert.strictEqual(effectiveBytes, 18);
         assert.doesNotThrow(() => assertWebviewTransportPayload(
-            buildResponse(effectiveBytes),
+            response,
             { surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse }
         ));
-        assert.throws(
-            () => assertWebviewTransportPayload(
-                buildResponse(effectiveBytes + 1),
-                { surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse }
-            ),
-            (error: unknown) => (
-                error instanceof WebviewPayloadLimitError &&
-                error.kind === 'aggregate-payload'
-            )
+    });
+
+    it('returns zero oversized markers for 5000 rows of 50 ordinary UUID cells', async () => {
+        const { decodeCellContainment } = await loadContainmentModule();
+        const rowCount = 5000;
+        const columnCount = 50;
+        const uuid = '550e8400-e29b-41d4-a716-446655440000';
+        const packedMetadata = Array(columnCount).fill('').join('|');
+        const transportedRow = [...Array(columnCount).fill(uuid), packedMetadata];
+        const page = decodeCellContainment(
+            Array(rowCount).fill(transportedRow),
+            columnCount,
+            undefined,
+            16 * 1024 * 1024
         );
+
+        assert.strictEqual(page.rows.length, 5000);
+        assert.strictEqual(page.rows[0].length, 50);
+        assert.strictEqual(page.oversizedCells, undefined);
     });
 
     it('returns bounded WASM previews and exact sparse metadata without changing small DTOs', async () => {

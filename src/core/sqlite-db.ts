@@ -41,6 +41,14 @@ import {
   type WasmEngineLogHandler,
   type WasmQueryCancellation
 } from './engine/wasm/WasmDatabaseEngine';
+import { createChunkedReadCache } from './chunked-read-cache';
+import { resolvePagedExactCountMaxFileBytes } from './paged-count';
+import {
+  isWalMarkedHeader,
+  patchWalHeaderToRollback,
+  SQLITE_HEADER_PROBE_BYTES,
+  WAL_HEADER_SIZE_BYTES
+} from './paged-open';
 
 export { WasmDatabaseEngine } from './engine/wasm/WasmDatabaseEngine';
 export { getNodeFs } from './platform/fs';
@@ -72,7 +80,22 @@ export async function createDatabaseEngine(
   }
 
   const SqlJsModule = await loadEngine(engineConfig) as unknown as WasmEngineModule;
+  return createEngineFromModule(SqlJsModule, config, logger);
+}
 
+/**
+ * Open a database on an already-initialized sql.js module.
+ *
+ * Split from createDatabaseEngine so tests can drive the open routing
+ * (buffer vs paged vs rejection) against a module whose capabilities they
+ * control — e.g. masking openPaged to pin the stale-vendored-build
+ * fallback — while production always goes through createDatabaseEngine.
+ */
+export async function createEngineFromModule(
+  SqlJsModule: WasmEngineModule,
+  config: DatabaseInitConfig,
+  logger?: WasmEngineLogHandler
+): Promise<DatabaseInitResult> {
   // Create database instance
   let wasmInstance: WasmDatabaseInstance;
   let buffer = config.content;
@@ -82,7 +105,8 @@ export async function createDatabaseEngine(
   // sibling -wal file, so committed-but-uncheckpointed WAL frames would be
   // invisible here. The layer that owns file access (workerFactory) checks
   // for WAL data before handing over a filePath (or content bytes) and forces
-  // readOnlyMode when it finds any; do not add WAL handling in the engine.
+  // readOnlyMode when it finds any; the only WAL awareness in the engine is
+  // the paged fallback's defensive frame recheck (openPagedDatabaseEngine).
   //
   // A filePath that cannot be stat'd/read MUST fail the open. Falling through
   // to the empty-database branch below would show an empty writable view of a
@@ -101,14 +125,52 @@ export async function createDatabaseEngine(
       );
     }
     try {
-      // Validate size
+      const openOverLimitFile = (actualSize: number): DatabaseInitResult => {
+        // Over the in-memory gate. Files this size used to be a hard
+        // failure; when the host permits it and the vendored engine
+        // carries openPaged, they now open page-on-demand read-only
+        // instead. Every fallback below (capability absent, paged open
+        // failed) lands on exactly today's size-gate rejection, with the
+        // paged failure preserved on the cause chain.
+        let pagedFailure: unknown;
+        if (
+          config.allowPagedFallback
+          && typeof SqlJsModule.Database.openPaged === 'function'
+        ) {
+          try {
+            return openPagedDatabaseEngine(
+              SqlJsModule,
+              fs,
+              config.filePath!,
+              config,
+              logger
+            );
+          } catch (pagedError) {
+            pagedFailure = pagedError;
+            logger?.(
+              'warn',
+              `Page-on-demand open failed for '${config.filePath}'; falling back to the size-limit rejection:`,
+              pagedError instanceof Error ? pagedError.message : String(pagedError)
+            );
+          }
+        }
+        throw new Error(
+          `file size (${actualSize} bytes) exceeds the maximum allowed size (${config.maxSize} bytes)`,
+          pagedFailure === undefined ? undefined : { cause: pagedFailure }
+        );
+      };
+
+      // Validate the metadata size first, then the bytes actually read. The
+      // second gate closes the stat/read TOCTOU and distrusts providers that
+      // return more data than their stat result advertised.
       const stats = await fs.promises.stat(config.filePath);
       if (config.maxSize > 0 && stats.size > config.maxSize) {
-        throw new Error(
-          `file size (${stats.size} bytes) exceeds the maximum allowed size (${config.maxSize} bytes)`
-        );
+        return openOverLimitFile(stats.size);
       }
       buffer = await fs.promises.readFile(config.filePath);
+      if (config.maxSize > 0 && buffer.byteLength > config.maxSize) {
+        return openOverLimitFile(buffer.byteLength);
+      }
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
       throw new Error(
@@ -116,6 +178,15 @@ export async function createDatabaseEngine(
         { cause: e }
       );
     }
+  }
+
+  // Byte-loading providers are outside this worker's trust boundary: their
+  // read can exceed the metadata size checked by the host. With no local fd
+  // to page from, the only safe outcome is the ordinary size rejection.
+  if (buffer && config.maxSize > 0 && buffer.byteLength > config.maxSize) {
+    throw new Error(
+      `file size (${buffer.byteLength} bytes) exceeds the maximum allowed size (${config.maxSize} bytes)`
+    );
   }
 
   if (buffer && buffer.byteLength > 0) {
@@ -149,8 +220,217 @@ export async function createDatabaseEngine(
 
   return {
     operations: engine,
-    isReadOnly: config.readOnlyMode ?? false
+    isReadOnly: config.readOnlyMode ?? false,
+    storage: 'memory'
   };
+}
+
+type NodeFsModule = NonNullable<ReturnType<typeof getNodeFs>>;
+
+interface PagedFileIdentity {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+}
+
+const PAGED_FILE_CHANGED_MESSAGE =
+  'Database file changed on disk; reload the document.';
+
+function readPagedFileIdentity(fs: NodeFsModule, fd: number): PagedFileIdentity {
+  const stats = fs.fstatSync(fd, { bigint: true });
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeNs: stats.mtimeNs
+  };
+}
+
+function samePagedFileIdentity(
+  expected: PagedFileIdentity,
+  actual: PagedFileIdentity
+): boolean {
+  return expected.dev === actual.dev
+    && expected.ino === actual.ino
+    && expected.size === actual.size
+    && expected.mtimeNs === actual.mtimeNs;
+}
+
+/**
+ * Defensive re-check of the sibling `-wal` immediately before a paged
+ * open. workerFactory's gate already rejected frame-bearing siblings
+ * before permitting the fallback, but a frame could appear between that
+ * check and this open (a writer showing up), and a snapshot taken then
+ * would silently miss committed rows. Failing here routes the open into
+ * the ordinary size-gate rejection instead.
+ */
+function assertNoSiblingWalFrames(fs: NodeFsModule, filePath: string): void {
+  const walPath = `${filePath}-wal`;
+  let walSize: number;
+  try {
+    walSize = fs.statSync(walPath).size;
+  } catch (error) {
+    const code = (error as { code?: string } | undefined)?.code;
+    // No sibling: there is no WAL state a main-file snapshot could miss.
+    if (code === 'ENOENT') return;
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `cannot verify WAL state of '${walPath}': ${reason}`,
+      { cause: error }
+    );
+  }
+  if (walSize > WAL_HEADER_SIZE_BYTES) {
+    throw new Error(
+      `sibling WAL file '${walPath}' holds uncheckpointed frames (${walSize} bytes); `
+      + 'a page-on-demand snapshot of the main file would miss them'
+    );
+  }
+}
+
+/**
+ * Open an over-limit local database page-on-demand (read-only snapshot).
+ *
+ * The hostIo serves absolute-offset reads through a positional
+ * fs.readSync loop over one long-lived file descriptor, wrapped in the
+ * shared chunked read cache so SQLite's per-4KB-page reads coalesce into
+ * 64KiB host reads (see src/core/chunked-read-cache.ts). The descriptor
+ * lives exactly as long as the engine: it is closed on shutdown, and on
+ * every failure path out of this function — openPaged throwing, engine
+ * construction throwing — before the error propagates.
+ */
+function openPagedDatabaseEngine(
+  SqlJsModule: WasmEngineModule,
+  fs: NodeFsModule,
+  filePath: string,
+  config: DatabaseInitConfig,
+  logger?: WasmEngineLogHandler
+): DatabaseInitResult {
+  assertNoSiblingWalFrames(fs, filePath);
+
+  const fd = fs.openSync(filePath, 'r');
+  let engineOwnsFd = false;
+  let fdClosed = false;
+  const closeFd = (context: string): void => {
+    if (fdClosed) return;
+    fdClosed = true;
+    try {
+      fs.closeSync(fd);
+    } catch (closeError) {
+      // Descriptor release must never mask the open's outcome.
+      logger?.('warn', `Failed to close paged database file (${context}):`, closeError);
+    }
+  };
+
+  try {
+    const openedIdentity = readPagedFileIdentity(fs, fd);
+    const snapshotFileSizeBytes = Number(openedIdentity.size);
+    if (!Number.isSafeInteger(snapshotFileSizeBytes) || snapshotFileSizeBytes < 0) {
+      throw new Error(`paged database size is not a safe integer: ${openedIdentity.size}`);
+    }
+    let pagedReadError: Error | undefined;
+    const assertFileGeneration = (): void => {
+      if (pagedReadError) throw pagedReadError;
+      let currentIdentity: PagedFileIdentity;
+      try {
+        currentIdentity = readPagedFileIdentity(fs, fd);
+      } catch (error) {
+        pagedReadError = new Error(PAGED_FILE_CHANGED_MESSAGE, { cause: error });
+        throw pagedReadError;
+      }
+      if (!samePagedFileIdentity(openedIdentity, currentIdentity)) {
+        pagedReadError = new Error(PAGED_FILE_CHANGED_MESSAGE);
+        throw pagedReadError;
+      }
+    };
+
+    // Positional reads (pread semantics) so no shared file-position state
+    // exists. POSIX permits short reads, so loop until the request is
+    // filled or EOF (readSync returning 0); the result is short exactly
+    // when the request overruns EOF, which is the contract both the paged
+    // VFS and the chunked cache are built on.
+    const readFromFd = (offset: number, length: number): Uint8Array => {
+      // createChunkedReadCache invokes this only on misses. Validate after
+      // the read, before returning its bytes to the cache: this also closes
+      // the fstat/read window where a writer could otherwise replace bytes
+      // immediately after a successful pre-read check.
+      if (pagedReadError) throw pagedReadError;
+      const out = new Uint8Array(length);
+      let filled = 0;
+      while (filled < length) {
+        const got = fs.readSync(fd, out, filled, length - filled, offset + filled);
+        if (got === 0) break;
+        filled += got;
+      }
+      assertFileGeneration();
+      return filled === length ? out : out.subarray(0, filled);
+    };
+
+    // WAL-at-rest sniff (header bytes 18/19 == 0x02 0x02). Decision:
+    // PAGEABLE. The sibling -wal has already been verified frame-free
+    // (workerFactory's gate, plus assertNoSiblingWalFrames above), so the
+    // main image alone is the complete committed state — there are no
+    // invisible frames a snapshot could miss. The engine itself cannot be
+    // relied on either way here: SQLite refuses to open a WAL-marked
+    // database through a read-only VFS that cannot create the -shm
+    // (SQLITE_CANTOPEN, observed with the pinned fork), so the hostIo
+    // presents the header as rollback-journal (bytes 18/19 -> 0x01) — the
+    // identical rewrite `PRAGMA journal_mode=DELETE` would persist, applied
+    // to read results only, never to disk. Patching sits inside the cache
+    // wrapper so chunk 0 is patched once when fetched.
+    const headerProbe = readFromFd(0, SQLITE_HEADER_PROBE_BYTES);
+    const rawRead = isWalMarkedHeader(headerProbe)
+      ? (offset: number, length: number): Uint8Array => {
+          const out = readFromFd(offset, length);
+          patchWalHeaderToRollback(out, offset);
+          return out;
+        }
+      : readFromFd;
+
+    // Fresh cache per open: the paged file is an immutable snapshot from
+    // the engine's viewpoint (size pinned below).
+    const read = createChunkedReadCache(rawRead);
+
+    const instance = SqlJsModule.Database.openPaged!({
+      size: () => snapshotFileSizeBytes,
+      read
+    });
+    try {
+      // Close the stat/open race: a writer can create a frame-bearing WAL
+      // while openPaged is initializing even when the pre-open stat missed it.
+      assertNoSiblingWalFrames(fs, filePath);
+      const engine = new WasmDatabaseEngine(
+        instance,
+        config.queryTimeout,
+        // Paged snapshots are read-only regardless of the requested mode.
+        true,
+        logger,
+        {
+          idleTimeoutMs: config.cellReadSessionIdleTimeoutMs,
+          absoluteTimeoutMs: config.cellReadSessionAbsoluteTimeoutMs
+        },
+        {
+          fileSizeBytes: snapshotFileSizeBytes,
+          exactCountMaxFileBytes: resolvePagedExactCountMaxFileBytes(
+            config.pagedExactCountMaxFileBytes
+          ),
+          getReadError: () => pagedReadError,
+          dispose: () => closeFd('shutdown')
+        }
+      );
+      engineOwnsFd = true;
+      return { operations: engine, isReadOnly: true, storage: 'paged' };
+    } catch (engineError) {
+      try {
+        instance.close();
+      } catch {
+        // The construction error is the one that matters.
+      }
+      throw engineError;
+    }
+  } finally {
+    if (!engineOwnsFd) closeFd('failed open');
+  }
 }
 
 // ============================================================================
@@ -165,24 +445,21 @@ export async function createDatabaseEngine(
  */
 export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
   let activeEngine: WasmDatabaseEngine | null = null;
+  // Each caller receives its own result, but engine replacement itself is
+  // ordered. Without this tail, concurrent RPCs all observe activeEngine=null
+  // before their first await and every superseded paged engine leaks its fd.
+  let initializationTail: Promise<void> = Promise.resolve();
 
   function requireEngine(): WasmDatabaseEngine {
     if (!activeEngine) throw new Error('No database initialized');
     return activeEngine;
   }
 
-  return {
-    /**
-     * Initialize a database from binary content.
-     *
-     * @param filename - Display name for the database
-     * @param config - Initialization configuration
-     * @returns Database handle and read-only status
-     */
-    async initializeDatabase(
-      filename: string,
-      config: DatabaseInitConfig
-    ): Promise<DatabaseInitResult> {
+  async function initializeDatabase(
+    filename: string,
+    config: DatabaseInitConfig
+  ): Promise<DatabaseInitResult> {
+    const queued = initializationTail.then(async () => {
       // Shutdown existing engine if present. Clear the reference before the
       // await below: if createDatabaseEngine rejects (e.g. unreadable
       // filePath), requireEngine() must report "no database" instead of
@@ -195,12 +472,28 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       const result = await createDatabaseEngine(config, logger);
       activeEngine = result.operations as WasmDatabaseEngine;
 
-      // Return value is primarily used for isReadOnly flag.
+      // Return value is primarily used for the isReadOnly/storage flags.
       // The actual database operations are accessed via the worker endpoint methods below.
       return {
-        isReadOnly: result.isReadOnly
+        isReadOnly: result.isReadOnly,
+        storage: result.storage
       };
-    },
+    });
+    // A rejected initialization must not poison later queue entries.
+    initializationTail = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  return {
+    /**
+     * Initialize a database from binary content. Overlapping calls are
+     * serialized so every superseded engine is shut down before replacement.
+     *
+     * @param filename - Display name for the database
+     * @param config - Initialization configuration
+     * @returns Database handle and read-only status
+     */
+    initializeDatabase,
 
     /**
      * Execute a query on the active database.

@@ -52,6 +52,7 @@ import { Worker } from './platform/threadPool';
 import type { DatabaseConnectionBundle } from './connectionTypes';
 import { getMaximumFileSizeBytes, getQueryTimeout } from './config';
 import { createWorkerEndpoint } from './core/sqlite-db';
+import { WAL_HEADER_SIZE_BYTES } from './core/paged-open';
 import { createSharedCancellationFlag } from './core/cancellation-utils';
 
 // Native worker support (only in Node.js environment)
@@ -679,6 +680,11 @@ async function createWorkerBackedWasmDatabaseConnection(
       forceReadOnly?: boolean,
       autoCommit?: boolean
     ) {
+      // Over-limit local files used to hard-fail with this size error. They
+      // now attempt a page-on-demand read-only open in the worker; every
+      // fallback (stale vendored engine without openPaged, paged open
+      // failure) must land on exactly this error so nothing regresses.
+      let oversizedInMemoryMessage: string | undefined;
       try {
         // Read database file
         // Optimization: If running in Node and file is local, pass path to worker instead of reading content here
@@ -694,10 +700,9 @@ async function createWorkerBackedWasmDatabaseConnection(
             const maxSize = getMaximumFileSizeBytes();
             const fileStat = await vsc.workspace.fs.stat(fileUri);
             if (maxSize !== 0 && fileStat.size > maxSize) {
-               throw new Error(`File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
-            } else {
-               filePath = fileUri.fsPath;
+               oversizedInMemoryMessage = `File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`;
             }
+            filePath = fileUri.fsPath;
         } else {
             dbContent = await loadDatabaseFile(fileUri);
         }
@@ -710,6 +715,30 @@ async function createWorkerBackedWasmDatabaseConnection(
         // checkpoint leftovers — see WAL_HEADER_SIZE_BYTES).
         const walSize = await statWalSize(fileUri);
         const hasUncheckpointedWal = walSize > WAL_HEADER_SIZE_BYTES;
+        if (oversizedInMemoryMessage !== undefined && hasUncheckpointedWal) {
+          // Over the in-memory gate AND carrying (or possibly carrying) WAL
+          // frames: the file can neither buffer (over the gate) nor open
+          // page-on-demand (the snapshot reads only the main file and would
+          // miss the committed WAL transactions). Reject with the actionable
+          // checkpoint instruction instead of the bare size error.
+          //
+          // A WAL-at-rest HEADER (bytes 18/19 == 0x02) with no frame-bearing
+          // sibling is a different case and deliberately stays pageable: with
+          // this sibling gate clean there are no invisible frames, and the
+          // worker-side sniff in openPagedDatabaseEngine (core/sqlite-db.ts)
+          // presents such headers to the engine in pageable form.
+          //
+          // Deliberate final rejection: clear the size-error substitution so
+          // the catch below surfaces the checkpoint instruction itself.
+          oversizedInMemoryMessage = undefined;
+          throw new Error(
+            `${displayName} has uncheckpointed WAL data and exceeds the in-memory size limit for the `
+            + 'WebAssembly backend, so it cannot be opened: a page-on-demand snapshot reads only the '
+            + 'main database file and would miss the WAL transactions. Run '
+            + '"PRAGMA wal_checkpoint(TRUNCATE)" on the database (or close the program writing to '
+            + 'it), then reopen it.'
+          );
+        }
         if (hasUncheckpointedWal) {
           warnWalReadOnlyDowngrade(displayName);
         }
@@ -726,7 +755,13 @@ async function createWorkerBackedWasmDatabaseConnection(
           resourceMap: {},
           wasmBinary: wasmContent,
           readOnlyMode: (forceReadOnly ?? false) || hasUncheckpointedWal,
-          queryTimeout: getQueryTimeout()
+          queryTimeout: getQueryTimeout(),
+          // Desktop local files may fall back to a page-on-demand read-only
+          // open when they exceed maxSize (the worker re-stats and decides).
+          // The browser extension host never reaches this bundle, and paged
+          // mode is impossible there anyway: workspace.fs is async-only
+          // while the in-process engine needs synchronous reads.
+          allowPagedFallback: filePath !== undefined
         };
 
         // Initialize database in worker
@@ -743,6 +778,13 @@ async function createWorkerBackedWasmDatabaseConnection(
             displayName,
             new Transfer(initConfig, transferables) as unknown as DatabaseInitConfig
         );
+
+        // Mirror the WAL gate's surfacing: the webview only ever receives the
+        // bare read-only flag, so the reason is raised here (toast + output
+        // channel) when the worker chose the page-on-demand fallback.
+        if (result.storage === 'paged') {
+          warnPagedReadOnlyDowngrade(displayName);
+        }
 
         // Create operations facade that routes to worker
         // Transfer a private copy. postMessage detaches transfer-list buffers, while
@@ -943,6 +985,19 @@ async function createWorkerBackedWasmDatabaseConnection(
       } catch (err) {
         // Terminate worker on connection failure to prevent leak
         terminateWorker();
+        if (oversizedInMemoryMessage !== undefined) {
+          // The over-limit open failed after the paged fallback was offered
+          // (capability absent in the vendored engine, paged open error, or
+          // any later init failure). Before the fallback existed these files
+          // failed with exactly the size-gate message — keep that surface,
+          // with the real reason on the cause chain and in the log.
+          const reason = err instanceof Error ? err.message : String(err);
+          GlobalOutputChannel?.appendLine(
+            `[SQLite Explorer] ${displayName}: page-on-demand fallback did not engage (${reason}); `
+            + 'reporting the in-memory size limit.'
+          );
+          throw new Error(oversizedInMemoryMessage, { cause: err });
+        }
         throw err;
       }
     }
@@ -976,22 +1031,9 @@ async function loadDatabaseFile(uri: vsc.Uri): Promise<Uint8Array> {
   return vsc.workspace.fs.readFile(uri);
 }
 
-/**
- * Size of the SQLite write-ahead log header in bytes.
- *
- * A -wal file is a 32-byte header followed by frames of 24 + page_size bytes
- * each (page_size >= 512), so anything larger than the bare header holds at
- * least one (possibly torn) frame. Observed with sqlite3 3.51: a database
- * with uncheckpointed commits leaves a frame-bearing -wal (e.g. 12392 bytes
- * for 3 pages), `PRAGMA wal_checkpoint(TRUNCATE)` leaves a 0-byte file, and
- * macOS system SQLite keeps a persistent empty -wal after a clean close.
- * Sizes <= 32 therefore must NOT count as WAL data or every cleanly
- * checkpointed database on macOS would be forced read-only. A fully
- * backfilled but untruncated WAL keeps its size and still trips the gate;
- * that false positive degrades to read-only, the safe direction when frame
- * state cannot be inspected without a WAL-aware SQLite.
- */
-const WAL_HEADER_SIZE_BYTES = 32;
+// WAL_HEADER_SIZE_BYTES (frame-detection threshold for sibling -wal files,
+// with the full rationale) lives in ./core/paged-open so the engine-side
+// paged fallback shares the identical definition.
 
 /**
  * Measure the -wal file next to a database.
@@ -1043,6 +1085,27 @@ function warnWalReadOnlyDowngrade(displayName: string): void {
   // connection establishment.
   void vsc.window.showWarningMessage(vsc.l10n.t(
     '{0} has WAL changes the WebAssembly SQLite backend cannot read, so it is opened read-only and the data shown may be incomplete. Run "PRAGMA wal_checkpoint(TRUNCATE)" on the database (or close the program writing to it), then reopen it.',
+    displayName
+  ));
+}
+
+/**
+ * Surface the paged (page-on-demand) read-only downgrade to the user.
+ *
+ * Same pattern as the WAL gate above: the webview only receives the bare
+ * read-only flag, so the reason is raised here — once as a toast and once
+ * in the output channel — when an over-limit file opened as a paged
+ * read-only snapshot instead of failing outright.
+ */
+function warnPagedReadOnlyDowngrade(displayName: string): void {
+  GlobalOutputChannel?.appendLine(
+    `[SQLite Explorer] ${displayName}: file exceeds the in-memory size limit for the WebAssembly ` +
+    "backend ('sqliteExplorer.maxFileSize'), so it is opened page-on-demand as a read-only " +
+    'snapshot. Raise the limit (or set it to 0 for unlimited) to load the file into memory for editing.'
+  );
+  // Fire-and-forget, matching warnWalReadOnlyDowngrade.
+  void vsc.window.showWarningMessage(vsc.l10n.t(
+    '{0} exceeds the in-memory size limit for the WebAssembly SQLite backend, so it is opened page-on-demand as read-only. Raise "sqliteExplorer.maxFileSize" (or set it to 0 for unlimited) to load it into memory for editing.',
     displayName
   ));
 }

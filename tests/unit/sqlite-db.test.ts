@@ -111,6 +111,67 @@ describe('createDatabaseEngine file reading errors', () => {
       (engine as WasmDatabaseEngine).shutdown();
     }
   });
+
+  it('rechecks bytes read after stat and routes a grown file to paged storage', async () => {
+    const tempDir = nodeFs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-db-test-'));
+    const tempFile = path.join(tempDir, 'grew-after-stat.sqlite');
+    const seed = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+    try {
+      await seed.operations!.executeQuery(
+        "CREATE TABLE gate_probe (value TEXT); INSERT INTO gate_probe VALUES ('present')"
+      );
+      nodeFs.writeFileSync(tempFile, await seed.operations!.serializeDatabase());
+    } finally {
+      (seed.operations as WasmDatabaseEngine).shutdown();
+    }
+
+    const originalStat = nodeFs.promises.stat;
+    (nodeFs.promises as any).stat = async (candidate: nodeFs.PathLike, ...args: unknown[]) => {
+      const actual = await (originalStat as any)(candidate, ...args);
+      return String(candidate) === tempFile ? { ...actual, size: 1 } : actual;
+    };
+
+    let result: Awaited<ReturnType<typeof createDatabaseEngine>> | undefined;
+    try {
+      result = await createDatabaseEngine({
+        content: null,
+        filePath: tempFile,
+        maxSize: 1,
+        readOnlyMode: false,
+        allowPagedFallback: true
+      });
+      assert.strictEqual(result.storage, 'paged');
+      assert.strictEqual(result.isReadOnly, true);
+    } finally {
+      (nodeFs.promises as any).stat = originalStat;
+      (result?.operations as WasmDatabaseEngine | undefined)?.shutdown();
+      nodeFs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects provider content whose actual bytes exceed the advertised gate', async () => {
+    const seed = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+    let content: Uint8Array;
+    try {
+      await seed.operations!.executeQuery(
+        "CREATE TABLE provider_probe (value TEXT); INSERT INTO provider_probe VALUES ('present')"
+      );
+      content = await seed.operations!.serializeDatabase();
+    } finally {
+      (seed.operations as WasmDatabaseEngine).shutdown();
+    }
+    assert.ok(content!.byteLength > 1);
+
+    await assert.rejects(
+      createDatabaseEngine({
+        content: content!,
+        maxSize: 1,
+        readOnlyMode: false,
+        allowPagedFallback: false
+      }),
+      /file size \(\d+ bytes\) exceeds the maximum allowed size \(1 bytes\)/
+    );
+  });
 });
 
 describe('createWorkerEndpoint initializeDatabase failure', () => {

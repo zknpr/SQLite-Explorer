@@ -2354,7 +2354,8 @@ export async function createNativeDatabaseConnection(
             const contained = decodeCellContainment(
               normalized.rows,
               columns.length,
-              normalized.exactIntegerTexts
+              normalized.exactIntegerTexts,
+              queryOptions.maxPageResponseBytes
             );
             const { rows, oversizedCells, exactIntegerTexts } = contained;
 

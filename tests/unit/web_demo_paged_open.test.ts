@@ -256,7 +256,7 @@ function initConfig(extra: Record<string, unknown>): Record<string, unknown> {
 
 let plainDbBytes: Uint8Array;
 let walDbBytes: Uint8Array;
-/** 20000 rowids inserted, even ids deleted: COUNT 10000, max(rowid) 19999. */
+/** 20000 positive rowids inserted, even ids deleted: COUNT 10000, span 19999. */
 let gappyDbBytes: Uint8Array;
 
 before(async () => {
@@ -648,7 +648,7 @@ describe('web demo worker File opens', () => {
         assert.strictEqual(await harness.invoke('fetchTableCount', 'fixtures', {}), 10000);
     });
 
-    it('answers large paged unfiltered counts with the max(rowid) upper bound', async () => {
+    it('answers large paged unfiltered counts with the rowid-span upper bound', async () => {
         const harness = await createPagedHarness({ openPaged: 'working' });
         await harness.invoke(
             'initializeDatabase',
@@ -660,7 +660,7 @@ describe('web demo worker File opens', () => {
                 pagedExactCountMaxFileBytes: 0
             })
         );
-        // Exact count is 10000; the upper bound reports the last rowid.
+        // Exact count is 10000; min(rowid)=1 makes the span 19999.
         assert.strictEqual(await harness.invoke('fetchTableCount', 'fixtures', {}), 19999);
         // Filtered counts keep exact semantics (row-19999 uniquely matches).
         assert.strictEqual(

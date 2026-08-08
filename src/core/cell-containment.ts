@@ -14,6 +14,7 @@ import {
 
 export const DEFAULT_MAX_INLINE_CELL_BYTES = 1024 * 1024;
 export const DEFAULT_MAX_PAGE_RESPONSE_BYTES = 16 * 1024 * 1024;
+export const MIN_SQL_INLINE_CELL_BYTES = 256;
 export const DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES =
   2 * DEFAULT_MAX_PAGE_RESPONSE_BYTES;
 export const WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES = 40;
@@ -53,10 +54,9 @@ function positiveIntegerOr(value: unknown, fallback: number): number {
 }
 
 /**
- * Divide the page budget over every requested value slot, then apply the
- * configured per-cell ceiling. An omitted LIMIT retains legacy query behavior;
- * its per-cell cap still applies, but there is no claimed page cardinality to
- * divide across.
+ * Derive the speculative SQL-side preview window, but never let page shape
+ * alone pre-clip an ordinary value below 256 bytes. The shared decoder applies
+ * the actual returned-byte budget after the query, in deterministic row order.
  */
 export function deriveEffectiveInlineCellBytes(
   options: Pick<TableQueryOptions, 'limit' | 'maxInlineCellBytes' | 'maxPageResponseBytes'>,
@@ -78,7 +78,9 @@ export function deriveEffectiveInlineCellBytes(
   const rawPageWindow = Number.isSafeInteger(pageSlots)
     ? Math.floor(maxPageResponseBytes / pageSlots)
     : 0;
-  if (!Number.isSafeInteger(pageSlots)) return 0;
+  if (!Number.isSafeInteger(pageSlots)) {
+    return Math.min(maxInlineCellBytes, MIN_SQL_INLINE_CELL_BYTES);
+  }
 
   // Model the worst transported slot: a clipped BLOB becomes a Base64 marker
   // in rows and also gains a sparse oversizedCells entry. Round the remaining
@@ -100,7 +102,11 @@ export function deriveEffectiveInlineCellBytes(
   );
   const wirePageWindow = Math.floor(base64BytesPerSlot / 4) * 3;
 
-  return Math.min(maxInlineCellBytes, rawPageWindow, wirePageWindow);
+  const derivedPageWindow = Math.min(rawPageWindow, wirePageWindow);
+  return Math.min(
+    maxInlineCellBytes,
+    Math.max(MIN_SQL_INLINE_CELL_BYTES, derivedPageWindow)
+  );
 }
 
 function oversizedPredicate(column: string, byteLimit: number): string {
@@ -195,13 +201,123 @@ function parseMetadataToken(token: string, rowIndex: number, columnIndex: number
   };
 }
 
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xD800 && code <= 0xDBFF && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        bytes += 4;
+        index++;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function inlineCellByteLength(value: CellValue): number | undefined {
+  if (typeof value === 'string') return utf8ByteLength(value);
+  if (value instanceof Uint8Array) return value.byteLength;
+  return undefined;
+}
+
+function emptyInlinePreview(storageClass: 'text' | 'blob'): CellValue {
+  return storageClass === 'text' ? '' : new Uint8Array(0);
+}
+
+function encodedBase64Bytes(byteLength: number): number {
+  return 4 * Math.ceil(byteLength / 3);
+}
+
+/** Match the webview transport estimator for one already-decoded cell value. */
+function transportedCellWireBytes(value: CellValue): number {
+  if (value instanceof Uint8Array) {
+    return encodedBase64Bytes(value.byteLength) + WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES;
+  }
+  if (typeof value === 'string') return utf8ByteLength(value) + 2;
+  return 8;
+}
+
+function objectKeyWireBytes(key: string): number {
+  return utf8ByteLength(key) + 3;
+}
+
+function estimateRowsWireBytes(rows: readonly (readonly CellValue[])[]): number {
+  let bytes = 2 + Math.max(0, rows.length - 1);
+  for (const row of rows) {
+    bytes += 2 + Math.max(0, row.length - 1);
+    for (const value of row) bytes += transportedCellWireBytes(value);
+  }
+  return bytes;
+}
+
+function estimateOversizedCellsWireBytes(oversizedCells: OversizedCellMap | undefined): number {
+  if (!oversizedCells) return 0;
+  const rows = Object.entries(oversizedCells);
+  let bytes = 2 + Math.max(0, rows.length - 1);
+  for (const [rowIndex, row] of rows) {
+    bytes += objectKeyWireBytes(rowIndex);
+    const cells = Object.entries(row);
+    bytes += 2 + Math.max(0, cells.length - 1);
+    for (const [columnIndex] of cells) {
+      bytes += objectKeyWireBytes(columnIndex) + OVERSIZED_CELL_METADATA_VALUE_BYTES;
+    }
+  }
+  return bytes;
+}
+
+function estimateExactIntegerTextsWireBytes(exactIntegerTexts: ExactIntegerTextMap | undefined): number {
+  if (!exactIntegerTexts) return 0;
+  const rows = Object.entries(exactIntegerTexts);
+  let bytes = 2 + Math.max(0, rows.length - 1);
+  for (const [rowIndex, row] of rows) {
+    bytes += objectKeyWireBytes(rowIndex);
+    const cells = Object.entries(row);
+    bytes += 2 + Math.max(0, cells.length - 1);
+    for (const [columnIndex, exactText] of cells) {
+      bytes += objectKeyWireBytes(columnIndex) + utf8ByteLength(exactText) + 2;
+    }
+  }
+  return bytes;
+}
+
 /** Strip the private metadata column and return sparse, positionally exact sidecars. */
 export function decodeCellContainment(
   transportedRows: readonly (readonly unknown[])[],
   valueColumnCount: number,
-  exactIntegerTexts?: ExactIntegerTextMap
+  exactIntegerTexts?: ExactIntegerTextMap,
+  maxPageResponseBytes: number = DEFAULT_MAX_PAGE_RESPONSE_BYTES
 ): DecodedCellContainment {
+  const pageByteBudget = positiveIntegerOr(
+    maxPageResponseBytes,
+    DEFAULT_MAX_PAGE_RESPONSE_BYTES
+  );
   let oversizedCells: OversizedCellMap | undefined;
+  let inlineBytes = 0;
+  let pageBudgetExhausted = false;
+  const retainedInlineCells: Array<{
+    rowIndex: number;
+    columnIndex: number;
+    metadata: { storageClass: 'text' | 'blob'; byteLength: number };
+  }> = [];
+
+  const recordOversizedCell = (
+    rowIndex: number,
+    columnIndex: number,
+    metadata: { storageClass: 'text' | 'blob'; byteLength: number }
+  ): void => {
+    oversizedCells ??= {};
+    oversizedCells[rowIndex] ??= {};
+    oversizedCells[rowIndex][columnIndex] ??= metadata;
+  };
+
   const rows = transportedRows.map((row, rowIndex) => {
     if (row.length < valueColumnCount + 1) {
       throw new Error(
@@ -220,14 +336,33 @@ export function decodeCellContainment(
         `expected ${valueColumnCount}`
       );
     }
+    const values = Array.from(row.slice(0, valueColumnCount)) as CellValue[];
     tokens.forEach((token, columnIndex) => {
-      const metadata = parseMetadataToken(token, rowIndex, columnIndex);
-      if (!metadata) return;
-      oversizedCells ??= {};
-      oversizedCells[rowIndex] ??= {};
-      oversizedCells[rowIndex][columnIndex] = metadata;
+      const sqlMetadata = parseMetadataToken(token, rowIndex, columnIndex);
+      if (sqlMetadata) recordOversizedCell(rowIndex, columnIndex, sqlMetadata);
+
+      const value = values[columnIndex];
+      const byteLength = inlineCellByteLength(value);
+      if (byteLength === undefined || byteLength === 0) return;
+      const metadata = sqlMetadata ?? {
+        storageClass: typeof value === 'string' ? 'text' as const : 'blob' as const,
+        byteLength
+      };
+
+      if (
+        pageBudgetExhausted
+        || byteLength > pageByteBudget - inlineBytes
+      ) {
+        pageBudgetExhausted = true;
+        recordOversizedCell(rowIndex, columnIndex, metadata);
+        values[columnIndex] = emptyInlinePreview(metadata.storageClass);
+        return;
+      }
+
+      inlineBytes += byteLength;
+      retainedInlineCells.push({ rowIndex, columnIndex, metadata });
     });
-    return Array.from(row.slice(0, valueColumnCount)) as CellValue[];
+    return values;
   });
 
   let retainedExactIntegerTexts: ExactIntegerTextMap | undefined;
@@ -241,6 +376,52 @@ export function decodeCellContainment(
         retainedExactIntegerTexts[Number(rowIndexText)][columnIndex] = exactText;
       }
     }
+  }
+
+  // The page budget limits source bytes; this second bound models the actual
+  // Base64/string representation plus sparse sidecars. It is deliberately
+  // below the 32 MiB transport guard so headers and the RPC envelope retain
+  // fixed headroom. If needed, remove previews from the retained prefix's tail
+  // while preserving its earliest cells.
+  const aggregateBudget =
+    DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES - WEBVIEW_GRID_RESPONSE_HEADROOM_BYTES;
+  let aggregateBytes = estimateRowsWireBytes(rows)
+    + estimateOversizedCellsWireBytes(oversizedCells)
+    + estimateExactIntegerTextsWireBytes(retainedExactIntegerTexts);
+
+  const metadataInsertionBytes = (rowIndex: number, columnIndex: number): number => {
+    if (oversizedCells?.[rowIndex]?.[columnIndex]) return 0;
+    const columnBytes = objectKeyWireBytes(String(columnIndex))
+      + OVERSIZED_CELL_METADATA_VALUE_BYTES;
+    const existingRow = oversizedCells?.[rowIndex];
+    if (existingRow) return 1 + columnBytes;
+    const rowBytes = objectKeyWireBytes(String(rowIndex)) + 2 + columnBytes;
+    if (oversizedCells) return 1 + rowBytes;
+    return 2 + rowBytes;
+  };
+
+  for (
+    let index = retainedInlineCells.length - 1;
+    index >= 0 && aggregateBytes > aggregateBudget;
+    index--
+  ) {
+    const candidate = retainedInlineCells[index];
+    const currentValue = rows[candidate.rowIndex][candidate.columnIndex];
+    const emptyValue = emptyInlinePreview(candidate.metadata.storageClass);
+    const delta = transportedCellWireBytes(emptyValue)
+      - transportedCellWireBytes(currentValue)
+      + metadataInsertionBytes(candidate.rowIndex, candidate.columnIndex);
+    if (delta >= 0) continue;
+    recordOversizedCell(candidate.rowIndex, candidate.columnIndex, candidate.metadata);
+    rows[candidate.rowIndex][candidate.columnIndex] = emptyValue;
+    aggregateBytes += delta;
+  }
+
+  if (aggregateBytes > aggregateBudget) {
+    throw new Error(
+      `Cell containment cannot fit this page within the ` +
+      `${DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES}-byte transport limit`
+    );
   }
 
   return {
