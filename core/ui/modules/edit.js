@@ -27,6 +27,7 @@ import { BlobInspector } from './blob-inspector.js';
 import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
 import { revealGridCell } from './grid-reveal.js';
 import { resetMatchNav } from './match-nav.js';
+import { ensureGridRowMaterialized, scheduleVirtualGridUpdate } from './grid-render.js';
 
 let blobInspector;
 
@@ -72,6 +73,11 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
 
     const column = state.tableColumns[colIdx];
     if (!column) return;
+
+    // The target row may be outside the virtualized window (e.g. Tab from the
+    // page's last cell wraps to row 0 while scrolled to the bottom). Scroll it
+    // into the window first; no-op on fully rendered pages.
+    ensureGridRowMaterialized(rowIdx);
 
     // Find the cell element
     const cellEl = document.getElementById(`cell-${rowIdx}-${colIdx}`);
@@ -330,6 +336,10 @@ function cleanupCellEdit() {
         state.activeCellInput = null;
     }
     state.editingCellInfo = null;
+    // The virtualized window stays frozen while an inline edit is active so
+    // the <textarea> can't be rebuilt away; catch up now in case the user
+    // scrolled during the edit or a background commit replaced the page.
+    scheduleVirtualGridUpdate();
 }
 
 // ================================================================

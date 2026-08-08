@@ -602,13 +602,25 @@ Linear at **~0.12 ms/row** beyond 500, over ~20 ms of fixed overhead. For compar
 engine alone returns 10,000 wide rows (1.57 MB, 6 columns incl. BLOB) in **6.1 ms** and
 25,000 in 16.7 ms — so **over 90% of a page turn is IPC and DOM, not SQL**.
 
-The grid does not virtualize: `grid-render.js` builds DOM for every row in the page, at
-`<td>` → `<span class="cell-text">` → text node, i.e. **27 nodes per row** for 8 columns.
-That is the wall, and it is why the default page size cannot simply be raised: 500 rows is
-92 ms (about the edge of feeling instant), 1,000 is 157 ms, and 2,500 is visibly janky.
+The curve above is the PRE-virtualization baseline (kept as the fallback-path reference).
+Since 2026-08-08 the grid windows its rows: only the visible slice plus 20 overscan rows
+per side is materialized between two spacer rows, so render cost is proportional to the
+viewport (~38-58 rows regardless of page size; a 2500-row page renders ~59× fewer nodes
+than a full build). Pages within ~1.5 viewports still render fully — that path is the
+table above. Gate on both:
 
-Re-measure this curve if cell rendering, highlighting, or the transport changes. A
-regression here is felt on every single page turn.
+- a large page must materialize only the window (count `tbody tr:not(.virtual-spacer)`
+  and check the two spacer heights sum to `(rows − materialized) × 26px`);
+- scrolling must back-fill within a frame, zebra stripes must be a pure function of the
+  row ordinal across re-centers, and an inline edit must freeze the window only while its
+  editor is actually in the DOM (a leaked session must not blank the grid — regression
+  test in grid_virtualization.test.ts).
+
+Raising the default page size is now unblocked by rendering, gated only by transport and
+memory per page — measure before changing the default.
+
+Re-measure the full-render curve if cell rendering, highlighting, or the transport
+changes. A regression here is felt on every page turn of the small-page path.
 
 ---
 
