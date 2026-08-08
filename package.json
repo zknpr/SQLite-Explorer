@@ -28,8 +28,30 @@
     "vscode": "^1.110.0"
   },
   "categories": [
+    "Visualization",
+    "Data Science",
     "Other"
   ],
+  "keywords": [
+    "sqlite",
+    "sqlite3",
+    "sqlite viewer",
+    "sqlite editor",
+    "database",
+    "database viewer",
+    "database editor",
+    "db browser",
+    "sql",
+    "db",
+    "db3",
+    "gpkg",
+    "geopackage",
+    "data grid"
+  ],
+  "galleryBanner": {
+    "color": "#1b1f2a",
+    "theme": "dark"
+  },
   "main": "./out/extension.js",
   "browser": "./out/extension-browser.js",
   "extensionKind": [
