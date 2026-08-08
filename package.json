@@ -74,6 +74,9 @@
           },
           {
             "filenamePattern": "*.s3db"
+          },
+          {
+            "filenamePattern": "*.gpkg"
           }
         ]
       },
@@ -105,13 +108,6 @@
           "maximum": 100000,
           "default": 5000,
           "markdownDescription": "Default number of rows to display per page."
-        },
-        "sqliteExplorer.maxRows": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 10000000,
-          "default": 0,
-          "markdownDescription": "Maximum number of rows to load from a table. Set to 0 for unlimited."
         },
         "sqliteExplorer.instantCommit": {
           "type": "string",

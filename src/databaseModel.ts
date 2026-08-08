@@ -82,6 +82,8 @@ const DEFAULT_MAX_UNDO_MEMORY = 50 * 1024 * 1024;
 export function isAutoCommitEnabled(): boolean {
   const config = vsc.workspace.getConfiguration(ConfigurationSection);
   const setting = config.get<string>('instantCommit', 'never');
+  // Deliberately configuration-only: the settings modal is a boolean toggle
+  // for always/never and cannot represent the remote-only third state.
   return setting === 'always' || (setting === 'remote-only' && IsRemoteWorkspaceMode);
 }
 

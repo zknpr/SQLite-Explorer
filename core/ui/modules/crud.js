@@ -10,6 +10,11 @@ import { refreshSchema } from './sidebar.js';
 import { parseGridInputValue } from './utils.js';
 import { noteRowCountChanged, noteCellValuesChanged } from './count-cache.js';
 
+let isSubmittingAddRow = false;
+let isSubmittingDelete = false;
+let isSubmittingCreateTable = false;
+let isSubmittingAddColumn = false;
+
 export function initCrud() {
     // --- Toolbar Buttons ---
     document.getElementById('btnAddRow')?.addEventListener('click', openAddRowModal);
@@ -97,6 +102,16 @@ export function openAddRowModal() {
 }
 
 export async function submitAddRow() {
+    if (isSubmittingAddRow) return;
+    isSubmittingAddRow = true;
+    try {
+        return await submitAddRowOnce();
+    } finally {
+        isSubmittingAddRow = false;
+    }
+}
+
+async function submitAddRowOnce() {
     const inputs = document.querySelectorAll('#addRowForm input[data-column]:not([disabled])');
     const missingRequired = [];
 
@@ -182,6 +197,16 @@ export function openDeleteModal() {
 }
 
 export async function submitDelete() {
+    if (isSubmittingDelete) return;
+    isSubmittingDelete = true;
+    try {
+        return await submitDeleteOnce();
+    } finally {
+        isSubmittingDelete = false;
+    }
+}
+
+async function submitDeleteOnce() {
     // The confirmation modal can already be open when a replacement load
     // starts. Never apply its stale row/column selection to the incoming grid.
     if (state.isGridReloading) return;
@@ -369,6 +394,16 @@ export function removeColumnDefinition(colId) {
 }
 
 export async function submitCreateTable() {
+    if (isSubmittingCreateTable) return;
+    isSubmittingCreateTable = true;
+    try {
+        return await submitCreateTableOnce();
+    } finally {
+        isSubmittingCreateTable = false;
+    }
+}
+
+async function submitCreateTableOnce() {
     const tableName = document.getElementById('newTableName').value.trim();
 
     if (!tableName) {
@@ -434,6 +469,16 @@ export function openAddColumnModal() {
 }
 
 export async function submitAddColumn() {
+    if (isSubmittingAddColumn) return;
+    isSubmittingAddColumn = true;
+    try {
+        return await submitAddColumnOnce();
+    } finally {
+        isSubmittingAddColumn = false;
+    }
+}
+
+async function submitAddColumnOnce() {
     const columnName = document.getElementById('newColumnName').value.trim();
     const columnType = document.getElementById('newColumnType').value;
     const defaultValue = document.getElementById('newColumnDefault').value.trim();

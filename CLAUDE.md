@@ -359,7 +359,6 @@ Settings in `package.json` → `contributes.configuration`:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `sqliteExplorer.maxFileSize` | 200 | Max file size in MB (0 = unlimited) |
-| `sqliteExplorer.maxRows` | 0 | Max rows to display (0 = unlimited) |
 | `sqliteExplorer.defaultPageSize` | 5000 | Default page size for pagination |
 | `sqliteExplorer.instantCommit` | "never" | Auto-save strategy (always/never/remote-only) |
 | `sqliteExplorer.doubleClickBehavior` | "inline" | Double-click action (inline/modal/vscode) |

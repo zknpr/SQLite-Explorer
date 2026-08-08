@@ -175,7 +175,6 @@ export function persistState() {
             sidebarFilter: state.sidebarFilter,
             scrollPosition: state.scrollPosition,
             dateFormat: state.dateFormat,
-            cellEditBehavior: state.cellEditBehavior,
         });
     }, 500);
 }

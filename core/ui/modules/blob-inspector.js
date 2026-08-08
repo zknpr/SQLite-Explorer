@@ -10,6 +10,7 @@ import {
 } from './data-utils.js';
 import { updateStatus } from './ui.js';
 import { noteCellValuesChanged } from './count-cache.js';
+import { registerModalCloseHandler } from './modals.js';
 
 
 const FILE_SIGNATURES = {
@@ -80,6 +81,7 @@ export class BlobInspector {
         this.isUploading = false;
 
         this.setupEventListeners();
+        registerModalCloseHandler('blob-inspector-modal', () => this.cleanup());
     }
 
     setupEventListeners() {
@@ -337,6 +339,10 @@ export class BlobInspector {
         this.hexContainer.value = '';
         this.infoContainer.textContent = '';
         this.currentData = null;
+        this.currentType = null;
+        this.currentRowId = null;
+        this.currentColName = null;
+        this.currentCellInfo = null;
     }
 
     switchTab(tabId) {

@@ -365,7 +365,7 @@ For each of CSV, Excel (CSV + BOM), and SQL:
 ## 14. Settings, pragmas and state
 
 1. Every setting takes effect without a reload where it claims to: `maxFileSize`,
-   `defaultPageSize`, `maxRows`, `instantCommit`, `doubleClickBehavior`, `fileOperations`,
+   `defaultPageSize`, `instantCommit`, `doubleClickBehavior`, `fileOperations`,
    `queryTimeout`, `maxInlineCellBytes`, `maxUndoMemory`.
 2. `fileOperations: web` forces the WASM path on desktop — an easy way to exercise the
    fallback engine. **[unverified]**

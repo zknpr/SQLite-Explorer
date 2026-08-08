@@ -30,6 +30,7 @@ import { resetMatchNav } from './match-nav.js';
 import { ensureGridRowMaterialized, scheduleVirtualGridUpdate } from './grid-render.js';
 
 let blobInspector;
+let isSavingCellPreview = false;
 
 export function initEdit() {
     blobInspector = new BlobInspector();
@@ -565,6 +566,16 @@ export function closeCellPreview() {
 }
 
 export async function saveCellPreview() {
+    if (isSavingCellPreview) return;
+    isSavingCellPreview = true;
+    try {
+        return await saveCellPreviewOnce();
+    } finally {
+        isSavingCellPreview = false;
+    }
+}
+
+async function saveCellPreviewOnce() {
     if (state.isReadOnly) {
         updateStatus('Document is read-only');
         return;

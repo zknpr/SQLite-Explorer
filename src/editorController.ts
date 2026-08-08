@@ -52,7 +52,6 @@ type VSCODE_ENV = {
   remoteWorkspace?: BoolString,
   cellEditBehavior?: string,
   defaultPageSize?: string,
-  maxRows?: string,
 };
 
 /**
@@ -292,7 +291,6 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     // Fallback must match the declared package.json default (5000) so a host
     // that fails to register the configuration still reports the real default.
     const defaultPageSize = config.get<number>('defaultPageSize', 5000);
-    const maxRows = config.get<number>('maxRows', 0);
 
     // Build environment data for webview
     const vscodeEnv = {
@@ -310,7 +308,6 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       remoteWorkspace: toBoolString(IsRemoteWorkspaceMode),
       cellEditBehavior: document.cellEditBehavior,
       defaultPageSize: defaultPageSize.toString(),
-      maxRows: maxRows.toString(),
     } satisfies VSCODE_ENV;
 
     // Replace placeholders in HTML template

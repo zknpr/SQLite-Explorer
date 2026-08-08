@@ -381,6 +381,9 @@ export const backendApi = {
     initialize: () => sendRpcRequest('initialize', []),
     exportDb: (filename) => sendRpcRequest('exportDb', [filename]),
     refreshFile: () => sendRpcRequest('refreshFile', []),
+    // The standalone demo has no VS Code globalState; keep the shared resize
+    // lifecycle callable without pretending the width persists outside it.
+    saveSidebarState: async () => undefined,
     fireEditEvent: (edit) => sendRpcRequest('fireEditEvent', [edit]),
     exportTable: (dbParams, columns, dbOptions, tableStore, exportOptions, extras) =>
         sendRpcRequest('exportTable', [dbParams, columns, dbOptions, tableStore, exportOptions, extras]),

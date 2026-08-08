@@ -1207,12 +1207,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             }
             break;
 
-        case 'table_drop':
-            if (strict) {
-                throw new Error('Cannot apply table_drop: forward replay is not supported');
-            }
-            break;
-
         case 'view_create':
             if (mod.viewDefAfter) {
                 await this.applyViewHistoryState(targetTable, null, mod.viewDefAfter);

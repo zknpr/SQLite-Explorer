@@ -2,6 +2,7 @@
  * UI Helper Functions
  */
 import { state } from './state.js';
+import { backendApi } from './api.js';
 import { escapeHtml } from './utils.js';
 
 export function updateStatus(message) {
@@ -76,7 +77,21 @@ export function initSidebarResize() {
 
     if (!sidebar || !handle) return;
 
+    const normalizeWidth = value => {
+        const width = Number(value);
+        return Number.isFinite(width)
+            ? Math.max(150, Math.min(400, width))
+            : undefined;
+    };
+    const persistedWidth = normalizeWidth(
+        document.getElementById('vscode-env')?.dataset.sidebarLeft
+    );
+    if (persistedWidth !== undefined) {
+        sidebar.style.width = persistedWidth + 'px';
+    }
+
     let isResizing = false;
+    let resizedWidth = persistedWidth;
 
     handle.addEventListener('mousedown', e => {
         isResizing = true;
@@ -86,14 +101,23 @@ export function initSidebarResize() {
 
     document.addEventListener('mousemove', e => {
         if (!isResizing) return;
-        const newWidth = Math.max(150, Math.min(400, e.clientX));
-        sidebar.style.width = newWidth + 'px';
+        resizedWidth = normalizeWidth(e.clientX);
+        if (resizedWidth !== undefined) {
+            sidebar.style.width = resizedWidth + 'px';
+        }
     });
 
-    document.addEventListener('mouseup', () => {
+    document.addEventListener('mouseup', async () => {
         if (isResizing) {
             isResizing = false;
             document.body.style.cursor = '';
+            if (resizedWidth === undefined) return;
+            try {
+                await backendApi.saveSidebarState('left', resizedWidth);
+            } catch (err) {
+                console.error('Failed to persist sidebar width:', err);
+                updateStatus(`Failed to persist sidebar width: ${err.message}`);
+            }
         }
     });
 }

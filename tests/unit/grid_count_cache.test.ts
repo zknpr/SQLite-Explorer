@@ -252,7 +252,7 @@ describe('grid count cache', () => {
         }
     });
 
-    it('adjusts the unfiltered count for inserts and deletes without a refetch', async () => {
+    it('adjusts the unfiltered count without refetching or double-counting duplicate inserts', async () => {
         installDocumentMock();
         const { state, backendApi, loadTableData } = await loadHarness();
         const crudModulePath = '../../core/ui/modules/crud.js';
@@ -286,7 +286,9 @@ describe('grid count cache', () => {
             assert.strictEqual(state.totalPageCount, 3); // ceil(58 / 20)
 
             // Insert through the real crud path (+1, still no fetch).
-            await submitAddRow();
+            const insert = submitAddRow();
+            const duplicateInsert = submitAddRow();
+            await Promise.all([insert, duplicateInsert]);
             assert.strictEqual(inserted, 1);
             assert.strictEqual(countCalls.length, 1);
             assert.strictEqual(state.totalRecordCount, 59);

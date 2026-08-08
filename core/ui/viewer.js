@@ -122,7 +122,6 @@ async function restoreSavedState() {
         state.columnFilters = savedState.columnFilters || {};
         state.sidebarFilter = savedState.sidebarFilter || '';
         state.dateFormat = savedState.dateFormat || 'raw';
-        state.cellEditBehavior = savedState.cellEditBehavior || 'inline';
 
         // Restore Set-based state (serialized as arrays)
         state.pinnedColumns = new Set(savedState.pinnedColumns || []);

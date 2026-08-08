@@ -13,7 +13,7 @@ import type { DatabaseEditorProvider, DatabaseViewerProvider } from './editorCon
 import { ConfigurationSection, ExtensionId, getMaxInlineCellBytes, SidebarLeft, SidebarRight, UriScheme } from './config';
 import { IsCursorIDE } from './helpers';
 
-import type { DatabaseDocument, DocumentModification } from './databaseModel';
+import type { DatabaseDocument } from './databaseModel';
 import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, WebviewQueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity } from './core/types';
 import { prepareCellUpdateForStorage } from './core/json-utils';
 import {
@@ -27,6 +27,7 @@ import {
 import { escapeIdentifier, validateRowId, validateRowIds } from './core/sql-utils';
 import { isViewDefinitionConflictError } from './core/view-utils';
 import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './core/cell-containment';
+import { assertDocumentModification } from './core/modification-validation';
 import type { CellMaterializationService } from './cellMaterialization';
 import {
   assertCellValueWithinEditLimit,
@@ -1065,7 +1066,11 @@ export class HostBridge implements ToastService {
    *
    * @param edit - The edit operation that was performed
    */
-  async fireEditEvent(edit: DocumentModification) {
+  async fireEditEvent(edit: unknown) {
+    if (this.isReadOnly) {
+      throw new Error('Document is read-only');
+    }
+    assertDocumentModification(edit);
     this.document.recordExternalModification(edit);
   }
 

@@ -347,7 +347,6 @@ export default function DemoClient() {
           messageId,
           success: true,
           data: {
-            maxRows: 0,
             defaultPageSize: 5000,
             instantCommit: 'never',
             doubleClickBehavior: 'inline'

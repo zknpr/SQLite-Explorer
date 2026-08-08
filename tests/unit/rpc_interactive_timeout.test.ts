@@ -2,6 +2,8 @@ import './vscode_mock_setup';
 
 import { after, it } from 'node:test';
 import assert from 'node:assert';
+import { readFileSync } from 'node:fs';
+import ts from 'typescript';
 
 const extensionMessages: any[] = [];
 const webMessages: any[] = [];
@@ -49,8 +51,14 @@ it('keeps host-modal RPCs alive until their response in both transports', async 
             'deleteColumns',
             'editView',
             'dropView',
+            'updateCell',
+            'updateCellBatch',
             'confirmLargeChanges',
             'confirmLargeSelection',
+            'openCellEditor',
+            'prepareCellMediaPreview',
+            'exportDb',
+            'refreshFile',
             'saveFile',
             'selectFile',
             'exportTable',
@@ -104,6 +112,51 @@ it('keeps host-modal RPCs alive until their response in both transports', async 
     } finally {
         globalThis.setTimeout = originalSetTimeout;
         globalThis.clearTimeout = originalClearTimeout;
+    }
+});
+
+it('keeps every HostBridge method that opens a modal unbounded', async () => {
+    const sharedModulePath = '../../core/ui/modules/rpc-constants.js';
+    const shared = await import(sharedModulePath);
+    const hostBridgeSource = readFileSync(
+        new URL('../../src/hostBridge.ts', import.meta.url),
+        'utf8'
+    );
+    const sourceFile = ts.createSourceFile(
+        'hostBridge.ts',
+        hostBridgeSource,
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TS
+    );
+    const hostBridgeClass = sourceFile.statements.find(
+        statement => ts.isClassDeclaration(statement) && statement.name?.text === 'HostBridge'
+    );
+    assert.ok(hostBridgeClass && ts.isClassDeclaration(hostBridgeClass));
+
+    const modalMethods = hostBridgeClass.members
+        .filter(ts.isMethodDeclaration)
+        .filter(method => {
+            let opensModal = false;
+            const visit = (node: ts.Node) => {
+                if (
+                    ts.isPropertyAssignment(node)
+                    && node.name.getText(sourceFile) === 'modal'
+                    && node.initializer.kind === ts.SyntaxKind.TrueKeyword
+                ) {
+                    opensModal = true;
+                    return;
+                }
+                ts.forEachChild(node, visit);
+            };
+            visit(method);
+            return opensModal;
+        })
+        .map(method => method.name.getText(sourceFile));
+
+    assert.ok(modalMethods.length > 0, 'HostBridge modal-method audit unexpectedly found no methods');
+    for (const method of modalMethods) {
+        assert.strictEqual(shared.getRpcTimeoutMs(method), undefined, method);
     }
 });
 

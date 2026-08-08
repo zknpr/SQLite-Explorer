@@ -286,7 +286,6 @@ export type ModificationType =
   | 'table_create'
   | 'column_add'
   | 'column_drop'
-  | 'table_drop'
   | 'view_create'
   | 'view_edit'
   | 'view_drop';

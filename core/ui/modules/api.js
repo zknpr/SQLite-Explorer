@@ -332,6 +332,7 @@ export const backendApi = {
     initialize: () => sendRpcRequest('initialize', []),
     exportDb: (filename) => sendRpcRequest('exportDb', [filename]),
     refreshFile: () => sendRpcRequest('refreshFile', []),
+    saveSidebarState: (side, position) => sendRpcRequest('saveSidebarState', [side, position]),
     fireEditEvent: (edit) => sendRpcRequest('fireEditEvent', [edit]),
     exportTable: (dbParams, columns, dbOptions, tableStore, exportOptions, extras) => sendRpcRequest('exportTable', [dbParams, columns, dbOptions, tableStore, exportOptions, extras]),
 

@@ -694,6 +694,89 @@ describe('HostBridge', () => {
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
+    it('rejects fireEditEvent for a read-only document without recording history', async () => {
+        const recordExternalModification = mock.fn();
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            {
+                isReadOnlyMode: true,
+                recordExternalModification
+            } as any
+        );
+
+        await assert.rejects(
+            () => bridge.fireEditEvent({
+                label: 'Edit Cell',
+                description: 'Update items.name',
+                modificationType: 'cell_update',
+                targetTable: 'items',
+                targetRowId: 1,
+                targetColumn: 'name',
+                priorValue: 'before',
+                newValue: 'after'
+            }),
+            /Document is read-only/
+        );
+        assert.strictEqual(recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('rejects malformed fireEditEvent entries without recording history', async () => {
+        const recordExternalModification = mock.fn();
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            {
+                isReadOnlyMode: false,
+                recordExternalModification
+            } as any
+        );
+
+        await assert.rejects(
+            () => bridge.fireEditEvent({
+                label: 'Forged Edit',
+                description: 'Unknown history entry',
+                modificationType: 'arbitrary_write',
+                targetTable: 'items'
+            } as any),
+            /Invalid document modification/
+        );
+        await assert.rejects(
+            () => bridge.fireEditEvent({
+                label: 'Malformed Delete',
+                description: 'Missing row snapshots',
+                modificationType: 'row_delete',
+                targetTable: 'items'
+            } as any),
+            /Invalid document modification/
+        );
+        assert.strictEqual(recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('records a structurally valid fireEditEvent on a writable document', async () => {
+        const recordExternalModification = mock.fn();
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            {
+                isReadOnlyMode: false,
+                recordExternalModification
+            } as any
+        );
+        const edit = {
+            label: 'Edit Cell',
+            description: 'Update items.name',
+            modificationType: 'cell_update' as const,
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'name',
+            priorValue: 'before',
+            newValue: 'after'
+        };
+
+        await bridge.fireEditEvent(edit);
+
+        assert.strictEqual(recordExternalModification.mock.callCount(), 1);
+        assert.strictEqual(recordExternalModification.mock.calls[0].arguments[0], edit);
+    });
+
     it('does not record a created view after Reload supersedes its connection', async () => {
         const definition = {
             identifier: 'created_view',

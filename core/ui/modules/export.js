@@ -7,6 +7,8 @@ import { updateStatus } from './ui.js';
 import { openModal, closeModal } from './modals.js';
 import { escapeHtml } from './utils.js';
 
+let isSubmittingExport = false;
+
 export function initExport() {
     document.getElementById('btnExport')?.addEventListener('click', openExportModal);
     document.getElementById('btnSubmitExport')?.addEventListener('click', submitExport);
@@ -113,6 +115,16 @@ export function onExportFormatChange() {
 }
 
 export async function submitExport() {
+    if (isSubmittingExport) return;
+    isSubmittingExport = true;
+    try {
+        return await submitExportOnce();
+    } finally {
+        isSubmittingExport = false;
+    }
+}
+
+async function submitExportOnce() {
     const format = document.getElementById('exportFormat').value;
     const colChecks = document.querySelectorAll('.export-col-check:checked');
     const columns = Array.from(colChecks).map(c => c.value);
