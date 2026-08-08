@@ -10,7 +10,7 @@ const require = createRequire(import.meta.url);
 const vendoredDirectory = path.resolve(process.cwd(), 'vendor/sql.js');
 const vendoredGlue = path.join(vendoredDirectory, 'sql-wasm.js');
 const vendoredWasm = path.join(vendoredDirectory, 'sql-wasm.wasm');
-const PATCHED_WASM_SHA256 = '502af596fbe684d766531d298e105cfb898111b9b363ab490c2e400caab9e72a';
+const PATCHED_WASM_SHA256 = 'a99d3385b30415a99475fdeb6251a89127a3b4c4260604d811e5c91b4e9dc231';
 
 describe('vendored sql.js', () => {
   it('provides the patched preemption APIs', async () => {

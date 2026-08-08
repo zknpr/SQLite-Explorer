@@ -22,9 +22,9 @@ import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from '../../src/core/webview-transport
  * Decision-ladder coverage for the web demo's paged-vs-buffer database
  * opens: the pure routing module, and the worker's File-handle open path
  * driven end-to-end with stub File/FileReaderSync plumbing. The vendored
- * sql.js build has no Database.openPaged, which makes it the natural
- * fixture for the capability-absent fallback leg; the paged legs run
- * against the same real engine with an openPaged stub layered on top.
+ * sql.js build is the real engine for every leg; the capability-absent
+ * leg masks openPaged explicitly (pin-proof either way), and the paged
+ * legs run with an openPaged stub layered on top.
  */
 
 const authoredWorkerPath = path.resolve(
@@ -125,7 +125,21 @@ async function createPagedHarness(options: {
     const workerGlobal: any = {
         initSqlJs: async (config: any) => {
             const sqlJs = await initSqlJs(config);
-            if (capability === 'absent') return sqlJs;
+            if (capability === 'absent') {
+                // Mask the capability explicitly instead of relying on the
+                // vendored build lacking it: once the fork artifacts are
+                // pinned, the real engine DOES carry openPaged, and this leg
+                // must keep testing the absent-capability fallback. A plain
+                // constructor function does not inherit the original class's
+                // static properties, so openPaged is genuinely absent here.
+                const BufferOnlyDatabase: any = function BufferOnlyDatabase(
+                    ...args: any[]
+                ) {
+                    return Reflect.construct(sqlJs.Database, args, BufferOnlyDatabase);
+                };
+                BufferOnlyDatabase.prototype = sqlJs.Database.prototype;
+                return { ...sqlJs, Database: BufferOnlyDatabase };
+            }
             // The real vendored Database class, with the fork's openPaged
             // surface stubbed on top: pull every byte through hostIo in
             // 4096-byte reads (short read terminates, like EOF), open a

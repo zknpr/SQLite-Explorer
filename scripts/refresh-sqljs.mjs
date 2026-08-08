@@ -25,10 +25,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPOSITORY = 'zknpr/sql.js';
-const RUN_ID = 30927681896;
+const RUN_ID = 31250407828;
 const PINNED_SHA256 = Object.freeze({
-  'sql-wasm.js': '2aecb44ff78f72609a2aac7b9a182b095b739bbd635c276f1988703d97149ba9',
-  'sql-wasm.wasm': '502af596fbe684d766531d298e105cfb898111b9b363ab490c2e400caab9e72a'
+  'sql-wasm.js': '30df84f792be9c294db6c5dde68b377f4d76d258c0ee954fd14a0f4ef60687b6',
+  'sql-wasm.wasm': 'a99d3385b30415a99475fdeb6251a89127a3b4c4260604d811e5c91b4e9dc231'
 });
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
