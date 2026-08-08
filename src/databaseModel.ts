@@ -48,6 +48,20 @@ export interface DocumentContentChange {
   readonly invalidateAllViewDocuments?: boolean;
 }
 
+/**
+ * Narrow state exposed only through the non-production desktop test API.
+ * It observes lifecycle decisions without giving tests an alternate mutation path.
+ */
+export interface DesktopTestDocumentState {
+  referenceCount: number;
+  engineKind: 'native' | 'wasm';
+  storage: 'native' | 'memory' | 'paged';
+  readOnly: boolean;
+  dirty: boolean;
+  workerDisposeRequested: boolean;
+  resolvedEditorCount: number;
+}
+
 // ============================================================================
 // Environment Detection
 // ============================================================================
@@ -235,6 +249,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   readonly #forceReadOnlyOnReconnect: boolean;
   #connectionGeneration = 0;
   #referenceCount = 1;
+  #workerDisposeRequested = false;
 
   private constructor(
     readonly viewerProvider: DatabaseViewerProvider,
@@ -304,6 +319,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       DocumentRegistry.delete(key);
     }
     this.workerMethods[Symbol.dispose]();
+    this.#workerDisposeRequested = true;
     // Consumers must see disposal before the registered emitter itself is
     // disposed by the base class, otherwise their cleanup callbacks never run.
     this.#disposeEmitter.fire();
@@ -700,6 +716,22 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
   get isReadOnlyMode(): boolean {
     return this.connectionState.isReadOnly ?? false;
+  }
+
+  /** Snapshot for the non-production desktop host-integration API. */
+  async getDesktopTestState(): Promise<DesktopTestDocumentState> {
+    const engineKind = await this.databaseOperations.engineKind;
+    return {
+      referenceCount: this.#referenceCount,
+      engineKind,
+      storage: engineKind === 'native'
+        ? 'native'
+        : this.connectionState.storage ?? 'memory',
+      readOnly: this.isReadOnlyMode,
+      dirty: this.#modificationTracker.hasUncommittedChanges(),
+      workerDisposeRequested: this.#workerDisposeRequested,
+      resolvedEditorCount: Array.from(this.viewerProvider.webviews.get(this.uri)).length
+    };
   }
 
   get cellEditBehavior(): string {

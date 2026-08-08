@@ -62,6 +62,17 @@ let nativeSupport: {
   createNativeDatabaseConnection: typeof import('./nativeWorker').createNativeDatabaseConnection;
 } | null = null;
 
+type DesktopTestBackend = 'native' | 'wasm';
+let desktopTestBackend: DesktopTestBackend | undefined;
+
+/** Set only by the non-production integration API; normal backend selection is unchanged. */
+export function setDesktopTestDatabaseBackend(backend: DesktopTestBackend | undefined): void {
+  if (backend !== undefined && backend !== 'native' && backend !== 'wasm') {
+    throw new Error(`Unsupported desktop test backend: ${String(backend)}`);
+  }
+  desktopTestBackend = backend;
+}
+
 // Dynamically import native worker in Node.js environment
 if (!import.meta.env?.VSCODE_BROWSER_EXT) {
   try {
@@ -338,6 +349,11 @@ export async function createDatabaseConnection(
   extensionUri: vsc.Uri,
   _reporter?: TelemetryReporter
 ): Promise<DatabaseConnectionBundle> {
+  if (desktopTestBackend === 'wasm') {
+    GlobalOutputChannel?.appendLine('[DesktopTest] Forcing WebAssembly SQLite backend');
+    return createWasmDatabaseConnection(extensionUri, _reporter);
+  }
+
   // Try native SQLite first (desktop Node.js only)
   if (!import.meta.env?.VSCODE_BROWSER_EXT && nativeSupport) {
     const extensionPath = extensionUri.fsPath;
@@ -354,7 +370,9 @@ export async function createDatabaseConnection(
         // Wrap the native bundle to provide fallback to WASM if file open fails
         // This handles cases where native SQLite can't access a specific file
         // (e.g., macOS sandboxing, permission issues, file locked)
-        const wasmBundlePromise = createWasmDatabaseConnection(extensionUri, _reporter);
+        const wasmBundlePromise = desktopTestBackend === 'native'
+          ? undefined
+          : createWasmDatabaseConnection(extensionUri, _reporter);
         let wasmBundle: DatabaseConnectionBundle | null = null;
 
         return {
@@ -364,19 +382,28 @@ export async function createDatabaseConnection(
               // Try native first
               return await nativeBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
             } catch (nativeErr) {
+              if (desktopTestBackend === 'native') {
+                nativeBundle.workerMethods[Symbol.dispose]();
+                throw nativeErr;
+              }
               // Native failed - fall back to WASM
               GlobalOutputChannel?.appendLine(`[SQLite Explorer] Native file open failed, falling back to WASM: ${nativeErr instanceof Error ? nativeErr.message : String(nativeErr)}`);
               if (!wasmBundle) {
-                wasmBundle = await wasmBundlePromise;
+                wasmBundle = await wasmBundlePromise!;
               }
               return wasmBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
             }
           }
         };
       } catch (err) {
+        if (desktopTestBackend === 'native') throw err;
         GlobalOutputChannel?.appendLine(`[SQLite Explorer] Native SQLite failed, falling back to WASM: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+  }
+
+  if (desktopTestBackend === 'native') {
+    throw new Error('Native SQLite backend is unavailable on this platform');
   }
 
   // Fall back to WASM (sql.js)

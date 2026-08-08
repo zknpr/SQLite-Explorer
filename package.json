@@ -180,14 +180,18 @@
     "package": "npm run build && npx vsce package",
     "package-all": "npm run build && npx vsce package",
     "test": "npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts",
+    "compile:desktop-tests": "rm -rf .desktop-test-out && tsc -p tsconfig.desktop.json",
+    "test:desktop": "npm run compile:desktop-tests && node scripts/run-desktop-tests.mjs",
     "test:native-smoke": "node --import tsx --test tests/unit/native_real_smoke.test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
     "@types/vscode": "=1.110.0",
+    "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.1",
     "esbuild-plugin-polyfill-node": "^0.3.0",
+    "mocha": "^11.7.5",
     "ts-node": "^10.9.2",
     "tsx": "^4.23.1",
     "typescript": "^6.0.3"

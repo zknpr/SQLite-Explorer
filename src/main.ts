@@ -7,6 +7,7 @@ import type { DbParams, ExportOptions } from './core/types';
 import { registerEditorProvider } from './editorController';
 import { SQLiteFileSystemProvider } from './virtualFileSystem';
 import { CellMaterializationService } from './cellMaterialization';
+import { createDesktopTestApi, type DesktopTestApi } from './desktopTestApi';
 
 export let GlobalOutputChannel: vsc.OutputChannel|null = null;
 
@@ -22,7 +23,9 @@ export function deactivate(): void {
  * Extension activation entry point.
  * Registers custom editors for SQLite files and sets up commands.
  */
-export async function activate(context: vsc.ExtensionContext) {
+export async function activate(
+  context: vsc.ExtensionContext
+): Promise<{ desktopTest: DesktopTestApi } | undefined> {
   // Only create TelemetryReporter if connection string is provided.
   // An empty string causes the reporter to throw errors on every event.
   let reporter: TelemetryReporter | undefined;
@@ -61,6 +64,16 @@ export async function activate(context: vsc.ExtensionContext) {
   const currVersion = vsc.extensions.getExtension(FullExtensionId)?.packageJSON?.version as string;
   if (currVersion) {
     context.globalState.update(FullExtensionId, currVersion);
+  }
+
+  // Extension-host integration tests cannot share bundled module state by
+  // importing src/. Expose the narrow controller only in non-production
+  // development/test hosts; marketplace and VSIX installations export nothing.
+  if (context.extensionMode === vsc.ExtensionMode.Development
+    || context.extensionMode === vsc.ExtensionMode.Test) {
+    const desktopTest = createDesktopTestApi(context);
+    context.subscriptions.push(desktopTest);
+    return { desktopTest };
   }
 }
 

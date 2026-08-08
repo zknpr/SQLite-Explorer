@@ -4,6 +4,8 @@ node_modules/
 # Build outputs
 out/
 assets/
+.desktop-test-out/
+.vscode-test/
 *.vsix
 
 # Temporary files

@@ -92,7 +92,13 @@ testing nothing.
 2. `npm run test:native-smoke` — zero failures. Spawns the **real bundled txiki binary**;
    the only automated lane that catches native-only regressions. It caught an int64
    rounding regression during a binary swap that every mocked test passed.
-3. Large-cell containment lane, if cell bounding, exports, blob handling or webview
+3. `npm run test:desktop` — run locally after `node scripts/build.mjs` for every release
+   candidate and whenever custom-document lifecycle, persistence, virtual files, exports,
+   or backend selection changes. It downloads/caches the `engines.vscode` version and runs
+   the native/WASM host-integration matrix in one Extension Development Host launch. This
+   is deliberately a local/release gate, not part of `ci.yml`; webview DOM behavior remains
+   in the demo Playwright lane.
+4. Large-cell containment lane, if cell bounding, exports, blob handling or webview
    transport changed:
    ```
    node scripts/generate-large-cell-fixture.mjs --output <path> [--size-mib 256]
@@ -100,7 +106,7 @@ testing nothing.
      --test tests/performance/large_cell_behavior.test.ts
    ```
    Override size with `SQLITE_EXPLORER_LARGE_CELL_MIB`. Zero TODO/skipped pins.
-4. Benchmarks in `tests/performance/` (insert batch, index drop, native column deletion,
+5. Benchmarks in `tests/performance/` (insert batch, index drop, native column deletion,
    native undo/redo) if the corresponding operation changed. **[unverified]** — these
    exist but are not part of a routine release pass.
 

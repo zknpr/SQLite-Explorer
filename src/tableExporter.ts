@@ -347,6 +347,26 @@ async function exportLocalAtomic(
   }
 }
 
+/** Invoke the production local atomic-export path from the non-production test API. */
+export async function exportTableToLocalFileForTests(
+  document: DatabaseDocument,
+  destination: string,
+  tableName: string,
+  columns: string[],
+  options: ExportOptions
+): Promise<number> {
+  const fs = getNodeFs();
+  if (!fs) throw new Error('Local filesystem exports are unavailable in this extension host');
+  return exportLocalAtomic(
+    fs,
+    vsc.Uri.file(destination),
+    document,
+    tableName,
+    columns,
+    options
+  );
+}
+
 function isMissingWorkspaceFile(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
   const code = (error as { code?: unknown }).code;
