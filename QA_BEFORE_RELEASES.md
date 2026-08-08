@@ -66,7 +66,15 @@ testing nothing.
 6. `npm run package` produces a `.vsix` without vsce warnings. Inspect the file list:
    `natives/` present for all five targets, `l10n/` present, no `test_db/`, no
    `docs/superpowers/`, no scan exports, no source maps that shouldn't ship.
-7. Confirm `engines.vscode` still matches the pinned `@types/vscode`. `vsce` fails if the
+7. **Package size is a gate, not a footnote (repeat offender).** The `.vsix` is
+   dominated by `natives/` (5 binaries). It doubled once (9→19 MB) from shipping
+   unstripped binaries with linked DWARF — invisible to every test. Record the `.vsix`
+   size and the `natives/ (N files) [XX MB]` line vsce prints; a **>10% growth** vs the
+   last release needs an explanation before shipping. Current baseline: `.vsix` ≈ 16 MB,
+   `natives/` ≈ 27.5 MB (strip+GC). The stripped binaries come from the fork artifact
+   workflow with `BUILD_WITH_STRIP`+`BUILD_WITH_GC_SECTIONS`; a plain-Release rebuild
+   silently regresses this.
+8. Confirm `engines.vscode` still matches the pinned `@types/vscode`. `vsce` fails if the
    types are newer than the engine floor.
 
 ---
@@ -203,6 +211,14 @@ product.
 
 1. Row numbers, column headers, type-appropriate rendering: `NULL` italic, `[BLOB]` marker,
    REAL vs INTEGER, dates under each `Date Format` mode (Raw / Local / ISO / Relative).
+1a. **Wide tables at the default page size (repeat offender).** Open a **≥50-column** table
+    at page size **5000 and 10000** and confirm ordinary cells (UUIDs, short JSON, emails —
+    tens of bytes) render **inline, not as `TEXT · N bytes` oversized markers**. A regression
+    once made the per-cell inline budget `maxPageResponseBytes / (rows × columns)`, so at
+    50 cols × 5000 rows every cell got ~30 bytes and clipped. The fix is a 256-byte SQL clip
+    floor plus budget enforcement on *actual* transported bytes; the guard is a
+    50-col × 5000-row zero-marker unit test, but eyeball it on a real wide table too — the
+    number of columns × the page size is the axis that breaks it.
 2. Primary-key indicator on single-column PKs and on **every** column of a composite PK.
 3. Tri-state column sort: none → asc → desc → none.
 4. Pagination: first/prev/next/last, page-size change (100/250/500/1000/2500/5000/10000,
