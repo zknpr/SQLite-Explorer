@@ -33,13 +33,13 @@ const REPOSITORY = 'zknpr/txiki.js';
 // The fork's master IS the shipped source; the sqlite-explorer/* branches are
 // frozen history. Artifact runs are dispatched from master.
 const SOURCE_BRANCH = 'master';
-const PINNED_RUN_ID = '31268780165';
+const PINNED_RUN_ID = '31278603707';
 const PINNED_SHA256 = Object.freeze({
-  'aarch64-linux-gnu/tjs': '096a5da55d5a01d19a3a1604f9bd1288ba711ca9fa9976f912d352317d1fcfc6',
-  'aarch64-macos/tjs': '3813c16d0420825f19ef4731533d38b7762384a2d319967db1d2bd5d936d4a3b',
-  'x86_64-linux-gnu/tjs': 'a8be26130417731dffe09398bea352fac052927458314da174cce732fe975490',
-  'x86_64-macos/tjs': 'dedc66bbd52fe4aa111505a2e706cc760949d4d9a90cecc735a826a037b7282a',
-  'x86_64-windows/tjs.exe': 'a3f36bcb3f73e060061a5d1e271ac57021f074a71dc103c9a2bbb2ccdb69a91b'
+  'aarch64-linux-gnu/tjs': 'e603ac1b9aa8aa9f6e8b30666062ee8c2cafff2e3099a1c760053fcc2b52c3a5',
+  'aarch64-macos/tjs': '5b3df909c99bd73fd4e1e4395253d0311e5308ae28363bd3e8099f8d0e37d044',
+  'x86_64-linux-gnu/tjs': '5fbaabbdfb9a13e6ce72ec4dedaf29c1dd9b4e8be096ae2a0cba6595d12686ad',
+  'x86_64-macos/tjs': 'cd8e22a6e7cf834d31711d56600476a83f671b2f9206280da4863ea48dc5208c',
+  'x86_64-windows/tjs.exe': '290215bb6184b811eb45606e5a36e48b0885fd0f0b8bac1a24a82cb8550bcaec'
 });
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
