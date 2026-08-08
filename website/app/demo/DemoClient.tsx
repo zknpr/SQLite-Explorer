@@ -20,6 +20,7 @@ import {
   demoRpcErrorFields,
   demoRpcErrorFromResponse,
   deserializeDemoIframeRequest,
+  guardDemoDatabaseExportResponse,
   guardDemoIframeRequest,
   guardDemoIframeResponse,
   guardDemoWorkerRequest,
@@ -153,6 +154,9 @@ export default function DemoClient() {
    */
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  /** Download-only failures leave the active editor usable. */
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+
   /**
    * Name of the currently loaded database file.
    */
@@ -164,11 +168,9 @@ export default function DemoClient() {
   const [isDragOver, setIsDragOver] = useState(false);
 
   /**
-   * Whether the Download button applies to the current database. Only
-   * inline-bytes opens retain a binary to re-export; File-handle opens
-   * (large or paged databases) have nothing meaningful to download — the
-   * original file is already on the user's disk and paged snapshots are
-   * read-only.
+   * Whether the Download button applies to the current database. Every
+   * writable worker database can export its current image; read-only paged
+   * fallbacks and WAL-gated buffers cannot.
    */
   const [canDownload, setCanDownload] = useState(false);
 
@@ -190,6 +192,7 @@ export default function DemoClient() {
    * Pending RPC calls waiting for responses.
    */
   const pendingCalls = useRef<Map<string, {
+    method: string;
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
   }>>(new Map());
@@ -215,14 +218,18 @@ export default function DemoClient() {
   const databaseFile = useRef<File | null>(null);
 
   /**
-   * Whether the worker opened the current database read-only (paged
-   * page-on-demand snapshot, or a WAL-marked file routed to the
+   * Whether the worker opened the current database read-only (a stale-runtime
+   * paged fallback, or a WAL-marked file routed to the
    * read-only buffer path). Reported to the viewer iframe on
    * `initialize` so its mutation UI disables itself. A ref, not state:
    * it is only read inside the iframe message handler, and the iframe
    * mounts after initialization completes.
    */
   const databaseIsReadOnly = useRef(false);
+
+  /** Worker-reported backing mode and original size for paged-save warnings. */
+  const databaseStorage = useRef<'memory' | 'paged'>('memory');
+  const databaseFileSizeBytes = useRef(0);
 
   // -------------------------------------------------------------------------
   // Worker Communication
@@ -270,7 +277,7 @@ export default function DemoClient() {
         return;
       }
 
-      pendingCalls.current.set(messageId, { resolve, reject });
+      pendingCalls.current.set(messageId, { method, resolve, reject });
       workerRef.current.postMessage(message);
     });
     return invocation.then(
@@ -328,9 +335,9 @@ export default function DemoClient() {
 
       // Special handling for extension-specific methods
       if (targetMethod === 'initialize') {
-        // Already initialized, just return success. Read-only reflects
-        // how the worker actually opened the database (paged snapshots
-        // and WAL-gated buffers are read-only).
+        // Already initialized, just return success. Read-only reflects how
+        // the worker actually opened the database (stale-runtime paged
+        // fallbacks and WAL-gated buffers are read-only).
         postIframeRpcResponse(event.source, viewerOrigin, {
           kind: 'response',
           messageId,
@@ -485,7 +492,11 @@ export default function DemoClient() {
         if (pending) {
           pendingCalls.current.delete(messageId);
           try {
-            guardDemoWorkerResponse(envelope);
+            if (pending.method === 'exportDatabase' && success) {
+              guardDemoDatabaseExportResponse(envelope);
+            } else {
+              guardDemoWorkerResponse(envelope);
+            }
           } catch (error) {
             pending.reject(error instanceof Error ? error : new Error(String(error)));
             return;
@@ -514,12 +525,17 @@ export default function DemoClient() {
           ? { content: source }
           : { file: source }
         // wasmBinary is loaded from the self-hosted runtime by the worker.
-      ]) as { isReadOnly?: boolean } | undefined;
+      ]) as { isReadOnly?: boolean; storage?: 'memory' | 'paged' } | undefined;
 
       databaseBinary.current = source instanceof Uint8Array ? source : null;
       databaseFile.current = source instanceof Uint8Array ? null : source;
       databaseIsReadOnly.current = result?.isReadOnly === true;
-      setCanDownload(source instanceof Uint8Array);
+      databaseStorage.current = result?.storage === 'paged' ? 'paged' : 'memory';
+      databaseFileSizeBytes.current = source instanceof Uint8Array
+        ? source.byteLength
+        : source.size;
+      setCanDownload(!databaseIsReadOnly.current);
+      setDownloadError(null);
       setDatabaseName(filename);
       setStatus('ready');
     } catch (error) {
@@ -632,12 +648,30 @@ export default function DemoClient() {
    * Download the current database.
    */
   const handleDownload = useCallback(async () => {
-    if (!databaseBinary.current || !databaseName) return;
+    if (!workerRef.current || !databaseName || databaseIsReadOnly.current) return;
+
+    if (databaseStorage.current === 'paged') {
+      const sizeGiB = (databaseFileSizeBytes.current / (1024 ** 3)).toFixed(2);
+      const confirmed = window.confirm(
+        `Download the edited ${sizeGiB} GiB database? ` +
+        'The page-on-demand write overlay is bounded by changed pages, but ' +
+        'saving must materialize the complete merged image in browser memory.'
+      );
+      if (!confirmed) return;
+    }
 
     try {
+      setDownloadError(null);
       // Get updated database from worker
       const exportedData = await callWorker('exportDatabase', ['main']) as Uint8Array;
-      const blob = new Blob([new Uint8Array(exportedData)], { type: 'application/x-sqlite3' });
+      // The worker transfers a dedicated export buffer. Avoid a second explicit
+      // Uint8Array copy before handing that buffer to the Blob implementation.
+      const exportedBuffer = exportedData.byteOffset === 0
+        && exportedData.byteLength === exportedData.buffer.byteLength
+        && exportedData.buffer instanceof ArrayBuffer
+        ? exportedData.buffer
+        : exportedData.slice().buffer;
+      const blob = new Blob([exportedBuffer], { type: 'application/x-sqlite3' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -646,6 +680,7 @@ export default function DemoClient() {
       URL.revokeObjectURL(url);
     } catch (error) {
       console.error('[Demo] Failed to export database:', error);
+      setDownloadError(error instanceof Error ? error.message : 'Failed to download database');
     }
   }, [callWorker, databaseName]);
 
@@ -674,7 +709,10 @@ export default function DemoClient() {
     databaseBinary.current = null;
     databaseFile.current = null;
     databaseIsReadOnly.current = false;
+    databaseStorage.current = 'memory';
+    databaseFileSizeBytes.current = 0;
     setCanDownload(false);
+    setDownloadError(null);
     setDatabaseName(null);
     setStatus('idle');
     setErrorMessage(null);
@@ -848,12 +886,22 @@ export default function DemoClient() {
         )}
 
         {status === 'ready' && (
-          <iframe
-            ref={iframeRef}
-            src="/sqlite-viewer/viewer.html"
-            className="flex-1 border-0"
-            title="SQLite Viewer"
-          />
+          <div className="flex-1 min-w-0 flex flex-col">
+            {downloadError && (
+              <div
+                role="alert"
+                className="px-4 py-2 text-sm text-red-700 bg-red-50 border-b border-red-200"
+              >
+                {downloadError}
+              </div>
+            )}
+            <iframe
+              ref={iframeRef}
+              src="/sqlite-viewer/viewer.html"
+              className="flex-1 border-0"
+              title="SQLite Viewer"
+            />
+          </div>
         )}
       </main>
     </div>

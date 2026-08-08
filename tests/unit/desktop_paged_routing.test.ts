@@ -231,6 +231,22 @@ async function connectDesktop(options: {
 const MB = 1024 * 1024;
 
 describe('desktop workerFactory paged routing', () => {
+  it('propagates a writable paged result without a read-only downgrade warning', async () => {
+    const result = await connectDesktop({
+      fileSize: 300 * MB,
+      maxFileSizeBytes: 200 * MB,
+      walSize: null,
+      initResult: { isReadOnly: false, storage: 'paged' }
+    });
+
+    assert.strictEqual(result.error, undefined);
+    assert.strictEqual(result.config?.allowPagedFallback, true);
+    assert.strictEqual(result.config?.readOnlyMode, false);
+    assert.strictEqual(result.isReadOnly, false, 'the editor mutation UI must stay enabled');
+    assert.deepStrictEqual(result.toasts, []);
+    assert.ok(!result.outputLines.some(line => /opened page-on-demand as read-only/.test(line)));
+  });
+
   it('offers the paged fallback for an over-limit local file and surfaces the downgrade', async () => {
     const result = await connectDesktop({
       fileSize: 300 * MB,

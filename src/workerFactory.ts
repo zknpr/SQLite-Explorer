@@ -45,7 +45,8 @@ import type {
   CellReadChunk,
   CellReadSession,
   CellReadTarget,
-  OversizedCellMetadata
+  OversizedCellMetadata,
+  DatabaseWriteResult
 } from './core/types';
 
 import { Worker } from './platform/threadPool';
@@ -176,7 +177,7 @@ interface WorkerMethods {
   getPragmas(): Promise<Record<string, CellValue>>;
   setPragma(pragma: string, value: CellValue): Promise<void>;
   ping(): Promise<boolean>;
-  writeToFile(path: string): Promise<void>;
+  writeToFile(path: string): Promise<DatabaseWriteResult | void>;
 }
 
 const WORKER_METHOD_NAMES = [
@@ -611,7 +612,8 @@ async function createInProcessWasmDatabaseConnection(
 
       return {
         databaseOps: serializeOperations(operationsFacade),
-        isReadOnly: result.isReadOnly ?? false
+        isReadOnly: result.isReadOnly ?? false,
+        storage: result.storage
       };
     }
   };
@@ -681,9 +683,9 @@ async function createWorkerBackedWasmDatabaseConnection(
       autoCommit?: boolean
     ) {
       // Over-limit local files used to hard-fail with this size error. They
-      // now attempt a page-on-demand read-only open in the worker; every
-      // fallback (stale vendored engine without openPaged, paged open
-      // failure) must land on exactly this error so nothing regresses.
+      // now prefer a page-on-demand writable overlay in the worker, degrading
+      // to read-only paging and then the original error when a stale vendored
+      // engine lacks the required capability or a paged open fails.
       let oversizedInMemoryMessage: string | undefined;
       try {
         // Read database file
@@ -756,8 +758,8 @@ async function createWorkerBackedWasmDatabaseConnection(
           wasmBinary: wasmContent,
           readOnlyMode: (forceReadOnly ?? false) || hasUncheckpointedWal,
           queryTimeout: getQueryTimeout(),
-          // Desktop local files may fall back to a page-on-demand read-only
-          // open when they exceed maxSize (the worker re-stats and decides).
+          // Desktop local files may fall back to page-on-demand storage when
+          // they exceed maxSize (writable overlay first, then read-only).
           // The browser extension host never reaches this bundle, and paged
           // mode is impossible there anyway: workspace.fs is async-only
           // while the in-process engine needs synchronous reads.
@@ -782,7 +784,7 @@ async function createWorkerBackedWasmDatabaseConnection(
         // Mirror the WAL gate's surfacing: the webview only ever receives the
         // bare read-only flag, so the reason is raised here (toast + output
         // channel) when the worker chose the page-on-demand fallback.
-        if (result.storage === 'paged') {
+        if (result.storage === 'paged' && result.isReadOnly) {
           warnPagedReadOnlyDowngrade(displayName);
         }
 
@@ -980,7 +982,8 @@ async function createWorkerBackedWasmDatabaseConnection(
 
         return {
           databaseOps: operationsFacade,
-          isReadOnly: result.isReadOnly ?? false
+          isReadOnly: result.isReadOnly ?? false,
+          storage: result.storage
         };
       } catch (err) {
         // Terminate worker on connection failure to prevent leak

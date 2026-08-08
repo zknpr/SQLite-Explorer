@@ -253,7 +253,9 @@ export class HostBridge implements ToastService {
 
   /**
    * Export the database as a Uint8Array.
-   * Exposed directly to avoid nested proxy issues.
+   * Exposed directly to avoid nested proxy issues. Writable paged engines
+   * return their merged base-plus-overlay image; read-only paged engines keep
+   * the engine's explicit unsupported-export error.
    *
    * @param filename - The filename for the export
    * @returns The database as a Uint8Array

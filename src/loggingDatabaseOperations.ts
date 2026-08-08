@@ -29,7 +29,8 @@ import type {
     CellReadChunk,
     CellReadSession,
     CellReadTarget,
-    OversizedCellMetadata
+    OversizedCellMetadata,
+    DatabaseWriteResult
 } from './core/types';
 import { escapeIdentifier } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -410,7 +411,7 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.ping();
     }
 
-    async writeToFile(path: string): Promise<void> {
+    async writeToFile(path: string): Promise<DatabaseWriteResult | void> {
         return this.logAndDelegate(`Writing to file: ${path}`, true, 'writeToFile', path);
     }
 }

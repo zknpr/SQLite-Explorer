@@ -291,6 +291,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             autoCommitEnabled?: boolean;
             outputChannel?: { appendLine(message: string): void };
             initialReadOnly?: boolean;
+            initialStorage?: 'memory' | 'paged';
         } = {}
     ) => {
         const mockViewerProvider = {
@@ -306,7 +307,11 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             uri,
             null, // tracker
             options.autoCommitEnabled ?? false,
-            { databaseOps: dbOps, isReadOnly: options.initialReadOnly ?? false },
+            {
+                databaseOps: dbOps,
+                isReadOnly: options.initialReadOnly ?? false,
+                storage: options.initialStorage
+            },
             { [Symbol.dispose]: () => {} }, // workerMethods
             establishConnection,
             {} // reporter
@@ -339,6 +344,167 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         );
         assert.strictEqual(serializeCalled, false, 'serializeDatabase must not run when cancelled');
         assert.strictEqual(writeToFileCalled, false, 'writeToFile must not run when cancelled');
+    });
+
+    it('save: freezes mutations, writes the paged base, then reopens before completing', async () => {
+        const events: string[] = [];
+        const replacementOps = { engineKind: Promise.resolve('wasm') };
+        let doc: any;
+        const pagedOps = {
+            engineKind: Promise.resolve('wasm'),
+            writeToFile: async (filePath: string) => {
+                events.push('write');
+                assert.strictEqual(filePath, '/test/paged.db');
+                assert.strictEqual(doc.connectionGeneration, 1);
+                assert.strictEqual(doc.isReadOnlyMode, true, 'new mutations must be gated during replace');
+                return { requiresReopen: true };
+            },
+            serializeDatabase: async () => {
+                throw new Error('paged save must not fall back to a second merged export');
+            }
+        };
+        doc = createDocBypassingFactory(
+            pagedOps,
+            createFileUri('/test/paged.db'),
+            async () => {
+                events.push('reopen');
+                return { databaseOps: replacementOps, isReadOnly: false, storage: 'paged' };
+            },
+            { initialStorage: 'paged' }
+        );
+
+        await doc.save();
+
+        assert.deepStrictEqual(events, ['write', 'reopen']);
+        assert.strictEqual(doc.databaseOperations, replacementOps);
+        assert.strictEqual(doc.isReadOnlyMode, false);
+        assert.strictEqual(doc.connectionGeneration, 1);
+    });
+
+    it('save: surfaces a paged mid-transaction refusal without buffer fallback', async () => {
+        const midEditError = new Error(
+            'Cannot save while a database transaction is open; retry after the edit completes.'
+        );
+        let serializeCalled = false;
+        let reconnectCalled = false;
+        const doc = createDocBypassingFactory(
+            {
+                engineKind: Promise.resolve('wasm'),
+                writeToFile: async () => { throw midEditError; },
+                serializeDatabase: async () => {
+                    serializeCalled = true;
+                    return new Uint8Array();
+                }
+            },
+            createFileUri('/test/paged-mid-edit.db'),
+            async () => {
+                reconnectCalled = true;
+                throw new Error('must not reconnect when no rename occurred');
+            },
+            { initialStorage: 'paged' }
+        );
+
+        await assert.rejects(doc.save(), midEditError);
+
+        assert.strictEqual(serializeCalled, false);
+        assert.strictEqual(reconnectCalled, false);
+        assert.strictEqual(doc.isReadOnlyMode, false, 'failed export must leave the overlay editable');
+        assert.strictEqual(doc.connectionGeneration, 1, 'in-flight pre-save mutations remain invalidated');
+    });
+
+    it('saveAs: writes a paged merged image directly without reopening the base', async () => {
+        let writtenPath: string | undefined;
+        let serializeCalled = false;
+        let reconnectCalled = false;
+        const doc = createDocBypassingFactory(
+            {
+                engineKind: Promise.resolve('wasm'),
+                writeToFile: async (filePath: string) => {
+                    assert.strictEqual(doc.isReadOnlyMode, true);
+                    assert.strictEqual(doc.connectionGeneration, 1);
+                    writtenPath = filePath;
+                    return { requiresReopen: false };
+                },
+                serializeDatabase: async () => {
+                    serializeCalled = true;
+                    throw new Error('paged Save As must not export twice');
+                }
+            },
+            createFileUri('/test/paged.db'),
+            async () => {
+                reconnectCalled = true;
+                throw new Error('Save As must not replace the active base');
+            },
+            { initialStorage: 'paged' }
+        );
+
+        await doc.saveAs(createFileUri('/test/paged-copy.db'), undefined);
+
+        assert.strictEqual(writtenPath, '/test/paged-copy.db');
+        assert.strictEqual(serializeCalled, false);
+        assert.strictEqual(reconnectCalled, false);
+        assert.strictEqual(doc.isReadOnlyMode, false);
+        assert.strictEqual(doc.connectionGeneration, 1);
+    });
+
+    it('saveAs: reopens when the target resolves to the active paged base', async () => {
+        const events: string[] = [];
+        const replacementOps = { engineKind: Promise.resolve('wasm') };
+        let doc: any;
+        doc = createDocBypassingFactory(
+            {
+                engineKind: Promise.resolve('wasm'),
+                writeToFile: async () => {
+                    events.push('write');
+                    assert.strictEqual(doc.isReadOnlyMode, true);
+                    return { requiresReopen: true };
+                },
+                serializeDatabase: async () => {
+                    throw new Error('paged Save As must not export twice');
+                }
+            },
+            createFileUri('/test/paged.db'),
+            async () => {
+                events.push('reopen');
+                return { databaseOps: replacementOps, isReadOnly: false, storage: 'paged' };
+            },
+            { initialStorage: 'paged' }
+        );
+
+        await doc.saveAs(createFileUri('/test/paged-alias.db'), undefined);
+
+        assert.deepStrictEqual(events, ['write', 'reopen']);
+        assert.strictEqual(doc.databaseOperations, replacementOps);
+        assert.strictEqual(doc.isReadOnlyMode, false);
+        assert.strictEqual(doc.connectionGeneration, 1);
+    });
+
+    it('saveAs: surfaces a paged mid-transaction refusal without buffer fallback', async () => {
+        const midEditError = new Error(
+            'Cannot save while a database transaction is open; retry after the edit completes.'
+        );
+        let serializeCalled = false;
+        const doc = createDocBypassingFactory(
+            {
+                engineKind: Promise.resolve('wasm'),
+                writeToFile: async () => { throw midEditError; },
+                serializeDatabase: async () => {
+                    serializeCalled = true;
+                    return new Uint8Array();
+                }
+            },
+            createFileUri('/test/paged.db'),
+            async () => {},
+            { initialStorage: 'paged' }
+        );
+
+        await assert.rejects(
+            doc.saveAs(createFileUri('/test/paged-copy.db'), undefined),
+            midEditError
+        );
+        assert.strictEqual(serializeCalled, false);
+        assert.strictEqual(doc.isReadOnlyMode, false);
+        assert.strictEqual(doc.connectionGeneration, 1);
     });
 
     it('saveAs: falls back to buffer transfer when writeToFile fails for file URI', async () => {

@@ -12,6 +12,7 @@ import { isTrustedViewerMessage } from '../../website/app/demo/messageGuard';
 import {
     guardDemoIframeRequest,
     guardDemoIframeResponse,
+    guardDemoDatabaseExportResponse,
     guardDemoWorkerRequest,
     guardDemoWorkerResponse
 } from '../../website/app/demo/transport';
@@ -47,6 +48,54 @@ describe('DemoClient transport guards', () => {
         const oversized = new Uint8Array(MAX_WEBVIEW_BINARY_VALUE_BYTES + 1);
         rejectsAt('web demo parent -> worker request', () => guardDemoWorkerRequest(oversized));
         rejectsAt('web demo worker -> parent response', () => guardDemoWorkerResponse(oversized));
+
+        assert.doesNotThrow(() => guardDemoDatabaseExportResponse({
+            channel: 'rpc',
+            content: {
+                kind: 'response',
+                messageId: 'export-1',
+                success: true,
+                data: oversized
+            }
+        }));
+    });
+
+    it('widens only the database image and keeps an exact export ceiling', () => {
+        const response = (data: unknown, sidecar?: unknown) => ({
+            channel: 'rpc',
+            content: {
+                kind: 'response',
+                messageId: 'export-1',
+                success: true,
+                data,
+                ...(sidecar === undefined ? {} : { sidecar })
+            }
+        });
+
+        assert.doesNotThrow(() => guardDemoDatabaseExportResponse(
+            response(new Uint8Array(32)),
+            32
+        ));
+        assert.throws(
+            () => guardDemoDatabaseExportResponse(response(new Uint8Array(33)), 32),
+            (error: unknown) => {
+                assert.ok(error instanceof WebviewPayloadLimitError);
+                assert.strictEqual(error.kind, 'binary-value');
+                assert.strictEqual(error.limitBytes, 32);
+                return true;
+            }
+        );
+        assert.throws(
+            () => guardDemoDatabaseExportResponse(response('not bytes'), 32),
+            /Uint8Array/
+        );
+        assert.throws(
+            () => guardDemoDatabaseExportResponse(
+                response(new Uint8Array(1), new Uint8Array(MAX_WEBVIEW_BINARY_VALUE_BYTES + 1)),
+                32
+            ),
+            WebviewPayloadLimitError
+        );
     });
 
     it('applies the aggregate budget on all four demo clone boundaries', () => {

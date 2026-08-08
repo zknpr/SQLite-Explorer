@@ -98,6 +98,7 @@ import {
   toCellEditRpcErrorData
 } from '../../../src/core/cell-edit-policy.ts';
 import {
+  BUFFER_OPEN_CEILING_BYTES,
   decideOpenPlan,
   isWalMarkedHeader,
   SQLITE_HEADER_PROBE_BYTES
@@ -144,13 +145,21 @@ let readOnlyMode = false;
 /**
  * How the active database is backed: 'memory' (bytes in the WASM-side
  * filesystem — today's buffer path) or 'paged' (page-on-demand reads
- * through host callbacks; read-only). Count queries consult this to keep
- * full-table scans bounded on paged storage.
+ * through host callbacks, optionally with the fork's copy-on-write
+ * overlay). Count queries consult this to keep full-table scans bounded
+ * on paged storage.
  * @type {'memory' | 'paged'}
  */
 let storageMode = 'memory';
 /** File size behind the current paged open; 0 for buffer opens. */
 let pagedFileSizeBytes = 0;
+/**
+ * A writable paged export materializes the complete merged database in
+ * browser memory. Keep the hard ceiling at the browser buffer-path limit;
+ * the page warns before every paged download because the transient peak is
+ * still materially larger than the on-disk image.
+ */
+let pagedExportMaxBytes = BUFFER_OPEN_CEILING_BYTES;
 /**
  * Exact-count gate for paged opens; policy and default live in the shared
  * src/core/paged-count.ts module (also consumed by the desktop engine).
@@ -588,8 +597,8 @@ function isFileLike(candidate) {
 }
 
 /**
- * Host I/O adapter for SQL.Database.openPaged: serves absolute-offset
- * reads of the File through FileReaderSync. Blob.slice clamps overhangs,
+ * Host I/O adapter shared by both paged database variants: serves absolute-
+ * offset reads of the File through FileReaderSync. Blob.slice clamps overhangs,
  * so reads at EOF come back short — the paged VFS zero-fills and reports
  * the short read to SQLite per the VFS contract. The size is pinned at
  * open time: Chromium invalidates a File snapshot whose backing file
@@ -636,13 +645,44 @@ function resolveOpenLimits(config) {
 }
 
 /**
+ * Resolve the hard merged-image download ceiling. The override is internal
+ * test plumbing; production stays pinned to the measured browser ArrayBuffer
+ * ceiling and callers cannot raise it beyond that bound.
+ *
+ * @param {unknown} value
+ * @returns {number}
+ */
+function resolvePagedExportMaxBytes(value) {
+  if (value === undefined) return BUFFER_OPEN_CEILING_BYTES;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error('pagedExportMaxBytes must be a positive safe integer');
+  }
+  if (value > BUFFER_OPEN_CEILING_BYTES) {
+    throw new Error(
+      `pagedExportMaxBytes must not exceed ${BUFFER_OPEN_CEILING_BYTES} bytes`
+    );
+  }
+  return value;
+}
+
+/** Preserve useful messages from worker, VM, and browser exception realms. */
+function getErrorMessage(error) {
+  return error
+    && typeof error === 'object'
+    && typeof error.message === 'string'
+    ? error.message
+    : String(error);
+}
+
+/**
  * Initialize a new database from binary content or a File handle.
  *
  * @param {string} filename - Display name for the database
  * @param {Object} config - Configuration object
  * @param {Uint8Array} [config.content] - SQLite database binary content
  * @param {File} [config.file] - Database file handle; opens page-on-demand
- *   (read-only) when large and the runtime supports it, else buffers
+ *   with a copy-on-write overlay when large and the runtime supports it,
+ *   otherwise degrades through read-only paging to the buffer path
  * @param {Uint8Array} [config.wasmBinary] - Optional WASM binary
  * @returns {Promise<Object>} Database handle info
  */
@@ -660,6 +700,7 @@ async function initializeDatabase(filename, config) {
   readOnlyMode = config.readOnlyMode === true;
   storageMode = 'memory';
   pagedFileSizeBytes = 0;
+  pagedExportMaxBytes = resolvePagedExportMaxBytes(config.pagedExportMaxBytes);
   pagedExactCountMaxFileBytes = resolvePagedExactCountMaxFileBytes(
     config.pagedExactCountMaxFileBytes
   );
@@ -703,8 +744,8 @@ async function initializeDatabase(filename, config) {
   if (readOnlyMode) {
     // Defense in depth for every current and future RPC path. Public mutators
     // still fail early with operation-specific errors, while SQLite itself
-    // refuses an accidentally unguarded write on this connection. Paged
-    // databases are additionally read-only at the VFS level.
+    // refuses an accidentally unguarded write on this connection. Read-only
+    // paged databases are additionally immutable at the VFS level.
     db.run('PRAGMA query_only = ON');
   }
 
@@ -717,15 +758,14 @@ async function initializeDatabase(filename, config) {
 
 /**
  * Open a database from a File handle, choosing between the paged
- * (page-on-demand, read-only) and buffer (in-memory) paths.
+ * (page-on-demand, writable when supported) and buffer (in-memory) paths.
  *
  * Sets the module-level `db`, and widens `readOnlyMode` when the chosen
- * path is a read-only one (paged snapshot, or WAL-marked above the
- * paged threshold). A failed paged open re-enters the ladder with the
- * capability marked unavailable, so degraded runtimes (e.g. a vendored
- * sql.js without openPaged) behave exactly like today's buffer path,
- * and oversized files fail with one clear message instead of an opaque
- * reader error or a doomed multi-GB allocation.
+ * path is a read-only one (read-only paged fallback, or WAL-marked above
+ * the paged threshold). Writable paging is preferred for an editable open;
+ * failure degrades to read-only openPaged, then re-enters the ladder with
+ * paging unavailable. Oversized files therefore fail with one clear message
+ * instead of an opaque reader error or a doomed multi-GB allocation.
  *
  * @param {File} file
  * @param {{pagedThresholdBytes?: number, bufferCeilingBytes?: number}} limits
@@ -736,26 +776,50 @@ function openDatabaseFromFile(file, limits) {
   const header = new Uint8Array(
     reader.readAsArrayBuffer(file.slice(0, SQLITE_HEADER_PROBE_BYTES))
   );
+  const canOpenPagedWritable = !readOnlyMode
+    && typeof SQL.Database.openPagedWritable === 'function';
+  const canOpenPagedReadOnly = typeof SQL.Database.openPaged === 'function';
   const input = {
     sizeBytes: file.size,
     walMarked: isWalMarkedHeader(header),
-    pagedAvailable: typeof SQL.Database.openPaged === 'function'
+    pagedAvailable: canOpenPagedWritable || canOpenPagedReadOnly
   };
 
   let plan = decideOpenPlan(input, limits);
   let pagedFailure = null;
   if (plan.mode === 'paged') {
-    try {
-      db = SQL.Database.openPaged(createFileHostIo(file, reader));
-      readOnlyMode = true;
-      pagedFileSizeBytes = file.size;
-      return 'paged';
-    } catch (error) {
-      // Fall back exactly as if the capability were absent; keep the
-      // cause for the oversized-rejection message below.
-      pagedFailure = error;
-      plan = decideOpenPlan({ ...input, pagedAvailable: false }, limits);
+    // Both VFS variants use exactly the same guarded/cached reader. The
+    // writable fork layers changed pages in host memory; base reads remain
+    // pinned to the File snapshot captured above.
+    const hostIo = createFileHostIo(file, reader);
+    const failures = [];
+    if (canOpenPagedWritable) {
+      try {
+        db = SQL.Database.openPagedWritable(hostIo);
+        pagedFileSizeBytes = file.size;
+        return 'paged';
+      } catch (error) {
+        const message = getErrorMessage(error);
+        failures.push(`writable paged open failed: ${message}`);
+        db = null;
+      }
     }
+    if (canOpenPagedReadOnly) {
+      try {
+        db = SQL.Database.openPaged(hostIo);
+        readOnlyMode = true;
+        pagedFileSizeBytes = file.size;
+        return 'paged';
+      } catch (error) {
+        const message = getErrorMessage(error);
+        failures.push(`read-only paged open failed: ${message}`);
+        db = null;
+      }
+    }
+    // Fall back exactly as if paging were absent; keep the causes for the
+    // oversized-rejection message below.
+    pagedFailure = failures.length > 0 ? new Error(failures.join('; ')) : null;
+    plan = decideOpenPlan({ ...input, pagedAvailable: false }, limits);
   }
   if (plan.mode === 'reject') {
     throw new Error(
@@ -809,7 +873,43 @@ async function runQuery(sql, params = [], cancellationFlag) {
  */
 async function exportDatabase(_name) {
   if (!db) throw new Error('No database initialized');
-  return db.export();
+  const writablePaged = storageMode === 'paged' && !readOnlyMode;
+  if (storageMode === 'paged' && readOnlyMode) {
+    throw new Error(
+      'paged databases are read-only snapshots; export() is only available ' +
+      'on openPagedWritable instances'
+    );
+  }
+  const limitError = () => new Error(
+    'Cannot download this page-on-demand database: the merged image would ' +
+    `exceed the ${pagedExportMaxBytes}-byte browser memory limit. Saving ` +
+    'materializes the complete database in memory; use the desktop extension ' +
+    'or reduce the database size.'
+  );
+  if (writablePaged && pagedFileSizeBytes > pagedExportMaxBytes) {
+    throw limitError();
+  }
+
+  let exported;
+  try {
+    exported = db.export();
+  } catch (error) {
+    const message = getErrorMessage(error);
+    if (writablePaged && /transaction is open|while a transaction/i.test(message)) {
+      throw new Error(
+        'Cannot save while a database transaction is open; retry after the edit completes.',
+        { cause: error }
+      );
+    }
+    throw error;
+  }
+  // Inserts can grow the merged image beyond the snapshotted base size. This
+  // post-check cannot undo the allocation, but it prevents another oversized
+  // transfer/Blob allocation and keeps the external limit exact.
+  if (writablePaged && exported.byteLength > pagedExportMaxBytes) {
+    throw limitError();
+  }
+  return exported;
 }
 
 /**
@@ -2845,7 +2945,7 @@ self.onmessage = async (event) => {
     assertCellReadSessionAllowsMethod(targetMethod);
     const result = await handler(...(payload || []));
 
-    self.postMessage({
+    const response = {
       channel: 'rpc',
       content: {
         kind: 'response',
@@ -2853,7 +2953,21 @@ self.onmessage = async (event) => {
         success: true,
         data: result
       }
-    });
+    };
+    // A merged database image is already a dedicated Uint8Array from sql.js.
+    // Transfer its buffer so the page does not retain a second structured-
+    // clone copy before constructing the download Blob.
+    if (targetMethod === 'exportDatabase' && result instanceof Uint8Array) {
+      const transferableResult = result.byteOffset === 0
+        && result.byteLength === result.buffer.byteLength
+        && result.buffer instanceof ArrayBuffer
+        ? result
+        : result.slice();
+      response.content.data = transferableResult;
+      self.postMessage(response, [transferableResult.buffer]);
+    } else {
+      self.postMessage(response);
+    }
   } catch (error) {
     console.error('[Worker] Method error:', targetMethod, error);
 

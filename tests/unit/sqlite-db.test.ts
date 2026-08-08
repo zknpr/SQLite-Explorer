@@ -141,7 +141,8 @@ describe('createDatabaseEngine file reading errors', () => {
         allowPagedFallback: true
       });
       assert.strictEqual(result.storage, 'paged');
-      assert.strictEqual(result.isReadOnly, true);
+      assert.strictEqual(result.isReadOnly, false);
+      await result.operations!.updateCell('gate_probe', 1, 'value', 'edited');
     } finally {
       (nodeFs.promises as any).stat = originalStat;
       (result?.operations as WasmDatabaseEngine | undefined)?.shutdown();

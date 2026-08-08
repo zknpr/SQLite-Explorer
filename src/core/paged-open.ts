@@ -3,19 +3,22 @@
  *
  * The web demo historically loaded every database fully into memory
  * ("buffer" mode: bytes -> sql.js MEMFS). The patched sql.js fork adds
- * `SQL.Database.openPaged(hostIo)`, a read-only mode where SQLite pulls
- * 4KB pages through host callbacks instead, so a multi-GB file opens with
- * near-zero heap cost. This module holds the pure routing logic shared by
+ * `SQL.Database.openPaged(hostIo)` and `openPagedWritable(hostIo)`, where
+ * SQLite pulls 4KB base pages through host callbacks instead, so a multi-GB
+ * file opens with near-zero initial heap cost. The writable variant keeps
+ * changed pages in a copy-on-write host-memory overlay. This module holds the
+ * pure routing logic shared by
  * the demo page (which decides what to post to the worker) and the demo
  * worker (which decides how to open what it received), so both sides and
  * the unit tests agree on one ladder:
  *
  *   (a) WAL-marked header (bytes 18/19 == 0x02)  -> never paged. The
- *       paged VFS is a read-only snapshot of the main file only; an
+ *       paged VFS sees the main file only; an
  *       at-rest WAL database may have committed frames in a sibling -wal
  *       the browser cannot see, and the fork refuses/ignores WAL
  *       sidecars by design.
- *   (b) size > paged threshold                    -> paged, read-only.
+ *   (b) size > paged threshold                    -> paged. The caller
+ *       prefers writable paging and degrades to read-only paging.
  *   (c) otherwise                                 -> today's editable
  *       buffer path, unchanged.
  *
@@ -76,8 +79,9 @@ export const WAL_HEADER_SIZE_BYTES = 32;
 export const DEMO_INLINE_CONTENT_MAX_BYTES = MAX_WEBVIEW_BINARY_VALUE_BYTES;
 
 /**
- * Above this size a database opens paged (read-only) when the runtime
- * supports it. Chosen from measured buffer-path behavior in the demo
+ * Above this size a database opens paged when the runtime supports it.
+ * Writable paging is preferred; stale runtimes degrade to the original
+ * read-only variant. Chosen from measured buffer-path behavior in the demo
  * (Chromium 146, macOS arm64, 24 GB): buffer opens peak at ~2.1x the
  * file size in renderer RSS — the FileReaderSync copy plus the copy
  * sql.js materializes for MEMFS — measured 2.92 GB peak for a 1.30 GiB
@@ -120,7 +124,7 @@ export interface DemoOpenInput {
   sizeBytes: number;
   /** Header bytes 18/19 are both 2 (journal_mode=WAL at rest). */
   walMarked: boolean;
-  /** The loaded sql.js runtime exposes Database.openPaged. */
+  /** The loaded runtime exposes a paged capability usable for this open. */
   pagedAvailable: boolean;
 }
 

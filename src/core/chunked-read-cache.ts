@@ -1,8 +1,9 @@
 /**
  * Chunked read cache for paged-database host I/O (read coalescing).
  *
- * The paged VFS (`SQL.Database.openPaged`) pulls 4KB SQLite pages through a
- * synchronous `read(offset, length)` host callback. Each host call has a
+ * Both paged VFS variants (`openPaged` and `openPagedWritable`) pull 4KB
+ * SQLite base pages through a synchronous `read(offset, length)` host callback.
+ * Each host call has a
  * flat per-call cost (~100-300µs for FileReaderSync / fs.readSync round
  * trips regardless of size in the 4-16KiB range), so a multi-GB table scan
  * that issues one host call per 4KB page spends almost all of its time in

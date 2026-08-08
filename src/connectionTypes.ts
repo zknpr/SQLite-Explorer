@@ -19,6 +19,12 @@ import type { DatabaseOperations, CellValue, QueryResultSet, DatabaseInitConfig,
  * - Accessing worker thread methods
  * - Establishing database connections
  */
+export interface EstablishedDatabaseConnection {
+  databaseOps: DatabaseOperations;
+  isReadOnly?: boolean;
+  storage?: DatabaseInitResult['storage'];
+}
+
 export interface DatabaseConnectionBundle {
   /**
    * Proxy to worker thread methods.
@@ -49,11 +55,5 @@ export interface DatabaseConnectionBundle {
     displayName: string,
     forceReadOnly?: boolean,
     autoCommit?: boolean
-  ): {
-    databaseOps: DatabaseOperations;
-    isReadOnly?: boolean;
-  } | PromiseLike<{
-    databaseOps: DatabaseOperations;
-    isReadOnly?: boolean;
-  }>;
+  ): EstablishedDatabaseConnection | PromiseLike<EstablishedDatabaseConnection>;
 }

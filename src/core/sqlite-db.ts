@@ -31,7 +31,8 @@ import type {
   CellReadChunk,
   CellReadSession,
   CellReadTarget,
-  OversizedCellMetadata
+  OversizedCellMetadata,
+  DatabaseWriteResult
 } from './types';
 import { getNodeFs } from './platform/fs';
 import {
@@ -43,6 +44,7 @@ import {
 } from './engine/wasm/WasmDatabaseEngine';
 import { createChunkedReadCache } from './chunked-read-cache';
 import { resolvePagedExactCountMaxFileBytes } from './paged-count';
+import { crypto } from '../platform/cryptoShim';
 import {
   isWalMarkedHeader,
   patchWalHeaderToRollback,
@@ -128,30 +130,42 @@ export async function createEngineFromModule(
       const openOverLimitFile = (actualSize: number): DatabaseInitResult => {
         // Over the in-memory gate. Files this size used to be a hard
         // failure; when the host permits it and the vendored engine
-        // carries openPaged, they now open page-on-demand read-only
-        // instead. Every fallback below (capability absent, paged open
-        // failed) lands on exactly today's size-gate rejection, with the
-        // paged failure preserved on the cause chain.
+        // carries the fork's paged APIs, editable documents prefer the
+        // copy-on-write overlay. Stale builds degrade to read-only paging,
+        // then exactly today's size-gate rejection.
         let pagedFailure: unknown;
-        if (
-          config.allowPagedFallback
-          && typeof SqlJsModule.Database.openPaged === 'function'
-        ) {
-          try {
-            return openPagedDatabaseEngine(
-              SqlJsModule,
-              fs,
-              config.filePath!,
-              config,
-              logger
-            );
-          } catch (pagedError) {
-            pagedFailure = pagedError;
-            logger?.(
-              'warn',
-              `Page-on-demand open failed for '${config.filePath}'; falling back to the size-limit rejection:`,
-              pagedError instanceof Error ? pagedError.message : String(pagedError)
-            );
+        if (config.allowPagedFallback) {
+          const modes: Array<'writable' | 'readOnly'> = [];
+          if (
+            config.readOnlyMode !== true
+            && typeof SqlJsModule.Database.openPagedWritable === 'function'
+          ) {
+            modes.push('writable');
+          }
+          if (typeof SqlJsModule.Database.openPaged === 'function') {
+            modes.push('readOnly');
+          }
+          for (const mode of modes) {
+            try {
+              return openPagedDatabaseEngine(
+                SqlJsModule,
+                fs,
+                config.filePath!,
+                config,
+                mode,
+                logger
+              );
+            } catch (pagedError) {
+              pagedFailure = pagedError;
+              logger?.(
+                'warn',
+                `${mode === 'writable' ? 'Writable p' : 'P'}age-on-demand open failed for `
+                + `'${config.filePath}'; ${mode === 'writable' && modes.includes('readOnly')
+                  ? 'trying the read-only paged fallback'
+                  : 'falling back to the size-limit rejection'}:`,
+                pagedError instanceof Error ? pagedError.message : String(pagedError)
+              );
+            }
           }
         }
         throw new Error(
@@ -232,19 +246,34 @@ interface PagedFileIdentity {
   ino: bigint;
   size: bigint;
   mtimeNs: bigint;
+  mode: bigint;
 }
 
 const PAGED_FILE_CHANGED_MESSAGE =
   'Database file changed on disk; reload the document.';
 
-function readPagedFileIdentity(fs: NodeFsModule, fd: number): PagedFileIdentity {
-  const stats = fs.fstatSync(fd, { bigint: true });
+function pagedFileIdentityFromStats(stats: {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  mode: bigint;
+}): PagedFileIdentity {
   return {
     dev: stats.dev,
     ino: stats.ino,
     size: stats.size,
-    mtimeNs: stats.mtimeNs
+    mtimeNs: stats.mtimeNs,
+    mode: stats.mode
   };
+}
+
+function readPagedFileIdentity(fs: NodeFsModule, fd: number): PagedFileIdentity {
+  return pagedFileIdentityFromStats(fs.fstatSync(fd, { bigint: true }));
+}
+
+function readPagedPathIdentity(fs: NodeFsModule, filePath: string): PagedFileIdentity {
+  return pagedFileIdentityFromStats(fs.statSync(filePath, { bigint: true }));
 }
 
 function samePagedFileIdentity(
@@ -289,7 +318,9 @@ function assertNoSiblingWalFrames(fs: NodeFsModule, filePath: string): void {
 }
 
 /**
- * Open an over-limit local database page-on-demand (read-only snapshot).
+ * Open an over-limit local database page-on-demand. Writable opens keep all
+ * changes in the fork's host-memory overlay; read-only opens retain the stage-0
+ * behavior.
  *
  * The hostIo serves absolute-offset reads through a positional
  * fs.readSync loop over one long-lived file descriptor, wrapped in the
@@ -304,6 +335,7 @@ function openPagedDatabaseEngine(
   fs: NodeFsModule,
   filePath: string,
   config: DatabaseInitConfig,
+  mode: 'writable' | 'readOnly',
   logger?: WasmEngineLogHandler
 ): DatabaseInitResult {
   assertNoSiblingWalFrames(fs, filePath);
@@ -324,6 +356,7 @@ function openPagedDatabaseEngine(
 
   try {
     const openedIdentity = readPagedFileIdentity(fs, fd);
+    const canonicalBasePath = fs.realpathSync(filePath);
     const snapshotFileSizeBytes = Number(openedIdentity.size);
     if (!Number.isSafeInteger(snapshotFileSizeBytes) || snapshotFileSizeBytes < 0) {
       throw new Error(`paged database size is not a safe integer: ${openedIdentity.size}`);
@@ -331,14 +364,19 @@ function openPagedDatabaseEngine(
     let pagedReadError: Error | undefined;
     const assertFileGeneration = (): void => {
       if (pagedReadError) throw pagedReadError;
-      let currentIdentity: PagedFileIdentity;
+      let descriptorIdentity: PagedFileIdentity;
+      let pathIdentity: PagedFileIdentity;
       try {
-        currentIdentity = readPagedFileIdentity(fs, fd);
+        descriptorIdentity = readPagedFileIdentity(fs, fd);
+        pathIdentity = readPagedPathIdentity(fs, canonicalBasePath);
       } catch (error) {
         pagedReadError = new Error(PAGED_FILE_CHANGED_MESSAGE, { cause: error });
         throw pagedReadError;
       }
-      if (!samePagedFileIdentity(openedIdentity, currentIdentity)) {
+      if (
+        !samePagedFileIdentity(openedIdentity, descriptorIdentity)
+        || !samePagedFileIdentity(openedIdentity, pathIdentity)
+      ) {
         pagedReadError = new Error(PAGED_FILE_CHANGED_MESSAGE);
         throw pagedReadError;
       }
@@ -379,7 +417,8 @@ function openPagedDatabaseEngine(
     // to read results only, never to disk. Patching sits inside the cache
     // wrapper so chunk 0 is patched once when fetched.
     const headerProbe = readFromFd(0, SQLITE_HEADER_PROBE_BYTES);
-    const rawRead = isWalMarkedHeader(headerProbe)
+    const walMarked = isWalMarkedHeader(headerProbe);
+    const rawRead = walMarked
       ? (offset: number, length: number): Uint8Array => {
           const out = readFromFd(offset, length);
           patchWalHeaderToRollback(out, offset);
@@ -391,7 +430,21 @@ function openPagedDatabaseEngine(
     // the engine's viewpoint (size pinned below).
     const read = createChunkedReadCache(rawRead);
 
-    const instance = SqlJsModule.Database.openPaged!({
+    // A WAL-marked main image is never writable through the overlay. Even with
+    // a frame-free sibling, the header must be presented as rollback-journal;
+    // retain the existing read-only paged behavior for that compatibility case.
+    const writable = mode === 'writable' && !walMarked;
+    const openPaged = writable
+      ? SqlJsModule.Database.openPagedWritable
+      : SqlJsModule.Database.openPaged;
+    if (!openPaged) {
+      throw new Error(
+        writable
+          ? 'Writable page-on-demand mode is unavailable'
+          : 'Read-only page-on-demand mode is unavailable'
+      );
+    }
+    const instance = openPaged({
       size: () => snapshotFileSizeBytes,
       read
     });
@@ -402,24 +455,120 @@ function openPagedDatabaseEngine(
       const engine = new WasmDatabaseEngine(
         instance,
         config.queryTimeout,
-        // Paged snapshots are read-only regardless of the requested mode.
-        true,
+        !writable,
         logger,
         {
           idleTimeoutMs: config.cellReadSessionIdleTimeoutMs,
           absoluteTimeoutMs: config.cellReadSessionAbsoluteTimeoutMs
         },
         {
+          writable,
           fileSizeBytes: snapshotFileSizeBytes,
           exactCountMaxFileBytes: resolvePagedExactCountMaxFileBytes(
             config.pagedExactCountMaxFileBytes
           ),
           getReadError: () => pagedReadError,
+          assertBaseUnchanged: assertFileGeneration,
+          ...(writable ? {
+            writeDatabaseImage: (targetPath: string, data: Uint8Array) => {
+              let canonicalTargetPath: string | undefined;
+              try {
+                canonicalTargetPath = fs.realpathSync(targetPath);
+              } catch {
+                // A new Save As target has no canonical path yet.
+              }
+              const targetNamesActiveBase = targetPath === filePath
+                || targetPath === canonicalBasePath
+                || canonicalTargetPath === canonicalBasePath;
+              const targetSharesBaseInode = (() => {
+                try {
+                  const target = fs.statSync(targetPath, { bigint: true });
+                  return target.dev === openedIdentity.dev && target.ino === openedIdentity.ino;
+                } catch {
+                  return false;
+                }
+              })();
+
+              if (!targetNamesActiveBase && !targetSharesBaseInode) {
+                fs.writeFileSync(targetPath, data);
+                return { requiresReopen: false };
+              }
+
+              // Never write through any pathname that resolves to the frozen
+              // base inode: a distinct hard link would mutate the bytes still
+              // served by hostIo just as surely as the document path would.
+              // Replace the selected link atomically, but reopen only when the
+              // selected pathname is the active document base.
+              const replacementPath = targetNamesActiveBase
+                ? canonicalBasePath
+                : canonicalTargetPath ?? targetPath;
+              const requiresReopen = targetNamesActiveBase;
+
+              // The temp lives beside its replacement target, so rename is a
+              // same-filesystem atomic replacement. Keep it private while the
+              // full merged image is being written, then restore base mode.
+              const temporaryPath = `${replacementPath}.sqlite-explorer-`
+                + `${crypto.randomUUID()}.tmp`;
+              let temporaryFd: number | undefined;
+              let renamed = false;
+              try {
+                assertFileGeneration();
+                temporaryFd = fs.openSync(temporaryPath, 'wx', 0o600);
+                let written = 0;
+                while (written < data.byteLength) {
+                  const count = fs.writeSync(
+                    temporaryFd,
+                    data,
+                    written,
+                    data.byteLength - written,
+                    written
+                  );
+                  if (count <= 0) {
+                    throw new Error('temporary database write made no progress');
+                  }
+                  written += count;
+                }
+                fs.fchmodSync(temporaryFd, Number(openedIdentity.mode & 0o777n));
+                fs.fsyncSync(temporaryFd);
+                fs.closeSync(temporaryFd);
+                temporaryFd = undefined;
+                // Refuse to overwrite an externally changed base, including
+                // when export was served entirely from cached host chunks.
+                assertFileGeneration();
+                fs.renameSync(temporaryPath, replacementPath);
+                renamed = true;
+                return { requiresReopen };
+              } catch (error) {
+                if (temporaryFd !== undefined) {
+                  try {
+                    fs.closeSync(temporaryFd);
+                  } catch (closeError) {
+                    logger?.('warn', 'Failed to close paged save temp file:', closeError);
+                  }
+                }
+                if (!renamed) {
+                  try {
+                    fs.unlinkSync(temporaryPath);
+                  } catch (cleanupError) {
+                    const code = (cleanupError as { code?: string }).code;
+                    if (code !== 'ENOENT') {
+                      logger?.('warn', 'Failed to remove paged save temp file:', cleanupError);
+                    }
+                  }
+                }
+                throw new Error(
+                  `Failed to atomically save paged database '${targetPath}': `
+                  + (error instanceof Error ? error.message : String(error)),
+                  { cause: error }
+                );
+              }
+            }
+          } : {}),
           dispose: () => closeFd('shutdown')
         }
       );
       engineOwnsFd = true;
-      return { operations: engine, isReadOnly: true, storage: 'paged' };
+      return { operations: engine, isReadOnly: !writable, storage: 'paged' };
     } catch (engineError) {
       try {
         instance.close();
@@ -729,7 +878,7 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return activeEngine.ping();
     },
 
-    async writeToFile(path: string): Promise<void> {
+    async writeToFile(path: string): Promise<DatabaseWriteResult | void> {
       return requireEngine().writeToFile(path);
     },
 

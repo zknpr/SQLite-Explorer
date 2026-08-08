@@ -14,7 +14,10 @@ import { ConfigurationSection, FullExtensionId } from './config';
 import { Disposable } from './lifecycle';
 import { cancelTokenToAbortSignal, getUriParts, generateDatabaseDocumentKey } from './helpers';
 import { HostBridge } from './hostBridge';
-import { DatabaseConnectionBundle } from './connectionTypes';
+import type {
+  DatabaseConnectionBundle,
+  EstablishedDatabaseConnection
+} from './connectionTypes';
 import { DocumentRegistry } from './documentRegistry';
 
 import { createDatabaseConnection } from './workerFactory';
@@ -212,7 +215,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       fileUri,
       tracker,
       autoCommit,
-      { databaseOps, isReadOnly },
+      { databaseOps, isReadOnly, storage: result.storage },
       connectionBundle.workerMethods,
       connectionBundle.establishConnection.bind(connectionBundle),
       reporter,
@@ -238,7 +241,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     readonly uri: vsc.Uri,
     tracker: ModificationTracker<DocumentModification> | null,
     public autoCommitEnabled: boolean,
-    private connectionState: { databaseOps: DatabaseOperations; isReadOnly?: boolean },
+    private connectionState: EstablishedDatabaseConnection,
     private readonly workerMethods: DatabaseConnectionBundle['workerMethods'],
     private readonly establishConnection: DatabaseConnectionBundle['establishConnection'],
     private readonly reporter?: TelemetryReporter,
@@ -449,6 +452,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     // Export in-memory database to file (WASM engine only)
     // We always do this for WASM, regardless of auto-commit setting, because WASM is in-memory.
     if (this.uri.scheme === 'file') {
+        const pagedSave = this.connectionState.storage === 'paged';
+        const priorReadOnlyState = this.connectionState.isReadOnly;
+        let baseReplaced = false;
         try {
             // Capture the tracker position that matches the database snapshot
             // exported by writeToFile(). If undo, rollback, or history eviction
@@ -457,7 +463,21 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             const fileCheckpoint = this.#modificationTracker.getCurrentPosition();
             const fileCheckpointInvalidationRevision =
               this.#modificationTracker.getCheckpointInvalidationRevision();
+            if (pagedSave) {
+              // In-flight host mutations captured the prior generation and will
+              // fail their pre-write guard. New mutations see the temporary
+              // read-only state until the replacement connection is ready.
+              this.#connectionGeneration++;
+              this.connectionState.isReadOnly = true;
+            }
             await this.databaseOperations.writeToFile(this.uri.fsPath);
+            baseReplaced = true;
+            if (pagedSave) {
+              // The old hostIo still owns a descriptor for the frozen pre-save
+              // inode. Reopen before exposing writability so later overlay reads
+              // are based on the atomically replaced merged image.
+              await this.#reconnectFromDisk();
+            }
             if (
               this.#modificationTracker.getCheckpointInvalidationRevision() ===
               fileCheckpointInvalidationRevision
@@ -466,6 +486,23 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             }
             return;
         } catch (e) {
+            if (pagedSave) {
+              if (!baseReplaced) {
+                // Export/temporary-write failure leaves the original overlay and
+                // base intact, so the user can finish the edit and retry.
+                this.connectionState.isReadOnly = priorReadOnlyState;
+                throw e;
+              }
+              // Rename completed but the replacement connection failed. The
+              // saved file is durable; fail closed because the old engine still
+              // references the pre-rename inode (or was shut down while reopening).
+              this.connectionState.isReadOnly = true;
+              throw new Error(
+                'Database was saved, but its page-on-demand session could not be reopened. '
+                + 'Reload the document before making more edits.',
+                { cause: e }
+              );
+            }
             // Fallback if direct write fails
             this.viewerProvider.outputChannel?.appendLine(`[Fallback] Direct write failed, falling back to buffer transfer: ${e instanceof Error ? e.message : String(e)}`);
         }
@@ -510,11 +547,41 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     await this.ensureWritable();
 
     if (targetUri.scheme === 'file') {
+        const pagedSaveAs = this.connectionState.storage === 'paged';
+        const priorReadOnlyState = this.connectionState.isReadOnly;
+        let baseReplaced = false;
+        if (pagedSaveAs) {
+          // Freeze the overlay for the whole export/write window. This is also
+          // required when an alias or hard link makes a Save As target resolve
+          // to the active base and the writer reports that a reopen is needed.
+          this.#connectionGeneration++;
+          this.connectionState.isReadOnly = true;
+        }
         try {
             // Use optimized write/vacuum if available
-            await this.databaseOperations.writeToFile(targetUri.fsPath);
+            const result = await this.databaseOperations.writeToFile(targetUri.fsPath);
+            baseReplaced = result?.requiresReopen === true;
+            if (baseReplaced) {
+              await this.#reconnectFromDisk();
+            } else if (pagedSaveAs) {
+              this.connectionState.isReadOnly = priorReadOnlyState;
+            }
             return;
         } catch (e) {
+             if (pagedSaveAs) {
+               if (!baseReplaced) {
+                 // No rename of the active base occurred, so the original
+                 // overlay remains valid and can be edited/retried.
+                 this.connectionState.isReadOnly = priorReadOnlyState;
+                 throw e;
+               }
+               this.connectionState.isReadOnly = true;
+               throw new Error(
+                 'Database was saved, but its page-on-demand session could not be reopened. '
+                 + 'Reload the document before making more edits.',
+                 { cause: e }
+               );
+             }
              this.viewerProvider.outputChannel?.appendLine(`[Fallback] Direct write failed, falling back to buffer transfer: ${e instanceof Error ? e.message : String(e)}`);
         }
     }
@@ -678,7 +745,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     );
     this.connectionState = {
       databaseOps,
-      isReadOnly: this.#forceReadOnlyOnReconnect || !!result.isReadOnly
+      isReadOnly: this.#forceReadOnlyOnReconnect || !!result.isReadOnly,
+      storage: result.storage
     };
     return databaseOps;
   }

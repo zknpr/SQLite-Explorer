@@ -33,7 +33,8 @@ import type {
   CellReadSession,
   CellReadTarget,
   CellTextEncoding,
-  OversizedCellMetadata
+  OversizedCellMetadata,
+  DatabaseWriteResult
 } from '../../types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from '../../sql-utils';
 import { crypto } from '../../../platform/cryptoShim';
@@ -154,9 +155,9 @@ export interface WasmDatabaseInstance {
 }
 
 /**
- * Host I/O contract for `Database.openPaged`: absolute-offset synchronous
- * reads over an immutable snapshot whose size is pinned at open. Reads
- * must return exactly `length` bytes, short only past EOF.
+ * Host I/O contract for both paged open variants: absolute-offset synchronous
+ * reads over an immutable base whose size is pinned at open. Writable paging
+ * layers its copy-on-write overlay above this unchanged reader.
  */
 export interface WasmPagedHostIo {
   size(): number;
@@ -171,6 +172,8 @@ export interface WasmEngineModule {
      * vendored build degrades to the buffer paths instead of crashing.
      */
     openPaged?: (hostIo: WasmPagedHostIo) => WasmDatabaseInstance;
+    /** Copy-on-write paged open, present in stage 3 fork builds. */
+    openPagedWritable?: (hostIo: WasmPagedHostIo) => WasmDatabaseInstance;
   };
 }
 
@@ -216,6 +219,8 @@ function wasmBindPlaceholder(value: CellValue): string {
  * Default query timeout in milliseconds (30 seconds).
  */
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+/** Log the full-image export cost for bases at least 1 GiB. */
+const PAGED_EXPORT_MEMORY_WARNING_BYTES = 1024 * 1024 * 1024;
 const PROGRESS_HANDLER_INTERVAL = 1000;
 
 interface WasmCellReadSessionState {
@@ -232,18 +237,24 @@ interface WasmCellReadSessionState {
 
 /**
  * State a page-on-demand (openPaged) open hands the engine. Presence of
- * this object is what marks the engine as paged: counts consult the
- * shared paged count policy, serialization surfaces a clear unsupported
- * error, and shutdown releases the host read resources (the file
- * descriptor behind the hostIo) after the WASM instance closes.
+ * this object is what marks the engine as paged: counts consult the shared
+ * paged count policy, serialization is allowed only for writable overlays,
+ * and shutdown releases the host read resources after the WASM instance
+ * closes.
  */
 export interface WasmEnginePagedState {
+  /** True only when the fork supplied a copy-on-write overlay. */
+  writable: boolean;
   /** Size of the snapshot; upper-bounds any table scan within it. */
   fileSizeBytes: number;
   /** Resolved exact-count gate (resolvePagedExactCountMaxFileBytes). */
   exactCountMaxFileBytes: number;
   /** Persistent host-read failure, used to replace SQLite's generic I/O error. */
   getReadError?: () => Error | undefined;
+  /** Revalidate the frozen base even when every export read hits the host cache. */
+  assertBaseUnchanged?: () => void;
+  /** Desktop-only merged-image persistence, including in-place atomic replace. */
+  writeDatabaseImage?: (path: string, data: Uint8Array) => DatabaseWriteResult;
   /** Release host read resources; called once from shutdown(). */
   dispose?: () => void;
 }
@@ -262,6 +273,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private instanceClosed = false;
   /** Set only for page-on-demand opens; undefined for buffer opens. */
   private readonly pagedState: WasmEnginePagedState | undefined;
+  private pagedExportMemoryWarningEmitted = false;
   readonly engineKind = Promise.resolve('wasm' as const);
 
   constructor(
@@ -772,8 +784,42 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * @returns Database binary content
    */
   async serializeDatabase(): Promise<Uint8Array> {
+    return this.exportDatabaseImage();
+  }
+
+  /** Export a buffer/paged-writable database and normalize the fork's save gate. */
+  private exportDatabaseImage(): Uint8Array {
     this.assertSerializable();
-    return this.instance.export();
+    if (
+      this.pagedState?.writable
+      && this.pagedState.fileSizeBytes >= PAGED_EXPORT_MEMORY_WARNING_BYTES
+      && !this.pagedExportMemoryWarningEmitted
+    ) {
+      this.pagedExportMemoryWarningEmitted = true;
+      this.logger(
+        'warn',
+        'Saving a writable page-on-demand database materializes the complete merged image '
+        + `(${this.pagedState.fileSizeBytes} base bytes plus overlay changes) in host memory. `
+        + 'Overlay memory grows with changed pages; merged export memory grows with the full database.'
+      );
+    }
+    this.pagedState?.assertBaseUnchanged?.();
+    try {
+      const data = this.instance.export();
+      // A cached base page does not invoke hostIo.read(), so revalidate after
+      // export as well before any caller is allowed to persist the image.
+      this.pagedState?.assertBaseUnchanged?.();
+      return data;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.pagedState?.writable && /transaction is open/i.test(message)) {
+        throw new Error(
+          'Cannot save while a database transaction is open; retry after the edit completes.',
+          { cause: error }
+        );
+      }
+      throw error;
+    }
   }
 
   /**
@@ -784,7 +830,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * (the webview's exportDb RPC, future callers).
    */
   private assertSerializable(): void {
-    if (this.pagedState) {
+    if (this.pagedState && !this.pagedState.writable) {
       throw new Error(
         'Database export is unavailable: this file exceeds the in-memory limit '
         + 'for the WebAssembly backend and is opened page-on-demand as a '
@@ -2956,12 +3002,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Write database directly to file system.
    */
-  async writeToFile(path: string): Promise<void> {
-    // Same serialization surface as serializeDatabase: unsupported on a
-    // paged snapshot, and the fallback path callers use is serializeDatabase
-    // which raises the identical actionable error.
-    this.assertSerializable();
-    const data = this.instance.export();
+  async writeToFile(path: string): Promise<DatabaseWriteResult | void> {
+    const data = this.exportDatabaseImage();
+
+    if (this.pagedState?.writeDatabaseImage) {
+      return this.pagedState.writeDatabaseImage(path, data);
+    }
 
     const fs = getNodeFs();
     if (fs) {

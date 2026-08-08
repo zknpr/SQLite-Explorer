@@ -83,6 +83,12 @@ export interface CellReadChunk {
   done: boolean;
 }
 
+/** Persistence metadata returned when a save replaces a paged engine's base. */
+export interface DatabaseWriteResult {
+  /** The current engine still reads the frozen pre-save inode and must be reopened. */
+  requiresReopen: boolean;
+}
+
 /** Sparse reasons for rows that cannot safely be mutated from their grid identity. */
 export type ReadOnlyRowReasonMap = Record<number, string>;
 
@@ -537,7 +543,7 @@ export interface DatabaseOperations {
   ping(): Promise<boolean>;
 
   /** Write database directly to file system (optimization) */
-  writeToFile(path: string): Promise<void>;
+  writeToFile(path: string): Promise<DatabaseWriteResult | void>;
 }
 
 /**
@@ -676,11 +682,11 @@ export interface DatabaseInitConfig {
   /** Query execution timeout in milliseconds */
   queryTimeout?: number;
   /**
-   * Desktop worker only: permit the page-on-demand read-only fallback when
+   * Desktop worker only: permit the page-on-demand fallback when
    * the file at `filePath` exceeds `maxSize`. Set by workerFactory after its
-   * sibling `-wal` gate has confirmed no frames exist that a paged snapshot
-   * would miss; without it (or without engine support) an over-limit file
-   * keeps today's size-gate rejection.
+   * sibling `-wal` gate has confirmed no frames exist that a paged open would
+   * miss. A writable fork is preferred for editable databases; stale forks
+   * degrade to the read-only paged path and then today's size rejection.
    */
   allowPagedFallback?: boolean;
   /** Internal/test override for the paged exact-count gate; not a user setting. */
@@ -701,8 +707,9 @@ export interface DatabaseInitResult {
   isReadOnly: boolean;
   /**
    * How the database is backed: 'memory' (bytes in the WASM filesystem —
-   * the editable buffer path) or 'paged' (page-on-demand host reads;
-   * read-only snapshot). Absent from older workers; treat as 'memory'.
+   * the editable buffer path) or 'paged' (page-on-demand host reads, backed
+   * by either a writable overlay or a read-only snapshot). Absent from older
+   * workers; treat as 'memory'.
    */
   storage?: 'memory' | 'paged';
 }

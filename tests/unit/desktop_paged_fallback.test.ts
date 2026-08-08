@@ -13,6 +13,7 @@ import {
 } from '../../src/core/sqlite-db';
 import type { WasmEngineModule } from '../../src/core/engine/wasm/WasmDatabaseEngine';
 import type { DatabaseInitConfig, DatabaseInitResult } from '../../src/core/types';
+import { HostBridge } from '../../src/hostBridge';
 
 /**
  * Desktop WASM-fallback paged routing matrix at the engine layer
@@ -20,10 +21,12 @@ import type { DatabaseInitConfig, DatabaseInitResult } from '../../src/core/type
  * against the REAL vendored sql.js fork and real files on disk:
  *
  *   under the gate                        -> buffer, editable, byte-identical
- *   over the gate + openPaged             -> paged read-only snapshot
- *   over the gate + capability absent     -> today's size rejection
+ *   over the gate + openPagedWritable     -> paged writable overlay
+ *   over the gate + openPaged only        -> paged read-only snapshot
+ *   over the gate + both capabilities absent -> today's size rejection
  *   over the gate + fallback not allowed  -> today's size rejection
- *   over the gate + paged open throws     -> today's size rejection (cause kept)
+ *   over the gate + writable open throws  -> read-only paged fallback
+ *   over the gate + both opens throw      -> today's size rejection (cause kept)
  *   over the gate + frame-bearing -wal    -> refused (defensive recheck)
  *   over the gate + WAL-at-rest header    -> paged (no sibling = no frames)
  *   unlimited gate (0)                    -> buffer for everything
@@ -132,12 +135,10 @@ function overGateConfig(filePath: string, extra: Partial<DatabaseInitConfig> = {
 }
 
 /**
- * The real vendored Database class with openPaged masked off, mirroring a
- * stale vendored build. A plain constructor function does not inherit the
- * original class's static properties, so the capability is genuinely
- * absent rather than stubbed to throw.
+ * Clone the real constructor without inheriting any static paged capability.
+ * Individual helpers add back exactly the capability needed by that test.
  */
-function maskOpenPaged(module: WasmEngineModule): WasmEngineModule {
+function maskPagedCapabilities(module: WasmEngineModule): WasmEngineModule {
   const Original = module.Database;
   const BufferOnly: any = function BufferOnlyDatabase(...args: unknown[]) {
     return Reflect.construct(Original, args as never[], BufferOnly);
@@ -146,11 +147,27 @@ function maskOpenPaged(module: WasmEngineModule): WasmEngineModule {
   return { ...module, Database: BufferOnly };
 }
 
-/** The real class with openPaged replaced by a deterministic failure. */
-function throwingOpenPaged(module: WasmEngineModule): WasmEngineModule {
-  const masked = maskOpenPaged(module);
+/** A stale intermediate build: read-only paging exists, writable paging does not. */
+function maskOpenPagedWritable(module: WasmEngineModule): WasmEngineModule {
+  const masked = maskPagedCapabilities(module);
+  (masked.Database as any).openPaged = module.Database.openPaged;
+  return masked;
+}
+
+/** Writable open fails, but the read-only capability remains usable. */
+function throwingOpenPagedWritable(module: WasmEngineModule): WasmEngineModule {
+  const masked = maskOpenPagedWritable(module);
+  (masked.Database as any).openPagedWritable = () => {
+    throw new Error('synthetic writable paged open failure');
+  };
+  return masked;
+}
+
+/** Both paged capabilities fail, forcing the original size rejection. */
+function throwingPagedCapabilities(module: WasmEngineModule): WasmEngineModule {
+  const masked = throwingOpenPagedWritable(module);
   (masked.Database as any).openPaged = () => {
-    throw new Error('synthetic paged open failure');
+    throw new Error('synthetic read-only paged open failure');
   };
   return masked;
 }
@@ -182,64 +199,235 @@ describe('desktop paged fallback routing (engine layer)', () => {
     }
   });
 
-  it('opens over-gate files paged read-only through the real openPaged', async () => {
-    const result = await createDatabaseEngine(overGateConfig(dbPath));
+  it('edits and exports an over-gate file through the real openPagedWritable without touching its base', async () => {
+    const testPath = path.join(fixtureDir, 'writable-round-trip.db');
+    fs.writeFileSync(testPath, Buffer.from(dbBytes));
+    const baseBefore = fs.readFileSync(testPath);
+    const result = await createDatabaseEngine(overGateConfig(testPath));
+    assert.strictEqual(result.storage, 'paged');
+    assert.strictEqual(result.isReadOnly, false);
+    const engine = result.operations!;
+    try {
+      await engine.updateCell('fixtures', 1, 'label', 'updated');
+      await engine.insertRow('fixtures', { id: 2001, label: 'inserted' });
+      await engine.deleteRows('fixtures', [2]);
+
+      assert.deepStrictEqual(
+        fs.readFileSync(testPath),
+        baseBefore,
+        'overlay edits must not modify the base file'
+      );
+
+      const bridge = new HostBridge(
+        { webviews: new Map(), context: {} } as any,
+        { databaseOperations: engine } as any
+      );
+      const exported = await bridge.exportDb('writable-round-trip.db');
+      assert.deepStrictEqual(
+        fs.readFileSync(testPath),
+        baseBefore,
+        'merged export must leave the base file frozen'
+      );
+      const reopened = new (SqlJsModule.Database as any)(exported);
+      try {
+        const changed = reopened.exec(
+          'SELECT id, label FROM fixtures WHERE id IN (1, 2, 2001) ORDER BY id'
+        );
+        assert.deepStrictEqual(changed[0].values, [[1, 'updated'], [2001, 'inserted']]);
+        assert.deepStrictEqual(reopened.exec('PRAGMA integrity_check')[0].values, [['ok']]);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      (engine as WasmDatabaseEngine).shutdown();
+    }
+  });
+
+  it('warns once before a very large writable paged export materializes the full image', async () => {
+    const warnings: string[] = [];
+    const instance = new (SqlJsModule.Database as any)();
+    const engine = new WasmDatabaseEngine(
+      instance,
+      5000,
+      false,
+      (level, ...args) => {
+        if (level === 'warn') warnings.push(args.map(String).join(' '));
+      },
+      {},
+      {
+        writable: true,
+        fileSizeBytes: 1024 * 1024 * 1024,
+        exactCountMaxFileBytes: 0
+      }
+    );
+    try {
+      await engine.serializeDatabase();
+      await engine.serializeDatabase();
+      assert.strictEqual(
+        warnings.filter(message => /complete merged image.*host memory/i.test(message)).length,
+        1
+      );
+    } finally {
+      engine.shutdown();
+    }
+  });
+
+  it('saves in place through an adjacent temp file, then atomically renames over the frozen base', async () => {
+    const testPath = path.join(fixtureDir, 'atomic-save.db');
+    fs.writeFileSync(testPath, Buffer.from(dbBytes));
+    const baseBefore = fs.readFileSync(testPath);
+    const result = await createDatabaseEngine(overGateConfig(testPath));
+    const engine = result.operations!;
+    const originalRenameSync = fs.renameSync;
+    let renameObservation: { temporaryPath: string; targetPath: string } | undefined;
+    (fs as any).renameSync = (temporaryPath: fs.PathLike, targetPath: fs.PathLike) => {
+      assert.deepStrictEqual(
+        fs.readFileSync(testPath),
+        baseBefore,
+        'the base must remain byte-identical until the atomic replacement'
+      );
+      assert.notStrictEqual(String(temporaryPath), testPath);
+      assert.strictEqual(String(targetPath), fs.realpathSync(testPath));
+      assert.ok(fs.statSync(temporaryPath).size > 0, 'the merged temp image must be complete');
+      renameObservation = {
+        temporaryPath: String(temporaryPath),
+        targetPath: String(targetPath)
+      };
+      return originalRenameSync(temporaryPath, targetPath);
+    };
+    try {
+      await engine.updateCell('fixtures', 1, 'label', 'atomically-saved');
+      const writeResult = await engine.writeToFile(testPath) as any;
+      assert.deepStrictEqual(writeResult, { requiresReopen: true });
+      assert.ok(renameObservation, 'save-in-place must use rename');
+      assert.strictEqual(fs.existsSync(renameObservation!.temporaryPath), false);
+
+      const reopened = new (SqlJsModule.Database as any)(fs.readFileSync(testPath));
+      try {
+        assert.deepStrictEqual(
+          reopened.exec('SELECT label FROM fixtures WHERE id = 1')[0].values,
+          [['atomically-saved']]
+        );
+        assert.deepStrictEqual(reopened.exec('PRAGMA integrity_check')[0].values, [['ok']]);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      (fs as any).renameSync = originalRenameSync;
+      (engine as WasmDatabaseEngine).shutdown();
+    }
+  });
+
+  it('Save As to a hard-link alias replaces the chosen target without replacing the active base', async () => {
+    const testPath = path.join(fixtureDir, 'hard-link-base.db');
+    const targetPath = path.join(fixtureDir, 'hard-link-copy.db');
+    fs.writeFileSync(testPath, Buffer.from(dbBytes));
+    fs.linkSync(testPath, targetPath);
+    const result = await createDatabaseEngine(overGateConfig(testPath));
+    const engine = result.operations!;
+    try {
+      await engine.updateCell('fixtures', 1, 'label', 'hard-link-save-as');
+      const writeResult = await engine.writeToFile(targetPath);
+      assert.deepStrictEqual(writeResult, { requiresReopen: false });
+      assert.deepStrictEqual(fs.readFileSync(testPath), Buffer.from(dbBytes));
+
+      const reopenedCopy = new (SqlJsModule.Database as any)(fs.readFileSync(targetPath));
+      try {
+        assert.deepStrictEqual(
+          reopenedCopy.exec('SELECT label FROM fixtures WHERE id = 1')[0].values,
+          [['hard-link-save-as']]
+        );
+      } finally {
+        reopenedCopy.close();
+      }
+    } finally {
+      (engine as WasmDatabaseEngine).shutdown();
+    }
+  });
+
+  it('refuses to overwrite a base pathname atomically replaced by another writer', async () => {
+    const testPath = path.join(fixtureDir, 'externally-replaced.db');
+    const replacementPath = path.join(fixtureDir, 'external-next.db');
+    fs.writeFileSync(testPath, Buffer.from(dbBytes));
+    const result = await createDatabaseEngine(overGateConfig(testPath));
+    const engine = result.operations!;
+    try {
+      await engine.updateCell('fixtures', 1, 'label', 'local-overlay');
+
+      // rename(2) leaves the engine's old descriptor readable and internally
+      // consistent. Save must also validate that the pathname still resolves
+      // to that descriptor's generation or it would clobber this replacement.
+      fs.writeFileSync(replacementPath, Buffer.from(nextGenerationBytes));
+      fs.renameSync(replacementPath, testPath);
+
+      await assert.rejects(
+        engine.writeToFile(testPath),
+        /file changed on disk; reload the document/i
+      );
+      assert.deepStrictEqual(fs.readFileSync(testPath), Buffer.from(nextGenerationBytes));
+    } finally {
+      (engine as WasmDatabaseEngine).shutdown();
+    }
+  });
+
+  it('surfaces a clean retryable error when a writable paged export starts mid-transaction', async () => {
+    const testPath = path.join(fixtureDir, 'mid-transaction.db');
+    fs.writeFileSync(testPath, Buffer.from(dbBytes));
+    const result = await createDatabaseEngine(overGateConfig(testPath));
+    const engine = result.operations!;
+    try {
+      await engine.executeQuery('BEGIN');
+      await assert.rejects(
+        engine.serializeDatabase(),
+        /cannot save.*transaction.*retry after the edit completes/i
+      );
+      await assert.rejects(
+        engine.writeToFile(testPath),
+        /cannot save.*transaction.*retry after the edit completes/i
+      );
+      assert.deepStrictEqual(fs.readFileSync(testPath), Buffer.from(dbBytes));
+      await engine.executeQuery('ROLLBACK');
+    } finally {
+      (engine as WasmDatabaseEngine).shutdown();
+    }
+  });
+
+  it('falls back to read-only openPaged when openPagedWritable is absent', async () => {
+    const result = await createEngineFromModule(
+      maskOpenPagedWritable(SqlJsModule),
+      overGateConfig(dbPath)
+    );
     assert.strictEqual(result.storage, 'paged');
     assert.strictEqual(result.isReadOnly, true);
     const engine = result.operations!;
     try {
-      // A page fetch works.
-      const data = await engine.fetchTableData('fixtures', {
-        columns: ['id', 'label'],
-        limit: 5,
-        offset: 0,
-        orderBy: 'id',
-        orderDir: 'ASC'
-      });
-      assert.deepStrictEqual(
-        data.rows.map(row => row[row.length - 1]),
-        ['row-1', 'row-2', 'row-3', 'row-4', 'row-5']
-      );
-      // Counts answer (small fixture: exact under the default gate).
-      assert.strictEqual(await engine.fetchTableCount('fixtures', {}), 2000);
-      // Writes are cleanly rejected.
       await assert.rejects(
         engine.updateCell('fixtures', 1, 'label', 'nope'),
         /read.?only/i
       );
-      // Whole-database serialization surfaces the actionable error.
+      await assert.rejects(engine.setPragma('cache_size', 123), /read.?only/i);
       await assert.rejects(
         engine.serializeDatabase(),
         /page-on-demand as a[\s\S]*read-only snapshot[\s\S]*maxFileSize/
       );
-      await assert.rejects(
-        engine.writeToFile(path.join(fixtureDir, 'copy.db')),
-        /page-on-demand as a[\s\S]*read-only snapshot/
-      );
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }
   });
 
-  it('rejects PRAGMA changes on a paged read-only engine', async () => {
-    const result = await createDatabaseEngine(overGateConfig(dbPath));
+  it('uses read-only paging when the caller explicitly requests read-only mode', async () => {
+    const result = await createDatabaseEngine(overGateConfig(dbPath, { readOnlyMode: true }));
     assert.strictEqual(result.storage, 'paged');
-    const engine = result.operations!;
+    assert.strictEqual(result.isReadOnly, true);
     try {
-      const before = await engine.getPragmas();
-      await assert.rejects(
-        engine.setPragma('cache_size', 123),
-        /read.?only/i
-      );
-      const after = await engine.getPragmas();
-      assert.strictEqual(after.cache_size, before.cache_size);
+      await assert.rejects(result.operations!.serializeDatabase(), /read-only snapshot/);
     } finally {
-      (engine as WasmDatabaseEngine).shutdown();
+      (result.operations as WasmDatabaseEngine).shutdown();
     }
   });
 
-  it('rejects over-gate files with today\'s size error when openPaged is absent', async () => {
-    const masked = maskOpenPaged(SqlJsModule);
+  it('rejects over-gate files with today\'s size error when both paged capabilities are absent', async () => {
+    const masked = maskPagedCapabilities(SqlJsModule);
     await assert.rejects(
       createEngineFromModule(masked, overGateConfig(dbPath)),
       (error: Error) => {
@@ -261,8 +449,18 @@ describe('desktop paged fallback routing (engine layer)', () => {
     );
   });
 
-  it('falls back to the size error and keeps the cause when the paged open throws', async () => {
-    const throwing = throwingOpenPaged(SqlJsModule);
+  it('falls back to read-only paging when the writable paged open throws', async () => {
+    const result = await createEngineFromModule(
+      throwingOpenPagedWritable(SqlJsModule),
+      overGateConfig(dbPath)
+    );
+    assert.strictEqual(result.storage, 'paged');
+    assert.strictEqual(result.isReadOnly, true);
+    (result.operations as WasmDatabaseEngine).shutdown();
+  });
+
+  it('falls back to the size error and keeps the cause when both paged opens throw', async () => {
+    const throwing = throwingPagedCapabilities(SqlJsModule);
     const before = openFdCount();
     await assert.rejects(
       createEngineFromModule(throwing, overGateConfig(dbPath)),
@@ -270,7 +468,10 @@ describe('desktop paged fallback routing (engine layer)', () => {
         assert.match(error.message, SIZE_ERROR_PATTERN);
         // The paged failure rides the cause chain: wrap -> size error -> paged error.
         const sizeError = error.cause as Error;
-        assert.match(String((sizeError?.cause as Error)?.message), /synthetic paged open failure/);
+        assert.match(
+          String((sizeError?.cause as Error)?.message),
+          /synthetic read-only paged open failure/
+        );
         return true;
       }
     );
@@ -304,7 +505,7 @@ describe('desktop paged fallback routing (engine layer)', () => {
     const originalStatSync = fs.statSync;
     let walStatCalls = 0;
     let instanceCloseCalls = 0;
-    const fakeModule = maskOpenPaged(SqlJsModule);
+    const fakeModule = maskPagedCapabilities(SqlJsModule);
     (fakeModule.Database as any).openPaged = () => ({
       exec: () => [],
       close: () => { instanceCloseCalls += 1; },
@@ -438,14 +639,41 @@ describe('desktop paged fallback routing (engine layer)', () => {
 });
 
 describe('desktop paged fallback through the worker endpoint', () => {
-  it('reports paged storage, enforces read-only, and releases the fd on dispose', async () => {
+  it('edits, atomically saves, and reopens the replaced base through the endpoint', async () => {
+    const testPath = path.join(fixtureDir, 'endpoint-save-reopen.db');
+    fs.writeFileSync(testPath, Buffer.from(dbBytes));
+    const endpoint = createWorkerEndpoint();
+    try {
+      const config = overGateConfig(testPath, { wasmBinary: new Uint8Array(wasmBinary) });
+      const opened = await endpoint.initializeDatabase('endpoint-save.db', config);
+      assert.strictEqual(opened.storage, 'paged');
+      assert.strictEqual(opened.isReadOnly, false);
+
+      await endpoint.updateCell('fixtures', 1, 'label', 'worker-round-trip');
+      const writeResult = await endpoint.writeToFile(testPath);
+      assert.deepStrictEqual(writeResult, { requiresReopen: true });
+
+      const reopened = await endpoint.initializeDatabase('endpoint-save.db', config);
+      assert.strictEqual(reopened.storage, 'paged');
+      assert.strictEqual(reopened.isReadOnly, false);
+      const rows = await endpoint.runQuery(
+        'SELECT label FROM fixtures WHERE id = 1; PRAGMA integrity_check'
+      );
+      assert.deepStrictEqual(rows[0].rows, [['worker-round-trip']]);
+      assert.deepStrictEqual(rows[1].rows, [['ok']]);
+    } finally {
+      endpoint.dispose();
+    }
+  });
+
+  it('reports writable paged storage, exports edits, and releases the fd on dispose', async () => {
     const endpoint = createWorkerEndpoint();
     const before = openFdCount();
     const initResult: DatabaseInitResult = await endpoint.initializeDatabase(
       'big.db',
       overGateConfig(dbPath, { wasmBinary: new Uint8Array(wasmBinary) })
     );
-    assert.strictEqual(initResult.isReadOnly, true);
+    assert.strictEqual(initResult.isReadOnly, false);
     assert.strictEqual(initResult.storage, 'paged');
     if (before !== undefined) {
       assert.strictEqual(openFdCount(), before + 1);
@@ -457,11 +685,17 @@ describe('desktop paged fallback through the worker endpoint', () => {
       offset: 0
     });
     assert.strictEqual(data.rows.length, 1);
-    await assert.rejects(endpoint.exportDatabase(), /page-on-demand/);
-    await assert.rejects(
-      endpoint.updateCell('fixtures', 1, 'label', 'nope'),
-      /read.?only/i
-    );
+    await endpoint.updateCell('fixtures', 1, 'label', 'endpoint-edit');
+    const exported = await endpoint.exportDatabase();
+    const reopened = new (SqlJsModule.Database as any)(exported);
+    try {
+      assert.deepStrictEqual(
+        reopened.exec('SELECT label FROM fixtures WHERE id = 1')[0].values,
+        [['endpoint-edit']]
+      );
+    } finally {
+      reopened.close();
+    }
 
     endpoint.dispose();
     if (before !== undefined) {

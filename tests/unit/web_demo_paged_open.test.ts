@@ -105,92 +105,85 @@ interface PagedHarness {
     /** hostIo activity recorded by the openPaged stub. */
     hostReads: Array<{ offset: number; length: number }>;
     openPagedCalls: number;
+    openPagedWritableCalls: number;
+    lastResponseTransferCount: number;
 }
 
 /**
  * Boot the bundled worker in a vm with File/FileReaderSync stubs and an
- * optional openPaged capability grafted onto the real vendored engine.
+ * independently masked read-only/writable paged capabilities.
  */
 async function createPagedHarness(options: {
-    /** 'absent' (vendored reality), 'working', or 'throwing'. */
+    /** Read-only paged capability. */
     openPaged?: 'absent' | 'working' | 'throwing';
+    /** Copy-on-write paged capability. */
+    openPagedWritable?: 'absent' | 'working' | 'throwing';
 } = {}): Promise<PagedHarness> {
     const source = await bundleWorker();
     const responses: any[] = [];
     const pagedSql: string[] = [];
     const hostReads: Array<{ offset: number; length: number }> = [];
-    const capability = options.openPaged ?? 'absent';
+    const readOnlyCapability = options.openPaged ?? 'absent';
+    const writableCapability = options.openPagedWritable ?? 'absent';
     let openPagedCalls = 0;
+    let openPagedWritableCalls = 0;
+    let lastResponseTransferCount = 0;
 
     const workerGlobal: any = {
         initSqlJs: async (config: any) => {
             const sqlJs = await initSqlJs(config);
-            if (capability === 'absent') {
-                // Mask the capability explicitly instead of relying on the
-                // vendored build lacking it: once the fork artifacts are
-                // pinned, the real engine DOES carry openPaged, and this leg
-                // must keep testing the absent-capability fallback. A plain
-                // constructor function does not inherit the original class's
-                // static properties, so openPaged is genuinely absent here.
-                const BufferOnlyDatabase: any = function BufferOnlyDatabase(
-                    ...args: any[]
-                ) {
-                    return Reflect.construct(sqlJs.Database, args, BufferOnlyDatabase);
-                };
-                BufferOnlyDatabase.prototype = sqlJs.Database.prototype;
-                return { ...sqlJs, Database: BufferOnlyDatabase };
-            }
-            // The real vendored Database class, with the fork's openPaged
-            // surface stubbed on top: pull every byte through hostIo in
-            // 4096-byte reads (short read terminates, like EOF), open a
-            // real database over the result, and mirror the stage-0
-            // read-only contract (export() throws).
+            // A plain constructor does not inherit static properties, so each
+            // capability below is genuinely present/absent as requested while
+            // every working leg still executes the real vendored VFS.
             const PagedDatabase: any = function PagedDatabase(...args: any[]) {
                 return Reflect.construct(sqlJs.Database, args, PagedDatabase);
             };
             PagedDatabase.prototype = sqlJs.Database.prototype;
-            PagedDatabase.openPaged = (hostIo: {
+
+            const wrapHostIo = (hostIo: {
                 size(): number;
                 read(offset: number, length: number): Uint8Array;
-            }) => {
-                openPagedCalls += 1;
-                if (capability === 'throwing') {
-                    throw new Error('unable to open database file');
+            }) => ({
+                size: () => hostIo.size(),
+                read: (offset: number, length: number) => {
+                    const bytes = hostIo.read(offset, length);
+                    hostReads.push({ offset, length: bytes.length });
+                    return bytes;
                 }
-                const size = hostIo.size();
-                const chunks: Uint8Array[] = [];
-                let offset = 0;
-                while (offset < size) {
-                    const chunk = hostIo.read(offset, 4096);
-                    hostReads.push({ offset, length: chunk.length });
-                    if (chunk.length === 0) break;
-                    chunks.push(chunk);
-                    offset += chunk.length;
-                }
-                const assembled = new Uint8Array(size);
-                let cursor = 0;
-                for (const chunk of chunks) {
-                    assembled.set(chunk, cursor);
-                    cursor += chunk.length;
-                }
-                assert.strictEqual(cursor, size, 'hostIo reads must cover the file');
-                const database: any = new sqlJs.Database(assembled);
+            });
+            const instrument = (database: any) => {
                 const originalRun = database.run.bind(database);
                 database.run = (sql: string, ...rest: unknown[]) => {
                     pagedSql.push(sql);
                     return originalRun(sql, ...rest);
                 };
-                database.export = () => {
-                    throw new Error(
-                        'paged databases are read-only snapshots; export() is'
-                        + ' unsupported in stage 0'
-                    );
-                };
                 return database;
             };
+
+            if (readOnlyCapability !== 'absent') {
+                PagedDatabase.openPaged = (hostIo: any) => {
+                    openPagedCalls += 1;
+                    if (readOnlyCapability === 'throwing') {
+                        throw new Error('unable to open read-only paged database');
+                    }
+                    return instrument((sqlJs.Database as any).openPaged(wrapHostIo(hostIo)));
+                };
+            }
+            if (writableCapability !== 'absent') {
+                PagedDatabase.openPagedWritable = (hostIo: any) => {
+                    openPagedWritableCalls += 1;
+                    if (writableCapability === 'throwing') {
+                        throw new Error('unable to open writable paged database');
+                    }
+                    return instrument(
+                        (sqlJs.Database as any).openPagedWritable(wrapHostIo(hostIo))
+                    );
+                };
+            }
             return { ...sqlJs, Database: PagedDatabase };
         },
-        postMessage(message: unknown) {
+        postMessage(message: unknown, transfer?: unknown[]) {
+            lastResponseTransferCount = transfer?.length ?? 0;
             responses.push(message);
         }
     };
@@ -242,7 +235,9 @@ async function createPagedHarness(options: {
         invoke,
         pagedSql,
         hostReads,
-        get openPagedCalls() { return openPagedCalls; }
+        get openPagedCalls() { return openPagedCalls; },
+        get openPagedWritableCalls() { return openPagedWritableCalls; },
+        get lastResponseTransferCount() { return lastResponseTransferCount; }
     } as PagedHarness;
 }
 
@@ -484,7 +479,85 @@ describe('web demo worker File opens', () => {
         await harness.invoke('updateCell', 'fixtures', 1, 'label', 'still-editable');
     });
 
-    it('opens large File handles paged and read-only through hostIo', async () => {
+    it('edits, downloads, and reopens a File through the real writable paged VFS', async () => {
+        const originalBase = plainDbBytes.slice();
+        const harness = await createPagedHarness({ openPagedWritable: 'working' });
+        const result = await harness.invoke(
+            'initializeDatabase',
+            'large.db',
+            initConfig({
+                file: new StubFile(plainDbBytes, 'large.db'),
+                ...limitsAboveThreshold(plainDbBytes)
+            })
+        );
+        expectInitResult(result, { isReadOnly: false, storage: 'paged' });
+        assert.strictEqual(harness.openPagedWritableCalls, 1);
+        assert.strictEqual(harness.openPagedCalls, 0);
+        assert.ok(!harness.pagedSql.includes('PRAGMA query_only = ON'));
+
+        await harness.invoke('updateCell', 'fixtures', 1, 'label', 'updated');
+        await harness.invoke('insertRow', 'fixtures', { id: 65, label: 'inserted' });
+        await harness.invoke('deleteRows', 'fixtures', [2]);
+        assert.deepStrictEqual(plainDbBytes, originalBase, 'the uploaded File base must stay immutable');
+
+        const exported = await harness.invoke('exportDatabase', 'main') as Uint8Array;
+        assert.strictEqual(
+            harness.lastResponseTransferCount,
+            1,
+            'the merged image must transfer to the page without a second structured-clone copy'
+        );
+        assert.deepStrictEqual(plainDbBytes, originalBase);
+        const SQL = await initSqlJs({ wasmBinary });
+        const reopened = new SQL.Database(exported);
+        try {
+            assert.deepStrictEqual(
+                reopened.exec(
+                    'SELECT id, label FROM fixtures WHERE id IN (1, 2, 65) ORDER BY id'
+                )[0].values,
+                [[1, 'updated'], [65, 'inserted']]
+            );
+            assert.deepStrictEqual(reopened.exec('PRAGMA integrity_check')[0].values, [['ok']]);
+        } finally {
+            reopened.close();
+        }
+    });
+
+    it('surfaces a clean paged download refusal while a transaction is open', async () => {
+        const harness = await createPagedHarness({ openPagedWritable: 'working' });
+        await harness.invoke(
+            'initializeDatabase',
+            'large.db',
+            initConfig({
+                file: new StubFile(plainDbBytes, 'large.db'),
+                ...limitsAboveThreshold(plainDbBytes)
+            })
+        );
+        await harness.invoke('runQuery', 'BEGIN');
+        await assert.rejects(
+            harness.invoke('exportDatabase', 'main'),
+            /cannot save.*transaction.*retry after the edit completes/i
+        );
+        await harness.invoke('runQuery', 'ROLLBACK');
+    });
+
+    it('caps a merged paged download before materializing an unsafe full image', async () => {
+        const harness = await createPagedHarness({ openPagedWritable: 'working' });
+        await harness.invoke(
+            'initializeDatabase',
+            'large.db',
+            initConfig({
+                file: new StubFile(plainDbBytes, 'large.db'),
+                ...limitsAboveThreshold(plainDbBytes),
+                pagedExportMaxBytes: plainDbBytes.length - 1
+            })
+        );
+        await assert.rejects(
+            harness.invoke('exportDatabase', 'main'),
+            /cannot download.*merged image.*browser memory limit/i
+        );
+    });
+
+    it('opens large File handles paged and read-only when only openPaged exists', async () => {
         const harness = await createPagedHarness({ openPaged: 'working' });
         const result = await harness.invoke(
             'initializeDatabase',
@@ -496,13 +569,14 @@ describe('web demo worker File opens', () => {
         );
         expectInitResult(result, { isReadOnly: true, storage: 'paged' });
         assert.strictEqual(harness.openPagedCalls, 1);
-        // hostIo served the whole file in offset order, with a short
-        // final read at EOF (Blob.slice clamps the overhang).
-        assert.ok(harness.hostReads.length >= 2);
-        assert.strictEqual(harness.hostReads[0].offset, 0);
-        const last = harness.hostReads[harness.hostReads.length - 1];
-        assert.strictEqual(last.offset + last.length, plainDbBytes.length);
-        assert.ok(last.length <= 4096);
+        // Every VFS read stays inside the immutable uploaded-file snapshot;
+        // SQLite is free to leave untouched pages unread.
+        assert.ok(harness.hostReads.length >= 1);
+        for (const read of harness.hostReads) {
+            assert.ok(read.offset >= 0);
+            assert.ok(read.length >= 0);
+            assert.ok(read.offset + read.length <= plainDbBytes.length);
+        }
         // The existing read-only machinery engaged on the paged handle.
         assert.ok(harness.pagedSql.includes('PRAGMA query_only = ON'));
         await expectRows(harness);
@@ -516,7 +590,29 @@ describe('web demo worker File opens', () => {
         );
         await assert.rejects(
             harness.invoke('exportDatabase', 'main'),
-            /read-only snapshots; export\(\) is unsupported/
+            /read-only snapshots; export\(\).*openPagedWritable/
+        );
+    });
+
+    it('falls back to read-only paging when openPagedWritable throws', async () => {
+        const harness = await createPagedHarness({
+            openPagedWritable: 'throwing',
+            openPaged: 'working'
+        });
+        const result = await harness.invoke(
+            'initializeDatabase',
+            'large.db',
+            initConfig({
+                file: new StubFile(plainDbBytes, 'large.db'),
+                ...limitsAboveThreshold(plainDbBytes)
+            })
+        );
+        expectInitResult(result, { isReadOnly: true, storage: 'paged' });
+        assert.strictEqual(harness.openPagedWritableCalls, 1);
+        assert.strictEqual(harness.openPagedCalls, 1);
+        await assert.rejects(
+            harness.invoke('updateCell', 'fixtures', 1, 'label', 'nope'),
+            /read-only/
         );
     });
 
@@ -548,7 +644,10 @@ describe('web demo worker File opens', () => {
             ),
             (error: Error) => {
                 assert.match(error.message, /too large to load into memory/);
-                assert.match(error.message, /paged open failed: unable to open database file/);
+                assert.match(
+                    error.message,
+                    /paged open failed: unable to open read-only paged database/
+                );
                 return true;
             }
         );
@@ -575,7 +674,10 @@ describe('web demo worker File opens', () => {
     });
 
     it('routes large WAL-marked files to the read-only buffer path, never paged', async () => {
-        const harness = await createPagedHarness({ openPaged: 'working' });
+        const harness = await createPagedHarness({
+            openPaged: 'working',
+            openPagedWritable: 'working'
+        });
         const result = await harness.invoke(
             'initializeDatabase',
             'wal.db',
@@ -586,6 +688,7 @@ describe('web demo worker File opens', () => {
         );
         expectInitResult(result, { isReadOnly: true, storage: 'memory' });
         assert.strictEqual(harness.openPagedCalls, 0);
+        assert.strictEqual(harness.openPagedWritableCalls, 0);
         await expectRows(harness);
         await assert.rejects(
             harness.invoke('updateCell', 'fixtures', 1, 'label', 'nope'),
@@ -594,7 +697,10 @@ describe('web demo worker File opens', () => {
     });
 
     it('rejects oversized WAL-marked files with the checkpoint message', async () => {
-        const harness = await createPagedHarness({ openPaged: 'working' });
+        const harness = await createPagedHarness({
+            openPaged: 'working',
+            openPagedWritable: 'working'
+        });
         await assert.rejects(
             harness.invoke(
                 'initializeDatabase',
@@ -607,10 +713,14 @@ describe('web demo worker File opens', () => {
             new Error(WAL_TOO_LARGE_MESSAGE)
         );
         assert.strictEqual(harness.openPagedCalls, 0);
+        assert.strictEqual(harness.openPagedWritableCalls, 0);
     });
 
     it('keeps small WAL-marked files on today\'s editable path', async () => {
-        const harness = await createPagedHarness({ openPaged: 'working' });
+        const harness = await createPagedHarness({
+            openPaged: 'working',
+            openPagedWritable: 'working'
+        });
         const result = await harness.invoke(
             'initializeDatabase',
             'wal-small.db',
@@ -618,11 +728,15 @@ describe('web demo worker File opens', () => {
         );
         expectInitResult(result, { isReadOnly: false, storage: 'memory' });
         assert.strictEqual(harness.openPagedCalls, 0);
+        assert.strictEqual(harness.openPagedWritableCalls, 0);
         await harness.invoke('updateCell', 'fixtures', 1, 'label', 'editable');
     });
 
     it('keeps the inline-bytes path unchanged', async () => {
-        const harness = await createPagedHarness({ openPaged: 'working' });
+        const harness = await createPagedHarness({
+            openPaged: 'working',
+            openPagedWritable: 'working'
+        });
         const result = await harness.invoke(
             'initializeDatabase',
             'bytes.db',
@@ -630,6 +744,7 @@ describe('web demo worker File opens', () => {
         );
         expectInitResult(result, { isReadOnly: false, storage: 'memory' });
         assert.strictEqual(harness.openPagedCalls, 0);
+        assert.strictEqual(harness.openPagedWritableCalls, 0);
         await expectRows(harness);
         await harness.invoke('updateCell', 'fixtures', 1, 'label', 'edited');
     });
