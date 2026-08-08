@@ -289,7 +289,9 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
 
     // Get configuration settings for the webview
     const config = vsc.workspace.getConfiguration(ConfigurationSection);
-    const defaultPageSize = config.get<number>('defaultPageSize', 1000);
+    // Fallback must match the declared package.json default (5000) so a host
+    // that fails to register the configuration still reports the real default.
+    const defaultPageSize = config.get<number>('defaultPageSize', 5000);
     const maxRows = config.get<number>('maxRows', 0);
 
     // Build environment data for webview

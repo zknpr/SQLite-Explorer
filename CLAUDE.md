@@ -360,7 +360,7 @@ Settings in `package.json` → `contributes.configuration`:
 |---------|---------|-------------|
 | `sqliteExplorer.maxFileSize` | 200 | Max file size in MB (0 = unlimited) |
 | `sqliteExplorer.maxRows` | 0 | Max rows to display (0 = unlimited) |
-| `sqliteExplorer.defaultPageSize` | 500 | Default page size for pagination |
+| `sqliteExplorer.defaultPageSize` | 5000 | Default page size for pagination |
 | `sqliteExplorer.instantCommit` | "never" | Auto-save strategy (always/never/remote-only) |
 | `sqliteExplorer.doubleClickBehavior` | "inline" | Double-click action (inline/modal/vscode) |
 | `sqliteExplorer.fileOperations` | "native" | File I/O strategy (native/wasm) |

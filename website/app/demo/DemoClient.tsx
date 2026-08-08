@@ -318,7 +318,7 @@ export default function DemoClient() {
           success: true,
           data: {
             maxRows: 0,
-            defaultPageSize: 1000,
+            defaultPageSize: 5000,
             instantCommit: 'never',
             doubleClickBehavior: 'inline'
           }

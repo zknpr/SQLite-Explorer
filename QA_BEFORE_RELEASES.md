@@ -205,8 +205,8 @@ product.
    REAL vs INTEGER, dates under each `Date Format` mode (Raw / Local / ISO / Relative).
 2. Primary-key indicator on single-column PKs and on **every** column of a composite PK.
 3. Tri-state column sort: none → asc → desc → none.
-4. Pagination: first/prev/next/last, page-size change (100/250/500/1000), and the record
-   count. Deep pages on a large table.
+4. Pagination: first/prev/next/last, page-size change (100/250/500/1000/2500/5000/10000,
+   default 5000), and the record count. Deep pages on a large table.
 5. Filtering: global filter, per-column filters, match highlighting, `Enter`/`Shift+Enter`
    match navigation, and clearing filters.
 6. A failed filter must revert the term and leave the previous grid intact rather than
@@ -591,10 +591,10 @@ from the page-size change to the last row appearing:
 |---:|---:|---:|---:|---:|
 | 100 | 32 ms | 900 | 2,700 | 320 |
 | 250 | 57 ms | 2,250 | 6,750 | 228 |
-| **500 (default)** | **92 ms** | 4,500 | 13,500 | 184 |
+| 500 (default until 2026-08-08) | 92 ms | 4,500 | 13,500 | 184 |
 | 1,000 | 157 ms | 9,000 | 27,000 | 157 |
 | 2,500 | 324 ms | 22,500 | 67,500 | 130 |
-| 5,000 | 621 ms | 45,000 | 135,000 | 124 |
+| **5,000 (default since 2026-08-08)** | **621 ms** | 45,000 | 135,000 | 124 |
 | 10,000 | 1,197 ms | 90,000 | 270,000 | 120 |
 | 25,000 | 3,087 ms | 225,000 | 675,000 | 123 |
 
@@ -616,8 +616,11 @@ table above. Gate on both:
   editor is actually in the DOM (a leaked session must not blank the grid — regression
   test in grid_virtualization.test.ts).
 
-Raising the default page size is now unblocked by rendering, gated only by transport and
-memory per page — measure before changing the default.
+The default was raised 500 → 5000 on 2026-08-08 on the strength of keyset page turns,
+the count cache, and virtualization; the remaining per-page cost is SQL + transport
+(~548k rows/s native marshal), with the per-page inline-cell byte budget clipping
+oversized cells on wide tables as the designed graceful path. Re-measure before raising
+it again.
 
 Re-measure the full-render curve if cell rendering, highlighting, or the transport
 changes. A regression here is felt on every page turn of the small-page path.

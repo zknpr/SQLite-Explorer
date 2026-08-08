@@ -103,7 +103,7 @@
           "type": "number",
           "minimum": 10,
           "maximum": 100000,
-          "default": 500,
+          "default": 5000,
           "markdownDescription": "Default number of rows to display per page."
         },
         "sqliteExplorer.maxRows": {
