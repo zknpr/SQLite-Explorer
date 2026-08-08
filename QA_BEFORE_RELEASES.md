@@ -70,8 +70,10 @@ testing nothing.
    dominated by `natives/` (5 binaries). It doubled once (9→19 MB) from shipping
    unstripped binaries with linked DWARF — invisible to every test. Record the `.vsix`
    size and the `natives/ (N files) [XX MB]` line vsce prints; a **>10% growth** vs the
-   last release needs an explanation before shipping. Current baseline: `.vsix` ≈ 12.8 MB,
-   `natives/` ≈ 21 MB. The binaries come from the fork artifact workflow with
+   last release needs an explanation before shipping. Current baseline: `.vsix` ≈ 11.7 MB,
+   **73 files** (was 693 — `node_modules` is no longer shipped; the codicon font+css live
+   under `assets/codicons/`, and everything else is esbuild-bundled into `out/`). A sudden
+   file-count jump back into the hundreds means `node_modules` is leaking in again. The binaries come from the fork artifact workflow with
    `BUILD_WITH_STRIP`+`GC_SECTIONS` **and** `BUILD_WITH_WASM/FFI/LWS=OFF` (the worker only
    uses `tjs:sqlite`+`tjs:v8`, so the WASM interpreter, FFI/dlopen and the
    libwebsockets/TLS/HTTP stack are excluded — also a security win: the file-parsing

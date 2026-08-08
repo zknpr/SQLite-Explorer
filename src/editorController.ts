@@ -270,10 +270,8 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     // directory while an oversized media URI lease is active.
     const codiconsRoot = vsc.Uri.joinPath(
       this.context.extensionUri,
-      'node_modules',
-      '@vscode',
-      'codicons',
-      'dist'
+      'assets',
+      'codicons'
     );
     webviewPanel.webview.options = {
       enableScripts: true,
@@ -303,8 +301,9 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     const htmlUri = vsc.Uri.joinPath(this.context.extensionUri, 'core', 'ui', 'viewer.html');
     const html = new TextDecoder().decode(await vsc.workspace.fs.readFile(htmlUri));
 
-    // Load codicons CSS from @vscode/codicons package
-    const codiconsUri = vsc.Uri.joinPath(this.context.extensionUri, 'node_modules', '@vscode', 'codicons', 'dist', 'codicon.css');
+    // Load codicons CSS from assets/codicons (copied by build.mjs; the full
+    // @vscode/codicons package is not shipped in the .vsix).
+    const codiconsUri = vsc.Uri.joinPath(this.context.extensionUri, 'assets', 'codicons', 'codicon.css');
 
     // Build Content Security Policy
     const cspObj = {

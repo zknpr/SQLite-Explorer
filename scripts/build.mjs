@@ -259,6 +259,18 @@ const copyAssets = async () => {
   fs.copyFileSync(wasmSrc, wasmDst);
   console.log('Copied vendored sql.js WASM to assets/');
 
+  // Ship only the two codicon runtime files (css + the ttf it @font-face's)
+  // under assets/, so the .vsix never carries the 4.6MB @vscode/codicons
+  // package (2.3MB src/ SVGs, a 1.2MB preview HTML, ...). The extension serves
+  // codicons from assets/codicons/ (editorController + hostBridge).
+  const codiconsSrc = resolve('node_modules', '@vscode', 'codicons', 'dist');
+  const codiconsDst = resolve(assetsDir, 'codicons');
+  fs.mkdirSync(codiconsDst, { recursive: true });
+  for (const file of ['codicon.css', 'codicon.ttf']) {
+    fs.copyFileSync(resolve(codiconsSrc, file), resolve(codiconsDst, file));
+  }
+  console.log('Copied codicon.css + codicon.ttf to assets/codicons/');
+
   const demoAssetsDir = resolve('website', 'public', 'sqlite-viewer');
   fs.mkdirSync(demoAssetsDir, { recursive: true });
   fs.copyFileSync(

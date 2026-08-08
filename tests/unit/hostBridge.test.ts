@@ -425,7 +425,7 @@ describe('HostBridge', () => {
         assert.deepStrictEqual(
             webview.options.localResourceRoots.map(uri => uri.fsPath),
             [
-                '/extension/node_modules/@vscode/codicons/dist',
+                '/extension/assets/codicons',
                 '/private/materialized/sqlite-explorer-cell-materializations-run'
             ]
         );
@@ -435,7 +435,7 @@ describe('HostBridge', () => {
         assert.strictEqual(materializer.release.mock.calls[0].arguments[0], tempUri);
         assert.deepStrictEqual(
             webview.options.localResourceRoots.map(uri => uri.fsPath),
-            ['/extension/node_modules/@vscode/codicons/dist']
+            ['/extension/assets/codicons']
         );
     });
 

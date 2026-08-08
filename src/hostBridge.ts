@@ -1355,13 +1355,9 @@ export class HostBridge implements ToastService {
   }
 
   private codiconsResourceRoot(): vsc.Uri {
-    return vsc.Uri.joinPath(
-      this.context.extensionUri,
-      'node_modules',
-      '@vscode',
-      'codicons',
-      'dist'
-    );
+    // build.mjs copies codicon.css + codicon.ttf here; the full
+    // @vscode/codicons package is not shipped in the .vsix.
+    return vsc.Uri.joinPath(this.context.extensionUri, 'assets', 'codicons');
   }
 
   private trackMediaPanel(panel: vsc.WebviewPanel): void {
