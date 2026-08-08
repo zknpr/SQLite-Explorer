@@ -17,7 +17,12 @@ import {
     OversizedCellReplacementRequiredError
 } from '../../src/core/cell-edit-policy';
 import { streamTableExport } from '../../src/tableExporter';
-import type { TableQueryOptions } from '../../src/core/types';
+import { ModificationTracker } from '../../src/core/undo-history';
+import {
+    reconcileRestoredDatabase,
+    revertDatabaseToSaved
+} from '../../src/core/restore-reconciler';
+import type { LabeledModification, TableQueryOptions } from '../../src/core/types';
 
 const BUNDLED_TXIKI_SQLITE_VERSION = '3.51.2';
 const DIVERGENT_REAL_TEXT_BY_NATIVE_SQLITE_VERSION: Record<string, string> = {
@@ -345,6 +350,207 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             'native-smoke.sqlite'
         );
         const engine = connection.databaseOps;
+
+        await testContext.test('rejects direct applyModifications replay on the native backend', async () => {
+            await assert.rejects(
+                engine.applyModifications([]),
+                /applyModifications is not supported on the native backend; history replay uses redoModification/
+            );
+        });
+
+        await testContext.test(
+            'round-trips native hot-exit history and reverts to the saved checkpoint across modification types',
+            async () => {
+                const historyPath = path.join(testDir, 'native-history-round-trip.sqlite');
+                fs.closeSync(fs.openSync(historyPath, 'w'));
+                let historyBundle:
+                    | Awaited<ReturnType<typeof createNativeDatabaseConnection>>
+                    | undefined;
+
+                const table = 'native_history_round_trip';
+                const view = 'native_history_round_trip_view';
+                const baselineJson = '{"base":1,"drop":2}';
+                const patch = '{"base":9,"added":3}';
+                const assertBaselineState = async (ops: typeof engine) => {
+                    const rows = await ops.executeQuery(
+                        `SELECT rowid, value, json_value FROM ${table} ORDER BY rowid`
+                    );
+                    assert.deepStrictEqual(rows[0].rows, [
+                        [1, 'kept', baselineJson],
+                        [2, 'delete-me', '{"row":2}']
+                    ]);
+                    const columns = await ops.executeQuery(`PRAGMA table_info(${table})`);
+                    assert.deepStrictEqual(
+                        columns[0].rows.map(row => row[1]),
+                        ['value', 'json_value']
+                    );
+                    const views = await ops.executeQuery(
+                        `SELECT name FROM sqlite_schema WHERE type = 'view' AND name = '${view}'`
+                    );
+                    assert.deepStrictEqual(views[0].rows, []);
+                };
+                const assertSavedState = async (ops: typeof engine) => {
+                    const rows = await ops.executeQuery(
+                        `SELECT rowid, value, json_value, history_extra FROM ${table} ORDER BY rowid`
+                    );
+                    assert.strictEqual(rows[0].rows.length, 2);
+                    assert.deepStrictEqual(rows[0].rows[0].slice(0, 2), [1, 'edited']);
+                    assert.deepStrictEqual(
+                        JSON.parse(rows[0].rows[0][2] as string),
+                        { base: 9, drop: 2, added: 3 }
+                    );
+                    assert.strictEqual(rows[0].rows[0][3], 'history-default');
+                    assert.deepStrictEqual(rows[0].rows[1], [
+                        3,
+                        'inserted',
+                        '{}',
+                        'history-default'
+                    ]);
+                    const viewRows = await ops.executeQuery(
+                        `SELECT rowid, value FROM ${view} ORDER BY rowid`
+                    );
+                    assert.deepStrictEqual(viewRows[0].rows, [
+                        [1, 'edited'],
+                        [3, 'inserted']
+                    ]);
+                };
+
+                try {
+                    historyBundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
+                    let historyConnection = await historyBundle.establishConnection(
+                        vscode.Uri.file(historyPath),
+                        'native-history-round-trip.sqlite'
+                    );
+                    let historyEngine = historyConnection.databaseOps;
+                    await historyEngine.executeQuery(
+                        `CREATE TABLE ${table} (value TEXT, json_value TEXT); ` +
+                        `INSERT INTO ${table}(rowid, value, json_value) VALUES ` +
+                        `(1, 'kept', '${baselineJson}'), ` +
+                        `(2, 'delete-me', '{"row":2}')`
+                    );
+
+                    const tracker = new ModificationTracker<LabeledModification>();
+                    const modifications: LabeledModification[] = [];
+                    const record = (entry: LabeledModification) => {
+                        modifications.push(entry);
+                        tracker.record(entry);
+                    };
+
+                    await historyEngine.updateCell(table, 1, 'value', 'edited');
+                    record({
+                        label: 'Set native cell',
+                        description: 'Set native cell',
+                        modificationType: 'cell_update',
+                        targetTable: table,
+                        targetRowId: 1,
+                        targetColumn: 'value',
+                        priorValue: 'kept',
+                        newValue: 'edited',
+                        operation: 'set'
+                    });
+
+                    await historyEngine.updateCell(table, 1, 'json_value', null, patch);
+                    record({
+                        label: 'Patch native JSON cell',
+                        description: 'Patch native JSON cell',
+                        modificationType: 'cell_update',
+                        targetTable: table,
+                        targetRowId: 1,
+                        targetColumn: 'json_value',
+                        priorValue: baselineJson,
+                        newValue: patch,
+                        operation: 'json_patch'
+                    });
+
+                    const insertedRowId = await historyEngine.insertRow(table, {
+                        value: 'inserted',
+                        json_value: '{}'
+                    });
+                    assert.strictEqual(insertedRowId, 3);
+                    record({
+                        label: 'Insert native row',
+                        description: 'Insert native row',
+                        modificationType: 'row_insert',
+                        targetTable: table,
+                        targetRowId: insertedRowId,
+                        rowData: { value: 'inserted', json_value: '{}' }
+                    });
+
+                    const deletedRows = await historyEngine.deleteRows(table, [2]);
+                    assert.ok(deletedRows);
+                    record({
+                        label: 'Delete native row',
+                        description: 'Delete native row',
+                        modificationType: 'row_delete',
+                        targetTable: table,
+                        affectedRowIds: [2],
+                        deletedRows
+                    });
+
+                    await historyEngine.addColumn(
+                        table,
+                        'history_extra',
+                        'TEXT',
+                        'history-default'
+                    );
+                    record({
+                        label: 'Add native column',
+                        description: 'Add native column',
+                        modificationType: 'column_add',
+                        targetTable: table,
+                        targetColumn: 'history_extra',
+                        columnDef: { type: 'TEXT', defaultValue: 'history-default' }
+                    });
+
+                    const viewDefinition = await historyEngine.createView(
+                        view,
+                        `SELECT rowid, value FROM ${table}`
+                    );
+                    record({
+                        label: 'Create native view',
+                        description: 'Create native view',
+                        modificationType: 'view_create',
+                        targetTable: view,
+                        viewDefAfter: viewDefinition
+                    });
+
+                    await assertSavedState(historyEngine);
+                    await tracker.createCheckpoint();
+                    for (let index = modifications.length - 1; index >= 0; index--) {
+                        const entry = tracker.stepBack();
+                        assert.strictEqual(entry, modifications[index]);
+                        await historyEngine.undoModification(entry!);
+                    }
+                    await assertBaselineState(historyEngine);
+
+                    const backup = tracker.serialize();
+                    historyBundle.workerMethods[Symbol.dispose]();
+                    historyBundle = undefined;
+
+                    historyBundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
+                    historyConnection = await historyBundle.establishConnection(
+                        vscode.Uri.file(historyPath),
+                        'native-history-round-trip.sqlite'
+                    );
+                    historyEngine = historyConnection.databaseOps;
+                    const restoredTracker = ModificationTracker.deserialize<LabeledModification>(backup);
+
+                    await reconcileRestoredDatabase(
+                        historyEngine,
+                        restoredTracker,
+                        'native'
+                    );
+                    await assertBaselineState(historyEngine);
+                    assert.strictEqual(restoredTracker.canStepForward, true);
+
+                    await revertDatabaseToSaved(historyEngine, restoredTracker);
+                    await assertSavedState(historyEngine);
+                    assert.strictEqual(restoredTracker.hasUncommittedChanges(), false);
+                } finally {
+                    historyBundle?.workerMethods[Symbol.dispose]();
+                }
+            }
+        );
 
         await engine.executeQuery(
             'CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT)'

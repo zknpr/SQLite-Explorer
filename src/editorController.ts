@@ -12,15 +12,57 @@ import * as vsc from 'vscode';
 import { crypto } from './platform/cryptoShim';
 import { ConfigurationSection, CopilotChatId, ExtensionId, FirstInstallMs, FullExtensionId, Ns, SidebarLeft, SidebarRight } from './config';
 import { Disposable } from './lifecycle';
-import { cspUtil, doTry, toDatasetAttrs, themeToCss, uiKindToString, BoolString, toBoolString, IsCursorIDE, lang } from './helpers';
+import { cspUtil, doTry, toDatasetAttrs, themeToCss, uiKindToString, BoolString, toBoolString, IsCursorIDE, lang, generateDatabaseDocumentKey } from './helpers';
 import { WebviewCollection } from './webview-collection';
+import { DocumentRegistry } from './documentRegistry';
 
 import { SupportsWriteMode, IsRemoteWorkspaceMode, DatabaseDocument, isAutoCommitEnabled } from './databaseModel';
 
 import { buildMethodProxy } from './core/rpc';
 import { WEBVIEW_TRANSPORT_SURFACES, assertWebviewTransportPayload } from './core/webview-transport';
 import { WebviewMessageHandler } from './webviewMessageHandler';
+import { HostBridge } from './hostBridge';
 import type { CellMaterializationService } from './cellMaterialization';
+
+/** Coalesce provider opens that race before their shared document is registered. */
+const PendingDocumentOpens = new Map<string, Promise<DatabaseDocument>>();
+
+async function acquireDatabaseDocument(
+  provider: DatabaseViewerProvider,
+  uri: vsc.Uri,
+  openContext: vsc.CustomDocumentOpenContext,
+  token?: vsc.CancellationToken
+): Promise<DatabaseDocument> {
+  const documentKey = await generateDatabaseDocumentKey(uri);
+  const existing = DocumentRegistry.get(documentKey);
+  if (existing) {
+    existing.retainReference();
+    return existing;
+  }
+
+  const pending = PendingDocumentOpens.get(documentKey);
+  if (pending) {
+    const document = await pending;
+    document.retainReference();
+    return document;
+  }
+
+  const creation = DatabaseDocument.create(
+    provider,
+    uri,
+    openContext,
+    token,
+    documentKey
+  );
+  PendingDocumentOpens.set(documentKey, creation);
+  try {
+    return await creation;
+  } finally {
+    if (PendingDocumentOpens.get(documentKey) === creation) {
+      PendingDocumentOpens.delete(documentKey);
+    }
+  }
+}
 
 // Webview functions interface - methods the webview exposes to extension
 interface WebviewBridgeFunctions {
@@ -63,6 +105,8 @@ type VSCODE_ENV = {
 export class DatabaseViewerProvider extends Disposable implements vsc.CustomReadonlyEditorProvider<DatabaseDocument> {
   readonly webviews = new WebviewCollection();
   readonly webviewBridges = new Map<vsc.WebviewPanel, WebviewBridgeFunctions>();
+  readonly #configuredDocuments = new WeakSet<DatabaseDocument>();
+  readonly #hostBridges = new WeakMap<DatabaseDocument, HostBridge>();
 
   constructor(
     readonly viewType: string,
@@ -98,9 +142,14 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     token?: vsc.CancellationToken
   ): Promise<DatabaseDocument> {
 
-    const document = await DatabaseDocument.create(this, uri, openContext, token);
+    const document = await acquireDatabaseDocument(this, uri, openContext, token);
 
-    this.configureEventHandlers(document);
+    // A provider needs exactly one listener set for the shared document. The
+    // other view type installs its own set so refreshes reach both collections.
+    if (!this.#configuredDocuments.has(document)) {
+      this.#configuredDocuments.add(document);
+      this.configureEventHandlers(document);
+    }
 
     return document;
   }
@@ -201,9 +250,17 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     // Pass the per-proxy pending invocations map so RPC responses from the webview
     // are correctly routed to the bridge proxy for this specific panel.
     const pendingMap = webviewBridge.__pendingInvocations;
+    let hostBridge = this.#hostBridges.get(document);
+    if (!hostBridge) {
+      // A shared document can be resolved by both registered view types. Keep
+      // panel lookup and read-only gating bound to the provider that owns this
+      // webview while the database engine/history remain document-scoped.
+      hostBridge = new HostBridge(this, document);
+      this.#hostBridges.set(document, hostBridge);
+    }
     const messageHandler = new WebviewMessageHandler(
       (msg) => webviewPanel.webview.postMessage(msg),
-      document.hostBridge,
+      hostBridge,
       pendingMap
     );
     webviewPanel.webview.onDidReceiveMessage((message) => messageHandler.handleMessage(message));

@@ -1515,19 +1515,24 @@ describe('DatabaseDocument undo/redo error handling', () => {
             loaded: true,
             exports: {
                 createDatabaseConnection: () => {
+                    const databaseOps = {
+                        engineKind: Promise.resolve('native' as const),
+                        undoModification: () => Promise.resolve(),
+                        redoModification: () => Promise.resolve(),
+                        close: () => Promise.resolve(),
+                        getSchema: () => Promise.resolve([]),
+                        query: () => Promise.resolve([])
+                    };
                     return Promise.resolve({
                         workerMethods: {
                             open: () => Promise.resolve({ isReadOnly: false, bufferInfo: {} }),
                             exec: () => Promise.resolve(),
                         },
-                        establishConnection: () => Promise.resolve({ isReadOnly: false }),
-                        databaseOps: {
-                            undoModification: () => Promise.resolve(),
-                            redoModification: () => Promise.resolve(),
-                            close: () => Promise.resolve(),
-                            getSchema: () => Promise.resolve([]),
-                            query: () => Promise.resolve([])
-                        }
+                        establishConnection: () => Promise.resolve({
+                            isReadOnly: false,
+                            databaseOps
+                        }),
+                        databaseOps
                     });
                 }
             }

@@ -131,7 +131,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     viewerProvider: DatabaseViewerProvider,
     fileUri: vsc.Uri,
     openContext: vsc.CustomDocumentOpenContext,
-    cancellation?: vsc.CancellationToken
+    cancellation?: vsc.CancellationToken,
+    knownDocumentKey?: string
   ): Promise<DatabaseDocument> {
     const { reporter, isVerified, context: { extensionUri } } = viewerProvider;
     const configuredForceReadOnly = viewerProvider.forceReadOnly ?? false;
@@ -141,6 +142,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const connectionFactory = createDatabaseConnection;
 
     const { filename } = getUriParts(fileUri);
+    const documentKey = knownDocumentKey ?? await generateDatabaseDocumentKey(fileUri);
     const autoCommit = isAutoCommitEnabled();
 
     let connectionBundle: DatabaseConnectionBundle;
@@ -155,6 +157,14 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     );
     databaseOps = result.databaseOps;
     let isReadOnly = result.isReadOnly ?? configuredForceReadOnly;
+    const engineKind = await databaseOps.engineKind;
+
+    if (engineKind === 'native' && !autoCommit) {
+      viewerProvider.outputChannel?.appendLine(
+        '[Persistence] Native backend active: edits are written to the database file ' +
+        'immediately; sqliteExplorer.instantCommit only controls the in-memory WASM backend.'
+      );
+    }
 
     databaseOps = withSqlLogging(databaseOps, filename, viewerProvider.outputChannel);
 
@@ -175,7 +185,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         await reconcileRestoredDatabase(
           databaseOps,
           tracker,
-          await databaseOps.engineKind,
+          engineKind,
           cancelTokenToAbortSignal(cancellation)
         );
       } catch (err) {
@@ -206,7 +216,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       connectionBundle.workerMethods,
       connectionBundle.establishConnection.bind(connectionBundle),
       reporter,
-      forceReadOnlyOnReconnect
+      forceReadOnlyOnReconnect,
+      documentKey
     );
   }
 
@@ -220,6 +231,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   readonly #hostBridge: HostBridge;
   readonly #forceReadOnlyOnReconnect: boolean;
   #connectionGeneration = 0;
+  #referenceCount = 1;
 
   private constructor(
     readonly viewerProvider: DatabaseViewerProvider,
@@ -230,14 +242,15 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     private readonly workerMethods: DatabaseConnectionBundle['workerMethods'],
     private readonly establishConnection: DatabaseConnectionBundle['establishConnection'],
     private readonly reporter?: TelemetryReporter,
-    forceReadOnlyOnReconnect: boolean = viewerProvider.forceReadOnly ?? false
+    forceReadOnlyOnReconnect: boolean = viewerProvider.forceReadOnly ?? false,
+    documentKey: string = ''
   ) {
     super();
     this.#forceReadOnlyOnReconnect = forceReadOnlyOnReconnect;
     this.#modificationTracker = tracker ?? new ModificationTracker<DocumentModification>(MODIFICATION_LIMIT, getMaxUndoMemory());
     this.#hostBridge = new HostBridge(viewerProvider, this);
-    this.#documentKey = generateDatabaseDocumentKey(this.uri);
-    this.#documentKey.then(key => DocumentRegistry.set(key, this));
+    this.#documentKey = Promise.resolve(documentKey);
+    DocumentRegistry.set(documentKey, this);
   }
 
   // Public accessors
@@ -270,9 +283,23 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   // Lifecycle
   // ============================================================================
 
+  /** Retain the shared document for another provider-level custom document. */
+  retainReference(): void {
+    if (this.#referenceCount === 0 || this.isDisposed) {
+      throw new Error('Cannot retain a disposed database document');
+    }
+    this.#referenceCount++;
+  }
+
   async dispose(): Promise<void> {
+    if (this.#referenceCount === 0) return;
+    this.#referenceCount--;
+    if (this.#referenceCount > 0) return;
+
     const key = await this.#documentKey;
-    DocumentRegistry.delete(key);
+    if (DocumentRegistry.get(key) === this) {
+      DocumentRegistry.delete(key);
+    }
     this.workerMethods[Symbol.dispose]();
     // Consumers must see disposal before the registered emitter itself is
     // disposed by the base class, otherwise their cleanup callbacks never run.

@@ -335,13 +335,10 @@ describe('reconcileRestoredDatabase', () => {
     assert.strictEqual(r[0].rows[0][0], 'v1');
   });
 
-  it('BC-revert native: re-applies saved-undone edits via redoModification, not the native no-op applyModifications', async () => {
-    // The native engine implements replay in redoModification and treats
-    // applyModifications as a no-op (src/nativeWorker.ts). Mimic that contract:
-    // applyModifications records nothing, redoModification records. If
-    // revertDatabaseToSaved ever re-applies the redo via applyModifications, a
-    // native database would silently stay at the undone state — so assert it
-    // uses redoModification.
+  it('BC-revert native: re-applies saved-undone edits via redoModification, not unsupported applyModifications', async () => {
+    // Native history replay belongs to redoModification; applyModifications is
+    // unsupported. Record both calls so this unit test pins the branch even when
+    // the bundled native binary is unavailable.
     const redone: string[] = [];
     const applied: string[] = [];
     const discarded: string[] = [];

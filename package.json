@@ -117,7 +117,7 @@
             "remote-only"
           ],
           "default": "never",
-          "markdownDescription": "Controls when changes are saved to disk.\n- `always`: Changes are saved immediately.\n- `never`: Changes are kept in memory until manually saved.\n- `remote-only`: Auto-save only in remote workspaces."
+          "markdownDescription": "Controls when changes are saved to disk by the in-memory WASM backend. On the native desktop backend (the default), edits are written to the database file immediately regardless of this setting.\n- `always`: Changes are saved immediately.\n- `never`: Changes are kept in memory until manually saved.\n- `remote-only`: Auto-save only in remote workspaces."
         },
         "sqliteExplorer.doubleClickBehavior": {
           "type": "string",

@@ -79,12 +79,11 @@ export async function revertDatabaseToSaved(
   // Discard live edits first, then re-apply the saved entries the user had
   // undone so the final database matches the checkpoint.
   //
-  // Re-apply via `redoModification`, NOT `applyModifications`: the native engine
-  // implements replay in `redoModification` and treats `applyModifications` as a
-  // no-op (`src/nativeWorker.ts`), so using `applyModifications` here would
-  // silently leave a native database at the undone state while the tracker is
-  // marked clean. As in restore, the sequence is per-operation atomic rather
-  // than wrapped in a SAVEPOINT (row/column undos open their own transaction).
+  // Re-apply via `redoModification`, NOT `applyModifications`: native history
+  // replay is implemented per entry in `redoModification`, while its unsupported
+  // batch API throws so a future miswire cannot silently mark the wrong database
+  // state clean. As in restore, the sequence is per-operation atomic rather than
+  // wrapped in a SAVEPOINT (row/column undos open their own transaction).
   if (forward.length > 0) {
     await databaseOps.discardModifications(forward, signal);
   }

@@ -1273,7 +1273,12 @@ export async function createNativeDatabaseConnection(
           return result.content;
         },
 
-        applyModifications: async () => {},
+        applyModifications: async () => {
+          throw new Error(
+            'applyModifications is not supported on the native backend; ' +
+            'history replay uses redoModification'
+          );
+        },
 
         /**
          * Undo a modification by executing the inverse SQL.
