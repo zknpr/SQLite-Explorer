@@ -550,6 +550,11 @@ vendored sql.js build, so the curves are directly comparable. Same narrow fixtur
 
 ¹ open includes reading the file into memory, which for WASM is unavoidable.
 
+Build flags are settled: an `-O3` build of the same fork (measured 2026-08-08, warm
+A/B/A on the 10 M fixture) doubles the artifact for identical hot paths, a ~5% *slower*
+deep OFFSET, and ~12% on unindexed scans only — keep `-Oz` for every target and re-test
+only if the compiler toolchain changes.
+
 Head-to-head at 10 M rows (WASM vs raw `sqlite3`): deep OFFSET 74.3 vs 67.2 ms, keyset 0.1
 vs 0.0, `COUNT(*)` **12.1 vs 31.4** (WASM wins — the whole database is already resident, so
 there are no page-cache misses), unindexed scan 376 vs 216 ms.
