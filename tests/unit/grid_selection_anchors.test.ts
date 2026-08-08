@@ -96,6 +96,11 @@ describe('grid selection anchors', () => {
         delete (globalThis as any).document;
         delete (globalThis as any).CSS;
         await resetSelectionState();
+        // The count cache is module state shared across this process; clear it
+        // so the next test's count mock always gets its first fetch.
+        const countCacheModulePath = '../../core/ui/modules/count-cache.js';
+        const { invalidateAllCounts } = await import(countCacheModulePath);
+        invalidateAllCounts();
     });
 
     it('drops all shift-range anchors when loadTableData commits a new page', async () => {

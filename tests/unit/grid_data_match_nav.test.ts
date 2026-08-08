@@ -20,9 +20,14 @@ function createClassList(initial: string[] = []) {
 }
 
 describe('grid data match cache', () => {
-    afterEach(() => {
+    afterEach(async () => {
         delete (globalThis as any).document;
         mock.restoreAll();
+        // The count cache is module state shared across this process; clear it
+        // so the next test's count mock always gets its first fetch.
+        const countCacheModulePath = '../../core/ui/modules/count-cache.js';
+        const { invalidateAllCounts } = await import(countCacheModulePath);
+        invalidateAllCounts();
     });
 
     it('omits whitespace-only filters from both count and data requests', async () => {
@@ -662,9 +667,10 @@ describe('grid data match cache', () => {
         const originalFetchData = backendApi.fetchTableData;
         mock.method(console, 'error', () => {});
         backendApi.fetchTableCount = async () => counts[countCall++];
-        backendApi.fetchTableData = async () => {
-            throw new Error('fetchTableData should not run in this test');
-        };
+        // A cache miss legitimately issues the data query in parallel with the
+        // count; neither load's result is committed here (the first is
+        // superseded, the second fails on its count), so plain rows suffice.
+        backendApi.fetchTableData = async () => ({ rows: [] });
         state.selectedTable = 'items';
         state.selectedTableType = 'table';
         state.renderedTable = null;

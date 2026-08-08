@@ -8,6 +8,7 @@ import { openModal, closeModal } from './modals.js';
 import { loadTableData, loadTableColumns } from './grid.js';
 import { refreshSchema } from './sidebar.js';
 import { parseGridInputValue } from './utils.js';
+import { noteRowCountChanged, noteCellValuesChanged } from './count-cache.js';
 
 export function initCrud() {
     // --- Toolbar Buttons ---
@@ -140,9 +141,16 @@ export async function submitAddRow() {
         }
     }
 
+    // Snapshot the target so the count delta below can never be applied to a
+    // table the user switched to while the insert RPC was in flight.
+    const targetTable = state.selectedTable;
+
     try {
         updateStatus('Inserting row...');
-        await backendApi.insertRow(state.selectedTable, rowData);
+        await backendApi.insertRow(targetTable, rowData);
+        // Keeps the cached count truthful so the reload below (and page turns
+        // after it) need no COUNT(*) refetch.
+        noteRowCountChanged(targetTable, 1);
 
         closeModal('addRowModal');
         await loadTableData();
@@ -188,10 +196,17 @@ async function submitDeleteRows() {
     if (state.selectedRowIds.size === 0) return;
 
     const rowIds = Array.from(state.selectedRowIds);
+    // Snapshot the target so the count delta below can never be applied to a
+    // table the user switched to while the delete RPC was in flight.
+    const targetTable = state.selectedTable;
 
     try {
         updateStatus('Deleting rows...');
-        await backendApi.deleteRows(state.selectedTable, rowIds);
+        await backendApi.deleteRows(targetTable, rowIds);
+        // The ids came from the displayed grid, so within this session the
+        // engine deleted exactly this many rows; external divergence lands as
+        // a refreshContent broadcast, which invalidates the cache wholesale.
+        noteRowCountChanged(targetTable, -rowIds.length);
 
         closeModal('deleteModal');
         state.selectedRowIds.clear();
@@ -209,10 +224,13 @@ async function submitDeleteColumns() {
     if (state.selectedColumns.size === 0) return;
 
     const columnNames = Array.from(state.selectedColumns);
+    // Snapshot: a table switch during the RPC must not misattribute the
+    // count invalidation below.
+    const table = state.selectedTable;
 
     try {
         updateStatus('Deleting columns...');
-        const result = await backendApi.deleteColumns(state.selectedTable, columnNames);
+        const result = await backendApi.deleteColumns(table, columnNames);
 
         // If user cancelled the operation (e.g., declined to drop dependent indexes), don't reload
         if (result && result.cancelled) {
@@ -220,6 +238,12 @@ async function submitDeleteColumns() {
             closeModal('deleteModal');
             return;
         }
+
+        // Dropping a column keeps the row count but changes what filters can
+        // match — and count identities name filters, not schema, so a later
+        // re-add of the same column name must not revive counts cached
+        // against the old column's values.
+        noteCellValuesChanged(table);
 
         closeModal('deleteModal');
         state.selectedColumns.clear();
@@ -424,9 +448,16 @@ export async function submitAddColumn() {
         return;
     }
 
+    // Snapshot for the same reason as submitDeleteColumns.
+    const table = state.selectedTable;
+
     try {
         updateStatus('Adding column...');
-        await backendApi.addColumn(state.selectedTable, columnName, columnType, defaultValue);
+        await backendApi.addColumn(table, columnName, columnType, defaultValue);
+
+        // Same schema-change rule as submitDeleteColumns: filtered counts
+        // cached before this DDL must not survive it.
+        noteCellValuesChanged(table);
 
         closeModal('addColumnModal');
         await loadTableColumns();

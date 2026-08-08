@@ -47,6 +47,11 @@ function createTextarea(value: string, selectionStart: number, selectionEnd = se
 describe('editor keyboard and grid selection interactions', () => {
     afterEach(async () => {
         delete (globalThis as any).document;
+        // The count cache is module state shared across this process; clear it
+        // so the next test's count mock always gets its first fetch.
+        const countCacheModulePath = '../../core/ui/modules/count-cache.js';
+        const { invalidateAllCounts } = await import(countCacheModulePath);
+        invalidateAllCounts();
         const { state } = await import(stateModulePath);
         state.editingCellInfo = null;
         state.activeCellInput = null;

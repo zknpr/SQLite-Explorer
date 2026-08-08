@@ -26,9 +26,14 @@ async function loadHarness() {
     const stateModulePath = '../../core/ui/modules/state.js';
     const apiModulePath = '../../core/ui/modules/api.js';
     const gridDataModulePath = '../../core/ui/modules/grid-data.js';
+    const countCacheModulePath = '../../core/ui/modules/count-cache.js';
     const { state } = await import(stateModulePath);
     const { backendApi } = await import(apiModulePath);
     const { loadTableData } = await import(gridDataModulePath);
+    const { invalidateAllCounts } = await import(countCacheModulePath);
+    // The count cache is module state shared across this process; start each
+    // test cold so per-test count mocks always get their first fetch.
+    invalidateAllCounts();
     return { state, backendApi, loadTableData };
 }
 

@@ -13,6 +13,7 @@ import {
     remapDisplayedRowIdentity,
     resolveDisplayedCell
 } from './data-utils.js';
+import { noteCellValuesChanged } from './count-cache.js';
 import { formatCellValueAsText } from './utils.js';
 import { renderDataGrid } from './grid.js';
 
@@ -241,6 +242,9 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
             uint8Array,
             uploadTarget.originalValue
         );
+        // The uploaded value may enter/leave an active filter's match set,
+        // so the table's cached filtered counts can't be trusted.
+        noteCellValuesChanged(uploadTarget.table);
 
         // A background refresh may reorder rows or columns while the write is
         // in flight. Resolve the current UI position only after the stable

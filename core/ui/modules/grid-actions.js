@@ -16,9 +16,11 @@ import {
 
 const FILTER_DEBOUNCE_MS = 300;
 const FILTER_RELOAD_RETRY_MS = 50;
-// One grid load performs count and data RPCs sequentially, so its legitimate
-// lifetime can approach two RPC deadlines. A missing owner is an impossible
-// production state, but still gets a short fail-safe bound instead of spinning.
+// One grid load fetches count and data in parallel but may still issue one
+// sequential follow-up data fetch (count-first 'last' navigation, a clamp
+// correction, or the keyset OFFSET retry), so its legitimate lifetime can
+// approach two RPC deadlines. A missing owner is an impossible production
+// state, but still gets a short fail-safe bound instead of spinning.
 const FILTER_RELOAD_OWNER_WAIT_MS = RPC_TIMEOUT_MS * 2;
 const FILTER_RELOAD_FALLBACK_WAIT_MS = 5000;
 

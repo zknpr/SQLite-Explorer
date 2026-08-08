@@ -5,6 +5,7 @@ import { state } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus, updateToolbarButtons } from './ui.js';
 import { loadTableData } from './grid.js';
+import { noteCellValuesChanged } from './count-cache.js';
 import {
     getCellValueForDisplay,
     getCellMutationBlockReason,
@@ -154,7 +155,13 @@ export async function clearSelectedCellValues() {
         }
 
         const label = `Clear ${updates.length} cell${updates.length > 1 ? 's' : ''}`;
-        const outcomes = await backendApi.updateCellBatch(state.selectedTable, updates, label);
+        // Snapshot the target so the cache note below can never be applied to
+        // a table the user switched to while the batch RPC was in flight.
+        const targetTable = state.selectedTable;
+        const outcomes = await backendApi.updateCellBatch(targetTable, updates, label);
+        // Cleared values may leave an active filter's match set, so the
+        // table's cached filtered counts are no longer trustworthy.
+        noteCellValuesChanged(targetTable);
         for (const outcome of outcomes ?? []) {
             const currentCell = resolveDisplayedCell(
                 state.selectedTable,

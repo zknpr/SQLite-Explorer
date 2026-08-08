@@ -145,7 +145,12 @@ it('clears and persists a displayed view selection before the demo refresh reloa
                                 return ${harness}.state.isDbConnected;
                             }
                         `,
-                        './modules/global-shortcuts.js': 'export function setupGlobalShortcuts() {}'
+                        './modules/global-shortcuts.js': 'export function setupGlobalShortcuts() {}',
+                        './modules/count-cache.js': `
+                            export function invalidateAllCounts() {
+                                globalThis.__countInvalidations = (globalThis.__countInvalidations ?? 0) + 1;
+                            }
+                        `
                     };
                     const contents = modules[args.path];
                     if (!contents) throw new Error(`Missing web-viewer test stub for ${args.path}`);

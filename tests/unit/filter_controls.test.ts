@@ -207,6 +207,11 @@ async function prepareState(columns: Array<{ name: string; type: string }>) {
 describe('filter controls', () => {
     afterEach(async () => {
         delete (globalThis as any).document;
+        // The count cache is module state shared across this process; clear it
+        // so the next test's count mock always gets its first fetch.
+        const countCacheModulePath = '../../core/ui/modules/count-cache.js';
+        const { invalidateAllCounts } = await import(countCacheModulePath);
+        invalidateAllCounts();
         const { state } = await import(stateModulePath);
         if (state.filterTimer !== null) clearTimeout(state.filterTimer);
         state.filterTimer = null;

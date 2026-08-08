@@ -7,6 +7,7 @@ import { validateRowId, formatCellValueAsText, parseGridInputValue } from './uti
 import { updateStatus } from './ui.js';
 import { updateSelectionStates, clearSelection } from './grid-selection.js';
 import { loadTableData } from './grid-data.js';
+import { noteCellValuesChanged } from './count-cache.js';
 import {
     getRowDataOffset,
     getCellValue,
@@ -210,6 +211,9 @@ export async function saveCellEdit() {
             valueToSave,
             originalValue
         );
+        // The edited value may enter/leave an active filter's match set, so
+        // the table's cached filtered counts are no longer trustworthy.
+        noteCellValuesChanged(targetTable);
 
         // A broadcast refresh can reorder gridData before this RPC resolves.
         // Resolve by stable identity only if the original table is still
@@ -560,6 +564,9 @@ export async function saveCellPreview() {
             valueToSave,
             originalValue
         );
+        // The edited value may enter/leave an active filter's match set, so
+        // the table's cached filtered counts are no longer trustworthy.
+        noteCellValuesChanged(targetTable);
 
         // A broadcast refresh can reorder both rows and columns while the RPC is
         // pending. Resolve the preview target from its stable database identity

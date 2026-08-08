@@ -6,6 +6,7 @@ import { clearSelection, loadTableData, loadTableColumns } from './grid.js';
 import { refreshSchema } from './sidebar.js';
 import { handleRpcResponse, sendRpcResult, sendRpcError } from './api.js';
 import { applyConnectionResult } from './connection-state.js';
+import { invalidateAllCounts } from './count-cache.js';
 
 export { backendApi } from './api.js';
 
@@ -13,6 +14,11 @@ export { backendApi } from './api.js';
  * Methods called by the extension host.
  */
 export async function refreshContent(filename, connectionResult) {
+    // This broadcast means the document changed in a way this webview didn't
+    // perform itself (undo/redo, another panel's edit, a VS Code cell-editor
+    // write, revert — the host also echoes one after this webview's own
+    // edits). None of the cached counts can be trusted across it.
+    invalidateAllCounts();
     if (connectionResult) {
         applyConnectionResult(connectionResult);
     }

@@ -17,6 +17,7 @@ import { openSettingsModal } from './settings.js';
 import { openCreateViewModal, openEditViewModal, dropViewFromSidebar } from './views.js';
 import { groupSelectedCellsByColumn, summarizeColumnValue, prepareBatchUpdates } from './batch-update-logic.js';
 import { applyConnectionResult } from './connection-state.js';
+import { invalidateAllCounts, noteCellValuesChanged } from './count-cache.js';
 
 export function initSidebar() {
     const sidebarPanel = document.getElementById('sidebarPanel');
@@ -429,6 +430,10 @@ export async function applyBatchUpdate() {
         return;
     }
 
+    // Snapshot the target so the count-cache note below can never be applied
+    // to a table the user switched to while the batch RPC was in flight.
+    const targetTable = state.selectedTable;
+
     try {
         updateStatus(`Updating ${updates.length} cells...`);
         const label = `Batch update ${updates.length} cells`;
@@ -442,7 +447,10 @@ export async function applyBatchUpdate() {
             operation: u.operation
         }));
 
-        const outcomes = await backendApi.updateCellBatch(state.selectedTable, backendUpdates, label);
+        const outcomes = await backendApi.updateCellBatch(targetTable, backendUpdates, label);
+        // Edited values may enter/leave an active filter's match set, so the
+        // table's cached filtered counts are no longer trustworthy.
+        noteCellValuesChanged(targetTable);
         const identityChanges = new Map();
         for (const outcome of outcomes ?? []) {
             if (outcome.newRowId === undefined || outcome.newRowId === outcome.rowId) continue;
@@ -559,6 +567,13 @@ export function toggleSection(section) {
 }
 
 export async function selectTableItem(name, type) {
+    // Drop every cached count, not just the target's: views project other
+    // tables and triggers/cascades can fan a mutation out, so counts cached
+    // for objects other than the one being edited are only sound while the
+    // selection cannot have observed such a change — which ends here. A
+    // switch's first load fetches its count in parallel with data, so this
+    // costs no extra latency class.
+    invalidateAllCounts();
     state.selectedTable = name;
     state.selectedTableType = type;
     state.selectedTableIdentity = type === 'table'
@@ -608,6 +623,9 @@ export async function reloadFromDisk() {
 
     try {
         updateStatus('Reloading...');
+        // The reload exists to pick up changes this webview didn't make, so
+        // no cached count survives it.
+        invalidateAllCounts();
         const connectionResult = await backendApi.refreshFile();
         if (connectionResult?.connected === true) {
             applyConnectionResult(connectionResult);

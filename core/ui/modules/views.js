@@ -9,6 +9,7 @@ import { clearSelection, loadTableColumns, loadTableData } from './grid.js';
 import { showEmptyState, updateStatus, updateToolbarButtons } from './ui.js';
 import { formatCellValueAsText } from './utils.js';
 import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
+import { invalidateAllCounts } from './count-cache.js';
 import {
     isViewDefinitionConflictError,
     isViewDefinitionSnapshotCurrent,
@@ -329,6 +330,12 @@ async function saveDraft() {
         }
 
         const changedView = targetView ?? draft.name;
+        // A redefined view is a different query — and any OTHER view that
+        // projects it changed row set too, without a table switch to
+        // invalidate for it (the modal can edit view B while view A stays
+        // selected). Wholesale invalidation is the only sound scope here;
+        // it costs one count refetch on the next load.
+        invalidateAllCounts();
         if (isCurrentModalSession(modalSession)) closeModal('viewModal');
         await refreshSchema();
         if (state.selectedTable === changedView && state.selectedTableType === 'view') {

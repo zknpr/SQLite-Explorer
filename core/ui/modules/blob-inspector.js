@@ -9,6 +9,7 @@ import {
     resolveDisplayedCell
 } from './data-utils.js';
 import { updateStatus } from './ui.js';
+import { noteCellValuesChanged } from './count-cache.js';
 
 
 const FILE_SIGNATURES = {
@@ -265,6 +266,9 @@ export class BlobInspector {
                 uint8Array,
                 originalValue
             );
+            // The replaced value may enter/leave an active filter's match
+            // set, so the table's cached filtered counts can't be trusted.
+            noteCellValuesChanged(targetTable);
 
             const currentCell = resolveDisplayedCell(targetTable, targetRowId, targetColumn)
                 ?? (updatedRowId !== undefined

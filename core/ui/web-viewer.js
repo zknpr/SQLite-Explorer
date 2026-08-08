@@ -20,6 +20,7 @@ import {
 import {
     initExport
 } from './modules/export.js';
+import { invalidateAllCounts } from './modules/count-cache.js';
 
 import {
     initCrud
@@ -62,6 +63,11 @@ import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
  */
 const webviewMethods = {
     async refreshContent(filename, connectionResult) {
+        // Same contract as the VS Code twin in rpc.js: this broadcast means
+        // the database changed in a way this webview didn't perform itself,
+        // so no cached count survives it. (Currently unused by the demo
+        // host, but the parity keeps it safe to wire.)
+        invalidateAllCounts();
         if (connectionResult) {
             applyConnectionResult(connectionResult);
         }

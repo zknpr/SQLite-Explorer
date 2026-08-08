@@ -8,6 +8,7 @@ import { updatePagination, renderDataGrid } from './grid-render.js';
 import { clearCellSelection } from './grid-selection.js';
 import { resetMatchNav } from './match-nav.js';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
+import { buildCountIdentity, getCachedCount, prepareCountStore } from './count-cache.js';
 
 export async function loadTableColumns() {
     if (!state.selectedTable) return;
@@ -86,8 +87,13 @@ export function getGridReloadOwner() {
  * these checks and fall back to OFFSET. The engine independently re-validates
  * the anchor's embedded query tag, so sort/filter/page-size staleness needs no
  * tracking here.
+ *
+ * `recordCount`/`pageCount` are undefined for the speculative data query a
+ * cache miss fires in parallel with its count; anchor-based modes never need
+ * them, and 'last' (whose remainder derives from the count) is unreachable
+ * there because 'last' navigation resolves its count first.
  */
-function buildKeysetRequest(nav, pageIndex, pageCount, recordCount, table) {
+function buildKeysetRequest(nav, pageIndex, pageCount, recordCount, table, pageSize) {
     // Page 0 needs no anchor and no OFFSET scan; covers 'first', 'prev' to 0,
     // any refetch at 0, and single-page tables.
     if (pageIndex === 0) return { mode: 'first' };
@@ -99,11 +105,11 @@ function buildKeysetRequest(nav, pageIndex, pageCount, recordCount, table) {
     if (nav === 'prev' && usable && anchors.pageIndex === pageIndex + 1 && anchors.first) {
         return { mode: 'before', anchor: anchors.first };
     }
-    if (nav === 'last' && pageIndex === pageCount - 1) {
+    if (nav === 'last' && recordCount !== undefined && pageIndex === pageCount - 1) {
         // The reversed query must return the same short remainder page as
-        // OFFSET so the page phase never shifts; computed from the count
-        // fetched moments ago in this same load.
-        return { mode: 'last', lastPageRowCount: recordCount - pageIndex * state.rowsPerPage };
+        // OFFSET so the page phase never shifts; computed from the count this
+        // same load resolved (cached, or fetched moments ago).
+        return { mode: 'last', lastPageRowCount: recordCount - pageIndex * pageSize };
     }
     if (nav === 'refetch' && usable && anchors.pageIndex === pageIndex && anchors.first) {
         return { mode: 'atOrAfter', anchor: anchors.first };
@@ -112,20 +118,20 @@ function buildKeysetRequest(nav, pageIndex, pageCount, recordCount, table) {
 }
 
 /**
- * True when a keyset page disagrees with the count fetched in the same load —
- * rows past the anchor were deleted (or filtered away) since it was minted.
- * The caller re-runs the load once with the OFFSET query, which both restores
+ * True when a keyset page disagrees with the count this load resolved — rows
+ * past the anchor were deleted (or filtered away) since it was minted. The
+ * caller re-runs the load once with the OFFSET query, which both restores
  * today's exact behavior for the race and re-anchors from its result. 'first'
  * and 'last' are self-consistent and never retried.
  */
-function keysetResultNeedsOffsetRetry(keyset, dataResult, recordCount, pageIndex) {
+function keysetResultNeedsOffsetRetry(keyset, dataResult, recordCount, pageIndex, pageSize) {
     if (keyset.mode === 'first' || keyset.mode === 'last') return false;
     const rowCount = (dataResult.rows || []).length;
-    const expectedRows = recordCount - pageIndex * state.rowsPerPage;
+    const expectedRows = recordCount - pageIndex * pageSize;
     if (rowCount === 0) return expectedRows > 0;
-    // 'before' targets an interior page, which the fresh count says is full; a
-    // short result would shift the page phase, so prefer the OFFSET truth.
-    if (keyset.mode === 'before') return rowCount < Math.min(state.rowsPerPage, expectedRows);
+    // 'before' targets an interior page, which the load's count says is full;
+    // a short result would shift the page phase, so prefer the OFFSET truth.
+    if (keyset.mode === 'before') return rowCount < Math.min(pageSize, expectedRows);
     return false;
 }
 
@@ -214,17 +220,19 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             globalFilterColumns: columnNames
         };
 
-        // Get total count
-        const totalRecordCount = await backendApi.fetchTableCount(requestedTable, countOptions);
-        if (isSuperseded()) return; // a newer load started, or the user switched tables
-        const totalPageCount = Math.max(1, Math.ceil(totalRecordCount / state.rowsPerPage));
-        let currentPageIndex = state.currentPageIndex;
+        // The count's cache identity, built from the exact inputs countOptions
+        // carries so a cached value is interchangeable with a fetch. Page size
+        // and sort order don't change the count and are not part of it.
+        const countIdentity = buildCountIdentity(
+            requestedTable, filters, globalFilter, columnNames
+        );
 
-        if (currentPageIndex >= totalPageCount) {
-            currentPageIndex = Math.max(0, totalPageCount - 1);
-        }
+        // Snapshot the page size once so the clamp, OFFSET, keyset remainder,
+        // and committed page math all derive from the same value across the
+        // awaits below. (A mid-load page-size change also supersedes this
+        // load; the snapshot makes the consistency structural, not reasoned.)
+        const requestedPageSize = state.rowsPerPage;
 
-        // Get data
         const isTable = requestedTableType === 'table';
 
         // For tables, we need to explicitly request the 'rowid' column to handle row identification.
@@ -232,35 +240,119 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // Query builder handles the construction: SELECT "rowid", "col1", ...
         const queryColumns = isTable ? ['rowid', ...columnNames] : columnNames;
 
-        const queryOptions = {
-            columns: queryColumns,
-            // rowid stays in SELECT for table identity, but users filter only
-            // the displayed schema columns scanned by match navigation.
-            globalFilterColumns: columnNames,
-            orderBy: state.sortedColumn,
-            orderDir: state.sortAscending ? 'ASC' : 'DESC',
-            limit: state.rowsPerPage,
-            offset: currentPageIndex * state.rowsPerPage,
-            filters,
-            globalFilter
+        // One builder for every data request this load can issue (speculative,
+        // clamped, retry), so they can never disagree on anything but the page
+        // index and count knowledge. OFFSET always stays in the request: it is
+        // the engine's validated fallback whenever the keyset does not hold up.
+        const buildDataQueryOptions = (pageIndex, recordCount, pageCount) => {
+            const options = {
+                columns: queryColumns,
+                // rowid stays in SELECT for table identity, but users filter only
+                // the displayed schema columns scanned by match navigation.
+                globalFilterColumns: columnNames,
+                orderBy: state.sortedColumn,
+                orderDir: state.sortAscending ? 'ASC' : 'DESC',
+                limit: requestedPageSize,
+                offset: pageIndex * requestedPageSize,
+                filters,
+                globalFilter
+            };
+            const keyset = isTable
+                ? buildKeysetRequest(
+                    navIntent ?? 'refetch',
+                    pageIndex,
+                    pageCount,
+                    recordCount,
+                    requestedTable,
+                    requestedPageSize
+                  )
+                : undefined;
+            if (keyset) options.keyset = keyset;
+            return options;
         };
 
-        // OFFSET always stays in the request: it is the engine's validated
-        // fallback whenever the keyset request does not hold up.
-        const keyset = isTable
-            ? buildKeysetRequest(
-                navIntent ?? 'refetch',
-                currentPageIndex,
-                totalPageCount,
-                totalRecordCount,
-                requestedTable
-              )
-            : undefined;
-        if (keyset) queryOptions.keyset = keyset;
+        // Resolve the count: cached when the identity is known, otherwise
+        // fetched — in parallel with the data query wherever possible. From
+        // here on this single totalRecordCount value feeds the clamp, the
+        // page count, the keyset 'last' remainder, the retry check, and the
+        // commit; cached and fetched counts are never mixed within one load.
+        let totalRecordCount = getCachedCount(countIdentity);
 
-        let dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
-        if (isSuperseded()) return; // superseded (newer load or table switch) during the fetch
-        if (keyset && keysetResultNeedsOffsetRetry(keyset, dataResult, totalRecordCount, currentPageIndex)) {
+        if (totalRecordCount === undefined && navIntent === 'last') {
+            // 'last' must resolve the count before the data query: both its
+            // page index and the keyset remainder derive from it, and on huge
+            // tables the reversed remainder scan is far cheaper than the
+            // deep-OFFSET scan a count-blind query would need. This is exactly
+            // the original sequential flow.
+            const storeCount = prepareCountStore(countIdentity);
+            totalRecordCount = await backendApi.fetchTableCount(requestedTable, countOptions);
+            if (isSuperseded()) return; // a newer load started, or the user switched tables
+            storeCount(totalRecordCount);
+        }
+
+        let totalPageCount;
+        let currentPageIndex = state.currentPageIndex;
+        let dataResult;
+        let queryOptions;
+
+        if (totalRecordCount !== undefined) {
+            // Count known synchronously (cache hit) or resolved above: page
+            // turns run a single data query and no count RPC at all.
+            totalPageCount = Math.max(1, Math.ceil(totalRecordCount / requestedPageSize));
+            if (currentPageIndex >= totalPageCount) {
+                currentPageIndex = Math.max(0, totalPageCount - 1);
+            }
+            queryOptions = buildDataQueryOptions(currentPageIndex, totalRecordCount, totalPageCount);
+            dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
+            if (isSuperseded()) return; // superseded (newer load or table switch) during the fetch
+        } else {
+            // Cache miss: fetch count and data in parallel instead of serially,
+            // so the miss costs the slower of the two rather than their sum.
+            // The data query is speculative in one narrow way: it assumes the
+            // current page index needs no clamp. That only fails when the
+            // count shrank below the current page through changes this webview
+            // didn't make (its own deletes adjust the cache and take the
+            // count-known branch), and then the speculative result is
+            // discarded and refetched at the clamped index.
+            const storeCount = prepareCountStore(countIdentity);
+            const speculativeOptions = buildDataQueryOptions(currentPageIndex, undefined, undefined);
+            // allSettled: a rejection on either leg must not surface as an
+            // unhandled rejection while the other is pending. Failures rethrow
+            // below in count-then-data order, matching the sequential flow
+            // this replaces.
+            const [countOutcome, dataOutcome] = await Promise.allSettled([
+                backendApi.fetchTableCount(requestedTable, countOptions),
+                backendApi.fetchTableData(requestedTable, speculativeOptions)
+            ]);
+            if (isSuperseded()) return; // superseded during the parallel fetch
+            if (countOutcome.status === 'rejected') throw countOutcome.reason;
+            totalRecordCount = countOutcome.value;
+            // Store before inspecting the data outcome: the count is engine
+            // truth for this identity regardless of the data query's fate, so
+            // even a failed load seeds the reload that follows it. The store
+            // itself refuses the write if any mutation/invalidation happened
+            // while the fetch was in flight, and the isSuperseded gate above
+            // kept a stale load from reaching it.
+            storeCount(totalRecordCount);
+            totalPageCount = Math.max(1, Math.ceil(totalRecordCount / requestedPageSize));
+            if (currentPageIndex >= totalPageCount) {
+                // The speculative query targeted a page past the new end; its
+                // (empty) result never surfaces. Refetch at the clamped index
+                // with the count-aware keyset, as the sequential flow did.
+                currentPageIndex = Math.max(0, totalPageCount - 1);
+                queryOptions = buildDataQueryOptions(currentPageIndex, totalRecordCount, totalPageCount);
+                dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
+                if (isSuperseded()) return;
+            } else {
+                if (dataOutcome.status === 'rejected') throw dataOutcome.reason;
+                dataResult = dataOutcome.value;
+                queryOptions = speculativeOptions;
+            }
+        }
+
+        if (queryOptions.keyset && keysetResultNeedsOffsetRetry(
+            queryOptions.keyset, dataResult, totalRecordCount, currentPageIndex, requestedPageSize
+        )) {
             // Concurrent writes invalidated the anchor's position. One retry
             // with the plain OFFSET query (identical to the pre-keyset SQL)
             // restores today's behavior and re-anchors from its result.
