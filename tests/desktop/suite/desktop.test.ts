@@ -2,7 +2,6 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import initSqlJs, { type SqlJsStatic, type SqlValue } from 'sql.js';
 import * as vscode from 'vscode';
 
 declare function suite(title: string, body: () => void): void;
@@ -11,6 +10,23 @@ declare function setup(body: () => void | Promise<void>): void;
 declare function teardown(body: () => void | Promise<void>): void;
 declare function suiteSetup(body: () => void | Promise<void>): void;
 declare function suiteTeardown(body: () => void | Promise<void>): void;
+
+type SqlValue = number | string | Uint8Array | null;
+
+interface SqlJsDatabase {
+  run(sql: string, params?: SqlValue[]): void;
+  exec(sql: string): Array<{ columns: string[]; values: SqlValue[][] }>;
+  export(): Uint8Array;
+  close(): void;
+}
+
+interface SqlJsStatic {
+  Database: new (data?: Uint8Array | ArrayBuffer) => SqlJsDatabase;
+}
+
+const initSqlJs = require('sql.js') as (config?: {
+  locateFile?: (filename: string) => string;
+}) => Promise<SqlJsStatic>;
 
 type Backend = 'native' | 'wasm';
 type Storage = 'native' | 'memory' | 'paged';
@@ -124,7 +140,12 @@ function findCustomTab(uri: vscode.Uri, viewType: string): vscode.Tab | undefine
   });
 }
 
-async function closeTab(tab: vscode.Tab): Promise<void> {
+async function closeCustomTab(uri: vscode.Uri, viewType: string): Promise<void> {
+  // TabGroups.close validates object identity against its current tab model.
+  // Re-resolve immediately before closing: opening/resolving another editor can
+  // replace the API snapshot while leaving the same visible tab alive.
+  const tab = findCustomTab(uri, viewType);
+  assert.ok(tab, `Custom editor tab disappeared before close: ${viewType}`);
   assert.equal(await vscode.window.tabGroups.close(tab), true, 'VS Code refused to close the custom-editor tab');
 }
 
@@ -294,7 +315,7 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
         assert.equal(state.engineKind, backend);
         assert.equal(state.workerDisposeRequested, false);
 
-        await closeTab(tab);
+        await closeCustomTab(fixture.uri, viewTypes[0]);
         await waitFor('registry removal after editor close', async () => (
           (await api.inspectDocument(fixture.uri.toString())) === null
         ));
@@ -324,7 +345,7 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
           viewTypes[1],
           vscode.ViewColumn.Beside
         );
-        const optionalTab = await waitFor('the optional custom editor', () => (
+        await waitFor('the optional custom editor', () => (
           findCustomTab(fixture.uri, viewTypes[1])
         ));
         const defaultTab = findCustomTab(fixture.uri, viewTypes[0]);
@@ -338,7 +359,7 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
         assert.equal(shared.documentId, firstState.documentId);
         assert.equal(shared.engineKind, backend);
 
-        await closeTab(defaultTab);
+        await closeCustomTab(fixture.uri, viewTypes[0]);
         const retained = await waitFor('the remaining document reference', async () => {
           const candidate = await api.inspectDocument(fixture.uri.toString());
           return candidate?.referenceCount === 1 ? candidate : undefined;
@@ -349,7 +370,7 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
           'original'
         );
 
-        await closeTab(optionalTab);
+        await closeCustomTab(fixture.uri, viewTypes[1]);
         await waitFor('final shared-document disposal', async () => (
           (await api.inspectDocument(fixture.uri.toString())) === null
         ));

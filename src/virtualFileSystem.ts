@@ -113,6 +113,16 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     }
 
     async stat(uri: vsc.Uri): Promise<vsc.FileStat> {
+        if (this.isLogicalDirectory(uri)) {
+            const now = Date.now();
+            return {
+                type: vsc.FileType.Directory,
+                ctime: now,
+                mtime: now,
+                size: 0
+            };
+        }
+
         const { document, table, rowId } = this.parseUri(uri);
 
         if (rowId === '__view__.sql') {
@@ -163,6 +173,10 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     }
 
     async createDirectory(uri: vsc.Uri): Promise<void> {
+        // workspace.fs.writeFile has mkdirp semantics. These directories are
+        // logical URI ancestors, so creating an existing one is an idempotent
+        // no-op; actual cell resources remain non-creatable as directories.
+        if (this.isLogicalDirectory(uri)) return;
         throw vsc.FileSystemError.NoPermissions();
     }
 
@@ -473,39 +487,36 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                     }
                 }
 
-                let priorValue: import('./core/types').CellValue | undefined;
-                if (isPrimaryKeyRecordId(validatedRowId)) {
-                    const escapedColumn = escapeIdentifier(column);
-                    const byteLengthExpression =
-                        `CASE WHEN ${escapedColumn} IS NULL THEN 0 ` +
-                        `ELSE length(CAST(${escapedColumn} AS BLOB)) END`;
-                    const previous = await document.databaseOperations.executeQuery(
-                        `SELECT typeof(${escapedColumn}), ${byteLengthExpression}, ` +
-                        `CASE WHEN typeof(${escapedColumn}) IN ('text', 'blob') ` +
-                        `AND ${byteLengthExpression} > ? THEN NULL ELSE ${escapedColumn} END ` +
-                        `FROM ${escapeIdentifier(table)} WHERE ${rowPredicate.sql} LIMIT 2`,
-                        [editLimitBytes, ...rowPredicate.params]
-                    );
-                    if (previous[0]?.rows.length !== 1) {
-                        throw new Error(`Cannot update ${table}.${column}: row identity no longer exists`);
-                    }
-                    const [storageClass, rawByteLength, boundedValue] = previous[0].rows[0];
-                    const byteLength = typeof rawByteLength === 'bigint'
-                        ? Number(rawByteLength)
-                        : rawByteLength;
-                    if (
-                        (storageClass === 'text' || storageClass === 'blob')
-                        && Number(byteLength) > editLimitBytes
-                    ) {
-                        // The CASE above deliberately returned NULL instead of
-                        // the raced oversized payload. Re-read and confirm it.
-                        continue;
-                    }
-                    const keyColumnIndex = rowPredicate.primaryKey?.columns.indexOf(column) ?? -1;
-                    priorValue = keyColumnIndex >= 0
-                        ? rowPredicate.primaryKey!.values[keyColumnIndex]
-                        : boundedValue;
+                const escapedColumn = escapeIdentifier(column);
+                const byteLengthExpression =
+                    `CASE WHEN ${escapedColumn} IS NULL THEN 0 ` +
+                    `ELSE length(CAST(${escapedColumn} AS BLOB)) END`;
+                const previous = await document.databaseOperations.executeQuery(
+                    `SELECT typeof(${escapedColumn}), ${byteLengthExpression}, ` +
+                    `CASE WHEN typeof(${escapedColumn}) IN ('text', 'blob') ` +
+                    `AND ${byteLengthExpression} > ? THEN NULL ELSE ${escapedColumn} END ` +
+                    `FROM ${escapeIdentifier(table)} WHERE ${rowPredicate.sql} LIMIT 2`,
+                    [editLimitBytes, ...rowPredicate.params]
+                );
+                if (previous[0]?.rows.length !== 1) {
+                    throw new Error(`Cannot update ${table}.${column}: row identity no longer exists`);
                 }
+                const [storageClass, rawByteLength, boundedValue] = previous[0].rows[0];
+                const byteLength = typeof rawByteLength === 'bigint'
+                    ? Number(rawByteLength)
+                    : rawByteLength;
+                if (
+                    (storageClass === 'text' || storageClass === 'blob')
+                    && Number(byteLength) > editLimitBytes
+                ) {
+                    // The CASE above deliberately returned NULL instead of
+                    // the raced oversized payload. Re-read and confirm it.
+                    continue;
+                }
+                const keyColumnIndex = rowPredicate.primaryKey?.columns.indexOf(column) ?? -1;
+                const priorValue = keyColumnIndex >= 0
+                    ? rowPredicate.primaryKey!.values[keyColumnIndex]
+                    : boundedValue;
 
                 let updatedRowId: RecordId | void;
                 try {
@@ -534,7 +545,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                     targetRowId: validatedRowId,
                     ...(isPrimaryKeyRecordId(validatedRowId) ? { newTargetRowId } : {}),
                     targetColumn: column,
-                    ...(isPrimaryKeyRecordId(validatedRowId) ? { priorValue } : {}),
+                    priorValue,
                     newValue: value
                 });
 
@@ -576,6 +587,18 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             this.cellDocumentTargets.set(document, targets);
         }
         targets.set(uri.toString(), rowId);
+    }
+
+    private isLogicalDirectory(uri: vsc.Uri): boolean {
+        const pathParts = uri.path.split('/').filter(part => part.length > 0);
+        if (pathParts.length === 0) return true;
+        if (pathParts.length > 4) return false;
+
+        const documentKey = decodeURIComponent(pathParts[0]);
+        if (!DocumentRegistry.has(documentKey)) {
+            throw vsc.FileSystemError.FileNotFound(uri);
+        }
+        return true;
     }
 
     private parseUri(uri: vsc.Uri): { document: DatabaseDocument, table: string, rowId: string, column: string } {

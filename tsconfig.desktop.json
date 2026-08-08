@@ -12,10 +12,9 @@
     "rootDir": "tests/desktop",
     "types": ["node", "vscode"]
   },
-  "include": [
-    "tests/desktop/**/*.ts",
-    "tests/desktop/**/*.js",
-    "src/declarations.d.ts"
+  "files": [
+    "tests/desktop/suite/desktop.test.ts",
+    "tests/desktop/suite/index.js"
   ],
   "exclude": ["node_modules"]
 }

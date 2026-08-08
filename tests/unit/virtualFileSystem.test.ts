@@ -355,6 +355,10 @@ describe('SQLiteFileSystemProvider', () => {
         it('should map string error to Unavailable', async () => {
             const dbOps = {
                 getCellMetadata: mock.fn(async () => ({ storageClass: 'text', byteLength: 0 })),
+                executeQuery: mock.fn(async () => [{
+                    headers: ['type', 'bytes', 'value'],
+                    rows: [['text', 0, '']]
+                }]),
                 updateCell: mock.fn(async () => {
                     throw 'Database write string error';
                 })
@@ -371,6 +375,10 @@ describe('SQLiteFileSystemProvider', () => {
         it('should map Error object to Unavailable', async () => {
             const dbOps = {
                 getCellMetadata: mock.fn(async () => ({ storageClass: 'text', byteLength: 0 })),
+                executeQuery: mock.fn(async () => [{
+                    headers: ['type', 'bytes', 'value'],
+                    rows: [['text', 0, '']]
+                }]),
                 updateCell: mock.fn(async () => {
                     throw new Error('Database write error');
                 })
@@ -409,6 +417,10 @@ describe('SQLiteFileSystemProvider', () => {
         it('should write text content correctly', async () => {
             const dbOps = {
                 getCellMetadata: mock.fn(async () => ({ storageClass: 'text', byteLength: 11 })),
+                executeQuery: mock.fn(async () => [{
+                    headers: ['type', 'bytes', 'value'],
+                    rows: [['text', 11, 'Before Text']]
+                }]),
                 updateCell: mock.fn(async () => {})
             };
             const doc = setupMockDocument(docKey, dbOps);
@@ -559,6 +571,43 @@ describe('SQLiteFileSystemProvider', () => {
                     'WHERE rowid = 9007199254740993'
                 );
                 assert.deepStrictEqual(stored[0].rows, [['integer', '9007199254740993']]);
+            } finally {
+                (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+
+        it('records a rowid cell prior so an external-editor write can be undone', async () => {
+            const engineResult = await createDatabaseEngine({
+                content: null,
+                maxSize: 0,
+                readOnlyMode: false
+            });
+            const engine = engineResult.operations!;
+            await engine.executeQuery(
+                'CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL); ' +
+                "INSERT INTO items VALUES (1, 'original')"
+            );
+            const document = setupMockDocument(docKey, engine);
+            const uri = vscode.Uri.from({
+                scheme: 'vscode-sqlite',
+                path: `/${docKey}/items/-/1/value.txt`
+            });
+
+            try {
+                await provider.writeFile(
+                    uri,
+                    new TextEncoder().encode('replacement'),
+                    { create: false, overwrite: true }
+                );
+                const modification = (document.recordExternalModification as any)
+                    .mock.calls[0].arguments[0];
+                assert.strictEqual(modification.priorValue, 'original');
+
+                await engine.undoModification(modification);
+                assert.deepStrictEqual(
+                    (await engine.executeQuery('SELECT value FROM items WHERE id = 1'))[0].rows,
+                    [['original']]
+                );
             } finally {
                 (engine as WasmDatabaseEngine).shutdown();
             }
@@ -751,8 +800,13 @@ describe('SQLiteFileSystemProvider', () => {
         });
 
         it('should write binary content if not valid UTF-8', async () => {
+            const priorContent = new Uint8Array([1, 2, 3]);
             const dbOps = {
                 getCellMetadata: mock.fn(async () => ({ storageClass: 'blob', byteLength: 3 })),
+                executeQuery: mock.fn(async () => [{
+                    headers: ['type', 'bytes', 'value'],
+                    rows: [['blob', 3, priorContent]]
+                }]),
                 updateCell: mock.fn(async () => {})
             };
             const doc = setupMockDocument(docKey, dbOps);
@@ -1482,11 +1536,30 @@ describe('SQLiteFileSystemProvider', () => {
         const provider = new SQLiteFileSystemProvider();
         const docKey = 'test-doc';
 
-        it('should throw NoPermissions for createDirectory', async () => {
-            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group`);
-            await assert.rejects(async () => {
+        it('presents virtual ancestors as idempotent directories for workspace.fs writes', async () => {
+            setupMockDocument(docKey, {});
+            const ancestors = [
+                '/',
+                `/${docKey}`,
+                `/${docKey}/users`,
+                `/${docKey}/users/group`,
+                `/${docKey}/users/group/1`
+            ].map(uriPath => vscode.Uri.from({ scheme: 'vscode-sqlite', path: uriPath }));
+
+            for (const uri of ancestors) {
+                const metadata = await provider.stat(uri);
+                assert.strictEqual(metadata.type, vscode.FileType.Directory);
                 await provider.createDirectory(uri);
-            }, (err: any) => err.message.includes('NoPermissions'));
+            }
+
+            const fileUri = vscode.Uri.from({
+                scheme: 'vscode-sqlite',
+                path: `/${docKey}/users/group/1/name.txt`
+            });
+            await assert.rejects(
+                provider.createDirectory(fileUri),
+                (err: any) => err.message.includes('NoPermissions')
+            );
         });
 
         it('should return empty array for readDirectory', async () => {
