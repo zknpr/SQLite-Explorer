@@ -70,10 +70,13 @@ testing nothing.
    dominated by `natives/` (5 binaries). It doubled once (9→19 MB) from shipping
    unstripped binaries with linked DWARF — invisible to every test. Record the `.vsix`
    size and the `natives/ (N files) [XX MB]` line vsce prints; a **>10% growth** vs the
-   last release needs an explanation before shipping. Current baseline: `.vsix` ≈ 16 MB,
-   `natives/` ≈ 27.5 MB (strip+GC). The stripped binaries come from the fork artifact
-   workflow with `BUILD_WITH_STRIP`+`BUILD_WITH_GC_SECTIONS`; a plain-Release rebuild
-   silently regresses this.
+   last release needs an explanation before shipping. Current baseline: `.vsix` ≈ 12.8 MB,
+   `natives/` ≈ 21 MB. The binaries come from the fork artifact workflow with
+   `BUILD_WITH_STRIP`+`GC_SECTIONS` **and** `BUILD_WITH_WASM/FFI/LWS=OFF` (the worker only
+   uses `tjs:sqlite`+`tjs:v8`, so the WASM interpreter, FFI/dlopen and the
+   libwebsockets/TLS/HTTP stack are excluded — also a security win: the file-parsing
+   worker has no network egress or dlopen). A plain-Release rebuild, or one that re-enables
+   those subsystems, silently regresses both size and attack surface.
 8. Confirm `engines.vscode` still matches the pinned `@types/vscode`. `vsce` fails if the
    types are newer than the engine floor.
 
