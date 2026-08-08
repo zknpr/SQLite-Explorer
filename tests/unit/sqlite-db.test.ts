@@ -1,7 +1,10 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
-import { createDatabaseEngine, getNodeFs, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+import * as nodeFs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { createDatabaseEngine, createWorkerEndpoint, getNodeFs, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import type { Database } from 'sql.js';
 
 describe('getNodeFs', () => {
@@ -21,55 +24,123 @@ describe('getNodeFs', () => {
 });
 
 describe('createDatabaseEngine file reading errors', () => {
-  it('should catch and log error for non-existent file', async () => {
-    const originalConsoleError = console.error;
-    let loggedError: any;
-    console.error = (msg: string, err: any) => {
-      if (msg === 'Failed to read file in worker:') {
-        loggedError = err;
-      }
-    };
-    try {
-      await createDatabaseEngine({
+  // An unreadable filePath must fail the open. The engine must never fall
+  // back to an empty writable database: saving that empty view would
+  // overwrite the real file on disk.
+  it('rejects for a non-existent file instead of opening an empty database', async () => {
+    const missingPath = '/non/existent/path/for/test/db.sqlite';
+    await assert.rejects(
+      createDatabaseEngine({
         content: null,
-        filePath: '/non/existent/path/for/test/db.sqlite',
+        filePath: missingPath,
         maxSize: 1000,
         readOnlyMode: false
-      });
-      assert.ok(loggedError, 'Should have caught and logged an error');
-      assert.strictEqual(loggedError.code, 'ENOENT');
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, 'rejection must be an Error');
+        assert.ok(err.message.includes(missingPath), 'message must name the path');
+        assert.match(err.message, /ENOENT/, 'message must carry the original FS error');
+        const cause = err.cause as NodeJS.ErrnoException | undefined;
+        assert.strictEqual(cause?.code, 'ENOENT', 'original FS error must be preserved as cause');
+        return true;
+      }
+    );
+  });
+
+  it('rejects when the file exceeds maxSize instead of opening an empty database', async () => {
+    const tempDir = nodeFs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-db-test-'));
+    const tempFile = path.join(tempDir, 'too-large.sqlite');
+    nodeFs.writeFileSync(tempFile, 'dummy data for max size test');
+
+    try {
+      await assert.rejects(
+        createDatabaseEngine({
+          content: null,
+          filePath: tempFile,
+          maxSize: 1, // extremely small max size
+          readOnlyMode: false
+        }),
+        (err: unknown) => {
+          assert.ok(err instanceof Error, 'rejection must be an Error');
+          assert.ok(err.message.includes(tempFile), 'message must name the path');
+          assert.match(err.message, /exceeds the maximum allowed size/);
+          assert.ok(err.cause instanceof Error, 'size violation must be preserved as cause');
+          return true;
+        }
+      );
     } finally {
-      console.error = originalConsoleError;
+      nodeFs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 
-  it('should catch and log error when file exceeds maxSize', async () => {
-    const fs = require('fs');
-    const tempFile = 'test-temp.sqlite';
-    fs.writeFileSync(tempFile, 'dummy data for max size test');
-
-    const originalConsoleError = console.error;
-    let loggedError: any;
-    console.error = (msg: string, err: any) => {
-      if (msg === 'Failed to read file in worker:') {
-        loggedError = err;
-      }
-    };
+  it('still opens a fresh database for a zero-byte file (successful read, legitimately empty)', async () => {
+    const tempDir = nodeFs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-db-test-'));
+    const tempFile = path.join(tempDir, 'empty.sqlite');
+    nodeFs.writeFileSync(tempFile, new Uint8Array(0));
 
     try {
-      await createDatabaseEngine({
+      const result = await createDatabaseEngine({
         content: null,
         filePath: tempFile,
-        maxSize: 1, // extremely small max size
+        maxSize: 1000,
         readOnlyMode: false
       });
-      assert.ok(loggedError, 'Should have caught and logged an error');
-      assert.strictEqual(loggedError.message, 'File too large');
-    } finally {
-      console.error = originalConsoleError;
-      if (fs.existsSync(tempFile)) {
-        fs.unlinkSync(tempFile);
+      const engine = result.operations!;
+      try {
+        const sets = await engine.executeQuery('SELECT 1');
+        assert.strictEqual(sets[0].rows[0][0], 1);
+      } finally {
+        (engine as WasmDatabaseEngine).shutdown();
       }
+    } finally {
+      nodeFs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('still opens a fresh database for explicit zero-length content without a filePath', async () => {
+    const result = await createDatabaseEngine({
+      content: new Uint8Array(0),
+      maxSize: 0,
+      readOnlyMode: false
+    });
+    const engine = result.operations!;
+    try {
+      const sets = await engine.executeQuery('SELECT 1');
+      assert.strictEqual(sets[0].rows[0][0], 1);
+    } finally {
+      (engine as WasmDatabaseEngine).shutdown();
+    }
+  });
+});
+
+describe('createWorkerEndpoint initializeDatabase failure', () => {
+  it('leaves no half-initialized engine behind when a re-open fails', async () => {
+    const endpoint = createWorkerEndpoint();
+    try {
+      await endpoint.initializeDatabase('first.db', {
+        content: null,
+        maxSize: 0,
+        readOnlyMode: false
+      });
+      await endpoint.runQuery('CREATE TABLE t (id INTEGER)');
+
+      // Re-initialization against an unreadable path must reject...
+      await assert.rejects(
+        endpoint.initializeDatabase('missing.db', {
+          content: null,
+          filePath: '/non/existent/path/for/test/db.sqlite',
+          maxSize: 0,
+          readOnlyMode: false
+        }),
+        /Failed to open database file/
+      );
+
+      // ...and must not leave the previous (now shut down) engine reachable:
+      // the endpoint reports "no database" rather than serving a dead engine.
+      assert.strictEqual(await endpoint.ping(), false);
+      await assert.rejects(endpoint.runQuery('SELECT 1'), /No database initialized/);
+    } finally {
+      endpoint.dispose();
     }
   });
 });

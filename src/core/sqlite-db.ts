@@ -83,22 +83,39 @@ export async function createDatabaseEngine(
   // invisible here. The layer that owns file access (workerFactory) checks
   // for WAL data before handing over a filePath (or content bytes) and forces
   // readOnlyMode when it finds any; do not add WAL handling in the engine.
+  //
+  // A filePath that cannot be stat'd/read MUST fail the open. Falling through
+  // to the empty-database branch below would show an empty writable view of a
+  // real file, and a later save would overwrite that file with it — silent
+  // data destruction if the host-side existence check raced a delete or
+  // permission change. Only the explicit empty inputs (no filePath and
+  // missing/zero-length content, or a filePath whose read yields zero bytes)
+  // legitimately mean "start with a fresh empty database".
   if (!buffer && config.filePath) {
-      try {
-          // Dynamic require to avoid bundling fs in browser builds
-          // In actual build, this code path only runs in Node worker
-          const fs = getNodeFs();
-          if (fs) {
-              // Validate size
-              const stats = await fs.promises.stat(config.filePath);
-              if (config.maxSize > 0 && stats.size > config.maxSize) {
-                  throw new Error('File too large');
-              }
-              buffer = await fs.promises.readFile(config.filePath);
-          }
-      } catch (e) {
-          console.error('Failed to read file in worker:', e);
+    // Dynamic require to avoid bundling fs in browser builds
+    // In actual build, this code path only runs in Node worker
+    const fs = getNodeFs();
+    if (!fs) {
+      throw new Error(
+        `Failed to open database file '${config.filePath}': file system access is unavailable in this environment`
+      );
+    }
+    try {
+      // Validate size
+      const stats = await fs.promises.stat(config.filePath);
+      if (config.maxSize > 0 && stats.size > config.maxSize) {
+        throw new Error(
+          `file size (${stats.size} bytes) exceeds the maximum allowed size (${config.maxSize} bytes)`
+        );
       }
+      buffer = await fs.promises.readFile(config.filePath);
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `Failed to open database file '${config.filePath}': ${reason}`,
+        { cause: e }
+      );
+    }
   }
 
   if (buffer && buffer.byteLength > 0) {
@@ -166,9 +183,13 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       filename: string,
       config: DatabaseInitConfig
     ): Promise<DatabaseInitResult> {
-      // Shutdown existing engine if present
+      // Shutdown existing engine if present. Clear the reference before the
+      // await below: if createDatabaseEngine rejects (e.g. unreadable
+      // filePath), requireEngine() must report "no database" instead of
+      // handing out the already-shut-down engine.
       if (activeEngine) {
         activeEngine.shutdown();
+        activeEngine = null;
       }
 
       const result = await createDatabaseEngine(config, logger);
