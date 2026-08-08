@@ -15,6 +15,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { Upload, Database, FileUp, ArrowLeft, Download, RefreshCw, AlertCircle } from 'lucide-react';
 import { isTrustedViewerMessage } from './messageGuard';
+import { DEMO_INLINE_CONTENT_MAX_BYTES } from '../../../src/core/paged-open';
 import {
   demoRpcErrorFields,
   demoRpcErrorFromResponse,
@@ -162,6 +163,15 @@ export default function DemoClient() {
    */
   const [isDragOver, setIsDragOver] = useState(false);
 
+  /**
+   * Whether the Download button applies to the current database. Only
+   * inline-bytes opens retain a binary to re-export; File-handle opens
+   * (large or paged databases) have nothing meaningful to download — the
+   * original file is already on the user's disk and paged snapshots are
+   * read-only.
+   */
+  const [canDownload, setCanDownload] = useState(false);
+
   // -------------------------------------------------------------------------
   // Refs
   // -------------------------------------------------------------------------
@@ -193,8 +203,26 @@ export default function DemoClient() {
 
   /**
    * Binary content of the loaded database (for download).
+   * Retained only for inline-bytes opens; File-handle opens keep the
+   * handle instead (databaseFile) and never duplicate the bytes.
    */
   const databaseBinary = useRef<Uint8Array | null>(null);
+
+  /**
+   * File handle of the loaded database when it was posted to the worker
+   * as a File (large databases). Used by Reload to re-open from disk.
+   */
+  const databaseFile = useRef<File | null>(null);
+
+  /**
+   * Whether the worker opened the current database read-only (paged
+   * page-on-demand snapshot, or a WAL-marked file routed to the
+   * read-only buffer path). Reported to the viewer iframe on
+   * `initialize` so its mutation UI disables itself. A ref, not state:
+   * it is only read inside the iframe message handler, and the iframe
+   * mounts after initialization completes.
+   */
+  const databaseIsReadOnly = useRef(false);
 
   // -------------------------------------------------------------------------
   // Worker Communication
@@ -300,12 +328,14 @@ export default function DemoClient() {
 
       // Special handling for extension-specific methods
       if (targetMethod === 'initialize') {
-        // Already initialized, just return success
+        // Already initialized, just return success. Read-only reflects
+        // how the worker actually opened the database (paged snapshots
+        // and WAL-gated buffers are read-only).
         postIframeRpcResponse(event.source, viewerOrigin, {
           kind: 'response',
           messageId,
           success: true,
-          data: { connected: true, isReadOnly: false }
+          data: { connected: true, isReadOnly: databaseIsReadOnly.current }
         });
         return;
       }
@@ -425,9 +455,17 @@ export default function DemoClient() {
   }, [handleIframeMessage]);
 
   /**
-   * Create and initialize the worker with a database file.
+   * Create and initialize the worker with a database.
+   *
+   * `source` is either the full database bytes (small files — today's
+   * path) or the File handle itself. A File is structured-cloned to the
+   * worker as a handle, not bytes: the worker reads it via
+   * FileReaderSync, and databases above the paged threshold open
+   * page-on-demand without the page ever holding a copy. Bytes above
+   * the worker-request transport guard's binary cap must travel as a
+   * File — the guard rejects larger inline Uint8Arrays.
    */
-  const initializeWorker = useCallback(async (binary: Uint8Array, filename: string) => {
+  const initializeWorker = useCallback(async (source: Uint8Array | File, filename: string) => {
     // Terminate existing worker
     activePreviewController.current?.abort();
     activePreviewController.current = null;
@@ -471,15 +509,18 @@ export default function DemoClient() {
     // Wait for worker to be ready, then initialize database
     // The worker resolves the self-hosted sql.js runtime beside worker.js.
     try {
-      await callWorker('initializeDatabase', [
+      const result = await callWorker('initializeDatabase', [
         filename,
-        {
-          content: binary
-          // wasmBinary is loaded from the self-hosted runtime by the worker.
-        }
-      ]);
+        source instanceof Uint8Array
+          ? { content: source }
+          : { file: source }
+        // wasmBinary is loaded from the self-hosted runtime by the worker.
+      ]) as { isReadOnly?: boolean } | undefined;
 
-      databaseBinary.current = binary;
+      databaseBinary.current = source instanceof Uint8Array ? source : null;
+      databaseFile.current = source instanceof Uint8Array ? null : source;
+      databaseIsReadOnly.current = result?.isReadOnly === true;
+      setCanDownload(source instanceof Uint8Array);
       setDatabaseName(filename);
       setStatus('ready');
     } catch (error) {
@@ -495,23 +536,32 @@ export default function DemoClient() {
 
   /**
    * Load a database from a File object.
+   *
+   * Small files keep today's path: read fully on the main thread and
+   * post the bytes. Larger files post the File handle itself — the
+   * transport guard rejects inline binaries above its cap, and reading
+   * a multi-GB file here would hold a full copy (or two) on the main
+   * thread that the worker's paged path is designed to avoid.
    */
   const loadDatabaseFile = useCallback(async (file: File) => {
     setStatus('loading');
     setErrorMessage(null);
 
     try {
-      const buffer = await file.arrayBuffer();
-      const binary = new Uint8Array(buffer);
-
-      // Basic validation: Check SQLite magic header
+      // Basic validation: Check SQLite magic header (first 16 bytes —
+      // one small slice; never the whole file).
       const magic = 'SQLite format 3\0';
-      const header = new TextDecoder().decode(binary.slice(0, 16));
+      const headerBytes = new Uint8Array(await file.slice(0, 16).arrayBuffer());
+      const header = new TextDecoder().decode(headerBytes);
       if (header !== magic) {
         throw new Error('Not a valid SQLite database file');
       }
 
-      await initializeWorker(binary, file.name);
+      if (file.size <= DEMO_INLINE_CONTENT_MAX_BYTES) {
+        await initializeWorker(new Uint8Array(await file.arrayBuffer()), file.name);
+      } else {
+        await initializeWorker(file, file.name);
+      }
     } catch (error) {
       console.error('[Demo] Failed to load file:', error);
       setStatus('error');
@@ -533,7 +583,14 @@ export default function DemoClient() {
       }
       const buffer = await response.arrayBuffer();
       const binary = new Uint8Array(buffer);
-      await initializeWorker(binary, name);
+      // Samples above the transport guard's inline cap (e.g. Northwind,
+      // 24.7 MB) must cross the worker boundary as a File handle like
+      // any other large database; inline bytes would be rejected at the
+      // RPC guard.
+      const source = binary.byteLength <= DEMO_INLINE_CONTENT_MAX_BYTES
+        ? binary
+        : new File([binary], name, { type: 'application/x-sqlite3' });
+      await initializeWorker(source, name);
     } catch (error) {
       console.error('[Demo] Failed to load sample:', error);
       setStatus('error');
@@ -594,11 +651,14 @@ export default function DemoClient() {
   }, [callWorker, databaseName]);
 
   /**
-   * Reload the current database (discard changes).
+   * Reload the current database (discard changes). File-handle opens
+   * re-read from disk; if the file changed since (Chromium invalidates
+   * the snapshot), the re-open fails into the normal error surface.
    */
   const handleReload = useCallback(() => {
-    if (databaseBinary.current && databaseName) {
-      initializeWorker(databaseBinary.current, databaseName);
+    const source = databaseBinary.current ?? databaseFile.current;
+    if (source && databaseName) {
+      initializeWorker(source, databaseName);
     }
   }, [initializeWorker, databaseName]);
 
@@ -613,6 +673,9 @@ export default function DemoClient() {
       workerRef.current = null;
     }
     databaseBinary.current = null;
+    databaseFile.current = null;
+    databaseIsReadOnly.current = false;
+    setCanDownload(false);
     setDatabaseName(null);
     setStatus('idle');
     setErrorMessage(null);
@@ -652,13 +715,15 @@ export default function DemoClient() {
               >
                 <RefreshCw className="w-4 h-4" />
               </button>
-              <button
-                onClick={handleDownload}
-                className="p-2 text-(--ui-subtle-fg) hover:text-(--ui-fg) transition-colors"
-                title="Download database"
-              >
-                <Download className="w-4 h-4" />
-              </button>
+              {canDownload && (
+                <button
+                  onClick={handleDownload}
+                  className="p-2 text-(--ui-subtle-fg) hover:text-(--ui-fg) transition-colors"
+                  title="Download database"
+                >
+                  <Download className="w-4 h-4" />
+                </button>
+              )}
               <button
                 onClick={handleClose}
                 className="px-3 py-1.5 text-sm bg-(--ui-subtle) hover:opacity-80 rounded-md transition-colors"

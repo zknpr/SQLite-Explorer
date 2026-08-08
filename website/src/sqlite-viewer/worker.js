@@ -87,6 +87,11 @@ import {
   OversizedCellReplacementRequiredError,
   toCellEditRpcErrorData
 } from '../../../src/core/cell-edit-policy.ts';
+import {
+  decideOpenPlan,
+  isWalMarkedHeader,
+  SQLITE_HEADER_PROBE_BYTES
+} from '../../../src/core/paged-open.ts';
 
 // ============================================================================
 // Configuration
@@ -96,6 +101,20 @@ const SQL_JS_GLUE_URL = './sql-wasm.js';
 const SQL_JS_WASM_URL = './sql-wasm.wasm';
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 const PROGRESS_HANDLER_INTERVAL = 1000;
+/**
+ * Largest page-on-demand database whose unfiltered COUNT(*) still runs
+ * exactly. An exact count full-scans the table's B-tree through per-4KB
+ * host callbacks at a measured ~25-35 MB/s (~2 minutes for a 3.5 GiB /
+ * 128M-row table), starving every queued RPC past the webview's 60s
+ * deadline — and it cannot be interrupted mid-flight, because SQLite
+ * serves `SELECT COUNT(*)` with the single OP_Count opcode, which never
+ * yields to the progress handler. The gate is therefore decided up front
+ * from the file size (the upper bound on any table scan within it): at
+ * 64 MiB the worst-case exact scan stays around two seconds. Larger paged
+ * databases answer unfiltered counts with the max(rowid) upper bound
+ * instead (see fetchTableCount).
+ */
+const PAGED_EXACT_COUNT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 const WEB_DEMO_EXPORT_MAX_BYTES = 16 * 1024 * 1024;
 const WEB_DEMO_EXPORT_CHUNK_CHARS = 64 * 1024;
 const WEB_DEMO_EXPORT_LIMIT_DESCRIPTION = '16 MiB (16,777,216 bytes)';
@@ -120,6 +139,17 @@ let db = null;
 let SQL = null;
 let queryTimeout = DEFAULT_QUERY_TIMEOUT_MS;
 let readOnlyMode = false;
+/**
+ * How the active database is backed: 'memory' (bytes in the WASM-side
+ * filesystem — today's buffer path) or 'paged' (page-on-demand reads
+ * through host callbacks; read-only). Count queries consult this to keep
+ * full-table scans bounded on paged storage.
+ * @type {'memory' | 'paged'}
+ */
+let storageMode = 'memory';
+/** File size behind the current paged open; 0 for buffer opens. */
+let pagedFileSizeBytes = 0;
+let pagedExactCountMaxFileBytes = PAGED_EXACT_COUNT_MAX_FILE_BYTES;
 let cellReadSessionIdleTimeoutMs = DEFAULT_CELL_READ_SESSION_IDLE_TIMEOUT_MS;
 let cellReadSessionAbsoluteTimeoutMs = DEFAULT_CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS;
 let activeCellReadSession = null;
@@ -546,11 +576,69 @@ function assertCellReadSessionAllowsMethod(targetMethod) {
 // ============================================================================
 
 /**
- * Initialize a new database from binary content.
+ * True for File-like handles posted by the demo page. Duck-typed rather
+ * than `instanceof File` so the unit harness can drive this path with a
+ * stub File class from outside the worker realm.
+ *
+ * @param {unknown} candidate
+ * @returns {candidate is File}
+ */
+function isFileLike(candidate) {
+  return !!candidate
+    && typeof candidate === 'object'
+    && typeof (/** @type {File} */ (candidate).slice) === 'function'
+    && typeof (/** @type {File} */ (candidate).size) === 'number';
+}
+
+/**
+ * Host I/O adapter for SQL.Database.openPaged: serves absolute-offset
+ * reads of the File through FileReaderSync. Blob.slice clamps overhangs,
+ * so reads at EOF come back short — the paged VFS zero-fills and reports
+ * the short read to SQLite per the VFS contract. The size is pinned at
+ * open time: Chromium invalidates a File snapshot whose backing file
+ * changes on disk, making later reads throw, which the VFS surfaces as
+ * an I/O error rather than serving torn pages.
+ *
+ * @param {File} file
+ * @param {FileReaderSync} reader
+ */
+function createFileHostIo(file, reader) {
+  const size = file.size;
+  return {
+    size: () => size,
+    read: (offset, length) => new Uint8Array(
+      reader.readAsArrayBuffer(file.slice(offset, offset + length))
+    )
+  };
+}
+
+/**
+ * Resolve optional open-routing limit overrides from the init config.
+ * Bounds tuning is compile-time (src/core/paged-open.ts); these exist so
+ * tests can exercise the ladder without multi-GB fixtures.
+ *
+ * @param {Object} config
+ * @returns {{pagedThresholdBytes?: number, bufferCeilingBytes?: number}}
+ */
+function resolveOpenLimits(config) {
+  const limits = {};
+  if (config.pagedOpenThresholdBytes !== undefined) {
+    limits.pagedThresholdBytes = config.pagedOpenThresholdBytes;
+  }
+  if (config.bufferOpenCeilingBytes !== undefined) {
+    limits.bufferCeilingBytes = config.bufferOpenCeilingBytes;
+  }
+  return limits;
+}
+
+/**
+ * Initialize a new database from binary content or a File handle.
  *
  * @param {string} filename - Display name for the database
  * @param {Object} config - Configuration object
- * @param {Uint8Array} config.content - SQLite database binary content
+ * @param {Uint8Array} [config.content] - SQLite database binary content
+ * @param {File} [config.file] - Database file handle; opens page-on-demand
+ *   (read-only) when large and the runtime supports it, else buffers
  * @param {Uint8Array} [config.wasmBinary] - Optional WASM binary
  * @returns {Promise<Object>} Database handle info
  */
@@ -566,6 +654,12 @@ async function initializeDatabase(filename, config) {
     ? config.queryTimeout
     : DEFAULT_QUERY_TIMEOUT_MS;
   readOnlyMode = config.readOnlyMode === true;
+  storageMode = 'memory';
+  pagedFileSizeBytes = 0;
+  pagedExactCountMaxFileBytes = Number.isFinite(config.pagedExactCountMaxFileBytes)
+    && config.pagedExactCountMaxFileBytes >= 0
+    ? config.pagedExactCountMaxFileBytes
+    : PAGED_EXACT_COUNT_MAX_FILE_BYTES;
   cellReadSessionIdleTimeoutMs = normalizeCellReadTimeout(
     config.cellReadSessionIdleTimeoutMs,
     DEFAULT_CELL_READ_SESSION_IDLE_TIMEOUT_MS
@@ -592,8 +686,12 @@ async function initializeDatabase(filename, config) {
     SQL = await self.initSqlJs(sqlConfig);
   }
 
-  // Create database from binary content
-  if (config.content && config.content.length > 0) {
+  // Create the database. A File handle runs the open ladder (WAL sniff,
+  // then paged-vs-buffer by size — see src/core/paged-open.ts); inline
+  // bytes keep today's buffer path unchanged.
+  if (isFileLike(config.file)) {
+    storageMode = openDatabaseFromFile(config.file, resolveOpenLimits(config));
+  } else if (config.content && config.content.length > 0) {
     db = new SQL.Database(config.content);
   } else {
     // Create empty database
@@ -602,14 +700,70 @@ async function initializeDatabase(filename, config) {
   if (readOnlyMode) {
     // Defense in depth for every current and future RPC path. Public mutators
     // still fail early with operation-specific errors, while SQLite itself
-    // refuses an accidentally unguarded write on this connection.
+    // refuses an accidentally unguarded write on this connection. Paged
+    // databases are additionally read-only at the VFS level.
     db.run('PRAGMA query_only = ON');
   }
 
   return {
     operations: {},
-    isReadOnly: readOnlyMode
+    isReadOnly: readOnlyMode,
+    storage: storageMode
   };
+}
+
+/**
+ * Open a database from a File handle, choosing between the paged
+ * (page-on-demand, read-only) and buffer (in-memory) paths.
+ *
+ * Sets the module-level `db`, and widens `readOnlyMode` when the chosen
+ * path is a read-only one (paged snapshot, or WAL-marked above the
+ * paged threshold). A failed paged open re-enters the ladder with the
+ * capability marked unavailable, so degraded runtimes (e.g. a vendored
+ * sql.js without openPaged) behave exactly like today's buffer path,
+ * and oversized files fail with one clear message instead of an opaque
+ * reader error or a doomed multi-GB allocation.
+ *
+ * @param {File} file
+ * @param {{pagedThresholdBytes?: number, bufferCeilingBytes?: number}} limits
+ * @returns {'paged' | 'memory'} storage mode actually opened
+ */
+function openDatabaseFromFile(file, limits) {
+  const reader = new FileReaderSync();
+  const header = new Uint8Array(
+    reader.readAsArrayBuffer(file.slice(0, SQLITE_HEADER_PROBE_BYTES))
+  );
+  const input = {
+    sizeBytes: file.size,
+    walMarked: isWalMarkedHeader(header),
+    pagedAvailable: typeof SQL.Database.openPaged === 'function'
+  };
+
+  let plan = decideOpenPlan(input, limits);
+  let pagedFailure = null;
+  if (plan.mode === 'paged') {
+    try {
+      db = SQL.Database.openPaged(createFileHostIo(file, reader));
+      readOnlyMode = true;
+      pagedFileSizeBytes = file.size;
+      return 'paged';
+    } catch (error) {
+      // Fall back exactly as if the capability were absent; keep the
+      // cause for the oversized-rejection message below.
+      pagedFailure = error;
+      plan = decideOpenPlan({ ...input, pagedAvailable: false }, limits);
+    }
+  }
+  if (plan.mode === 'reject') {
+    throw new Error(
+      pagedFailure
+        ? `${plan.message} (paged open failed: ${pagedFailure.message})`
+        : plan.message
+    );
+  }
+  db = new SQL.Database(new Uint8Array(reader.readAsArrayBuffer(file)));
+  if (plan.readOnly) readOnlyMode = true;
+  return 'memory';
 }
 
 /**
@@ -1294,6 +1448,32 @@ async function fetchTableCount(table, options = {}) {
 
   if (whereClauses.length > 0) {
     sql += ` WHERE ${whereClauses.join(' AND ')}`;
+  }
+
+  // Page-on-demand storage answers large unfiltered counts with the
+  // max(rowid) upper bound instead of an exact scan. The exact COUNT(*)
+  // full-scans the B-tree through per-page host callbacks — minutes on
+  // multi-GB files, wedging every queued RPC past the webview deadline —
+  // and SQLite's OP_Count opcode never yields to the progress handler, so
+  // the scan cannot be interrupted once started. The file size decides up
+  // front (it upper-bounds any scan within the file). The bound equals the
+  // exact count for gap-free rowid tables and otherwise overshoots, which
+  // only renders trailing pages short or empty — never a dead end.
+  // Filtered counts have no cheap bound and keep exact semantics.
+  if (
+    storageMode === 'paged'
+    && whereClauses.length === 0
+    && pagedFileSizeBytes > pagedExactCountMaxFileBytes
+  ) {
+    try {
+      const upperBound = db.exec(
+        `SELECT COALESCE(max(rowid), 0) FROM ${escapeIdentifier(table)}`
+      );
+      return upperBound[0].values[0][0];
+    } catch {
+      // Views and WITHOUT ROWID relations have no rowid to bound with;
+      // fall through to the exact count for them.
+    }
   }
 
   const results = db.exec(sql, params);
