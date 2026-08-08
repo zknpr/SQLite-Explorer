@@ -116,6 +116,15 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
         colIdx,
         rowId,
         columnName: column.name,
+        // Snapshot of the full save target, taken when the edit starts. Every
+        // commit path resolves its target from this snapshot — never from live
+        // selection state. The blur commit is deferred (~100ms) and can fire
+        // after a sidebar table switch; resolving the table then would aim the
+        // UPDATE at a same-named column in the newly selected table.
+        table: state.selectedTable,
+        tableType: state.selectedTableType,
+        column,
+        identityKind: state.selectedTableIdentity?.kind ?? null,
         originalValue: value,
         originalText: String(getCellValueForDisplay(row, rowIdx, colIdx) ?? '')
     };
@@ -161,8 +170,13 @@ export async function onCellInputKeydown(event) {
 
 export function onCellInputBlur() {
     // Small delay to allow clicking on other elements (like save button if we had one)
+    const editSession = state.editingCellInfo;
     setTimeout(() => {
-        if (state.editingCellInfo) {
+        // Commit only the session this blur belongs to. If it was cancelled or
+        // replaced meanwhile (Escape, a new edit started), there is nothing of
+        // ours left to save — calling saveCellEdit unconditionally would commit
+        // the successor session out from under its own editor.
+        if (editSession && state.editingCellInfo === editSession) {
             saveCellEdit();
         }
     }, 100);
@@ -173,8 +187,14 @@ export async function saveCellEdit() {
     if (!state.editingCellInfo || !state.activeCellInput) return false;
 
     const editSession = state.editingCellInfo;
-    const targetTable = state.selectedTable;
-    const { rowIdx, colIdx, rowId, columnName, originalValue, originalText } = editSession;
+    // Target and typing rules come from the snapshot taken at edit start, not
+    // from live selection state: a deferred blur commit may run after the user
+    // switched tables, when state.selectedTable/tableColumns already describe
+    // an unrelated table.
+    const {
+        rowId, columnName, column, identityKind,
+        originalValue, originalText, table: targetTable
+    } = editSession;
     const newValue = state.activeCellInput.value;
 
     const origStr = originalText ?? (originalValue === null ? '' : String(originalValue));
@@ -186,7 +206,6 @@ export async function saveCellEdit() {
         return true;
     }
 
-    const column = state.tableColumns[colIdx];
     const isNotNull = column && column.notnull === 1;
 
     let valueToSave;
@@ -200,7 +219,7 @@ export async function saveCellEdit() {
         valueToSave = parseGridInputValue(
             newValue,
             column,
-            state.selectedTableIdentity?.kind === 'primaryKey'
+            identityKind === 'primaryKey'
         );
     } else {
         valueToSave = newValue;
@@ -241,7 +260,15 @@ export async function saveCellEdit() {
         // Update UI immediately (preserves scroll)
         // refreshContent RPC will handle final consistency check
         if (currentCell) updateCellDom(currentCell.rowIdx, currentCell.colIdx, valueToSave);
-        if (state.selectedTable !== targetTable) return true;
+        if (state.selectedTable !== targetTable) {
+            // The write landed on the snapshot table while another table is
+            // displayed, so the current view shows no trace of it — name the
+            // target. The displayed grid is untouched by this write; do not
+            // reload it (in VS Code the refreshContent echo refreshes any
+            // panel that does show the snapshot table).
+            updateStatus(`Saved to ${targetTable}.${columnName}`);
+            return true;
+        }
 
         if (state.matchNav.scope !== null) resetMatchNav();
         state.selectedCells = [];
@@ -253,10 +280,25 @@ export async function saveCellEdit() {
 
     } catch (err) {
         console.error('Save failed:', err);
-        // On error, the cell remains in edit mode to allow user corrections
         let errorMessage = err.message || String(err);
         // ... error message formatting ...
-        updateStatus(`Save failed: ${errorMessage}`);
+        // Retaining the failed session only helps while its editor textarea is
+        // still there to correct the value. A table switch re-renders the grid
+        // and wipes the textarea; keeping the session then would leak frozen
+        // edit state with no way to resolve it (editorHoldsWindow defends the
+        // virtualized window against exactly that). The isConnected !== false
+        // form mirrors editorHoldsWindow: non-DOM test doubles without the
+        // property count as live.
+        const editorAlive = state.editingCellInfo === editSession
+            && state.activeCellInput
+            && state.activeCellInput.isConnected !== false;
+        if (editorAlive) {
+            // On error, the cell remains in edit mode to allow user corrections
+            updateStatus(`Save failed: ${errorMessage}`);
+        } else {
+            if (state.editingCellInfo === editSession) cleanupCellEdit();
+            updateStatus(`Save failed for ${targetTable}.${columnName}: ${errorMessage}`);
+        }
         return false;
     } finally {
         state.isSavingCell = false;
@@ -266,7 +308,10 @@ export async function saveCellEdit() {
 async function saveCellEditAndMove(direction) {
     if (!state.editingCellInfo) return;
     const editSession = state.editingCellInfo;
-    const targetTable = state.selectedTable;
+    // Snapshot table, for the same reason as saveCellEdit: if the selection
+    // already drifted, the post-save advance below must compare against the
+    // table the edit belongs to, not whatever is now selected.
+    const targetTable = editSession.table;
     const { rowIdx, colIdx, originalValue, originalText } = editSession;
     const submittedValue = state.activeCellInput?.value;
 
