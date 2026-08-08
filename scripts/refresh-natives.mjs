@@ -5,12 +5,12 @@
  *   node scripts/refresh-natives.mjs
  *
  * A different workflow run can be checked against the same pinned hashes:
- *   node scripts/refresh-natives.mjs 31205719703
+ *   node scripts/refresh-natives.mjs 31254443938
  *
  * Maintainers can verify already-downloaded artifacts without network access.
  * The commit is explicit because an extracted artifact has no trustworthy run metadata:
  *   node scripts/refresh-natives.mjs --from /path/to/extracted/artifacts \
- *     --run 31205719703 --commit <40-character-sha>
+ *     --run 31254443938 --commit <40-character-sha>
  */
 
 import { execFileSync } from 'node:child_process';
@@ -33,13 +33,13 @@ const REPOSITORY = 'zknpr/txiki.js';
 // The fork's master IS the shipped source; the sqlite-explorer/* branches are
 // frozen history. Artifact runs are dispatched from master.
 const SOURCE_BRANCH = 'master';
-const PINNED_RUN_ID = '31205719703';
+const PINNED_RUN_ID = '31254443938';
 const PINNED_SHA256 = Object.freeze({
-  'aarch64-linux-gnu/tjs': 'e1fa8d5ecb2c74d233c01ebf6a84c122acf8341bd079c8e11948f9938febcd1d',
-  'aarch64-macos/tjs': '15e5e7579580afa84776fbc456e0bd24fa97756dc646ced6f74df07e8b1779a5',
-  'x86_64-linux-gnu/tjs': '1ecf1dfa70c3ff4481b895b4f5bf04d23ed5551a552274e84a3d43d588548dce',
-  'x86_64-macos/tjs': 'f99f57baa602a5f76664b3e7b30fdbdae4d99e6d7359b371da6c8ea614829cca',
-  'x86_64-windows/tjs.exe': 'bb6dacece251549148987bc7cd5947f00550c5919792f253892e0d554aa345e0'
+  'aarch64-linux-gnu/tjs': 'cd2ae5c7f107ae2048ccc5ff16713e045af33f4ebe5ad93df42c365dd31e3a0b',
+  'aarch64-macos/tjs': '372751ef708952ad8515130fff86051c897a614ceb0a329d37dd38f69847b634',
+  'x86_64-linux-gnu/tjs': 'ea97433ace31a95c919d1a799f86a429c8677a75b768b108c64c2e2378a5888b',
+  'x86_64-macos/tjs': '55136ef4df3da91884a7c14cb3b578a8643386c81b1a9cfe38a8afd0141cb0ee',
+  'x86_64-windows/tjs.exe': '736018dc704b63a0e7bda18d9debe9f115ba10a197f40116c6edf5f7d478482a'
 });
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
