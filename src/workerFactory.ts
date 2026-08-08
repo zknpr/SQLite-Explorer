@@ -450,8 +450,11 @@ async function createInProcessWasmDatabaseConnection(
       // Browser mode always reads database bytes through the VS Code filesystem.
       // There is no file-path fast path because the web extension host cannot
       // access local disk paths directly.
-      const [dbContent, walContent] = await loadDatabaseFiles(fileUri);
-      const hasActiveWal = !!walContent && walContent.byteLength > 0;
+      const [dbContent, walSize] = await Promise.all([
+        loadDatabaseFile(fileUri),
+        statWalSize(fileUri)
+      ]);
+      const hasActiveWal = walSize > 0;
       // sql.js opens one main database image and cannot merge a separate WAL
       // file, so browser editing is disabled when committed WAL pages may be
       // absent from the main database bytes that save() would later overwrite.
@@ -464,7 +467,6 @@ async function createInProcessWasmDatabaseConnection(
 
       const initConfig: DatabaseInitConfig = {
         content: dbContent,
-        walContent,
         maxSize: getMaximumFileSizeBytes(),
         resourceMap: {},
         wasmBinary: wasmContent,
@@ -678,14 +680,13 @@ async function createWorkerBackedWasmDatabaseConnection(
       autoCommit?: boolean
     ) {
       try {
-        // Read database and WAL files
+        // Read database file
         // Optimization: If running in Node and file is local, pass path to worker instead of reading content here
         // This avoids blocking the extension host and transferring large buffers
         const isNode = !import.meta.env?.VSCODE_BROWSER_EXT;
         const isLocal = fileUri.scheme === 'file';
 
         let dbContent: Uint8Array | null = null;
-        let walContent: Uint8Array | null = null;
         let filePath: string | undefined;
 
         if (isNode && isLocal) {
@@ -698,7 +699,19 @@ async function createWorkerBackedWasmDatabaseConnection(
                filePath = fileUri.fsPath;
             }
         } else {
-            [dbContent, walContent] = await loadDatabaseFiles(fileUri);
+            dbContent = await loadDatabaseFile(fileUri);
+        }
+
+        // Like the browser guard above, sql.js only ever opens the main
+        // database image: committed transactions still sitting in a sibling
+        // -wal file are invisible to it, and saving that stale view would
+        // erase them from disk. Force read-only whenever the -wal holds
+        // frames (size > header; empty or header-only files are clean
+        // checkpoint leftovers — see WAL_HEADER_SIZE_BYTES).
+        const walSize = await statWalSize(fileUri);
+        const hasUncheckpointedWal = walSize > WAL_HEADER_SIZE_BYTES;
+        if (hasUncheckpointedWal) {
+          warnWalReadOnlyDowngrade(displayName);
         }
 
         // Load WASM binary from assets directory
@@ -709,11 +722,10 @@ async function createWorkerBackedWasmDatabaseConnection(
         const initConfig: DatabaseInitConfig = {
           content: dbContent,
           filePath,
-          walContent,
           maxSize: getMaximumFileSizeBytes(),
           resourceMap: {},
           wasmBinary: wasmContent,
-          readOnlyMode: forceReadOnly ?? false,
+          readOnlyMode: (forceReadOnly ?? false) || hasUncheckpointedWal,
           queryTimeout: getQueryTimeout()
         };
 
@@ -722,9 +734,6 @@ async function createWorkerBackedWasmDatabaseConnection(
         const transferables: Transferable[] = [];
         if (initConfig.content && initConfig.content.buffer) {
             transferables.push(initConfig.content.buffer);
-        }
-        if (initConfig.walContent && initConfig.walContent.buffer) {
-            transferables.push(initConfig.walContent.buffer);
         }
         if (initConfig.wasmBinary && initConfig.wasmBinary.buffer) {
             transferables.push(initConfig.wasmBinary.buffer);
@@ -945,17 +954,15 @@ async function createWorkerBackedWasmDatabaseConnection(
 // ============================================================================
 
 /**
- * Load database file and optional WAL file.
+ * Load the database file content.
  *
  * @param uri - Database file URI
- * @returns Tuple of [database content, WAL content]
+ * @returns Database content (empty for untitled documents)
  */
-async function loadDatabaseFiles(
-  uri: vsc.Uri
-): Promise<[Uint8Array | null, Uint8Array | null]> {
+async function loadDatabaseFile(uri: vsc.Uri): Promise<Uint8Array> {
   // Untitled documents start empty
   if (uri.scheme === 'untitled') {
-    return [new Uint8Array(), null];
+    return new Uint8Array();
   }
 
   const maxSize = getMaximumFileSizeBytes();
@@ -966,12 +973,76 @@ async function loadDatabaseFiles(
     throw new Error(`File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
   }
 
-  // Construct WAL file URI
-  const walUri = uri.with({ path: uri.path + '-wal' });
+  return vsc.workspace.fs.readFile(uri);
+}
 
-  // Read both files concurrently
-  return Promise.all([
-    vsc.workspace.fs.readFile(uri),
-    Promise.resolve(vsc.workspace.fs.readFile(walUri)).catch(() => null)
-  ]);
+/**
+ * Size of the SQLite write-ahead log header in bytes.
+ *
+ * A -wal file is a 32-byte header followed by frames of 24 + page_size bytes
+ * each (page_size >= 512), so anything larger than the bare header holds at
+ * least one (possibly torn) frame. Observed with sqlite3 3.51: a database
+ * with uncheckpointed commits leaves a frame-bearing -wal (e.g. 12392 bytes
+ * for 3 pages), `PRAGMA wal_checkpoint(TRUNCATE)` leaves a 0-byte file, and
+ * macOS system SQLite keeps a persistent empty -wal after a clean close.
+ * Sizes <= 32 therefore must NOT count as WAL data or every cleanly
+ * checkpointed database on macOS would be forced read-only. A fully
+ * backfilled but untruncated WAL keeps its size and still trips the gate;
+ * that false positive degrades to read-only, the safe direction when frame
+ * state cannot be inspected without a WAL-aware SQLite.
+ */
+const WAL_HEADER_SIZE_BYTES = 32;
+
+/**
+ * Measure the -wal file next to a database.
+ *
+ * @param uri - Database file URI
+ * @returns Size of the sibling -wal file in bytes, or 0 when it is absent
+ */
+async function statWalSize(uri: vsc.Uri): Promise<number> {
+  if (uri.scheme === 'untitled') {
+    return 0;
+  }
+  const walUri = uri.with({ path: uri.path + '-wal' });
+  try {
+    return (await vsc.workspace.fs.stat(walUri)).size;
+  } catch (err) {
+    const code = (err as { code?: string } | undefined)?.code;
+    if (code === 'FileNotFound' || code === 'ENOENT') {
+      // No -wal file: the database has no separate WAL state to merge.
+      return 0;
+    }
+    // Any other stat failure (permissions, transient provider error) leaves
+    // the WAL state unknowable while committed frames may be invisible to
+    // sql.js — fail toward the read-only gate rather than silently disarming
+    // the only defense against saving a stale view over the real file.
+    GlobalOutputChannel?.appendLine(
+      `SQLite Explorer: could not inspect ${walUri.toString()} (`
+      + `${err instanceof Error ? err.message : String(err)}); `
+      + 'treating WAL state as unknown and opening read-only'
+    );
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+/**
+ * Surface the WAL read-only downgrade to the user.
+ *
+ * The webview only ever receives the bare read-only flag (the browser WAL
+ * guard is silent for the same reason), so the desktop gate raises the reason
+ * here: once as a toast and once in the output channel.
+ */
+function warnWalReadOnlyDowngrade(displayName: string): void {
+  GlobalOutputChannel?.appendLine(
+    `[SQLite Explorer] ${displayName}: uncheckpointed WAL data found next to the database. ` +
+    'The WebAssembly backend reads only the main database file, so the database opens ' +
+    'read-only to avoid saving a stale copy over the WAL transactions. Run ' +
+    '"PRAGMA wal_checkpoint(TRUNCATE)" on it (or close the program writing to it), then reopen.'
+  );
+  // Fire-and-forget: the toast resolves when dismissed and must not block
+  // connection establishment.
+  void vsc.window.showWarningMessage(vsc.l10n.t(
+    '{0} has WAL changes the WebAssembly SQLite backend cannot read, so it is opened read-only and the data shown may be incomplete. Run "PRAGMA wal_checkpoint(TRUNCATE)" on the database (or close the program writing to it), then reopen it.',
+    displayName
+  ));
 }

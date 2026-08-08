@@ -130,6 +130,17 @@ describe('workerFactory error path tests', () => {
     Module.prototype.require = originalRequire;
   });
 
+  // The factory derives the sibling -wal URI via uri.with() (WAL read-only
+  // gate), so database-file mocks must implement it like real vsc.Uri does.
+  const testDbUri = () => ({
+    scheme: 'file',
+    fsPath: '/test/db.sqlite',
+    path: '/test/db.sqlite',
+    with({ path: nextPath }: { path: string }) {
+      return { ...this, path: nextPath, fsPath: nextPath };
+    }
+  } as any);
+
   it('should terminate worker and re-throw error if establishConnection fails in WASM factory', async () => {
     connectionFailed = true;
 
@@ -141,7 +152,7 @@ describe('workerFactory error path tests', () => {
     // We have to cast to access the returned WASM bundle for testing establishConnection directly
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
 
-    const fileUri = { scheme: 'file', fsPath: '/test/db.sqlite', path: '/test/db.sqlite' } as any;
+    const fileUri = testDbUri();
 
     try {
       await bundle.establishConnection(fileUri, 'test.sqlite');
@@ -227,11 +238,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
 
@@ -344,7 +351,7 @@ describe('workerFactory error path tests', () => {
       null as any
     );
     const connection = await bundle.establishConnection(
-      { scheme: 'file', fsPath: '/test/db.sqlite', path: '/test/db.sqlite' } as any,
+      testDbUri(),
       'test.sqlite'
     );
 
@@ -370,11 +377,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
     const controller = new AbortController();
@@ -409,11 +412,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
     const controller = new AbortController();
@@ -463,11 +462,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
     const blob = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
@@ -530,11 +525,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
     const { ModificationTracker } = require('../../src/core/undo-history');
@@ -574,11 +565,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     await bundle.establishConnection(fileUri, 'test.sqlite');
     assert.ok(workerTimeoutPolicy, 'desktop worker should install a timeout policy');
@@ -689,11 +676,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     await bundle.establishConnection(fileUri, 'test.sqlite');
     const veryLargeHistory = Array.from({ length: 10_000 }, (_, index) => ({ index }));

@@ -666,8 +666,6 @@ export interface DatabaseInitConfig {
   content: Uint8Array | null;
   /** Path to database file (for direct reading in worker) */
   filePath?: string;
-  /** WAL file content if present */
-  walContent?: Uint8Array | null;
   /** Maximum allowed file size */
   maxSize: number;
   /** Path mappings for resources */

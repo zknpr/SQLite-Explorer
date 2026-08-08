@@ -78,6 +78,11 @@ export async function createDatabaseEngine(
   let buffer = config.content;
 
   // If content is missing but filePath is provided, read from disk (Node.js only)
+  // NOTE: this reads only the main database file — sql.js cannot merge a
+  // sibling -wal file, so committed-but-uncheckpointed WAL frames would be
+  // invisible here. The layer that owns file access (workerFactory) checks
+  // for WAL data before handing over a filePath (or content bytes) and forces
+  // readOnlyMode when it finds any; do not add WAL handling in the engine.
   if (!buffer && config.filePath) {
       try {
           // Dynamic require to avoid bundling fs in browser builds
