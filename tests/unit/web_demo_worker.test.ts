@@ -50,6 +50,11 @@ function readCurrentWorkerBundle(): Promise<string> {
     });
     assert.strictEqual(rendered.outputFiles.length, 1);
     const renderedSource = rendered.outputFiles[0].text;
+    // Source-only development runs are explicit; the default/full-suite lane
+    // continues to enforce the committed bundle byte-for-byte.
+    if (process.env.SQLITE_EXPLORER_TEST_AUTHORED_WORKER === '1') {
+        return renderedSource;
+    }
     const expectedHash = createHash('sha256').update(renderedSource).digest('hex');
     const bundledSource = readFileSync(bundledWorkerPath, 'utf8');
     const bundledHash = bundledSource.match(
@@ -84,6 +89,7 @@ async function createWorkerHarness(options: {
     initSqlJs?: (config: any) => Promise<any>;
     onImportScripts?: (url: string) => void;
     onSql?: (kind: 'exec' | 'prepare', sql: string) => void;
+    coerceBigIntsToNumbers?: boolean;
 } = {}): Promise<WorkerHarness> {
     const source = await readCurrentWorkerBundle();
     const responses: any[] = [];
@@ -91,7 +97,7 @@ async function createWorkerHarness(options: {
     const workerGlobal: any = {
         initSqlJs: async (config: any) => {
             const sqlJs = await initializeSqlJs(config);
-            if (!options.onSql) return sqlJs;
+            if (!options.onSql && !options.coerceBigIntsToNumbers) return sqlJs;
             const ObservedDatabase = new Proxy(sqlJs.Database, {
                 construct(Target: any, args: any[]): object {
                     const database = Reflect.construct(Target, args) as Record<string, any>;
@@ -99,7 +105,16 @@ async function createWorkerHarness(options: {
                         const original = database[kind].bind(database);
                         database[kind] = (sql: string, ...methodArgs: unknown[]) => {
                             options.onSql?.(kind, sql);
-                            return original(sql, ...methodArgs);
+                            const result = original(sql, ...methodArgs);
+                            if (kind !== 'exec' || !options.coerceBigIntsToNumbers) {
+                                return result;
+                            }
+                            return result.map((resultSet: any) => ({
+                                ...resultSet,
+                                values: resultSet.values.map((row: unknown[]) => row.map(
+                                    value => typeof value === 'bigint' ? Number(value) : value
+                                ))
+                            }));
                         };
                     }
                     return database;
@@ -189,7 +204,7 @@ describe('web demo view worker', () => {
             [
                 1,
                 'comma, "quote"\nline',
-                new Uint8Array([1, 2, 3]),
+                new Uint8Array([1, 2, 3, 4]),
                 2,
                 null,
                 new Uint8Array()
@@ -219,8 +234,8 @@ describe('web demo view worker', () => {
         assert.strictEqual(
             Array.from(json.contentChunks).join(''),
             JSON.stringify([
-                { id: 1, note: 'comma, "quote"\nline', payload: '[BLOB: 3 bytes]' },
-                { id: 2, note: null, payload: '[BLOB: 0 bytes]' }
+                { id: 1, note: 'comma, "quote"\nline', payload: 'AQIDBA==' },
+                { id: 2, note: null, payload: '' }
             ], null, 2)
         );
 
@@ -229,8 +244,8 @@ describe('web demo view worker', () => {
         assert.strictEqual(
             Array.from(sql.contentChunks).join(''),
             'INSERT INTO "table_name" ("id", "note", "payload") VALUES ' +
-            '(1, \'comma, "quote"\nline\', NULL);\n' +
-            'INSERT INTO "table_name" ("id", "note", "payload") VALUES (2, NULL, NULL);'
+            '(1, \'comma, "quote"\nline\', X\'01020304\');\n' +
+            'INSERT INTO "table_name" ("id", "note", "payload") VALUES (2, NULL, X\'\');'
         );
 
         await worker.invoke(
@@ -289,6 +304,102 @@ describe('web demo view worker', () => {
                 ['integer', '-9223372036854775808']
             ]
         );
+    });
+
+    it('round-trips demo SQL exports without losing BLOB, embedded NUL text, or int64 values', async () => {
+        const worker = await createWorkerHarness({ coerceBigIntsToNumbers: true });
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_sql_roundtrip (payload BLOB, nul_text TEXT, exact_int INTEGER)'
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_sql_roundtrip VALUES (?, CAST(? AS TEXT), 9007199254740993)',
+            [new Uint8Array([0, 1, 2, 253, 254]), new TextEncoder().encode('before\0after')]
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_sql_roundtrip' },
+            ['payload', 'nul_text', 'exact_int'],
+            {},
+            {},
+            { format: 'sql' }
+        );
+        const sql = Array.from(exported.contentChunks).join('');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_sql_roundtrip_copy ' +
+            '(payload BLOB, nul_text TEXT, exact_int INTEGER)'
+        );
+        await worker.invoke(
+            'runQuery',
+            sql.replaceAll('"demo_sql_roundtrip"', '"demo_sql_roundtrip_copy"')
+        );
+
+        const restored = await worker.invoke(
+            'runQuery',
+            'SELECT hex(payload), hex(CAST(nul_text AS BLOB)), typeof(exact_int), ' +
+            'CAST(exact_int AS TEXT) FROM demo_sql_roundtrip_copy'
+        );
+        assert.deepStrictEqual(Array.from(restored[0].rows[0]), [
+            '000102FDFE',
+            '6265666F7265006166746572',
+            'integer',
+            '9007199254740993'
+        ]);
+    });
+
+    it('round-trips demo JSON exports without losing BLOB, embedded NUL text, or int64 values', async () => {
+        const worker = await createWorkerHarness({ coerceBigIntsToNumbers: true });
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_json_roundtrip (payload BLOB, nul_text TEXT, exact_int INTEGER)'
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_json_roundtrip VALUES (?, CAST(? AS TEXT), 9007199254740993)',
+            [new Uint8Array([0, 1, 2, 253, 254]), new TextEncoder().encode('before\0after')]
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_json_roundtrip' },
+            ['payload', 'nul_text', 'exact_int'],
+            {},
+            {},
+            { format: 'json' }
+        );
+        const json = Array.from(exported.contentChunks).join('');
+        assert.match(json, /"exact_int": 9007199254740993/);
+        const [row] = JSON.parse(json);
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_json_roundtrip_copy ' +
+            '(payload BLOB, nul_text TEXT, exact_int INTEGER)'
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_json_roundtrip_copy VALUES ' +
+            '(?, CAST(? AS TEXT), json_extract(?, \'$[0].exact_int\'))',
+            [
+                new Uint8Array(Buffer.from(row.payload, 'base64')),
+                new TextEncoder().encode(row.nul_text),
+                json
+            ]
+        );
+
+        const restored = await worker.invoke(
+            'runQuery',
+            'SELECT hex(payload), hex(CAST(nul_text AS BLOB)), typeof(exact_int), ' +
+            'CAST(exact_int AS TEXT) FROM demo_json_roundtrip_copy'
+        );
+        assert.deepStrictEqual(Array.from(restored[0].rows[0]), [
+            '000102FDFE',
+            '6265666F7265006166746572',
+            'integer',
+            '9007199254740993'
+        ]);
     });
 
     it('splits bounded web-demo output into assembly chunks instead of one response string', async () => {
@@ -491,6 +602,103 @@ describe('web demo view worker', () => {
         );
         const rows = await worker.invoke('runQuery', 'SELECT id, kept FROM demo_delete');
         assert.deepStrictEqual(Array.from(rows[0].rows[0]), [1, 'survives']);
+    });
+
+    it('drops a demo column without changing surviving schema contracts', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'PRAGMA foreign_keys = ON; ' +
+            'CREATE TABLE demo_parent (id INTEGER PRIMARY KEY); ' +
+            'CREATE TABLE demo_audit (message TEXT); ' +
+            'CREATE TABLE demo_constraints (' +
+            'id INTEGER PRIMARY KEY, ' +
+            'code TEXT NOT NULL UNIQUE, ' +
+            'qty INTEGER NOT NULL CHECK (qty > 0), ' +
+            'parent_id INTEGER REFERENCES demo_parent(id), ' +
+            'removed TEXT, ' +
+            'generated TEXT GENERATED ALWAYS AS (code || \':\' || qty) STORED' +
+            ') WITHOUT ROWID; ' +
+            'CREATE INDEX demo_constraints_qty ON demo_constraints(qty); ' +
+            'CREATE INDEX demo_constraints_removed ON demo_constraints(removed); ' +
+            'CREATE TRIGGER demo_constraints_audit AFTER UPDATE OF qty ON demo_constraints ' +
+            'BEGIN INSERT INTO demo_audit VALUES (NEW.code); END; ' +
+            "INSERT INTO demo_parent VALUES (1); " +
+            "INSERT INTO demo_constraints(id, code, qty, parent_id, removed) " +
+            "VALUES (1, 'kept', 2, 1, 'gone')"
+        );
+        const untouchedBefore = await worker.invoke(
+            'runQuery',
+            "SELECT type, name, sql FROM sqlite_master " +
+            "WHERE name IN ('demo_constraints_qty', 'demo_constraints_audit') ORDER BY type, name"
+        );
+
+        await worker.invoke(
+            'deleteColumns',
+            'demo_constraints',
+            ['removed'],
+            ['demo_constraints_removed']
+        );
+
+        const untouchedAfter = await worker.invoke(
+            'runQuery',
+            "SELECT type, name, sql FROM sqlite_master " +
+            "WHERE name IN ('demo_constraints_qty', 'demo_constraints_audit') ORDER BY type, name"
+        );
+        assert.deepStrictEqual(
+            Array.from(untouchedAfter[0]?.rows ?? [], (row: unknown[]) => Array.from(row)),
+            Array.from(untouchedBefore[0].rows, (row: unknown[]) => Array.from(row))
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                "SELECT count(*) FROM sqlite_master " +
+                "WHERE type = 'index' AND name = 'demo_constraints_removed'"
+            ),
+            0
+        );
+        const tableSql = String(await workerScalar(
+            worker,
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'demo_constraints'"
+        ));
+        assert.match(tableSql, /PRIMARY KEY/i);
+        assert.match(tableSql, /UNIQUE/i);
+        assert.match(tableSql, /CHECK\s*\(qty\s*>\s*0\)/i);
+        assert.match(tableSql, /REFERENCES\s+demo_parent/i);
+        assert.match(tableSql, /GENERATED ALWAYS/i);
+        assert.match(tableSql, /WITHOUT ROWID/i);
+        assert.doesNotMatch(tableSql, /\bremoved\b/i);
+
+        await worker.invoke(
+            'runQuery',
+            'UPDATE demo_constraints SET qty = 3 WHERE id = 1'
+        );
+        assert.strictEqual(await workerScalar(worker, 'SELECT message FROM demo_audit'), 'kept');
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT generated FROM demo_constraints WHERE id = 1'),
+            'kept:3'
+        );
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                "INSERT INTO demo_constraints(id, code, qty, parent_id) VALUES (2, 'kept', 1, 1)"
+            ),
+            /UNIQUE constraint failed/i
+        );
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                "INSERT INTO demo_constraints(id, code, qty, parent_id) VALUES (2, 'bad-check', 0, 1)"
+            ),
+            /CHECK constraint failed/i
+        );
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                "INSERT INTO demo_constraints(id, code, qty, parent_id) VALUES (2, 'bad-fk', 1, 99)"
+            ),
+            /FOREIGN KEY constraint failed/i
+        );
     });
 
     it('does not execute a trailing statement smuggled through preview', async () => {
@@ -2245,6 +2453,17 @@ describe('web demo view worker', () => {
             ),
             1
         );
+    });
+
+    it('reports locking_mode and temp_store in the demo pragma snapshot', async () => {
+        const worker = await createWorkerHarness();
+
+        const pragmas = await worker.invoke('getPragmas');
+
+        assert.ok(Object.prototype.hasOwnProperty.call(pragmas, 'locking_mode'));
+        assert.ok(Object.prototype.hasOwnProperty.call(pragmas, 'temp_store'));
+        assert.strictEqual(typeof pragmas.locking_mode, 'string');
+        assert.strictEqual(typeof pragmas.temp_store, 'number');
     });
 
     it('nests demo batch updates inside an existing savepoint', async () => {

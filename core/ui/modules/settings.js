@@ -150,6 +150,15 @@ function renderPragmaForm(pragmas, settings) {
     container.appendChild(spacer);
     appendSection('SQLite Settings (Pragmas)');
 
+    const sessionNote = document.createElement('div');
+    sessionNote.className = 'setting-desc';
+    sessionNote.style.marginBottom = '12px';
+    sessionNote.textContent =
+        'Foreign Keys, Synchronous, Cache Size, Locking Mode, and Temp Store are session only ' +
+        'and reset when the database connection is reopened. Journal Mode and Auto Vacuum ' +
+        'are stored in the database.';
+    container.appendChild(sessionNote);
+
     // Journal Mode
     const journalSelect = document.createElement('select');
     journalSelect.className = 'setting-pragma';
@@ -192,6 +201,22 @@ function renderPragmaForm(pragmas, settings) {
     createOptions(['NORMAL', 'EXCLUSIVE'], pragmas.locking_mode).forEach(opt => lockSelect.appendChild(opt));
     appendField('Locking Mode', lockSelect, '');
 
+    // Temp Store
+    const tempStoreSelect = document.createElement('select');
+    tempStoreSelect.className = 'setting-pragma';
+    tempStoreSelect.dataset.name = 'temp_store';
+    tempStoreSelect.dataset.type = 'number';
+    [
+        {v:0, t:'DEFAULT (0)'}, {v:1, t:'FILE (1)'}, {v:2, t:'MEMORY (2)'}
+    ].forEach(o => {
+        const opt = document.createElement('option');
+        opt.value = o.v;
+        opt.textContent = o.t;
+        if (Number(pragmas.temp_store) === o.v) opt.selected = true;
+        tempStoreSelect.appendChild(opt);
+    });
+    appendField('Temp Store', tempStoreSelect, 'Storage used for temporary tables and indexes');
+
     // Auto Vacuum
     const vacSelect = document.createElement('select');
     vacSelect.className = 'setting-pragma';
@@ -233,9 +258,9 @@ export async function updatePragma(name, value) {
     try {
         updateStatus(`Updating ${name}...`);
         await backendApi.setPragma(name, value);
-        updateStatus(`Updated ${name}`);
         // Reload to verify (some pragmas normalize values)
-        // await loadPragmas();
+        await loadPragmas();
+        updateStatus(`Updated ${name}`);
     } catch (err) {
         console.error(`Failed to set ${name}:`, err);
         updateStatus(`Error: ${err.message}`);

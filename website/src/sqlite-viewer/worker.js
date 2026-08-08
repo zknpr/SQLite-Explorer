@@ -26,7 +26,17 @@ import {
   VIEW_TRIGGER_SCHEMA_QUERIES,
   normalizeViewSelectSql
 } from '../../../src/core/view-utils.ts';
-import { escapeLikePattern, validateRowId } from '../../../src/core/sql-utils.ts';
+import {
+  escapeIdentifier,
+  escapeLikePattern,
+  validateRowId
+} from '../../../src/core/sql-utils.ts';
+import {
+  encodeCsvExportCell,
+  encodeJsonExportCell,
+  encodeSqlExportCell
+} from '../../../src/core/export-encoding.ts';
+import { executeSchemaPreservingColumnDrop } from '../../../src/core/column-drop.ts';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 import {
   applyMergePatch,
@@ -173,15 +183,6 @@ async function loadSqlJs() {
 // ============================================================================
 // SQL Validation Utilities
 // ============================================================================
-
-/**
- * Escape a SQL identifier (table name, column name) for safe use in queries.
- * @param {string} identifier
- * @returns {string}
- */
-function escapeIdentifier(identifier) {
-  return `"${identifier.replace(/"/g, '""')}"`;
-}
 
 /**
  * Validate a SQL type definition to ensure it is safe.
@@ -836,13 +837,6 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
   if (!['csv', 'json', 'sql', 'excel'].includes(format)) {
     throw new Error(`Unsupported export format: ${format}`);
   }
-  // Build column list
-  const columnList = columns && columns.length > 0
-    ? columns.map(escapeIdentifier).join(', ')
-    : '*';
-
-  // Build query
-  let sql = `SELECT ${columnList} FROM ${escapeIdentifier(table)}`;
   let whereSql = '';
   let params = [];
 
@@ -854,7 +848,6 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
     }
     const predicate = buildRecordIdentitiesPredicate(rowIds, identity);
     whereSql = ` WHERE ${predicate.sql}`;
-    sql += whereSql;
     params = predicate.params;
   }
 
@@ -863,16 +856,52 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
     : getExportProjectionColumns(table);
   assertWebDemoExportWithinLimit(table, selectedColumns, whereSql, params);
 
-  // sql.js otherwise coerces signed int64 values through Number before any
-  // exporter sees them. Keep BigInt until each format emits exact decimals.
-  const results = db.exec(sql, params, { useBigInt: true });
+  // Project exact INTEGER text and raw TEXT bytes at the SQLite boundary.
+  // Raw sql.js values can round int64 and truncate strings at the first NUL.
+  const projection = selectedColumns.flatMap((column, index) => {
+    const identifier = escapeIdentifier(column);
+    const storageClass = `typeof(${identifier})`;
+    const value =
+      `CASE WHEN ${storageClass} = 'integer' THEN CAST(${identifier} AS TEXT) ` +
+      `WHEN ${storageClass} = 'text' THEN CAST(${identifier} AS BLOB) ` +
+      `ELSE ${identifier} END`;
+    return [
+      `${storageClass} AS ${escapeIdentifier(`__export_type_${index}`)}`,
+      `${value} AS ${escapeIdentifier(`__export_value_${index}`)}`
+    ];
+  }).join(', ');
+  const sql =
+    `SELECT ${projection} FROM ${escapeIdentifier(table)}${whereSql}`;
+  const results = db.exec(sql, params);
 
   if (results.length === 0) {
     return { contentChunks: [], filename: `${table}.${format}`, mimeType: 'text/plain' };
   }
 
-  const headers = results[0].columns;
-  const rows = results[0].values;
+  const headers = selectedColumns;
+  const textEncoding = normalizeCellTextEncoding(
+    db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]
+  );
+  const textDecoder = new TextDecoder(textEncoding, { fatal: true });
+  const storageClasses = new Set(['null', 'integer', 'real', 'text', 'blob']);
+  const rows = results[0].values.map(row => selectedColumns.map((column, index) => {
+    const storageClass = row[index * 2];
+    if (typeof storageClass !== 'string' || !storageClasses.has(storageClass)) {
+      throw new Error(`SQLite returned an invalid storage class for ${table}.${column}`);
+    }
+    const rawValue = row[index * 2 + 1];
+    let value = rawValue;
+    if (storageClass === 'text') {
+      if (!(rawValue instanceof Uint8Array)) {
+        throw new Error(`SQLite returned invalid TEXT bytes for ${table}.${column}`);
+      }
+      value = textDecoder.decode(rawValue);
+    }
+    if (storageClass === 'null' && value !== null) {
+      throw new Error(`SQLite returned a value for NULL cell ${table}.${column}`);
+    }
+    return { storageClass, value };
+  }));
 
   const output = new WebDemoExportChunkCollector();
   let mimeType = 'text/plain';
@@ -1018,28 +1047,20 @@ class WebDemoExportChunkCollector {
  * Convert data to CSV format.
  */
 function exportToCsv(headers, rows, includeHeader, output) {
-  const escapeCell = (val) => {
-    if (val === null || val === undefined) return '';
-    if (val instanceof Uint8Array) return '[BLOB]';
-    const str = String(val);
-    // Escape quotes and wrap in quotes if contains comma, quote, or newline
-    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-      return `"${str.replace(/"/g, '""')}"`;
-    }
-    return str;
-  };
-
   let wroteLine = false;
   const writeLine = cells => {
     if (wroteLine) output.append('\n');
-    output.append(cells.map(escapeCell).join(','));
+    output.append(cells.join(','));
     wroteLine = true;
   };
   if (includeHeader) {
-    writeLine(headers);
+    writeLine(headers.map(value => encodeCsvExportCell({
+      storageClass: 'text',
+      value
+    })));
   }
   for (const row of rows) {
-    writeLine(row);
+    writeLine(row.map(encodeCsvExportCell));
   }
 }
 
@@ -1052,11 +1073,7 @@ function exportToJson(headers, rows, output) {
     const row = rows[rowIndex];
     const obj = {};
     for (let i = 0; i < headers.length; i++) {
-      let val = row[i];
-      if (val instanceof Uint8Array) {
-        val = `[BLOB: ${val.length} bytes]`;
-      }
-      obj[headers[i]] = val;
+      obj[headers[i]] = row[i];
     }
     output.append(rowIndex === 0 ? '\n' : ',\n');
     const keys = Object.keys(obj);
@@ -1067,11 +1084,7 @@ function exportToJson(headers, rows, output) {
     output.append('  {\n');
     keys.forEach((key, keyIndex) => {
       if (keyIndex > 0) output.append(',\n');
-      const value = obj[key];
-      const serialized = typeof value === 'bigint'
-        ? value.toString()
-        : (JSON.stringify(value) ?? 'null');
-      output.append(`    ${JSON.stringify(key)}: ${serialized}`);
+      output.append(`    ${JSON.stringify(key)}: ${encodeJsonExportCell(obj[key])}`);
     });
     output.append('\n  }');
   }
@@ -1082,18 +1095,11 @@ function exportToJson(headers, rows, output) {
  * Convert data to SQL INSERT statements.
  */
 function exportToSql(table, headers, rows, includeTableName, output) {
-  const tableName = includeTableName ? `"${table.replace(/"/g, '""')}"` : '"table_name"';
-  const columnList = headers.map(h => `"${h.replace(/"/g, '""')}"`).join(', ');
-
-  const escapeValue = (val) => {
-    if (val === null || val === undefined) return 'NULL';
-    if (val instanceof Uint8Array) return 'NULL'; // Can't represent BLOB in SQL text
-    if (typeof val === 'number' || typeof val === 'bigint') return String(val);
-    return `'${String(val).replace(/'/g, "''")}'`;
-  };
+  const tableName = includeTableName ? escapeIdentifier(table) : '"table_name"';
+  const columnList = headers.map(escapeIdentifier).join(', ');
 
   rows.forEach((row, rowIndex) => {
-    const values = row.map(escapeValue).join(', ');
+    const values = row.map(encodeSqlExportCell).join(', ');
     if (rowIndex > 0) output.append('\n');
     output.append(`INSERT INTO ${tableName} (${columnList}) VALUES (${values});`);
   });
@@ -1588,13 +1594,14 @@ async function getPragmas() {
 
   const pragmas = {};
   const pragmaNames = [
+    'foreign_keys',
     'journal_mode',
     'synchronous',
-    'foreign_keys',
-    'auto_vacuum',
     'cache_size',
-    'page_size',
-    'encoding'
+    'locking_mode',
+    'temp_store',
+    'encoding',
+    'auto_vacuum'
   ];
 
   for (const name of pragmaNames) {
@@ -1958,33 +1965,24 @@ async function deleteRows(table, rowIds) {
 
 /**
  * Delete columns from a table.
- * Note: SQLite <3.35.0 doesn't support DROP COLUMN, so we recreate the table.
- *
  * @param {string} table - Table name
  * @param {Array<string>} columns - Columns to delete
+ * @param {Array<string>|undefined} dropDependentIndexes - Confirmed indexes to drop first
  */
-async function deleteColumns(table, columns) {
+async function deleteColumns(table, columns, dropDependentIndexes) {
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Column deletion');
-
-  // Get current table info
-  const tableInfo = await getTableInfo(table);
-  const columnsSet = new Set(columns);
-  const remainingColumns = tableInfo.filter(c => !columnsSet.has(c.identifier));
-
-  if (remainingColumns.length === 0) {
-    throw new Error('Cannot delete all columns');
-  }
-
-  const safeTable = table.replace(/"/g, '""');
-  const columnList = remainingColumns.map(c => `"${c.identifier.replace(/"/g, '""')}"`).join(', ');
+  if (columns.length === 0) return;
 
   const savepointName = createViewSavepointName('sp_delete_columns');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
-    db.run(`CREATE TABLE "_temp_${safeTable}" AS SELECT ${columnList} FROM "${safeTable}"`);
-    db.run(`DROP TABLE "${safeTable}"`);
-    db.run(`ALTER TABLE "_temp_${safeTable}" RENAME TO "${safeTable}"`);
+    await executeSchemaPreservingColumnDrop(
+      table,
+      columns,
+      dropDependentIndexes,
+      sql => runSingleStatement(sql)
+    );
     runSingleStatement(`RELEASE ${savepointName}`);
   } catch (e) {
     safeRollbackSavepoint(savepointName, 'deleteColumns');

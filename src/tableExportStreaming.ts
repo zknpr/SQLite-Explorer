@@ -9,8 +9,13 @@ import type {
   RecordId,
   TableIdentity
 } from './core/types';
-import { cellValueToSql, escapeIdentifier } from './core/sql-utils';
+import { escapeIdentifier } from './core/sql-utils';
 import { normalizeCellTextEncoding } from './core/cell-read';
+import {
+  encodeCsvExportCell,
+  encodeJsonExportCell,
+  encodeSqlExportCell
+} from './core/export-encoding';
 import {
   buildRecordIdentityPredicate,
   buildRecordIdentitiesPredicate,
@@ -726,7 +731,7 @@ async function writeCsvCell(
     return;
   }
   if (!needsCellStream(cell)) {
-    await emit(sink, escapeCsvValue(cell.value), cancellation);
+    await emit(sink, encodeCsvExportCell(cell), cancellation);
     return;
   }
   await withCellSession(operations, cell, cancellation, async input => {
@@ -746,14 +751,7 @@ async function writeJsonCell(
   cancellation?: ExportCancellation
 ): Promise<void> {
   if (!needsCellStream(cell)) {
-    if (cell.storageClass === 'blob') {
-      const bytes = cell.value as Uint8Array;
-      await emit(sink, JSON.stringify(Buffer.from(bytes).toString('base64')), cancellation);
-    } else if (cell.storageClass === 'integer') {
-      await emit(sink, String(cell.value), cancellation);
-    } else {
-      await emit(sink, JSON.stringify(cell.value) ?? 'null', cancellation);
-    }
+    await emit(sink, encodeJsonExportCell(cell), cancellation);
     return;
   }
 
@@ -775,11 +773,7 @@ async function writeSqlCell(
   cancellation?: ExportCancellation
 ): Promise<void> {
   if (!needsCellStream(cell)) {
-    await emit(
-      sink,
-      cell.storageClass === 'integer' ? String(cell.value) : cellValueToSql(cell.value),
-      cancellation
-    );
+    await emit(sink, encodeSqlExportCell(cell), cancellation);
     return;
   }
 

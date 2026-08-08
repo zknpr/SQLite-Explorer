@@ -115,6 +115,7 @@ import {
   OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE,
   OversizedCellReplacementRequiredError
 } from '../../cell-edit-policy';
+import { executeSchemaPreservingColumnDrop } from '../../column-drop';
 
 // ============================================================================
 // Internal sql.js Types
@@ -1735,25 +1736,19 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {
     if (columns.length === 0) return;
 
-    const escapedTable = escapeIdentifier(table);
-
     // Use a SAVEPOINT so column drops remain atomic on their own and can also
     // participate in the outer hot-exit restore transaction.
     const savepointName = this.createSavepointName('sp_delete_columns');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
-      // Drop specified dependent indexes first inside the transaction
-      if (dropDependentIndexes && dropDependentIndexes.length > 0) {
-        const dropIndexStatements = dropDependentIndexes
-          .map((indexName) => `DROP INDEX IF EXISTS ${escapeIdentifier(indexName)};`)
-          .join('\n');
-        await this.executeQuery(dropIndexStatements);
-      }
-
-      const dropColumnStatements = columns
-        .map((col) => `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)};`)
-        .join('\n');
-      await this.executeQuery(dropColumnStatements);
+      await executeSchemaPreservingColumnDrop(
+        table,
+        columns,
+        dropDependentIndexes,
+        async sql => {
+          await this.executeQuery(sql);
+        }
+      );
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (e) {
       await this.safeRollbackSavepoint(savepointName, 'deleteColumns');

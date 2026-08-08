@@ -261,6 +261,75 @@ describe('streamTableExport golden parity', () => {
         }
     });
 
+    it('round-trips desktop SQL and JSON exports across BLOB, embedded NUL text, and int64 cells', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE desktop_roundtrip (payload BLOB, nul_text TEXT, exact_int INTEGER)'
+        );
+        await operations.executeQuery(
+            'INSERT INTO desktop_roundtrip VALUES (?, CAST(? AS TEXT), 9007199254740993)',
+            [new Uint8Array([0, 1, 2, 253, 254, 255]), new TextEncoder().encode('before\0after')]
+        );
+
+        const assertRestored = async (table: string) => {
+            const restored = await operations.executeQuery(
+                `SELECT hex(payload), hex(CAST(nul_text AS BLOB)), typeof(exact_int), ` +
+                `CAST(exact_int AS TEXT) FROM "${table}"`
+            );
+            assert.deepStrictEqual(restored[0].rows, [[
+                '000102FDFEFF',
+                '6265666F7265006166746572',
+                'integer',
+                '9007199254740993'
+            ]]);
+        };
+
+        try {
+            const sql = await collectStreamingExport(
+                operations,
+                'desktop_roundtrip',
+                ['payload', 'nul_text', 'exact_int'],
+                { format: 'sql' }
+            );
+            await operations.executeQuery(
+                'CREATE TABLE desktop_sql_copy (payload BLOB, nul_text TEXT, exact_int INTEGER)'
+            );
+            await operations.executeQuery(
+                sql.content.replaceAll('"desktop_roundtrip"', '"desktop_sql_copy"')
+            );
+            await assertRestored('desktop_sql_copy');
+
+            const json = await collectStreamingExport(
+                operations,
+                'desktop_roundtrip',
+                ['payload', 'nul_text', 'exact_int'],
+                { format: 'json' }
+            );
+            assert.match(json.content, /"exact_int": 9007199254740993/);
+            const [row] = JSON.parse(json.content);
+            await operations.executeQuery(
+                'CREATE TABLE desktop_json_copy (payload BLOB, nul_text TEXT, exact_int INTEGER)'
+            );
+            await operations.executeQuery(
+                'INSERT INTO desktop_json_copy VALUES ' +
+                '(?, CAST(? AS TEXT), json_extract(?, \'$[0].exact_int\'))',
+                [
+                    new Uint8Array(Buffer.from(row.payload, 'base64')),
+                    new TextEncoder().encode(row.nul_text),
+                    json.content
+                ]
+            );
+            await assertRestored('desktop_json_copy');
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('matches legacy JSON key ordering and __proto__ handling', async () => {
         const database = await createDatabaseEngine({
             content: null,
