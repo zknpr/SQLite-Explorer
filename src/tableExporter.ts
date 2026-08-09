@@ -19,6 +19,12 @@ import {
   type ExportCancellation
 } from './tableExportStreaming';
 import { crypto as webCrypto } from './platform/cryptoShim';
+import {
+  replacementFileMetadataFromStats,
+  restoreTemporaryMetadata,
+  type OwnershipPreservationFailure,
+  type ReplacementFileMetadata
+} from './fileReplacementMetadata';
 export {
   EXPORT_CELL_CHUNK_BYTES,
   streamTableExport
@@ -111,6 +117,7 @@ type NodeWriteStream = import('node:fs').WriteStream;
 
 class AwaitedNodeStreamSink implements AsyncExportSink {
   private ended = false;
+  private fileDescriptor: number | undefined;
   private streamError: Error | undefined;
   private readonly recordStreamError = (error: Error): void => {
     this.streamError ??= error;
@@ -121,6 +128,9 @@ class AwaitedNodeStreamSink implements AsyncExportSink {
     // createWriteStream can fail asynchronously while the first database row is
     // still being prepared, before the first write callback exists.
     this.stream.on('error', this.recordStreamError);
+    this.stream.once('open', (fd) => {
+      this.fileDescriptor = fd;
+    });
   }
 
   async ready(): Promise<void> {
@@ -168,6 +178,29 @@ class AwaitedNodeStreamSink implements AsyncExportSink {
       }
     });
     if (this.streamError) throw this.streamError;
+  }
+
+  async restoreMetadata(
+    fs: NodeFs,
+    metadata: ReplacementFileMetadata
+  ): Promise<OwnershipPreservationFailure | undefined> {
+    if (this.ended) throw new Error('Cannot restore metadata on a completed export stream');
+    if (this.streamError) throw this.streamError;
+    const fd = this.fileDescriptor;
+    if (fd === undefined) {
+      throw new Error('Cannot restore export metadata before its file descriptor is ready');
+    }
+    return restoreTemporaryMetadata(
+      {
+        chown: (uid, gid) => new Promise<void>((resolve, reject) => {
+          fs.fchown(fd, uid, gid, (error) => error ? reject(error) : resolve());
+        }),
+        chmod: (mode) => new Promise<void>((resolve, reject) => {
+          fs.fchmod(fd, mode, (error) => error ? reject(error) : resolve());
+        })
+      },
+      metadata
+    );
   }
 
   async close(): Promise<void> {
@@ -295,11 +328,25 @@ function nodeErrorCode(error: unknown): string | undefined {
     : undefined;
 }
 
-async function resolveLocalExportDestination(fs: NodeFs, finalPath: string): Promise<string> {
+interface ResolvedLocalExportDestination {
+  replacementPath: string;
+  metadata?: ReplacementFileMetadata;
+}
+
+async function resolveLocalExportDestination(
+  fs: NodeFs,
+  finalPath: string
+): Promise<ResolvedLocalExportDestination> {
   try {
     // Replacing the canonical target preserves an existing destination symlink
     // while retaining the sibling-temp atomic swap on the target filesystem.
-    return await fs.promises.realpath(finalPath);
+    const replacementPath = await fs.promises.realpath(finalPath);
+    const targetStats = await fs.promises.stat(replacementPath, { bigint: true });
+    return {
+      replacementPath,
+      // Read metadata from the resolved target, not the symlink directory entry.
+      metadata: replacementFileMetadataFromStats(targetStats)
+    };
   } catch (error) {
     if (nodeErrorCode(error) !== 'ENOENT') throw error;
   }
@@ -307,7 +354,7 @@ async function resolveLocalExportDestination(fs: NodeFs, finalPath: string): Pro
   try {
     await fs.promises.lstat(finalPath);
   } catch (error) {
-    if (nodeErrorCode(error) === 'ENOENT') return finalPath;
+    if (nodeErrorCode(error) === 'ENOENT') return { replacementPath: finalPath };
     throw error;
   }
 
@@ -315,6 +362,21 @@ async function resolveLocalExportDestination(fs: NodeFs, finalPath: string): Pro
   // directory entry would silently destroy the link instead of exporting to
   // its intended target, so fail explicitly.
   throw new Error(`Cannot resolve existing local export destination: ${finalPath}`);
+}
+
+function warnAfterSuccessfulLocalExportRename(
+  failure: OwnershipPreservationFailure
+): void {
+  const { uid, gid, error } = failure;
+  try {
+    console.warn(
+      '[SQLite Explorer] Export replaced the destination, but could not restore its previous '
+      + `owner/group (uid ${uid}, gid ${gid}). Access based only on the previous owner/group may change:`,
+      error
+    );
+  } catch {
+    // A diagnostic sink must not turn an already-renamed export into a false failure.
+  }
 }
 
 async function removeLocalTemp(fs: NodeFs, tempPath: string, primaryError: unknown): Promise<never> {
@@ -338,14 +400,18 @@ async function exportLocalAtomic(
   options: ExportOptions,
   cancellation?: ExportCancellation
 ): Promise<number> {
-  const destinationPath = await resolveLocalExportDestination(fs, uri.fsPath);
+  const destination = await resolveLocalExportDestination(fs, uri.fsPath);
+  const destinationPath = destination.replacementPath;
   const tempPath = localSiblingTempPath(destinationPath);
   let sink: AwaitedNodeStreamSink | undefined;
+  let ownershipPreservationFailure: OwnershipPreservationFailure | undefined;
   try {
     const stream = fs.createWriteStream(tempPath, {
       encoding: 'utf8',
       flags: 'wx',
-      mode: 0o600
+      // Existing content stays private until its original ordinary mode is
+      // restored. New files use Node's normal 0666-and-process-umask policy.
+      mode: destination.metadata ? 0o600 : 0o666
     });
     sink = new AwaitedNodeStreamSink(stream);
     await sink.ready();
@@ -358,9 +424,15 @@ async function exportLocalAtomic(
       cancellation
     );
     assertExportNotCancelled(cancellation);
+    if (destination.metadata) {
+      ownershipPreservationFailure = await sink.restoreMetadata(fs, destination.metadata);
+    }
     await sink.close();
     assertExportNotCancelled(cancellation);
     await fs.promises.rename(tempPath, destinationPath);
+    if (ownershipPreservationFailure) {
+      warnAfterSuccessfulLocalExportRename(ownershipPreservationFailure);
+    }
     return rowCount;
   } catch (error) {
     let primaryError = error;

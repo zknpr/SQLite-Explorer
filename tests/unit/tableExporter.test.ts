@@ -1388,7 +1388,81 @@ describe('exportTableCommand atomic streaming', () => {
         }
     });
 
-    it('writes through an existing destination symlink without replacing the link', async () => {
+    it('preserves 0644 mode when replacing an existing destination', async (t) => {
+        if (process.platform === 'win32') {
+            t.skip('POSIX permission bits are not available on Windows');
+            return;
+        }
+
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            "CREATE TABLE mode_export (value TEXT); INSERT INTO mode_export VALUES ('new-content')"
+        );
+        const scratch = await fsPromises.mkdtemp(path.join(process.cwd(), '.stage-e-export-test-'));
+        const destinationPath = path.join(scratch, 'existing.json');
+        await fsPromises.writeFile(destinationPath, 'old-content');
+        await fsPromises.chmod(destinationPath, 0o644);
+
+        try {
+            const rowCount = await exportTableToLocalFileForTests(
+                { databaseOperations: operations } as any,
+                destinationPath,
+                'mode_export',
+                ['value'],
+                { format: 'json' }
+            );
+
+            assert.strictEqual(rowCount, 1);
+            assert.strictEqual((await fsPromises.stat(destinationPath)).mode & 0o777, 0o644);
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+            await fsPromises.rm(scratch, { recursive: true, force: true });
+        }
+    });
+
+    it('uses the process umask for a new destination', async (t) => {
+        if (process.platform === 'win32') {
+            t.skip('POSIX permission bits are not available on Windows');
+            return;
+        }
+
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            "CREATE TABLE umask_export (value TEXT); INSERT INTO umask_export VALUES ('new-content')"
+        );
+        const scratch = await fsPromises.mkdtemp(path.join(process.cwd(), '.stage-e-export-test-'));
+        const destinationPath = path.join(scratch, 'new.json');
+        const previousUmask = process.umask(0o027);
+
+        try {
+            const rowCount = await exportTableToLocalFileForTests(
+                { databaseOperations: operations } as any,
+                destinationPath,
+                'umask_export',
+                ['value'],
+                { format: 'json' }
+            );
+
+            assert.strictEqual(rowCount, 1);
+            assert.strictEqual((await fsPromises.stat(destinationPath)).mode & 0o777, 0o640);
+        } finally {
+            process.umask(previousUmask);
+            (operations as WasmDatabaseEngine).shutdown();
+            await fsPromises.rm(scratch, { recursive: true, force: true });
+        }
+    });
+
+    it('writes through an existing destination symlink without replacing the link or target mode', async () => {
         const database = await createDatabaseEngine({
             content: null,
             maxSize: 0,
@@ -1402,6 +1476,7 @@ describe('exportTableCommand atomic streaming', () => {
         const targetPath = path.join(scratch, 'target.json');
         const linkPath = path.join(scratch, 'destination.json');
         await fsPromises.writeFile(targetPath, 'old-content');
+        await fsPromises.chmod(targetPath, 0o644);
         await fsPromises.symlink(targetPath, linkPath);
 
         try {
@@ -1419,6 +1494,9 @@ describe('exportTableCommand atomic streaming', () => {
                 await fsPromises.readFile(targetPath, 'utf8'),
                 JSON.stringify([{ value: 'new-content' }], null, 2)
             );
+            if (process.platform !== 'win32') {
+                assert.strictEqual((await fsPromises.stat(targetPath)).mode & 0o777, 0o644);
+            }
         } finally {
             (operations as WasmDatabaseEngine).shutdown();
             await fsPromises.rm(scratch, { recursive: true, force: true });

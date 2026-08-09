@@ -7,6 +7,13 @@ import {
   type PagedWritableOverlaySnapshot
 } from './core/paged-writable-overlay';
 import { WAL_HEADER_SIZE_BYTES } from './core/paged-open';
+import {
+  ordinaryPermissionMode,
+  replacementFileMetadataFromStats,
+  restoreTemporaryMetadata,
+  type OwnershipPreservationFailure,
+  type ReplacementFileMetadata
+} from './fileReplacementMetadata';
 
 type NodeFs = typeof import('fs');
 type NodeFileHandle = Awaited<ReturnType<NodeFs['promises']['open']>>;
@@ -35,14 +42,9 @@ interface MissingTarget {
 
 type TargetGeneration = ExistingTarget | MissingTarget;
 
-interface ReplacementTarget {
+interface ReplacementTarget extends ReplacementFileMetadata {
   replacementPath: string;
   requiresReopen: boolean;
-  mode: number;
-  ownership?: {
-    uid: number;
-    gid: number;
-  };
   generation: TargetGeneration;
 }
 
@@ -57,13 +59,6 @@ interface HostFileFingerprint {
   uid: bigint;
   gid: bigint;
 }
-
-// Recreating setuid/setgid after writing user-controlled database bytes could
-// turn an executable-looking database into a privileged program. Sticky is a
-// directory policy and has no useful regular-file save meaning. Preserve only
-// the ordinary read/write/execute bits, matching the kernel's safe write-time
-// stripping of privilege-bearing special bits.
-const ORDINARY_PERMISSION_MASK = 0o777n;
 
 function errorCode(error: unknown): string | undefined {
   return (error as { code?: string } | undefined)?.code;
@@ -311,7 +306,7 @@ async function resolveReplacementTarget(
     return {
       replacementPath: path.join(canonicalParent, path.basename(absoluteTargetPath)),
       requiresReopen: false,
-      mode: Number(baseIdentity.mode & ORDINARY_PERMISSION_MASK),
+      mode: ordinaryPermissionMode(baseIdentity.mode),
       generation: { exists: false }
     };
   }
@@ -330,49 +325,9 @@ async function resolveReplacementTarget(
     // Existing permissions are live host metadata, not part of the frozen
     // SQLite byte generation. Preserve what is present when this save starts
     // (including a chmod performed after open) and verify it again at commit.
-    mode: Number(targetFingerprint.mode & ORDINARY_PERMISSION_MASK),
-    ownership: {
-      uid: Number(targetFingerprint.uid),
-      gid: Number(targetFingerprint.gid)
-    },
+    ...replacementFileMetadataFromStats(targetFingerprint),
     generation: { exists: true, fingerprint: targetFingerprint }
   };
-}
-
-interface OwnershipPreservationFailure {
-  uid: number;
-  gid: number;
-  error: unknown;
-}
-
-/**
- * Restore the inode metadata Node can reach without a path race.
- *
- * Node core has no API for copying per-file ACLs or extended attributes. The
- * atomic rename leaves the parent directory and its ACLs in place, but a fresh
- * temp inode cannot retain target-specific ACL entries, quarantine/provenance
- * xattrs, or other extended attributes without a native dependency or shelling
- * out. This save path deliberately does neither.
- */
-async function restoreTemporaryMetadata(
-  temporary: NodeFileHandle,
-  target: ReplacementTarget
-): Promise<OwnershipPreservationFailure | undefined> {
-  let ownershipFailure: OwnershipPreservationFailure | undefined;
-  if (target.ownership && process.platform !== 'win32') {
-    try {
-      // fchown before chmod: ownership changes can clear mode bits on POSIX.
-      await temporary.chown(target.ownership.uid, target.ownership.gid);
-    } catch (error) {
-      if (errorCode(error) !== 'EPERM') throw error;
-      // A non-root saver cannot give its temp inode back to a different owner.
-      // The rename can still be valid; report the access consequence only once
-      // the replacement has actually succeeded.
-      ownershipFailure = { ...target.ownership, error };
-    }
-  }
-  await temporary.chmod(target.mode);
-  return ownershipFailure;
 }
 
 function assertTargetGenerationSync(
