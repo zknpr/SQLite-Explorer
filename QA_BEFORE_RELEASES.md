@@ -63,17 +63,31 @@ testing nothing.
 5. Generated artifacts rebuilt and committed with their sources: `core/ui/viewer.html`,
    `website/public/sqlite-viewer/viewer.html`, `website/public/sqlite-viewer/worker.js`,
    `assets/sqlite3.wasm`. **Never hand-edit a generated file.**
-6. `npm run package` produces a `.vsix` without vsce warnings. Inspect the file list:
-   `natives/` present for all five targets, `l10n/` present, no `test_db/`, no
-   `docs/superpowers/`, no scan exports, no source maps that shouldn't ship.
-7. **Package size is a gate, not a footnote (repeat offender).** The `.vsix` is
-   dominated by `natives/` (5 binaries). It doubled once (9→19 MB) from shipping
-   unstripped binaries with linked DWARF — invisible to every test. Record the `.vsix`
-   size and the `natives/ (N files) [XX MB]` line vsce prints; a **>10% growth** vs the
-   last release needs an explanation before shipping. Current baseline: `.vsix` ≈ 11.7 MB,
-   **73 files** (was 693 — `node_modules` is no longer shipped; the codicon font+css live
-   under `assets/codicons/`, and everything else is esbuild-bundled into `out/`). A sudden
-   file-count jump back into the hundreds means `node_modules` is leaking in again. The binaries come from the fork artifact workflow with
+6. `npm run package` produces exactly six `.vsix` files without vsce warnings: five
+   platform targets plus the natives-free universal. The packaging script lists and gates
+   every archive before moving it into `release/`. Each target must contain only
+   `natives/native-worker.js` and its mapped `tjs` executable; universal must contain no
+   `natives/` path. Every package retains `out/extension-browser.js` and `l10n/`, with no
+   `test_db/`, `docs/superpowers/`, scan exports, or source maps.
+7. **Package size is a gate, not a footnote (repeat offender).** The old universal package
+   doubled once (9→19 MB) from shipping unstripped binaries with linked DWARF — invisible
+   to every test. Record every package's byte size and archive file count; a **>10% growth**
+   against its own baseline needs an explanation before shipping. Baseline from the
+   1.6.0 build on 2026-08-09:
+
+   | Package | Bytes | MiB | Files |
+   |---|---:|---:|---:|
+   | `sqlite-explorer-darwin-x64-1.6.0.vsix` | 3,112,074 | 2.97 | 69 |
+   | `sqlite-explorer-darwin-arm64-1.6.0.vsix` | 3,019,726 | 2.88 | 69 |
+   | `sqlite-explorer-linux-x64-1.6.0.vsix` | 3,305,318 | 3.15 | 69 |
+   | `sqlite-explorer-linux-arm64-1.6.0.vsix` | 3,278,494 | 3.13 | 69 |
+   | `sqlite-explorer-win32-x64-1.6.0.vsix` | 3,296,228 | 3.14 | 69 |
+   | `sqlite-explorer-1.6.0.vsix` (WASM-only universal) | 1,334,478 | 1.27 | 67 |
+
+   The file-count tripwire applies per package: native targets remain at **69 files** and
+   universal at **67 files**. Any increase requires archive inspection; a jump into the
+   hundreds is a release blocker because it usually means `node_modules` leaked back in.
+   The binaries come from the fork artifact workflow with
    `BUILD_WITH_STRIP`+`GC_SECTIONS` **and** `BUILD_WITH_WASM/FFI/LWS=OFF` (the worker only
    uses `tjs:sqlite`+`tjs:v8`, so the WASM interpreter, FFI/dlopen and the
    libwebsockets/TLS/HTTP stack are excluded — also a security win: the file-parsing
@@ -121,8 +135,9 @@ testing nothing.
 | Web demo | — | in a Web Worker |
 
 ¹ Desktop falls back to WASM on musl/Alpine, Windows-arm, hardened macOS, and wherever the
-bundled binary cannot execute. **[unverified]** — the fallback path has never been
-deliberately exercised in a release pass.
+bundled binary is absent or cannot execute. The unit suite pins a natives-absent open
+through the WASM worker with no native connection attempt or error notification; a real
+unsupported-host release smoke test remains **[unverified]**.
 
 ² This is the only surface where a blocking query stalls the **extension host** rather than
 a worker thread. Preemption regressions are invisible on the other two surfaces.
@@ -685,14 +700,20 @@ If `natives/` or `vendor/sql.js/` changed:
 3. Merge `dev` → `main`. This is where the review bots run — Codex auto-reviews every push
    (~6 min), CodeRabbit and Gemini also comment. **Read and verify their findings before
    merging.** Bots skip bot-authored PRs, so you are the reviewer there.
-4. The release ships on a `v*` tag, not on merge. `release.yml` builds the `.vsix` and
-   creates the GitHub Release.
-5. Open VSX is published separately by `scripts/publish-openvsx.mjs`, which verifies the
-   GitHub asset's SHA-256 before uploading. `--verify-only <version>` audits a published
-   version; `--dry-run` rehearses.
-6. All third-party GitHub Actions pinned to full commit SHAs, and each pin resolves to the
+4. The release ships on a `v*` tag, not on merge. `release.yml` builds all five platform
+   VSIX files plus the WASM-only universal in one run and uploads all six to the GitHub
+   Release.
+5. Open VSX is published separately by `scripts/publish-openvsx.mjs`. It validates all six
+   GitHub assets, publishes platform packages with `ovsx --target`, publishes universal,
+   and SHA-256-compares every served target with its GitHub release asset.
+   `--verify-only <version>` audits all six published variants; `--dry-run` rehearses.
+6. The Microsoft Marketplace is published by `scripts/publish-marketplace.mjs`, using the
+   PAT from macOS Keychain service `vsce.k`. Its `--dry-run` validates all six assets
+   without reading the PAT or publishing. If the script cannot be used, the Microsoft web
+   portal remains the manual fallback: drag **all six VSIX files** into the same release.
+7. All third-party GitHub Actions pinned to full commit SHAs, and each pin resolves to the
    tag its comment claims.
-7. After publishing, install the released artifact from the Marketplace **and** Open VSX in
+8. After publishing, install the released artifact from the Marketplace **and** Open VSX in
    a clean profile and smoke-test it. The thing users get is not the thing you built
    locally. **[unverified]** as a routine step.
 
@@ -703,7 +724,7 @@ If `natives/` or `vendor/sql.js/` changed:
 Do not tag until each line is satisfied or **explicitly documented with a reason**.
 
 - [ ] Clean tree; build and type-check pass; generated artifacts rebuilt and committed
-- [ ] `.vsix` contents inspected
+- [ ] All six `.vsix` contents inspected; per-package native/browser gates pass
 - [ ] Full unit suite green **twice consecutively**
 - [ ] Native real-binary smoke lane green
 - [ ] Large-cell lane green, or documented as not applicable

@@ -32,11 +32,15 @@ cd "$SCRIPT_DIR"
 EXT_NAME="sqlite-explorer"
 EXT_VERSION=$(node -p "require('./package.json').version")
 RELEASE_DIR="release"
-VSIX_FILE="${RELEASE_DIR}/${EXT_NAME}-${EXT_VERSION}.vsix"
+LOCAL_TARGET=$(node scripts/vsix-targets.mjs --current-target)
+UNIVERSAL_VSIX_FILE="${RELEASE_DIR}/${EXT_NAME}-${EXT_VERSION}.vsix"
+PREFERRED_VSIX_FILE="${RELEASE_DIR}/$(node scripts/vsix-targets.mjs --current-vsix "$EXT_NAME" "$EXT_VERSION")"
+VSIX_FILE=""
 
 echo -e "${BLUE}=================================${NC}"
 echo -e "${BLUE}  SQLite Explorer Installer${NC}"
 echo -e "${BLUE}  Version: ${EXT_VERSION}${NC}"
+echo -e "${BLUE}  Package target: ${LOCAL_TARGET}${NC}"
 echo -e "${BLUE}=================================${NC}"
 echo ""
 
@@ -116,28 +120,28 @@ if [ "$SKIP_BUILD" = false ]; then
     echo -e "${GREEN}✓ Dependencies synced${NC}"
 
     echo ""
-    echo -e "${YELLOW}Building extension...${NC}"
+    echo -e "${YELLOW}Building all platform packages...${NC}"
 
-    # Run the build script
-    node scripts/build.mjs
+    # The packager builds once, creates five native-target VSIX files plus the
+    # natives-free universal, and verifies every archive before release/.
+    node scripts/package-vsix.mjs
 
-    echo -e "${GREEN}✓ Build complete${NC}"
-
-    echo ""
-    echo -e "${YELLOW}Packaging extension...${NC}"
-
-    # Package the extension
-    npx vsce package --skip-license --out "$VSIX_FILE"
-
-    echo -e "${GREEN}✓ Package complete: ${VSIX_FILE}${NC}"
-else
-    # Check if .vsix exists
-    if [ ! -f "$VSIX_FILE" ]; then
-        echo -e "${RED}Error: ${VSIX_FILE} not found. Run without --skip-build first.${NC}"
-        exit 1
-    fi
-    echo -e "${YELLOW}Using existing package: ${VSIX_FILE}${NC}"
+    echo -e "${GREEN}✓ Package build complete${NC}"
 fi
+
+# Prefer the local native package. Unsupported hosts (including musl) resolve
+# directly to universal; a missing supported-target artifact also fails over to
+# universal instead of installing an unrelated native binary.
+if [ -f "$PREFERRED_VSIX_FILE" ]; then
+    VSIX_FILE="$PREFERRED_VSIX_FILE"
+elif [ -f "$UNIVERSAL_VSIX_FILE" ]; then
+    VSIX_FILE="$UNIVERSAL_VSIX_FILE"
+    echo -e "${YELLOW}Target package unavailable; using WASM-only universal package.${NC}"
+else
+    echo -e "${RED}Error: neither ${PREFERRED_VSIX_FILE} nor ${UNIVERSAL_VSIX_FILE} exists. Run without --skip-build first.${NC}"
+    exit 1
+fi
+echo -e "${YELLOW}Using package: ${VSIX_FILE}${NC}"
 
 # Install the extension
 echo ""

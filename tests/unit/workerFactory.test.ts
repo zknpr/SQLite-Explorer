@@ -1,6 +1,6 @@
 import './vscode_mock_setup';
 
-import { describe, it, beforeEach, afterEach } from 'node:test';
+import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert';
 import { DEFAULT_INVOCATION_TIMEOUT_MS } from '../../src/core/rpc';
 
@@ -13,6 +13,10 @@ let exposedWorkerMethods: string[] = [];
 let workerProxy: Record<string, (...args: any[]) => any> = {};
 let workerTimeoutPolicy: ((methodName: string, parameters: readonly unknown[]) => number) | undefined;
 let pagedHostSaveCalls: unknown[][] = [];
+let nativeAvailable = false;
+let nativeAvailabilityChecks = 0;
+let nativeConnectionCalls = 0;
+let outputLines: string[] = [];
 
 const Module = require('module');
 
@@ -91,10 +95,19 @@ Module.prototype.require = function(id: string) {
         };
     }
     if (id.endsWith('main')) {
-        return { GlobalOutputChannel: null };
+        return { GlobalOutputChannel: { appendLine: (line: string) => outputLines.push(line) } };
     }
     if (id.endsWith('nativeWorker')) {
-        return { isNativeAvailable: async () => false };
+        return {
+          isNativeAvailable: async () => {
+            nativeAvailabilityChecks++;
+            return nativeAvailable;
+          },
+          createNativeDatabaseConnection: async () => {
+            nativeConnectionCalls++;
+            throw new Error('native connection must not be created without its binary');
+          }
+        };
     }
     return originalRequire.call(this, id);
 };
@@ -112,6 +125,10 @@ describe('workerFactory error path tests', () => {
     exposedWorkerMethods = [];
     workerTimeoutPolicy = undefined;
     pagedHostSaveCalls = [];
+    nativeAvailable = false;
+    nativeAvailabilityChecks = 0;
+    nativeConnectionCalls = 0;
+    outputLines = [];
     workerProxy = {
       initializeDatabase: async () => {
         if (connectionFailed) throw new Error('Connection failed');
@@ -138,6 +155,7 @@ describe('workerFactory error path tests', () => {
   afterEach(() => {
     // Restore the original require implementation to avoid leaking to other tests
     Module.prototype.require = originalRequire;
+    mock.restoreAll();
   });
 
   // The factory derives the sibling -wal URI via uri.with() (WAL read-only
@@ -150,6 +168,20 @@ describe('workerFactory error path tests', () => {
       return { ...this, path: nextPath, fsPath: nextPath };
     }
   } as any);
+
+  it('opens with WASM without an error notification when the install has no native binary', async () => {
+    const showErrorMessage = mock.method(mockVscode.window, 'showErrorMessage');
+    const extensionUri = { scheme: 'file', fsPath: '/test/natives-less-extension' } as any;
+
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const connection = await bundle.establishConnection(testDbUri(), 'test.sqlite');
+
+    assert.strictEqual(nativeAvailabilityChecks, 1);
+    assert.strictEqual(nativeConnectionCalls, 0);
+    assert.strictEqual(await connection.databaseOps.engineKind, 'wasm');
+    assert.strictEqual(showErrorMessage.mock.callCount(), 0);
+    assert.deepStrictEqual(outputLines, ['[SQLite Explorer] Using WebAssembly SQLite backend']);
+  });
 
   it('should terminate worker and re-throw error if establishConnection fails in WASM factory', async () => {
     connectionFailed = true;
