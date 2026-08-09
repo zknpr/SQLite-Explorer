@@ -488,6 +488,167 @@ function executeQuery(db, sql, params) {
   };
 }
 
+function foreignKeyIntegerText(value) {
+  if (value === null) return null;
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value);
+  if (typeof value === 'string' && /^-?(?:0|[1-9]\d*)$/.test(value)) return value;
+  return undefined;
+}
+
+function utf8StringBytes(value) {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xD800 && code <= 0xDBFF && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        bytes += 4;
+        index++;
+      } else bytes += 3;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+function readAllRows(connection, sql) {
+  const statement = connection.prepare(sql);
+  try {
+    return statement.all();
+  } finally {
+    if (typeof statement.finalize === 'function') statement.finalize();
+  }
+}
+
+function readBoundedForeignKeyCheck(
+  connection,
+  table,
+  rowLimit,
+  byteLimit,
+  fieldByteLimit
+) {
+  if (
+    typeof table !== 'string'
+    || !Number.isSafeInteger(rowLimit) || rowLimit < 1
+    || !Number.isSafeInteger(byteLimit) || byteLimit < 1
+    || !Number.isSafeInteger(fieldByteLimit) || fieldByteLimit < 1
+  ) {
+    throw new Error('Invalid bounded foreign-key check request');
+  }
+  const tempShadow = readAllRows(
+    connection,
+    "SELECT 1 AS collision FROM sqlite_temp_schema " +
+      "WHERE type IN ('table', 'view') " +
+      "AND name = 'pragma_foreign_key_check' COLLATE NOCASE LIMIT 1"
+  );
+  if (tempShadow.length > 0) {
+    throw new Error(
+      `Cannot undo column drop on ${table}: a TEMP schema object shadows the foreign-key safety check`
+    );
+  }
+
+  // Qualifying the eponymous pragma through the unshadowed TEMP schema avoids
+  // a persistent main-schema table named pragma_foreign_key_check. The txiki
+  // binding has no stepping API, so scalar preflights must prove that all()
+  // below is bounded before it materializes any attacker-controlled names.
+  const pragmaTable = 'temp.pragma_foreign_key_check';
+  const countRows = readAllRows(
+    connection,
+    `SELECT count(*) AS violation_count FROM (` +
+      `SELECT 1 FROM ${pragmaTable} LIMIT ${rowLimit + 1})`
+  );
+  const violationCount = countRows[0]?.violation_count;
+  if (!Number.isSafeInteger(violationCount) || violationCount < 0) {
+    throw new Error(`Invalid foreign-key violation count while undoing column drop on ${table}`);
+  }
+  if (violationCount > rowLimit) {
+    throw new Error(
+      `Cannot undo column drop on ${table}: foreign-key violations exceed the safety bound`
+    );
+  }
+
+  const oversizedField = readAllRows(
+    connection,
+    `SELECT 1 AS oversized FROM ${pragmaTable} ` +
+      `WHERE length(CAST("table" AS BLOB)) > ${fieldByteLimit} ` +
+      `OR length(CAST("parent" AS BLOB)) > ${fieldByteLimit} LIMIT 1`
+  );
+  if (oversizedField.length > 0) {
+    throw new Error(
+      `Cannot undo column drop on ${table}: a foreign-key violation field exceeds the safety bound`
+    );
+  }
+
+  const byteRows = readAllRows(
+    connection,
+    `SELECT coalesce(sum(` +
+      `length(CAST("table" AS BLOB)) + ` +
+      `coalesce(length(CAST("rowid" AS BLOB)), 0) + ` +
+      `length(CAST("parent" AS BLOB)) + ` +
+      `length(CAST("fkid" AS BLOB)) + 32), 0) AS violation_bytes ` +
+      `FROM ${pragmaTable}`
+  );
+  const estimatedBytes = byteRows[0]?.violation_bytes;
+  const safeEstimatedBytes = typeof estimatedBytes === 'bigint'
+    ? estimatedBytes <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(estimatedBytes)
+      : Number.MAX_SAFE_INTEGER + 1
+    : estimatedBytes;
+  if (!Number.isSafeInteger(safeEstimatedBytes) || safeEstimatedBytes < 0) {
+    throw new Error(`Invalid foreign-key violation size while undoing column drop on ${table}`);
+  }
+  if (safeEstimatedBytes > byteLimit) {
+    throw new Error(
+      `Cannot undo column drop on ${table}: foreign-key violations exceed the byte safety bound`
+    );
+  }
+
+  const rawRows = readAllRows(
+    connection,
+    `SELECT "table" AS child_table, CAST("rowid" AS TEXT) AS child_rowid, ` +
+      `"parent" AS parent_table, CAST("fkid" AS TEXT) AS foreign_key_id ` +
+      `FROM ${pragmaTable} LIMIT ${rowLimit + 1}`
+  );
+  const values = [];
+  let aggregateBytes = 0;
+  for (const raw of rawRows) {
+    const rowid = foreignKeyIntegerText(raw.child_rowid);
+    const fkid = foreignKeyIntegerText(raw.foreign_key_id);
+    if (
+      typeof raw.child_table !== 'string'
+      || rowid === undefined
+      || typeof raw.parent_table !== 'string'
+      || fkid === undefined
+      || fkid === null
+    ) {
+      throw new Error(`Invalid foreign-key check row while undoing column drop on ${table}`);
+    }
+    const row = [raw.child_table, rowid, raw.parent_table, fkid];
+    const fieldBytes = row
+      .filter(value => value !== null)
+      .map(value => utf8StringBytes(value));
+    if (fieldBytes.some(bytes => bytes > fieldByteLimit)) {
+      throw new Error(
+        `Cannot undo column drop on ${table}: a foreign-key violation field exceeds the safety bound`
+      );
+    }
+    aggregateBytes += fieldBytes.reduce((total, bytes) => total + bytes, 0) + 32;
+    if (aggregateBytes > byteLimit) {
+      throw new Error(
+        `Cannot undo column drop on ${table}: foreign-key violations exceed the byte safety bound`
+      );
+    }
+    values.push(row);
+  }
+  return {
+    columns: ['table', 'rowid', 'parent', 'fkid'],
+    values,
+    rowCount: values.length
+  };
+}
+
 function escapeCellIdentifier(value, label) {
   if (typeof value !== 'string' || value.length === 0 || value.includes('\0')) {
     throw new Error(`Cell read ${label} must be a non-empty SQLite identifier`);
@@ -498,7 +659,7 @@ function escapeCellIdentifier(value, label) {
 function isCellBinding(value) {
   return value === null ||
     typeof value === 'string' ||
-    (typeof value === 'number' && Number.isFinite(value)) ||
+    (typeof value === 'number' && !Number.isNaN(value)) ||
     value instanceof Uint8Array;
 }
 
@@ -1141,6 +1302,19 @@ async function handleRequest(request) {
 
         result = executeQuery(db, sql, params);
         console.error("[native-worker] query complete");
+        break;
+      }
+
+      case "foreignKeyCheckBounded": {
+        const [table, rowLimit, byteLimit, fieldByteLimit] = args;
+        if (!db) throw new Error("Database not open");
+        result = readBoundedForeignKeyCheck(
+          db,
+          table,
+          rowLimit,
+          byteLimit,
+          fieldByteLimit
+        );
         break;
       }
 

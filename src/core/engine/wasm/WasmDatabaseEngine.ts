@@ -45,6 +45,7 @@ import {
   computeKeysetQueryTag,
   keysetFallbackOrder,
   mintKeysetAnchors,
+  ordersBySyntheticRowId,
   resolveKeysetPlan
 } from '../../keyset-pagination';
 import {
@@ -62,8 +63,12 @@ import {
   ROWID_TABLE_AUTHORITY_SQL
 } from '../../integer-utils';
 import {
+  buildByteFaithfulPrimaryKeyProjection,
   buildCellContainmentQuery,
+  decodeRawTextColumns,
   decodeCellContainment,
+  encodeByteFaithfulPrimaryKeyRecordId,
+  findUnrepresentableTextRows,
   remapPrimaryKeyContainment
 } from '../../cell-containment';
 import { getNodeFs } from '../../platform/fs';
@@ -123,11 +128,17 @@ import {
   buildBatchPriorLimitQueries
 } from '../../batch-update';
 import {
+  assertNoNewColumnDropForeignKeyViolations,
   assertColumnDropTableStateCurrent,
   buildColumnDropRestorePlan,
+  captureColumnDropForeignKeyBaseline,
+  columnDropForeignKeyViolationBytes,
+  COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT,
+  COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT,
   COLUMN_DROP_TABLE_STATE_SQL,
   executeSchemaPreservingColumnDrop,
-  mapColumnDropTableState
+  mapColumnDropTableState,
+  normalizeColumnDropForeignKeyViolation
 } from '../../column-drop';
 import {
   normalizePagedWritableOverlay,
@@ -1151,6 +1162,33 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
+  private readBoundedColumnDropForeignKeyViolations(
+    table: string
+  ): Array<readonly [string, string | null, string, string]> {
+    // Use the PRAGMA statement directly: an untrusted database can create a
+    // table named pragma_foreign_key_check and shadow the table-valued form.
+    const statement = this.instance.prepare('PRAGMA foreign_key_check');
+    const rows: Array<readonly [string, string | null, string, string]> = [];
+    let aggregateBytes = 0;
+    try {
+      while (statement.step()) {
+        const row = statement.get(null, { useBigInt: true });
+        if (!row) throw new Error(`Invalid foreign-key check result for ${table}`);
+        aggregateBytes += columnDropForeignKeyViolationBytes(table, row);
+        if (aggregateBytes > COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT) {
+          throw new Error(
+            `Cannot undo column drop on ${table}: foreign-key violations exceed the byte safety bound`
+          );
+        }
+        rows.push(normalizeColumnDropForeignKeyViolation(table, row));
+        if (rows.length > COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT) break;
+      }
+      return rows;
+    } finally {
+      statement.free();
+    }
+  }
+
   private async undoColumnDrop(targetTable: string, mod: ModificationEntry): Promise<void> {
     const { deletedColumns, columnDropSnapshot } = mod;
     // Undo drop column = add column + restore values
@@ -1195,6 +1233,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
       await this.executeQuery('BEGIN TRANSACTION');
       transactionStarted = true;
+      const foreignKeyBaseline = captureColumnDropForeignKeyBaseline(
+        targetTable,
+        this.readBoundedColumnDropForeignKeyViolations(targetTable)
+      );
       const current = await this.readColumnDropTableState(targetTable);
       assertColumnDropTableStateCurrent(targetTable, columnDropSnapshot.after, current);
       const collision = await this.executeQuery(
@@ -1247,10 +1289,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
       const restored = await this.readColumnDropTableState(targetTable);
       assertColumnDropTableStateCurrent(targetTable, columnDropSnapshot.before, restored);
-      const foreignKeyCheck = await this.executeQuery('PRAGMA foreign_key_check');
-      if ((foreignKeyCheck[0]?.rows.length ?? 0) !== 0) {
-        throw new Error(`Foreign-key check failed while undoing column drop on ${targetTable}`);
-      }
+      assertNoNewColumnDropForeignKeyViolations(
+        targetTable,
+        foreignKeyBaseline,
+        this.readBoundedColumnDropForeignKeyViolations(targetTable)
+      );
       await this.executeQuery('COMMIT');
       transactionStarted = false;
     } catch (error) {
@@ -1756,12 +1799,17 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       await this.executeQuery(`SAVEPOINT ${savepointName}`);
       try {
         const returningSql =
-          `${sql} RETURNING ${identity.columns.map(column => escapeIdentifier(column.identifier)).join(', ')}`;
+          `${sql} RETURNING ${buildByteFaithfulPrimaryKeyProjection(identity)}`;
         const result = this.queryRaw(returningSql, params);
         if (result.rows.length !== 1) {
           throw new Error(`Insert into ${table} did not return exactly one primary-key identity`);
         }
-        const candidateId = encodePrimaryKeyRecordId(identity.columns, result.rows[0]);
+        const candidateId = encodeByteFaithfulPrimaryKeyRecordId(
+          identity,
+          result.rows[0],
+          this.getCellTextEncoding(),
+          `Cannot insert into ${table}`
+        );
         const rowId = this.readPrimaryKeyRecordId(
           table,
           identity,
@@ -2176,7 +2224,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     predicate: { sql: string; params: CellValue[] }
   ): RecordId {
     const result = this.queryRaw(
-      `SELECT ${identity.columns.map(column => escapeIdentifier(column.identifier)).join(', ')} ` +
+      `SELECT ${buildByteFaithfulPrimaryKeyProjection(identity)} ` +
       `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
       predicate.params
     );
@@ -2187,7 +2235,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           : `Primary-key identity for ${table} matched more than one row`
       );
     }
-    return encodePrimaryKeyRecordId(identity.columns, result.rows[0]);
+    return encodeByteFaithfulPrimaryKeyRecordId(
+      identity,
+      result.rows[0],
+      this.getCellTextEncoding(),
+      `Cannot resolve updated identity in ${table}`
+    );
   }
 
   private applyJsonPatchValue(currentValue: CellValue, patch: CellValue): string {
@@ -2863,7 +2916,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           .filter(column => !visibleColumns.includes(column));
         queryOptions.columns = [...visibleColumns, ...hiddenPrimaryKeyColumns];
         primaryKeyContext = { identity, visibleColumns };
-        if (queryOptions.orderBy?.toLowerCase() === 'rowid') {
+        if (ordersBySyntheticRowId(options)) {
           queryOptions.orderBy = undefined;
           queryOptions.orderByColumns = identity.columns.map(column => column.identifier);
         }
@@ -2921,10 +2974,32 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         headerStmt.free();
         executionState.headerStmt = undefined;
 
-        const containmentQuery = buildCellContainmentQuery(sql, headers.length, queryOptions);
+        const primaryKeyColumnIndices = primaryKeyContext
+          ? primaryKeyContext.identity.columns.map(column => {
+              const index = headers.indexOf(column.identifier);
+              if (index < 0) {
+                throw new Error(`Primary-key column missing from table fetch: ${column.identifier}`);
+              }
+              return index;
+            })
+          : [];
+        const keysetColumnIndices = keysetKey
+          ? keysetKey.keyColumns
+              .map(column => headers.indexOf(column))
+              .filter(index => index >= 0)
+          : [];
+        const rawTextColumnIndices = [
+          ...new Set([...primaryKeyColumnIndices, ...keysetColumnIndices])
+        ];
+        const containmentQuery = buildCellContainmentQuery(
+          sql,
+          headers.length,
+          queryOptions,
+          rawTextColumnIndices
+        );
         const transportQuery = buildExactNumericTextQuery(
           containmentQuery.sql,
-          headers.length + 1
+          containmentQuery.transportColumnCount
         );
         const stmt = this.instance.prepare(transportQuery.sql, bindParams);
         executionState.stmt = stmt;
@@ -2985,6 +3060,37 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           queryOptions.maxPageResponseBytes
         );
         const { rows, oversizedCells, exactIntegerTexts } = contained;
+        const rawTextRows = decodeRawTextColumns(normalized.rows, containmentQuery);
+        const textEncoding = rawTextColumnIndices.length > 0
+          ? this.getCellTextEncoding()
+          : undefined;
+        const remapped = primaryKeyContext
+          ? remapPrimaryKeyContainment({
+              identity: primaryKeyContext.identity,
+              sourceColumns: headers,
+              visibleColumnCount: primaryKeyContext.visibleColumns.length,
+              identityRows: sourceRows,
+              rawTextBytes: rawTextRows,
+              rawTextColumnIndices: containmentQuery.rawTextColumnIndices,
+              rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable,
+              textEncoding: textEncoding!,
+              rows,
+              oversizedCells,
+              exactIntegerTexts,
+              effectiveInlineCellBytes: containmentQuery.effectiveInlineCellBytes,
+              rowOffset: queryOptions.offset
+            })
+          : undefined;
+        const unrepresentableKeysetTextRows = keysetKey && textEncoding
+          ? findUnrepresentableTextRows({
+              sourceRows,
+              sourceColumnIndices: keysetColumnIndices,
+              rawTextRows,
+              rawTextColumnIndices: containmentQuery.rawTextColumnIndices,
+              textEncoding,
+              rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable
+            })
+          : undefined;
         // Anchors come from the exact source rows (BigInt-preserving, already
         // in display order) so every OFFSET or keyset page re-anchors itself.
         const keysetAnchors = keysetKey && keysetTag !== undefined
@@ -2993,22 +3099,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
               key: keysetKey,
               projectionColumns: headers,
               rows: sourceRows,
-              oversizedCells
+              oversizedCells,
+              excludedRowIndices: unrepresentableKeysetTextRows
             })
           : undefined;
-        if (primaryKeyContext) {
-          const visibleColumnCount = primaryKeyContext.visibleColumns.length;
-          const remapped = remapPrimaryKeyContainment({
-            identity: primaryKeyContext.identity,
-            sourceColumns: headers,
-            visibleColumnCount,
-            identityRows: sourceRows,
-            rows,
-            oversizedCells,
-            exactIntegerTexts,
-            effectiveInlineCellBytes: containmentQuery.effectiveInlineCellBytes,
-            rowOffset: queryOptions.offset
-          });
+        if (primaryKeyContext && remapped) {
           const resultHeaders = ['rowid', ...primaryKeyContext.visibleColumns];
           return {
             headers: resultHeaders,

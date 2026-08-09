@@ -9,6 +9,11 @@ import {
     fromCellEditRpcErrorData,
     toCellEditRpcErrorData
 } from '../../../src/core/cell-edit-policy.ts';
+import {
+    decodeJsonSafeNumberString,
+    encodeJsonSafeNonFiniteNumber,
+    escapeJsonSafeNumberString
+} from '../../../src/core/json-safe-numbers.ts';
 
 export {
     MAX_WEBVIEW_BINARY_VALUE_BYTES,
@@ -16,6 +21,11 @@ export {
     assertWebviewTransportPayload,
     fromWebviewPayloadLimitErrorData,
     toWebviewPayloadLimitErrorData
+};
+export {
+    decodeJsonSafeNumberString,
+    encodeJsonSafeNonFiniteNumber,
+    escapeJsonSafeNumberString
 };
 
 async function uint8ArrayToBase64Async(bytes) {
@@ -52,6 +62,10 @@ function base64ToUint8Array(base64) {
 }
 
 async function serializeValueUnchecked(value) {
+    if (typeof value === 'number' && !Number.isFinite(value)) {
+        return encodeJsonSafeNonFiniteNumber(value);
+    }
+    if (typeof value === 'string') return escapeJsonSafeNumberString(value);
     if (value instanceof Uint8Array) {
         return { __type: 'Uint8Array', base64: await uint8ArrayToBase64Async(value) };
     }
@@ -79,6 +93,7 @@ export async function serializeArgsAsync(args, limits) {
 }
 
 function deserializeValueUnchecked(value) {
+    if (typeof value === 'string') return decodeJsonSafeNumberString(value);
     // Demo responses use structured clone rather than Base64. Preserve bounded
     // typed arrays directly instead of enumerating numeric keys.
     if (value instanceof Uint8Array) return value;

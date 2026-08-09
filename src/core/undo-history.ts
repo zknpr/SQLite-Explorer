@@ -6,6 +6,11 @@
  */
 
 import type { LabeledModification } from './types';
+import {
+  decodeJsonSafeNumberString,
+  encodeJsonSafeNonFiniteNumber,
+  escapeJsonSafeNumberString
+} from './json-safe-numbers';
 
 // ============================================================================
 // JSON Serialization Helpers for Non-JSON Cell Values
@@ -20,6 +25,10 @@ import type { LabeledModification } from './types';
  * This replacer preserves the binary data as base64.
  */
 function binaryReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    return encodeJsonSafeNonFiniteNumber(value);
+  }
+  if (typeof value === 'string') return escapeJsonSafeNumberString(value);
   if (typeof value === 'bigint') {
     return { __type: 'BigInt', text: value.toString() };
   }
@@ -39,6 +48,7 @@ function binaryReplacer(_key: string, value: unknown): unknown {
  * Converts the special object format back to Uint8Array.
  */
 function binaryReviver(_key: string, value: unknown): unknown {
+  if (typeof value === 'string') return decodeJsonSafeNumberString(value);
   if (value && typeof value === 'object' && '__type' in value) {
     const typed = value as { __type: string; data?: unknown; text?: unknown };
     const keys = Object.keys(value);

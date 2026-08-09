@@ -56,6 +56,259 @@ describe('WITHOUT ROWID primary-key identity', () => {
         );
     });
 
+    it('orders a declared rowid column as data and keeps keyset pages in that order', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE declared_rowid_order (' +
+            'pk INTEGER PRIMARY KEY, rowid TEXT NOT NULL, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO declared_rowid_order VALUES " +
+            "(1, 'zulu', 'one'), (2, 'alpha', 'two'), (3, 'alpha', 'three')"
+        );
+        const options = {
+            columns: ['rowid', 'pk', 'rowid', 'value'],
+            orderBy: 'rowid',
+            orderDir: 'ASC' as const,
+            limit: 2,
+            offset: 0
+        };
+
+        const offsetPage = await engine.fetchTableData('declared_rowid_order', options);
+        assert.deepStrictEqual(
+            offsetPage.rows.map(row => [row[1], row[2]]),
+            [[2, 'alpha'], [3, 'alpha']]
+        );
+
+        const first = await engine.fetchTableData('declared_rowid_order', {
+            ...options,
+            keyset: { mode: 'first' }
+        });
+        assert.deepStrictEqual(
+            first.rows.map(row => [row[1], row[2]]),
+            [[2, 'alpha'], [3, 'alpha']]
+        );
+        assert.ok(first.keysetAnchors?.last);
+        const second = await engine.fetchTableData('declared_rowid_order', {
+            ...options,
+            offset: 2,
+            keyset: { mode: 'after', anchor: first.keysetAnchors.last }
+        });
+        assert.deepStrictEqual(
+            second.rows.map(row => [row[1], row[2]]),
+            [[1, 'zulu']]
+        );
+    });
+
+    it('round-trips signed infinite REAL primary keys while NaN remains unstorable', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE infinite_real_identity (' +
+            'key REAL PRIMARY KEY, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO infinite_real_identity VALUES " +
+            "(-1e999, 'negative'), (1e999, 'positive')"
+        );
+        const options = {
+            columns: ['rowid', 'key', 'value'],
+            orderBy: 'key',
+            orderDir: 'ASC' as const,
+            limit: 1,
+            offset: 0
+        };
+
+        const first = await engine.fetchTableData('infinite_real_identity', {
+            ...options,
+            keyset: { mode: 'first' }
+        });
+        assert.strictEqual(first.rows[0][1], Number.NEGATIVE_INFINITY);
+        assert.match(String(first.rows[0][0]), /^pk:/);
+        assert.ok(first.keysetAnchors?.last);
+        const second = await engine.fetchTableData('infinite_real_identity', {
+            ...options,
+            offset: 1,
+            keyset: { mode: 'after', anchor: first.keysetAnchors.last }
+        });
+        assert.strictEqual(second.rows[0][1], Number.POSITIVE_INFINITY);
+        assert.match(String(second.rows[0][0]), /^pk:/);
+
+        await engine.updateCell(
+            'infinite_real_identity',
+            second.rows[0][0] as RecordId,
+            'value',
+            'edited'
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT value FROM infinite_real_identity WHERE key = 1e999'
+            ))[0].rows,
+            [['edited']]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT typeof(0.0/0.0), 0.0/0.0 IS NULL'))[0].rows,
+            [['null', 1]]
+        );
+        await assert.rejects(
+            engine.executeQuery(
+                "INSERT INTO infinite_real_identity VALUES (0.0/0.0, 'nan')"
+            ),
+            /NOT NULL constraint failed/
+        );
+    });
+
+    it('keeps malformed UTF-8 TEXT identities viewable but read-only', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE malformed_text_identity (' +
+            'key TEXT PRIMARY KEY, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO malformed_text_identity VALUES " +
+            "(CAST(X'80' AS TEXT), 'malformed'), " +
+            "(CAST(X'EFBFBD' AS TEXT), 'replacement-character')"
+        );
+        const page = await engine.fetchTableData('malformed_text_identity', {
+            columns: ['rowid', 'key', 'value'],
+            limit: 10,
+            offset: 0,
+            keyset: { mode: 'first' }
+        });
+        const malformedIndex = page.rows.findIndex(row => row[2] === 'malformed');
+        const validIndex = page.rows.findIndex(row => row[2] === 'replacement-character');
+        assert.notStrictEqual(malformedIndex, -1);
+        assert.notStrictEqual(validIndex, -1);
+        const malformedIdentity = page.rows[malformedIndex][0] as RecordId;
+        const validIdentity = page.rows[validIndex][0] as RecordId;
+
+        assert.match(String(malformedIdentity), /^readonly-pk:/);
+        assert.match(String(validIdentity), /^pk:/);
+        assert.notStrictEqual(malformedIdentity, validIdentity);
+        assert.match(page.readOnlyRowReasons?.[malformedIndex] ?? '', /not valid UTF-8/i);
+        if (malformedIndex === 0) assert.strictEqual(page.keysetAnchors?.first, undefined);
+        if (malformedIndex === page.rows.length - 1) {
+            assert.strictEqual(page.keysetAnchors?.last, undefined);
+        }
+
+        await assert.rejects(
+            engine.updateCell('malformed_text_identity', malformedIdentity, 'value', 'bad-edit'),
+            /not valid UTF-8/i
+        );
+        await engine.updateCell(
+            'malformed_text_identity',
+            validIdentity,
+            'value',
+            'valid-edit'
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT hex(CAST(key AS BLOB)), value FROM malformed_text_identity ORDER BY 1'
+            ))[0].rows,
+            [['80', 'malformed'], ['EFBFBD', 'valid-edit']]
+        );
+    });
+
+    it('suppresses keyset anchors for malformed ordinary TEXT sort keys', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE malformed_text_sort (' +
+            'id INTEGER PRIMARY KEY, sort_value TEXT NOT NULL' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO malformed_text_sort VALUES " +
+            "(1, CAST(X'80' AS TEXT)), " +
+            "(2, CAST(X'C0' AS TEXT)), " +
+            "(3, CAST(X'EFBFBD' AS TEXT))"
+        );
+        const options = {
+            columns: ['rowid', 'id', 'sort_value'],
+            orderBy: 'sort_value',
+            orderDir: 'ASC' as const,
+            limit: 1,
+            offset: 0
+        };
+
+        const first = await engine.fetchTableData('malformed_text_sort', {
+            ...options,
+            keyset: { mode: 'first' }
+        });
+        assert.strictEqual(first.rows[0][1], 1);
+        assert.strictEqual(first.keysetAnchors, undefined);
+        const offsetSecond = await engine.fetchTableData('malformed_text_sort', {
+            ...options,
+            offset: 1
+        });
+        assert.strictEqual(offsetSecond.rows[0][1], 2);
+        assert.strictEqual(offsetSecond.keysetAnchors, undefined);
+    });
+
+    it('treats a leading UTF-8 BOM as identity-significant bytes', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE bom_text_identity (' +
+            'key TEXT PRIMARY KEY, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO bom_text_identity VALUES " +
+            "(CAST(X'EFBBBF41' AS TEXT), 'bom'), ('A', 'plain')"
+        );
+        const page = await engine.fetchTableData('bom_text_identity', {
+            columns: ['rowid', 'key', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        const bomRow = page.rows.find(row => row[2] === 'bom');
+        const plainRow = page.rows.find(row => row[2] === 'plain');
+        assert.ok(bomRow && plainRow);
+        assert.match(String(bomRow[0]), /^readonly-pk:/);
+        assert.match(String(plainRow[0]), /^pk:/);
+        assert.notStrictEqual(bomRow[0], plainRow[0]);
+        await assert.rejects(
+            engine.updateCell('bom_text_identity', bomRow[0] as RecordId, 'value', 'wrong'),
+            /byte-faithful|stored bytes/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT hex(CAST(key AS BLOB)), value FROM bom_text_identity ORDER BY 1'
+            ))[0].rows,
+            [['41', 'plain'], ['EFBBBF41', 'bom']]
+        );
+    });
+
+    it('rolls back an insert whose generated TEXT key cannot mint a byte-faithful identity', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE generated_malformed_identity (' +
+            "key TEXT PRIMARY KEY DEFAULT (CAST(X'80' AS TEXT)), value TEXT" +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO generated_malformed_identity(key, value) " +
+            "VALUES (CAST(X'EFBFBD' AS TEXT), 'existing-valid')"
+        );
+
+        await assert.rejects(
+            engine.insertRow('generated_malformed_identity', { value: 'must-rollback' }),
+            /byte-faithful editable identity cannot be minted/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT hex(CAST(key AS BLOB)), value FROM generated_malformed_identity'
+            ))[0].rows,
+            [['EFBFBD', 'existing-valid']]
+        );
+    });
+
+    it('keeps a 1000-column composite key viewable with bounded read-only identities', async () => {
+        const columns = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        await engine.executeQuery(
+            `CREATE TABLE wide_composite_identity (` +
+            columns.map((column, index) => `"${column}" TEXT DEFAULT 'v${index}'`).join(', ') +
+            `, PRIMARY KEY (${columns.map(column => `"${column}"`).join(', ')})) WITHOUT ROWID; ` +
+            'INSERT INTO wide_composite_identity DEFAULT VALUES'
+        );
+
+        const page = await engine.fetchTableData('wide_composite_identity', {
+            columns: ['rowid', ...columns],
+            limit: 1,
+            offset: 0,
+            keyset: { mode: 'first' }
+        });
+
+        assert.strictEqual(page.headers.length, 1001);
+        assert.strictEqual(page.rows[0].length, 1001);
+        assert.match(String(page.rows[0][0]), /^readonly-pk:/);
+        assert.match(page.readOnlyRowReasons?.[0] ?? '', /result-column limit/i);
+        assert.strictEqual(page.keysetAnchors, undefined);
+    });
+
     it('edits a row identified by a TEXT primary key', async () => {
         await engine.executeQuery(
             "CREATE TABLE text_identity (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID; " +

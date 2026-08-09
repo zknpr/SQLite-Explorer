@@ -1,9 +1,11 @@
 import { escapeIdentifier } from './sql-utils';
 import type {
   CellValue,
+  CellTextEncoding,
   ExactIntegerTextMap,
   OversizedCellMap,
   ReadOnlyRowReasonMap,
+  RecordId,
   TableIdentity,
   TableQueryOptions
 } from './types';
@@ -29,8 +31,13 @@ const PER_CELL_COLLECTION_FRAMING_BYTES = 2;
 const CELL_SOURCE_ALIAS = '__sqlite_explorer_cell_source';
 const CELL_VALUE_PREFIX = '__sqlite_explorer_cell_value_';
 const CELL_METADATA_ALIAS = '__sqlite_explorer_cell_metadata';
+const CELL_RAW_TEXT_PREFIX = '__sqlite_explorer_cell_raw_text_';
 const METADATA_CHUNK_COLUMNS = 400;
 const MAX_UTF8_BYTES_PER_CODE_POINT = 4;
+// Both bundled SQLite builds use SQLite's default SQLITE_MAX_COLUMN. Private
+// raw-TEXT companions must never turn an otherwise valid grid projection into
+// a statement that exceeds this result-column ceiling.
+const SQLITE_MAX_RESULT_COLUMNS = 2000;
 
 export interface CellContainmentQuery {
   sql: string;
@@ -38,6 +45,15 @@ export interface CellContainmentQuery {
   valueColumnCount: number;
   /** Value-column index occupied by the packed metadata transport column. */
   metadataColumnIndex: number;
+  /** Count including values, packed metadata, and private raw-TEXT columns. */
+  transportColumnCount: number;
+  /** First private raw-TEXT byte slot, aligned with rawTextColumnIndices. */
+  rawTextColumnStart: number;
+  rawTextColumnCount: number;
+  /** Source-column indices actually represented by private raw-TEXT slots. */
+  rawTextColumnIndices: readonly number[];
+  /** Requested raw validation was omitted to stay within SQLite's width cap. */
+  rawTextValidationUnavailable: boolean;
   effectiveInlineCellBytes: number;
 }
 
@@ -142,7 +158,8 @@ function buildPackedMetadataExpression(columns: string[], byteLimit: number): st
 export function buildCellContainmentQuery(
   sourceSql: string,
   columnCount: number,
-  options: Pick<TableQueryOptions, 'limit' | 'maxInlineCellBytes' | 'maxPageResponseBytes'>
+  options: Pick<TableQueryOptions, 'limit' | 'maxInlineCellBytes' | 'maxPageResponseBytes'>,
+  rawTextColumnIndices: readonly number[] = []
 ): CellContainmentQuery {
   const effectiveInlineCellBytes = deriveEffectiveInlineCellBytes(options, columnCount);
   const textCharacterWindow = Math.floor(
@@ -152,6 +169,17 @@ export function buildCellContainmentQuery(
     `${CELL_VALUE_PREFIX}${index}`
   ));
   const quotedValues = valueNames.map(escapeIdentifier);
+  if (
+    new Set(rawTextColumnIndices).size !== rawTextColumnIndices.length
+    || rawTextColumnIndices.some(index => !Number.isInteger(index) || index < 0 || index >= columnCount)
+  ) {
+    throw new Error('Cell containment raw-TEXT columns must be unique in-range indices');
+  }
+  const rawTextValidationUnavailable = rawTextColumnIndices.length > 0
+    && columnCount + 1 + rawTextColumnIndices.length > SQLITE_MAX_RESULT_COLUMNS;
+  const projectedRawTextColumnIndices = rawTextValidationUnavailable
+    ? []
+    : rawTextColumnIndices;
   const projectedValues = quotedValues.map((column, index) => (
     `CASE ` +
     `WHEN typeof(${column}) = 'text' AND octet_length(${column}) > ${effectiveInlineCellBytes} ` +
@@ -165,6 +193,18 @@ export function buildCellContainmentQuery(
     quotedValues,
     effectiveInlineCellBytes
   );
+  const rawTextExpressions = projectedRawTextColumnIndices.map((columnIndex, keyIndex) => {
+    const column = quotedValues[columnIndex];
+    return (
+      `CASE WHEN typeof(${column}) = 'text' ` +
+      `AND octet_length(${column}) <= ${effectiveInlineCellBytes} ` +
+      `THEN CAST(${column} AS BLOB) END AS ` +
+      `${escapeIdentifier(`${CELL_RAW_TEXT_PREFIX}${keyIndex}`)}`
+    );
+  });
+  const privateProjection = rawTextExpressions.length > 0
+    ? `, ${rawTextExpressions.join(', ')}`
+    : '';
 
   return {
     // OFFSET prevents query flattening so volatile view expressions are
@@ -174,11 +214,93 @@ export function buildCellContainmentQuery(
       `SELECT * FROM (\n${sourceSql}\n) LIMIT -1 OFFSET 0\n)\n` +
       `SELECT ${projectedValues.join(', ')}, ` +
       `${metadataExpression} AS ${escapeIdentifier(CELL_METADATA_ALIAS)} ` +
+      `${privateProjection} ` +
       `FROM ${quotedSource}`,
     valueColumnCount: columnCount,
     metadataColumnIndex: columnCount,
+    transportColumnCount: columnCount + 1 + projectedRawTextColumnIndices.length,
+    rawTextColumnStart: columnCount + 1,
+    rawTextColumnCount: projectedRawTextColumnIndices.length,
+    rawTextColumnIndices: projectedRawTextColumnIndices,
+    rawTextValidationUnavailable,
     effectiveInlineCellBytes
   };
+}
+
+/** Extract bounded raw bytes which never leave the engine-side fetch path. */
+export function decodeRawTextColumns(
+  rows: readonly (readonly unknown[])[],
+  query: Pick<CellContainmentQuery, 'rawTextColumnStart' | 'rawTextColumnCount' | 'transportColumnCount'>
+): Array<Array<Uint8Array | null>> {
+  return rows.map((row, rowIndex) => {
+    if (row.length < query.transportColumnCount) {
+      throw new Error(`Raw TEXT row ${rowIndex} is missing private transport columns`);
+    }
+    return Array.from({ length: query.rawTextColumnCount }, (_, keyIndex) => {
+      const value = row[query.rawTextColumnStart + keyIndex];
+      if (value !== null && !(value instanceof Uint8Array)) {
+        throw new Error(`Raw TEXT value at row ${rowIndex}, key ${keyIndex} is not a BLOB`);
+      }
+      return value;
+    });
+  });
+}
+
+/** Identify rows whose decoded TEXT cells cannot reproduce SQLite's bytes. */
+export function findUnrepresentableTextRows(input: {
+  sourceRows: readonly (readonly unknown[])[];
+  sourceColumnIndices: readonly number[];
+  rawTextRows: readonly (readonly (Uint8Array | null)[])[];
+  rawTextColumnIndices: readonly number[];
+  textEncoding: CellTextEncoding;
+  rawTextValidationUnavailable?: boolean;
+}): ReadonlySet<number> | undefined {
+  if (input.sourceRows.length === 0 || input.sourceColumnIndices.length === 0) {
+    return undefined;
+  }
+  if (input.rawTextValidationUnavailable) {
+    return new Set(input.sourceRows.map((_, rowIndex) => rowIndex));
+  }
+  if (input.rawTextRows.length !== input.sourceRows.length) {
+    throw new Error('Raw TEXT validation row count does not match the source page');
+  }
+  const rawSlots = input.sourceColumnIndices.map(columnIndex => {
+    const slot = input.rawTextColumnIndices.indexOf(columnIndex);
+    if (slot < 0) {
+      throw new Error(`Raw TEXT validation column ${columnIndex} was not projected`);
+    }
+    return slot;
+  });
+  // The default decoder strips a leading BOM, which would collapse BOM+A and
+  // plain A into the same identity. Retain it so byte-distinct valid TEXT is
+  // rejected whenever the ordinary engine string cannot represent it.
+  const decoder = new TextDecoder(input.textEncoding, { fatal: true, ignoreBOM: true });
+  let unrepresentableRows: Set<number> | undefined;
+  input.sourceRows.forEach((row, rowIndex) => {
+    const rawRow = input.rawTextRows[rowIndex];
+    if (!rawRow || rawRow.length !== input.rawTextColumnIndices.length) {
+      throw new Error(`Raw TEXT validation row ${rowIndex} has the wrong width`);
+    }
+    for (let slot = 0; slot < input.sourceColumnIndices.length; slot++) {
+      const value = row[input.sourceColumnIndices[slot]];
+      if (typeof value !== 'string') continue;
+      const rawBytes = rawRow[rawSlots[slot]];
+      let representable = false;
+      if (rawBytes instanceof Uint8Array) {
+        try {
+          representable = decoder.decode(rawBytes) === value;
+        } catch {
+          representable = false;
+        }
+      }
+      if (!representable) {
+        unrepresentableRows ??= new Set();
+        unrepresentableRows.add(rowIndex);
+        break;
+      }
+    }
+  });
+  return unrepresentableRows;
 }
 
 function parseMetadataToken(token: string, rowIndex: number, columnIndex: number) {
@@ -448,6 +570,11 @@ export interface PrimaryKeyContainmentInput {
   sourceColumns: readonly string[];
   visibleColumnCount: number;
   identityRows: readonly (readonly (CellValue | bigint)[])[];
+  rawTextBytes: readonly (readonly (Uint8Array | null)[])[];
+  /** Source indices aligned with each rawTextBytes row. */
+  rawTextColumnIndices: readonly number[];
+  rawTextValidationUnavailable?: boolean;
+  textEncoding: CellTextEncoding;
   rows: CellValue[][];
   oversizedCells?: OversizedCellMap;
   exactIntegerTexts?: ExactIntegerTextMap;
@@ -460,6 +587,8 @@ export interface PrimaryKeyContainmentResult {
   oversizedCells?: OversizedCellMap;
   exactIntegerTexts?: ExactIntegerTextMap;
   readOnlyRowReasons?: ReadOnlyRowReasonMap;
+  /** Engine-internal only: these source rows cannot safely mint seek anchors. */
+  unrepresentableTextKeyRows?: ReadonlySet<number>;
 }
 
 function remapSparseColumns<T>(
@@ -480,6 +609,20 @@ function remapSparseColumns<T>(
   return remapped;
 }
 
+function boundedReasonIdentifier(identifier: string): string {
+  const retained = identifier.length <= 128
+    ? identifier
+    : `${identifier.slice(0, 125)}...`;
+  return `"${retained}"`;
+}
+
+function boundedReasonColumnList(columns: readonly string[]): string {
+  const retained = columns.slice(0, 8).map(boundedReasonIdentifier);
+  return columns.length > retained.length
+    ? `${retained.join(', ')}, and ${columns.length - retained.length} more`
+    : retained.join(', ');
+}
+
 function readOnlyPrimaryKeyReason(
   members: Array<{ identifier: string; byteLength: number }>,
   inlineLimit: number
@@ -488,16 +631,106 @@ function readOnlyPrimaryKeyReason(
     const member = members[0];
     return (
       `Row is read-only because WITHOUT ROWID primary-key column ` +
-      `"${member.identifier}" is ${member.byteLength} bytes and exceeds the ` +
+      `${boundedReasonIdentifier(member.identifier)} is ${member.byteLength} bytes and exceeds the ` +
       `${inlineLimit}-byte inline limit; its identity was not transported.`
     );
   }
-  const descriptions = members
-    .map(member => `"${member.identifier}" (${member.byteLength} bytes)`)
-    .join(', ');
+  const descriptions = members.slice(0, 8)
+    .map(member => `${boundedReasonIdentifier(member.identifier)} (${member.byteLength} bytes)`);
+  if (members.length > descriptions.length) {
+    descriptions.push(`and ${members.length - descriptions.length} more`);
+  }
   return (
-    `Row is read-only because WITHOUT ROWID primary-key columns ${descriptions} ` +
+    `Row is read-only because WITHOUT ROWID primary-key columns ${descriptions.join(', ')} ` +
     `exceed the ${inlineLimit}-byte inline limit; their identity was not transported.`
+  );
+}
+
+function textEncodingLabel(encoding: CellTextEncoding): string {
+  if (encoding === 'utf-8') return 'UTF-8';
+  if (encoding === 'utf-16le') return 'UTF-16LE';
+  return 'UTF-16BE';
+}
+
+/**
+ * Project decoded PK values beside byte-exact TEXT companions. Mutation paths
+ * use this inside their savepoint before minting an editable identity.
+ */
+export function buildByteFaithfulPrimaryKeyProjection(
+  identity: Extract<TableIdentity, { kind: 'primaryKey' }>
+): string {
+  if (identity.columns.length * 2 > SQLITE_MAX_RESULT_COLUMNS) {
+    throw new Error(
+      `Cannot mint a byte-faithful WITHOUT ROWID identity with ` +
+      `${identity.columns.length} primary-key columns within SQLite's result-column limit`
+    );
+  }
+  const columns = identity.columns.map(column => escapeIdentifier(column.identifier));
+  const rawColumns = columns.map((column, index) => (
+    `CASE WHEN typeof(${column}) = 'text' THEN CAST(${column} AS BLOB) END AS ` +
+    escapeIdentifier(`${CELL_RAW_TEXT_PREFIX}${index}`)
+  ));
+  return [...columns, ...rawColumns].join(', ');
+}
+
+/** Refuse a mutable identity whenever the engine's TEXT value lost bytes. */
+export function encodeByteFaithfulPrimaryKeyRecordId(
+  identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
+  projectedRow: readonly unknown[],
+  textEncoding: CellTextEncoding,
+  context: string
+): RecordId {
+  const keyCount = identity.columns.length;
+  if (projectedRow.length !== keyCount * 2) {
+    throw new Error(`${context}: SQLite returned an invalid primary-key validation row`);
+  }
+  const values = projectedRow.slice(0, keyCount) as Array<CellValue | bigint>;
+  const decoder = new TextDecoder(textEncoding, { fatal: true, ignoreBOM: true });
+  for (let index = 0; index < keyCount; index++) {
+    const value = values[index];
+    if (typeof value !== 'string') continue;
+    const rawBytes = projectedRow[keyCount + index];
+    let representable = false;
+    if (rawBytes instanceof Uint8Array) {
+      try {
+        representable = decoder.decode(rawBytes) === value;
+      } catch {
+        representable = false;
+      }
+    }
+    if (!representable) {
+      throw new Error(
+        `${context}: WITHOUT ROWID primary-key column ` +
+        `"${identity.columns[index].identifier}" contains text that is not valid ` +
+        `${textEncodingLabel(textEncoding)} without changing its stored bytes; ` +
+        `a byte-faithful editable identity cannot be minted`
+      );
+    }
+  }
+  return encodePrimaryKeyRecordId(identity.columns, values);
+}
+
+function readOnlyPrimaryKeyTextReason(
+  columns: readonly string[],
+  encoding: CellTextEncoding
+): string {
+  const names = boundedReasonColumnList(columns);
+  return (
+    `Row is read-only because WITHOUT ROWID primary-key ` +
+    `${columns.length === 1 ? 'column' : 'columns'} ${names} contain text that is not valid ` +
+    `${textEncodingLabel(encoding)} without changing its stored bytes; ` +
+    `a byte-faithful editable identity cannot be minted.`
+  );
+}
+
+function readOnlyPrimaryKeyValidationReason(columns: readonly string[]): string {
+  const names = columns.length === 1
+    ? boundedReasonIdentifier(columns[0])
+    : `${columns.length}-column key (${boundedReasonColumnList(columns)})`;
+  return (
+    `Row is read-only because WITHOUT ROWID primary-key ` +
+    `${columns.length === 1 ? 'column' : 'columns'} ${names} could not be byte-validated ` +
+    `without exceeding SQLite's result-column limit.`
   );
 }
 
@@ -516,13 +749,52 @@ export function remapPrimaryKeyContainment(
     ? input.rowOffset!
     : 0;
   let readOnlyRowReasons: ReadOnlyRowReasonMap | undefined;
+  let unrepresentableTextKeyRows: Set<number> | undefined;
   const mutableRecordIdRows: number[] = [];
+  const textDecoder = new TextDecoder(input.textEncoding, { fatal: true, ignoreBOM: true });
+  const rawTextSlots = input.rawTextValidationUnavailable
+    ? []
+    : primaryKeyIndices.map(columnIndex => {
+        const slot = input.rawTextColumnIndices.indexOf(columnIndex);
+        if (slot < 0) {
+          throw new Error(`Primary-key raw TEXT column ${columnIndex} was not projected`);
+        }
+        return slot;
+      });
   const rows = input.rows.map((row, rowIndex) => {
     const oversizedMembers = input.identity.columns.flatMap((column, keyIndex) => {
       const metadata = input.oversizedCells?.[rowIndex]?.[primaryKeyIndices[keyIndex]];
       return metadata ? [{ identifier: column.identifier, byteLength: metadata.byteLength }] : [];
     });
+    const identityRow = input.identityRows[rowIndex];
+    if (!identityRow) throw new Error(`Primary-key identity row missing at index ${rowIndex}`);
+    const rawTextRow = input.rawTextBytes[rowIndex];
+    if (
+      !input.rawTextValidationUnavailable
+      && (!rawTextRow || rawTextRow.length !== input.rawTextColumnIndices.length)
+    ) {
+      throw new Error(`Primary-key raw TEXT row missing at index ${rowIndex}`);
+    }
+    const unrepresentableTextMembers = oversizedMembers.length > 0
+      ? []
+      : input.rawTextValidationUnavailable
+        ? input.identity.columns.map(column => column.identifier)
+        : input.identity.columns.flatMap((column, keyIndex) => {
+          const value = identityRow[primaryKeyIndices[keyIndex]];
+          if (typeof value !== 'string') return [];
+          const rawBytes = rawTextRow[rawTextSlots[keyIndex]];
+          if (!(rawBytes instanceof Uint8Array)) return [column.identifier];
+          try {
+            return textDecoder.decode(rawBytes) === value ? [] : [column.identifier];
+          } catch {
+            return [column.identifier];
+          }
+          });
     let recordId;
+    if (input.rawTextValidationUnavailable) {
+      unrepresentableTextKeyRows ??= new Set();
+      unrepresentableTextKeyRows.add(rowIndex);
+    }
     if (oversizedMembers.length > 0) {
       const reason = readOnlyPrimaryKeyReason(
         oversizedMembers,
@@ -531,9 +803,16 @@ export function remapPrimaryKeyContainment(
       readOnlyRowReasons ??= {};
       readOnlyRowReasons[rowIndex] = reason;
       recordId = encodeReadOnlyPrimaryKeyRecordId(reason, rowOffset + rowIndex);
+    } else if (unrepresentableTextMembers.length > 0) {
+      const reason = input.rawTextValidationUnavailable
+        ? readOnlyPrimaryKeyValidationReason(unrepresentableTextMembers)
+        : readOnlyPrimaryKeyTextReason(unrepresentableTextMembers, input.textEncoding);
+      readOnlyRowReasons ??= {};
+      readOnlyRowReasons[rowIndex] = reason;
+      unrepresentableTextKeyRows ??= new Set();
+      unrepresentableTextKeyRows.add(rowIndex);
+      recordId = encodeReadOnlyPrimaryKeyRecordId(reason, rowOffset + rowIndex);
     } else {
-      const identityRow = input.identityRows[rowIndex];
-      if (!identityRow) throw new Error(`Primary-key identity row missing at index ${rowIndex}`);
       recordId = encodePrimaryKeyRecordId(
         input.identity.columns,
         primaryKeyIndices.map(index => identityRow[index])
@@ -604,6 +883,7 @@ export function remapPrimaryKeyContainment(
     rows,
     ...(oversizedCells ? { oversizedCells } : {}),
     ...(exactIntegerTexts ? { exactIntegerTexts } : {}),
-    ...(readOnlyRowReasons ? { readOnlyRowReasons } : {})
+    ...(readOnlyRowReasons ? { readOnlyRowReasons } : {}),
+    ...(unrepresentableTextKeyRows ? { unrepresentableTextKeyRows } : {})
   };
 }

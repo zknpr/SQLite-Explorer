@@ -7,6 +7,10 @@ import {
 import { BUFFER_OPEN_CEILING_BYTES } from '../../../src/core/paged-open';
 import { deserializeValue } from '../../../core/ui/modules/transport.js';
 import {
+  encodeJsonSafeNonFiniteNumber,
+  escapeJsonSafeNumberString
+} from '../../../src/core/json-safe-numbers';
+import {
   fromCellEditRpcErrorData,
   toCellEditRpcErrorData
 } from '../../../src/core/cell-edit-policy';
@@ -77,6 +81,30 @@ export function deserializeDemoIframeRequest(value: unknown): unknown {
   return deserializeValue(value, {
     surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeRequest
   });
+}
+
+/**
+ * The worker boundary uses structured clone, but the iframe consumer applies
+ * the JSON-safe scalar decoder used by VS Code. Encode only those scalars
+ * before forwarding so reserved-prefix TEXT is escaped and Infinity survives
+ * either transport without converting typed arrays to Base64.
+ */
+export function serializeDemoIframeResponse(value: unknown): unknown {
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    return encodeJsonSafeNonFiniteNumber(value);
+  }
+  if (typeof value === 'string') return escapeJsonSafeNumberString(value);
+  if (Array.isArray(value)) return value.map(serializeDemoIframeResponse);
+  if (
+    value
+    && typeof value === 'object'
+    && Object.prototype.toString.call(value) === '[object Object]'
+  ) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, serializeDemoIframeResponse(item)])
+    );
+  }
+  return value;
 }
 
 export function demoRpcErrorFields(error: unknown) {

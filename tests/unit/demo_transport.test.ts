@@ -14,8 +14,10 @@ import {
     guardDemoIframeResponse,
     guardDemoDatabaseExportResponse,
     guardDemoWorkerRequest,
-    guardDemoWorkerResponse
+    guardDemoWorkerResponse,
+    serializeDemoIframeResponse
 } from '../../website/app/demo/transport';
+import { deserializeValue } from '../../core/ui/modules/transport.js';
 
 function rejectsAt(surface: string, operation: () => void) {
     assert.throws(operation, (error: unknown) => {
@@ -38,6 +40,18 @@ function rejectsAggregateAt(surface: string, operation: () => void) {
 }
 
 describe('DemoClient transport guards', () => {
+    it('preserves reserved-prefix TEXT and infinities across the iframe response', () => {
+        const original = {
+            text: '~sqlite-explorer-non-finite:Infinity',
+            number: Infinity
+        };
+        const encoded = serializeDemoIframeResponse(original);
+        const restored = deserializeValue(encoded, {
+            surface: 'demo reserved-prefix response test'
+        });
+
+        assert.deepStrictEqual(restored, original);
+    });
     it('guards both sides of the iframe boundary', () => {
         const oversized = new Uint8Array(MAX_WEBVIEW_BINARY_VALUE_BYTES + 1);
         rejectsAt('web demo iframe -> parent request', () => guardDemoIframeRequest(oversized));

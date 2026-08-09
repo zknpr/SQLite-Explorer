@@ -45,7 +45,7 @@ function assertCellValue(value: unknown, field: string): asserts value is CellVa
     value !== null
     && typeof value !== 'string'
     && typeof value !== 'bigint'
-    && !(typeof value === 'number' && Number.isFinite(value))
+    && !(typeof value === 'number' && !Number.isNaN(value))
     && !(value instanceof Uint8Array)
   ) {
     invalid(`${field} is not a SQLite cell value`);

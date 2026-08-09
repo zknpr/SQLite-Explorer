@@ -1493,13 +1493,18 @@ describe('createNativeDatabaseConnection', () => {
         const columns = ['rowid', ...Array.from({ length: 1000 }, (_, index) => `c${index}`)];
         // queryNumeric receives the bounded transport SELECT, whose final
         // private column packs one empty containment token per numeric value.
-        const transportColumns = [...columns, '__sqlite_explorer_cell_metadata'];
+        const transportColumns = [
+            ...columns,
+            '__sqlite_explorer_cell_metadata',
+            '__sqlite_explorer_cell_raw_text_0'
+        ];
         const sourceRow = [
             1,
             1.25,
             2.5,
             ...Array.from({ length: 998 }, () => 0),
-            '|'.repeat(columns.length - 1)
+            '|'.repeat(columns.length - 1),
+            null
         ];
         const connection = await createRecordingConnection(call => {
             if (call.method === 'queryNumeric') {
@@ -1522,6 +1527,9 @@ describe('createNativeDatabaseConnection', () => {
                 && String(call.args[0]).startsWith('SELECT 1 FROM pragma_table_list')
             ) {
                 return { result: { columns: ['1'], values: [[1]] } };
+            }
+            if (call.method === 'query' && call.args[0] === 'PRAGMA encoding') {
+                return { result: { columns: ['encoding'], values: [['UTF-8']] } };
             }
             if (call.method === 'queryBatch') {
                 const [queries] = call.args as [Array<{ sql: string; params: unknown[] }>];

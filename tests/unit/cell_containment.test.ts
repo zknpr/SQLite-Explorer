@@ -123,6 +123,11 @@ describe('grid cell containment limits', () => {
             sourceColumns: ['value', 'key'],
             visibleColumnCount: 1,
             identityRows: decoded.rows,
+            rawTextBytes: decoded.rows.map((row: unknown[]) => [
+                new TextEncoder().encode(String(row[1]))
+            ]),
+            rawTextColumnIndices: [1],
+            textEncoding: 'utf-8',
             rows: decoded.rows,
             oversizedCells: decoded.oversizedCells,
             exactIntegerTexts: decoded.exactIntegerTexts,
@@ -170,6 +175,21 @@ describe('grid cell containment limits', () => {
         assert.strictEqual(page.rows.length, 5000);
         assert.strictEqual(page.rows[0].length, 50);
         assert.strictEqual(page.oversizedCells, undefined);
+    });
+
+    it('fails closed instead of exceeding SQLite result width for a 1000-column key', async () => {
+        const { buildCellContainmentQuery } = await loadContainmentModule();
+        const keyColumns = Array.from({ length: 1000 }, (_, index) => index);
+        const query = buildCellContainmentQuery(
+            'SELECT * FROM "wide_key"',
+            1000,
+            { limit: 1 },
+            keyColumns
+        );
+
+        assert.strictEqual(query.transportColumnCount, 1001);
+        assert.strictEqual(query.rawTextColumnCount, 0);
+        assert.strictEqual(query.rawTextValidationUnavailable, true);
     });
 
     it('returns bounded WASM previews and exact sparse metadata without changing small DTOs', async () => {

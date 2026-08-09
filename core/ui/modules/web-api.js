@@ -11,7 +11,10 @@ import {
     MAX_WEBVIEW_BINARY_VALUE_BYTES,
     WEBVIEW_TRANSPORT_SURFACES,
     assertWebviewTransportPayload,
+    decodeJsonSafeNumberString,
+    encodeJsonSafeNonFiniteNumber,
     errorFromRpcResponse,
+    escapeJsonSafeNumberString,
     rpcErrorFields
 } from './transport.js';
 import {
@@ -176,6 +179,10 @@ function base64ToUint8Array(base64) {
  * @returns {Promise<*>} Serialized value
  */
 async function serializeValueAsync(value) {
+    if (typeof value === 'number' && !Number.isFinite(value)) {
+        return encodeJsonSafeNonFiniteNumber(value);
+    }
+    if (typeof value === 'string') return escapeJsonSafeNumberString(value);
     // Handle Uint8Array by converting to Base64 marker object
     if (value instanceof Uint8Array) {
         const base64 = await uint8ArrayToBase64Async(value);
@@ -227,6 +234,7 @@ async function serializeArgsAsync(args) {
  * @returns {*} Deserialized value
  */
 function deserializeValue(value) {
+    if (typeof value === 'string') return decodeJsonSafeNumberString(value);
     if (value instanceof Uint8Array) return value;
     if (ArrayBuffer.isView(value)) {
         return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
@@ -234,6 +242,7 @@ function deserializeValue(value) {
     // Check for Uint8Array serialization marker
     if (value && typeof value === 'object' && !Array.isArray(value)) {
         const keys = Object.keys(value);
+
 
         // Check for Base64 format (new, preferred): { __type: 'Uint8Array', base64: '...' }
         if (value.__type === 'Uint8Array' && typeof value.base64 === 'string') {

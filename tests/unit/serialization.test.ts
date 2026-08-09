@@ -49,6 +49,49 @@ describe('RPC Serialization', () => {
     });
 
     describe('serializeValue', () => {
+        it('preserves non-finite numbers through a JSON-only webview boundary', () => {
+            const wireValue = serializeValue({ values: [Infinity, -Infinity, Number.NaN] });
+            const jsonValue = JSON.parse(JSON.stringify(wireValue));
+            const restored = deserializeValue(jsonValue) as { values: number[] };
+
+            assert.strictEqual(restored.values[0], Infinity);
+            assert.strictEqual(restored.values[1], -Infinity);
+            assert.ok(Number.isNaN(restored.values[2]));
+            assert.doesNotMatch(JSON.stringify(wireValue), /null/);
+        });
+
+        it('does not collide with a legitimate row shaped like the old non-finite marker', () => {
+            const original = {
+                row: { __type: 'NonFiniteNumber', value: 'Infinity' },
+                number: Infinity
+            };
+            const wireValue = serializeValue(original);
+            const jsonValue = JSON.parse(JSON.stringify(wireValue));
+
+            assert.deepStrictEqual(deserializeValue(jsonValue), original);
+        });
+
+        it('budgets the expanded non-finite marker before serializing it', () => {
+            assert.doesNotThrow(() => serializeValue(1, {
+                surface: 'non-finite expansion test',
+                maxBinaryBytes: 64,
+                maxAggregateBytes: 38
+            }));
+            assert.throws(
+                () => serializeValue(-Infinity, {
+                    surface: 'non-finite expansion test',
+                    maxBinaryBytes: 64,
+                    maxAggregateBytes: 38
+                }),
+                (error: unknown) => {
+                    assert.ok(error instanceof WebviewPayloadLimitError);
+                    assert.strictEqual(error.kind, 'aggregate-payload');
+                    assert.strictEqual(error.actualBytes, 39);
+                    return true;
+                }
+            );
+        });
+
         it('rejects a per-value overflow before invoking the base64 encoder', () => {
             const bytes = new Uint8Array(5);
             const bufferFrom = mock.method(Buffer, 'from', () => {
@@ -179,6 +222,11 @@ describe('RPC Serialization', () => {
 
 
     describe('deserializeValue edge cases', () => {
+        it('does not decode non-finite-number marker lookalikes with extra keys', () => {
+            const marker = { __type: 'NonFiniteNumber', value: 'Infinity', extra: true };
+            assert.deepStrictEqual(deserializeValue(marker), marker);
+        });
+
         it('should ignore marker objects with extra keys (Base64 format)', () => {
             const marker = { __type: 'Uint8Array', base64: Buffer.from([1, 2]).toString('base64'), extra: 123 };
             const result = deserializeValue(marker) as any;

@@ -107,8 +107,27 @@ describe('keyset key derivation', () => {
       { keyColumns: ['rowid'], nullableSortKey: false, direction: 'DESC' }
     );
     assert.deepStrictEqual(
-      computeKeysetKey({ orderBy: 'rowid', orderDir: 'DESC' }, COMPOSITE_IDENTITY),
+      computeKeysetKey({
+        columns: ['rowid', 'tenant', 'seq', 'value'],
+        orderBy: 'rowid',
+        orderDir: 'DESC'
+      }, COMPOSITE_IDENTITY),
       { keyColumns: ['tenant', 'seq'], nullableSortKey: false, direction: 'DESC' }
+    );
+  });
+
+  it('treats a visible WITHOUT ROWID rowid column as ordinary sortable data', () => {
+    assert.deepStrictEqual(
+      computeKeysetKey({
+        columns: ['rowid', 'tenant', 'rowid', 'value'],
+        orderBy: 'rowid',
+        orderDir: 'DESC'
+      }, COMPOSITE_IDENTITY),
+      {
+        keyColumns: ['rowid', 'tenant', 'seq'],
+        nullableSortKey: true,
+        direction: 'DESC'
+      }
     );
   });
 
@@ -143,6 +162,8 @@ describe('keyset anchor codec', () => {
       [[9223372036854775807n], ['9223372036854775807']],
       [[-9223372036854775808n], ['-9223372036854775808']],
       [[1.5], [1.5]],
+      [[Number.NEGATIVE_INFINITY], [Number.NEGATIVE_INFINITY]],
+      [[Number.POSITIVE_INFINITY], [Number.POSITIVE_INFINITY]],
       [[9.652937795298495e282], [9.652937795298495e282]],
       [['hello "world"'], ['hello "world"']],
       [[''], ['']],
@@ -671,16 +692,14 @@ describe('mintKeysetAnchors', () => {
     assert.strictEqual(clipped?.first, undefined);
     assert.ok(clipped?.last);
 
-    // Non-finite REAL sort value and NULL identity are unanchorable.
-    assert.strictEqual(
-      mintKeysetAnchors({
-        tag: 'tag',
-        key,
-        projectionColumns: projection,
-        rows: [[1n, Number.POSITIVE_INFINITY]]
-      }),
-      undefined
-    );
+    // SQLite stores signed infinities as REAL and the anchor codec preserves them.
+    const infinite = mintKeysetAnchors({
+      tag: 'tag',
+      key,
+      projectionColumns: projection,
+      rows: [[1n, Number.POSITIVE_INFINITY]]
+    });
+    assert.deepStrictEqual(decodeKeysetAnchor(infinite?.first).values, [Infinity, 1]);
     assert.strictEqual(
       mintKeysetAnchors({
         tag: 'tag',

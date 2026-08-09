@@ -3,6 +3,10 @@ import {
   DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES,
   WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES
 } from './cell-containment';
+import {
+  JSON_SAFE_NON_FINITE_NUMBER_MAX_WIRE_BYTES,
+  jsonSafeNumberStringExpansionBytes
+} from './json-safe-numbers';
 
 /** Stable machine-readable identity used on both sides of every webview boundary. */
 export const WEBVIEW_PAYLOAD_LIMIT_ERROR_CODE = 'ERR_WEBVIEW_PAYLOAD_LIMIT' as const;
@@ -201,14 +205,20 @@ export function assertWebviewTransportPayload(
       return;
     }
     if (typeof candidate === 'string') {
-      add(utf8ByteLength(candidate) + 2);
+      add(
+        utf8ByteLength(candidate) + 2
+        + jsonSafeNumberStringExpansionBytes(candidate)
+      );
+      return;
+    }
+    if (typeof candidate === 'number') {
+      add(Number.isFinite(candidate) ? 8 : JSON_SAFE_NON_FINITE_NUMBER_MAX_WIRE_BYTES);
       return;
     }
     if (
       candidate === null
       || candidate === undefined
       || typeof candidate === 'boolean'
-      || typeof candidate === 'number'
       || typeof candidate === 'bigint'
     ) {
       add(8);

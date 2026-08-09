@@ -19,6 +19,9 @@ export function serializeArgsAsync(
     args: unknown[],
     limits?: WebviewTransportLimits
 ): Promise<unknown>;
+export function encodeJsonSafeNonFiniteNumber(value: number): string;
+export function escapeJsonSafeNumberString(value: string): string;
+export function decodeJsonSafeNumberString(value: string): string | number;
 export function deserializeValue(
     value: unknown,
     limits?: WebviewTransportLimits

@@ -10,6 +10,11 @@ import {
   assertWebviewTransportPayload,
   type WebviewTransportLimits
 } from './webview-transport';
+import {
+  decodeJsonSafeNumberString,
+  encodeJsonSafeNonFiniteNumber,
+  escapeJsonSafeNumberString
+} from './json-safe-numbers';
 
 const DEFAULT_SERIALIZATION_LIMITS: WebviewTransportLimits = {
   surface: WEBVIEW_TRANSPORT_SURFACES.coreSerialization
@@ -63,6 +68,13 @@ export function serializeValue(
 }
 
 function serializeValueUnchecked(value: unknown): unknown {
+  // VS Code webview messages must be JSON-serializable. JSON would silently
+  // coerce these SQLite REAL values to null. The escaped scalar namespace
+  // cannot collide with a legitimate row object or user string.
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    return encodeJsonSafeNonFiniteNumber(value);
+  }
+  if (typeof value === 'string') return escapeJsonSafeNumberString(value);
   // Handle Uint8Array by converting to Base64 marker object
   if (value instanceof Uint8Array) {
     return { __type: 'Uint8Array', base64: Buffer.from(value).toString('base64') };
@@ -111,12 +123,13 @@ export function deserializeValue(
 }
 
 function deserializeValueUnchecked(value: unknown): unknown {
+  if (typeof value === 'string') return decodeJsonSafeNumberString(value);
   // Check for our Uint8Array serialization marker
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj);
 
     if ('__type' in obj && obj.__type === 'Uint8Array') {
-      const keys = Object.keys(obj);
       // Check for Base64 format (new, preferred): { __type: 'Uint8Array', base64: '...' }
       if (typeof obj.base64 === 'string') {
         if (keys.length === 2 && keys.includes('__type') && keys.includes('base64')) {

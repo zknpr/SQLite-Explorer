@@ -24,7 +24,8 @@ import {
   guardDemoIframeRequest,
   guardDemoIframeResponse,
   guardDemoWorkerRequest,
-  guardDemoWorkerResponse
+  guardDemoWorkerResponse,
+  serializeDemoIframeResponse
 } from './transport';
 
 // ============================================================================
@@ -54,7 +55,10 @@ function postIframeRpcResponse(
   targetOrigin: string,
   content: RpcMessage['content']
 ): void {
-  let envelope: RpcMessage = { channel: 'rpc', content };
+  const wireContent = content.data === undefined
+    ? content
+    : { ...content, data: serializeDemoIframeResponse(content.data) };
+  let envelope: RpcMessage = { channel: 'rpc', content: wireContent };
   try {
     guardDemoIframeResponse(envelope);
   } catch (error) {

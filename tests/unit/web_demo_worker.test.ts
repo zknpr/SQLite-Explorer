@@ -1211,6 +1211,236 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('orders a declared demo rowid column as data across keyset pages', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_declared_rowid_order (' +
+            'pk INTEGER PRIMARY KEY, rowid TEXT NOT NULL, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_declared_rowid_order VALUES " +
+            "(1, 'zulu', 'one'), (2, 'alpha', 'two'), (3, 'alpha', 'three')"
+        );
+        const options = {
+            columns: ['rowid', 'pk', 'rowid', 'value'],
+            orderBy: 'rowid',
+            orderDir: 'ASC',
+            limit: 2,
+            offset: 0
+        };
+
+        const offsetPage = await worker.invoke(
+            'fetchTableData',
+            'demo_declared_rowid_order',
+            options
+        );
+        assert.deepStrictEqual(
+            Array.from(offsetPage.rows, (row: unknown[]) => [row[1], row[2]]),
+            [[2, 'alpha'], [3, 'alpha']]
+        );
+        const first = await worker.invoke('fetchTableData', 'demo_declared_rowid_order', {
+            ...options,
+            keyset: { mode: 'first' }
+        });
+        assert.deepStrictEqual(
+            Array.from(first.rows, (row: unknown[]) => [row[1], row[2]]),
+            [[2, 'alpha'], [3, 'alpha']]
+        );
+        assert.ok(first.keysetAnchors?.last);
+        const second = await worker.invoke('fetchTableData', 'demo_declared_rowid_order', {
+            ...options,
+            offset: 2,
+            keyset: { mode: 'after', anchor: first.keysetAnchors.last }
+        });
+        assert.deepStrictEqual(
+            Array.from(second.rows, (row: unknown[]) => [row[1], row[2]]),
+            [[1, 'zulu']]
+        );
+    });
+
+    it('round-trips signed infinite REAL identities in the demo', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_infinite_real_identity (' +
+            'key REAL PRIMARY KEY, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_infinite_real_identity VALUES " +
+            "(-1e999, 'negative'), (1e999, 'positive')"
+        );
+        const options = {
+            columns: ['rowid', 'key', 'value'],
+            orderBy: 'key',
+            orderDir: 'ASC',
+            limit: 1,
+            offset: 0
+        };
+
+        const first = await worker.invoke('fetchTableData', 'demo_infinite_real_identity', {
+            ...options,
+            keyset: { mode: 'first' }
+        });
+        assert.strictEqual(first.rows[0][1], Number.NEGATIVE_INFINITY);
+        assert.ok(first.keysetAnchors?.last);
+        const second = await worker.invoke('fetchTableData', 'demo_infinite_real_identity', {
+            ...options,
+            offset: 1,
+            keyset: { mode: 'after', anchor: first.keysetAnchors.last }
+        });
+        assert.strictEqual(second.rows[0][1], Number.POSITIVE_INFINITY);
+        await worker.invoke(
+            'updateCell',
+            'demo_infinite_real_identity',
+            second.rows[0][0],
+            'value',
+            'edited'
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT value FROM demo_infinite_real_identity WHERE key = 1e999'
+            ),
+            'edited'
+        );
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT typeof(0.0/0.0), 0.0/0.0 IS NULL'
+            ))[0].rows[0]),
+            ['null', 1]
+        );
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                "INSERT INTO demo_infinite_real_identity VALUES (0.0/0.0, 'nan')"
+            ),
+            /NOT NULL constraint failed/
+        );
+    });
+
+    it('keeps malformed UTF-8 demo TEXT identities viewable but read-only', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_malformed_text_identity (' +
+            'key TEXT PRIMARY KEY, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_malformed_text_identity VALUES " +
+            "(CAST(X'80' AS TEXT), 'malformed'), " +
+            "(CAST(X'EFBFBD' AS TEXT), 'replacement-character')"
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_malformed_text_identity', {
+            columns: ['rowid', 'key', 'value'],
+            limit: 10,
+            offset: 0,
+            keyset: { mode: 'first' }
+        });
+        const rows = Array.from(page.rows, (row: unknown[]) => Array.from(row));
+        const malformedIndex = rows.findIndex(row => row[2] === 'malformed');
+        const validIndex = rows.findIndex(row => row[2] === 'replacement-character');
+        assert.notStrictEqual(malformedIndex, -1);
+        assert.notStrictEqual(validIndex, -1);
+        const malformedIdentity = rows[malformedIndex][0];
+        const validIdentity = rows[validIndex][0];
+
+        assert.match(String(malformedIdentity), /^readonly-pk:/);
+        assert.match(String(validIdentity), /^pk:/);
+        assert.notStrictEqual(malformedIdentity, validIdentity);
+        assert.match(page.readOnlyRowReasons?.[malformedIndex] ?? '', /not valid UTF-8/i);
+        if (malformedIndex === 0) assert.strictEqual(page.keysetAnchors?.first, undefined);
+        if (malformedIndex === rows.length - 1) {
+            assert.strictEqual(page.keysetAnchors?.last, undefined);
+        }
+
+        await assert.rejects(
+            worker.invoke(
+                'updateCell',
+                'demo_malformed_text_identity',
+                malformedIdentity,
+                'value',
+                'bad-edit'
+            ),
+            /not valid UTF-8/i
+        );
+        await worker.invoke(
+            'updateCell',
+            'demo_malformed_text_identity',
+            validIdentity,
+            'value',
+            'valid-edit'
+        );
+        const stored = await worker.invoke(
+            'runQuery',
+            'SELECT hex(CAST(key AS BLOB)), value FROM demo_malformed_text_identity ORDER BY 1'
+        );
+        assert.deepStrictEqual(
+            Array.from(stored[0].rows, (row: unknown[]) => Array.from(row)),
+            [['80', 'malformed'], ['EFBFBD', 'valid-edit']]
+        );
+    });
+
+    it('suppresses demo keyset anchors for malformed ordinary TEXT sort keys', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_malformed_text_sort (' +
+            'id INTEGER PRIMARY KEY, sort_value TEXT NOT NULL' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_malformed_text_sort VALUES " +
+            "(1, CAST(X'80' AS TEXT)), " +
+            "(2, CAST(X'C0' AS TEXT)), " +
+            "(3, CAST(X'EFBFBD' AS TEXT))"
+        );
+        const first = await worker.invoke('fetchTableData', 'demo_malformed_text_sort', {
+            columns: ['rowid', 'id', 'sort_value'],
+            orderBy: 'sort_value',
+            orderDir: 'ASC',
+            limit: 1,
+            offset: 0,
+            keyset: { mode: 'first' }
+        });
+        assert.strictEqual(first.rows[0][1], 1);
+        assert.strictEqual(first.keysetAnchors, undefined);
+        const second = await worker.invoke('fetchTableData', 'demo_malformed_text_sort', {
+            columns: ['rowid', 'id', 'sort_value'],
+            orderBy: 'sort_value',
+            orderDir: 'ASC',
+            limit: 1,
+            offset: 1
+        });
+        assert.strictEqual(second.rows[0][1], 2);
+        assert.strictEqual(second.keysetAnchors, undefined);
+    });
+
+    it('rolls back a demo insert whose generated TEXT key is not byte-faithful', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_generated_malformed_identity (' +
+            "key TEXT PRIMARY KEY DEFAULT (CAST(X'80' AS TEXT)), value TEXT" +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_generated_malformed_identity(key, value) " +
+            "VALUES (CAST(X'EFBFBD' AS TEXT), 'existing-valid')"
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'insertRow',
+                'demo_generated_malformed_identity',
+                { value: 'must-rollback' }
+            ),
+            /byte-faithful editable identity cannot be minted/i
+        );
+        const stored = await worker.invoke(
+            'runQuery',
+            'SELECT hex(CAST(key AS BLOB)), value FROM demo_generated_malformed_identity'
+        );
+        assert.deepStrictEqual(
+            Array.from(stored[0].rows, (row: unknown[]) => Array.from(row)),
+            [['EFBFBD', 'existing-valid']]
+        );
+    });
+
     it('excludes the hidden rowid from demo data and count global filters', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

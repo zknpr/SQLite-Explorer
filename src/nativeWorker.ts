@@ -20,6 +20,7 @@ import type { TelemetryReporter } from '@vscode/extension-telemetry';
 import type { DatabaseConnectionBundle } from './connectionTypes';
 import type {
   CellValue,
+  CellTextEncoding,
   RecordId,
   QueryResultSet,
   DatabaseOperations,
@@ -57,6 +58,7 @@ import {
   computeKeysetQueryTag,
   keysetFallbackOrder,
   mintKeysetAnchors,
+  ordersBySyntheticRowId,
   resolveKeysetPlan
 } from './core/keyset-pagination';
 import {
@@ -85,8 +87,12 @@ import {
   ROWID_TABLE_AUTHORITY_SQL
 } from './core/integer-utils';
 import {
+  buildByteFaithfulPrimaryKeyProjection,
   buildCellContainmentQuery,
+  decodeRawTextColumns,
   decodeCellContainment,
+  encodeByteFaithfulPrimaryKeyRecordId,
+  findUnrepresentableTextRows,
   remapPrimaryKeyContainment
 } from './core/cell-containment';
 import { serializeOperations } from './core/operation-serializer';
@@ -110,6 +116,7 @@ import {
 import { crypto } from './platform/cryptoShim';
 import { DEFAULT_QUERY_TIMEOUT_MS } from './config';
 import {
+  normalizeCellTextEncoding,
   validateCellReadTarget,
   validateCellReadWindow
 } from './core/cell-read';
@@ -125,8 +132,13 @@ import {
   buildBatchPriorLimitQueries
 } from './core/batch-update';
 import {
+  assertNoNewColumnDropForeignKeyViolations,
   assertColumnDropTableStateCurrent,
   buildColumnDropRestorePlan,
+  captureColumnDropForeignKeyBaseline,
+  COLUMN_DROP_FOREIGN_KEY_FIELD_BYTES_LIMIT,
+  COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT,
+  COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT,
   COLUMN_DROP_TABLE_STATE_SQL,
   executeSchemaPreservingColumnDrop,
   mapColumnDropTableState
@@ -1105,13 +1117,20 @@ export async function createNativeDatabaseConnection(
         await worker.call('runSingle', [`${sql}\n${boundary}`, sql, params, boundary]);
       };
 
+      const readNativeCellTextEncoding = async (): Promise<CellTextEncoding> => (
+        normalizeCellTextEncoding((await worker.call<NativeQueryResult>('query', [
+          'PRAGMA encoding',
+          []
+        ])).values[0]?.[0])
+      );
+
       const readNativePrimaryKeyRecordId = async (
         table: string,
         identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
         predicate: { sql: string; params: CellValue[] }
       ): Promise<RecordId> => {
         const result = await worker.call<NativeQueryResult>('query', [
-          `SELECT ${identity.columns.map(column => escapeIdentifier(column.identifier)).join(', ')} ` +
+          `SELECT ${buildByteFaithfulPrimaryKeyProjection(identity)} ` +
           `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
           predicate.params
         ]);
@@ -1122,7 +1141,12 @@ export async function createNativeDatabaseConnection(
               : `Primary-key identity for ${table} matched more than one row`
           );
         }
-        return encodePrimaryKeyRecordId(identity.columns, result.values[0]);
+        return encodeByteFaithfulPrimaryKeyRecordId(
+          identity,
+          result.values[0],
+          await readNativeCellTextEncoding(),
+          `Cannot resolve updated identity in ${table}`
+        );
       };
 
       const applyNativeJsonPatchValue = (currentValue: CellValue, patch: CellValue): string => {
@@ -1355,6 +1379,15 @@ export async function createNativeDatabaseConnection(
             throw new Error(`Unable to set PRAGMA ${pragma} for column-drop undo`);
           }
         };
+        const readBoundedForeignKeyViolations = async (): Promise<NativeQueryResult['values']> => {
+          const result = await worker.call<NativeQueryResult>('foreignKeyCheckBounded', [
+            table,
+            COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT,
+            COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT,
+            COLUMN_DROP_FOREIGN_KEY_FIELD_BYTES_LIMIT
+          ]);
+          return result.values ?? [];
+        };
 
         const foreignKeysBefore = await readPragma('foreign_keys');
         const legacyAlterBefore = await readPragma('legacy_alter_table');
@@ -1366,6 +1399,10 @@ export async function createNativeDatabaseConnection(
 
           await worker.call('run', ['BEGIN TRANSACTION']);
           transactionStarted = true;
+          const foreignKeyBaseline = captureColumnDropForeignKeyBaseline(
+            table,
+            await readBoundedForeignKeyViolations()
+          );
           const current = await readNativeColumnDropTableState(table);
           assertColumnDropTableStateCurrent(table, snapshot.after, current);
           const collision = await worker.call<NativeQueryResult>('query', [
@@ -1414,12 +1451,11 @@ export async function createNativeDatabaseConnection(
 
           const restored = await readNativeColumnDropTableState(table);
           assertColumnDropTableStateCurrent(table, snapshot.before, restored);
-          const foreignKeyCheck = await worker.call<NativeQueryResult>('query', [
-            'PRAGMA foreign_key_check'
-          ]);
-          if ((foreignKeyCheck.values?.length ?? 0) !== 0) {
-            throw new Error(`Foreign-key check failed while undoing column drop on ${table}`);
-          }
+          assertNoNewColumnDropForeignKeyViolations(
+            table,
+            foreignKeyBaseline,
+            await readBoundedForeignKeyViolations()
+          );
           await worker.call('run', ['COMMIT']);
           transactionStarted = false;
         } catch (error) {
@@ -1992,13 +2028,18 @@ export async function createNativeDatabaseConnection(
             try {
               const returning = await queryNativeSingleStatement<NativeQueryResult>(
                 `${sql} RETURNING ` +
-                identity.columns.map(column => escapeIdentifier(column.identifier)).join(', '),
+                buildByteFaithfulPrimaryKeyProjection(identity),
                 params
               );
               if (returning.values.length !== 1) {
                 throw new Error(`Insert into ${table} did not return exactly one primary-key identity`);
               }
-              const candidateId = encodePrimaryKeyRecordId(identity.columns, returning.values[0]);
+              const candidateId = encodeByteFaithfulPrimaryKeyRecordId(
+                identity,
+                returning.values[0],
+                await readNativeCellTextEncoding(),
+                `Cannot insert into ${table}`
+              );
               const rowId = await readNativePrimaryKeyRecordId(
                 table,
                 identity,
@@ -2462,6 +2503,7 @@ export async function createNativeDatabaseConnection(
           let effectiveOrderBy = options.orderBy;
           let identityOrderBy: string[] | undefined;
           if (columns[0]?.toLowerCase() === 'rowid') {
+            const syntheticRowIdOrder = ordersBySyntheticRowId({ ...options, columns });
             identity = await findNativeTableIdentity(table);
             if (identity?.kind === 'primaryKey') {
               const visibleColumns = columns.slice(1);
@@ -2470,7 +2512,7 @@ export async function createNativeDatabaseConnection(
                 .filter(column => !visibleColumns.includes(column));
               columns = [...visibleColumns, ...hiddenPrimaryKeyColumns];
               primaryKeyContext = { identity, visibleColumns };
-              if (effectiveOrderBy?.toLowerCase() === 'rowid') {
+              if (syntheticRowIdOrder) {
                 effectiveOrderBy = undefined;
                 identityOrderBy = identity.columns.map(column => column.identifier);
               }
@@ -2535,10 +2577,32 @@ export async function createNativeDatabaseConnection(
               queryOptions.orderDir = fallbackOrder.orderDir;
             }
             const { sql, params } = buildSelectQuery(table, queryOptions, keysetPlan);
-            const containmentQuery = buildCellContainmentQuery(sql, columns.length, queryOptions);
+            const primaryKeyColumnIndices = primaryKeyContext
+              ? primaryKeyContext.identity.columns.map(column => {
+                  const index = columns.indexOf(column.identifier);
+                  if (index < 0) {
+                    throw new Error(`Primary-key column missing from table fetch: ${column.identifier}`);
+                  }
+                  return index;
+                })
+              : [];
+            const keysetColumnIndices = keysetKey
+              ? keysetKey.keyColumns
+                  .map(column => columns.indexOf(column))
+                  .filter(index => index >= 0)
+              : [];
+            const rawTextColumnIndices = [
+              ...new Set([...primaryKeyColumnIndices, ...keysetColumnIndices])
+            ];
+            const containmentQuery = buildCellContainmentQuery(
+              sql,
+              columns.length,
+              queryOptions,
+              rawTextColumnIndices
+            );
             const transportQuery = buildExactNumericTextQuery(
               containmentQuery.sql,
-              columns.length + 1
+              containmentQuery.transportColumnCount
             );
             const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
               && hasRowIdShape;
@@ -2592,6 +2656,40 @@ export async function createNativeDatabaseConnection(
               queryOptions.maxPageResponseBytes
             );
             const { rows, oversizedCells, exactIntegerTexts } = contained;
+            const rawTextRows = decodeRawTextColumns(normalized.rows, containmentQuery);
+            const textEncoding = rawTextColumnIndices.length > 0
+              ? normalizeCellTextEncoding((await worker.call<NativeQueryResult>('query', [
+                  'PRAGMA encoding',
+                  []
+                ])).values[0]?.[0])
+              : undefined;
+            const remapped = primaryKeyContext && textEncoding
+              ? remapPrimaryKeyContainment({
+                  identity: primaryKeyContext.identity,
+                  sourceColumns: columns,
+                  visibleColumnCount: primaryKeyContext.visibleColumns.length,
+                  identityRows: result.values,
+                  rawTextBytes: rawTextRows,
+                  rawTextColumnIndices: containmentQuery.rawTextColumnIndices,
+                  rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable,
+                  textEncoding,
+                  rows,
+                  oversizedCells,
+                  exactIntegerTexts,
+                  effectiveInlineCellBytes: containmentQuery.effectiveInlineCellBytes,
+                  rowOffset: queryOptions.offset
+                })
+              : undefined;
+            const unrepresentableKeysetTextRows = keysetKey && textEncoding
+              ? findUnrepresentableTextRows({
+                  sourceRows: result.values,
+                  sourceColumnIndices: keysetColumnIndices,
+                  rawTextRows,
+                  rawTextColumnIndices: containmentQuery.rawTextColumnIndices,
+                  textEncoding,
+                  rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable
+                })
+              : undefined;
 
             // Anchors come from the exact source rows (BigInt-preserving,
             // display order); keysetKey exists only when the in-savepoint
@@ -2602,23 +2700,12 @@ export async function createNativeDatabaseConnection(
                   key: keysetKey,
                   projectionColumns: columns,
                   rows: result.values,
-                  oversizedCells
+                  oversizedCells,
+                  excludedRowIndices: unrepresentableKeysetTextRows
                 })
               : undefined;
 
-            if (primaryKeyContext) {
-              const visibleColumnCount = primaryKeyContext.visibleColumns.length;
-              const remapped = remapPrimaryKeyContainment({
-                identity: primaryKeyContext.identity,
-                sourceColumns: columns,
-                visibleColumnCount,
-                identityRows: result.values,
-                rows,
-                oversizedCells,
-                exactIntegerTexts,
-                effectiveInlineCellBytes: containmentQuery.effectiveInlineCellBytes,
-                rowOffset: queryOptions.offset
-              });
+            if (primaryKeyContext && remapped) {
               const resultHeaders = ['rowid', ...primaryKeyContext.visibleColumns];
               if (snapshotName) {
                 await worker.call('run', [`RELEASE ${snapshotName}`]);

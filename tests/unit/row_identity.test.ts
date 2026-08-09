@@ -6,7 +6,8 @@ import { describe, it } from 'node:test';
 import {
     buildRecordIdentitiesPredicate,
     decodePrimaryKeyRecordId,
-    encodePrimaryKeyRecordId
+    encodePrimaryKeyRecordId,
+    encodePrimaryKeyValue
 } from '../../src/core/row-identity';
 import type { PrimaryKeyColumn } from '../../src/core/types';
 
@@ -37,6 +38,26 @@ describe('primary-key RecordId canonicalization', () => {
             values: [1]
         });
         assert.strictEqual(encodePrimaryKeyRecordId(integerColumn, [1n]), canonical);
+    });
+
+    it('round-trips signed REAL infinities without JSON null coercion', () => {
+        const realColumn: PrimaryKeyColumn[] = [
+            { identifier: 'key', declaredType: 'REAL', position: 1 }
+        ];
+
+        for (const value of [Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY]) {
+            const identity = encodePrimaryKeyRecordId(realColumn, [value]);
+            assert.deepStrictEqual(decodePrimaryKeyRecordId(identity), {
+                columns: ['key'],
+                values: [value]
+            });
+            assert.doesNotMatch(decodeURIComponent(String(identity)), /\["real",null\]/);
+        }
+
+        assert.throws(
+            () => encodePrimaryKeyValue(Number.NaN),
+            /NaN|REAL identity/
+        );
     });
 });
 

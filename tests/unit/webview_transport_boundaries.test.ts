@@ -72,6 +72,38 @@ async function settleRejectedBeforePost(
 }
 
 describe('VS Code webview transport guards', () => {
+    it('preserves signed infinities across the JSON-only transport encoding', async () => {
+        const transport = await import(`../../core/ui/modules/transport.js?nonfinite=${Date.now()}`);
+        const encoded = await transport.serializeValueAsync(
+            [Infinity, -Infinity, Number.NaN],
+            { surface: 'non-finite transport test' }
+        );
+        const jsonValue = JSON.parse(JSON.stringify(encoded));
+        const restored = transport.deserializeValue(jsonValue, { surface: 'non-finite transport test' });
+
+        assert.strictEqual(restored[0], Infinity);
+        assert.strictEqual(restored[1], -Infinity);
+        assert.ok(Number.isNaN(restored[2]));
+    });
+
+    it('round-trips marker-shaped user objects without decoding them as numbers', async () => {
+        const transport = await import(`../../core/ui/modules/transport.js?marker-collision=${Date.now()}`);
+        const original = {
+            row: { __type: 'NonFiniteNumber', value: 'Infinity' },
+            number: -Infinity
+        };
+        const encoded = await transport.serializeValueAsync(
+            original,
+            { surface: 'non-finite marker collision test' }
+        );
+        const jsonValue = JSON.parse(JSON.stringify(encoded));
+
+        assert.deepStrictEqual(
+            transport.deserializeValue(jsonValue, { surface: 'non-finite marker collision test' }),
+            original
+        );
+    });
+
     it('rejects an oversized request before base64 encoding and postMessage', async () => {
         let resolvePosted!: (message: any) => void;
         const posted = new Promise<any>(resolve => { resolvePosted = resolve; });

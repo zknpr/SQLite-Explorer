@@ -4,6 +4,12 @@ import assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
+import {
+    assertNoNewColumnDropForeignKeyViolations,
+    captureColumnDropForeignKeyBaseline,
+    COLUMN_DROP_FOREIGN_KEY_FIELD_BYTES_LIMIT,
+    COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT
+} from '../../src/core/column-drop';
 
 describe('SQLite Engine Undo/Redo', () => {
     let engine: any;
@@ -338,6 +344,176 @@ describe('SQLite Engine Undo/Redo', () => {
                 "SELECT id FROM column_restore_sequence WHERE tail = 'tail-next'"
             ))[0].rows[0][0],
             101
+        );
+    });
+
+    it('allows positional column-drop undo when an unrelated FK violation pre-existed', async () => {
+        await engine.executeQuery('PRAGMA foreign_keys = OFF');
+        await engine.executeQuery('CREATE TABLE preexisting_fk_parent (id INTEGER PRIMARY KEY)');
+        await engine.executeQuery(
+            'CREATE TABLE preexisting_fk_child (' +
+            'id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES preexisting_fk_parent(id)' +
+            ') WITHOUT ROWID'
+        );
+        await engine.executeQuery('INSERT INTO preexisting_fk_child VALUES (1, 999), (2, 999)');
+        await engine.executeQuery('PRAGMA foreign_keys = ON');
+        assert.deepStrictEqual(
+            (await engine.executeQuery('PRAGMA foreign_key_check'))[0].rows,
+            [
+                ['preexisting_fk_child', null, 'preexisting_fk_parent', 0],
+                ['preexisting_fk_child', null, 'preexisting_fk_parent', 0]
+            ]
+        );
+
+        const createTableSql =
+            'CREATE TABLE fk_baseline_restore (' +
+            'id INTEGER PRIMARY KEY, removed TEXT, tail TEXT)';
+        await engine.executeQuery(createTableSql);
+        await engine.executeQuery(
+            "INSERT INTO fk_baseline_restore(rowid, id, removed, tail) " +
+            "VALUES (7, 7, 'saved', 'tail')"
+        );
+        const removedData = (await engine.executeQuery(
+            'SELECT rowid, removed FROM fk_baseline_restore'
+        ))[0].rows.map((row: any[]) => ({ rowId: row[0], value: row[1] }));
+        await engine.deleteColumns('fk_baseline_restore', ['removed']);
+        const afterTableSql = (await engine.executeQuery(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'fk_baseline_restore'"
+        ))[0].rows[0][0];
+
+        await engine.undoModification({
+            modificationType: 'column_drop',
+            targetTable: 'fk_baseline_restore',
+            description: 'Restore with unrelated pre-existing FK violation',
+            deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+            columnDropSnapshot: {
+                before: {
+                    tableSql: createTableSql,
+                    columns: ['id', 'removed', 'tail'],
+                    identity: { kind: 'rowid' },
+                    schemaObjects: []
+                },
+                after: {
+                    tableSql: afterTableSql,
+                    columns: ['id', 'tail'],
+                    identity: { kind: 'rowid' },
+                    schemaObjects: []
+                }
+            }
+        } as any);
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT rowid, id, removed, tail FROM fk_baseline_restore'
+            ))[0].rows,
+            [[7, 7, 'saved', 'tail']]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('PRAGMA foreign_key_check'))[0].rows,
+            [
+                ['preexisting_fk_child', null, 'preexisting_fk_parent', 0],
+                ['preexisting_fk_child', null, 'preexisting_fk_parent', 0]
+            ]
+        );
+    });
+
+    it('compares bounded foreign-key violations as a multiset', () => {
+        const violation = ['child', null, 'parent', '0'] as const;
+        const baseline = captureColumnDropForeignKeyBaseline('target', [violation, violation]);
+
+        assert.doesNotThrow(() => assertNoNewColumnDropForeignKeyViolations(
+            'target',
+            baseline,
+            [violation, violation]
+        ));
+        assert.throws(
+            () => assertNoNewColumnDropForeignKeyViolations(
+                'target',
+                baseline,
+                [violation, violation, violation]
+            ),
+            /new violations/i
+        );
+        assert.throws(
+            () => captureColumnDropForeignKeyBaseline(
+                'target',
+                Array(COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT + 1).fill(violation)
+            ),
+            /safety bound/i
+        );
+        const longName = 'x'.repeat(20_000);
+        assert.throws(
+            () => captureColumnDropForeignKeyBaseline(
+                'target',
+                Array(60).fill([longName, null, longName, '0'])
+            ),
+            /byte safety bound/i
+        );
+        assert.throws(
+            () => captureColumnDropForeignKeyBaseline(
+                'target',
+                [['x'.repeat(COLUMN_DROP_FOREIGN_KEY_FIELD_BYTES_LIMIT + 1), null, 'p', '0']]
+            ),
+            /field exceeds the safety bound/i
+        );
+    });
+
+    it('rolls back positional undo when restored values introduce an FK violation', async () => {
+        await engine.executeQuery('CREATE TABLE rebuild_fk_parent (id INTEGER PRIMARY KEY)');
+        await engine.executeQuery('INSERT INTO rebuild_fk_parent VALUES (1)');
+        const createTableSql =
+            'CREATE TABLE rebuild_fk_target (' +
+            'id INTEGER PRIMARY KEY, removed INTEGER REFERENCES rebuild_fk_parent(id), tail TEXT)';
+        await engine.executeQuery(createTableSql);
+        await engine.executeQuery(
+            "INSERT INTO rebuild_fk_target(rowid, id, removed, tail) VALUES (7, 7, 1, 'tail')"
+        );
+        await engine.deleteColumns('rebuild_fk_target', ['removed']);
+        const afterTableSql = (await engine.executeQuery(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'rebuild_fk_target'"
+        ))[0].rows[0][0];
+        // A real object with this name shadows the table-valued pragma. The
+        // safety gate must execute the non-shadowable PRAGMA statement.
+        await engine.executeQuery(
+            'CREATE TABLE pragma_foreign_key_check (' +
+            '"table" TEXT, rowid INTEGER, parent TEXT, fkid INTEGER)'
+        );
+
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'column_drop',
+                targetTable: 'rebuild_fk_target',
+                description: 'Reject a new rebuild violation',
+                deletedColumns: [{
+                    name: 'removed',
+                    type: 'INTEGER',
+                    data: [{ rowId: 7, value: 999 }]
+                }],
+                columnDropSnapshot: {
+                    before: {
+                        tableSql: createTableSql,
+                        columns: ['id', 'removed', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: []
+                    },
+                    after: {
+                        tableSql: afterTableSql,
+                        columns: ['id', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: []
+                    }
+                }
+            } as any),
+            /new violations/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('PRAGMA table_info(rebuild_fk_target)'))[0].rows
+                .map((column: any[]) => column[1]),
+            ['id', 'tail']
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('PRAGMA foreign_key_check'))[0]?.rows ?? [],
+            []
         );
     });
 

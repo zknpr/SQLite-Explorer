@@ -64,10 +64,14 @@ import {
   ROWID_TABLE_AUTHORITY_SQL
 } from '../../../src/core/integer-utils.ts';
 import {
+  buildByteFaithfulPrimaryKeyProjection,
   buildCellContainmentQuery,
+  decodeRawTextColumns,
   decodeCellContainment,
   DEFAULT_MAX_INLINE_CELL_BYTES,
   DEFAULT_MAX_PAGE_RESPONSE_BYTES,
+  encodeByteFaithfulPrimaryKeyRecordId,
+  findUnrepresentableTextRows,
   remapPrimaryKeyContainment
 } from '../../../src/core/cell-containment.ts';
 import {
@@ -76,6 +80,7 @@ import {
   computeKeysetQueryTag,
   keysetFallbackOrder,
   mintKeysetAnchors,
+  ordersBySyntheticRowId,
   resolveKeysetPlan
 } from '../../../src/core/keyset-pagination.ts';
 import {
@@ -1249,7 +1254,7 @@ async function resolveTableIdentity(table) {
 
 function readPrimaryKeyRecordId(table, identity, predicate) {
   const result = db.exec(
-    `SELECT ${identity.columns.map(column => escapeIdentifier(column.identifier)).join(', ')} ` +
+    `SELECT ${buildByteFaithfulPrimaryKeyProjection(identity)} ` +
     `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
     normalizeBindParams(predicate.params),
     { useBigInt: true }
@@ -1262,7 +1267,12 @@ function readPrimaryKeyRecordId(table, identity, predicate) {
         : `Primary-key identity for ${table} matched more than one row`
     );
   }
-  return encodePrimaryKeyRecordId(identity.columns, rows[0]);
+  return encodeByteFaithfulPrimaryKeyRecordId(
+    identity,
+    rows[0],
+    normalizeCellTextEncoding(db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]),
+    `Cannot resolve updated identity in ${table}`
+  );
 }
 
 function applyJsonPatchValue(currentValue, patch) {
@@ -1308,7 +1318,7 @@ async function fetchTableData(table, options = {}) {
         .filter(column => !visibleColumns.includes(column));
       projectionColumns = [...visibleColumns, ...hiddenPrimaryKeyColumns];
       primaryKeyContext = { identity, visibleColumns };
-      if (effectiveOrderBy?.toLowerCase() === 'rowid') {
+      if (ordersBySyntheticRowId({ ...options, columns })) {
         effectiveOrderBy = null;
         identityOrderBy = identity.columns.map(column => column.identifier);
       }
@@ -1427,14 +1437,32 @@ async function fetchTableData(table, options = {}) {
     maxInlineCellBytes: Math.min(DEFAULT_MAX_INLINE_CELL_BYTES, requestedCellLimit),
     maxPageResponseBytes: Math.min(DEFAULT_MAX_PAGE_RESPONSE_BYTES, requestedPageLimit)
   };
+  const primaryKeyColumnIndices = primaryKeyContext
+    ? primaryKeyContext.identity.columns.map(column => {
+        const index = headers.indexOf(column.identifier);
+        if (index < 0) {
+          throw new Error(`Primary-key column missing from table fetch: ${column.identifier}`);
+        }
+        return index;
+      })
+    : [];
+  const keysetColumnIndices = keysetKey
+    ? keysetKey.keyColumns
+        .map(column => headers.indexOf(column))
+        .filter(index => index >= 0)
+    : [];
+  const rawTextColumnIndices = [
+    ...new Set([...primaryKeyColumnIndices, ...keysetColumnIndices])
+  ];
   const containmentQuery = buildCellContainmentQuery(
     sql,
     headers.length,
-    containmentOptions
+    containmentOptions,
+    rawTextColumnIndices
   );
   const transportQuery = buildExactNumericTextQuery(
     containmentQuery.sql,
-    headers.length + 1
+    containmentQuery.transportColumnCount
   );
   const results = db.exec(transportQuery.sql, params, { useBigInt: true });
 
@@ -1480,6 +1508,37 @@ async function fetchTableData(table, options = {}) {
     containmentOptions.maxPageResponseBytes
   );
   const { rows, oversizedCells, exactIntegerTexts } = contained;
+  const rawTextRows = decodeRawTextColumns(normalized.rows, containmentQuery);
+  const textEncoding = rawTextColumnIndices.length > 0
+    ? normalizeCellTextEncoding(db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0])
+    : undefined;
+  const remapped = primaryKeyContext && textEncoding
+    ? remapPrimaryKeyContainment({
+        identity: primaryKeyContext.identity,
+        sourceColumns: headers,
+        visibleColumnCount: primaryKeyContext.visibleColumns.length,
+        identityRows: sourceRows,
+        rawTextBytes: rawTextRows,
+        rawTextColumnIndices: containmentQuery.rawTextColumnIndices,
+        rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable,
+        textEncoding,
+        rows,
+        oversizedCells,
+        exactIntegerTexts,
+        effectiveInlineCellBytes: containmentQuery.effectiveInlineCellBytes,
+        rowOffset: parseInt(offset, 10)
+      })
+    : undefined;
+  const unrepresentableKeysetTextRows = keysetKey && textEncoding
+    ? findUnrepresentableTextRows({
+        sourceRows,
+        sourceColumnIndices: keysetColumnIndices,
+        rawTextRows,
+        rawTextColumnIndices: containmentQuery.rawTextColumnIndices,
+        textEncoding,
+        rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable
+      })
+    : undefined;
   // Anchors come from the exact source rows (BigInt-preserving, display order)
   // so every OFFSET or keyset page re-anchors itself.
   const keysetAnchors = keysetKey && keysetTag !== undefined
@@ -1488,22 +1547,11 @@ async function fetchTableData(table, options = {}) {
         key: keysetKey,
         projectionColumns: headers,
         rows: sourceRows,
-        oversizedCells
+        oversizedCells,
+        excludedRowIndices: unrepresentableKeysetTextRows
       })
     : undefined;
-  if (primaryKeyContext) {
-    const visibleColumnCount = primaryKeyContext.visibleColumns.length;
-    const remapped = remapPrimaryKeyContainment({
-      identity: primaryKeyContext.identity,
-      sourceColumns: headers,
-      visibleColumnCount,
-      identityRows: sourceRows,
-      rows,
-      oversizedCells,
-      exactIntegerTexts,
-      effectiveInlineCellBytes: containmentQuery.effectiveInlineCellBytes,
-      rowOffset: parseInt(offset, 10)
-    });
+  if (primaryKeyContext && remapped) {
     return {
       headers: ['rowid', ...primaryKeyContext.visibleColumns],
       rows: remapped.rows,
@@ -1947,7 +1995,7 @@ async function insertRow(table, data, maxEditValueBytes, historyReplayToken) {
     try {
       const statement = db.prepare(
         `${insertSql} RETURNING ` +
-        identity.columns.map(column => escapeIdentifier(column.identifier)).join(', '),
+        buildByteFaithfulPrimaryKeyProjection(identity),
         normalizeBindParams(values)
       );
       let row;
@@ -1962,7 +2010,12 @@ async function insertRow(table, data, maxEditValueBytes, historyReplayToken) {
       } finally {
         statement.free();
       }
-      const candidateId = encodePrimaryKeyRecordId(identity.columns, row);
+      const candidateId = encodeByteFaithfulPrimaryKeyRecordId(
+        identity,
+        row,
+        normalizeCellTextEncoding(db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]),
+        `Cannot insert into ${table}`
+      );
       const rowId = readPrimaryKeyRecordId(
         table,
         identity,

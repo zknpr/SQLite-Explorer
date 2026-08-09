@@ -69,6 +69,18 @@ export interface KeysetKey {
   direction: 'ASC' | 'DESC';
 }
 
+/**
+ * The grid prepends an intrinsic-rowid identity slot to `columns`. A real
+ * column named `rowid` appears later in that same projection. WITHOUT ROWID
+ * tables permit that declaration, so a sort for the duplicated visible name
+ * must remain a column sort instead of being rewritten to primary-key order.
+ */
+export function ordersBySyntheticRowId(options: TableQueryOptions): boolean {
+  return options.orderBy?.toLowerCase() === 'rowid'
+    && options.columns?.[0]?.toLowerCase() === 'rowid'
+    && !options.columns.slice(1).some(column => column.toLowerCase() === 'rowid');
+}
+
 /** Validated, engine-resolved plan consumed by the SQL assembly. */
 export interface ResolvedKeysetPlan extends KeysetKey {
   mode: KeysetNavigationMode;
@@ -155,9 +167,9 @@ export function computeKeysetKey(
   }
 
   const direction = options.orderDir === 'DESC' ? 'DESC' : 'ASC';
-  // ORDER BY rowid is identity order on rowid tables, and the engines rewrite
-  // it to full PK order on WITHOUT ROWID tables.
-  if (orderBy.toLowerCase() === 'rowid') {
+  // Only the prepended synthetic slot means identity order. A later `rowid`
+  // projection is an ordinary declared column on a WITHOUT ROWID table.
+  if (ordersBySyntheticRowId(options)) {
     return { keyColumns: identityColumns, nullableSortKey: false, direction };
   }
   // Sorting by an identity member keeps the key NOT NULL and unique; dedupe so
@@ -472,8 +484,8 @@ export function assembleKeysetSelect(input: {
 /**
  * Mint the first/last anchors for a fetched page from its source rows (exact,
  * BigInt-preserving values in display order). Rows whose key cells cannot be
- * reproduced faithfully — containment-clipped TEXT/BLOB previews, non-finite
- * REALs, NULL identity cells — yield no anchor for that side, so navigation
+ * reproduced faithfully — containment-clipped TEXT/BLOB previews or NULL
+ * identity cells — yield no anchor for that side, so navigation
  * from them degrades to the OFFSET fallback instead of seeking a wrong key.
  */
 export function mintKeysetAnchors(input: {
@@ -485,6 +497,8 @@ export function mintKeysetAnchors(input: {
   rows: readonly (readonly (CellValue | bigint)[])[];
   /** Source-column-indexed clipping metadata for this page, when any. */
   oversizedCells?: OversizedCellMap;
+  /** Rows whose decoded key text differs from SQLite's stored bytes. */
+  excludedRowIndices?: ReadonlySet<number>;
 }): KeysetAnchorSet | undefined {
   if (input.rows.length === 0) return undefined;
   const keyIndices = input.key.keyColumns.map(column =>
@@ -493,6 +507,7 @@ export function mintKeysetAnchors(input: {
   if (keyIndices.some(index => index < 0)) return undefined;
 
   const mintRow = (rowIndex: number): string | undefined => {
+    if (input.excludedRowIndices?.has(rowIndex)) return undefined;
     const row = input.rows[rowIndex];
     const values: (CellValue | bigint)[] = [];
     for (let slot = 0; slot < keyIndices.length; slot++) {
@@ -501,7 +516,7 @@ export function mintKeysetAnchors(input: {
       const value = row[columnIndex];
       if (value === undefined) return undefined;
       if (value === null && !(slot === 0 && input.key.nullableSortKey)) return undefined;
-      if (typeof value === 'number' && !Number.isFinite(value)) return undefined;
+      if (typeof value === 'number' && Number.isNaN(value)) return undefined;
       values.push(value);
     }
     const anchor = encodeKeysetAnchorUnchecked(input.tag, values);

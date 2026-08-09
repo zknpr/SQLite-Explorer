@@ -15,6 +15,134 @@ WHERE (type = 'table' AND name = ? COLLATE NOCASE)
        AND sql IS NOT NULL)
 ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name`;
 
+/** Bound host memory while comparing the pre/post rebuild violation multiset. */
+export const COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT = 4096;
+export const COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT = 2 * 1024 * 1024;
+export const COLUMN_DROP_FOREIGN_KEY_FIELD_BYTES_LIMIT = 64 * 1024;
+
+export type ColumnDropForeignKeyBaseline = ReadonlyMap<string, number>;
+
+type NormalizedForeignKeyViolation = readonly [string, string | null, string, string];
+
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xD800 && code <= 0xDBFF && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        bytes += 4;
+        index++;
+      } else bytes += 3;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+function exactIntegerText(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value);
+  if (typeof value === 'string' && /^-?(?:0|[1-9]\d*)$/.test(value)) return value;
+  return undefined;
+}
+
+/** Normalize an actual PRAGMA row without lossy unsafe-integer conversion. */
+export function normalizeColumnDropForeignKeyViolation(
+  table: string,
+  row: readonly unknown[]
+): NormalizedForeignKeyViolation {
+  const rowid = exactIntegerText(row[1]);
+  const fkid = exactIntegerText(row[3]);
+  if (
+    row.length !== 4
+    || typeof row[0] !== 'string'
+    || rowid === undefined
+    || typeof row[2] !== 'string'
+    || fkid === undefined
+    || fkid === null
+  ) {
+    throw new Error(`Invalid foreign-key check row while undoing column drop on ${table}`);
+  }
+  return [row[0], rowid, row[2], fkid];
+}
+
+/** Measure before retaining/serializing a tuple so the count cap is also byte-bounded. */
+export function columnDropForeignKeyViolationBytes(
+  table: string,
+  row: readonly unknown[]
+): number {
+  const normalized = normalizeColumnDropForeignKeyViolation(table, row);
+  const fields = normalized.filter((value): value is string => value !== null);
+  const fieldBytes = fields.map(utf8ByteLength);
+  if (fieldBytes.some(bytes => bytes > COLUMN_DROP_FOREIGN_KEY_FIELD_BYTES_LIMIT)) {
+    throw new Error(
+      `Cannot undo column drop on ${table}: a foreign-key violation field exceeds the safety bound`
+    );
+  }
+  return fieldBytes.reduce((total, bytes) => total + bytes, 0) + 32;
+}
+
+function foreignKeyViolationKey(table: string, row: readonly unknown[]): string {
+  return JSON.stringify(normalizeColumnDropForeignKeyViolation(table, row));
+}
+
+/** Capture an exact, bounded multiset before the rebuild mutates any schema. */
+export function captureColumnDropForeignKeyBaseline(
+  table: string,
+  rows: readonly (readonly unknown[])[]
+): ColumnDropForeignKeyBaseline {
+  if (rows.length > COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT) {
+    throw new Error(
+      `Cannot undo column drop on ${table}: more than ` +
+      `${COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT} pre-existing foreign-key violations ` +
+      `cannot be compared within the safety bound`
+    );
+  }
+  const counts = new Map<string, number>();
+  let aggregateBytes = 0;
+  for (const row of rows) {
+    aggregateBytes += columnDropForeignKeyViolationBytes(table, row);
+    if (aggregateBytes > COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT) {
+      throw new Error(
+        `Cannot undo column drop on ${table}: pre-existing foreign-key violations ` +
+        `exceed the byte safety bound`
+      );
+    }
+    const key = foreignKeyViolationKey(table, row);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/** Reject only tuples whose post-rebuild multiplicity exceeds the baseline. */
+export function assertNoNewColumnDropForeignKeyViolations(
+  table: string,
+  baseline: ColumnDropForeignKeyBaseline,
+  rows: readonly (readonly unknown[])[]
+): void {
+  if (rows.length > COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT) {
+    throw new Error(`Foreign-key check found new violations while undoing column drop on ${table}`);
+  }
+  const remaining = new Map(baseline);
+  let aggregateBytes = 0;
+  for (const row of rows) {
+    aggregateBytes += columnDropForeignKeyViolationBytes(table, row);
+    if (aggregateBytes > COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT) {
+      throw new Error(`Foreign-key check found new violations while undoing column drop on ${table}`);
+    }
+    const key = foreignKeyViolationKey(table, row);
+    const count = remaining.get(key) ?? 0;
+    if (count === 0) {
+      throw new Error(`Foreign-key check found new violations while undoing column drop on ${table}`);
+    }
+    if (count === 1) remaining.delete(key);
+    else remaining.set(key, count - 1);
+  }
+}
+
 export type ColumnDropStatementExecutor = (
   sql: string
 ) => void | Promise<void>;

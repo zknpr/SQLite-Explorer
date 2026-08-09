@@ -878,6 +878,210 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             );
         });
 
+        await testContext.test('orders a declared native rowid column as data across keyset pages', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_declared_rowid_order (' +
+                'pk INTEGER PRIMARY KEY, rowid TEXT NOT NULL, value TEXT' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_declared_rowid_order VALUES " +
+                "(1, 'zulu', 'one'), (2, 'alpha', 'two'), (3, 'alpha', 'three')"
+            );
+            const options: TableQueryOptions = {
+                columns: ['rowid', 'pk', 'rowid', 'value'],
+                orderBy: 'rowid',
+                orderDir: 'ASC',
+                limit: 2,
+                offset: 0
+            };
+
+            const offsetPage = await engine.fetchTableData('native_declared_rowid_order', options);
+            assert.deepStrictEqual(
+                offsetPage.rows.map(row => [row[1], row[2]]),
+                [[2, 'alpha'], [3, 'alpha']]
+            );
+            const first = await engine.fetchTableData('native_declared_rowid_order', {
+                ...options,
+                keyset: { mode: 'first' }
+            });
+            assert.deepStrictEqual(
+                first.rows.map(row => [row[1], row[2]]),
+                [[2, 'alpha'], [3, 'alpha']]
+            );
+            assert.ok(first.keysetAnchors?.last);
+            const second = await engine.fetchTableData('native_declared_rowid_order', {
+                ...options,
+                offset: 2,
+                keyset: { mode: 'after', anchor: first.keysetAnchors.last }
+            });
+            assert.deepStrictEqual(
+                second.rows.map(row => [row[1], row[2]]),
+                [[1, 'zulu']]
+            );
+        });
+
+        await testContext.test('round-trips signed infinite native REAL identities', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_infinite_real_identity (' +
+                'key REAL PRIMARY KEY, value TEXT' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_infinite_real_identity VALUES " +
+                "(-1e999, 'negative'), (1e999, 'positive')"
+            );
+            const options: TableQueryOptions = {
+                columns: ['rowid', 'key', 'value'],
+                orderBy: 'key',
+                orderDir: 'ASC',
+                limit: 1,
+                offset: 0
+            };
+
+            const first = await engine.fetchTableData('native_infinite_real_identity', {
+                ...options,
+                keyset: { mode: 'first' }
+            });
+            assert.strictEqual(first.rows[0][1], Number.NEGATIVE_INFINITY);
+            assert.ok(first.keysetAnchors?.last);
+            const second = await engine.fetchTableData('native_infinite_real_identity', {
+                ...options,
+                offset: 1,
+                keyset: { mode: 'after', anchor: first.keysetAnchors.last }
+            });
+            assert.strictEqual(second.rows[0][1], Number.POSITIVE_INFINITY);
+            await engine.updateCell(
+                'native_infinite_real_identity',
+                second.rows[0][0] as string,
+                'value',
+                'edited'
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT value FROM native_infinite_real_identity WHERE key = 1e999'
+                ))[0].rows,
+                [['edited']]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT typeof(0.0/0.0), 0.0/0.0 IS NULL'))[0].rows,
+                [['null', 1]]
+            );
+            await assert.rejects(
+                engine.executeQuery(
+                    "INSERT INTO native_infinite_real_identity VALUES (0.0/0.0, 'nan')"
+                ),
+                /constraint failed/i
+            );
+        });
+
+        await testContext.test('keeps malformed native UTF-8 TEXT identities viewable but read-only', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_malformed_text_identity (' +
+                'key TEXT PRIMARY KEY, value TEXT' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_malformed_text_identity VALUES " +
+                "(CAST(X'80' AS TEXT), 'malformed'), " +
+                "(CAST(X'EFBFBD' AS TEXT), 'replacement-character')"
+            );
+            const page = await engine.fetchTableData('native_malformed_text_identity', {
+                columns: ['rowid', 'key', 'value'],
+                limit: 10,
+                offset: 0,
+                keyset: { mode: 'first' }
+            });
+            const malformedIndex = page.rows.findIndex(row => row[2] === 'malformed');
+            const validIndex = page.rows.findIndex(row => row[2] === 'replacement-character');
+            assert.notStrictEqual(malformedIndex, -1);
+            assert.notStrictEqual(validIndex, -1);
+            const malformedIdentity = page.rows[malformedIndex][0] as string;
+            const validIdentity = page.rows[validIndex][0] as string;
+
+            assert.match(malformedIdentity, /^readonly-pk:/);
+            assert.match(validIdentity, /^pk:/);
+            assert.notStrictEqual(malformedIdentity, validIdentity);
+            assert.match(page.readOnlyRowReasons?.[malformedIndex] ?? '', /not valid UTF-8/i);
+            if (malformedIndex === 0) assert.strictEqual(page.keysetAnchors?.first, undefined);
+            if (malformedIndex === page.rows.length - 1) {
+                assert.strictEqual(page.keysetAnchors?.last, undefined);
+            }
+
+            await assert.rejects(
+                engine.updateCell(
+                    'native_malformed_text_identity',
+                    malformedIdentity,
+                    'value',
+                    'bad-edit'
+                ),
+                /not valid UTF-8/i
+            );
+            await engine.updateCell(
+                'native_malformed_text_identity',
+                validIdentity,
+                'value',
+                'valid-edit'
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT hex(CAST(key AS BLOB)), value ' +
+                    'FROM native_malformed_text_identity ORDER BY 1'
+                ))[0].rows,
+                [['80', 'malformed'], ['EFBFBD', 'valid-edit']]
+            );
+        });
+
+        await testContext.test('suppresses native keyset anchors for malformed ordinary TEXT sort keys', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_malformed_text_sort (' +
+                'id INTEGER PRIMARY KEY, sort_value TEXT NOT NULL' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_malformed_text_sort VALUES " +
+                "(1, CAST(X'80' AS TEXT)), " +
+                "(2, CAST(X'C0' AS TEXT)), " +
+                "(3, CAST(X'EFBFBD' AS TEXT))"
+            );
+            const options: TableQueryOptions = {
+                columns: ['rowid', 'id', 'sort_value'],
+                orderBy: 'sort_value',
+                orderDir: 'ASC',
+                limit: 1,
+                offset: 0
+            };
+            const first = await engine.fetchTableData('native_malformed_text_sort', {
+                ...options,
+                keyset: { mode: 'first' }
+            });
+            assert.strictEqual(first.rows[0][1], 1);
+            assert.strictEqual(first.keysetAnchors, undefined);
+            const second = await engine.fetchTableData('native_malformed_text_sort', {
+                ...options,
+                offset: 1
+            });
+            assert.strictEqual(second.rows[0][1], 2);
+            assert.strictEqual(second.keysetAnchors, undefined);
+        });
+
+        await testContext.test('rolls back a native insert whose generated TEXT key is not byte-faithful', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_generated_malformed_identity (' +
+                "key TEXT PRIMARY KEY DEFAULT (CAST(X'80' AS TEXT)), value TEXT" +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_generated_malformed_identity(key, value) " +
+                "VALUES (CAST(X'EFBFBD' AS TEXT), 'existing-valid')"
+            );
+
+            await assert.rejects(
+                engine.insertRow(
+                    'native_generated_malformed_identity',
+                    { value: 'must-rollback' }
+                ),
+                /byte-faithful editable identity cannot be minted/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT hex(CAST(key AS BLOB)), value ' +
+                    'FROM native_generated_malformed_identity'
+                ))[0].rows,
+                [['EFBFBD', 'existing-valid']]
+            );
+        });
+
         await testContext.test('keeps adjacent unsafe native rowids distinct and editable', async () => {
             await engine.executeQuery(
                 'CREATE TABLE native_unsafe_rowids (value TEXT); ' +
@@ -1499,6 +1703,155 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 ))[0].rows[0][0],
                 101
             );
+        });
+
+        await testContext.test('allows native positional undo with a pre-existing FK violation', async () => {
+            await engine.executeQuery('PRAGMA foreign_keys = OFF');
+            try {
+                await engine.executeQuery(
+                    'CREATE TABLE native_preexisting_fk_parent (id INTEGER PRIMARY KEY)'
+                );
+                await engine.executeQuery(
+                    'CREATE TABLE native_preexisting_fk_child (' +
+                    'id INTEGER PRIMARY KEY, parent_id INTEGER ' +
+                    'REFERENCES native_preexisting_fk_parent(id)) WITHOUT ROWID'
+                );
+                await engine.executeQuery(
+                    'INSERT INTO native_preexisting_fk_child VALUES (1, 999), (2, 999)'
+                );
+                await engine.executeQuery('PRAGMA foreign_keys = ON');
+                assert.deepStrictEqual(
+                    (await engine.executeQuery('PRAGMA foreign_key_check'))[0].rows,
+                    [
+                        ['native_preexisting_fk_child', null, 'native_preexisting_fk_parent', 0],
+                        ['native_preexisting_fk_child', null, 'native_preexisting_fk_parent', 0]
+                    ]
+                );
+
+                const createTableSql =
+                    'CREATE TABLE native_fk_baseline_restore (' +
+                    'id INTEGER PRIMARY KEY, removed TEXT, tail TEXT)';
+                await engine.executeQuery(createTableSql);
+                await engine.executeQuery(
+                    "INSERT INTO native_fk_baseline_restore(rowid, id, removed, tail) " +
+                    "VALUES (7, 7, 'saved', 'tail')"
+                );
+                const removedData = (await engine.executeQuery(
+                    'SELECT rowid AS grid_rowid, removed FROM native_fk_baseline_restore'
+                ))[0].rows.map(row => ({ rowId: row[0], value: row[1] }));
+                await engine.deleteColumns('native_fk_baseline_restore', ['removed']);
+                const afterTableSql = (await engine.executeQuery(
+                    "SELECT sql FROM sqlite_schema WHERE type = 'table' " +
+                    "AND name = 'native_fk_baseline_restore'"
+                ))[0].rows[0][0] as string;
+
+                await engine.undoModification({
+                    modificationType: 'column_drop',
+                    targetTable: 'native_fk_baseline_restore',
+                    description: 'Restore with unrelated pre-existing FK violation',
+                    deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+                    columnDropSnapshot: {
+                        before: {
+                            tableSql: createTableSql,
+                            columns: ['id', 'removed', 'tail'],
+                            identity: { kind: 'rowid' },
+                            schemaObjects: []
+                        },
+                        after: {
+                            tableSql: afterTableSql,
+                            columns: ['id', 'tail'],
+                            identity: { kind: 'rowid' },
+                            schemaObjects: []
+                        }
+                    }
+                } as any);
+
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'SELECT rowid AS grid_rowid, id, removed, tail ' +
+                        'FROM native_fk_baseline_restore'
+                    ))[0].rows,
+                    [[7, 7, 'saved', 'tail']]
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery('PRAGMA foreign_key_check'))[0].rows,
+                    [
+                        ['native_preexisting_fk_child', null, 'native_preexisting_fk_parent', 0],
+                        ['native_preexisting_fk_child', null, 'native_preexisting_fk_parent', 0]
+                    ]
+                );
+            } finally {
+                await engine.executeQuery('PRAGMA foreign_keys = OFF');
+                await engine.executeQuery('DROP TABLE IF EXISTS native_preexisting_fk_child');
+                await engine.executeQuery('DROP TABLE IF EXISTS native_preexisting_fk_parent');
+                await engine.executeQuery('PRAGMA foreign_keys = ON');
+            }
+        });
+
+        await testContext.test('uses the non-shadowable native FK check for positional undo', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_rebuild_fk_parent (id INTEGER PRIMARY KEY)'
+            );
+            await engine.executeQuery('INSERT INTO native_rebuild_fk_parent VALUES (1)');
+            const createTableSql =
+                'CREATE TABLE native_rebuild_fk_target (' +
+                'id INTEGER PRIMARY KEY, removed INTEGER ' +
+                'REFERENCES native_rebuild_fk_parent(id), tail TEXT)';
+            await engine.executeQuery(createTableSql);
+            await engine.executeQuery(
+                "INSERT INTO native_rebuild_fk_target(rowid, id, removed, tail) " +
+                "VALUES (7, 7, 1, 'tail')"
+            );
+            await engine.deleteColumns('native_rebuild_fk_target', ['removed']);
+            const afterTableSql = (await engine.executeQuery(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' " +
+                "AND name = 'native_rebuild_fk_target'"
+            ))[0].rows[0][0] as string;
+            await engine.executeQuery(
+                'CREATE TABLE pragma_foreign_key_check (' +
+                '"table" TEXT, rowid INTEGER, parent TEXT, fkid INTEGER)'
+            );
+            try {
+                await assert.rejects(
+                    engine.undoModification({
+                        modificationType: 'column_drop',
+                        targetTable: 'native_rebuild_fk_target',
+                        description: 'Reject a shadowed native FK check',
+                        deletedColumns: [{
+                            name: 'removed',
+                            type: 'INTEGER',
+                            data: [{ rowId: 7, value: 999 }]
+                        }],
+                        columnDropSnapshot: {
+                            before: {
+                                tableSql: createTableSql,
+                                columns: ['id', 'removed', 'tail'],
+                                identity: { kind: 'rowid' },
+                                schemaObjects: []
+                            },
+                            after: {
+                                tableSql: afterTableSql,
+                                columns: ['id', 'tail'],
+                                identity: { kind: 'rowid' },
+                                schemaObjects: []
+                            }
+                        }
+                    } as any),
+                    /new violations/i
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'PRAGMA table_info(native_rebuild_fk_target)'
+                    ))[0].rows.map(column => column[1]),
+                    ['id', 'tail']
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery('PRAGMA foreign_key_check'))[0]?.rows ?? [],
+                    []
+                );
+            } finally {
+                await engine.executeQuery('DROP TABLE pragma_foreign_key_check');
+            }
         });
 
         await testContext.test('rolls back a stale native guarded column restore', async () => {

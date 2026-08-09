@@ -29,7 +29,7 @@ ORDER BY tl."name", ti."cid"`;
 
 export type EncodedPrimaryKeyValue =
   | ['integer', string]
-  | ['real', number]
+  | ['real', number | 'positive-infinity' | 'negative-infinity']
   | ['text', string]
   | ['blob', string];
 
@@ -71,9 +71,9 @@ function hexToBytes(hex: string): Uint8Array {
 export function encodePrimaryKeyValue(value: CellValue | bigint): EncodedPrimaryKeyValue {
   if (typeof value === 'bigint') return ['integer', value.toString()];
   if (typeof value === 'number') {
-    if (!Number.isFinite(value)) {
-      throw new Error('Primary-key REAL identity must be finite');
-    }
+    if (Number.isNaN(value)) throw new Error('Primary-key REAL identity cannot be NaN');
+    if (value === Number.POSITIVE_INFINITY) return ['real', 'positive-infinity'];
+    if (value === Number.NEGATIVE_INFINITY) return ['real', 'negative-infinity'];
     return ['real', value];
   }
   if (typeof value === 'string') return ['text', value];
@@ -100,6 +100,8 @@ export function decodePrimaryKeyValue(encoded: unknown): CellValue {
       }
       return validateRowId(value);
     case 'real':
+      if (value === 'positive-infinity') return Number.POSITIVE_INFINITY;
+      if (value === 'negative-infinity') return Number.NEGATIVE_INFINITY;
       if (typeof value !== 'number' || !Number.isFinite(value)) {
         throw new Error('Invalid primary-key REAL identity');
       }
