@@ -59,6 +59,11 @@ interface ExportCell {
   table: string;
   column: string;
   rowId?: RecordId;
+  snapshotPosition?: {
+    orderByColumns: readonly string[];
+    rowOffset: number;
+    textEncoding: CellTextEncoding;
+  };
   storageClass: CellStorageClass;
   byteLength: number;
   value: CellValue;
@@ -71,8 +76,9 @@ interface ExportRow {
 }
 
 interface ExportCellSession {
-  session: CellReadSession;
+  session: Pick<CellReadSession, 'metadata'>;
   cell: ExportCell;
+  readChunk(byteOffset: number, maxBytes: number): ReturnType<DatabaseOperations['readCellChunk']>;
 }
 
 function cancellationError(): Error {
@@ -145,7 +151,8 @@ function parseCells(
   row: readonly CellValue[],
   startIndex: number,
   textEncoding: CellTextEncoding,
-  rowId?: RecordId
+  rowId?: RecordId,
+  snapshotPosition?: ExportCell['snapshotPosition']
 ): ExportCell[] {
   const expectedLength = startIndex + columns.length * 3;
   if (row.length !== expectedLength) {
@@ -207,6 +214,7 @@ function parseCells(
       table,
       column,
       rowId,
+      ...(snapshotPosition ? { snapshotPosition } : {}),
       storageClass,
       byteLength: sourceBytes,
       value,
@@ -411,19 +419,33 @@ async function* readPrimaryKeyTableRows(
 
       if (isReadOnlyPrimaryKeyRecordId(rowId)) {
         // Oversized primary keys deliberately have no bindable identity. They
-        // also cannot open a later cell-read session, so read their projected
-        // values one row at a time instead of attaching the token to a
-        // separately fetched batch. This keeps inline exports coherent while
-        // retaining the existing read-only behavior for streamed cells.
+        // also cannot open an identity-bound cell-read session, so keep their
+        // absolute position in the export's PK order. The export-wide savepoint
+        // makes that position stable across the bounded cell-window queries.
+        const rowOffset = offset + rowIndex;
         const result = await operations.executeQuery(
           `SELECT ${projection} FROM ${escapeIdentifier(table)} ` +
-          `ORDER BY ${orderBy} LIMIT 1 OFFSET ${offset + rowIndex}`
+          `ORDER BY ${orderBy} LIMIT 1 OFFSET ${rowOffset}`
         );
         const row = result[0]?.rows?.[0];
         if (!row || (result[0]?.rows.length ?? 0) !== 1) {
           throw new Error(`Table ${table} changed while export identities were being enumerated`);
         }
-        yield { cells: parseCells(table, columns, row, 0, textEncoding, rowId) };
+        yield {
+          cells: parseCells(
+            table,
+            columns,
+            row,
+            0,
+            textEncoding,
+            rowId,
+            {
+              orderByColumns: identity.columns.map(column => column.identifier),
+              rowOffset,
+              textEncoding
+            }
+          )
+        };
         rowIndex++;
         continue;
       }
@@ -715,6 +737,42 @@ function requireStableRowId(cell: ExportCell): RecordId {
   return cell.rowId;
 }
 
+async function readPositionedCellChunk(
+  operations: DatabaseOperations,
+  cell: ExportCell,
+  byteOffset: number,
+  maxBytes: number
+): ReturnType<DatabaseOperations['readCellChunk']> {
+  const position = cell.snapshotPosition;
+  if (!position) throw new Error(`Cell ${cell.table}.${cell.column} has no snapshot position`);
+  const orderBy = position.orderByColumns
+    .map(column => `${escapeIdentifier(column)} ASC`)
+    .join(', ');
+  const result = await operations.executeQuery(
+    `SELECT substr(CAST(${escapeIdentifier(cell.column)} AS BLOB), ?, ?) ` +
+    `FROM ${escapeIdentifier(cell.table)} ORDER BY ${orderBy} LIMIT 1 OFFSET ?`,
+    [byteOffset + 1, maxBytes, position.rowOffset]
+  );
+  const rows = result[0]?.rows ?? [];
+  if (rows.length !== 1) {
+    throw new Error(
+      `Snapshot row for ${cell.table}.${cell.column} disappeared during export`
+    );
+  }
+  const bytes = rows[0]?.[0];
+  if (!(bytes instanceof Uint8Array)) {
+    throw new Error(`SQLite returned a non-BLOB window for ${cell.table}.${cell.column}`);
+  }
+  if (bytes.byteLength > maxBytes) {
+    throw new Error('SQLite returned a positioned cell window larger than requested');
+  }
+  return {
+    byteOffset,
+    bytes,
+    done: byteOffset + bytes.byteLength >= cell.byteLength
+  };
+}
+
 async function withCellSession<T>(
   operations: DatabaseOperations,
   cell: ExportCell,
@@ -722,6 +780,22 @@ async function withCellSession<T>(
   body: (input: ExportCellSession) => Promise<T>
 ): Promise<T> {
   assertNotCancelled(cancellation);
+  if (cell.snapshotPosition) {
+    const metadata: CellMetadata = {
+      storageClass: cell.storageClass,
+      byteLength: cell.byteLength,
+      ...(cell.storageClass === 'text'
+        ? { textEncoding: cell.snapshotPosition.textEncoding }
+        : {})
+    };
+    return body({
+      session: { metadata },
+      cell,
+      readChunk: (byteOffset, maxBytes) => (
+        readPositionedCellChunk(operations, cell, byteOffset, maxBytes)
+      )
+    });
+  }
   const rowId = requireStableRowId(cell);
   const session = await operations.openCellReadSession({
     table: cell.table,
@@ -732,7 +806,15 @@ async function withCellSession<T>(
   try {
     assertNotCancelled(cancellation);
     assertSessionMetadata(cell, session.metadata);
-    return await body({ session, cell });
+    return await body({
+      session,
+      cell,
+      readChunk: (byteOffset, maxBytes) => operations.readCellChunk(
+        session.sessionId,
+        byteOffset,
+        maxBytes
+      )
+    });
   } catch (error) {
     primaryError = error;
     throw error;
@@ -752,7 +834,6 @@ async function withCellSession<T>(
 }
 
 async function forEachRawChunk(
-  operations: DatabaseOperations,
   input: ExportCellSession,
   cancellation: ExportCancellation | undefined,
   consume: (bytes: Uint8Array) => Promise<void>
@@ -764,11 +845,7 @@ async function forEachRawChunk(
       EXPORT_CELL_CHUNK_BYTES,
       input.session.metadata.byteLength - sourceOffset
     );
-    const chunk = await operations.readCellChunk(
-      input.session.sessionId,
-      sourceOffset,
-      requestedBytes
-    );
+    const chunk = await input.readChunk(sourceOffset, requestedBytes);
     assertNotCancelled(cancellation);
     validateChunk(
       chunk,
@@ -817,7 +894,7 @@ async function inspectDecodedText(
     { fatal: true, ignoreBOM: true }
   );
   let representable = true;
-  await forEachRawChunk(operations, input, cancellation, async bytes => {
+  await forEachRawChunk(input, cancellation, async bytes => {
     if (!representable) return;
     let decoded: string;
     try {
@@ -853,7 +930,7 @@ async function writeBase64(
   cancellation?: ExportCancellation
 ): Promise<void> {
   let carry = new Uint8Array();
-  await forEachRawChunk(operations, input, cancellation, async bytes => {
+  await forEachRawChunk(input, cancellation, async bytes => {
     const combined = concatBytes(carry, bytes);
     const alignedLength = combined.byteLength - (combined.byteLength % 3);
     if (alignedLength > 0) {
@@ -876,7 +953,7 @@ async function writeHexBytes(
   sink: AsyncExportSink,
   cancellation?: ExportCancellation
 ): Promise<void> {
-  await forEachRawChunk(operations, input, cancellation, async bytes => {
+  await forEachRawChunk(input, cancellation, async bytes => {
     await emit(sink, Buffer.from(bytes).toString('hex'), cancellation);
   });
 }

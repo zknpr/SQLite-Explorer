@@ -488,6 +488,140 @@ describe('streamTableExport golden parity', () => {
 });
 
 describe('streamTableExport cell boundaries', () => {
+    const readonlyPrimaryKeyExportTable = 'stage_e_readonly_pk_stream';
+    const oversizedReadonlyRowText =
+        'readonly-payload|' + 'x'.repeat(EXPORT_CELL_CHUNK_BYTES + 17);
+    const bindableReadonlyExportRows = Array.from({ length: 128 }, (_, index) => ({
+        label: `bindable-${String(index).padStart(3, '0')}`,
+        payload: `selected-safe-${String(index).padStart(3, '0')}`
+    }));
+    const allReadonlyExportRows = [
+        ...bindableReadonlyExportRows,
+        { label: 'readonly', payload: oversizedReadonlyRowText }
+    ];
+
+    async function createReadonlyPrimaryKeyExportFixture(
+        operations: DatabaseOperations
+    ): Promise<RecordId> {
+        const oversizedPrimaryKey = 'readonly-key|' + 'k'.repeat(256 * 1024);
+        await operations.executeQuery(
+            `CREATE TABLE ${readonlyPrimaryKeyExportTable} (` +
+            'key TEXT PRIMARY KEY, label TEXT, payload TEXT' +
+            ') WITHOUT ROWID'
+        );
+        await operations.executeQuery(
+            `WITH RECURSIVE rows(id) AS (` +
+            'VALUES(0) UNION ALL SELECT id + 1 FROM rows WHERE id < 127' +
+            `) INSERT INTO ${readonlyPrimaryKeyExportTable} ` +
+            "SELECT printf('key-%03d', id), printf('bindable-%03d', id), " +
+            "printf('selected-safe-%03d', id) FROM rows"
+        );
+        await operations.executeQuery(
+            `INSERT INTO ${readonlyPrimaryKeyExportTable} VALUES (?, ?, ?)`,
+            [oversizedPrimaryKey, 'readonly', oversizedReadonlyRowText]
+        );
+
+        const page = await operations.fetchTableData(readonlyPrimaryKeyExportTable, {
+            columns: ['rowid', 'label'],
+            orderBy: 'rowid',
+            orderDir: 'ASC',
+            limit: 256,
+            offset: 0,
+            keyset: { mode: 'first' },
+            maxInlineCellBytes: 1024 * 1024,
+            maxPageResponseBytes: 16 * 1024 * 1024
+        });
+        const bindableRow = page.rows.find(row => row[1] === 'bindable-000');
+        const readonlyRow = page.rows.find(row => row[1] === 'readonly');
+        assert.ok(bindableRow && readonlyRow);
+        assert.match(String(bindableRow[0]), /^pk:/);
+        assert.match(String(readonlyRow[0]), /^readonly-pk:/);
+        return bindableRow[0] as RecordId;
+    }
+
+    for (const testCase of [
+        {
+            format: 'csv' as const,
+            expected:
+                'label,payload\n' +
+                allReadonlyExportRows.map(row => `${row.label},${row.payload}`).join('\n')
+        },
+        {
+            format: 'excel' as const,
+            expected:
+                '\uFEFFlabel,payload\n' +
+                allReadonlyExportRows.map(row => `${row.label},${row.payload}`).join('\n')
+        },
+        {
+            format: 'json' as const,
+            expected: JSON.stringify(allReadonlyExportRows, null, 2)
+        },
+        {
+            format: 'sql' as const,
+            expected: allReadonlyExportRows.map(row => (
+                `INSERT INTO "${readonlyPrimaryKeyExportTable}" ("label", "payload") ` +
+                `VALUES ('${row.label}', '${row.payload}');`
+            )).join('\n')
+        }
+    ]) {
+        it(
+            `streams a readonly WITHOUT ROWID row's oversized TEXT byte-faithfully in ` +
+            testCase.format.toUpperCase(),
+            async () => {
+                const database = await createDatabaseEngine({
+                    content: null,
+                    maxSize: 0,
+                    readOnlyMode: false
+                });
+                const operations = database.operations!;
+
+                try {
+                    await createReadonlyPrimaryKeyExportFixture(operations);
+                    const exported = await collectStreamingExport(
+                        operations,
+                        readonlyPrimaryKeyExportTable,
+                        ['label', 'payload'],
+                        { format: testCase.format }
+                    );
+
+                    assert.strictEqual(exported.rowCount, 129);
+                    assert.strictEqual(exported.content, testCase.expected);
+                } finally {
+                    (operations as WasmDatabaseEngine).shutdown();
+                }
+            }
+        );
+    }
+
+    it('exports another selected row from a readonly WITHOUT ROWID table', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+
+        try {
+            const bindableRowId = await createReadonlyPrimaryKeyExportFixture(operations);
+            const exported = await collectStreamingExport(
+                operations,
+                readonlyPrimaryKeyExportTable,
+                ['label', 'payload'],
+                { format: 'json', rowIds: [bindableRowId] }
+            );
+
+            assert.strictEqual(exported.rowCount, 1);
+            assert.strictEqual(
+                exported.content,
+                JSON.stringify([
+                    { label: 'bindable-000', payload: 'selected-safe-000' }
+                ], null, 2)
+            );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('streams late-invalid TEXT bytes through lossless envelopes without leaking a decoded prefix', async () => {
         const database = await createDatabaseEngine({
             content: null,
