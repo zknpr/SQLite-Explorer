@@ -410,6 +410,102 @@ describe('paged writable host save', () => {
     assert.strictEqual(fs.statSync(targetPath).mode & 0o777, 0o604);
   });
 
+  it('restores the active base owner, group, and ordinary mode on the temp inode', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip('POSIX ownership metadata is not meaningful on Windows');
+      return;
+    }
+
+    const basePath = path.join(fixtureDir, 'active-owner-mode.db');
+    fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+    fs.chmodSync(basePath, 0o644);
+    const before = fs.statSync(basePath);
+    const chownCalls: Array<[number, number]> = [];
+    const open = async (...args: Parameters<typeof fs.promises.open>) => {
+      const handle = await fs.promises.open(...args);
+      if (args[1] !== 'wx') return handle;
+      const realChown = handle.chown.bind(handle);
+      return new Proxy(handle, {
+        get(target, property) {
+          if (property === 'chown') {
+            return async (uid: number, gid: number) => {
+              chownCalls.push([uid, gid]);
+              await realChown(uid, gid);
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        }
+      });
+    };
+
+    const result = await writePagedWritableOverlayToFile(
+      capabilityWithOpen(open as typeof fs.promises.open),
+      basePath,
+      basePath,
+      snapshotFor(basePath),
+      undefined,
+      acquireFixtureWriteLock
+    );
+
+    const after = fs.statSync(basePath);
+    assert.deepStrictEqual(result, { requiresReopen: true });
+    assert.deepStrictEqual(chownCalls, [[before.uid, before.gid]]);
+    assert.strictEqual(after.uid, before.uid);
+    assert.strictEqual(after.gid, before.gid);
+    assert.strictEqual(after.mode & 0o777, 0o644);
+  });
+
+  it('continues after EPERM restoring ownership and emits one output-channel note', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip('POSIX ownership metadata is not meaningful on Windows');
+      return;
+    }
+
+    const basePath = path.join(fixtureDir, 'owner-eperm.db');
+    fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+    fs.chmodSync(basePath, 0o644);
+    const warnings: Array<{ message: string; error: unknown }> = [];
+    let chownCalls = 0;
+    const open = async (...args: Parameters<typeof fs.promises.open>) => {
+      const handle = await fs.promises.open(...args);
+      if (args[1] !== 'wx') return handle;
+      return new Proxy(handle, {
+        get(target, property) {
+          if (property === 'chown') {
+            return async () => {
+              chownCalls++;
+              throw Object.assign(new Error('synthetic foreign-owner EPERM'), { code: 'EPERM' });
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        }
+      });
+    };
+
+    const result = await writePagedWritableOverlayToFile(
+      capabilityWithOpen(open as typeof fs.promises.open),
+      basePath,
+      basePath,
+      snapshotFor(basePath),
+      (_level, message, error) => warnings.push({ message, error }),
+      acquireFixtureWriteLock
+    );
+
+    assert.deepStrictEqual(result, { requiresReopen: true });
+    assert.strictEqual(chownCalls, 1);
+    assert.deepStrictEqual(
+      fs.readFileSync(basePath),
+      Buffer.from([9, 8, 7, 6, 5, 6, 7, 8])
+    );
+    assert.strictEqual(fs.statSync(basePath).mode & 0o777, 0o644);
+    assert.strictEqual(warnings.length, 1);
+    assert.match(warnings[0].message, /could not restore.*owner\/group/i);
+    assert.match(warnings[0].message, /parent directory.*ACL/i);
+    assert.match(String(warnings[0].error), /synthetic foreign-owner EPERM/i);
+  });
+
   it('preserves the active base mode observed when the save starts', async () => {
     const basePath = path.join(fixtureDir, 'active-mode-before-save.db');
     fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
