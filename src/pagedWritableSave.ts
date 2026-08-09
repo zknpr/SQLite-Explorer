@@ -1,0 +1,641 @@
+import path from 'path';
+import { crypto } from './platform/cryptoShim';
+import type { DatabaseWriteResult } from './core/types';
+import {
+  MAX_PAGED_OVERLAY_RUN_BYTES,
+  type PagedFileIdentity,
+  type PagedWritableOverlaySnapshot
+} from './core/paged-writable-overlay';
+
+type NodeFs = typeof import('fs');
+type NodeFileHandle = Awaited<ReturnType<NodeFs['promises']['open']>>;
+type PagedSaveLogger = (level: 'warn', message: string, error?: unknown) => void;
+
+/** One reusable host buffer bounds every copy from the frozen base. */
+const BASE_COPY_BUFFER_BYTES = 1024 * 1024;
+const PAGED_FILE_CHANGED_MESSAGE = 'Database file changed on disk; reload the document.';
+
+interface ExistingTarget {
+  exists: true;
+  fingerprint: HostFileFingerprint;
+}
+
+interface MissingTarget {
+  exists: false;
+}
+
+type TargetGeneration = ExistingTarget | MissingTarget;
+
+interface ReplacementTarget {
+  replacementPath: string;
+  requiresReopen: boolean;
+  mode: number;
+  generation: TargetGeneration;
+}
+
+/** Host-only identity for paths participating in the atomic replacement. */
+interface HostFileFingerprint {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+  mode: bigint;
+}
+
+function errorCode(error: unknown): string | undefined {
+  return (error as { code?: string } | undefined)?.code;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function identityFromStats(stats: {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  mode: bigint;
+}): PagedFileIdentity {
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeNs: stats.mtimeNs,
+    mode: stats.mode
+  };
+}
+
+function fingerprintFromStats(stats: {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+  mode: bigint;
+}): HostFileFingerprint {
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeNs: stats.mtimeNs,
+    ctimeNs: stats.ctimeNs,
+    mode: stats.mode
+  };
+}
+
+async function handleIdentity(handle: NodeFileHandle): Promise<PagedFileIdentity> {
+  return identityFromStats(await handle.stat({ bigint: true }));
+}
+
+async function pathIdentity(fs: NodeFs, filePath: string): Promise<PagedFileIdentity> {
+  return identityFromStats(await fs.promises.stat(filePath, { bigint: true }));
+}
+
+async function pathFingerprint(fs: NodeFs, filePath: string): Promise<HostFileFingerprint> {
+  return fingerprintFromStats(await fs.promises.stat(filePath, { bigint: true }));
+}
+
+function sameBaseGeneration(expected: PagedFileIdentity, actual: PagedFileIdentity): boolean {
+  // Permission changes do not change the frozen SQLite generation. `mode` is
+  // carried only so the replacement can restore the intended permissions.
+  return expected.dev === actual.dev
+    && expected.ino === actual.ino
+    && expected.size === actual.size
+    && expected.mtimeNs === actual.mtimeNs;
+}
+
+function sameHostFingerprint(
+  expected: HostFileFingerprint,
+  actual: HostFileFingerprint
+): boolean {
+  return expected.dev === actual.dev
+    && expected.ino === actual.ino
+    && expected.size === actual.size
+    && expected.mtimeNs === actual.mtimeNs
+    && expected.ctimeNs === actual.ctimeNs
+    && expected.mode === actual.mode;
+}
+
+function sameInode(expected: PagedFileIdentity, actual: PagedFileIdentity): boolean {
+  return expected.dev === actual.dev && expected.ino === actual.ino;
+}
+
+function assertNonNegativeSafeInteger(value: unknown, name: string): asserts value is number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new Error(
+      `Malformed paged writable snapshot: ${name} must be a non-negative safe integer`
+    );
+  }
+}
+
+function validateBaseIdentity(identity: unknown): asserts identity is PagedFileIdentity {
+  if (typeof identity !== 'object' || identity === null) {
+    throw new Error('Malformed paged writable snapshot: baseIdentity must be an object');
+  }
+  const candidate = identity as Partial<PagedFileIdentity>;
+  for (const name of ['dev', 'ino', 'size', 'mtimeNs', 'mode'] as const) {
+    if (typeof candidate[name] !== 'bigint') {
+      throw new Error(
+        `Malformed paged writable snapshot: baseIdentity.${name} must be a bigint`
+      );
+    }
+  }
+  if (candidate.dev! < 0n || candidate.ino! < 0n || candidate.size! < 0n || candidate.mode! < 0n) {
+    throw new Error(
+      'Malformed paged writable snapshot: baseIdentity fields except mtimeNs must be non-negative'
+    );
+  }
+}
+
+/** Revalidate worker-provided data before opening a temp or touching a target. */
+function validateSnapshot(snapshot: unknown): asserts snapshot is PagedWritableOverlaySnapshot {
+  if (typeof snapshot !== 'object' || snapshot === null) {
+    throw new Error('Malformed paged writable snapshot: expected an object');
+  }
+  const candidate = snapshot as Partial<PagedWritableOverlaySnapshot>;
+  assertNonNegativeSafeInteger(candidate.chunkSize, 'chunkSize');
+  if (candidate.chunkSize === 0) {
+    throw new Error(
+      'Malformed paged writable snapshot: chunkSize must be a positive safe integer'
+    );
+  }
+  assertNonNegativeSafeInteger(candidate.logicalSize, 'logicalSize');
+  assertNonNegativeSafeInteger(candidate.baseLimit, 'baseLimit');
+  assertNonNegativeSafeInteger(candidate.dirtyBytes, 'dirtyBytes');
+  validateBaseIdentity(candidate.baseIdentity);
+  if (BigInt(candidate.baseLimit) > candidate.baseIdentity.size) {
+    throw new Error(
+      'Malformed paged writable snapshot: baseLimit exceeds the original base size'
+    );
+  }
+  if (!Array.isArray(candidate.runs)) {
+    throw new Error('Malformed paged writable snapshot: runs must be an array');
+  }
+
+  let previousEnd = 0;
+  let computedDirtyBytes = 0;
+  for (const [position, run] of candidate.runs.entries()) {
+    if (typeof run !== 'object' || run === null) {
+      throw new Error(`Malformed paged writable snapshot: runs[${position}] must be an object`);
+    }
+    assertNonNegativeSafeInteger(run.startChunkIndex, `runs[${position}] start`);
+    if (!(run.data instanceof ArrayBuffer)) {
+      throw new Error(
+        `Malformed paged writable snapshot: runs[${position}].data must be an ArrayBuffer`
+      );
+    }
+    const runLength = run.data.byteLength;
+    if (runLength === 0) {
+      throw new Error(
+        `Malformed paged writable snapshot: run ${position} byteLength must be positive`
+      );
+    }
+    if (runLength % candidate.chunkSize !== 0) {
+      throw new Error(
+        `Malformed paged writable snapshot: run ${position} byteLength must be an exact multiple of chunkSize`
+      );
+    }
+    if (runLength > MAX_PAGED_OVERLAY_RUN_BYTES) {
+      throw new Error(
+        `Malformed paged writable snapshot: run ${position} exceeds the 8 MiB cap`
+      );
+    }
+    const runStart = run.startChunkIndex * candidate.chunkSize;
+    if (!Number.isSafeInteger(runStart)) {
+      throw new Error(
+        `Malformed paged writable snapshot: run ${position} start exceeds safe integer range`
+      );
+    }
+    if (runStart > Number.MAX_SAFE_INTEGER - runLength) {
+      throw new Error(
+        `Malformed paged writable snapshot: run ${position} end exceeds safe integer range`
+      );
+    }
+    const runEnd = runStart + runLength;
+    if (position > 0 && runStart < previousEnd) {
+      throw new Error(
+        'Malformed paged writable snapshot: runs must be sorted and non-overlapping'
+      );
+    }
+    previousEnd = runEnd;
+    computedDirtyBytes += runLength;
+    if (!Number.isSafeInteger(computedDirtyBytes)) {
+      throw new Error(
+        'Malformed paged writable snapshot: summed dirty bytes exceed safe integer range'
+      );
+    }
+  }
+  if (computedDirtyBytes !== candidate.dirtyBytes) {
+    throw new Error(
+      'Malformed paged writable snapshot: dirtyBytes must equal the sum of run byte lengths'
+    );
+  }
+}
+
+async function assertBaseGeneration(
+  fs: NodeFs,
+  source: NodeFileHandle,
+  activeBasePath: string,
+  expected: PagedFileIdentity
+): Promise<void> {
+  let descriptor: PagedFileIdentity;
+  let activePath: PagedFileIdentity;
+  try {
+    [descriptor, activePath] = await Promise.all([
+      handleIdentity(source),
+      pathIdentity(fs, activeBasePath)
+    ]);
+  } catch (error) {
+    throw new Error(PAGED_FILE_CHANGED_MESSAGE, { cause: error });
+  }
+  if (!sameBaseGeneration(expected, descriptor) || !sameBaseGeneration(expected, activePath)) {
+    throw new Error(PAGED_FILE_CHANGED_MESSAGE);
+  }
+}
+
+async function resolveReplacementTarget(
+  fs: NodeFs,
+  activeBasePath: string,
+  targetPath: string,
+  baseIdentity: PagedFileIdentity
+): Promise<ReplacementTarget> {
+  const absoluteTargetPath = path.resolve(targetPath);
+  let canonicalTargetPath: string;
+  let targetFingerprint: HostFileFingerprint;
+  try {
+    canonicalTargetPath = await fs.promises.realpath(absoluteTargetPath);
+    targetFingerprint = await pathFingerprint(fs, canonicalTargetPath);
+  } catch (error) {
+    if (errorCode(error) !== 'ENOENT') throw error;
+
+    // A dangling symlink is not a new path: following it could write outside
+    // the directory where the private temp was created. Refuse that ambiguity.
+    try {
+      await fs.promises.lstat(absoluteTargetPath);
+      throw new Error(`Cannot save through dangling symlink '${targetPath}'`);
+    } catch (lstatError) {
+      if (errorCode(lstatError) !== 'ENOENT') throw lstatError;
+    }
+
+    const canonicalParent = await fs.promises.realpath(path.dirname(absoluteTargetPath));
+    return {
+      replacementPath: path.join(canonicalParent, path.basename(absoluteTargetPath)),
+      requiresReopen: false,
+      mode: Number(baseIdentity.mode & 0o777n),
+      generation: { exists: false }
+    };
+  }
+
+  const targetNamesActiveBase = canonicalTargetPath === activeBasePath;
+
+  // A distinct hard link deliberately keeps its own pathname: replacing that
+  // directory entry leaves the descriptor-backed active base frozen.
+  const requiresReopen = targetNamesActiveBase;
+  const replacementPath = targetNamesActiveBase
+    ? activeBasePath
+    : canonicalTargetPath;
+  return {
+    replacementPath,
+    requiresReopen,
+    // Existing permissions are live host metadata, not part of the frozen
+    // SQLite byte generation. Preserve what is present when this save starts
+    // (including a chmod performed after open) and verify it again at commit.
+    mode: Number(targetFingerprint.mode & 0o777n),
+    generation: { exists: true, fingerprint: targetFingerprint }
+  };
+}
+
+function assertTargetGenerationSync(
+  fs: NodeFs,
+  target: ReplacementTarget
+): void {
+  if (target.generation.exists) {
+    let current: HostFileFingerprint;
+    try {
+      current = fingerprintFromStats(fs.statSync(target.replacementPath, { bigint: true }));
+    } catch (error) {
+      throw new Error('Save target changed on disk; retry the save.', { cause: error });
+    }
+    if (!sameHostFingerprint(target.generation.fingerprint, current)) {
+      throw new Error('Save target changed on disk; retry the save.');
+    }
+    return;
+  }
+
+  try {
+    fs.lstatSync(target.replacementPath);
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return;
+    throw new Error('Cannot verify the Save As target before replacement.', { cause: error });
+  }
+  throw new Error('Save target appeared on disk during save; retry the save.');
+}
+
+function assertTemporaryGenerationSync(
+  fs: NodeFs,
+  temporaryPath: string,
+  expected: HostFileFingerprint
+): void {
+  let current: HostFileFingerprint;
+  try {
+    current = fingerprintFromStats(fs.lstatSync(temporaryPath, { bigint: true }));
+  } catch (error) {
+    throw new Error('Temporary database changed before rename.', { cause: error });
+  }
+  if (!sameHostFingerprint(expected, current)) {
+    throw new Error('Temporary database changed before rename.');
+  }
+}
+
+/**
+ * Final replacement gate. Every operation is synchronous so no extension-host
+ * task can interleave after a successful check and before renameSync.
+ */
+function commitReplacementSync(
+  fs: NodeFs,
+  sourceFd: number,
+  activeBasePath: string,
+  expectedBase: PagedFileIdentity,
+  temporaryPath: string,
+  expectedTemporary: HostFileFingerprint,
+  target: ReplacementTarget
+): void {
+  assertTemporaryGenerationSync(fs, temporaryPath, expectedTemporary);
+  assertTargetGenerationSync(fs, target);
+
+  let descriptor: PagedFileIdentity;
+  let activePath: PagedFileIdentity;
+  try {
+    descriptor = identityFromStats(fs.fstatSync(sourceFd, { bigint: true }));
+    activePath = identityFromStats(fs.statSync(activeBasePath, { bigint: true }));
+  } catch (error) {
+    throw new Error(PAGED_FILE_CHANGED_MESSAGE, { cause: error });
+  }
+  if (
+    !sameBaseGeneration(expectedBase, descriptor)
+    || !sameBaseGeneration(expectedBase, activePath)
+  ) {
+    throw new Error(PAGED_FILE_CHANGED_MESSAGE);
+  }
+  fs.renameSync(temporaryPath, target.replacementPath);
+}
+
+async function writeAll(
+  handle: NodeFileHandle,
+  data: Uint8Array,
+  position: number
+): Promise<void> {
+  let written = 0;
+  while (written < data.byteLength) {
+    const result = await handle.write(
+      data,
+      written,
+      data.byteLength - written,
+      position + written
+    );
+    if (result.bytesWritten <= 0) {
+      throw new Error('Temporary database write made no progress');
+    }
+    written += result.bytesWritten;
+  }
+}
+
+async function copyBaseGap(
+  source: NodeFileHandle,
+  temporary: NodeFileHandle,
+  buffer: Uint8Array,
+  start: number,
+  end: number,
+  baseLimit: number
+): Promise<void> {
+  const copyEnd = Math.min(end, baseLimit);
+  let position = start;
+  while (position < copyEnd) {
+    const requested = Math.min(buffer.byteLength, copyEnd - position);
+    let filled = 0;
+    while (filled < requested) {
+      const result = await source.read(
+        buffer,
+        filled,
+        requested - filled,
+        position + filled
+      );
+      if (result.bytesRead <= 0) {
+        throw new Error(
+          `Short read from frozen base below baseLimit at byte ${position + filled}`
+        );
+      }
+      filled += result.bytesRead;
+    }
+    await writeAll(temporary, buffer.subarray(0, requested), position);
+    position += requested;
+  }
+  // [copyEnd, end) is outside baseLimit. Leaving it unwritten creates a
+  // sparse zero-filled hole; the final truncate establishes trailing holes.
+}
+
+async function assembleSnapshot(
+  source: NodeFileHandle,
+  temporary: NodeFileHandle,
+  snapshot: PagedWritableOverlaySnapshot
+): Promise<void> {
+  const baseBuffer = new Uint8Array(BASE_COPY_BUFFER_BYTES);
+  let outputPosition = 0;
+  for (const run of snapshot.runs) {
+    const runStart = run.startChunkIndex * snapshot.chunkSize;
+    if (runStart >= snapshot.logicalSize) break;
+    await copyBaseGap(
+      source,
+      temporary,
+      baseBuffer,
+      outputPosition,
+      Math.min(runStart, snapshot.logicalSize),
+      snapshot.baseLimit
+    );
+    const runBytes = new Uint8Array(run.data);
+    const writtenLength = Math.min(runBytes.byteLength, snapshot.logicalSize - runStart);
+    await writeAll(temporary, runBytes.subarray(0, writtenLength), runStart);
+    outputPosition = runStart + writtenLength;
+  }
+  await copyBaseGap(
+    source,
+    temporary,
+    baseBuffer,
+    outputPosition,
+    snapshot.logicalSize,
+    snapshot.baseLimit
+  );
+  await temporary.truncate(snapshot.logicalSize);
+}
+
+function warnAfterSuccessfulRename(
+  logger: PagedSaveLogger | undefined,
+  message: string,
+  error: unknown
+): void {
+  try {
+    if (logger) logger('warn', message, error);
+    else console.warn(`[SQLite Explorer] ${message}`, error);
+  } catch {
+    // A logging sink must not turn an already-renamed save into a false failure.
+  }
+}
+
+/**
+ * Stream a worker-transferred dirty overlay over its frozen local base.
+ *
+ * The function never allocates a merged database image: overlay buffers are
+ * written directly and every base gap uses one 1 MiB reusable buffer.
+ */
+export async function writePagedWritableOverlayToFile(
+  fs: NodeFs,
+  basePath: string,
+  targetPath: string,
+  snapshot: PagedWritableOverlaySnapshot,
+  logger?: PagedSaveLogger
+): Promise<DatabaseWriteResult> {
+  validateSnapshot(snapshot);
+
+  let source: NodeFileHandle | undefined;
+  let temporary: NodeFileHandle | undefined;
+  let replacementDirectory: NodeFileHandle | undefined;
+  let replacementDirectoryOpenError: unknown;
+  let temporaryPath: string | undefined;
+  let completedTemporaryFingerprint: HostFileFingerprint | undefined;
+  let temporaryCreated = false;
+  let renamed = false;
+  try {
+    source = await fs.promises.open(basePath, 'r');
+    const activeBasePath = await fs.promises.realpath(basePath);
+    await assertBaseGeneration(fs, source, activeBasePath, snapshot.baseIdentity);
+
+    const target = await resolveReplacementTarget(
+      fs,
+      activeBasePath,
+      targetPath,
+      snapshot.baseIdentity
+    );
+    try {
+      // Open before assembly so the post-rename durability step needs no path
+      // lookup in the commit window. Some platforms cannot open directories;
+      // that becomes a post-rename durability warning, not a false save failure.
+      replacementDirectory = await fs.promises.open(
+        path.dirname(target.replacementPath),
+        'r'
+      );
+    } catch (error) {
+      replacementDirectoryOpenError = error;
+    }
+    temporaryPath = path.join(
+      path.dirname(target.replacementPath),
+      `.${path.basename(target.replacementPath)}.sqlite-explorer-${crypto.randomUUID()}.tmp`
+    );
+    temporary = await fs.promises.open(temporaryPath, 'wx', 0o600);
+    temporaryCreated = true;
+
+    await assembleSnapshot(source, temporary, snapshot);
+    await temporary.chmod(target.mode);
+    await temporary.sync();
+    completedTemporaryFingerprint = fingerprintFromStats(
+      fs.fstatSync(temporary.fd, { bigint: true })
+    );
+    await temporary.close();
+    temporary = undefined;
+
+    commitReplacementSync(
+      fs,
+      source.fd,
+      activeBasePath,
+      snapshot.baseIdentity,
+      temporaryPath,
+      completedTemporaryFingerprint,
+      target
+    );
+    renamed = true;
+
+    if (replacementDirectory) {
+      try {
+        await replacementDirectory.sync();
+      } catch (syncError) {
+        warnAfterSuccessfulRename(
+          logger,
+          'Paged save replaced the database, but parent-directory durability could not be confirmed:',
+          syncError
+        );
+      }
+      try {
+        await replacementDirectory.close();
+      } catch (closeError) {
+        warnAfterSuccessfulRename(
+          logger,
+          'Paged save replaced the database, but the parent-directory descriptor could not be closed:',
+          closeError
+        );
+      }
+      replacementDirectory = undefined;
+    } else if (replacementDirectoryOpenError !== undefined) {
+      warnAfterSuccessfulRename(
+        logger,
+        'Paged save replaced the database, but parent-directory durability is unsupported or unavailable:',
+        replacementDirectoryOpenError
+      );
+    }
+
+    try {
+      await source.close();
+    } catch (closeError) {
+      warnAfterSuccessfulRename(
+        logger,
+        'Paged save succeeded, but the frozen source descriptor could not be closed:',
+        closeError
+      );
+    }
+    source = undefined;
+    return { requiresReopen: target.requiresReopen };
+  } catch (error) {
+    const cleanupErrors: unknown[] = [];
+    if (replacementDirectory) {
+      try {
+        await replacementDirectory.close();
+      } catch (closeError) {
+        cleanupErrors.push(closeError);
+      }
+      replacementDirectory = undefined;
+    }
+    if (temporary) {
+      try {
+        await temporary.close();
+      } catch (closeError) {
+        cleanupErrors.push(closeError);
+      }
+      temporary = undefined;
+    }
+    if (source) {
+      try {
+        await source.close();
+      } catch (closeError) {
+        cleanupErrors.push(closeError);
+      }
+      source = undefined;
+    }
+    if (temporaryCreated && !renamed && temporaryPath) {
+      try {
+        await fs.promises.unlink(temporaryPath);
+      } catch (unlinkError) {
+        if (errorCode(unlinkError) !== 'ENOENT') cleanupErrors.push(unlinkError);
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupErrors],
+        `Failed to save paged database '${targetPath}', and cleanup also failed`
+      );
+    }
+    throw new Error(
+      `Failed to save paged database '${targetPath}': ${describeError(error)}`,
+      { cause: error }
+    );
+  }
+}

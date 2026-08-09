@@ -112,6 +112,14 @@ function getMaxUndoMemory(): number {
   return config.get<number>('maxUndoMemory', DEFAULT_MAX_UNDO_MEMORY);
 }
 
+/** Refuse materialization when a paged document cannot reach the local streaming writer. */
+function pagedNonFilePersistenceError(): Error {
+  return new Error(vsc.l10n.t(
+    'Page-on-demand databases cannot be saved to non-file providers because they do not offer ' +
+    'the required streaming path. Save locally, then copy the file.'
+  ));
+}
+
 /** Apply the document's SQL logging decorator consistently across reconnects. */
 function withSqlLogging(
   databaseOps: DatabaseOperations,
@@ -248,6 +256,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   readonly #hostBridge: HostBridge;
   readonly #forceReadOnlyOnReconnect: boolean;
   #connectionGeneration = 0;
+  #activeMutations = 0;
+  #pagedSaveExclusive = false;
+  readonly #mutationDrainWaiters = new Set<() => void>();
   #referenceCount = 1;
   #workerDisposeRequested = false;
 
@@ -277,6 +288,55 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   get documentKey() { return this.#documentKey; }
   /** Monotonic barrier for host operations that span a database reload. */
   get connectionGeneration() { return this.#connectionGeneration; }
+
+  /**
+   * Keep a complete host mutation (backend write plus history/event update)
+   * visible to paged save's exclusive barrier. The flag is only raised for a
+   * writable paged save, so other storage modes retain their existing behavior.
+   */
+  async runTrackedMutation<T>(operation: () => T | PromiseLike<T>): Promise<T> {
+    if (this.#pagedSaveExclusive) {
+      throw new Error(vsc.l10n.t(
+        'The document is temporarily read-only while its page-on-demand save is in progress.'
+      ));
+    }
+    this.#activeMutations++;
+    try {
+      return await operation();
+    } finally {
+      this.#activeMutations--;
+      if (this.#activeMutations === 0) {
+        for (const resolve of this.#mutationDrainWaiters) resolve();
+        this.#mutationDrainWaiters.clear();
+      }
+    }
+  }
+
+  /** Reject new mutations, then wait until prior writes have updated history. */
+  #beginPagedSaveExclusive(): Promise<void> {
+    if (this.#pagedSaveExclusive) {
+      throw new Error(vsc.l10n.t('A page-on-demand save is already in progress.'));
+    }
+    this.#pagedSaveExclusive = true;
+    this.#connectionGeneration++;
+    this.connectionState.isReadOnly = true;
+    return (async () => {
+      if (this.#activeMutations > 0) {
+        await new Promise<void>(resolve => this.#mutationDrainWaiters.add(resolve));
+      }
+      // A tracked mutation releases only after its history/event work, but this
+      // extra turn also drains promise continuations from backend calls that were
+      // already resolving as the exclusive flag was raised.
+      await Promise.resolve();
+      // The worker endpoint serializes writable-paged operations. Its ping is a
+      // real worker-side drain even if an earlier host RPC timed out first.
+      await this.databaseOperations.ping();
+    })();
+  }
+
+  #endPagedSaveExclusive(): void {
+    this.#pagedSaveExclusive = false;
+  }
 
   // ============================================================================
   // Event Emitters
@@ -346,7 +406,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
     this.#modificationEmitter.fire({
       label: modification.label,
-      undo: async () => {
+      undo: () => this.runTrackedMutation(async () => {
         const undoneEntry = tracker.stepBack();
         if (!undoneEntry) {
           if (tracker.isUndoBlockedByBarrier) {
@@ -376,8 +436,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             GlobalOutputChannel?.appendLine(`[Undo] Failed: ${errorMessage}`);
             vsc.window.showErrorMessage(vsc.l10n.t('Undo failed: {0}', errorMessage));
         }
-      },
-      redo: async () => {
+      }),
+      redo: () => this.runTrackedMutation(async () => {
         const redoneEntry = tracker.stepForward();
         if (!redoneEntry) {
             GlobalOutputChannel?.appendLine('[Redo] No entry found in tracker');
@@ -401,7 +461,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
              GlobalOutputChannel?.appendLine(`[Redo] Failed: ${errorMessage}`);
              vsc.window.showErrorMessage(vsc.l10n.t('Redo failed: {0}', errorMessage));
         }
-      }
+      })
     });
 
     this.#autoSaveIfNeeded();
@@ -435,7 +495,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * For native SQLite engine: changes are already persisted to disk via SQLite's
    * auto-commit, so we just need to create a checkpoint for undo/redo tracking.
    *
-   * For WASM engine: we need to serialize the in-memory database and write to disk.
+   * For WASM engine: memory-backed databases serialize to a full image, while
+   * writable paged databases use the local streaming writer.
    */
   async save(cancellation?: vsc.CancellationToken): Promise<void> {
     if (cancellation?.isCancellationRequested) {
@@ -465,27 +526,31 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       throw new vsc.CancellationError();
     }
 
+    const pagedSave = this.connectionState.storage === 'paged';
+    if (pagedSave && this.uri.scheme !== 'file') {
+      throw pagedNonFilePersistenceError();
+    }
+
     // Export in-memory database to file (WASM engine only)
     // We always do this for WASM, regardless of auto-commit setting, because WASM is in-memory.
     if (this.uri.scheme === 'file') {
-        const pagedSave = this.connectionState.storage === 'paged';
         const priorReadOnlyState = this.connectionState.isReadOnly;
         let baseReplaced = false;
+        let pagedExclusiveOwned = false;
         try {
+            if (pagedSave) {
+              const drain = this.#beginPagedSaveExclusive();
+              pagedExclusiveOwned = true;
+              await drain;
+            }
             // Capture the tracker position that matches the database snapshot
             // exported by writeToFile(). If undo, rollback, or history eviction
             // changes the retained timeline while the async filesystem write is
             // pending, the saved bytes no longer match the live tracker state.
+            // Paged saves take this position only after their mutation drain.
             const fileCheckpoint = this.#modificationTracker.getCurrentPosition();
             const fileCheckpointInvalidationRevision =
               this.#modificationTracker.getCheckpointInvalidationRevision();
-            if (pagedSave) {
-              // In-flight host mutations captured the prior generation and will
-              // fail their pre-write guard. New mutations see the temporary
-              // read-only state until the replacement connection is ready.
-              this.#connectionGeneration++;
-              this.connectionState.isReadOnly = true;
-            }
             await this.databaseOperations.writeToFile(this.uri.fsPath);
             baseReplaced = true;
             if (pagedSave) {
@@ -500,13 +565,20 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             ) {
               this.#modificationTracker.createCheckpointAt(fileCheckpoint);
             }
+            if (pagedExclusiveOwned) {
+              this.#endPagedSaveExclusive();
+              pagedExclusiveOwned = false;
+            }
             return;
         } catch (e) {
             if (pagedSave) {
               if (!baseReplaced) {
                 // Export/temporary-write failure leaves the original overlay and
                 // base intact, so the user can finish the edit and retry.
-                this.connectionState.isReadOnly = priorReadOnlyState;
+                if (pagedExclusiveOwned) {
+                  this.#endPagedSaveExclusive();
+                  this.connectionState.isReadOnly = priorReadOnlyState;
+                }
                 throw e;
               }
               // Rename completed but the replacement connection failed. The
@@ -524,6 +596,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         }
     }
 
+    // Paged documents were refused above unless the local streaming writer
+    // handled them. Whole-image materialization remains only for memory-backed
+    // WASM saves (including memory-backed non-file providers).
     const { filename } = this.fileParts;
     const binaryContent = await this.databaseOperations.serializeDatabase();
     // Capture the tracker position immediately after serialization. The bytes
@@ -562,18 +637,23 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   async saveAs(targetUri: vsc.Uri, cancellation: vsc.CancellationToken): Promise<void> {
     await this.ensureWritable();
 
+    const pagedSaveAs = this.connectionState.storage === 'paged';
+    if (pagedSaveAs && targetUri.scheme !== 'file') {
+      throw pagedNonFilePersistenceError();
+    }
+
     if (targetUri.scheme === 'file') {
-        const pagedSaveAs = this.connectionState.storage === 'paged';
         const priorReadOnlyState = this.connectionState.isReadOnly;
         let baseReplaced = false;
-        if (pagedSaveAs) {
-          // Freeze the overlay for the whole export/write window. This is also
-          // required when an alias or hard link makes a Save As target resolve
-          // to the active base and the writer reports that a reopen is needed.
-          this.#connectionGeneration++;
-          this.connectionState.isReadOnly = true;
-        }
+        let pagedExclusiveOwned = false;
         try {
+            if (pagedSaveAs) {
+              // Freeze and drain for the whole export/write window. This is
+              // also required when an alias makes Save As replace the base.
+              const drain = this.#beginPagedSaveExclusive();
+              pagedExclusiveOwned = true;
+              await drain;
+            }
             // Use optimized write/vacuum if available
             const result = await this.databaseOperations.writeToFile(targetUri.fsPath);
             baseReplaced = result?.requiresReopen === true;
@@ -582,13 +662,20 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             } else if (pagedSaveAs) {
               this.connectionState.isReadOnly = priorReadOnlyState;
             }
+            if (pagedExclusiveOwned) {
+              this.#endPagedSaveExclusive();
+              pagedExclusiveOwned = false;
+            }
             return;
         } catch (e) {
              if (pagedSaveAs) {
                if (!baseReplaced) {
                  // No rename of the active base occurred, so the original
                  // overlay remains valid and can be edited/retried.
-                 this.connectionState.isReadOnly = priorReadOnlyState;
+                 if (pagedExclusiveOwned) {
+                   this.#endPagedSaveExclusive();
+                   this.connectionState.isReadOnly = priorReadOnlyState;
+                 }
                  throw e;
                }
                this.connectionState.isReadOnly = true;
@@ -602,6 +689,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         }
     }
 
+    // The paged case cannot reach this full-image fallback. Memory-backed WASM
+    // Save As retains the existing materialization behavior for file and
+    // non-file targets.
     const fileStat = await vsc.workspace.fs.stat(this.uri);
     if (fileStat.size > this.getFileSizeLimit()) {
       throw new Error(vsc.l10n.t('Database too large for copy operation'));
@@ -616,6 +706,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * Revert to last saved state.
    */
   async revert(cancellation: vsc.CancellationToken): Promise<void> {
+    return this.runTrackedMutation(() => this.#revert(cancellation));
+  }
+
+  async #revert(cancellation: vsc.CancellationToken): Promise<void> {
     await this.ensureWritable();
     if (this.#modificationTracker.hasUncommittedHistoryBarrier) {
       const message = vsc.l10n.t(
@@ -627,6 +721,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     }
     let invalidatedByRecoveryReload = false;
     try {
+      // Revert mutates the live engine by replaying retained history; it never
+      // serializes a whole database image, including for paged documents.
       await revertDatabaseToSaved(
         this.databaseOperations,
         this.#modificationTracker,
@@ -743,6 +839,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * Reload database from disk.
    */
   async reloadFromDisk(): Promise<DatabaseOperations> {
+    return this.runTrackedMutation(() => this.#reloadFromDisk());
+  }
+
+  async #reloadFromDisk(): Promise<DatabaseOperations> {
     // Advance before the first await. Host mutations that already captured this
     // document must not finish a preliminary read and then dispatch their write
     // into the replacement worker endpoint.
@@ -791,6 +891,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     destination: vsc.Uri,
     _cancellation: vsc.CancellationToken
   ): Promise<vsc.CustomDocumentBackup> {
+    // Hot-exit persists only ModificationTracker history. It never copies the
+    // database image, so a multi-gigabyte paged base is not materialized here.
     const serializedState = this.#modificationTracker.serialize();
     await vsc.workspace.fs.writeFile(destination, serializedState);
 

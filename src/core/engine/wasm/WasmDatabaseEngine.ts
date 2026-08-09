@@ -117,6 +117,13 @@ import {
   OversizedCellReplacementRequiredError
 } from '../../cell-edit-policy';
 import { executeSchemaPreservingColumnDrop } from '../../column-drop';
+import {
+  normalizePagedWritableOverlay,
+  shouldWarnForPagedOverlayCopy,
+  type PagedFileIdentity,
+  type PagedWritableOverlaySnapshot,
+  type RawPagedWritableOverlay
+} from '../../paged-writable-overlay';
 
 // ============================================================================
 // Internal sql.js Types
@@ -151,6 +158,7 @@ export interface WasmDatabaseInstance {
   progress_handler(nOps?: number | null, callback?: (() => unknown) | null): void;
   interrupt(): void;
   export(): Uint8Array;
+  exportPagedWritableOverlay?: () => RawPagedWritableOverlay;
   close(): void;
 }
 
@@ -219,8 +227,6 @@ function wasmBindPlaceholder(value: CellValue): string {
  * Default query timeout in milliseconds (30 seconds).
  */
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
-/** Log the full-image export cost for bases at least 1 GiB. */
-const PAGED_EXPORT_MEMORY_WARNING_BYTES = 1024 * 1024 * 1024;
 const PROGRESS_HANDLER_INTERVAL = 1000;
 
 interface WasmCellReadSessionState {
@@ -249,12 +255,12 @@ export interface WasmEnginePagedState {
   fileSizeBytes: number;
   /** Resolved exact-count gate (resolvePagedExactCountMaxFileBytes). */
   exactCountMaxFileBytes: number;
+  /** Identity of the frozen base originally opened by the worker. */
+  baseIdentity: PagedFileIdentity;
   /** Persistent host-read failure, used to replace SQLite's generic I/O error. */
   getReadError?: () => Error | undefined;
   /** Revalidate the frozen base even when every export read hits the host cache. */
   assertBaseUnchanged?: () => void;
-  /** Desktop-only merged-image persistence, including in-place atomic replace. */
-  writeDatabaseImage?: (path: string, data: Uint8Array) => DatabaseWriteResult;
   /** Release host read resources; called once from shutdown(). */
   dispose?: () => void;
 }
@@ -273,7 +279,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private instanceClosed = false;
   /** Set only for page-on-demand opens; undefined for buffer opens. */
   private readonly pagedState: WasmEnginePagedState | undefined;
-  private pagedExportMemoryWarningEmitted = false;
+  private pagedOverlayMemoryWarningEmitted = false;
   readonly engineKind = Promise.resolve('wasm' as const);
 
   constructor(
@@ -779,6 +785,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
   /**
    * Serialize the database to binary format.
+   * This implements a caller-selected whole-image export; save policy remains
+   * with DatabaseDocument and explicit export policy with HostBridge.
    *
    * @param _name - Identifier (unused, for interface compatibility)
    * @returns Database binary content
@@ -790,19 +798,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /** Export a buffer/paged-writable database and normalize the fork's save gate. */
   private exportDatabaseImage(): Uint8Array {
     this.assertSerializable();
-    if (
-      this.pagedState?.writable
-      && this.pagedState.fileSizeBytes >= PAGED_EXPORT_MEMORY_WARNING_BYTES
-      && !this.pagedExportMemoryWarningEmitted
-    ) {
-      this.pagedExportMemoryWarningEmitted = true;
-      this.logger(
-        'warn',
-        'Saving a writable page-on-demand database materializes the complete merged image '
-        + `(${this.pagedState.fileSizeBytes} base bytes plus overlay changes) in host memory. `
-        + 'Overlay memory grows with changed pages; merged export memory grows with the full database.'
-      );
-    }
     this.pagedState?.assertBaseUnchanged?.();
     try {
       const data = this.instance.export();
@@ -820,6 +815,55 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
       throw error;
     }
+  }
+
+  /** Extract and validate the dirty copy-on-write state without reading the base. */
+  exportPagedWritableOverlay(): PagedWritableOverlaySnapshot {
+    const pagedState = this.pagedState;
+    if (!pagedState?.writable) {
+      throw new Error(
+        'Paged overlay export is available only for writable page-on-demand databases.'
+      );
+    }
+    const exportOverlay = this.instance.exportPagedWritableOverlay;
+    if (!exportOverlay) {
+      throw new Error(
+        'Writable sql.js fork does not expose exportPagedWritableOverlay.'
+      );
+    }
+
+    pagedState.assertBaseUnchanged?.();
+    let rawOverlay: RawPagedWritableOverlay;
+    try {
+      rawOverlay = exportOverlay.call(this.instance);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/transaction is open/i.test(message)) {
+        throw new Error(
+          'Cannot save while a database transaction is open; retry after the edit completes.',
+          { cause: error }
+        );
+      }
+      throw error;
+    }
+    // Validate the frozen base before any normalization allocation or transfer.
+    pagedState.assertBaseUnchanged?.();
+
+    const snapshot = normalizePagedWritableOverlay(rawOverlay, pagedState.baseIdentity);
+    if (
+      shouldWarnForPagedOverlayCopy(
+        snapshot.dirtyBytes,
+        this.pagedOverlayMemoryWarningEmitted
+      )
+    ) {
+      this.pagedOverlayMemoryWarningEmitted = true;
+      this.logger(
+        'warn',
+        'Saving a writable page-on-demand database copied '
+        + `${snapshot.dirtyBytes} dirty overlay bytes in worker memory.`
+      );
+    }
+    return snapshot;
   }
 
   /**
@@ -3003,11 +3047,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * Write database directly to file system.
    */
   async writeToFile(path: string): Promise<DatabaseWriteResult | void> {
-    const data = this.exportDatabaseImage();
-
-    if (this.pagedState?.writeDatabaseImage) {
-      return this.pagedState.writeDatabaseImage(path, data);
+    if (this.pagedState?.writable) {
+      throw new Error(
+        'Internal error: writable page-on-demand databases must be saved by the desktop host stream writer.'
+      );
     }
+    const data = this.exportDatabaseImage();
 
     const fs = getNodeFs();
     if (fs) {

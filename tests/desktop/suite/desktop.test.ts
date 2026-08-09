@@ -415,13 +415,20 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
           await disposeDirect(handle);
         });
       } else {
-        test('[row 3][WASM paged-only] save uses adjacent-temp atomic rename and reopens final bytes', async () => {
+        test('[row 3][WASM paged-only] worker-to-host streaming save atomically renames and reconnects', async () => {
           await setMaxFileSize(PAGED_TEST_LIMIT_MIB);
           const fixture = createFixture('save-wasm-paged', { large: true });
+          assert.ok(
+            fixture.originalBytes.length < 2 ** 20,
+            'the forced-paged streaming fixture must remain below 1 MiB'
+          );
           const { handle, state } = await openDirect(fixture);
           assert.equal(state.storage, 'paged');
           assert.equal(state.readOnly, false);
 
+          // The low limit forces edits into the worker's paged overlay. Saving
+          // must stream its runs to the host-side adjacent-temp writer, rename
+          // atomically, and reconnect the document to the replacement inode.
           const originalStat = fs.statSync(fixture.filePath, { bigint: true });
           const frozenDescriptor = fs.openSync(fixture.filePath, 'r');
           try {
@@ -429,9 +436,49 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
             assert.deepEqual(fs.readFileSync(fixture.filePath), fixture.originalBytes);
             await api.save(handle);
 
-            const finalBytes = fs.readFileSync(fixture.filePath);
-            assert.notDeepEqual(finalBytes, fixture.originalBytes);
+            const firstFinalBytes = fs.readFileSync(fixture.filePath);
+            assert.notDeepEqual(firstFinalBytes, fixture.originalBytes);
             assert.deepEqual(queryFile(fixture.filePath, 'SELECT value FROM items'), [['wasm-paged-saved']]);
+            assertSingleValue(
+              await api.query(handle, 'SELECT value FROM items WHERE id = 1'),
+              'wasm-paged-saved'
+            );
+            const firstReplacementStat = fs.statSync(fixture.filePath, { bigint: true });
+            assert.notEqual(
+              `${originalStat.dev}:${originalStat.ino}`,
+              `${firstReplacementStat.dev}:${firstReplacementStat.ino}`,
+              'the first save must atomically replace the original file'
+            );
+
+            await api.updateCell(handle, 'items', 1, 'value', 'wasm-paged-saved-again');
+            assert.deepEqual(
+              queryFile(fixture.filePath, 'SELECT value FROM items'),
+              [['wasm-paged-saved']],
+              'the second edit must remain in the reconnected worker overlay until save'
+            );
+            assertSingleValue(
+              await api.query(handle, 'SELECT value FROM items WHERE id = 1'),
+              'wasm-paged-saved-again'
+            );
+            assert.equal((await api.inspectDocument(fixture.uri.toString()))?.dirty, true);
+
+            // If the first save did not reconnect, this second host save sees
+            // the first replacement as a foreign base generation and fails.
+            await api.save(handle);
+            assert.deepEqual(
+              queryFile(fixture.filePath, 'SELECT value FROM items'),
+              [['wasm-paged-saved-again']]
+            );
+            assertSingleValue(
+              await api.query(handle, 'SELECT value FROM items WHERE id = 1'),
+              'wasm-paged-saved-again'
+            );
+            const secondReplacementStat = fs.statSync(fixture.filePath, { bigint: true });
+            assert.notEqual(
+              `${firstReplacementStat.dev}:${firstReplacementStat.ino}`,
+              `${secondReplacementStat.dev}:${secondReplacementStat.ino}`,
+              'the second save must atomically replace the first saved file'
+            );
 
             // An in-place overwrite would change reads through this already-open
             // descriptor. Atomic rename leaves it on the byte-identical old inode.
@@ -440,12 +487,6 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
             assert.equal(bytesRead, fixture.originalBytes.length);
             assert.deepEqual(frozenBytes, fixture.originalBytes);
 
-            const finalStat = fs.statSync(fixture.filePath, { bigint: true });
-            assert.notEqual(
-              `${originalStat.dev}:${originalStat.ino}`,
-              `${finalStat.dev}:${finalStat.ino}`,
-              'the final path must identify the atomically replaced file'
-            );
             assert.equal(
               fs.readdirSync(fixtureRoot).some(name => name.includes('.sqlite-explorer-') && name.endsWith('.tmp')),
               false,

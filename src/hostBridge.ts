@@ -140,6 +140,24 @@ interface ToastService {
   showErrorToast<T extends string | DialogButton>(message: string, options?: DialogConfig, ...items: T[]): Promise<T | undefined>;
 }
 
+/** Methods whose complete host-side lifecycle must precede a paged snapshot. */
+const TRACKED_MUTATION_METHODS = [
+  'updateCell',
+  'insertRow',
+  'deleteRows',
+  'deleteColumns',
+  'createTable',
+  'createView',
+  'editView',
+  'dropView',
+  'updateCellBatch',
+  'addColumn',
+  'setPragma',
+  'fireEditEvent',
+  'triggerUndo',
+  'triggerRedo'
+] as const;
+
 /**
  * Bridge between VS Code host and webview.
  *
@@ -156,7 +174,24 @@ export class HostBridge implements ToastService {
   constructor(
     private readonly viewerProvider: DatabaseEditorProvider | DatabaseViewerProvider,
     private readonly document: DatabaseDocument,
-  ) { }
+  ) {
+    // Track the whole bridge call rather than only its worker Promise: history
+    // and content-change events are part of the snapshot's logical state.
+    // Lightweight document doubles used by focused HostBridge tests predate
+    // this lifecycle API and intentionally keep their direct method behavior.
+    if (typeof this.document.runTrackedMutation !== 'function') return;
+    const methods = this as unknown as Record<string, (...args: unknown[]) => unknown>;
+    for (const methodName of TRACKED_MUTATION_METHODS) {
+      const implementation = methods[methodName].bind(this);
+      Object.defineProperty(this, methodName, {
+        configurable: false,
+        enumerable: false,
+        value: (...args: unknown[]) => this.document.runTrackedMutation(
+          () => implementation(...args)
+        )
+      });
+    }
+  }
 
   // Getters for provider properties
   private get webviews() { return this.viewerProvider.webviews; }
@@ -253,9 +288,11 @@ export class HostBridge implements ToastService {
 
   /**
    * Export the database as a Uint8Array.
-   * Exposed directly to avoid nested proxy issues. Writable paged engines
-   * return their merged base-plus-overlay image; read-only paged engines keep
-   * the engine's explicit unsupported-export error.
+   * This is an explicit user-requested whole-image export, not an automatic
+   * document save, so it intentionally remains materializing. Exposed directly
+   * to avoid nested proxy issues. Writable paged engines return their merged
+   * base-plus-overlay image; read-only paged engines keep the engine's explicit
+   * unsupported-export error.
    *
    * @param filename - The filename for the export
    * @returns The database as a Uint8Array

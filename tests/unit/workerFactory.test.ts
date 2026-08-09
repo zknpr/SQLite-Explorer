@@ -12,6 +12,7 @@ let workerTerminated = false;
 let exposedWorkerMethods: string[] = [];
 let workerProxy: Record<string, (...args: any[]) => any> = {};
 let workerTimeoutPolicy: ((methodName: string, parameters: readonly unknown[]) => number) | undefined;
+let pagedHostSaveCalls: unknown[][] = [];
 
 const Module = require('module');
 
@@ -81,6 +82,14 @@ Module.prototype.require = function(id: string) {
         // throw from the facade method it wraps.
         return { serializeOperations: (operations: unknown) => operations };
     }
+    if (id.endsWith('pagedWritableSave')) {
+        return {
+          writePagedWritableOverlayToFile: async (...args: unknown[]) => {
+            pagedHostSaveCalls.push(args);
+            return { requiresReopen: true };
+          }
+        };
+    }
     if (id.endsWith('main')) {
         return { GlobalOutputChannel: null };
     }
@@ -102,6 +111,7 @@ describe('workerFactory error path tests', () => {
     workerTerminated = false;
     exposedWorkerMethods = [];
     workerTimeoutPolicy = undefined;
+    pagedHostSaveCalls = [];
     workerProxy = {
       initializeDatabase: async () => {
         if (connectionFailed) throw new Error('Connection failed');
@@ -161,6 +171,75 @@ describe('workerFactory error path tests', () => {
       assert.strictEqual(err.message, 'Connection failed');
       assert.strictEqual(workerTerminated, true, 'terminateWorker should be called to prevent memory leaks');
     }
+  });
+
+  it('routes writable paged saves through the host streamer without a worker full-image path', async () => {
+    let directWorkerWriteCalls = 0;
+    let fullExportCalls = 0;
+    const runData = new Uint8Array([9, 8, 7, 6]).buffer;
+    const snapshot = {
+      chunkSize: 4,
+      logicalSize: 4,
+      baseLimit: 4,
+      dirtyBytes: 4,
+      baseIdentity: { dev: 1n, ino: 2n, size: 4n, mtimeNs: 3n, mode: 0o600n },
+      runs: [{ startChunkIndex: 0, data: runData }]
+    };
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false, storage: 'paged' }),
+      exportPagedWritableOverlay: async () => snapshot,
+      writeToFile: async () => {
+        directWorkerWriteCalls++;
+        return { requiresReopen: false };
+      },
+      exportDatabase: async () => {
+        fullExportCalls++;
+        return new Uint8Array([1, 2, 3, 4]);
+      }
+    };
+
+    const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
+    const fileUri = testDbUri();
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
+
+    const result = await databaseOps.writeToFile('/test/save-as.sqlite');
+
+    assert.deepStrictEqual(result, { requiresReopen: true });
+    assert.strictEqual(directWorkerWriteCalls, 0);
+    assert.strictEqual(fullExportCalls, 0);
+    assert.strictEqual(pagedHostSaveCalls.length, 1);
+    assert.strictEqual(pagedHostSaveCalls[0][1], '/test/db.sqlite');
+    assert.strictEqual(pagedHostSaveCalls[0][2], '/test/save-as.sqlite');
+    assert.strictEqual(pagedHostSaveCalls[0][3], snapshot, 'transferred buffers must be consumed directly');
+  });
+
+  it('keeps memory-backed saves on the worker writeToFile path', async () => {
+    let directWorkerWriteCalls = 0;
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false, storage: 'memory' }),
+      writeToFile: async (targetPath: string) => {
+        directWorkerWriteCalls++;
+        assert.strictEqual(targetPath, '/test/memory-save.sqlite');
+        return { requiresReopen: false };
+      },
+      exportPagedWritableOverlay: async () => {
+        throw new Error('memory save must not request a paged overlay');
+      }
+    };
+
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+    const { databaseOps } = await bundle.establishConnection(testDbUri(), 'test.sqlite');
+
+    assert.deepStrictEqual(
+      await databaseOps.writeToFile('/test/memory-save.sqlite'),
+      { requiresReopen: false }
+    );
+    assert.strictEqual(directWorkerWriteCalls, 1);
+    assert.deepStrictEqual(pagedHostSaveCalls, []);
   });
 
   it('routes view history through the desktop worker-backed WASM facade', async () => {
@@ -314,6 +393,7 @@ describe('workerFactory error path tests', () => {
     assert.strictEqual(flushRpcArgumentCounts.at(-1), 0);
 
     for (const method of [
+      'exportPagedWritableOverlay',
       'applyModifications',
       'undoModification',
       'redoModification',

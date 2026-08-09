@@ -309,6 +309,11 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             throw vsc.FileSystemError.NoPermissions('Database is read-only');
         }
 
+        const runTrackedMutation = typeof document.runTrackedMutation === 'function'
+            ? document.runTrackedMutation.bind(document)
+            : async <T>(operation: () => T | PromiseLike<T>) => operation();
+        return runTrackedMutation(async () => {
+
         if (rowId === '__view__.sql') {
             const metadata = this.getViewDocumentMetadata(document, uri, table);
             const connectionGeneration = document.connectionGeneration;
@@ -557,6 +562,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error writing cell: ${err instanceof Error ? err.message : String(err)}`);
             throw vsc.FileSystemError.Unavailable(err instanceof Error ? err.message : String(err));
         }
+        });
     }
 
     async delete(uri: vsc.Uri, options: { recursive: boolean }): Promise<void> {

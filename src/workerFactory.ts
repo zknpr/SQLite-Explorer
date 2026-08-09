@@ -48,13 +48,16 @@ import type {
   OversizedCellMetadata,
   DatabaseWriteResult
 } from './core/types';
+import type { PagedWritableOverlaySnapshot } from './core/paged-writable-overlay';
 
 import { Worker } from './platform/threadPool';
 import type { DatabaseConnectionBundle } from './connectionTypes';
 import { getMaximumFileSizeBytes, getQueryTimeout } from './config';
 import { createWorkerEndpoint } from './core/sqlite-db';
+import { getNodeFs } from './core/platform/fs';
 import { WAL_HEADER_SIZE_BYTES } from './core/paged-open';
 import { createSharedCancellationFlag } from './core/cancellation-utils';
+import { writePagedWritableOverlayToFile } from './pagedWritableSave';
 
 // Native worker support (only in Node.js environment)
 let nativeSupport: {
@@ -114,6 +117,7 @@ interface WorkerMethods {
   ): Promise<CellReadChunk>;
   closeCellReadSession(sessionId: string): Promise<void>;
   exportDatabase(): Promise<Uint8Array>;
+  exportPagedWritableOverlay(): Promise<PagedWritableOverlaySnapshot>;
   applyModifications(mods: ModificationEntry[]): Promise<void>;
   undoModification(mod: ModificationEntry): Promise<void>;
   redoModification(mod: ModificationEntry): Promise<void>;
@@ -199,6 +203,7 @@ const WORKER_METHOD_NAMES = [
   'readCellChunk',
   'closeCellReadSession',
   'exportDatabase',
+  'exportPagedWritableOverlay',
   'applyModifications',
   'undoModification',
   'redoModification',
@@ -517,6 +522,7 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.readCellChunk(sessionId, byteOffset, maxBytes),
         closeCellReadSession: (sessionId: string) =>
           endpoint.closeCellReadSession(sessionId),
+        // In-process facade plumbing; persistence policy belongs to the caller.
         serializeDatabase: () => endpoint.exportDatabase(),
         applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
           endpoint.applyModifications(mods, signal),
@@ -842,6 +848,30 @@ async function createWorkerBackedWasmDatabaseConnection(
           return call();
         };
 
+        const writeToFile = result.storage === 'paged' && result.isReadOnly !== true
+          ? async (targetPath: string): Promise<DatabaseWriteResult> => {
+              if (!filePath) {
+                throw new Error(
+                  'Internal error: writable paged save has no local frozen base path.'
+                );
+              }
+              const fs = getNodeFs();
+              if (!fs) {
+                throw new Error(
+                  'Internal error: writable paged save requires desktop filesystem access.'
+                );
+              }
+              const snapshot = await workerProxy.exportPagedWritableOverlay();
+              return writePagedWritableOverlayToFile(
+                fs,
+                filePath,
+                targetPath,
+                snapshot,
+                (level, message, error) => forwardWorkerLog(level, [message, error])
+              );
+            }
+          : (targetPath: string) => workerProxy.writeToFile(targetPath);
+
         const operationsFacade: DatabaseOperations = {
           engineKind: Promise.resolve('wasm'),
           executeQuery: (sql: string, params?: CellValue[], signal?: AbortSignal) => (
@@ -860,6 +890,7 @@ async function createWorkerBackedWasmDatabaseConnection(
             workerProxy.readCellChunk(sessionId, byteOffset, maxBytes),
           closeCellReadSession: (sessionId: string) =>
             workerProxy.closeCellReadSession(sessionId),
+          // Worker facade plumbing; persistence policy belongs to the caller.
           serializeDatabase: () => workerProxy.exportDatabase(),
           applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
             callWorkerAfterAbortCheck(signal, () => workerProxy.applyModifications(mods)),
@@ -1003,8 +1034,7 @@ async function createWorkerBackedWasmDatabaseConnection(
             workerProxy.setPragma(pragma, value),
           ping: () =>
             workerProxy.ping(),
-          writeToFile: (path: string) =>
-            workerProxy.writeToFile(path)
+          writeToFile
         };
 
         return {

@@ -44,7 +44,11 @@ import {
 } from './engine/wasm/WasmDatabaseEngine';
 import { createChunkedReadCache } from './chunked-read-cache';
 import { resolvePagedExactCountMaxFileBytes } from './paged-count';
-import { crypto } from '../platform/cryptoShim';
+import { Transfer } from './rpc';
+import type {
+  PagedFileIdentity,
+  PagedWritableOverlaySnapshot
+} from './paged-writable-overlay';
 import {
   isWalMarkedHeader,
   patchWalHeaderToRollback,
@@ -240,14 +244,6 @@ export async function createEngineFromModule(
 }
 
 type NodeFsModule = NonNullable<ReturnType<typeof getNodeFs>>;
-
-interface PagedFileIdentity {
-  dev: bigint;
-  ino: bigint;
-  size: bigint;
-  mtimeNs: bigint;
-  mode: bigint;
-}
 
 const PAGED_FILE_CHANGED_MESSAGE =
   'Database file changed on disk; reload the document.';
@@ -467,103 +463,9 @@ function openPagedDatabaseEngine(
           exactCountMaxFileBytes: resolvePagedExactCountMaxFileBytes(
             config.pagedExactCountMaxFileBytes
           ),
+          baseIdentity: openedIdentity,
           getReadError: () => pagedReadError,
           assertBaseUnchanged: assertFileGeneration,
-          ...(writable ? {
-            writeDatabaseImage: (targetPath: string, data: Uint8Array) => {
-              let canonicalTargetPath: string | undefined;
-              try {
-                canonicalTargetPath = fs.realpathSync(targetPath);
-              } catch {
-                // A new Save As target has no canonical path yet.
-              }
-              const targetNamesActiveBase = targetPath === filePath
-                || targetPath === canonicalBasePath
-                || canonicalTargetPath === canonicalBasePath;
-              const targetSharesBaseInode = (() => {
-                try {
-                  const target = fs.statSync(targetPath, { bigint: true });
-                  return target.dev === openedIdentity.dev && target.ino === openedIdentity.ino;
-                } catch {
-                  return false;
-                }
-              })();
-
-              if (!targetNamesActiveBase && !targetSharesBaseInode) {
-                fs.writeFileSync(targetPath, data);
-                return { requiresReopen: false };
-              }
-
-              // Never write through any pathname that resolves to the frozen
-              // base inode: a distinct hard link would mutate the bytes still
-              // served by hostIo just as surely as the document path would.
-              // Replace the selected link atomically, but reopen only when the
-              // selected pathname is the active document base.
-              const replacementPath = targetNamesActiveBase
-                ? canonicalBasePath
-                : canonicalTargetPath ?? targetPath;
-              const requiresReopen = targetNamesActiveBase;
-
-              // The temp lives beside its replacement target, so rename is a
-              // same-filesystem atomic replacement. Keep it private while the
-              // full merged image is being written, then restore base mode.
-              const temporaryPath = `${replacementPath}.sqlite-explorer-`
-                + `${crypto.randomUUID()}.tmp`;
-              let temporaryFd: number | undefined;
-              let renamed = false;
-              try {
-                assertFileGeneration();
-                temporaryFd = fs.openSync(temporaryPath, 'wx', 0o600);
-                let written = 0;
-                while (written < data.byteLength) {
-                  const count = fs.writeSync(
-                    temporaryFd,
-                    data,
-                    written,
-                    data.byteLength - written,
-                    written
-                  );
-                  if (count <= 0) {
-                    throw new Error('temporary database write made no progress');
-                  }
-                  written += count;
-                }
-                fs.fchmodSync(temporaryFd, Number(openedIdentity.mode & 0o777n));
-                fs.fsyncSync(temporaryFd);
-                fs.closeSync(temporaryFd);
-                temporaryFd = undefined;
-                // Refuse to overwrite an externally changed base, including
-                // when export was served entirely from cached host chunks.
-                assertFileGeneration();
-                fs.renameSync(temporaryPath, replacementPath);
-                renamed = true;
-                return { requiresReopen };
-              } catch (error) {
-                if (temporaryFd !== undefined) {
-                  try {
-                    fs.closeSync(temporaryFd);
-                  } catch (closeError) {
-                    logger?.('warn', 'Failed to close paged save temp file:', closeError);
-                  }
-                }
-                if (!renamed) {
-                  try {
-                    fs.unlinkSync(temporaryPath);
-                  } catch (cleanupError) {
-                    const code = (cleanupError as { code?: string }).code;
-                    if (code !== 'ENOENT') {
-                      logger?.('warn', 'Failed to remove paged save temp file:', cleanupError);
-                    }
-                  }
-                }
-                throw new Error(
-                  `Failed to atomically save paged database '${targetPath}': `
-                  + (error instanceof Error ? error.message : String(error)),
-                  { cause: error }
-                );
-              }
-            }
-          } : {}),
           dispose: () => closeFd('shutdown')
         }
       );
@@ -594,10 +496,28 @@ function openPagedDatabaseEngine(
  */
 export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
   let activeEngine: WasmDatabaseEngine | null = null;
+  let writablePagedOperations = false;
+  let operationTail: Promise<void> = Promise.resolve();
   // Each caller receives its own result, but engine replacement itself is
   // ordered. Without this tail, concurrent RPCs all observe activeEngine=null
   // before their first await and every superseded paged engine leaks its fd.
   let initializationTail: Promise<void> = Promise.resolve();
+
+  const runWritablePagedOperation = async <T>(
+    operation: () => T | PromiseLike<T>
+  ): Promise<T> => {
+    const previous = operationTail;
+    let release!: () => void;
+    operationTail = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  };
 
   function requireEngine(): WasmDatabaseEngine {
     if (!activeEngine) throw new Error('No database initialized');
@@ -618,8 +538,15 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
         activeEngine = null;
       }
 
-      const result = await createDatabaseEngine(config, logger);
+      let result: Awaited<ReturnType<typeof createDatabaseEngine>>;
+      try {
+        result = await createDatabaseEngine(config, logger);
+      } catch (error) {
+        writablePagedOperations = false;
+        throw error;
+      }
       activeEngine = result.operations as WasmDatabaseEngine;
+      writablePagedOperations = result.storage === 'paged' && !result.isReadOnly;
 
       // Return value is primarily used for the isReadOnly/storage flags.
       // The actual database operations are accessed via the worker endpoint methods below.
@@ -633,7 +560,7 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
     return queued;
   }
 
-  return {
+  const endpoint = {
     /**
      * Initialize a database from binary content. Overlapping calls are
      * serialized so every superseded engine is shut down before replacement.
@@ -681,12 +608,19 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
 
     /**
      * Export the active database to binary.
+     * RPC endpoint plumbing only: the caller decides whether whole-image
+     * materialization is appropriate for its persistence/export surface.
      *
      * @param name - Database name
      * @returns Binary content
      */
     async exportDatabase(): Promise<Uint8Array> {
       return requireEngine().serializeDatabase();
+    },
+
+    async exportPagedWritableOverlay(): Promise<Transfer<PagedWritableOverlaySnapshot>> {
+      const snapshot = requireEngine().exportPagedWritableOverlay();
+      return new Transfer(snapshot, snapshot.runs.map(run => run.data));
     },
 
     // Expose undo/history operations for the browser in-process facade, which
@@ -891,10 +825,31 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
      * Node worker path tears down the whole worker thread instead.
      */
     dispose(): void {
+      writablePagedOperations = false;
       if (activeEngine) {
         activeEngine.shutdown();
         activeEngine = null;
       }
     }
   };
+
+  const wrappedMethods = new Map<PropertyKey, unknown>();
+  return new Proxy(endpoint, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === 'dispose' || typeof value !== 'function') return value;
+      if (!wrappedMethods.has(property)) {
+        wrappedMethods.set(property, (...args: unknown[]) => {
+          const invoke = () => value.apply(target, args);
+          // Browser/in-memory behavior remains unchanged. Only a writable
+          // page-on-demand engine needs the worker-side FIFO: it makes ping and
+          // overlay extraction true barriers even after a host RPC timeout.
+          return writablePagedOperations
+            ? runWritablePagedOperation(invoke)
+            : invoke();
+        });
+      }
+      return wrappedMethods.get(property);
+    }
+  });
 }
