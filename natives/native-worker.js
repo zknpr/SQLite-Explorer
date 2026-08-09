@@ -683,7 +683,9 @@ function buildCellLocator(locator) {
     !Array.isArray(locator.columns) ||
     locator.columns.length === 0 ||
     !Array.isArray(locator.values) ||
-    locator.values.length !== locator.columns.length
+    locator.values.length !== locator.columns.length ||
+    !Array.isArray(locator.integerCasts) ||
+    locator.integerCasts.length !== locator.columns.length
   ) {
     throw new Error('Cell read primary-key locator is invalid');
   }
@@ -697,8 +699,13 @@ function buildCellLocator(locator) {
   if (locator.values.some(value => !isCellBinding(value))) {
     throw new Error('Cell read primary-key locator contains an invalid value');
   }
+  if (locator.integerCasts.some(value => typeof value !== 'boolean')) {
+    throw new Error('Cell read primary-key locator contains an invalid INTEGER cast flag');
+  }
   return {
-    sql: columns.map(column => `${column} = ?`).join(' AND '),
+    sql: columns.map((column, index) => (
+      `${column} = ${locator.integerCasts[index] ? 'CAST(? AS INTEGER)' : '?'}`
+    )).join(' AND '),
     params: locator.values
   };
 }

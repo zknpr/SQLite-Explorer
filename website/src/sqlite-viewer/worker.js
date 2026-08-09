@@ -46,13 +46,14 @@ import {
 } from '../../../src/core/json-utils.ts';
 import {
   assertMutableRecordId,
-  buildRecordIdentitiesPredicate,
+  buildRecordIdentityPredicateChunks,
   buildRecordIdentityPredicate,
   buildTableIdentityMap,
   classifyTableIdentity,
   encodePrimaryKeyRecordId,
   isPrimaryKeyRecordId,
   primaryKeyColumnsFromTableInfo,
+  replacePrimaryKeyRecordIdValues,
   TABLE_IDENTITY_METADATA_SQL
 } from '../../../src/core/row-identity.ts';
 import {
@@ -961,8 +962,7 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
   if (!['csv', 'json', 'sql', 'excel'].includes(format)) {
     throw new Error(`Unsupported export format: ${format}`);
   }
-  let whereSql = '';
-  let params = [];
+  let predicateChunks = [{ sql: '', params: [] }];
 
   // Filter by rowIds if specified
   if (rowIds && rowIds.length > 0) {
@@ -970,16 +970,21 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
     if (rowIds.some(isPrimaryKeyRecordId) && !rowIds.every(isPrimaryKeyRecordId)) {
       throw new Error('Cannot mix rowid and primary-key row identities');
     }
-    const predicate = buildRecordIdentitiesPredicate(rowIds, identity);
-    whereSql = ` WHERE ${predicate.sql}`;
-    params = predicate.params;
+    const seen = new Set();
+    const uniqueRowIds = [];
+    for (const rowId of rowIds) {
+      const normalized = identity.kind === 'rowid' ? validateRowId(rowId) : rowId;
+      const key = String(normalized);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniqueRowIds.push(normalized);
+    }
+    predicateChunks = buildRecordIdentityPredicateChunks(uniqueRowIds, identity);
   }
 
   const selectedColumns = columns && columns.length > 0
     ? columns
     : getExportProjectionColumns(table);
-  assertWebDemoExportWithinLimit(table, selectedColumns, whereSql, params);
-
   // Project exact INTEGER text and raw TEXT bytes at the SQLite boundary.
   // Raw sql.js values can round int64 and truncate strings at the first NUL.
   const projection = selectedColumns.flatMap((column, index) => {
@@ -994,11 +999,42 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
       `${value} AS ${escapeIdentifier(`__export_value_${index}`)}`
     ];
   }).join(', ');
-  const sql =
-    `SELECT ${projection} FROM ${escapeIdentifier(table)}${whereSql}`;
-  const results = db.exec(sql, params);
+  const savepointName = createViewSavepointName('sp_export_rows');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  let rawRows = [];
+  let sawResultSet = false;
+  try {
+    let estimatedBytes = 1024;
+    for (const predicate of predicateChunks) {
+      const whereSql = predicate.sql ? ` WHERE ${predicate.sql}` : '';
+      estimatedBytes += estimateWebDemoExportBytes(
+        table,
+        selectedColumns,
+        whereSql,
+        predicate.params
+      );
+      if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes > WEB_DEMO_EXPORT_MAX_BYTES) {
+        throw webDemoExportLimitError();
+      }
+    }
+    for (const predicate of predicateChunks) {
+      const whereSql = predicate.sql ? ` WHERE ${predicate.sql}` : '';
+      const results = db.exec(
+        `SELECT ${projection} FROM ${escapeIdentifier(table)}${whereSql}`,
+        predicate.params
+      );
+      if (results.length > 0) {
+        sawResultSet = true;
+        rawRows.push(...results[0].values);
+      }
+    }
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'exportTable');
+    throw error;
+  }
 
-  if (results.length === 0) {
+  if (!sawResultSet) {
     return { contentChunks: [], filename: `${table}.${format}`, mimeType: 'text/plain' };
   }
 
@@ -1006,25 +1042,37 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
   const textEncoding = normalizeCellTextEncoding(
     db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]
   );
-  const textDecoder = new TextDecoder(textEncoding, { fatal: true });
   const storageClasses = new Set(['null', 'integer', 'real', 'text', 'blob']);
-  const rows = results[0].values.map(row => selectedColumns.map((column, index) => {
+  const rows = rawRows.map(row => selectedColumns.map((column, index) => {
     const storageClass = row[index * 2];
     if (typeof storageClass !== 'string' || !storageClasses.has(storageClass)) {
       throw new Error(`SQLite returned an invalid storage class for ${table}.${column}`);
     }
     const rawValue = row[index * 2 + 1];
     let value = rawValue;
+    let unrepresentableTextBytes;
     if (storageClass === 'text') {
       if (!(rawValue instanceof Uint8Array)) {
         throw new Error(`SQLite returned invalid TEXT bytes for ${table}.${column}`);
       }
-      value = textDecoder.decode(rawValue);
+      try {
+        value = new TextDecoder(textEncoding, { fatal: true, ignoreBOM: true })
+          .decode(rawValue);
+      } catch {
+        value = rawValue;
+        unrepresentableTextBytes = rawValue;
+      }
     }
     if (storageClass === 'null' && value !== null) {
       throw new Error(`SQLite returned a value for NULL cell ${table}.${column}`);
     }
-    return { storageClass, value };
+    return {
+      storageClass,
+      value,
+      ...(unrepresentableTextBytes === undefined
+        ? {}
+        : { unrepresentableTextBytes, textEncoding })
+    };
   }));
 
   const output = new WebDemoExportChunkCollector();
@@ -1071,7 +1119,7 @@ function getExportProjectionColumns(table) {
   }
 }
 
-function assertWebDemoExportWithinLimit(table, columns, whereSql, params) {
+function estimateWebDemoExportBytes(table, columns, whereSql, params) {
   const estimateCells = columns.map(column => {
     const identifier = escapeIdentifier(column);
     return `CASE typeof(${identifier}) ` +
@@ -1085,10 +1133,11 @@ function assertWebDemoExportWithinLimit(table, columns, whereSql, params) {
   );
   const row = result[0]?.values?.[0] ?? [0, 0];
   const rowCount = Number(row[0]);
-  const estimatedBytes = Number(row[1]) + rowCount * 128 + 1024;
-  if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes > WEB_DEMO_EXPORT_MAX_BYTES) {
+  const estimatedBytes = Number(row[1]) + rowCount * 128;
+  if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes < 0) {
     throw webDemoExportLimitError();
   }
+  return estimatedBytes;
 }
 
 function utf8ByteLength(value) {
@@ -1936,10 +1985,12 @@ async function replaceOversizedCell(
     if (changes !== 1) throw new Error(OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE);
     if (identity.kind === 'rowid') return validateRowId(rowId);
 
-    const candidateValues = [...predicate.primaryKey.values];
     const keyIndex = identity.columns.findIndex(key => key.identifier === column);
-    if (keyIndex >= 0) candidateValues[keyIndex] = value;
-    const candidateId = encodePrimaryKeyRecordId(identity.columns, candidateValues);
+    const candidateId = replacePrimaryKeyRecordIdValues(
+      rowId,
+      identity,
+      keyIndex >= 0 ? [{ column, value }] : []
+    );
     return readPrimaryKeyRecordId(
       table,
       identity,
@@ -2057,38 +2108,43 @@ async function deleteRows(table, rowIds) {
     if (identity.kind !== 'primaryKey') {
       throw new Error(`Primary-key identity cannot target rowid table ${table}`);
     }
-    const predicate = buildRecordIdentitiesPredicate(rowIds, identity);
+    const predicates = buildRecordIdentityPredicateChunks(rowIds, identity);
     const savepointName = createViewSavepointName('sp_delete_pk_rows');
     runSingleStatement(`SAVEPOINT ${savepointName}`);
     try {
       const insertableColumns = getInsertableColumnNames(table);
-      const current = db.exec(
-        `SELECT ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
-        `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
-        normalizeBindParams(predicate.params),
-        { useBigInt: true }
-      )[0];
-      const headers = current?.columns ?? [];
-      const rows = current?.values ?? [];
-      const primaryKeyIndices = identity.columns.map(column => {
-        const index = headers.indexOf(column.identifier);
-        if (index < 0) throw new Error(`Primary-key column missing from ${table}: ${column.identifier}`);
-        return index;
-      });
-      const deletedRows = rows.map(row => ({
-        rowId: encodePrimaryKeyRecordId(
-          identity.columns,
-          primaryKeyIndices.map(index => row[index])
-        ),
-        row: Object.fromEntries(headers.map((header, index) => [header, row[index]]))
-      }));
+      const deletedRows = [];
+      for (const predicate of predicates) {
+        const current = db.exec(
+          `SELECT ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+          `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+          normalizeBindParams(predicate.params),
+          { useBigInt: true }
+        )[0];
+        const headers = current?.columns ?? [];
+        const rows = current?.values ?? [];
+        const primaryKeyIndices = identity.columns.map(column => {
+          const index = headers.indexOf(column.identifier);
+          if (index < 0) throw new Error(`Primary-key column missing from ${table}: ${column.identifier}`);
+          return index;
+        });
+        deletedRows.push(...rows.map(row => ({
+          rowId: encodePrimaryKeyRecordId(
+            identity.columns,
+            primaryKeyIndices.map(index => row[index])
+          ),
+          row: Object.fromEntries(headers.map((header, index) => [header, row[index]]))
+        })));
+      }
       if (deletedRows.length !== rowIds.length) {
         throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
       }
-      db.run(
-        `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
-        normalizeBindParams(predicate.params)
-      );
+      for (const predicate of predicates) {
+        db.run(
+          `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+          normalizeBindParams(predicate.params)
+        );
+      }
       runSingleStatement(`RELEASE ${savepointName}`);
       return deletedRows;
     } catch (error) {
@@ -2758,14 +2814,23 @@ async function updateCellBatch(
           ])
         );
 
-        const candidateValues = [...oldPredicate.primaryKey.values];
+        const primaryKeyReplacements = [];
         for (const preparedUpdate of preparedUpdates) {
           const keyIndex = identity.columns.findIndex(
             keyColumn => keyColumn.identifier === preparedUpdate.update.column
           );
-          if (keyIndex >= 0) candidateValues[keyIndex] = preparedUpdate.storedValue;
+          if (keyIndex >= 0) {
+            primaryKeyReplacements.push({
+              column: preparedUpdate.update.column,
+              value: preparedUpdate.storedValue
+            });
+          }
         }
-        const candidateId = encodePrimaryKeyRecordId(identity.columns, candidateValues);
+        const candidateId = replacePrimaryKeyRecordIdValues(
+          rowId,
+          identity,
+          primaryKeyReplacements
+        );
         const newRowId = readPrimaryKeyRecordId(
           table,
           identity,

@@ -18,6 +18,7 @@
 - **Opening the same file in both editor modes no longer risks conflicting edits.** Both SQLite Explorer editor entries now share a single underlying session per file, so two panels can't fight over the same database.
 - **Batch update visuals stay consistent.** After a batch update completes, the column header no longer stays highlighted once the selection is cleared.
 - **Exports from the web demo no longer lose data.** SQL and JSON exports now carry binary (BLOB) values and text containing NUL characters faithfully instead of silently dropping or mangling them, matching the desktop extension.
+- **Exports preserve SQLite TEXT that is not valid Unicode.** These values no longer abort the whole export: SQL emits the byte-exact `CAST(X'…' AS TEXT)` form, JSON emits a typed `$sqliteExplorerTextBytes` object with encoding and Base64 data, and CSV/Excel emit the same metadata in a tagged scalar.
 - **Deleting a column in the web demo preserves the rest of the table.** The demo previously rebuilt the table in a way that could silently drop constraints, indexes, and triggers; it now uses the same safe path as the extension.
 - **The settings (PRAGMA) panel tells the truth.** It now shows the value SQLite actually applied (not just what was requested) and clearly marks settings that only last for the current session.
 - **Double-clicking a dialog button can't apply a change twice.** Add-row and similar dialogs now ignore repeated submissions while the first one is in flight.

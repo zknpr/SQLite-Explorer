@@ -4,6 +4,7 @@ import assert from 'node:assert';
 import { describe, it } from 'node:test';
 
 import {
+    buildRecordIdentityPredicate,
     buildRecordIdentitiesPredicate,
     decodePrimaryKeyRecordId,
     encodePrimaryKeyRecordId,
@@ -62,6 +63,36 @@ describe('primary-key RecordId canonicalization', () => {
 });
 
 describe('bulk primary-key predicates', () => {
+    it('casts INTEGER-class identity binds independently of column affinity', () => {
+        const columns: PrimaryKeyColumn[] = [
+            { identifier: 'key', declaredType: '', position: 1 }
+        ];
+        const identities = [
+            encodePrimaryKeyRecordId(columns, [9007199254740992n]),
+            encodePrimaryKeyRecordId(columns, [9007199254740993n])
+        ];
+
+        const single = buildRecordIdentityPredicate(
+            identities[1],
+            { kind: 'primaryKey', columns }
+        );
+        assert.strictEqual(single.sql, '"key" = CAST(? AS INTEGER)');
+        assert.deepStrictEqual(single.params, ['9007199254740993']);
+
+        const bulk = buildRecordIdentitiesPredicate(
+            identities,
+            { kind: 'primaryKey', columns }
+        );
+        assert.strictEqual(
+            bulk.sql,
+            '"key" IN (CAST(? AS INTEGER), CAST(? AS INTEGER))'
+        );
+        assert.deepStrictEqual(
+            bulk.params,
+            ['9007199254740992', '9007199254740993']
+        );
+    });
+
     it('uses one IN predicate for a single-column primary key', () => {
         const columns: PrimaryKeyColumn[] = [
             { identifier: 'key', declaredType: 'TEXT', position: 1 }
@@ -90,7 +121,7 @@ describe('bulk primary-key predicates', () => {
 
         assert.strictEqual(
             predicate.sql,
-            '("tenant", "sequence") IN (VALUES (?, ?), (?, ?))'
+            '("tenant", "sequence") IN (VALUES (?, CAST(? AS INTEGER)), (?, CAST(? AS INTEGER)))'
         );
         assert.deepStrictEqual(predicate.params, ['north', 1, 'south', 2]);
     });

@@ -18,6 +18,7 @@ import {
     rpcErrorFields
 } from './transport.js';
 import {
+    CellEditPolicyError,
     DEFAULT_MAX_CELL_EDIT_BYTES,
     formatOversizedCellReplacementWarning,
     isOversizedCellReplacementConflictError
@@ -553,25 +554,53 @@ export const backendApi = {
         return Promise.resolve();
     },
     selectFile: () => {
-        return new Promise((resolve) => {
+        return new Promise((resolve, reject) => {
             const input = document.createElement('input');
             input.type = 'file';
             input.style.display = 'none';
+            const parent = document.body;
+            let removed = false;
+            const cleanup = () => {
+                if (removed) return;
+                removed = true;
+                parent.removeChild(input);
+            };
             input.onchange = async (e) => {
-                if (e.target.files.length > 0) {
-                    const file = e.target.files[0];
-                    const buffer = await file.arrayBuffer();
-                    resolve({
-                        name: file.name,
-                        data: new Uint8Array(buffer)
-                    });
-                } else {
-                    resolve(undefined);
+                try {
+                    if (e.target.files.length > 0) {
+                        const file = e.target.files[0];
+                        if (!Number.isSafeInteger(file.size) || file.size < 0) {
+                            throw new Error('Unable to determine the selected file size safely.');
+                        }
+                        if (file.size > DEFAULT_MAX_CELL_EDIT_BYTES) {
+                            throw new CellEditPolicyError(
+                                'blob',
+                                file.size,
+                                DEFAULT_MAX_CELL_EDIT_BYTES
+                            );
+                        }
+                        const buffer = await file.arrayBuffer();
+                        const data = new Uint8Array(buffer);
+                        if (data.byteLength > DEFAULT_MAX_CELL_EDIT_BYTES) {
+                            throw new CellEditPolicyError(
+                                'blob',
+                                data.byteLength,
+                                DEFAULT_MAX_CELL_EDIT_BYTES
+                            );
+                        }
+                        resolve({ name: file.name, data });
+                    } else {
+                        resolve(undefined);
+                    }
+                } catch (error) {
+                    reject(error);
+                } finally {
+                    cleanup();
                 }
             };
-            document.body.appendChild(input);
+            parent.appendChild(input);
             input.click();
-            setTimeout(() => document.body.removeChild(input), 1000);
+            setTimeout(cleanup, 1000);
         });
     }
 };

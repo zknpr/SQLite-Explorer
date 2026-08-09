@@ -1,9 +1,42 @@
-import type { CellStorageClass, CellValue } from './types';
+import type { CellStorageClass, CellTextEncoding, CellValue } from './types';
 import { cellValueToSql } from './sql-utils';
 
 export interface ExportEncodingCell {
   storageClass: CellStorageClass;
   value: CellValue;
+  /** Raw database-encoding bytes when a TEXT value cannot be decoded. */
+  unrepresentableTextBytes?: Uint8Array;
+  textEncoding?: CellTextEncoding;
+}
+
+export type UnrepresentableTextExportFormat = 'csv' | 'json' | 'sql';
+
+/**
+ * Invalid TEXT cannot be emitted as a Unicode string without replacing bytes.
+ * SQL uses SQLite's byte-preserving CAST(X'...' AS TEXT). JSON uses a typed
+ * object so it cannot be confused with an ordinary string. CSV (and Excel's
+ * CSV-compatible output) uses the same encoding/base64 metadata in a tagged
+ * scalar, the only representation available in an untyped cell format.
+ */
+export function getUnrepresentableTextExportEnvelope(
+  format: UnrepresentableTextExportFormat,
+  encoding: CellTextEncoding
+): { prefix: string; suffix: string; byteEncoding: 'base64' | 'hex' } {
+  if (format === 'sql') {
+    return { prefix: "CAST(X'", suffix: "' AS TEXT)", byteEncoding: 'hex' };
+  }
+  if (format === 'json') {
+    return {
+      prefix: `{"$sqliteExplorerTextBytes":{"encoding":${JSON.stringify(encoding)},"base64":"`,
+      suffix: '"}}',
+      byteEncoding: 'base64'
+    };
+  }
+  return {
+    prefix: `[SQLite TEXT bytes; encoding=${encoding}; base64=`,
+    suffix: ']',
+    byteEncoding: 'base64'
+  };
 }
 
 const BASE64_ALPHABET =
@@ -64,8 +97,26 @@ function requireBlob(value: CellValue): Uint8Array {
   return value;
 }
 
+function encodeUnrepresentableText(
+  cell: ExportEncodingCell,
+  format: UnrepresentableTextExportFormat
+): string | undefined {
+  const bytes = cell.unrepresentableTextBytes;
+  if (bytes === undefined) return undefined;
+  if (cell.storageClass !== 'text' || !(bytes instanceof Uint8Array) || !cell.textEncoding) {
+    throw new Error('SQLite returned invalid unrepresentable TEXT export metadata');
+  }
+  const envelope = getUnrepresentableTextExportEnvelope(format, cell.textEncoding);
+  const encoded = envelope.byteEncoding === 'hex'
+    ? Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+    : encodeExportBytesAsBase64(bytes);
+  return envelope.prefix + encoded + envelope.suffix;
+}
+
 /** Encode one complete, bounded cell with the shared CSV policy. */
 export function encodeCsvExportCell(cell: ExportEncodingCell): string {
+  const unrepresentableText = encodeUnrepresentableText(cell, 'csv');
+  if (unrepresentableText !== undefined) return unrepresentableText;
   if (cell.storageClass === 'null') return '';
   if (cell.storageClass === 'blob') return '[BLOB]';
   if (cell.storageClass === 'integer') return canonicalIntegerText(cell.value);
@@ -77,6 +128,8 @@ export function encodeCsvExportCell(cell: ExportEncodingCell): string {
 
 /** Return the complete JSON token for one bounded export cell. */
 export function encodeJsonExportCell(cell: ExportEncodingCell): string {
+  const unrepresentableText = encodeUnrepresentableText(cell, 'json');
+  if (unrepresentableText !== undefined) return unrepresentableText;
   if (cell.storageClass === 'integer') return canonicalIntegerText(cell.value);
   if (cell.storageClass === 'blob') {
     return JSON.stringify(encodeExportBytesAsBase64(requireBlob(cell.value)));
@@ -86,6 +139,8 @@ export function encodeJsonExportCell(cell: ExportEncodingCell): string {
 
 /** Return the complete SQLite literal for one bounded export cell. */
 export function encodeSqlExportCell(cell: ExportEncodingCell): string {
+  const unrepresentableText = encodeUnrepresentableText(cell, 'sql');
+  if (unrepresentableText !== undefined) return unrepresentableText;
   return cell.storageClass === 'integer'
     ? canonicalIntegerText(cell.value)
     : cellValueToSql(cell.value);

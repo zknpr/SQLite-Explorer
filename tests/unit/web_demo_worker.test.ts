@@ -14,6 +14,8 @@ import {
     DEFAULT_MAX_CELL_EDIT_BYTES,
     fromCellEditRpcErrorData
 } from '../../src/core/cell-edit-policy';
+import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
+import type { PrimaryKeyColumn } from '../../src/core/types';
 
 interface WorkerHarness {
     invoke(method: string, ...payload: unknown[]): Promise<any>;
@@ -307,6 +309,38 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('exports malformed TEXT bytes faithfully in all four demo formats', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_invalid_text_export (value TEXT); ' +
+            "INSERT INTO demo_invalid_text_export VALUES (CAST(X'80' AS TEXT))"
+        );
+        const expected: Record<string, string> = {
+            csv: 'value\n[SQLite TEXT bytes; encoding=utf-8; base64=gA==]',
+            excel: 'value\n[SQLite TEXT bytes; encoding=utf-8; base64=gA==]',
+            json:
+                '[\n' +
+                '  {\n' +
+                '    "value": {"$sqliteExplorerTextBytes":{"encoding":"utf-8","base64":"gA=="}}\n' +
+                '  }\n' +
+                ']',
+            sql: 'INSERT INTO "demo_invalid_text_export" ("value") VALUES (CAST(X\'80\' AS TEXT));'
+        };
+
+        for (const format of ['csv', 'excel', 'json', 'sql']) {
+            const exported = await worker.invoke(
+                'exportTable',
+                { table: 'demo_invalid_text_export' },
+                ['value'],
+                {},
+                {},
+                { format }
+            );
+            assert.strictEqual(Array.from(exported.contentChunks).join(''), expected[format]);
+        }
+    });
+
     it('round-trips demo SQL exports without losing BLOB, embedded NUL text, or int64 values', async () => {
         const worker = await createWorkerHarness({ coerceBigIntsToNumbers: true });
         await worker.invoke(
@@ -458,6 +492,91 @@ describe('web demo view worker', () => {
             observedSql.every(sql => !/^SELECT\s+"payload"\s+FROM\s+"demo_stage_e_cap"/i.test(sql)),
             `oversized export fetched the whole cell: ${observedSql.join('\n')}`
         );
+    });
+
+    it('chunks a 5000-row seven-column selected export below the SQLite bind limit', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_wide_selected_export (' +
+            'a INTEGER, b INTEGER, c INTEGER, d INTEGER, e INTEGER, f INTEGER, g INTEGER, ' +
+            'value TEXT, PRIMARY KEY (a, b, c, d, e, f, g)' +
+            ') WITHOUT ROWID; ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 5000' +
+            ') INSERT INTO demo_wide_selected_export ' +
+            "SELECT value, 0, 0, 0, 0, 0, 0, printf('row-%d', value) FROM ids"
+        );
+        const keyColumns: PrimaryKeyColumn[] = 'abcdefg'.split('').map((identifier, index) => ({
+            identifier,
+            declaredType: 'INTEGER',
+            position: index + 1
+        }));
+        const rowIds = Array.from({ length: 5000 }, (_, index) => (
+            encodePrimaryKeyRecordId(keyColumns, [index + 1, 0, 0, 0, 0, 0, 0])
+        ));
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_wide_selected_export' },
+            ['value'],
+            {},
+            {},
+            { format: 'csv', rowIds }
+        );
+        const values = Array.from(exported.contentChunks).join('').split('\n').slice(1);
+        assert.strictEqual(values.length, 5000);
+        assert.strictEqual(new Set(values).size, 5000);
+        assert.ok(values.includes('row-1'));
+        assert.ok(values.includes('row-5000'));
+    });
+
+    it('preserves an untouched unsafe typeless key member across guarded replacement and PK edits', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_typeless_key_update (' +
+            'id, shard TEXT, payload BLOB, PRIMARY KEY (id, shard)' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_typeless_key_update VALUES (9007199254740993, 'a', X'01020304')"
+        );
+        const keyColumns: PrimaryKeyColumn[] = [
+            { identifier: 'id', declaredType: '', position: 1 },
+            { identifier: 'shard', declaredType: 'TEXT', position: 2 }
+        ];
+        const rowId = encodePrimaryKeyRecordId(keyColumns, [9007199254740993n, 'a']);
+
+        assert.strictEqual(
+            await worker.invoke(
+                'replaceOversizedCell',
+                'demo_typeless_key_update',
+                rowId,
+                'payload',
+                new Uint8Array([9]),
+                { storageClass: 'blob', byteLength: 4 },
+                2
+            ),
+            rowId
+        );
+        const changedRowId = await worker.invoke(
+            'updateCell',
+            'demo_typeless_key_update',
+            rowId,
+            'shard',
+            'b'
+        );
+        assert.match(changedRowId, /^pk:/);
+        const row = await worker.invoke(
+            'runQuery',
+            'SELECT typeof(id), CAST(id AS TEXT), shard, hex(payload) ' +
+            'FROM demo_typeless_key_update'
+        );
+        assert.deepStrictEqual(row[0].rows, [[
+            'integer',
+            '9007199254740993',
+            'b',
+            '09'
+        ]]);
     });
 
     it('enforces typed new-value limits and guarded oversized replacement', async () => {

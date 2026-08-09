@@ -9,12 +9,14 @@ import type {
   RecordId,
   TableIdentity
 } from './core/types';
+import { crypto as webCrypto } from './platform/cryptoShim';
 import { escapeIdentifier } from './core/sql-utils';
 import { normalizeCellTextEncoding } from './core/cell-read';
 import {
   encodeCsvExportCell,
   encodeJsonExportCell,
-  encodeSqlExportCell
+  encodeSqlExportCell,
+  getUnrepresentableTextExportEnvelope
 } from './core/export-encoding';
 import {
   buildRecordIdentityPredicate,
@@ -59,6 +61,8 @@ interface ExportCell {
   storageClass: CellStorageClass;
   byteLength: number;
   value: CellValue;
+  unrepresentableTextBytes?: Uint8Array;
+  textEncoding?: CellTextEncoding;
 }
 
 interface ExportRow {
@@ -154,9 +158,20 @@ function parseCells(
     const storageClass = parseStorageClass(row[offset], `${table}.${column}`);
     const sourceBytes = byteLength(row[offset + 2], `${table}.${column}`);
     const transportedValue = row[offset + 1];
-    let value = storageClass === 'text' && transportedValue instanceof Uint8Array
-      ? new TextDecoder(textEncoding, { fatal: true }).decode(transportedValue)
-      : transportedValue;
+    let value = transportedValue;
+    let unrepresentableTextBytes: Uint8Array | undefined;
+    if (storageClass === 'text' && transportedValue instanceof Uint8Array) {
+      try {
+        value = new TextDecoder(textEncoding, { fatal: true, ignoreBOM: true })
+          .decode(transportedValue);
+      } catch {
+        // SQLite permits TEXT with byte sequences that cannot be represented
+        // by JavaScript strings. Keep the projection's exact bytes for the
+        // format-specific lossless export envelope.
+        value = transportedValue;
+        unrepresentableTextBytes = transportedValue;
+      }
+    }
 
     if (storageClass === 'integer') {
       if (typeof transportedValue !== 'string') {
@@ -172,7 +187,12 @@ function parseCells(
       value = transportedValue;
     }
 
-    if (storageClass === 'text' && sourceBytes <= EXPORT_INLINE_TEXT_BYTES && typeof value !== 'string') {
+    if (
+      storageClass === 'text'
+      && sourceBytes <= EXPORT_INLINE_TEXT_BYTES
+      && typeof value !== 'string'
+      && unrepresentableTextBytes === undefined
+    ) {
       throw new Error(`SQLite omitted bounded TEXT for ${table}.${column}`);
     }
     if (storageClass === 'blob' && value !== null && !(value instanceof Uint8Array)) {
@@ -188,7 +208,10 @@ function parseCells(
       rowId,
       storageClass,
       byteLength: sourceBytes,
-      value
+      value,
+      ...(unrepresentableTextBytes === undefined
+        ? {}
+        : { unrepresentableTextBytes, textEncoding })
     };
   });
 }
@@ -327,6 +350,9 @@ async function* readPrimaryKeyTableRows(
     .map(column => `${escapeIdentifier(column.identifier)} ASC`)
     .join(', ');
   let offset = 0;
+  let keyset: { mode: 'first' } | { mode: 'after'; anchor: string } | undefined = {
+    mode: 'first'
+  };
 
   while (true) {
     assertNotCancelled(cancellation);
@@ -336,6 +362,7 @@ async function* readPrimaryKeyTableRows(
       orderDir: 'ASC',
       limit: EXPORT_ROW_BATCH_SIZE,
       offset,
+      ...(keyset ? { keyset } : {}),
       maxInlineCellBytes: UNSTABLE_CELL_INLINE_BYTES,
       maxPageResponseBytes: 16 * 1024 * 1024
     });
@@ -416,7 +443,121 @@ async function* readPrimaryKeyTableRows(
     }
 
     offset += identityRows.length;
+    keyset = identities.keysetAnchors?.last
+      ? { mode: 'after', anchor: identities.keysetAnchors.last }
+      : undefined;
     if (identityRows.length < EXPORT_ROW_BATCH_SIZE) return;
+  }
+}
+
+async function* readUnstableCursorRows(
+  operations: DatabaseOperations,
+  table: string,
+  columns: readonly string[],
+  projection: string,
+  textEncoding: CellTextEncoding,
+  cancellation?: ExportCancellation
+): AsyncGenerator<ExportRow> {
+  const openQueryReadSession = operations.openQueryReadSession!;
+  const readQueryRows = operations.readQueryRows!;
+  const closeQueryReadSession = operations.closeQueryReadSession!;
+  const session = await openQueryReadSession.call(
+    operations,
+    `SELECT ${projection} FROM ${escapeIdentifier(table)}`
+  );
+  let primaryError: unknown;
+  try {
+    while (true) {
+      assertNotCancelled(cancellation);
+      // A single row can already contain one bounded value per selected column;
+      // keep the aggregate transport bound independent of column count.
+      const chunk = await readQueryRows.call(operations, session.sessionId, 1);
+      if (chunk.rows.length > 1) {
+        throw new Error(`Query read session returned too many rows for ${table}`);
+      }
+      const row = chunk.rows[0];
+      if (row) {
+        yield { cells: parseCells(table, columns, row, 0, textEncoding) };
+      } else if (!chunk.done) {
+        throw new Error(`Query read session made no progress for ${table}`);
+      }
+      if (chunk.done) return;
+    }
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    try {
+      await closeQueryReadSession.call(operations, session.sessionId);
+    } catch (cleanupError) {
+      if (primaryError !== undefined) {
+        throw new AggregateError(
+          [primaryError, cleanupError],
+          `View export failed and its query read session could not be closed`
+        );
+      }
+      throw cleanupError;
+    }
+  }
+}
+
+async function* readUnstableSpoolRows(
+  operations: DatabaseOperations,
+  table: string,
+  columns: readonly string[],
+  projection: string,
+  textEncoding: CellTextEncoding,
+  cancellation?: ExportCancellation
+): AsyncGenerator<ExportRow> {
+  const spoolTable = `__sqlite_explorer_export_${webCrypto.randomUUID().replace(/-/g, '')}`;
+  const escapedSpool = escapeIdentifier(spoolTable);
+  let spoolCreated = false;
+  let primaryError: unknown;
+  try {
+    assertNotCancelled(cancellation);
+    // Views and keyless sources cannot be resumed safely: volatile expressions
+    // and ORDER BY random() are re-evaluated by every LIMIT/OFFSET statement.
+    // Evaluate once into SQLite-owned TEMP storage, then stream bounded rows
+    // from its intrinsic rowid order without transporting the full result.
+    await operations.executeQuery(
+      `CREATE TEMP TABLE ${escapedSpool} AS ` +
+      `SELECT ${projection} FROM ${escapeIdentifier(table)}`
+    );
+    spoolCreated = true;
+
+    let lastSpoolRowId: RecordId = 0;
+    while (true) {
+      assertNotCancelled(cancellation);
+      const result = await operations.executeQuery(
+        `SELECT CAST(rowid AS TEXT), * FROM ${escapedSpool} ` +
+        `WHERE rowid > ? ORDER BY rowid LIMIT 1`,
+        [lastSpoolRowId]
+      );
+      const row = result[0]?.rows[0];
+      if (!row) return;
+      if (typeof row[0] !== 'string' && typeof row[0] !== 'number') {
+        throw new Error(`SQLite returned an invalid export spool rowid for ${table}`);
+      }
+      lastSpoolRowId = row[0];
+      yield { cells: parseCells(table, columns, row, 1, textEncoding) };
+    }
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    if (spoolCreated) {
+      try {
+        await operations.executeQuery(`DROP TABLE temp.${escapedSpool}`);
+      } catch (cleanupError) {
+        if (primaryError !== undefined) {
+          throw new AggregateError(
+            [primaryError, cleanupError],
+            `View export failed and temporary spool ${spoolTable} could not be removed`
+          );
+        }
+        throw cleanupError;
+      }
+    }
   }
 }
 
@@ -433,17 +574,29 @@ async function* readUnstableRows(
     UNSTABLE_CELL_INLINE_BYTES,
     includeInlineBlobs
   );
-  let offset = 0;
-  while (true) {
-    assertNotCancelled(cancellation);
-    const result = await operations.executeQuery(
-      `SELECT ${projection} FROM ${escapeIdentifier(table)} LIMIT 1 OFFSET ${offset}`
+  if (
+    operations.openQueryReadSession
+    && operations.readQueryRows
+    && operations.closeQueryReadSession
+  ) {
+    yield* readUnstableCursorRows(
+      operations,
+      table,
+      columns,
+      projection,
+      textEncoding,
+      cancellation
     );
-    const row = result[0]?.rows[0];
-    if (!row) return;
-    yield { cells: parseCells(table, columns, row, 0, textEncoding) };
-    offset++;
+    return;
   }
+  yield* readUnstableSpoolRows(
+    operations,
+    table,
+    columns,
+    projection,
+    textEncoding,
+    cancellation
+  );
 }
 
 function readRows(
@@ -617,16 +770,48 @@ async function forEachDecodedText(
   cancellation: ExportCancellation | undefined,
   consume: (text: string) => Promise<void>
 ): Promise<void> {
+  const representable = await inspectDecodedText(
+    operations,
+    input,
+    cancellation,
+    consume
+  );
+  if (!representable) {
+    throw new Error('SQLite TEXT bytes are not representable in the database encoding');
+  }
+}
+
+/** Decode a complete pass without allowing an invalid suffix to leak partial output. */
+async function inspectDecodedText(
+  operations: DatabaseOperations,
+  input: ExportCellSession,
+  cancellation: ExportCancellation | undefined,
+  consume: (text: string) => Promise<void>
+): Promise<boolean> {
   const decoder = new TextDecoder(
     requireTextEncoding(input.session.metadata),
-    { fatal: true }
+    { fatal: true, ignoreBOM: true }
   );
+  let representable = true;
   await forEachRawChunk(operations, input, cancellation, async bytes => {
-    const decoded = decoder.decode(bytes, { stream: true });
+    if (!representable) return;
+    let decoded: string;
+    try {
+      decoded = decoder.decode(bytes, { stream: true });
+    } catch {
+      representable = false;
+      return;
+    }
     if (decoded) await consume(decoded);
   });
-  const finalText = decoder.decode();
-  if (finalText) await consume(finalText);
+  if (!representable) return false;
+  try {
+    const finalText = decoder.decode();
+    if (finalText) await consume(finalText);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function concatBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
@@ -672,6 +857,26 @@ async function writeHexBytes(
   });
 }
 
+async function writeUnrepresentableText(
+  operations: DatabaseOperations,
+  input: ExportCellSession,
+  sink: AsyncExportSink,
+  format: 'csv' | 'json' | 'sql',
+  cancellation?: ExportCancellation
+): Promise<void> {
+  const envelope = getUnrepresentableTextExportEnvelope(
+    format,
+    requireTextEncoding(input.session.metadata)
+  );
+  await emit(sink, envelope.prefix, cancellation);
+  if (envelope.byteEncoding === 'hex') {
+    await writeHexBytes(operations, input, sink, cancellation);
+  } else {
+    await writeBase64(operations, input, sink, cancellation);
+  }
+  await emit(sink, envelope.suffix, cancellation);
+}
+
 class IncrementalJsonEscaper {
   private pendingHighSurrogate = '';
 
@@ -709,16 +914,16 @@ async function writeJsonText(
   await emit(sink, escaper.finish(), cancellation);
 }
 
-async function cellContainsNul(
+async function inspectSqlText(
   operations: DatabaseOperations,
   input: ExportCellSession,
   cancellation?: ExportCancellation
-): Promise<boolean> {
-  let found = false;
-  await forEachDecodedText(operations, input, cancellation, async text => {
-    if (text.includes('\0')) found = true;
+): Promise<{ representable: boolean; containsNul: boolean }> {
+  let containsNul = false;
+  const representable = await inspectDecodedText(operations, input, cancellation, async text => {
+    if (text.includes('\0')) containsNul = true;
   });
-  return found;
+  return { representable, containsNul };
 }
 
 async function writeUtf8TextHex(
@@ -744,16 +949,16 @@ async function writeSqlQuotedText(
   });
 }
 
-async function csvTextNeedsQuotes(
+async function inspectCsvText(
   operations: DatabaseOperations,
   input: ExportCellSession,
   cancellation?: ExportCancellation
-): Promise<boolean> {
+): Promise<{ representable: boolean; needsQuotes: boolean }> {
   let needsQuotes = false;
-  await forEachDecodedText(operations, input, cancellation, async text => {
+  const representable = await inspectDecodedText(operations, input, cancellation, async text => {
     if (text.includes(',') || text.includes('"') || text.includes('\n')) needsQuotes = true;
   });
-  return needsQuotes;
+  return { representable, needsQuotes };
 }
 
 function escapeCsvValue(value: CellValue): string {
@@ -789,12 +994,20 @@ async function writeCsvCell(
     return;
   }
   await withCellSession(operations, cell, cancellation, async input => {
-    const quoted = await csvTextNeedsQuotes(operations, input, cancellation);
-    if (quoted) await emit(sink, '"', cancellation);
+    const inspection = await inspectCsvText(operations, input, cancellation);
+    if (!inspection.representable) {
+      await writeUnrepresentableText(operations, input, sink, 'csv', cancellation);
+      return;
+    }
+    if (inspection.needsQuotes) await emit(sink, '"', cancellation);
     await forEachDecodedText(operations, input, cancellation, async text => {
-      await emit(sink, quoted ? text.replace(/"/g, '""') : text, cancellation);
+      await emit(
+        sink,
+        inspection.needsQuotes ? text.replace(/"/g, '""') : text,
+        cancellation
+      );
     });
-    if (quoted) await emit(sink, '"', cancellation);
+    if (inspection.needsQuotes) await emit(sink, '"', cancellation);
   });
 }
 
@@ -810,12 +1023,25 @@ async function writeJsonCell(
   }
 
   await withCellSession(operations, cell, cancellation, async input => {
-    await emit(sink, '"', cancellation);
     if (cell.storageClass === 'blob') {
+      await emit(sink, '"', cancellation);
       await writeBase64(operations, input, sink, cancellation);
-    } else {
-      await writeJsonText(operations, input, sink, cancellation);
+      await emit(sink, '"', cancellation);
+      return;
     }
+
+    const representable = await inspectDecodedText(
+      operations,
+      input,
+      cancellation,
+      async () => {}
+    );
+    if (!representable) {
+      await writeUnrepresentableText(operations, input, sink, 'json', cancellation);
+      return;
+    }
+    await emit(sink, '"', cancellation);
+    await writeJsonText(operations, input, sink, cancellation);
     await emit(sink, '"', cancellation);
   });
 }
@@ -842,8 +1068,10 @@ async function writeSqlCell(
     // The output grammar changes when any NUL exists, so scan and then rewind
     // this same snapshot session. Buffering until the decision would re-create
     // the large-cell amplification Stage E is removing.
-    const containsNul = await cellContainsNul(operations, input, cancellation);
-    if (containsNul) {
+    const inspection = await inspectSqlText(operations, input, cancellation);
+    if (!inspection.representable) {
+      await writeUnrepresentableText(operations, input, sink, 'sql', cancellation);
+    } else if (inspection.containsNul) {
       await emit(sink, "CAST(X'", cancellation);
       await writeUtf8TextHex(operations, input, sink, cancellation);
       await emit(sink, "' AS TEXT)", cancellation);

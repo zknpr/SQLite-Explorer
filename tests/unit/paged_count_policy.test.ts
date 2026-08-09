@@ -165,7 +165,7 @@ describe('desktop engine paged count policy', () => {
     const result = await createEngineFromModule(SqlJsModule, {
       content: null,
       filePath: dbPath,
-      maxSize: 4096,
+      maxSize: 0,
       // Keep the fixture genuinely paged without coupling that choice to the
       // independent maxSize refusal cap.
       pagedOpenThresholdBytes: 4096,
@@ -262,7 +262,7 @@ describe('desktop engine paged count policy', () => {
     const result = await createEngineFromModule(SqlJsModule, {
       content: null,
       filePath: dbPath,
-      maxSize: 4096,
+      maxSize: 0,
       pagedOpenThresholdBytes: 4096,
       allowPagedFallback: true,
       // No exact-count override: the fixture is far below that 64 MiB gate.

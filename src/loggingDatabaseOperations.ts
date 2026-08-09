@@ -46,11 +46,33 @@ const LOG_IDENTITY_PREVIEW_CHARS = 48;
 const MAX_DELETE_LOG_IDENTITIES = 8;
 
 export class LoggingDatabaseOperations implements DatabaseOperations {
+    readonly openQueryReadSession?: NonNullable<DatabaseOperations['openQueryReadSession']>;
+    readonly readQueryRows?: NonNullable<DatabaseOperations['readQueryRows']>;
+    readonly closeQueryReadSession?: NonNullable<DatabaseOperations['closeQueryReadSession']>;
+
     constructor(
         private readonly wrapped: DatabaseOperations,
         private readonly filename: string,
         private readonly outputChannel: vsc.OutputChannel
-    ) {}
+    ) {
+        const openQueryReadSession = wrapped.openQueryReadSession;
+        const readQueryRows = wrapped.readQueryRows;
+        const closeQueryReadSession = wrapped.closeQueryReadSession;
+        if (openQueryReadSession && readQueryRows && closeQueryReadSession) {
+            this.openQueryReadSession = async (sql: string) => {
+                this.log('Opening incremental query read');
+                return openQueryReadSession.call(wrapped, sql);
+            };
+            this.readQueryRows = async (sessionId: string, maxRows: number) => {
+                this.log(`Reading up to ${maxRows} incremental query rows`);
+                return readQueryRows.call(wrapped, sessionId, maxRows);
+            };
+            this.closeQueryReadSession = async (sessionId: string) => {
+                this.log('Closing incremental query read');
+                return closeQueryReadSession.call(wrapped, sessionId);
+            };
+        }
+    }
 
     get engineKind() {
         return this.wrapped.engineKind;

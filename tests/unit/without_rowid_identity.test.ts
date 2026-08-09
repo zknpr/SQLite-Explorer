@@ -4,7 +4,13 @@ import assert from 'node:assert';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
-import type { DatabaseOperations, ModificationEntry, RecordId } from '../../src/core/types';
+import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
+import type {
+    DatabaseOperations,
+    ModificationEntry,
+    PrimaryKeyColumn,
+    RecordId
+} from '../../src/core/types';
 
 describe('WITHOUT ROWID primary-key identity', () => {
     let engine: DatabaseOperations;
@@ -445,6 +451,96 @@ describe('WITHOUT ROWID primary-key identity', () => {
         );
     });
 
+    it('targets an unsafe INTEGER stored in a typeless primary key across record operations', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE typeless_integer_identity (' +
+            'id, shard TEXT, value TEXT, payload BLOB, PRIMARY KEY (id, shard)' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO typeless_integer_identity VALUES " +
+            "(9007199254740993, 'a', 'before', X'01020304')"
+        );
+        const page = await engine.fetchTableData('typeless_integer_identity', {
+            columns: ['rowid', 'id', 'shard', 'value', 'payload'],
+            limit: 10,
+            offset: 0
+        });
+        const identity = page.rows[0][0] as RecordId;
+
+        const metadata = await engine.getCellMetadata({
+            table: 'typeless_integer_identity',
+            rowId: identity,
+            column: 'value'
+        });
+        assert.deepStrictEqual(metadata, {
+            storageClass: 'text',
+            byteLength: 6,
+            textEncoding: 'utf-8'
+        });
+        const session = await engine.openCellReadSession({
+            table: 'typeless_integer_identity',
+            rowId: identity,
+            column: 'value'
+        });
+        await engine.closeCellReadSession(session.sessionId);
+
+        const replacementIdentity = await engine.replaceOversizedCell(
+            'typeless_integer_identity',
+            identity,
+            'payload',
+            new Uint8Array([9]),
+            { storageClass: 'blob', byteLength: 4 },
+            2
+        );
+        assert.strictEqual(replacementIdentity, identity);
+
+        await engine.updateCell(
+            'typeless_integer_identity',
+            identity,
+            'value',
+            'after'
+        );
+        const changedIdentity = await engine.updateCell(
+            'typeless_integer_identity',
+            identity,
+            'shard',
+            'b'
+        );
+        if (changedIdentity === undefined) {
+            throw new Error('Primary-key update did not return the changed identity');
+        }
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(id), CAST(id AS TEXT), shard, value, hex(payload) ' +
+                'FROM typeless_integer_identity'
+            ))[0].rows,
+            [['integer', '9007199254740993', 'b', 'after', '09']]
+        );
+
+        const deleted = await engine.deleteRows('typeless_integer_identity', [changedIdentity]);
+        assert.strictEqual(deleted?.length, 1);
+        assert.strictEqual(await engine.fetchTableCount('typeless_integer_identity', {}), 0);
+
+        await engine.executeQuery(
+            'CREATE TABLE strict_any_identity (id ANY PRIMARY KEY, value TEXT) ' +
+            'STRICT, WITHOUT ROWID; ' +
+            "INSERT INTO strict_any_identity VALUES (9007199254740993, 'strict')"
+        );
+        const strictPage = await engine.fetchTableData('strict_any_identity', {
+            columns: ['rowid', 'id', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        assert.deepStrictEqual(await engine.getCellMetadata({
+            table: 'strict_any_identity',
+            rowId: strictPage.rows[0][0] as RecordId,
+            column: 'value'
+        }), {
+            storageClass: 'text',
+            byteLength: 6,
+            textEncoding: 'utf-8'
+        });
+    });
+
     it('returns primary-key identity for insert and restores a deleted row', async () => {
         await engine.executeQuery(
             'CREATE TABLE row_lifecycle (' +
@@ -767,5 +863,60 @@ describe('WITHOUT ROWID primary-key identity', () => {
 
         assert.strictEqual(deleted?.length, 1000);
         assert.strictEqual(await engine.fetchTableCount('bulk_composite', {}), 0);
+    });
+
+    it('chunks a 5000-row seven-column primary-key delete atomically below the bind limit', async () => {
+        const keyColumns: PrimaryKeyColumn[] = Array.from(
+            { length: 7 },
+            (_, index) => ({
+                identifier: `k${index + 1}`,
+                declaredType: 'INTEGER',
+                position: index + 1
+            })
+        );
+        await engine.executeQuery(
+            'CREATE TABLE bulk_wide_composite (' +
+            keyColumns.map(column => `"${column.identifier}" INTEGER`).join(', ') +
+            ', value TEXT, PRIMARY KEY (' +
+            keyColumns.map(column => `"${column.identifier}"`).join(', ') +
+            ')) WITHOUT ROWID; ' +
+            'WITH RECURSIVE rows(id) AS (' +
+            'VALUES(1) UNION ALL SELECT id + 1 FROM rows WHERE id < 5000' +
+            ') INSERT INTO bulk_wide_composite SELECT ' +
+            [...keyColumns.map(() => 'id'), "printf('value-%d', id)"].join(', ') +
+            ' FROM rows'
+        );
+        const identityFor = (id: number) => encodePrimaryKeyRecordId(
+            keyColumns,
+            keyColumns.map(() => BigInt(id))
+        );
+        const rowIds = Array.from({ length: 5000 }, (_, index) => identityFor(index + 1));
+
+        await assert.rejects(
+            engine.deleteRows(
+                'bulk_wide_composite',
+                [...rowIds.slice(0, 4680), rowIds[0]]
+            ),
+            /Duplicate row identities are not allowed/
+        );
+        assert.strictEqual(
+            await engine.fetchTableCount('bulk_wide_composite', {}),
+            5000,
+            'a duplicate identity crossing a chunk boundary must be rejected atomically'
+        );
+
+        await assert.rejects(
+            engine.deleteRows('bulk_wide_composite', [...rowIds, identityFor(5001)]),
+            /one or more row identities no longer exist/
+        );
+        assert.strictEqual(
+            await engine.fetchTableCount('bulk_wide_composite', {}),
+            5000,
+            'a missing identity in a later chunk must roll back earlier chunk deletions'
+        );
+
+        const deleted = await engine.deleteRows('bulk_wide_composite', rowIds);
+        assert.strictEqual(deleted?.length, 5000);
+        assert.strictEqual(await engine.fetchTableCount('bulk_wide_composite', {}), 0);
     });
 });

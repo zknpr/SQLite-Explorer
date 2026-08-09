@@ -2,6 +2,7 @@ import * as vsc from 'vscode';
 
 import { crypto as webCrypto } from './platform/cryptoShim';
 import { MAX_CELL_READ_CHUNK_BYTES } from './core/cell-read';
+import { runReadSnapshot } from './core/operation-serializer';
 import type {
     CellMetadata,
     CellReadTarget,
@@ -88,6 +89,8 @@ export class CellMaterializationService implements vsc.Disposable {
     private readonly ownerFiles = new Map<CellMaterializationOwner, Set<string>>();
     private readonly ownerSubscriptions = new Map<CellMaterializationOwner, vsc.Disposable>();
     private readonly closeDocumentSubscription: vsc.Disposable | undefined;
+    /** Disk bytes held by live files plus reservations for in-progress writes. */
+    private allocatedBytes = 0;
     private runDirectory: string | undefined;
     private disposed = false;
 
@@ -122,14 +125,48 @@ export class CellMaterializationService implements vsc.Disposable {
         target: CellReadTarget,
         options: MaterializeCellOptions = {}
     ): Promise<MaterializedCell> {
-        if (this.disposed) throw new Error('Cell materialization service is disposed');
-        assertNotCancelled(options.signal);
+        this.assertActive(options.signal);
+        let completed: MaterializedCell | undefined;
+        try {
+            return await runReadSnapshot(operations, async leasedOperations => {
+                completed = await this.materializeWithinLease(
+                    leasedOperations,
+                    target,
+                    options
+                );
+                return completed;
+            });
+        } catch (primaryError) {
+            if (completed) {
+                try {
+                    this.release(completed.uri);
+                } catch (cleanupError) {
+                    throw new AggregateError(
+                        [primaryError, cleanupError],
+                        'Cell materialization failed and its completed temp file could not be removed'
+                    );
+                }
+            }
+            throw primaryError;
+        }
+    }
 
-        const session = await operations.openCellReadSession(target);
+    private async materializeWithinLease(
+        operations: DatabaseOperations,
+        target: CellReadTarget,
+        options: MaterializeCellOptions
+    ): Promise<MaterializedCell> {
+        this.assertActive(options.signal);
+
+        let session: Awaited<ReturnType<DatabaseOperations['openCellReadSession']>> | undefined;
         let filePath: string | undefined;
         let fileHandle: import('node:fs/promises').FileHandle | undefined;
+        let reservedBytes = 0;
+        let sessionClosed = false;
         let primaryError: unknown;
         try {
+            session = await operations.openCellReadSession(target);
+            this.assertActive(options.signal);
             const { metadata } = session;
             if (metadata.byteLength > this.maxBytes) {
                 throw new Error(
@@ -137,8 +174,10 @@ export class CellMaterializationService implements vsc.Disposable {
                     'temporary-file quota; export the cell with an explicit destination instead'
                 );
             }
+            this.reserveBytes(metadata.byteLength);
+            reservedBytes = metadata.byteLength;
 
-            assertNotCancelled(options.signal);
+            this.assertActive(options.signal);
             const { fs, crypto } = requireNodeModules();
             const runDirectory = this.ensureRunDirectory(fs);
             const extension = safeExtension(options.fileExtension, metadata);
@@ -147,7 +186,9 @@ export class CellMaterializationService implements vsc.Disposable {
                 `${webCrypto.randomUUID()}.${extension}`
             );
             fileHandle = await fs.promises.open(filePath, 'wx', 0o600);
+            this.assertActive(options.signal);
             await fileHandle.chmod(0o600);
+            this.assertActive(options.signal);
 
             const outputHash = crypto.createHash('sha256');
             const decoder = metadata.storageClass === 'text'
@@ -158,7 +199,7 @@ export class CellMaterializationService implements vsc.Disposable {
             let outputBytes = 0;
 
             while (sourceOffset < metadata.byteLength) {
-                assertNotCancelled(options.signal);
+                this.assertActive(options.signal);
                 const requestedBytes = Math.min(
                     this.chunkBytes,
                     metadata.byteLength - sourceOffset
@@ -168,14 +209,15 @@ export class CellMaterializationService implements vsc.Disposable {
                     sourceOffset,
                     requestedBytes
                 );
-                assertNotCancelled(options.signal);
+                this.assertActive(options.signal);
                 this.validateChunk(chunk, sourceOffset, requestedBytes, metadata.byteLength);
 
                 const output = decoder && encoder
                     ? encoder.encode(decoder.decode(chunk.bytes, { stream: true }))
                     : chunk.bytes;
                 outputBytes = this.checkedOutputSize(outputBytes, output.byteLength);
-                await this.writeFully(fileHandle, output);
+                reservedBytes = this.ensureOutputReservation(reservedBytes, outputBytes);
+                await this.writeFully(fileHandle, output, options.signal);
                 outputHash.update(output);
                 sourceOffset += chunk.bytes.byteLength;
             }
@@ -183,13 +225,16 @@ export class CellMaterializationService implements vsc.Disposable {
             if (decoder && encoder) {
                 const finalBytes = encoder.encode(decoder.decode());
                 outputBytes = this.checkedOutputSize(outputBytes, finalBytes.byteLength);
-                await this.writeFully(fileHandle, finalBytes);
+                reservedBytes = this.ensureOutputReservation(reservedBytes, outputBytes);
+                await this.writeFully(fileHandle, finalBytes, options.signal);
                 outputHash.update(finalBytes);
             }
-            assertNotCancelled(options.signal);
+            this.assertActive(options.signal);
             await fileHandle.sync();
+            this.assertActive(options.signal);
             await fileHandle.close();
             fileHandle = undefined;
+            this.assertActive(options.signal);
 
             const assembledChecksum = outputHash.digest('hex');
             const verified = await this.verifyFile(fs, crypto, filePath, options.signal);
@@ -198,16 +243,25 @@ export class CellMaterializationService implements vsc.Disposable {
             }
 
             await operations.closeCellReadSession(session.sessionId);
+            sessionClosed = true;
+            this.assertActive(options.signal);
             const materialized: MaterializedCell = {
                 uri: vsc.Uri.file(filePath),
                 metadata,
                 byteLength: outputBytes,
                 checksumSha256: assembledChecksum
             };
+            this.releaseReservedBytes(reservedBytes - outputBytes);
+            reservedBytes = outputBytes;
             this.track(materialized, options.owner);
+            // The reservation is now owned by the tracked file and released
+            // only after release() removes that file from disk.
+            reservedBytes = 0;
             return materialized;
         } catch (error) {
-            primaryError = error;
+            primaryError = this.disposed
+                ? new Error('Cell materialization service is disposed', { cause: error })
+                : error;
             if (fileHandle) {
                 try {
                     await fileHandle.close();
@@ -221,21 +275,28 @@ export class CellMaterializationService implements vsc.Disposable {
             if (filePath) {
                 try {
                     requireNodeModules().fs.rmSync(filePath, { force: true });
+                    this.releaseReservedBytes(reservedBytes);
+                    reservedBytes = 0;
                 } catch (cleanupError) {
                     primaryError = new AggregateError(
                         [primaryError, cleanupError],
                         'Cell materialization failed and its partial temp file could not be removed'
                     );
                 }
+            } else {
+                this.releaseReservedBytes(reservedBytes);
+                reservedBytes = 0;
             }
             this.pruneEmptyRunDirectory();
-            try {
-                await operations.closeCellReadSession(session.sessionId);
-            } catch (sessionError) {
-                primaryError = new AggregateError(
-                    [primaryError, sessionError],
-                    'Cell materialization failed and its read session could not be closed'
-                );
+            if (session && !sessionClosed) {
+                try {
+                    await operations.closeCellReadSession(session.sessionId);
+                } catch (sessionError) {
+                    primaryError = new AggregateError(
+                        [primaryError, sessionError],
+                        'Cell materialization failed and its read session could not be closed'
+                    );
+                }
             }
             throw primaryError;
         }
@@ -244,10 +305,12 @@ export class CellMaterializationService implements vsc.Disposable {
     /** Remove a tracked materialization. Unknown URIs are intentionally ignored. */
     release(uri: vsc.Uri): void {
         const filePath = uri.fsPath;
-        if (!this.trackedFiles.has(filePath)) return;
+        const materialized = this.trackedFiles.get(filePath);
+        if (!materialized) return;
         const { fs } = requireNodeModules();
         fs.rmSync(filePath, { force: true });
         this.trackedFiles.delete(filePath);
+        this.releaseReservedBytes(materialized.byteLength);
         for (const [owner, files] of this.ownerFiles) {
             files.delete(filePath);
             if (files.size === 0) this.removeOwner(owner);
@@ -263,12 +326,25 @@ export class CellMaterializationService implements vsc.Disposable {
         this.ownerSubscriptions.clear();
         this.ownerFiles.clear();
 
+        let trackedBytes = 0;
+        for (const materialized of this.trackedFiles.values()) {
+            trackedBytes += materialized.byteLength;
+        }
+
         if (this.runDirectory) {
             const { fs } = requireNodeModules();
             fs.rmSync(this.runDirectory, { recursive: true, force: true });
             this.runDirectory = undefined;
         }
         this.trackedFiles.clear();
+        // Reservations belonging to in-flight materializations remain charged
+        // until those operations observe disposal and finish their own cleanup.
+        this.releaseReservedBytes(trackedBytes);
+    }
+
+    private assertActive(signal: AbortSignal | undefined): void {
+        if (this.disposed) throw new Error('Cell materialization service is disposed');
+        assertNotCancelled(signal);
     }
 
     private ensureRunDirectory(fs: NodeFs): string {
@@ -325,18 +401,47 @@ export class CellMaterializationService implements vsc.Disposable {
         return next;
     }
 
+    private reserveBytes(requestedBytes: number): void {
+        const next = this.allocatedBytes + requestedBytes;
+        if (!Number.isSafeInteger(next) || next > this.maxBytes) {
+            throw new Error(
+                `${requestedBytes}-byte materialization cannot fit the aggregate temporary-file ` +
+                `quota: ${this.allocatedBytes} of ${this.maxBytes} bytes are already live or in progress`
+            );
+        }
+        this.allocatedBytes = next;
+    }
+
+    private ensureOutputReservation(reservedBytes: number, outputBytes: number): number {
+        if (outputBytes <= reservedBytes) return reservedBytes;
+        const additionalBytes = outputBytes - reservedBytes;
+        this.reserveBytes(additionalBytes);
+        return outputBytes;
+    }
+
+    private releaseReservedBytes(byteLength: number): void {
+        if (byteLength === 0) return;
+        if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > this.allocatedBytes) {
+            throw new Error('Cell materialization quota accounting became inconsistent');
+        }
+        this.allocatedBytes -= byteLength;
+    }
+
     private async writeFully(
         file: import('node:fs/promises').FileHandle,
-        bytes: Uint8Array
+        bytes: Uint8Array,
+        signal: AbortSignal | undefined
     ): Promise<void> {
         let offset = 0;
         while (offset < bytes.byteLength) {
+            this.assertActive(signal);
             const { bytesWritten } = await file.write(
                 bytes,
                 offset,
                 bytes.byteLength - offset,
                 null
             );
+            this.assertActive(signal);
             if (bytesWritten < 1) throw new Error('Temp-file write made no progress');
             offset += bytesWritten;
         }
@@ -354,8 +459,9 @@ export class CellMaterializationService implements vsc.Disposable {
         let byteLength = 0;
         try {
             while (true) {
-                assertNotCancelled(signal);
+                this.assertActive(signal);
                 const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, null);
+                this.assertActive(signal);
                 if (bytesRead === 0) break;
                 hash.update(buffer.subarray(0, bytesRead));
                 byteLength += bytesRead;

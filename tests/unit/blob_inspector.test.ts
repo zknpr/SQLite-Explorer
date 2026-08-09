@@ -2,6 +2,7 @@ import './vscode_mock_setup';
 
 import assert from 'node:assert';
 import { afterEach, describe, it, mock } from 'node:test';
+import { DEFAULT_MAX_CELL_EDIT_BYTES } from '../../src/core/cell-edit-policy';
 
 (globalThis as any).acquireVsCodeApi = () => ({
     getState: () => undefined,
@@ -106,6 +107,47 @@ describe('BlobInspector oversized containment', () => {
         assert.strictEqual(rendered[0], small);
         assert.strictEqual(hexed[0], small);
         assert.strictEqual(inspector.currentOversizedMetadata, null);
+    });
+
+    it('rejects an over-edit-limit replacement before reading the file', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const updateCell = mock.fn(async () => 1);
+        const arrayBuffer = mock.fn(async () => new ArrayBuffer(0));
+        const consoleError = mock.method(console, 'error', () => {});
+        backendApi.updateCell = updateCell;
+        state.selectedTable = 'large_cells';
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'statusText') return { textContent: '' };
+                return null;
+            }
+        };
+        const inspector = Object.create(BlobInspector.prototype);
+        Object.assign(inspector, {
+            currentData: Uint8Array.from([1]),
+            currentRowId: 1,
+            currentColName: 'payload',
+            currentCellInfo: { rowIdx: 0, colIdx: 0 },
+            currentOversizedMetadata: null,
+            isUploading: false,
+            setUploadState() {}
+        });
+
+        try {
+            await inspector.uploadFile({
+                name: 'too-large.bin',
+                size: DEFAULT_MAX_CELL_EDIT_BYTES + 1,
+                arrayBuffer
+            });
+            assert.strictEqual(arrayBuffer.mock.callCount(), 0);
+            assert.strictEqual(updateCell.mock.callCount(), 0);
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+            consoleError.mock.restore();
+        }
     });
 
     it('routes full oversized content to the desktop temp-file host flow', async () => {

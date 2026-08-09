@@ -168,6 +168,72 @@ describe('streamTableExport golden parity', () => {
         }
     });
 
+    for (const testCase of [
+        {
+            format: 'csv' as const,
+            expected: 'value\n[SQLite TEXT bytes; encoding=utf-8; base64=gA==]'
+        },
+        {
+            format: 'excel' as const,
+            expected: '\uFEFFvalue\n[SQLite TEXT bytes; encoding=utf-8; base64=gA==]'
+        },
+        {
+            format: 'json' as const,
+            expected:
+                '[\n' +
+                '  {\n' +
+                '    "value": {"$sqliteExplorerTextBytes":{"encoding":"utf-8","base64":"gA=="}}\n' +
+                '  }\n' +
+                ']'
+        },
+        {
+            format: 'sql' as const,
+            expected: 'INSERT INTO "stage_e_invalid_text" ("value") VALUES (CAST(X\'80\' AS TEXT));'
+        }
+    ]) {
+        it(`exports unrepresentable TEXT bytes faithfully in ${testCase.format.toUpperCase()}`, async () => {
+            const database = await createDatabaseEngine({
+                content: null,
+                maxSize: 0,
+                readOnlyMode: false
+            });
+            const operations = database.operations!;
+            await operations.executeQuery(
+                'CREATE TABLE stage_e_invalid_text (value TEXT); ' +
+                "INSERT INTO stage_e_invalid_text VALUES (CAST(X'80' AS TEXT))"
+            );
+
+            try {
+                const exported = await collectStreamingExport(
+                    operations,
+                    'stage_e_invalid_text',
+                    ['value'],
+                    { format: testCase.format }
+                );
+                assert.strictEqual(exported.content, testCase.expected);
+
+                if (testCase.format === 'sql') {
+                    await operations.executeQuery(
+                        'CREATE TABLE stage_e_invalid_text_copy (value TEXT)'
+                    );
+                    await operations.executeQuery(
+                        exported.content.replace(
+                            '"stage_e_invalid_text"',
+                            '"stage_e_invalid_text_copy"'
+                        )
+                    );
+                    const restored = await operations.executeQuery(
+                        'SELECT typeof(value), hex(CAST(value AS BLOB)) ' +
+                        'FROM stage_e_invalid_text_copy'
+                    );
+                    assert.deepStrictEqual(restored[0].rows, [['text', '80']]);
+                }
+            } finally {
+                (operations as WasmDatabaseEngine).shutdown();
+            }
+        });
+    }
+
     it('preserves bounded CSV, JSON, and SQL bytes including options and NUL text', async () => {
         const database = await createDatabaseEngine({
             content: null,
@@ -421,6 +487,76 @@ describe('streamTableExport golden parity', () => {
 });
 
 describe('streamTableExport cell boundaries', () => {
+    it('streams late-invalid TEXT bytes through lossless envelopes without leaking a decoded prefix', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        const rawText = new Uint8Array(EXPORT_CELL_CHUNK_BYTES + 1);
+        rawText.fill(0x61);
+        rawText[rawText.length - 1] = 0x80;
+        const base64 = Buffer.from(rawText).toString('base64');
+        const hex = Buffer.from(rawText).toString('hex');
+        const tagged = `[SQLite TEXT bytes; encoding=utf-8; base64=${base64}]`;
+        await operations.executeQuery('CREATE TABLE stage_e_late_invalid_text (value TEXT)');
+        await operations.executeQuery(
+            'INSERT INTO stage_e_late_invalid_text VALUES (CAST(? AS TEXT))',
+            [rawText]
+        );
+
+        try {
+            const csv = await collectStreamingExport(
+                operations,
+                'stage_e_late_invalid_text',
+                ['value'],
+                { format: 'csv' }
+            );
+            const excel = await collectStreamingExport(
+                operations,
+                'stage_e_late_invalid_text',
+                ['value'],
+                { format: 'excel' }
+            );
+            const json = await collectStreamingExport(
+                operations,
+                'stage_e_late_invalid_text',
+                ['value'],
+                { format: 'json' }
+            );
+            const sql = await collectStreamingExport(
+                operations,
+                'stage_e_late_invalid_text',
+                ['value'],
+                { format: 'sql' }
+            );
+
+            assert.strictEqual(csv.content, `value\n${tagged}`);
+            assert.strictEqual(excel.content, `\uFEFFvalue\n${tagged}`);
+            assert.strictEqual(
+                json.content,
+                '[\n' +
+                '  {\n' +
+                `    "value": {"$sqliteExplorerTextBytes":{"encoding":"utf-8","base64":"${base64}"}}\n` +
+                '  }\n' +
+                ']'
+            );
+            assert.strictEqual(
+                sql.content,
+                `INSERT INTO "stage_e_late_invalid_text" ("value") VALUES (CAST(X'${hex}' AS TEXT));`
+            );
+            for (const exported of [csv, excel, json, sql]) {
+                assert.ok(
+                    exported.chunks.every(chunk => !chunk.includes('a'.repeat(1024))),
+                    'the valid first source chunk must not be emitted before decode preflight finishes'
+                );
+            }
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('keeps JSON base64 and escaped UTF-8 text correct across cell chunk seams', async () => {
         const database = await createDatabaseEngine({
             content: null,
@@ -597,6 +733,101 @@ describe('streamTableExport cell boundaries', () => {
         }
     });
 
+    it('evaluates a volatile ordered view once for the whole streamed export', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_volatile_source (id INTEGER PRIMARY KEY); ' +
+            'INSERT INTO stage_e_volatile_source VALUES (1), (2), (3)'
+        );
+        let invocations = 0;
+        const sqlJs = (operations as unknown as {
+            instance: { create_function(name: string, callback: (id: number) => number): void };
+        }).instance;
+        sqlJs.create_function('__stage_e_volatile_order', (id: number) => {
+            const evaluation = Math.floor(invocations++ / 3);
+            return (id + evaluation) % 3;
+        });
+        await operations.executeQuery(
+            'CREATE VIEW stage_e_volatile_view AS ' +
+            'SELECT id FROM stage_e_volatile_source ' +
+            'ORDER BY __stage_e_volatile_order(id)'
+        );
+        let openedQuerySessions = 0;
+        let closedQuerySessions = 0;
+        const queryReadLimits: number[] = [];
+        const recordingOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'openQueryReadSession') {
+                    return async (sql: string) => {
+                        openedQuerySessions++;
+                        return target.openQueryReadSession!(sql);
+                    };
+                }
+                if (property === 'readQueryRows') {
+                    return async (sessionId: string, maxRows: number) => {
+                        queryReadLimits.push(maxRows);
+                        return target.readQueryRows!(sessionId, maxRows);
+                    };
+                }
+                if (property === 'closeQueryReadSession') {
+                    return async (sessionId: string) => {
+                        closedQuerySessions++;
+                        return target.closeQueryReadSession!(sessionId);
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+
+        try {
+            const exported = await collectStreamingExport(
+                recordingOperations,
+                'stage_e_volatile_view',
+                ['id'],
+                { format: 'csv' }
+            );
+            assert.strictEqual(exported.content, 'id\n3\n1\n2');
+            assert.strictEqual(exported.rowCount, 3);
+            assert.strictEqual(invocations, 3, 'the view must have one SQLite evaluation pass');
+            assert.strictEqual(openedQuerySessions, 1);
+            assert.strictEqual(closedQuerySessions, 1);
+            assert.ok(queryReadLimits.length >= 3);
+            assert.ok(queryReadLimits.every(limit => limit === 1));
+
+            invocations = 0;
+            const spoolFallbackOperations = new Proxy(operations, {
+                get(target, property, receiver) {
+                    if (
+                        property === 'openQueryReadSession'
+                        || property === 'readQueryRows'
+                        || property === 'closeQueryReadSession'
+                    ) {
+                        return undefined;
+                    }
+                    const value = Reflect.get(target, property, receiver);
+                    return typeof value === 'function' ? value.bind(target) : value;
+                }
+            });
+            const fallbackExport = await collectStreamingExport(
+                spoolFallbackOperations,
+                'stage_e_volatile_view',
+                ['id'],
+                { format: 'csv' }
+            );
+            assert.strictEqual(fallbackExport.content, 'id\n3\n1\n2');
+            assert.strictEqual(fallbackExport.rowCount, 3);
+            assert.strictEqual(invocations, 3, 'the spool fallback must also evaluate the view once');
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('refuses selected-row export when the source has no stable row identity', async () => {
         const database = await createDatabaseEngine({
             content: null,
@@ -686,6 +917,42 @@ describe('streamTableExport cell boundaries', () => {
         }
     });
 
+    it('exports a selected unsafe INTEGER stored in a typeless primary key', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_typeless_pk (' +
+            'id PRIMARY KEY, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO stage_e_typeless_pk VALUES (9007199254740993, 'selected')"
+        );
+        const page = await operations.fetchTableData('stage_e_typeless_pk', {
+            columns: ['rowid', 'id', 'value'],
+            limit: 10,
+            offset: 0
+        });
+
+        try {
+            const exported = await collectStreamingExport(
+                operations,
+                'stage_e_typeless_pk',
+                ['id', 'value'],
+                { format: 'csv', rowIds: [page.rows[0][0] as string] }
+            );
+            assert.strictEqual(
+                exported.content,
+                'id,value\n9007199254740993,selected'
+            );
+            assert.strictEqual(exported.rowCount, 1);
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('keeps full WITHOUT ROWID export rows coherent across an equal-length ordering shift', async () => {
         const database = await createDatabaseEngine({
             content: null,
@@ -706,6 +973,8 @@ describe('streamTableExport cell boundaries', () => {
         );
 
         let mutationInjected = false;
+        let mutation: Promise<unknown> | undefined;
+        let serialized!: DatabaseOperations;
         const racingOperations = new Proxy(operations, {
             get(target, property, receiver) {
                 if (property === 'fetchTableData') {
@@ -714,14 +983,15 @@ describe('streamTableExport cell boundaries', () => {
                         if (!mutationInjected && args[0] === 'stage_e_pk_full_race') {
                             mutationInjected = true;
                             // Keep 129 rows and every streamed TEXT length unchanged,
-                            // but shift the first 128-row page by one key.
-                            await target.executeQuery(
+                            // but shift the first 128-row page by one key. Queue
+                            // through the public facade so the export-wide
+                            // snapshot lease keeps this external edit outside.
+                            mutation = serialized.executeQuery(
                                 'DELETE FROM stage_e_pk_full_race WHERE id = 130'
-                            );
-                            await target.executeQuery(
+                            ).then(() => serialized.executeQuery(
                                 'INSERT INTO stage_e_pk_full_race VALUES (?, ?, ?)',
                                 [1, payloadFor(1), 'row-1']
-                            );
+                            ));
                         }
                         return page;
                     };
@@ -730,10 +1000,11 @@ describe('streamTableExport cell boundaries', () => {
                 return typeof value === 'function' ? value.bind(target) : value;
             }
         });
+        serialized = serializeOperations(racingOperations);
 
         try {
             const exported = await collectStreamingExport(
-                racingOperations,
+                serialized,
                 'stage_e_pk_full_race',
                 ['payload', 'tag'],
                 { format: 'csv' }
@@ -752,6 +1023,65 @@ describe('streamTableExport cell boundaries', () => {
                     'one exported row combined a streamed identity value with another row\'s inline value'
                 );
             }
+            await mutation;
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('seeks across 128-row WITHOUT ROWID export boundaries without skips or duplicates', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_pk_seek (' +
+            'tenant TEXT, bucket INTEGER, sequence INTEGER, value TEXT, ' +
+            'PRIMARY KEY (tenant, bucket, sequence)' +
+            ') WITHOUT ROWID; ' +
+            'WITH RECURSIVE rows(id) AS (' +
+            'VALUES(1) UNION ALL SELECT id + 1 FROM rows WHERE id < 257' +
+            ') INSERT INTO stage_e_pk_seek ' +
+            "SELECT printf('tenant-%d', id % 5), id % 7, id, printf('row-%d', id) FROM rows"
+        );
+        const fetches: Parameters<DatabaseOperations['fetchTableData']>[1][] = [];
+        const recordingOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'fetchTableData') {
+                    return async (...args: Parameters<DatabaseOperations['fetchTableData']>) => {
+                        if (args[0] === 'stage_e_pk_seek') fetches.push(args[1]);
+                        return target.fetchTableData(...args);
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+
+        try {
+            const exported = await collectStreamingExport(
+                recordingOperations,
+                'stage_e_pk_seek',
+                ['value'],
+                { format: 'csv' }
+            );
+            const values = exported.content.split('\n').slice(1);
+            assert.strictEqual(exported.rowCount, 257);
+            assert.strictEqual(values.length, 257);
+            assert.strictEqual(new Set(values).size, 257);
+            assert.deepStrictEqual(
+                [...values].sort(),
+                Array.from({ length: 257 }, (_, index) => `row-${index + 1}`).sort()
+            );
+
+            assert.strictEqual(fetches.length, 3);
+            assert.deepStrictEqual(fetches[0].keyset, { mode: 'first' });
+            assert.strictEqual(fetches[1].keyset?.mode, 'after');
+            assert.strictEqual(fetches[2].keyset?.mode, 'after');
+            assert.ok(fetches[1].keyset?.anchor);
+            assert.ok(fetches[2].keyset?.anchor);
         } finally {
             (operations as WasmDatabaseEngine).shutdown();
         }

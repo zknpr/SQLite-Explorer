@@ -14,6 +14,7 @@ import {
 } from '../../src/core/row-identity';
 import {
     CELL_EDIT_VALUE_TOO_LARGE_CODE,
+    DEFAULT_MAX_CELL_EDIT_BYTES,
     toCellEditPolicyErrorData
 } from '../../src/core/cell-edit-policy';
 import { DEFAULT_MAX_INLINE_CELL_BYTES } from '../../src/core/cell-containment';
@@ -267,6 +268,36 @@ describe('HostBridge', () => {
         assert.ok(args.defaultUri.path.endsWith('/dbDir/passwd'), `Expected safe path, got ${args.defaultUri.path}`);
 
         assert.strictEqual(writeFileMock.mock.callCount(), 1);
+    });
+
+    it('rejects an oversized selected BLOB before reading it into the extension host', async () => {
+        const selectedUri = vscode.Uri.parse('file:///dbDir/too-large.bin');
+        mock.method(vscode.window, 'showOpenDialog', async () => [selectedUri]);
+        mock.method(vscode.workspace.fs, 'stat', async () => ({
+            type: vscode.FileType.File,
+            ctime: 0,
+            mtime: 0,
+            size: DEFAULT_MAX_CELL_EDIT_BYTES + 1
+        }));
+        const readFile = mock.method(
+            vscode.workspace.fs,
+            'readFile',
+            async () => new Uint8Array(0)
+        );
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            { uri: vscode.Uri.parse('file:///dbDir/test.db') } as any
+        );
+
+        await assert.rejects(
+            bridge.selectFile(),
+            (error: Error) => {
+                assert.strictEqual((error as any).code, CELL_EDIT_VALUE_TOO_LARGE_CODE);
+                assert.match(error.message, new RegExp(`${DEFAULT_MAX_CELL_EDIT_BYTES}-byte edit limit`));
+                return true;
+            }
+        );
+        assert.strictEqual(readFile.mock.callCount(), 0);
     });
 
 

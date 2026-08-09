@@ -10,6 +10,7 @@ import {
     CellMaterializationService,
     type CellMaterializationOwner
 } from '../../src/cellMaterialization';
+import { serializeOperations } from '../../src/core/operation-serializer';
 import type {
     CellMetadata,
     CellReadTarget,
@@ -25,6 +26,9 @@ function makeChunkedOperations(
     const operations = {
         closeCount: 0,
         readSizes: [] as number[],
+        async executeQuery() {
+            return [];
+        },
         async openCellReadSession() {
             return { sessionId: 'session-1', metadata, expiresAt: Date.now() + 60_000 };
         },
@@ -131,6 +135,193 @@ describe('CellMaterializationService', () => {
         await assert.rejects(
             service.materialize(operations, target),
             /17 bytes exceeds the 16-byte temporary-file quota/
+        );
+        assert.strictEqual(operations.closeCount, 1);
+        assert.deepStrictEqual(fs.readdirSync(testDir), []);
+    });
+
+    it('refuses a second live materialization when the aggregate would exceed quota', async () => {
+        const source = Uint8Array.from({ length: 12 }, () => 0x42);
+        const firstOperations = makeChunkedOperations(
+            source,
+            { storageClass: 'blob', byteLength: source.byteLength }
+        );
+        const secondOperations = makeChunkedOperations(
+            source,
+            { storageClass: 'blob', byteLength: source.byteLength }
+        );
+        service = new CellMaterializationService(vscode.Uri.file(testDir), {
+            maxBytes: 16,
+            chunkBytes: 4
+        });
+
+        const first = await service.materialize(firstOperations, target);
+        await assert.rejects(
+            service.materialize(secondOperations, target),
+            /12-byte materialization.*12 of 16 bytes.*live or in progress/i
+        );
+
+        assert.strictEqual(fs.existsSync(first.uri.fsPath), true);
+        assert.strictEqual(firstOperations.closeCount, 1);
+        assert.strictEqual(secondOperations.closeCount, 1);
+        assert.strictEqual(
+            fs.readdirSync(path.dirname(first.uri.fsPath)).length,
+            1,
+            'refusal must not evict or create another live file'
+        );
+    });
+
+    it('releases aggregate quota when the materialized cell document closes', async () => {
+        const source = Uint8Array.from({ length: 12 }, () => 0x24);
+        const operations = makeChunkedOperations(
+            source,
+            { storageClass: 'blob', byteLength: source.byteLength }
+        );
+        service = new CellMaterializationService(vscode.Uri.file(testDir), {
+            maxBytes: 16,
+            chunkBytes: 4
+        });
+
+        const first = await service.materialize(operations, target);
+        (vscode.workspace as any).__fireDidCloseTextDocument({ uri: first.uri });
+        const replacement = await service.materialize(operations, target);
+
+        assert.strictEqual(fs.existsSync(first.uri.fsPath), false);
+        assert.strictEqual(fs.existsSync(replacement.uri.fsPath), true);
+    });
+
+    it('reserves aggregate quota across concurrent materializations', async () => {
+        const source = Uint8Array.from({ length: 12 }, () => 0x7a);
+        const firstOperations = makeChunkedOperations(
+            source,
+            { storageClass: 'blob', byteLength: source.byteLength }
+        );
+        const secondOperations = makeChunkedOperations(
+            source,
+            { storageClass: 'blob', byteLength: source.byteLength }
+        );
+        const originalRead = firstOperations.readCellChunk.bind(firstOperations);
+        let markReadStarted!: () => void;
+        let allowRead!: () => void;
+        const readStarted = new Promise<void>(resolve => { markReadStarted = resolve; });
+        const readAllowed = new Promise<void>(resolve => { allowRead = resolve; });
+        firstOperations.readCellChunk = async (...args: Parameters<DatabaseOperations['readCellChunk']>) => {
+            markReadStarted();
+            await readAllowed;
+            return originalRead(...args);
+        };
+        service = new CellMaterializationService(vscode.Uri.file(testDir), {
+            maxBytes: 16,
+            chunkBytes: 4
+        });
+
+        const firstPromise = service.materialize(firstOperations, target);
+        await readStarted;
+        try {
+            await assert.rejects(
+                service.materialize(secondOperations, target),
+                /already live or in progress/i
+            );
+        } finally {
+            allowRead();
+        }
+        const first = await firstPromise;
+        assert.strictEqual(fs.existsSync(first.uri.fsPath), true);
+    });
+
+    it('holds one serializer lease until the materialization read session closes', async () => {
+        const source = Uint8Array.from({ length: 8 }, (_, index) => index);
+        const operations = makeChunkedOperations(
+            source,
+            { storageClass: 'blob', byteLength: source.byteLength }
+        );
+        const events: string[] = [];
+        let sessionActive = false;
+        const originalOpen = operations.openCellReadSession.bind(operations);
+        operations.openCellReadSession = async target => {
+            sessionActive = true;
+            events.push('open');
+            return originalOpen(target);
+        };
+        const originalClose = operations.closeCellReadSession.bind(operations);
+        operations.closeCellReadSession = async sessionId => {
+            events.push('close');
+            sessionActive = false;
+            return originalClose(sessionId);
+        };
+
+        let markReadStarted!: () => void;
+        let allowRead!: () => void;
+        const readStarted = new Promise<void>(resolve => { markReadStarted = resolve; });
+        const readAllowed = new Promise<void>(resolve => { allowRead = resolve; });
+        const originalRead = operations.readCellChunk.bind(operations);
+        let firstRead = true;
+        operations.readCellChunk = async (...args) => {
+            if (firstRead) {
+                firstRead = false;
+                markReadStarted();
+                await readAllowed;
+            }
+            return originalRead(...args);
+        };
+        operations.updateCell = async () => {
+            events.push('update');
+            if (sessionActive) throw new Error('active cell read session');
+        };
+        const serialized = serializeOperations(operations);
+        service = new CellMaterializationService(vscode.Uri.file(testDir), {
+            maxBytes: 32,
+            chunkBytes: 4
+        });
+
+        const materialization = service.materialize(serialized, target);
+        await readStarted;
+        const update = serialized.updateCell('cells', 1, 'payload', 'changed').then(
+            () => 'updated',
+            error => `failed: ${String(error)}`
+        );
+        await new Promise(resolve => setImmediate(resolve));
+        allowRead();
+
+        const [materialized, updateStatus] = await Promise.all([materialization, update]);
+        assert.strictEqual(fs.existsSync(materialized.uri.fsPath), true);
+        assert.strictEqual(updateStatus, 'updated');
+        assert.ok(events.indexOf('close') < events.indexOf('update'));
+    });
+
+    it('cancels an in-flight materialization cleanly when the service is disposed', async () => {
+        const source = Uint8Array.from({ length: 12 }, () => 0x5a);
+        const operations = makeChunkedOperations(
+            source,
+            { storageClass: 'blob', byteLength: source.byteLength }
+        );
+        const originalRead = operations.readCellChunk.bind(operations);
+        let markReadStarted!: () => void;
+        let allowRead!: () => void;
+        const readStarted = new Promise<void>(resolve => { markReadStarted = resolve; });
+        const readAllowed = new Promise<void>(resolve => { allowRead = resolve; });
+        operations.readCellChunk = async (...args: Parameters<DatabaseOperations['readCellChunk']>) => {
+            markReadStarted();
+            await readAllowed;
+            return originalRead(...args);
+        };
+        service = new CellMaterializationService(vscode.Uri.file(testDir), {
+            maxBytes: 16,
+            chunkBytes: 4
+        });
+
+        const materialization = service.materialize(operations, target);
+        await readStarted;
+        service.dispose();
+        allowRead();
+
+        await assert.rejects(
+            materialization,
+            (error: Error) => {
+                assert.match(error.message, /Cell materialization service is disposed/);
+                assert.doesNotMatch(error.message, /quota accounting became inconsistent/);
+                return true;
+            }
         );
         assert.strictEqual(operations.closeCount, 1);
         assert.deepStrictEqual(fs.readdirSync(testDir), []);

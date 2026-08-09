@@ -32,6 +32,8 @@ import type {
   CellReadChunk,
   CellReadSession,
   CellReadTarget,
+  QueryReadChunk,
+  QueryReadSession,
   CellTextEncoding,
   OversizedCellMetadata,
   DatabaseWriteResult,
@@ -80,12 +82,14 @@ import {
 import {
   assertMutableRecordId,
   buildRecordIdentitiesPredicate,
+  buildRecordIdentityPredicateChunks,
   buildRecordIdentityPredicate,
   buildTableIdentityMap,
   classifyTableIdentity,
   encodePrimaryKeyRecordId,
   isPrimaryKeyRecordId,
   primaryKeyColumnsFromTableInfo,
+  replacePrimaryKeyRecordIdValues,
   TABLE_IDENTITY_METADATA_SQL
 } from '../../row-identity';
 import {
@@ -264,6 +268,13 @@ interface WasmCellReadSessionState {
   absoluteTimer: ReturnType<typeof setTimeout>;
 }
 
+interface WasmQueryReadSessionState {
+  sessionId: string;
+  statement: WasmPreparedStatement;
+}
+
+const MAX_QUERY_READ_ROWS = 128;
+
 /**
  * State a page-on-demand (openPaged) open hands the engine. Presence of
  * this object is what marks the engine as paged: counts consult the shared
@@ -299,6 +310,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private readonly cellReadSessionAbsoluteTimeoutMs: number;
   private cellReadSession: WasmCellReadSessionState | undefined;
   private readonly closedCellReadSessionIds = new Set<string>();
+  private queryReadSession: WasmQueryReadSessionState | undefined;
+  private readonly closedQueryReadSessionIds = new Set<string>();
   private instanceClosed = false;
   /** Set only for page-on-demand opens; undefined for buffer opens. */
   private readonly pagedState: WasmEnginePagedState | undefined;
@@ -532,7 +545,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     params?: CellValue[],
     cancellation?: WasmQueryCancellation
   ): Promise<QueryResultSet[]> {
-    this.assertNoActiveCellReadSession();
+    this.assertNoActiveReadSession();
     const results: QueryResultSet[] = [];
     const executionState: { currentStmt?: WasmPreparedStatement } = {};
 
@@ -593,10 +606,15 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
-  private assertNoActiveCellReadSession(): void {
+  private assertNoActiveReadSession(): void {
     if (this.cellReadSession) {
       throw new Error(
         'A cell read session is active; close it before running another database operation'
+      );
+    }
+    if (this.queryReadSession) {
+      throw new Error(
+        'A query read session is active; close it before running another database operation'
       );
     }
   }
@@ -631,13 +649,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   async getCellMetadata(target: CellReadTarget): Promise<CellMetadata> {
-    this.assertNoActiveCellReadSession();
+    this.assertNoActiveReadSession();
     const sqlTarget = await this.resolveCellReadSqlTarget(target);
     return this.readCellMetadata(target, sqlTarget);
   }
 
   async openCellReadSession(target: CellReadTarget): Promise<CellReadSession> {
-    this.assertNoActiveCellReadSession();
+    this.assertNoActiveReadSession();
     const sqlTarget = await this.resolveCellReadSqlTarget(target);
     const sessionId = crypto.randomUUID();
     const savepointName = this.createSavepointName('sp_cell_read');
@@ -738,6 +756,54 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       throw new Error(`Cell read session expired or not found: ${sessionId}`);
     }
     this.releaseCellReadSession(session);
+  }
+
+  async openQueryReadSession(sql: string): Promise<QueryReadSession> {
+    this.assertNoActiveReadSession();
+    const sessionId = crypto.randomUUID();
+    const statement = this.prepareSingleStatement(sql);
+    this.queryReadSession = { sessionId, statement };
+    return { sessionId };
+  }
+
+  async readQueryRows(sessionId: string, maxRows: number): Promise<QueryReadChunk> {
+    if (!Number.isSafeInteger(maxRows) || maxRows < 1 || maxRows > MAX_QUERY_READ_ROWS) {
+      throw new Error(
+        `Query read row limit must be an integer between 1 and ${MAX_QUERY_READ_ROWS}`
+      );
+    }
+    const session = this.queryReadSession;
+    if (!session || session.sessionId !== sessionId) {
+      throw new Error(`Query read session not found: ${sessionId}`);
+    }
+
+    return this.executeWithProgressHandler(() => {
+      const rows: CellValue[][] = [];
+      while (rows.length < maxRows && session.statement.step()) {
+        const row = session.statement.get();
+        if (!row) {
+          throw new Error('SQLite returned no row after a successful statement step');
+        }
+        rows.push(row);
+      }
+      // When a batch fills exactly, EOF is learned by the next bounded read;
+      // stepping ahead here would consume a row we cannot safely buffer.
+      return { rows, done: rows.length < maxRows };
+    });
+  }
+
+  async closeQueryReadSession(sessionId: string): Promise<void> {
+    if (this.closedQueryReadSessionIds.has(sessionId)) return;
+    const session = this.queryReadSession;
+    if (!session || session.sessionId !== sessionId) {
+      throw new Error(`Query read session not found: ${sessionId}`);
+    }
+    this.queryReadSession = undefined;
+    try {
+      session.statement.free();
+    } finally {
+      this.closedQueryReadSessionIds.add(sessionId);
+    }
   }
 
   private refreshCellReadSession(session: WasmCellReadSessionState): void {
@@ -1613,7 +1679,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     maxEditValueBytes?: number,
     historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
   ): Promise<RecordId> {
-    this.assertNoActiveCellReadSession();
+    this.assertNoActiveReadSession();
     const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
     const enforcePriorPolicy = !isHistoryReplay && maxEditValueBytes !== undefined;
     const editLimitBytes = isHistoryReplay
@@ -1717,7 +1783,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     expected: OversizedCellMetadata,
     maxEditValueBytes?: number
   ): Promise<RecordId> {
-    this.assertNoActiveCellReadSession();
+    this.assertNoActiveReadSession();
     const editLimitBytes = assertCellValuesWithinEditLimit([value], maxEditValueBytes);
     assertOversizedCellReplacementExpectation(expected, editLimitBytes);
     assertMutableRecordId(rowId);
@@ -1743,10 +1809,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
       if (identity.kind === 'rowid') return validateRowId(rowId);
 
-      const candidateValues = [...predicate.primaryKey!.values];
       const keyIndex = identity.columns.findIndex(key => key.identifier === column);
-      if (keyIndex >= 0) candidateValues[keyIndex] = value;
-      const candidateId = encodePrimaryKeyRecordId(identity.columns, candidateValues);
+      const candidateId = replacePrimaryKeyRecordIdValues(
+        rowId,
+        identity,
+        keyIndex >= 0 ? [{ column, value }] : []
+      );
       return this.readPrimaryKeyRecordId(
         table,
         identity,
@@ -1918,38 +1986,43 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       if (identity.kind !== 'primaryKey') {
         throw new Error(`Primary-key identity cannot target rowid table ${table}`);
       }
-      const predicate = buildRecordIdentitiesPredicate(rowIds, identity);
+      const predicates = buildRecordIdentityPredicateChunks(rowIds, identity);
       const savepointName = this.createSavepointName('sp_delete_pk_rows');
       await this.executeQuery(`SAVEPOINT ${savepointName}`);
       try {
         const insertableColumns = await this.getInsertableColumnNames(table);
-        const current = this.queryRaw(
-          `SELECT ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
-          `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
-          predicate.params
-        );
-        const primaryKeyIndices = identity.columns.map(column => {
-          const index = current.headers.indexOf(column.identifier);
-          if (index < 0) throw new Error(`Primary-key column missing from ${table}: ${column.identifier}`);
-          return index;
-        });
-        const deletedRows = current.rows.map(row => {
-          const rowId = encodePrimaryKeyRecordId(
-            identity.columns,
-            primaryKeyIndices.map(index => row[index])
+        const deletedRows: DeletedRow[] = [];
+        for (const predicate of predicates) {
+          const current = this.queryRaw(
+            `SELECT ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+            `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+            predicate.params
           );
-          const rowData = Object.fromEntries(
-            current.headers.map((header, index) => [header, row[index] as CellValue])
-          );
-          return { rowId, row: rowData };
-        });
+          const primaryKeyIndices = identity.columns.map(column => {
+            const index = current.headers.indexOf(column.identifier);
+            if (index < 0) throw new Error(`Primary-key column missing from ${table}: ${column.identifier}`);
+            return index;
+          });
+          deletedRows.push(...current.rows.map(row => {
+            const deletedRowId = encodePrimaryKeyRecordId(
+              identity.columns,
+              primaryKeyIndices.map(index => row[index])
+            );
+            const rowData = Object.fromEntries(
+              current.headers.map((header, index) => [header, row[index] as CellValue])
+            );
+            return { rowId: deletedRowId, row: rowData };
+          }));
+        }
         if (deletedRows.length !== rowIds.length) {
           throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
         }
-        await this.executeQuery(
-          `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
-          predicate.params
-        );
+        for (const predicate of predicates) {
+          await this.executeQuery(
+            `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+            predicate.params
+          );
+        }
         await this.executeQuery(`RELEASE ${savepointName}`);
         return deletedRows;
       } catch (error) {
@@ -2324,14 +2397,23 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           ]
         );
 
-        const candidateValues = [...oldPredicate.primaryKey!.values];
+        const primaryKeyReplacements: Array<{ column: string; value: CellValue }> = [];
         for (const preparedUpdate of preparedUpdates) {
           const keyIndex = identity.columns.findIndex(
             keyColumn => keyColumn.identifier === preparedUpdate.update.column
           );
-          if (keyIndex >= 0) candidateValues[keyIndex] = preparedUpdate.storedValue;
+          if (keyIndex >= 0) {
+            primaryKeyReplacements.push({
+              column: preparedUpdate.update.column,
+              value: preparedUpdate.storedValue
+            });
+          }
         }
-        const candidateId = encodePrimaryKeyRecordId(identity.columns, candidateValues);
+        const candidateId = replacePrimaryKeyRecordIdValues(
+          rowId,
+          identity,
+          primaryKeyReplacements
+        );
         const newRowId = this.readPrimaryKeyRecordId(
           table,
           identity,
@@ -3333,6 +3415,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * Release database resources.
    */
   shutdown(): void {
+    if (this.queryReadSession) {
+      try {
+        const { sessionId } = this.queryReadSession;
+        this.queryReadSession.statement.free();
+        this.queryReadSession = undefined;
+        this.closedQueryReadSessionIds.add(sessionId);
+      } catch (error) {
+        this.logger('error', 'Failed to release query read session during shutdown:', error);
+      }
+    }
     if (this.cellReadSession) {
       try {
         this.releaseCellReadSession(this.cellReadSession);

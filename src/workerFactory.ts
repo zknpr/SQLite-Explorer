@@ -45,6 +45,8 @@ import type {
   CellReadChunk,
   CellReadSession,
   CellReadTarget,
+  QueryReadChunk,
+  QueryReadSession,
   OversizedCellMetadata,
   DatabaseWriteResult,
   ColumnDropTableState
@@ -131,6 +133,9 @@ interface WorkerMethods {
     maxBytes: number
   ): Promise<CellReadChunk>;
   closeCellReadSession(sessionId: string): Promise<void>;
+  openQueryReadSession(sql: string): Promise<QueryReadSession>;
+  readQueryRows(sessionId: string, maxRows: number): Promise<QueryReadChunk>;
+  closeQueryReadSession(sessionId: string): Promise<void>;
   exportDatabase(): Promise<Uint8Array>;
   exportPagedWritableOverlay(): Promise<PagedWritableOverlaySnapshot>;
   applyModifications(mods: ModificationEntry[]): Promise<void>;
@@ -221,6 +226,9 @@ const WORKER_METHOD_NAMES = [
   'openCellReadSession',
   'readCellChunk',
   'closeCellReadSession',
+  'openQueryReadSession',
+  'readQueryRows',
+  'closeQueryReadSession',
   'exportDatabase',
   'exportPagedWritableOverlay',
   'applyModifications',
@@ -541,6 +549,12 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.readCellChunk(sessionId, byteOffset, maxBytes),
         closeCellReadSession: (sessionId: string) =>
           endpoint.closeCellReadSession(sessionId),
+        openQueryReadSession: (sql: string) =>
+          endpoint.openQueryReadSession(sql),
+        readQueryRows: (sessionId: string, maxRows: number) =>
+          endpoint.readQueryRows(sessionId, maxRows),
+        closeQueryReadSession: (sessionId: string) =>
+          endpoint.closeQueryReadSession(sessionId),
         // In-process facade plumbing; persistence policy belongs to the caller.
         serializeDatabase: () => endpoint.exportDatabase(),
         applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
@@ -735,10 +749,9 @@ async function createWorkerBackedWasmDatabaseConnection(
       autoCommit?: boolean
     ) {
       // Keep the configured refusal message ready for local files above
-      // maxFileSize. The worker independently selects page-on-demand storage
-      // using its materialization threshold; this message is surfaced only
-      // when that open still requires an over-cap in-memory fallback.
-      let oversizedInMemoryMessage: string | undefined;
+      // maxFileSize. The worker owns the authoritative backend-agnostic gate;
+      // the host substitutes the existing user-facing units when it refuses.
+      let oversizedFileMessage: string | undefined;
       try {
         // Read database file
         // Optimization: If running in Node and file is local, pass path to worker instead of reading content here
@@ -754,7 +767,7 @@ async function createWorkerBackedWasmDatabaseConnection(
             const maxSize = getMaximumFileSizeBytes();
             const fileStat = await vsc.workspace.fs.stat(fileUri);
             if (maxSize !== 0 && fileStat.size > maxSize) {
-               oversizedInMemoryMessage = `File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`;
+               oversizedFileMessage = `File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`;
             }
             filePath = fileUri.fsPath;
         } else {
@@ -769,7 +782,7 @@ async function createWorkerBackedWasmDatabaseConnection(
         // checkpoint leftovers — see WAL_HEADER_SIZE_BYTES).
         const walSize = await statWalSize(fileUri);
         const hasUncheckpointedWal = walSize > WAL_HEADER_SIZE_BYTES;
-        if (oversizedInMemoryMessage !== undefined && hasUncheckpointedWal) {
+        if (oversizedFileMessage !== undefined && hasUncheckpointedWal) {
           // Over the in-memory gate AND carrying (or possibly carrying) WAL
           // frames: the file can neither buffer (over the gate) nor open
           // page-on-demand (the snapshot reads only the main file and would
@@ -784,7 +797,7 @@ async function createWorkerBackedWasmDatabaseConnection(
           //
           // Deliberate final rejection: clear the size-error substitution so
           // the catch below surfaces the checkpoint instruction itself.
-          oversizedInMemoryMessage = undefined;
+          oversizedFileMessage = undefined;
           throw new Error(
             `${displayName} has uncheckpointed WAL data and exceeds the in-memory size limit for the `
             + 'WebAssembly backend, so it cannot be opened: a page-on-demand snapshot reads only the '
@@ -812,7 +825,7 @@ async function createWorkerBackedWasmDatabaseConnection(
           queryTimeout: getQueryTimeout(),
           // Desktop local files may use page-on-demand storage above the
           // worker's dedicated paging threshold (writable first, then
-          // read-only), independently of maxSize.
+          // read-only) after the independent maxSize refusal gate passes.
           // The browser extension host never reaches this bundle, and paged
           // mode is impossible there anyway: workspace.fs is async-only
           // while the in-process engine needs synchronous reads.
@@ -913,6 +926,12 @@ async function createWorkerBackedWasmDatabaseConnection(
             workerProxy.readCellChunk(sessionId, byteOffset, maxBytes),
           closeCellReadSession: (sessionId: string) =>
             workerProxy.closeCellReadSession(sessionId),
+          openQueryReadSession: (sql: string) =>
+            workerProxy.openQueryReadSession(sql),
+          readQueryRows: (sessionId: string, maxRows: number) =>
+            workerProxy.readQueryRows(sessionId, maxRows),
+          closeQueryReadSession: (sessionId: string) =>
+            workerProxy.closeQueryReadSession(sessionId),
           // Worker facade plumbing; persistence policy belongs to the caller.
           serializeDatabase: () => workerProxy.exportDatabase(),
           applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
@@ -1068,16 +1087,15 @@ async function createWorkerBackedWasmDatabaseConnection(
       } catch (err) {
         // Terminate worker on connection failure to prevent leak
         terminateWorker();
-        if (oversizedInMemoryMessage !== undefined) {
-          // An over-cap open still failed (paging was not selected, was
-          // unavailable, or failed). Preserve the configured refusal surface,
-          // with the worker's real reason on the cause chain and in the log.
+        if (oversizedFileMessage !== undefined) {
+          // Preserve the configured refusal surface while retaining the
+          // worker's authoritative byte-level reason on the cause chain.
           const reason = err instanceof Error ? err.message : String(err);
           GlobalOutputChannel?.appendLine(
             `[SQLite Explorer] ${displayName}: WebAssembly open failed (${reason}); `
             + 'reporting the configured maxFileSize refusal.'
           );
-          throw new Error(oversizedInMemoryMessage, { cause: err });
+          throw new Error(oversizedFileMessage, { cause: err });
         }
         throw err;
       }

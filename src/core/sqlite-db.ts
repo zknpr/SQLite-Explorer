@@ -31,6 +31,8 @@ import type {
   CellReadChunk,
   CellReadSession,
   CellReadTarget,
+  QueryReadChunk,
+  QueryReadSession,
   OversizedCellMetadata,
   DatabaseWriteResult,
   ColumnDropTableState
@@ -114,14 +116,15 @@ export async function createEngineFromModule(
   // Create database instance
   let wasmInstance: WasmDatabaseInstance;
   let buffer = config.content;
+  let localFileFs: NodeFsModule | undefined;
 
   // If content is missing but filePath is provided, read from disk (Node.js only)
   // NOTE: this reads only the main database file — sql.js cannot merge a
   // sibling -wal file, so committed-but-uncheckpointed WAL frames would be
   // invisible here. The layer that owns file access (workerFactory) checks
-  // for WAL data before handing over a filePath (or content bytes) and forces
-  // readOnlyMode when it finds any; the only WAL awareness in the engine is
-  // the paged fallback's defensive frame recheck (openPagedDatabaseEngine).
+  // for WAL data before handing over a filePath (or content bytes), while this
+  // factory terminally refuses recovery-bearing rollback journals because its
+  // byte-only in-memory fallback cannot give SQLite access to that sibling.
   //
   // A filePath that cannot be stat'd/read MUST fail the open. Falling through
   // to the empty-database branch below would show an empty writable view of a
@@ -139,6 +142,7 @@ export async function createEngineFromModule(
         `Failed to open database file '${config.filePath}': file system access is unavailable in this environment`
       );
     }
+    localFileFs = fs;
     try {
       const pagedOpenThresholdBytes =
         config.pagedOpenThresholdBytes ?? DESKTOP_PAGED_OPEN_THRESHOLD_BYTES;
@@ -150,11 +154,9 @@ export async function createEngineFromModule(
       }
 
       // Paging policy and refusal policy are intentionally independent:
-      // large local files try the writable/read-only paged ladder even when
-      // maxSize is unlimited or higher than the file. maxSize is consulted
-      // only if paging is unavailable, fails, or is not selected below the
-      // threshold. This prevents an "unlimited" cap from forcing a multi-GB
-      // readFile + sql.js materialization.
+      // maxSize is a backend-agnostic refusal gate, while files that pass it
+      // use the separate paging threshold to avoid a multi-GB readFile +
+      // sql.js materialization. A zero cap remains unlimited.
       let pagedFailure: unknown;
       let pagedAttempted = false;
       const tryOpenPagedFile = (actualSize: number): DatabaseInitResult | undefined => {
@@ -181,6 +183,14 @@ export async function createEngineFromModule(
                 logger
               );
             } catch (pagedError) {
+              // No later WASM rung can safely recover a sibling rollback
+              // journal because every rung receives only main-file bytes.
+              if (
+                pagedError instanceof RollbackJournalSafetyError
+                || pagedError instanceof WalSafetyError
+              ) {
+                throw pagedError;
+              }
               pagedFailure = pagedError;
               const fallback = config.maxSize > 0 && actualSize > config.maxSize
                 ? 'falling back to the size-limit rejection'
@@ -205,16 +215,13 @@ export async function createEngineFromModule(
         );
       };
       const routeKnownSize = (actualSize: number): DatabaseInitResult | undefined => {
+        if (config.maxSize > 0 && actualSize > config.maxSize) {
+          rejectOverLimitFile(actualSize);
+        }
+        assertNoRecoveryBearingRollbackJournal(fs, config.filePath!);
         if (actualSize > pagedOpenThresholdBytes && !pagedAttempted) {
           const paged = tryOpenPagedFile(actualSize);
           if (paged) return paged;
-        }
-        // Below the paging threshold, maxSize is an explicit refusal cap on
-        // full-image materialization. Lowering it must restrict that path, not
-        // implicitly opt the file into a different storage backend; paging is
-        // selected only by the independent threshold above.
-        if (config.maxSize > 0 && actualSize > config.maxSize) {
-          rejectOverLimitFile(actualSize);
         }
         return undefined;
       };
@@ -250,6 +257,22 @@ export async function createEngineFromModule(
     // Open existing database from binary
     // Avoid creating an intermediate copy
 
+    if (config.filePath && localFileFs) {
+      try {
+        // This final synchronous check is deliberately adjacent to the raw
+        // constructor. It minimizes the cross-process inspection/open window;
+        // Node cannot acquire SQLite's RESERVED lock, so the earlier and paged
+        // checks remain conservative rather than claiming a lock-safe snapshot.
+        assertNoRecoveryBearingRollbackJournal(localFileFs, config.filePath);
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : String(e);
+        throw new Error(
+          `Failed to open database file '${config.filePath}': ${reason}`,
+          { cause: e }
+        );
+      }
+    }
+
     const data = (buffer.buffer && buffer.byteLength === buffer.buffer.byteLength)
         ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
         : buffer;
@@ -283,6 +306,19 @@ export async function createEngineFromModule(
 }
 
 type NodeFsModule = NonNullable<ReturnType<typeof getNodeFs>>;
+
+const ROLLBACK_JOURNAL_MIN_HOT_BYTES = 512;
+const ROLLBACK_JOURNAL_HEADER_MAGIC = [
+  0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7
+] as const;
+
+class RollbackJournalSafetyError extends Error {
+  readonly name = 'RollbackJournalSafetyError';
+}
+
+class WalSafetyError extends Error {
+  readonly name = 'WalSafetyError';
+}
 
 const PAGED_FILE_CHANGED_MESSAGE =
   'Database file changed on disk; reload the document.';
@@ -323,11 +359,11 @@ function samePagedFileIdentity(
 
 /**
  * Defensive re-check of the sibling `-wal` immediately before a paged
- * open. workerFactory's gate already rejected frame-bearing siblings
- * before permitting the fallback, but a frame could appear between that
- * check and this open (a writer showing up), and a snapshot taken then
- * would silently miss committed rows. Failing here routes the open into
- * the ordinary size-gate rejection instead.
+ * open. The host classifies frame-bearing siblings before permitting the
+ * fallback, but a frame could appear between that check and this open (a
+ * writer showing up), and a snapshot taken then would silently miss committed
+ * rows. This is terminal for every WASM rung: the in-memory constructor also
+ * receives only the main-file bytes.
  */
 function assertNoSiblingWalFrames(fs: NodeFsModule, filePath: string): void {
   const walPath = `${filePath}-wal`;
@@ -339,17 +375,101 @@ function assertNoSiblingWalFrames(fs: NodeFsModule, filePath: string): void {
     // No sibling: there is no WAL state a main-file snapshot could miss.
     if (code === 'ENOENT') return;
     const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(
+    throw new WalSafetyError(
       `cannot verify WAL state of '${walPath}': ${reason}`,
       { cause: error }
     );
   }
   if (walSize > WAL_HEADER_SIZE_BYTES) {
-    throw new Error(
+    throw new WalSafetyError(
       `sibling WAL file '${walPath}' holds uncheckpointed frames (${walSize} bytes); `
       + 'a page-on-demand snapshot of the main file would miss them'
     );
   }
+}
+
+/**
+ * Refuse a rollback journal that SQLite could need for crash recovery. The
+ * documented hot-journal shape includes a size above 512 bytes and a valid,
+ * non-zero eight-byte header. Determining the RESERVED-lock part of SQLite's
+ * hot-journal test is not safely available through Node's file APIs, so a
+ * recovery-bearing header is treated conservatively as potentially hot.
+ * Empty, header-only, and zeroed PERSIST-mode leftovers remain openable.
+ */
+function assertNoRecoveryBearingRollbackJournal(
+  fs: NodeFsModule,
+  filePath: string
+): void {
+  const journalPath = `${filePath}-journal`;
+  let fd: number;
+  try {
+    fd = fs.openSync(journalPath, 'r');
+  } catch (error) {
+    const code = (error as { code?: string } | undefined)?.code;
+    if (code === 'ENOENT') return;
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new RollbackJournalSafetyError(
+      `Cannot verify rollback journal '${journalPath}': ${reason}. ` +
+      'The WebAssembly backend cannot safely recover sibling journals.',
+      { cause: error }
+    );
+  }
+
+  let failure: RollbackJournalSafetyError | undefined;
+  try {
+    const journalSize = fs.fstatSync(fd).size;
+    if (!Number.isSafeInteger(journalSize) || journalSize < 0) {
+      failure = new RollbackJournalSafetyError(
+        `Cannot verify rollback journal '${journalPath}': its size is not a safe integer. ` +
+        'The WebAssembly backend cannot safely recover sibling journals.'
+      );
+    } else if (journalSize > ROLLBACK_JOURNAL_MIN_HOT_BYTES) {
+      const header = new Uint8Array(ROLLBACK_JOURNAL_HEADER_MAGIC.length);
+      let bytesRead = 0;
+      while (bytesRead < header.byteLength) {
+        const read = fs.readSync(
+          fd,
+          header,
+          bytesRead,
+          header.byteLength - bytesRead,
+          bytesRead
+        );
+        if (read === 0) break;
+        bytesRead += read;
+      }
+      if (bytesRead !== header.byteLength) {
+        failure = new RollbackJournalSafetyError(
+          `Cannot verify rollback journal '${journalPath}': its header changed during inspection. ` +
+          'The WebAssembly backend cannot safely recover sibling journals.'
+        );
+      } else if (ROLLBACK_JOURNAL_HEADER_MAGIC.every((byte, index) => header[index] === byte)) {
+        failure = new RollbackJournalSafetyError(
+          `Sibling rollback journal '${journalPath}' has a valid SQLite header and may require ` +
+          'crash recovery. This WebAssembly open reads only the main database file and cannot ' +
+          'safely recover it. Open the database once with writable native SQLite, then reopen it.'
+        );
+      }
+    }
+  } catch (error) {
+    failure = error instanceof RollbackJournalSafetyError
+      ? error
+      : new RollbackJournalSafetyError(
+          `Cannot verify rollback journal '${journalPath}': ${
+            error instanceof Error ? error.message : String(error)
+          }. The WebAssembly backend cannot safely recover sibling journals.`,
+          { cause: error }
+        );
+  }
+
+  try {
+    fs.closeSync(fd);
+  } catch (error) {
+    failure = new RollbackJournalSafetyError(
+      `Cannot safely close rollback journal '${journalPath}' after inspection.`,
+      { cause: failure === undefined ? error : new AggregateError([failure, error]) }
+    );
+  }
+  if (failure) throw failure;
 }
 
 /**
@@ -373,6 +493,7 @@ function openPagedDatabaseEngine(
   mode: 'writable' | 'readOnly',
   logger?: WasmEngineLogHandler
 ): DatabaseInitResult {
+  assertNoRecoveryBearingRollbackJournal(fs, filePath);
   assertNoSiblingWalFrames(fs, filePath);
 
   const fd = fs.openSync(filePath, 'r');
@@ -485,7 +606,9 @@ function openPagedDatabaseEngine(
     });
     try {
       // Close the stat/open race: a writer can create a frame-bearing WAL
-      // while openPaged is initializing even when the pre-open stat missed it.
+      // or recovery-bearing rollback journal while openPaged is initializing
+      // even when the pre-open checks missed it.
+      assertNoRecoveryBearingRollbackJournal(fs, filePath);
       assertNoSiblingWalFrames(fs, filePath);
       const engine = new WasmDatabaseEngine(
         instance,
@@ -643,6 +766,18 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
 
     async closeCellReadSession(sessionId: string): Promise<void> {
       return requireEngine().closeCellReadSession(sessionId);
+    },
+
+    async openQueryReadSession(sql: string): Promise<QueryReadSession> {
+      return requireEngine().openQueryReadSession(sql);
+    },
+
+    async readQueryRows(sessionId: string, maxRows: number): Promise<QueryReadChunk> {
+      return requireEngine().readQueryRows(sessionId, maxRows);
+    },
+
+    async closeQueryReadSession(sessionId: string): Promise<void> {
+      return requireEngine().closeQueryReadSession(sessionId);
     },
 
     /**

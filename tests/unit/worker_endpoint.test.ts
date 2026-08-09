@@ -89,7 +89,7 @@ describe('Worker Endpoint', () => {
         assert.ok(data.length > 0);
     });
 
-    it('routes bounded cell sessions through the worker endpoint', async () => {
+    it('routes bounded cell and query sessions through the worker endpoint', async () => {
         await endpoint.initializeDatabase('test.db', {
             content: null,
             maxSize: 0,
@@ -116,6 +116,20 @@ describe('Worker Endpoint', () => {
         assert.deepStrictEqual(first.bytes, new Uint8Array([65, 240, 159]));
         assert.deepStrictEqual(second.bytes, new Uint8Array([152, 128, 66]));
         assert.strictEqual(second.done, true);
+
+        const querySession = await endpoint.openQueryReadSession(
+            'SELECT payload FROM cell_windows'
+        );
+        assert.deepStrictEqual(
+            await endpoint.readQueryRows(querySession.sessionId, 1),
+            { rows: [['A😀B']], done: false }
+        );
+        assert.deepStrictEqual(
+            await endpoint.readQueryRows(querySession.sessionId, 1),
+            { rows: [], done: true }
+        );
+        await endpoint.closeQueryReadSession(querySession.sessionId);
+        await endpoint.closeQueryReadSession(querySession.sessionId);
     });
 
     it('forwards skipped view-undo diagnostics through the endpoint logger', async () => {

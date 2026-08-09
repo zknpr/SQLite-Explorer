@@ -37,6 +37,7 @@ import type { CellMaterializationService } from './cellMaterialization';
 import {
   assertCellValueWithinEditLimit,
   assertCellValuesWithinEditLimit,
+  CellEditPolicyError,
   DEFAULT_MAX_CELL_EDIT_BYTES,
   formatOversizedCellReplacementWarning,
   isOversizedCellReplacementConflictError,
@@ -1717,7 +1718,15 @@ export class HostBridge implements ToastService {
 
     if (uris && uris.length > 0) {
         const uri = uris[0];
+        const stat = await vsc.workspace.fs.stat(uri);
+        if (!Number.isSafeInteger(stat.size) || stat.size < 0) {
+            throw new Error('Unable to determine the selected file size safely.');
+        }
+        if (stat.size > DEFAULT_MAX_CELL_EDIT_BYTES) {
+            throw new CellEditPolicyError('blob', stat.size, DEFAULT_MAX_CELL_EDIT_BYTES);
+        }
         const data = await vsc.workspace.fs.readFile(uri);
+        assertCellValueWithinEditLimit(data, DEFAULT_MAX_CELL_EDIT_BYTES);
         return {
             name: path.basename(uri.fsPath),
             data: data

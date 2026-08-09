@@ -436,7 +436,7 @@ describe('workerFactory error path tests', () => {
     }
   });
 
-  it('routes bounded cell sessions through the desktop WASM worker facade', async () => {
+  it('routes bounded read sessions through the desktop WASM worker facade', async () => {
     const target = { table: 'items', rowId: 7, column: 'payload' };
     const metadata = { storageClass: 'blob', byteLength: 3 };
     workerProxy = {
@@ -455,6 +455,17 @@ describe('workerFactory error path tests', () => {
       },
       closeCellReadSession: async (sessionId: string) => {
         assert.strictEqual(sessionId, 'session-1');
+      },
+      openQueryReadSession: async (sql: string) => {
+        assert.strictEqual(sql, 'SELECT value FROM items');
+        return { sessionId: 'query-session-1' };
+      },
+      readQueryRows: async (sessionId: string, maxRows: number) => {
+        assert.deepStrictEqual([sessionId, maxRows], ['query-session-1', 1]);
+        return { rows: [['value']], done: false };
+      },
+      closeQueryReadSession: async (sessionId: string) => {
+        assert.strictEqual(sessionId, 'query-session-1');
       }
     };
 
@@ -471,6 +482,9 @@ describe('workerFactory error path tests', () => {
     assert.ok(exposedWorkerMethods.includes('openCellReadSession'));
     assert.ok(exposedWorkerMethods.includes('readCellChunk'));
     assert.ok(exposedWorkerMethods.includes('closeCellReadSession'));
+    assert.ok(exposedWorkerMethods.includes('openQueryReadSession'));
+    assert.ok(exposedWorkerMethods.includes('readQueryRows'));
+    assert.ok(exposedWorkerMethods.includes('closeQueryReadSession'));
     assert.deepStrictEqual(await connection.databaseOps.getCellMetadata(target), metadata);
     const session = await connection.databaseOps.openCellReadSession(target);
     assert.strictEqual(session.sessionId, 'session-1');
@@ -479,6 +493,14 @@ describe('workerFactory error path tests', () => {
       { byteOffset: 0, bytes: new Uint8Array([1, 2, 3]), done: true }
     );
     await connection.databaseOps.closeCellReadSession(session.sessionId);
+    const querySession = await connection.databaseOps.openQueryReadSession!(
+      'SELECT value FROM items'
+    );
+    assert.deepStrictEqual(
+      await connection.databaseOps.readQueryRows!(querySession.sessionId, 1),
+      { rows: [['value']], done: false }
+    );
+    await connection.databaseOps.closeQueryReadSession!(querySession.sessionId);
   });
 
   it('rejects pre-aborted desktop worker operations instead of throwing synchronously', async () => {

@@ -9,6 +9,7 @@ import * as vscode from 'vscode';
 import { isNativeAvailable, NativeWorkerProcess } from '../../src/nativeWorker';
 import { InvocationTimeoutError } from '../../src/core/rpc';
 import type { DatabaseOperations } from '../../src/core/types';
+import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
 import { createDeferred } from './helpers/deferred';
 import {
     CellEditPolicyError,
@@ -420,6 +421,81 @@ describe('createNativeDatabaseConnection', () => {
                 !['getCellMetadata', 'openCellReadSession'].includes(call.method)
                 || !call.args.some(argument => typeof argument === 'string' && /rowid\s*=/.test(argument))
             )));
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('preserves typeless INTEGER cast flags in native primary-key cell locators', async () => {
+        const metadata = { storageClass: 'blob', byteLength: 4 };
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                const sql = String(call.args[0]);
+                if (sql.startsWith('SELECT "type", "wr" FROM pragma_table_list')) {
+                    return { result: { columns: ['type', 'wr'], values: [['table', 1]] } };
+                }
+                if (sql.startsWith('PRAGMA table_info')) {
+                    return {
+                        result: {
+                            columns: ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'],
+                            values: [
+                                [0, 'id', '', 1, null, 1],
+                                [1, 'shard', 'TEXT', 1, null, 2],
+                                [2, 'payload', 'BLOB', 0, null, 0]
+                            ]
+                        }
+                    };
+                }
+            }
+            if (call.method === 'getCellMetadata') return { result: metadata };
+            if (call.method === 'openCellReadSession') {
+                return {
+                    result: { sessionId: 'native-pk-session', metadata, expiresAt: 1234 }
+                };
+            }
+            return { result: { success: true } };
+        });
+        const columns = [
+            { identifier: 'id', declaredType: '', position: 1 },
+            { identifier: 'shard', declaredType: 'TEXT', position: 2 }
+        ];
+        const rowId = encodePrimaryKeyRecordId(columns, [9007199254740993n, 'a']);
+        const target = { table: 'assets', rowId, column: 'payload' };
+
+        try {
+            connection.calls.length = 0;
+            assert.deepStrictEqual(await connection.databaseOps.getCellMetadata(target), metadata);
+            await connection.databaseOps.openCellReadSession(target);
+            const expectedLocator = {
+                kind: 'primaryKey',
+                columns: ['id', 'shard'],
+                values: ['9007199254740993', 'a'],
+                integerCasts: [true, false]
+            };
+            for (const method of ['getCellMetadata', 'openCellReadSession']) {
+                const call = connection.calls.find(candidate => candidate.method === method);
+                assert.ok(call, `missing ${method} native call`);
+                assert.deepStrictEqual(call.args, ['assets', 'payload', expectedLocator]);
+            }
+
+            const escapeCellIdentifier = loadNativeWorkerFunction(
+                'escapeCellIdentifier',
+                ['value', 'label']
+            );
+            const isCellBinding = loadNativeWorkerFunction('isCellBinding', ['value']);
+            const buildCellLocator = loadNativeWorkerFunction(
+                'buildCellLocator',
+                ['locator'],
+                { escapeCellIdentifier, isCellBinding }
+            );
+            assert.deepStrictEqual(buildCellLocator(expectedLocator), {
+                sql: '"id" = CAST(? AS INTEGER) AND "shard" = ?',
+                params: ['9007199254740993', 'a']
+            });
+            assert.throws(
+                () => buildCellLocator({ ...expectedLocator, integerCasts: [true, '?'] }),
+                /invalid INTEGER cast flag/
+            );
         } finally {
             connection.dispose();
         }
@@ -1485,6 +1561,49 @@ describe('createNativeDatabaseConnection', () => {
                 }
             );
         } finally {
+            connection.dispose();
+        }
+    });
+
+    it('routes a superseded native preview abort to its bounded worker query', async () => {
+        const queryStarted = createDeferred<RecordedNativeCall>();
+        const queryResponse = createDeferred<RecordedNativeResponse>();
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA main.table_info')) {
+                return { result: { columns: ['cid', 'name'], values: [[0, 'value']] } };
+            }
+            if (call.method === 'queryBounded') {
+                queryStarted.resolve(call);
+                return queryResponse.promise;
+            }
+            return { result: { columns: [], values: [] } };
+        });
+        const controller = new AbortController();
+        const cancellation = new DOMException('Superseded preview', 'AbortError');
+        const preview = connection.databaseOps.previewViewDefinition(
+            'cancelled_preview',
+            'SELECT 1 AS value',
+            10,
+            'create',
+            controller.signal
+        );
+
+        try {
+            const queryCall = await queryStarted.promise;
+            controller.abort(cancellation);
+            await new Promise(resolve => setImmediate(resolve));
+
+            const cancelCall = connection.calls.find(call => call.method === 'cancel');
+            assert.ok(cancelCall, 'preview cancellation must reach the native worker');
+            assert.deepStrictEqual(cancelCall.args, [queryCall.id]);
+            queryResponse.resolve({
+                error: '[queryBounded] Operation cancelled',
+                cancelled: true
+            });
+            await assert.rejects(preview, error => error === cancellation);
+        } finally {
+            queryResponse.resolve({ error: 'test cleanup' });
+            await preview.catch(() => {});
             connection.dispose();
         }
     });

@@ -154,7 +154,7 @@ describe('paged writable host save', () => {
     const opened = await createDatabaseEngine({
       content: null,
       filePath: basePath,
-      maxSize: 4096,
+      maxSize: 0,
       pagedOpenThresholdBytes: 4096,
       allowPagedFallback: true,
       readOnlyMode: false

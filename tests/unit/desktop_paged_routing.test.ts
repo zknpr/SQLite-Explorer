@@ -16,7 +16,7 @@ import type { DatabaseInitConfig, DatabaseInitResult } from '../../src/core/type
  * seam faked, so the tests pin exactly what establishConnection sends to
  * the worker and how it surfaces the worker's answer.
  *
- *   over the gate, clean -wal   -> dispatch with allowPagedFallback, then
+ *   above paging threshold and under cap -> dispatch with allowPagedFallback, then
  *                                  toast + output line when the worker
  *                                  answers storage:'paged'
  *   over the gate, framed -wal  -> checkpoint rejection BEFORE dispatch
@@ -266,7 +266,7 @@ describe('desktop workerFactory paged routing', () => {
   it('propagates a writable paged result without a read-only downgrade warning', async () => {
     const result = await connectDesktop({
       fileSize: 300 * MB,
-      maxFileSizeBytes: 200 * MB,
+      maxFileSizeBytes: 400 * MB,
       walSize: null,
       initResult: { isReadOnly: false, storage: 'paged' }
     });
@@ -279,10 +279,10 @@ describe('desktop workerFactory paged routing', () => {
     assert.ok(!result.outputLines.some(line => /opened page-on-demand as read-only/.test(line)));
   });
 
-  it('offers the paged fallback for an over-limit local file and surfaces the downgrade', async () => {
+  it('offers the paged fallback for an under-cap local file and surfaces the downgrade', async () => {
     const result = await connectDesktop({
       fileSize: 300 * MB,
-      maxFileSizeBytes: 200 * MB,
+      maxFileSizeBytes: 400 * MB,
       walSize: null,
       initResult: { isReadOnly: true, storage: 'paged' }
     });
@@ -294,9 +294,9 @@ describe('desktop workerFactory paged routing', () => {
     assert.strictEqual(result.config?.filePath, '/workspace/big.db');
     assert.strictEqual(result.config?.content, null);
     assert.strictEqual(result.config?.allowPagedFallback, true);
-    assert.strictEqual(result.config?.maxSize, 200 * MB);
-    // The size gate itself no longer forces read-only up front; the
-    // paged open reports it back like the WAL gate's flag does.
+    assert.strictEqual(result.config?.maxSize, 400 * MB);
+    // Paging does not force read-only up front; the selected backend reports
+    // its actual capability after the worker-owned ladder completes.
     assert.strictEqual(result.config?.readOnlyMode, false);
     assert.strictEqual(result.isReadOnly, true, 'paged result must propagate read-only');
     // Reason surfaces as a toast and an output line, mirroring the WAL gate.
@@ -344,7 +344,7 @@ describe('desktop workerFactory paged routing', () => {
     for (const walSize of [0, 32]) {
       const result = await connectDesktop({
         fileSize: 300 * MB,
-        maxFileSizeBytes: 200 * MB,
+        maxFileSizeBytes: 400 * MB,
         walSize,
         initResult: { isReadOnly: true, storage: 'paged' }
       });
@@ -354,7 +354,7 @@ describe('desktop workerFactory paged routing', () => {
     }
   });
 
-  it('surfaces today\'s exact size error when the worker cannot open paged', async () => {
+  it('surfaces today\'s exact size error when the worker applies the finite cap', async () => {
     const workerFailure = new Error(
       "Failed to open database file '/workspace/big.db': file size (314572800 bytes) exceeds the maximum allowed size (209715200 bytes)"
     );

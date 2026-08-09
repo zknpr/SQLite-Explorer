@@ -11,6 +11,10 @@ import {
 import { updateStatus } from './ui.js';
 import { noteCellValuesChanged } from './count-cache.js';
 import { registerModalCloseHandler } from './modals.js';
+import {
+    CellEditPolicyError,
+    DEFAULT_MAX_CELL_EDIT_BYTES
+} from '../../../src/core/cell-edit-policy.ts';
 
 
 const FILE_SIGNATURES = {
@@ -193,6 +197,7 @@ export class BlobInspector {
                     // Mock a File object for uploadFile
                     const file = {
                         name: result.name,
+                        size: data.byteLength,
                         arrayBuffer: async () => data.buffer
                     };
                     await this.uploadFile(file);
@@ -233,17 +238,31 @@ export class BlobInspector {
         this.setUploadState(true);
 
         try {
+            if (!Number.isSafeInteger(file.size) || file.size < 0) {
+                throw new Error('Unable to determine the selected file size safely.');
+            }
+            if (file.size > DEFAULT_MAX_CELL_EDIT_BYTES) {
+                throw new CellEditPolicyError(
+                    'blob',
+                    file.size,
+                    DEFAULT_MAX_CELL_EDIT_BYTES
+                );
+            }
+
             updateStatus(`Reading ${file.name}...`);
             const buffer = await file.arrayBuffer();
             const uint8Array = new Uint8Array(buffer);
 
-            const sizeMB = uint8Array.length / (1024 * 1024);
-
-            // Reject files larger than 50MB to prevent extension freeze
-            const MAX_BLOB_SIZE_MB = 50;
-            if (sizeMB > MAX_BLOB_SIZE_MB) {
-                throw new Error(`File too large (${sizeMB.toFixed(1)}MB). Maximum size is ${MAX_BLOB_SIZE_MB}MB to prevent freezing.`);
+            // Recheck the bytes actually read to close size/read races and to
+            // distrust file-like providers whose metadata understates data.
+            if (uint8Array.byteLength > DEFAULT_MAX_CELL_EDIT_BYTES) {
+                throw new CellEditPolicyError(
+                    'blob',
+                    uint8Array.byteLength,
+                    DEFAULT_MAX_CELL_EDIT_BYTES
+                );
             }
+            const sizeMB = uint8Array.length / (1024 * 1024);
 
             // Warn about moderately large files
             if (sizeMB > 10) {

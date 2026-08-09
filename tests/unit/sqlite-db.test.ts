@@ -136,7 +136,7 @@ describe('createDatabaseEngine file reading errors', () => {
       result = await createDatabaseEngine({
         content: null,
         filePath: tempFile,
-        maxSize: 1,
+        maxSize: 0,
         pagedOpenThresholdBytes: 1,
         readOnlyMode: false,
         allowPagedFallback: true

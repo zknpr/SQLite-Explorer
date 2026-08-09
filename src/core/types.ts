@@ -408,6 +408,17 @@ export interface LabeledModification extends ModificationEntry {
 // Database Interface Types
 // ============================================================================
 
+/** Opaque handle for a bounded, incrementally stepped SELECT statement. */
+export interface QueryReadSession {
+  sessionId: string;
+}
+
+/** One bounded batch from an open query read session. */
+export interface QueryReadChunk {
+  rows: CellValue[][];
+  done: boolean;
+}
+
 /**
  * Interface for database operations exposed by worker.
  */
@@ -445,6 +456,15 @@ export interface DatabaseOperations {
 
   /** Idempotently release a snapshot read bracket. */
   closeCellReadSession(sessionId: string): Promise<void>;
+
+  /** Open one SELECT for incremental reads when the backend exposes a cursor. */
+  openQueryReadSession?(sql: string): Promise<QueryReadSession>;
+
+  /** Step a bounded number of rows from an open query read session. */
+  readQueryRows?(sessionId: string, maxRows: number): Promise<QueryReadChunk>;
+
+  /** Idempotently finalize an incremental query read session. */
+  closeQueryReadSession?(sessionId: string): Promise<void>;
 
   /** Export database to binary */
   serializeDatabase(): Promise<Uint8Array>;

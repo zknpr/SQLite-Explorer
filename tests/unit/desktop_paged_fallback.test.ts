@@ -26,11 +26,11 @@ import { writePagedWritableOverlayToFile } from '../../src/pagedWritableSave';
  *   below the paging threshold            -> buffer, editable, byte-identical
  *   above threshold + openPagedWritable   -> paged writable overlay
  *   above threshold + openPaged only      -> paged read-only snapshot
- *   above threshold + both capabilities absent + over cap -> size rejection
- *   above threshold + fallback not allowed + over cap      -> size rejection
+ *   above threshold + over cap           -> size rejection before paging
+ *   above threshold + capabilities absent -> in-memory fallback
  *   above threshold + writable open throws -> read-only paged fallback
- *   above threshold + both opens throw + over cap -> size rejection (cause kept)
- *   above threshold + frame-bearing -wal  -> refused (defensive recheck)
+ *   above threshold + both opens throw    -> in-memory fallback
+ *   above threshold + unsafe sibling journal -> terminal safety refusal
  *   above threshold + WAL-at-rest header  -> paged (no sibling = no frames)
  *   cap 0 or cap above file                -> still paged above the threshold
  *
@@ -51,7 +51,7 @@ let garbagePath: string;
 let generationDbPath: string;
 let nextGenerationBytes: Uint8Array;
 
-/** Cap and paging threshold placed below every fixture. */
+/** Paging threshold placed below every fixture; finite-cap tests opt in. */
 const TINY_GATE = 4096;
 
 function openFdCount(): number | undefined {
@@ -130,7 +130,7 @@ function overGateConfig(filePath: string, extra: Partial<DatabaseInitConfig> = {
   return {
     content: null,
     filePath,
-    maxSize: TINY_GATE,
+    maxSize: 0,
     pagedOpenThresholdBytes: TINY_GATE,
     readOnlyMode: false,
     allowPagedFallback: true,
@@ -167,7 +167,7 @@ function throwingOpenPagedWritable(module: WasmEngineModule): WasmEngineModule {
   return masked;
 }
 
-/** Both paged capabilities fail, forcing the original size rejection. */
+/** Both paged capabilities fail, forcing the in-memory fallback. */
 function throwingPagedCapabilities(module: WasmEngineModule): WasmEngineModule {
   const masked = throwingOpenPagedWritable(module);
   (masked.Database as any).openPaged = () => {
@@ -177,6 +177,25 @@ function throwingPagedCapabilities(module: WasmEngineModule): WasmEngineModule {
 }
 
 const SIZE_ERROR_PATTERN = /file size \(\d+ bytes\) exceeds the maximum allowed size \(4096 bytes\)/;
+const ROLLBACK_JOURNAL_MAGIC = Buffer.from([
+  0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7
+]);
+
+function writeRecoveryBearingJournal(filePath: string): void {
+  const encodedPageSize = (dbBytes[16] << 8) | dbBytes[17];
+  const pageSize = encodedPageSize === 1 ? 65_536 : encodedPageSize;
+  const sectorSize = 512;
+  const journal = Buffer.alloc(sectorSize + 4 + pageSize + 4);
+  ROLLBACK_JOURNAL_MAGIC.copy(journal, 0);
+  journal.writeUInt32BE(1, 8); // one page record follows the padded header
+  journal.writeUInt32BE(0x52052052, 12); // checksum nonce
+  journal.writeUInt32BE(Math.ceil(dbBytes.byteLength / pageSize), 16);
+  journal.writeUInt32BE(sectorSize, 20);
+  journal.writeUInt32BE(pageSize, 24);
+  journal.writeUInt32BE(1, sectorSize);
+  Buffer.from(dbBytes.subarray(0, pageSize)).copy(journal, sectorSize + 4);
+  fs.writeFileSync(`${filePath}-journal`, journal);
+}
 
 describe('desktop paged fallback routing (engine layer)', () => {
   it('keeps under-gate files on the editable buffer path, byte-for-byte', async () => {
@@ -217,6 +236,27 @@ describe('desktop paged fallback routing (engine layer)', () => {
     );
   });
 
+  it('rejects a file above both the paging threshold and finite maxSize before opening paged', async () => {
+    const masked = maskPagedCapabilities(SqlJsModule);
+    let pagedOpenCalls = 0;
+    const refuseToOpen = () => {
+      pagedOpenCalls += 1;
+      throw new Error('paged open must not be attempted above the configured cap');
+    };
+    (masked.Database as any).openPagedWritable = refuseToOpen;
+    (masked.Database as any).openPaged = refuseToOpen;
+
+    await assert.rejects(
+      createEngineFromModule(masked, overGateConfig(dbPath, { maxSize: TINY_GATE })),
+      SIZE_ERROR_PATTERN
+    );
+    assert.strictEqual(
+      pagedOpenCalls,
+      0,
+      'maxSize is a refusal gate, not a backend-specific materialization limit'
+    );
+  });
+
   it('pages a file above the threshold when maxSize is above the file size', async () => {
     const result = await createDatabaseEngine(overGateConfig(dbPath, {
       maxSize: dbBytes.length + 1024
@@ -226,7 +266,7 @@ describe('desktop paged fallback routing (engine layer)', () => {
     (result.operations as WasmDatabaseEngine).shutdown();
   });
 
-  it('edits and exports an over-gate file through the real openPagedWritable without touching its base', async () => {
+  it('edits and exports an above-threshold file through the real openPagedWritable without touching its base', async () => {
     const testPath = path.join(fixtureDir, 'writable-round-trip.db');
     fs.writeFileSync(testPath, Buffer.from(dbBytes));
     const baseBefore = fs.readFileSync(testPath);
@@ -383,10 +423,10 @@ describe('desktop paged fallback routing (engine layer)', () => {
     }
   });
 
-  it('rejects over-gate files with today\'s size error when both paged capabilities are absent', async () => {
+  it('rejects an above-threshold over-cap file before checking whether paged capabilities exist', async () => {
     const masked = maskPagedCapabilities(SqlJsModule);
     await assert.rejects(
-      createEngineFromModule(masked, overGateConfig(dbPath)),
+      createEngineFromModule(masked, overGateConfig(dbPath, { maxSize: TINY_GATE })),
       (error: Error) => {
         assert.match(error.message, /Failed to open database file/);
         assert.match(error.message, SIZE_ERROR_PATTERN);
@@ -395,13 +435,19 @@ describe('desktop paged fallback routing (engine layer)', () => {
     );
   });
 
-  it('rejects over-gate files with today\'s size error when the fallback is not allowed', async () => {
+  it('rejects an above-threshold over-cap file even when paging is disabled', async () => {
     await assert.rejects(
-      createDatabaseEngine(overGateConfig(dbPath, { allowPagedFallback: false })),
+      createDatabaseEngine(overGateConfig(dbPath, {
+        maxSize: TINY_GATE,
+        allowPagedFallback: false
+      })),
       SIZE_ERROR_PATTERN
     );
     await assert.rejects(
-      createDatabaseEngine(overGateConfig(dbPath, { allowPagedFallback: undefined })),
+      createDatabaseEngine(overGateConfig(dbPath, {
+        maxSize: TINY_GATE,
+        allowPagedFallback: undefined
+      })),
       SIZE_ERROR_PATTERN
     );
   });
@@ -416,22 +462,13 @@ describe('desktop paged fallback routing (engine layer)', () => {
     (result.operations as WasmDatabaseEngine).shutdown();
   });
 
-  it('falls back to the size error and keeps the cause when both paged opens throw', async () => {
+  it('falls back to an editable in-memory open when both paged capabilities throw', async () => {
     const throwing = throwingPagedCapabilities(SqlJsModule);
     const before = openFdCount();
-    await assert.rejects(
-      createEngineFromModule(throwing, overGateConfig(dbPath)),
-      (error: Error) => {
-        assert.match(error.message, SIZE_ERROR_PATTERN);
-        // The paged failure rides the cause chain: wrap -> size error -> paged error.
-        const sizeError = error.cause as Error;
-        assert.match(
-          String((sizeError?.cause as Error)?.message),
-          /synthetic read-only paged open failure/
-        );
-        return true;
-      }
-    );
+    const result = await createEngineFromModule(throwing, overGateConfig(dbPath));
+    assert.strictEqual(result.storage, 'memory');
+    assert.strictEqual(result.isReadOnly, false);
+    (result.operations as WasmDatabaseEngine).shutdown();
     if (before !== undefined) {
       assert.strictEqual(openFdCount(), before, 'failed paged open must not leak its fd');
     }
@@ -442,14 +479,7 @@ describe('desktop paged fallback routing (engine layer)', () => {
     await assert.rejects(
       createDatabaseEngine(overGateConfig(framedWalDbPath)),
       (error: Error) => {
-        // The deliberate refusal lands on the ordinary size rejection...
-        assert.match(error.message, SIZE_ERROR_PATTERN);
-        // ...with the WAL refusal preserved on the cause chain.
-        const sizeError = error.cause as Error;
-        assert.match(
-          String((sizeError?.cause as Error)?.message),
-          /holds uncheckpointed frames/
-        );
+        assert.match(error.message, /holds uncheckpointed frames/);
         return true;
       }
     );
@@ -499,9 +529,87 @@ describe('desktop paged fallback routing (engine layer)', () => {
 
     assert.strictEqual(opened, undefined, 'the raced WAL must prevent a paged result');
     assert.ok(rejected);
-    assert.match(String((rejected.cause as Error)?.cause), /holds uncheckpointed frames/);
+    assert.match(rejected.message, /holds uncheckpointed frames/);
     assert.strictEqual(walStatCalls, 2, 'the sibling WAL must be checked again after openPaged');
     assert.strictEqual(instanceCloseCalls, 1, 'the rejected paged instance must be closed');
+  });
+
+  it('refuses a recovery-bearing rollback journal before invoking a paged capability', async () => {
+    const testPath = path.join(fixtureDir, 'hot-journal-before-open.db');
+    fs.writeFileSync(testPath, Buffer.from(dbBytes));
+    writeRecoveryBearingJournal(testPath);
+    const fakeModule = maskPagedCapabilities(SqlJsModule);
+    let pagedOpenCalls = 0;
+    const unexpectedPagedOpen = () => {
+      pagedOpenCalls += 1;
+      throw new Error('paged open must not run while rollback recovery may be required');
+    };
+    (fakeModule.Database as any).openPagedWritable = unexpectedPagedOpen;
+    (fakeModule.Database as any).openPaged = unexpectedPagedOpen;
+
+    await assert.rejects(
+      createEngineFromModule(fakeModule, overGateConfig(testPath, { maxSize: 0 })),
+      /rollback journal.*may require crash recovery.*cannot safely recover/i
+    );
+    assert.strictEqual(pagedOpenCalls, 0);
+  });
+
+  it('does not route a recovery-bearing rollback journal into the raw in-memory fallback', async () => {
+    const testPath = path.join(fixtureDir, 'hot-journal-buffer.db');
+    fs.writeFileSync(testPath, Buffer.from(dbBytes));
+    writeRecoveryBearingJournal(testPath);
+
+    await assert.rejects(
+      createDatabaseEngine(overGateConfig(testPath, {
+        maxSize: 0,
+        pagedOpenThresholdBytes: dbBytes.length + 1024
+      })),
+      /rollback journal.*may require crash recovery.*cannot safely recover/i
+    );
+  });
+
+  it('allows cold rollback-journal leftovers without a recovery-bearing header', async () => {
+    for (const [name, journal] of [
+      ['empty', Buffer.alloc(0)],
+      ['header-only', Buffer.concat([ROLLBACK_JOURNAL_MAGIC, Buffer.alloc(504)])],
+      ['zero-header', Buffer.alloc(513)],
+      ['invalid-nonzero-header', Buffer.alloc(513, 0x41)]
+    ] as const) {
+      const testPath = path.join(fixtureDir, `cold-journal-${name}.db`);
+      fs.writeFileSync(testPath, Buffer.from(dbBytes));
+      fs.writeFileSync(`${testPath}-journal`, journal);
+      const result = await createDatabaseEngine(overGateConfig(testPath, { maxSize: 0 }));
+      assert.strictEqual(result.storage, 'paged');
+      (result.operations as WasmDatabaseEngine).shutdown();
+    }
+  });
+
+  it('abandons and closes a paged open when a recovery-bearing journal appears during initialization', async () => {
+    const testPath = path.join(fixtureDir, 'hot-journal-race.db');
+    fs.writeFileSync(testPath, Buffer.from(dbBytes));
+    const fakeModule = maskPagedCapabilities(SqlJsModule);
+    let instanceCloseCalls = 0;
+    (fakeModule.Database as any).openPaged = () => {
+      writeRecoveryBearingJournal(testPath);
+      return {
+        exec: () => [],
+        close: () => { instanceCloseCalls += 1; },
+        export: () => new Uint8Array(0),
+        interrupt: () => {},
+        iterateStatements: () => [],
+        prepare: () => { throw new Error('prepare must not run during initialization'); },
+        progress_handler: () => {}
+      };
+    };
+
+    await assert.rejects(
+      createEngineFromModule(fakeModule, overGateConfig(testPath, {
+        maxSize: 0,
+        readOnlyMode: true
+      })),
+      /rollback journal.*may require crash recovery.*cannot safely recover/i
+    );
+    assert.strictEqual(instanceCloseCalls, 1, 'the unsafe paged instance must be closed');
   });
 
   it('pages WAL-at-rest headers when no sibling -wal exists', async () => {
@@ -552,7 +660,7 @@ describe('desktop paged fallback routing (engine layer)', () => {
     assert.strictEqual(openFdCount(), before);
   });
 
-  it('opens garbage over-gate bytes paged and fails queries honestly', async () => {
+  it('opens garbage above-threshold bytes paged and fails queries honestly', async () => {
     // sql.js defers validation to the first statement on the buffer path
     // too; paged garbage behaves the same way instead of regressing to a
     // less accurate error.

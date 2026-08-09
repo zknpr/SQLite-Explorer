@@ -135,6 +135,12 @@ export const mockVscode = {
         onDidCloseTextDocument: closeTextDocumentEmitter.event,
         __fireDidCloseTextDocument: (document: any) => closeTextDocumentEmitter.fire(document),
         fs: {
+            stat: (_uri: any) => Promise.resolve({
+                type: 1,
+                ctime: 0,
+                mtime: 0,
+                size: 0
+            }),
             readFile: (_uri: any) => Promise.resolve(new Uint8Array()),
             writeFile: (_uri: any, _bytes: Uint8Array) => Promise.resolve(),
             rename: (_from: any, _to: any, _options?: any) => Promise.resolve(),

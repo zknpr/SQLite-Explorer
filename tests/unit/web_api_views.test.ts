@@ -3,6 +3,7 @@ import './vscode_mock_setup';
 import { after, beforeEach, it } from 'node:test';
 import assert from 'node:assert';
 import { DEFAULT_MAX_INLINE_CELL_BYTES } from '../../src/core/cell-containment';
+import { DEFAULT_MAX_CELL_EDIT_BYTES } from '../../src/core/cell-edit-policy';
 import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from '../../src/core/webview-transport';
 import { createDeferred } from './helpers/deferred';
 
@@ -94,6 +95,48 @@ it('uses the transport edit ceiling instead of the inline preview ceiling', asyn
     });
 
     assert.strictEqual(await update, 1);
+});
+
+it('rejects an oversized demo file selection before reading it', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const { backendApi } = await import(webApiModulePath);
+    let arrayBufferCalls = 0;
+    let input: any;
+    (globalThis as any).document = {
+        createElement() {
+            input = {
+                type: '',
+                style: {},
+                onchange: undefined,
+                click() {}
+            };
+            return input;
+        },
+        body: {
+            appendChild() {},
+            removeChild() {}
+        }
+    };
+
+    try {
+        const selected = backendApi.selectFile();
+        await input.onchange({
+            target: {
+                files: [{
+                    name: 'too-large.bin',
+                    size: DEFAULT_MAX_CELL_EDIT_BYTES + 1,
+                    async arrayBuffer() {
+                        arrayBufferCalls += 1;
+                        return new ArrayBuffer(0);
+                    }
+                }]
+            }
+        });
+        await assert.rejects(selected, /exceeds the 16777216-byte edit limit/);
+        assert.strictEqual(arrayBufferCalls, 0);
+    } finally {
+        delete (globalThis as any).document;
+    }
 });
 
 it('names demo view triggers before a confirmed drop and forwards that snapshot', async () => {

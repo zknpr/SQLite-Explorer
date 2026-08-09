@@ -70,12 +70,14 @@ import {
 import {
   assertMutableRecordId,
   buildRecordIdentitiesPredicate,
+  buildRecordIdentityPredicateChunks,
   buildRecordIdentityPredicate,
   buildTableIdentityMap,
   classifyTableIdentity,
   encodePrimaryKeyRecordId,
   isPrimaryKeyRecordId,
   primaryKeyColumnsFromTableInfo,
+  replacePrimaryKeyRecordIdValues,
   TABLE_IDENTITY_METADATA_SQL
 } from './core/row-identity';
 import {
@@ -1016,7 +1018,7 @@ export async function createNativeDatabaseConnection(
       ): {
         kind: 'rowid'; value: CellValue;
       } | {
-        kind: 'primaryKey'; columns: string[]; values: CellValue[];
+        kind: 'primaryKey'; columns: string[]; values: CellValue[]; integerCasts: boolean[];
       } => {
         const predicate = buildRecordIdentityPredicate(rowId, identity);
         return identity.kind === 'rowid'
@@ -1024,7 +1026,8 @@ export async function createNativeDatabaseConnection(
           : {
               kind: 'primaryKey',
               columns: identity.columns.map(column => column.identifier),
-              values: predicate.params
+              values: predicate.params,
+              integerCasts: predicate.primaryKeyIntegerCasts!
             };
       };
 
@@ -1231,14 +1234,23 @@ export async function createNativeDatabaseConnection(
               ]
             ]);
 
-            const candidateValues = [...oldPredicate.primaryKey!.values];
+            const primaryKeyReplacements: Array<{ column: string; value: CellValue }> = [];
             for (const preparedUpdate of preparedUpdates) {
               const keyIndex = identity.columns.findIndex(
                 keyColumn => keyColumn.identifier === preparedUpdate.update.column
               );
-              if (keyIndex >= 0) candidateValues[keyIndex] = preparedUpdate.storedValue;
+              if (keyIndex >= 0) {
+                primaryKeyReplacements.push({
+                  column: preparedUpdate.update.column,
+                  value: preparedUpdate.storedValue
+                });
+              }
             }
-            const candidateId = encodePrimaryKeyRecordId(identity.columns, candidateValues);
+            const candidateId = replacePrimaryKeyRecordIdValues(
+              rowId,
+              identity,
+              primaryKeyReplacements
+            );
             const newRowId = await readNativePrimaryKeyRecordId(
               table,
               identity,
@@ -1267,7 +1279,8 @@ export async function createNativeDatabaseConnection(
       const queryNativeBoundedStatement = async (
         sql: string,
         columns: string[],
-        limit: number
+        limit: number,
+        signal?: AbortSignal
       ): Promise<NativeQueryResult> => {
         const transportQuery = buildExactNumericTextQuery(sql, columns.length);
         const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
@@ -1279,7 +1292,7 @@ export async function createNativeDatabaseConnection(
           transportQuery.valueColumnCount,
           limit,
           queryTimeout
-        ], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS);
+        ], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
       };
 
       const compileNativeViewSelect = async (selectSql: string): Promise<void> => {
@@ -1510,18 +1523,10 @@ export async function createNativeDatabaseConnection(
         openCellReadSession: async (target: CellReadTarget): Promise<CellReadSession> => {
           validateCellReadTarget(target);
           const identity = await resolveNativeTableIdentity(target.table);
-          const predicate = buildRecordIdentityPredicate(target.rowId, identity);
-          const locator = identity.kind === 'rowid'
-            ? { kind: 'rowid' as const, value: predicate.params[0] }
-            : {
-                kind: 'primaryKey' as const,
-                columns: identity.columns.map(column => column.identifier),
-                values: predicate.params
-              };
           return worker.call<CellReadSession>('openCellReadSession', [
             target.table,
             target.column,
-            locator
+            buildNativeCellLocator(target.rowId, identity)
           ]);
         },
 
@@ -1971,10 +1976,12 @@ export async function createNativeDatabaseConnection(
             }
             if (identity.kind === 'rowid') return validateRowId(rowId);
 
-            const candidateValues = [...predicate.primaryKey!.values];
             const keyIndex = identity.columns.findIndex(key => key.identifier === column);
-            if (keyIndex >= 0) candidateValues[keyIndex] = value;
-            const candidateId = encodePrimaryKeyRecordId(identity.columns, candidateValues);
+            const candidateId = replacePrimaryKeyRecordIdValues(
+              rowId,
+              identity,
+              keyIndex >= 0 ? [{ column, value }] : []
+            );
             return readNativePrimaryKeyRecordId(
               table,
               identity,
@@ -2120,40 +2127,45 @@ export async function createNativeDatabaseConnection(
             if (identity.kind !== 'primaryKey') {
               throw new Error(`Primary-key identity cannot target rowid table ${table}`);
             }
-            const predicate = buildRecordIdentitiesPredicate(rowIds, identity);
+            const predicates = buildRecordIdentityPredicateChunks(rowIds, identity);
             const savepointName = createSavepointName('sp_delete_pk_rows');
             await worker.call('run', [`SAVEPOINT ${savepointName}`]);
             try {
               const insertableColumns = await getNativeInsertableColumnNames(table);
-              const current = await worker.call<NativeQueryResult>('query', [
-                `SELECT ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
-                `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
-                predicate.params
-              ]);
-              const primaryKeyIndices = identity.columns.map(column => {
-                const index = current.columns.indexOf(column.identifier);
-                if (index < 0) {
-                  throw new Error(`Primary-key column missing from ${table}: ${column.identifier}`);
-                }
-                return index;
-              });
-              const deletedRows = current.values.map(row => {
-                const deletedRowId = encodePrimaryKeyRecordId(
-                  identity.columns,
-                  primaryKeyIndices.map(index => row[index])
-                );
-                const rowData = Object.fromEntries(
-                  current.columns.map((header, index) => [header, row[index]])
-                );
-                return { rowId: deletedRowId, row: rowData };
-              });
+              const deletedRows: DeletedRow[] = [];
+              for (const predicate of predicates) {
+                const current = await worker.call<NativeQueryResult>('query', [
+                  `SELECT ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+                  `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+                  predicate.params
+                ]);
+                const primaryKeyIndices = identity.columns.map(column => {
+                  const index = current.columns.indexOf(column.identifier);
+                  if (index < 0) {
+                    throw new Error(`Primary-key column missing from ${table}: ${column.identifier}`);
+                  }
+                  return index;
+                });
+                deletedRows.push(...current.values.map(row => {
+                  const deletedRowId = encodePrimaryKeyRecordId(
+                    identity.columns,
+                    primaryKeyIndices.map(index => row[index])
+                  );
+                  const rowData = Object.fromEntries(
+                    current.columns.map((header, index) => [header, row[index]])
+                  );
+                  return { rowId: deletedRowId, row: rowData };
+                }));
+              }
               if (deletedRows.length !== rowIds.length) {
                 throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
               }
-              await worker.call('run', [
-                `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
-                predicate.params
-              ]);
+              for (const predicate of predicates) {
+                await worker.call('run', [
+                  `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+                  predicate.params
+                ]);
+              }
               await worker.call('run', [`RELEASE ${savepointName}`]);
               return deletedRows;
             } catch (error) {
@@ -2330,7 +2342,8 @@ export async function createNativeDatabaseConnection(
           view: string,
           selectSql: string,
           limit: number = 50,
-          intent: ViewDefinitionIntent = 'edit'
+          intent: ViewDefinitionIntent = 'edit',
+          signal?: AbortSignal
         ) => {
           if (forceReadOnly) {
             throw new Error('View preview is unavailable because the database is read-only');
@@ -2371,7 +2384,8 @@ export async function createNativeDatabaseConnection(
           const result = await queryNativeBoundedStatement(
             body,
             columns,
-            boundedLimit
+            boundedLimit,
+            signal
           );
           const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
             result.values,
