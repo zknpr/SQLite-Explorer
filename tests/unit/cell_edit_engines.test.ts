@@ -5,6 +5,7 @@ import { describe, it } from 'node:test';
 
 import {
     CellEditPolicyError,
+    DEFAULT_MAX_CELL_EDIT_BYTES,
     OversizedCellReplacementRequiredError
 } from '../../src/core/cell-edit-policy';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
@@ -96,7 +97,7 @@ describe('WASM oversized-cell edit policy', () => {
             readOnlyMode: false
         });
         const engine = initialized.operations!;
-        const legacyValue = new Uint8Array(1024 * 1024 + 1);
+        const legacyValue = new Uint8Array(DEFAULT_MAX_CELL_EDIT_BYTES + 1);
         try {
             await engine.executeQuery(
                 "CREATE TABLE legacy_history (payload BLOB); INSERT INTO legacy_history VALUES (x'01')"

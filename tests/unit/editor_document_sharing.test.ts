@@ -226,6 +226,36 @@ it('coalesces simultaneous opens for one URI before either engine is registered'
     }
 });
 
+it('keeps documents with the same path but different URI schemes distinct', async () => {
+    const provider = createProvider('sqlite-explorer.view');
+    const localUri = fileUri('/workspace/collision.sqlite');
+    const remoteUri = {
+        ...fileUri('/workspace/collision.sqlite'),
+        scheme: 'vscode-remote',
+        authority: 'ssh-remote+dev',
+        toString: () => 'vscode-remote://ssh-remote+dev/workspace/collision.sqlite'
+    } as Uri;
+    const local = await provider.openCustomDocument(localUri, openContext);
+    const remote = await provider.openCustomDocument(remoteUri, openContext);
+
+    try {
+        const [localKey, remoteKey] = await Promise.all([
+            local.documentKey,
+            remote.documentKey
+        ]);
+        assert.notStrictEqual(local, remote);
+        assert.notStrictEqual(local.databaseOperations, remote.databaseOperations);
+        assert.notStrictEqual(localKey, remoteKey);
+        assert.strictEqual(connectionCount, 2);
+        assert.strictEqual(DocumentRegistry.get(localKey), local);
+        assert.strictEqual(DocumentRegistry.get(remoteKey), remote);
+    } finally {
+        await local.dispose();
+        await remote.dispose();
+        provider.dispose();
+    }
+});
+
 it('binds optional-view RPC to the provider that owns its webview panel', async () => {
     const defaultProvider = createProvider('sqlite-explorer.view');
     const optionalProvider = createProvider('sqlite-explorer.option');

@@ -12,6 +12,7 @@ import type { DatabaseOperations } from '../../src/core/types';
 import { createDeferred } from './helpers/deferred';
 import {
     CellEditPolicyError,
+    DEFAULT_MAX_CELL_EDIT_BYTES,
     OversizedCellReplacementRequiredError
 } from '../../src/core/cell-edit-policy';
 
@@ -611,7 +612,7 @@ describe('createNativeDatabaseConnection', () => {
         const connection = await createRecordingConnection(() => ({
             result: { changes: 1, lastInsertRowId: 1 }
         }));
-        const legacyValue = new Uint8Array(1024 * 1024 + 1);
+        const legacyValue = new Uint8Array(DEFAULT_MAX_CELL_EDIT_BYTES + 1);
         try {
             connection.calls.length = 0;
             await assert.rejects(
@@ -1121,7 +1122,36 @@ describe('createNativeDatabaseConnection', () => {
     });
 
     it('replays column_drop redo by dropping recorded dependent indexes first', async () => {
-        const connection = await createRecordingConnection();
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                const sql = String(call.args[0]);
+                if (sql.includes('sqlite_schema')) {
+                    return {
+                        result: {
+                            columns: ['type', 'name', 'sql'],
+                            values: [['table', 'docs', 'CREATE TABLE docs (id INTEGER PRIMARY KEY)']]
+                        }
+                    };
+                }
+                if (sql.startsWith('PRAGMA table_info')) {
+                    return {
+                        result: {
+                            columns: ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'],
+                            values: [[0, 'id', 'INTEGER', 0, null, 1]]
+                        }
+                    };
+                }
+                if (sql.includes('pragma_table_list')) {
+                    return {
+                        result: {
+                            columns: ['type', 'wr'],
+                            values: [['table', 0]]
+                        }
+                    };
+                }
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
 
         try {
             connection.calls.length = 0;
@@ -1134,18 +1164,113 @@ describe('createNativeDatabaseConnection', () => {
                 droppedIndexes: ['idx_docs_payload']
             });
 
-            assert.strictEqual(connection.calls.length, 1);
-            const call = connection.calls[0];
-            assert.strictEqual(call.method, 'execBatch');
-
-            const batch = call.args[0] as { sql: string }[];
             assert.deepStrictEqual(
-                batch.map(item => item.sql),
+                connection.calls
+                    .filter(call => call.method === 'run')
+                    .map(call => String(call.args[0]))
+                    .slice(1, -1),
                 [
                     `DROP INDEX IF EXISTS "idx_docs_payload"`,
                     `ALTER TABLE "docs" DROP COLUMN "payload"`
                 ]
             );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('captures native post-drop state before releasing the delete savepoint', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                const sql = String(call.args[0]);
+                if (sql.includes('sqlite_schema')) {
+                    return {
+                        result: {
+                            columns: ['type', 'name', 'sql'],
+                            values: [['table', 'docs', 'CREATE TABLE docs (id INTEGER PRIMARY KEY)']]
+                        }
+                    };
+                }
+                if (sql.startsWith('PRAGMA table_info')) {
+                    return {
+                        result: {
+                            columns: ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'],
+                            values: [[0, 'id', 'INTEGER', 0, null, 1]]
+                        }
+                    };
+                }
+                if (sql.includes('pragma_table_list')) {
+                    return {
+                        result: {
+                            columns: ['type', 'wr'],
+                            values: [['table', 0]]
+                        }
+                    };
+                }
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            connection.calls.length = 0;
+
+            const stateAfter = await connection.databaseOps.deleteColumns(
+                'docs',
+                ['payload'],
+                ['idx_docs_payload']
+            );
+
+            assert.deepStrictEqual(stateAfter, {
+                tableSql: 'CREATE TABLE docs (id INTEGER PRIMARY KEY)',
+                columns: ['id'],
+                identity: { kind: 'rowid' },
+                schemaObjects: []
+            });
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['run', 'run', 'run', 'query', 'query', 'query', 'run']
+            );
+            assert.match(String(connection.calls[0].args[0]), /^SAVEPOINT /);
+            assert.strictEqual(
+                connection.calls[1].args[0],
+                'DROP INDEX IF EXISTS "idx_docs_payload"'
+            );
+            assert.strictEqual(
+                connection.calls[2].args[0],
+                'ALTER TABLE "docs" DROP COLUMN "payload"'
+            );
+            assert.match(String(connection.calls.at(-1)?.args[0]), /^RELEASE /);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rolls back the native column drop when post-drop capture fails', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (
+                call.method === 'query'
+                && String(call.args[0]).includes('sqlite_schema')
+            ) {
+                throw new Error('post-drop snapshot failed');
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            connection.calls.length = 0;
+
+            await assert.rejects(
+                connection.databaseOps.deleteColumns('docs', ['payload']),
+                /post-drop snapshot failed/
+            );
+
+            const runSql = connection.calls
+                .filter(call => call.method === 'run')
+                .map(call => String(call.args[0]));
+            assert.match(runSql[0], /^SAVEPOINT /);
+            assert.strictEqual(runSql[1], 'ALTER TABLE "docs" DROP COLUMN "payload"');
+            assert.strictEqual(runSql[2], `ROLLBACK TO ${runSql[0].slice('SAVEPOINT '.length)}`);
+            assert.strictEqual(runSql[3], `RELEASE ${runSql[0].slice('SAVEPOINT '.length)}`);
         } finally {
             connection.dispose();
         }

@@ -46,7 +46,8 @@ import type {
   CellReadSession,
   CellReadTarget,
   OversizedCellMetadata,
-  DatabaseWriteResult
+  DatabaseWriteResult,
+  ColumnDropTableState
 } from './core/types';
 import type { PagedWritableOverlaySnapshot } from './core/paged-writable-overlay';
 
@@ -150,7 +151,11 @@ interface WorkerMethods {
     maxEditValueBytes?: number
   ): Promise<void>;
   deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void>;
-  deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
+  deleteColumns(
+    table: string,
+    columns: string[],
+    dropDependentIndexes?: string[]
+  ): Promise<ColumnDropTableState>;
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
   getViewDefinition(view: string): Promise<ViewDefinition>;

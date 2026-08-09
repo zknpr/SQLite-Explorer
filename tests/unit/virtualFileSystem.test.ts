@@ -5,6 +5,7 @@ import assert from 'node:assert';
 import { SQLiteFileSystemProvider } from '../../src/virtualFileSystem';
 import { DocumentRegistry } from '../../src/documentRegistry';
 import type { DatabaseDocument } from '../../src/databaseModel';
+import { DEFAULT_MAX_CELL_EDIT_BYTES } from '../../src/core/cell-edit-policy';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import * as vscode from 'vscode';
 
@@ -436,7 +437,7 @@ describe('SQLiteFileSystemProvider', () => {
                 'col',
                 'Hello World',
                 undefined,
-                1024 * 1024
+                DEFAULT_MAX_CELL_EDIT_BYTES
             ]);
             assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 1);
         });
@@ -453,10 +454,14 @@ describe('SQLiteFileSystemProvider', () => {
             await assert.rejects(
                 provider.writeFile(
                     uri,
-                    new Uint8Array(1024 * 1024 + 1),
+                    new Uint8Array(DEFAULT_MAX_CELL_EDIT_BYTES + 1),
                     { create: false, overwrite: true }
                 ),
-                /New TEXT cell value is 1048577 bytes.*1048576-byte edit limit/i
+                new RegExp(
+                    `New TEXT cell value is ${DEFAULT_MAX_CELL_EDIT_BYTES + 1} bytes.*` +
+                    `${DEFAULT_MAX_CELL_EDIT_BYTES}-byte edit limit`,
+                    'i'
+                )
             );
             assert.strictEqual(dbOps.getCellMetadata.mock.callCount(), 0);
             assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
@@ -465,10 +470,11 @@ describe('SQLiteFileSystemProvider', () => {
         });
 
         it('confirms and barriers an oversized external-editor replacement without reading it', async () => {
+            const oversizedPriorBytes = DEFAULT_MAX_CELL_EDIT_BYTES + 1;
             const dbOps = {
                 getCellMetadata: mock.fn(async () => ({
                     storageClass: 'blob',
-                    byteLength: 2 * 1024 * 1024
+                    byteLength: oversizedPriorBytes
                 })),
                 executeQuery: mock.fn(async () => {
                     throw new Error('whole prior value must not be queried');
@@ -493,15 +499,15 @@ describe('SQLiteFileSystemProvider', () => {
             assert.match(String(warning.mock.calls[0].arguments[0]), /BLOB/);
             assert.match(
                 String(warning.mock.calls[0].arguments[0]),
-                /2(?:,|\.)097(?:,|\.)152 bytes/
+                /16(?:,|\.)777(?:,|\.)217 bytes/
             );
             assert.deepStrictEqual(dbOps.replaceOversizedCell.mock.calls[0].arguments, [
                 'assets',
                 1,
                 'payload',
                 saved,
-                { storageClass: 'blob', byteLength: 2 * 1024 * 1024 },
-                1024 * 1024
+                { storageClass: 'blob', byteLength: oversizedPriorBytes },
+                DEFAULT_MAX_CELL_EDIT_BYTES
             ]);
             assert.strictEqual(dbOps.executeQuery.mock.callCount(), 0);
             assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
@@ -520,7 +526,7 @@ describe('SQLiteFileSystemProvider', () => {
             const dbOps = {
                 getCellMetadata: mock.fn(async () => ({
                     storageClass: 'blob',
-                    byteLength: 2 * 1024 * 1024
+                    byteLength: DEFAULT_MAX_CELL_EDIT_BYTES + 1
                 })),
                 replaceOversizedCell: mock.fn(async () => {
                     throw new Error('guarded update failed');
@@ -822,7 +828,7 @@ describe('SQLiteFileSystemProvider', () => {
                 'col',
                 content,
                 undefined,
-                1024 * 1024
+                DEFAULT_MAX_CELL_EDIT_BYTES
             ]);
             assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 1);
         });

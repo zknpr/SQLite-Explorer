@@ -489,7 +489,11 @@ export interface DatabaseOperations {
   deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void>;
 
   /** Delete columns by name */
-  deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
+  deleteColumns(
+    table: string,
+    columns: string[],
+    dropDependentIndexes?: string[]
+  ): Promise<ColumnDropTableState>;
 
   /** Find indexes that depend on specific columns */
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;

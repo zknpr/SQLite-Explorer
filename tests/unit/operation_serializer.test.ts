@@ -31,7 +31,12 @@ function createOperations(overrides: Partial<DatabaseOperations> = {}): Database
         insertRow: async () => undefined,
         insertRowBatch: async () => {},
         deleteRows: async () => {},
-        deleteColumns: async () => {},
+        deleteColumns: async table => ({
+            tableSql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY)`,
+            columns: ['id'],
+            identity: { kind: 'rowid' },
+            schemaObjects: []
+        }),
         findDependentIndexes: async () => [],
         createTable: async () => {},
         getViewDefinition: async () => ({ identifier: 'v', sql: 'CREATE VIEW v AS SELECT 1', selectSql: 'SELECT 1', triggers: [] }),

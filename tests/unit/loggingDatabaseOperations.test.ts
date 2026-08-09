@@ -3,7 +3,7 @@ import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import * as vsc from 'vscode';
 import { LoggingDatabaseOperations } from '../../src/loggingDatabaseOperations';
-import type { DatabaseOperations, CellValue, QueryResultSet, ModificationEntry, CellUpdate, TableQueryOptions, TableCountOptions, SchemaSnapshot, ColumnMetadata, ColumnDefinition, CellReadTarget, CellMetadata, CellReadSession, CellReadChunk } from '../../src/core/types';
+import type { DatabaseOperations, CellValue, QueryResultSet, ModificationEntry, CellUpdate, TableQueryOptions, TableCountOptions, SchemaSnapshot, ColumnMetadata, ColumnDefinition, CellReadTarget, CellMetadata, CellReadSession, CellReadChunk, ColumnDropTableState } from '../../src/core/types';
 
 class MockDatabaseOperations implements DatabaseOperations {
     engineKind = Promise.resolve('wasm' as const);
@@ -37,7 +37,18 @@ class MockDatabaseOperations implements DatabaseOperations {
     async insertRow(table: string, data: Record<string, CellValue>): Promise<number> { return 1; }
     async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {}
     async deleteRows(table: string, rowIds: number[]): Promise<void> {}
-    async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {}
+    async deleteColumns(
+        table: string,
+        columns: string[],
+        dropDependentIndexes?: string[]
+    ): Promise<ColumnDropTableState> {
+        return {
+            tableSql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY)`,
+            columns: ['id'],
+            identity: { kind: 'rowid' },
+            schemaObjects: []
+        };
+    }
     async findDependentIndexes(table: string, columns: string[]): Promise<string[]> { return []; }
     async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {}
     async getViewDefinition(view: string) { return { identifier: view, sql: `CREATE VIEW ${view} AS SELECT 1`, selectSql: 'SELECT 1', triggers: [] }; }

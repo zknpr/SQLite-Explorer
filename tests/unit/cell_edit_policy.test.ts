@@ -4,9 +4,12 @@ import assert from 'node:assert/strict';
 import {
   CELL_EDIT_VALUE_TOO_LARGE_CODE,
   assertCellValueWithinEditLimit,
+  assertCellValuesWithinEditLimit,
   fromCellEditPolicyErrorData,
   toCellEditPolicyErrorData
 } from '../../src/core/cell-edit-policy';
+import { DEFAULT_MAX_INLINE_CELL_BYTES } from '../../src/core/cell-containment';
+import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from '../../src/core/webview-transport';
 
 describe('oversized cell edit policy', () => {
   it('rejects a new BLOB above the edit limit with a typed, round-trippable refusal', () => {
@@ -52,5 +55,14 @@ describe('oversized cell edit policy', () => {
     for (const value of [null, 1, 1n, 1.5] as const) {
       assert.doesNotThrow(() => assertCellValueWithinEditLimit(value, 1));
     }
+  });
+
+  it('defaults writes to the transport ceiling rather than the inline preview ceiling', () => {
+    const replacement = new Uint8Array(DEFAULT_MAX_INLINE_CELL_BYTES + 1);
+
+    assert.strictEqual(
+      assertCellValuesWithinEditLimit([replacement]),
+      MAX_WEBVIEW_BINARY_VALUE_BYTES
+    );
   });
 });

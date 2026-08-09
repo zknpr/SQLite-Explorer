@@ -144,6 +144,27 @@ describe('SQLite Engine Undo/Redo', () => {
         }
     });
 
+    it('rolls back a column drop when its post-drop snapshot cannot be captured', async () => {
+        const originalGetTableInfo = engine.getTableInfo.bind(engine);
+        engine.getTableInfo = async (table: string) => {
+            const columns = await originalGetTableInfo(table);
+            if (table === 'users' && !columns.some((column: any) => column.identifier === 'name')) {
+                throw new Error('post-drop snapshot failed');
+            }
+            return columns;
+        };
+
+        await assert.rejects(
+            engine.deleteColumns('users', ['name']),
+            /post-drop snapshot failed/
+        );
+
+        assert.deepStrictEqual(
+            (await originalGetTableInfo('users')).map((column: any) => column.identifier),
+            ['id', 'name']
+        );
+    });
+
     it('restores a dropped middle column with its exact schema position and dependents', async () => {
         const createTableSql =
             "CREATE TABLE column_restore_parent (id INTEGER PRIMARY KEY, removed TEXT NOT NULL DEFAULT 'fallback' CHECK(length(removed) > 0), tail TEXT)";

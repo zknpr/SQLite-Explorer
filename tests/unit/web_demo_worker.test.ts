@@ -11,6 +11,7 @@ import esbuild from 'esbuild';
 import initSqlJs from '../../vendor/sql.js/sql-wasm.js';
 import {
     CellEditPolicyError,
+    DEFAULT_MAX_CELL_EDIT_BYTES,
     fromCellEditRpcErrorData
 } from '../../src/core/cell-edit-policy';
 
@@ -508,7 +509,7 @@ describe('web demo view worker', () => {
             'bounded'
         );
 
-        const legacyValue = new Uint8Array(1024 * 1024 + 1);
+        const legacyValue = new Uint8Array(DEFAULT_MAX_CELL_EDIT_BYTES + 1);
         await assert.rejects(
             worker.invoke('updateCell', 'demo_stage_d', 1, 'payload', legacyValue),
             CellEditPolicyError

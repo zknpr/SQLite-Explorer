@@ -37,6 +37,7 @@ import type { CellMaterializationService } from './cellMaterialization';
 import {
   assertCellValueWithinEditLimit,
   assertCellValuesWithinEditLimit,
+  DEFAULT_MAX_CELL_EDIT_BYTES,
   formatOversizedCellReplacementWarning,
   isOversizedCellReplacementConflictError,
   isOversizedCellReplacementRequiredError
@@ -341,9 +342,9 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
     assertMutableRecordId(rowId);
-    const editLimitBytes = getMaxInlineCellBytes();
-    // Stage C guards the transport ceiling. Stage D applies the stricter
-    // semantic policy before any database read or confirmation work.
+    const editLimitBytes = DEFAULT_MAX_CELL_EDIT_BYTES;
+    // Refuse values the transport cannot carry before any database read or
+    // confirmation work. Inline preview settings are read-only concerns.
     assertCellValueWithinEditLimit(value, editLimitBytes);
 
     const identity = await this.resolveTableIdentity(dbOps, table);
@@ -504,7 +505,7 @@ export class HostBridge implements ToastService {
 
     const editLimitBytes = assertCellValuesWithinEditLimit(
       Object.values(data),
-      getMaxInlineCellBytes()
+      DEFAULT_MAX_CELL_EDIT_BYTES
     );
     let rowId: RecordId | undefined;
 
@@ -710,21 +711,17 @@ export class HostBridge implements ToastService {
     }));
 
     this.assertConnectionGeneration(connectionGeneration);
+    let stateAfter: ColumnDropTableState;
     if ('deleteColumns' in dbOps) {
       // Pass dependent indexes to be dropped first if user confirmed
-      await dbOps.deleteColumns(table, columns, dependentIndexes.length > 0 ? dependentIndexes : undefined);
+      stateAfter = await dbOps.deleteColumns(
+        table,
+        columns,
+        dependentIndexes.length > 0 ? dependentIndexes : undefined
+      );
     } else {
       throw new Error("Backend does not support deleteColumns");
     }
-
-    const tableInfoAfter = await dbOps.getTableInfo(table);
-    const identityAfter = await this.resolveTableIdentity(dbOps, table, tableInfoAfter);
-    const stateAfter = await this.captureColumnDropTableState(
-      dbOps,
-      table,
-      tableInfoAfter,
-      identityAfter
-    );
 
     // Fire edit event
     this.document.recordExternalModification({
@@ -954,7 +951,7 @@ export class HostBridge implements ToastService {
     if (updates.length === 0) return;
     const editLimitBytes = assertCellValuesWithinEditLimit(
       updates.map(update => update.value),
-      getMaxInlineCellBytes()
+      DEFAULT_MAX_CELL_EDIT_BYTES
     );
 
     this.assertConnectionGeneration(connectionGeneration);

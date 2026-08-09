@@ -128,6 +128,7 @@ import {
   assertColumnDropTableStateCurrent,
   buildColumnDropRestorePlan,
   COLUMN_DROP_TABLE_STATE_SQL,
+  executeSchemaPreservingColumnDrop,
   mapColumnDropTableState
 } from './core/column-drop';
 
@@ -2176,26 +2177,32 @@ export async function createNativeDatabaseConnection(
          * Delete columns by name.
          * If dropDependentIndexes is provided, those indexes will be dropped first.
          */
-        deleteColumns: async (table: string, columns: string[], dropDependentIndexes?: string[]) => {
-          if (columns.length === 0) return;
+        deleteColumns: async (
+          table: string,
+          columns: string[],
+          dropDependentIndexes?: string[]
+        ): Promise<ColumnDropTableState> => {
+          if (columns.length === 0) return readNativeColumnDropTableState(table);
 
-          const escapedTable = escapeIdentifier(table);
-          const batch: { sql: string; params?: CellValue[] }[] = [];
-
-          // Drop specified dependent indexes first
-          if (dropDependentIndexes && dropDependentIndexes.length > 0) {
-            for (const indexName of dropDependentIndexes) {
-              batch.push({ sql: `DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}` });
-            }
-          }
-
-          // Now drop the columns
-          for (const col of columns) {
-            batch.push({ sql: `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}` });
-          }
-
-          if (batch.length > 0) {
-            await worker.call('execBatch', [batch]);
+          // A SAVEPOINT composes with replay's outer transaction. The post-drop
+          // snapshot is read before RELEASE so capture failure rolls the DDL back.
+          const savepointName = createSavepointName('sp_delete_columns');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            await executeSchemaPreservingColumnDrop(
+              table,
+              columns,
+              dropDependentIndexes,
+              async sql => {
+                await worker.call('run', [sql]);
+              }
+            );
+            const stateAfter = await readNativeColumnDropTableState(table);
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return stateAfter;
+          } catch (error) {
+            await safeRollbackSavepoint(savepointName, 'deleteColumns');
+            throw error;
           }
         },
 

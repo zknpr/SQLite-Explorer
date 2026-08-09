@@ -1939,8 +1939,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * @param columns - Column names to delete
    * @param dropDependentIndexes - Optional list of indexes to drop first
    */
-  async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {
-    if (columns.length === 0) return;
+  async deleteColumns(
+    table: string,
+    columns: string[],
+    dropDependentIndexes?: string[]
+  ): Promise<ColumnDropTableState> {
+    if (columns.length === 0) return this.readColumnDropTableState(table);
 
     // Use a SAVEPOINT so column drops remain atomic on their own and can also
     // participate in the outer hot-exit restore transaction.
@@ -1955,7 +1959,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           await this.executeQuery(sql);
         }
       );
+      // Capture the exact undo guard while the DDL is still rollbackable.
+      const stateAfter = await this.readColumnDropTableState(table);
       await this.executeQuery(`RELEASE ${savepointName}`);
+      return stateAfter;
     } catch (e) {
       await this.safeRollbackSavepoint(savepointName, 'deleteColumns');
       throw e;

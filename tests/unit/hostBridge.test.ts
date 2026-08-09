@@ -16,6 +16,8 @@ import {
     CELL_EDIT_VALUE_TOO_LARGE_CODE,
     toCellEditPolicyErrorData
 } from '../../src/core/cell-edit-policy';
+import { DEFAULT_MAX_INLINE_CELL_BYTES } from '../../src/core/cell-containment';
+import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from '../../src/core/webview-transport';
 
 describe('HostBridge', () => {
     it('projects one canonical row matrix without changing bounded consumer bytes', () => {
@@ -926,7 +928,40 @@ describe('HostBridge', () => {
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
-    it('rejects an oversized new cell value with a typed refusal before any database read', async () => {
+    it('allows a BLOB replacement above the inline preview ceiling up to the transport ceiling', async () => {
+        const replacement = new Uint8Array(DEFAULT_MAX_INLINE_CELL_BYTES + 1);
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => sql.includes('pragma_table_list')
+                ? [{ headers: ['type', 'wr'], rows: [['table', 0]] }]
+                : [{
+                    headers: ['storage_class', 'byte_length', 'bounded_value'],
+                    rows: [['blob', 1, new Uint8Array([7])]]
+                }]),
+            updateCell: mock.fn(async () => 7)
+        };
+        const recordExternalModification = mock.fn();
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, mockDocument as any);
+
+        const updatedRowId = await bridge.updateCell('items', 7, 'payload', replacement);
+
+        assert.strictEqual(updatedRowId, 7);
+        assert.strictEqual(dbOps.updateCell.mock.callCount(), 1);
+        assert.strictEqual(
+            Array.from(dbOps.updateCell.mock.calls[0].arguments)[5],
+            MAX_WEBVIEW_BINARY_VALUE_BYTES
+        );
+        assert.strictEqual(recordExternalModification.mock.callCount(), 1);
+    });
+
+    it('rejects a new cell value above the transport edit ceiling before any database read', async () => {
         const dbOps = {
             executeQuery: mock.fn(async () => []),
             updateCell: mock.fn(async () => {})
@@ -946,14 +981,14 @@ describe('HostBridge', () => {
                 'items',
                 7,
                 'payload',
-                new Uint8Array(1024 * 1024 + 1)
+                new Uint8Array(MAX_WEBVIEW_BINARY_VALUE_BYTES + 1)
             ),
             error => {
                 const typed = toCellEditPolicyErrorData(error);
                 assert.strictEqual(typed?.code, CELL_EDIT_VALUE_TOO_LARGE_CODE);
                 assert.strictEqual(typed?.storageClass, 'blob');
-                assert.strictEqual(typed?.actualBytes, 1024 * 1024 + 1);
-                assert.strictEqual(typed?.limitBytes, 1024 * 1024);
+                assert.strictEqual(typed?.actualBytes, MAX_WEBVIEW_BINARY_VALUE_BYTES + 1);
+                assert.strictEqual(typed?.limitBytes, MAX_WEBVIEW_BINARY_VALUE_BYTES);
                 return true;
             }
         );
@@ -1010,7 +1045,7 @@ describe('HostBridge', () => {
             'payload',
             'replacement',
             { storageClass: 'blob', byteLength: sourceBytes },
-            1024 * 1024
+            MAX_WEBVIEW_BINARY_VALUE_BYTES
         ]);
         assert.strictEqual(confirmations.length, 1);
         const confirmationText = String(confirmations[0][0]);
@@ -1036,7 +1071,7 @@ describe('HostBridge', () => {
                 ? [{ headers: ['type', 'wr'], rows: [['table', 0]] }]
                 : [{
                     headers: ['storage_class', 'byte_length', 'bounded_value'],
-                    rows: [['text', 4 * 1024 * 1024, null]]
+                    rows: [['text', 32 * 1024 * 1024, null]]
                 }]),
             replaceOversizedCell: mock.fn(async () => { throw writeError; }),
             updateCell: mock.fn(async () => 1)
@@ -1558,7 +1593,15 @@ describe('HostBridge', () => {
                     ]
                 }];
             }),
-            deleteColumns: mock.fn(async () => { dropped = true; })
+            deleteColumns: mock.fn(async () => {
+                dropped = true;
+                return {
+                    tableSql: 'CREATE TABLE items (id INTEGER PRIMARY KEY)',
+                    columns: ['id'],
+                    identity: { kind: 'rowid' as const },
+                    schemaObjects: []
+                };
+            })
         };
         const recordExternalModification = mock.fn();
         const mockDocument = {
@@ -1636,7 +1679,15 @@ describe('HostBridge', () => {
                     rows: [[4, 'kept']]
                 }];
             }),
-            deleteColumns: mock.fn(async () => { dropped = true; })
+            deleteColumns: mock.fn(async () => {
+                dropped = true;
+                return {
+                    tableSql: afterSql,
+                    columns: ['id', 'tail'],
+                    identity: { kind: 'rowid' as const },
+                    schemaObjects: []
+                };
+            })
         };
         const recordExternalModification = mock.fn();
         const mockDocument = {
@@ -1669,6 +1720,82 @@ describe('HostBridge', () => {
                 schemaObjects: []
             }
         });
+    });
+
+    it('uses the engine-owned post-drop snapshot without metadata reads after commit', async () => {
+        const beforeColumns = [
+            {
+                ordinal: 0,
+                identifier: 'id',
+                declaredType: 'INTEGER',
+                isRequired: 0,
+                defaultExpression: null,
+                primaryKeyPosition: 1
+            },
+            {
+                ordinal: 1,
+                identifier: 'payload',
+                declaredType: 'TEXT',
+                isRequired: 0,
+                defaultExpression: null,
+                primaryKeyPosition: 0
+            }
+        ];
+        const afterState = {
+            tableSql: 'CREATE TABLE items (id INTEGER PRIMARY KEY)',
+            columns: ['id'],
+            identity: { kind: 'rowid' as const },
+            schemaObjects: []
+        };
+        let dropped = false;
+        const dbOps = {
+            findDependentIndexes: mock.fn(async () => []),
+            getTableInfo: mock.fn(async () => {
+                if (dropped) throw new Error('post-commit metadata read');
+                return beforeColumns;
+            }),
+            executeQuery: mock.fn(async (sql: string) => {
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
+                }
+                if (sql.includes('sqlite_schema')) {
+                    return [{
+                        headers: ['type', 'name', 'sql'],
+                        rows: [[
+                            'table',
+                            'items',
+                            'CREATE TABLE items (id INTEGER PRIMARY KEY, payload TEXT)'
+                        ]]
+                    }];
+                }
+                return [{ headers: ['rowid', 'payload'], rows: [[1, 'kept']] }];
+            }),
+            deleteColumns: mock.fn(async () => {
+                dropped = true;
+                return afterState;
+            })
+        };
+        const recordExternalModification = mock.fn();
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            {
+                uri: vscode.Uri.parse('file:///test.db'),
+                documentKey: Promise.resolve('test-key'),
+                databaseOperations: dbOps,
+                isReadOnlyMode: false,
+                connectionGeneration: 1,
+                recordExternalModification
+            } as any
+        );
+
+        await bridge.deleteColumns('items', ['payload']);
+
+        assert.strictEqual(dbOps.getTableInfo.mock.callCount(), 1);
+        assert.strictEqual(recordExternalModification.mock.callCount(), 1);
+        assert.deepStrictEqual(
+            recordExternalModification.mock.calls[0].arguments[0].columnDropSnapshot.after,
+            afterState
+        );
     });
 
     it('returns refreshed connection capabilities after reloading from disk', async () => {

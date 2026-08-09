@@ -131,6 +131,12 @@ export function initSidebar() {
     });
 }
 
+export function syncSelectedTableIdentity() {
+    state.selectedTableIdentity = state.selectedTableType === 'table'
+        ? state.schemaCache.tables.find(table => table.name === state.selectedTable)?.identity ?? null
+        : null;
+}
+
 export async function refreshSchema() {
     if (!state.isDbConnected) return;
 
@@ -143,9 +149,7 @@ export async function refreshSchema() {
         }));
         state.schemaCache.views = (schema.views || []).map(v => ({ name: v.identifier }));
         state.schemaCache.indexes = (schema.indexes || []).map(i => ({ name: i.identifier, table: i.parentTable }));
-        state.selectedTableIdentity = state.selectedTableType === 'table'
-            ? state.schemaCache.tables.find(table => table.name === state.selectedTable)?.identity ?? null
-            : null;
+        syncSelectedTableIdentity();
 
         renderSidebar();
 
@@ -553,9 +557,7 @@ export async function selectTableItem(name, type) {
     invalidateAllCounts();
     state.selectedTable = name;
     state.selectedTableType = type;
-    state.selectedTableIdentity = type === 'table'
-        ? state.schemaCache.tables.find(table => table.name === name)?.identity ?? null
-        : null;
+    syncSelectedTableIdentity();
     state.currentPageIndex = 0;
     state.sortedColumn = null;
     state.sortAscending = true;

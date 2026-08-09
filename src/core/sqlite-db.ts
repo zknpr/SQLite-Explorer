@@ -32,7 +32,8 @@ import type {
   CellReadSession,
   CellReadTarget,
   OversizedCellMetadata,
-  DatabaseWriteResult
+  DatabaseWriteResult,
+  ColumnDropTableState
 } from './types';
 import { getNodeFs } from './platform/fs';
 import {
@@ -703,7 +704,11 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().deleteRows(table, rowIds);
     },
 
-    async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {
+    async deleteColumns(
+      table: string,
+      columns: string[],
+      dropDependentIndexes?: string[]
+    ): Promise<ColumnDropTableState> {
       return requireEngine().deleteColumns(table, columns, dropDependentIndexes);
     },
 

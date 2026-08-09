@@ -40,6 +40,54 @@ async function collectStreamingExport(
 }
 
 describe('streamTableExport golden parity', () => {
+    it('emits headers for empty CSV/Excel results and preserves JSON/SQL empty shapes', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery('CREATE TABLE stage_e_empty (id INTEGER, name TEXT)');
+
+        try {
+            const csv = await collectStreamingExport(
+                operations,
+                'stage_e_empty',
+                ['id', 'name'],
+                { format: 'csv' }
+            );
+            const excel = await collectStreamingExport(
+                operations,
+                'stage_e_empty',
+                ['id', 'name'],
+                { format: 'excel' }
+            );
+            const json = await collectStreamingExport(
+                operations,
+                'stage_e_empty',
+                ['id', 'name'],
+                { format: 'json' }
+            );
+            const sql = await collectStreamingExport(
+                operations,
+                'stage_e_empty',
+                ['id', 'name'],
+                { format: 'sql' }
+            );
+
+            assert.deepStrictEqual(
+                [csv.content, excel.content, json.content, sql.content],
+                ['id,name', '\uFEFFid,name', '[]', '']
+            );
+            assert.deepStrictEqual(
+                [csv.rowCount, excel.rowCount, json.rowCount, sql.rowCount],
+                [0, 0, 0, 0]
+            );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('exports exact signed int64 bytes through CSV, Excel, JSON, and SQL', async () => {
         const database = await createDatabaseEngine({
             content: null,
@@ -630,7 +678,7 @@ describe('streamTableExport cell boundaries', () => {
                 { format: 'csv', rowIds: [selectedId] }
             );
             assert.strictEqual(mutationInjected, true);
-            assert.strictEqual(exported.content, '');
+            assert.strictEqual(exported.content, 'value');
             assert.doesNotMatch(exported.content, /other|unselected replacement/);
         } finally {
             (operations as WasmDatabaseEngine).shutdown();

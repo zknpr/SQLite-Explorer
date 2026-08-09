@@ -30,7 +30,8 @@ import type {
     CellReadSession,
     CellReadTarget,
     OversizedCellMetadata,
-    DatabaseWriteResult
+    DatabaseWriteResult,
+    ColumnDropTableState
 } from './core/types';
 import { escapeIdentifier } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -250,7 +251,11 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.deleteRows(table, rowIds);
     }
 
-    async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {
+    async deleteColumns(
+        table: string,
+        columns: string[],
+        dropDependentIndexes?: string[]
+    ): Promise<ColumnDropTableState> {
         if (dropDependentIndexes && dropDependentIndexes.length > 0) {
             for (const indexName of dropDependentIndexes) {
                 this.log(`DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}`, true);

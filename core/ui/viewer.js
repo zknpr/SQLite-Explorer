@@ -7,7 +7,8 @@ import { backendApi, getVsCodeState } from './modules/api.js';
 import {
     initSidebar,
     refreshSchema,
-    renderSidebar
+    renderSidebar,
+    syncSelectedTableIdentity
 } from './modules/sidebar.js';
 import {
     initExport
@@ -114,6 +115,9 @@ async function restoreSavedState() {
         // Restore scalar state fields
         state.selectedTable = savedState.selectedTable;
         state.selectedTableType = savedState.selectedTableType || 'table';
+        // The initial schema load ran before persisted selection restoration.
+        // Rebind identity before any CRUD code can parse primary-key values.
+        syncSelectedTableIdentity();
         state.currentPageIndex = savedState.currentPageIndex || 0;
         state.sortedColumn = savedState.sortedColumn || null;
         state.sortAscending = savedState.sortAscending !== false;

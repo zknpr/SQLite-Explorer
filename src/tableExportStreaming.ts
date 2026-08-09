@@ -822,13 +822,11 @@ async function writeCsvRows(
 ): Promise<number> {
   let rowCount = 0;
   if (excel) await emit(sink, '\uFEFF', cancellation);
+  if (includeHeader) {
+    await emit(sink, columns.map(escapeCsvValue).join(','), cancellation);
+  }
   for await (const row of rows) {
-    if (rowCount === 0) {
-      if (includeHeader) {
-        await emit(sink, columns.map(escapeCsvValue).join(','), cancellation);
-        await emit(sink, '\n', cancellation);
-      }
-    } else {
+    if (includeHeader || rowCount > 0) {
       await emit(sink, '\n', cancellation);
     }
     for (let index = 0; index < row.cells.length; index++) {

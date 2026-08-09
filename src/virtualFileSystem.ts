@@ -16,6 +16,7 @@ import { GlobalOutputChannel } from './main';
 import { getMaxInlineCellBytes } from './config';
 import {
     assertCellValueWithinEditLimit,
+    DEFAULT_MAX_CELL_EDIT_BYTES,
     formatOversizedCellReplacementWarning,
     isOversizedCellReplacementConflictError,
     isOversizedCellReplacementRequiredError
@@ -431,7 +432,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             } catch {
                 // Keep as Uint8Array, treating as BLOB
             }
-            const editLimitBytes = getMaxInlineCellBytes();
+            const editLimitBytes = DEFAULT_MAX_CELL_EDIT_BYTES;
             assertCellValueWithinEditLimit(value, editLimitBytes);
 
             while (true) {

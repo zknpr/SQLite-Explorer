@@ -1,4 +1,4 @@
-import { DEFAULT_MAX_INLINE_CELL_BYTES } from './cell-containment';
+import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from './webview-transport';
 import type {
   CellValue,
   OversizedCellMetadata,
@@ -10,6 +10,9 @@ export const OVERSIZED_CELL_REPLACEMENT_REQUIRED_CODE =
   'SQLITE_EXPLORER_OVERSIZED_CELL_REPLACEMENT_REQUIRED';
 export const OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE =
   'Oversized cell metadata changed before the confirmed replacement was applied';
+// Writes are bounded by the RPC transport, independently of the configurable
+// inline preview limit. A preview setting must never shrink edit capability.
+export const DEFAULT_MAX_CELL_EDIT_BYTES = MAX_WEBVIEW_BINARY_VALUE_BYTES;
 
 export interface CellEditPolicyErrorData {
   name: 'CellEditPolicyError';
@@ -120,7 +123,7 @@ export function assertCellValueWithinEditLimit(value: CellValue, limitBytes: num
 }
 
 export function normalizeCellEditLimitBytes(limitBytes?: number): number {
-  const effectiveLimit = limitBytes ?? DEFAULT_MAX_INLINE_CELL_BYTES;
+  const effectiveLimit = limitBytes ?? DEFAULT_MAX_CELL_EDIT_BYTES;
   if (!Number.isSafeInteger(effectiveLimit) || effectiveLimit < 1) {
     throw new Error(`Cell edit limit must be a positive safe integer, got ${effectiveLimit}`);
   }
