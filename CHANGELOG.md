@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.7.0
+
+### Features
+
+- **Huge databases open instantly.** Databases are now read page-by-page on demand instead of being loaded whole into memory: a multi-gigabyte file opens to a browsable grid in a fraction of a second, with almost no memory use. This applies to the desktop extension and the web demo alike — the old practical size ceiling is gone.
+- **Huge databases are editable too.** Files opened in page-on-demand mode can be edited like any other database. Your edits are kept separately while you work — the file on disk is never touched until you save — and saving writes only what actually changed, so saving a small edit to a huge database is fast and safe (the save is atomic: either it fully completes or the original file is left exactly as it was).
+- **Much smaller downloads.** The extension now ships as per-platform packages: the marketplace automatically delivers the one matching your machine (~3 MB) instead of a single package containing every platform's engine (previously ~19 MB at its worst). VS Code for Web gets a 1.3 MB package.
+- **Faster, smoother large tables.** Pages now hold 5,000 rows by default (selectable up to 10,000), jumping to a deep page is as fast as the first page, repeat visits to a table skip the row-count query entirely, and the grid only renders the rows actually on screen — so even maximum-size pages scroll smoothly.
+- **Sidebar width is remembered.** Resizing the table list now persists across sessions.
+
+### Fixes
+
+- **Wide tables show their data again.** A 50-column table at large page sizes could render ordinary small values as "TEXT · N bytes" placeholders instead of the actual content; cells now always display inline unless they are genuinely oversized.
+- **Undoing a column deletion puts the column back where it was.** Previously the restored column reappeared at the end of the table; it now returns to its original position with its data, type, and constraints intact.
+- **Reverting a cell edited in a VS Code tab no longer blanks it.** Editing a cell through "open in VS Code editor" and then reverting the database could replace the original value with NULL. The original value is now restored exactly.
+- **Opening the same file in both editor modes no longer risks conflicting edits.** Both SQLite Explorer editor entries now share a single underlying session per file, so two panels can't fight over the same database.
+- **Batch update visuals stay consistent.** After a batch update completes, the column header no longer stays highlighted once the selection is cleared.
+- **Exports from the web demo no longer lose data.** SQL and JSON exports now carry binary (BLOB) values and text containing NUL characters faithfully instead of silently dropping or mangling them, matching the desktop extension.
+- **Deleting a column in the web demo preserves the rest of the table.** The demo previously rebuilt the table in a way that could silently drop constraints, indexes, and triggers; it now uses the same safe path as the extension.
+- **The settings (PRAGMA) panel tells the truth.** It now shows the value SQLite actually applied (not just what was requested) and clearly marks settings that only last for the current session.
+- **Double-clicking a dialog button can't apply a change twice.** Add-row and similar dialogs now ignore repeated submissions while the first one is in flight.
+- **Databases with active write-ahead logs open read-only.** If a database has a live `-wal` companion file that can't be safely merged, it opens protected instead of risking inconsistent reads and writes.
+- **A failed open can no longer damage the file.** Errors while opening a database by path now surface properly instead of, in the worst case, leaving an empty database where your file was.
+- **Cell edits always land in the cell you edited.** Confirming an edit after switching tables could previously write the value into the newly selected table.
+- **Clearer auto-save setting.** The instant-commit setting now explains that the default desktop engine always writes changes straight to the file, and that the setting governs the in-memory engine.
+
+### Performance
+
+- **Batch updates are dramatically faster.** Updating three columns across 10,000 rows went from about 2.5 seconds to under 50 ms (single-column batches improved similarly). Undo and redo of large batches stay instant.
+- **Deep pagination is no longer a cliff.** Turning to a late page in a large table dropped from ~200 ms to ~3 ms.
+
+### Security
+
+- **The bundled database engine lost its network stack.** The native engine that powers desktop SQLite no longer contains TLS, HTTP, WebSocket, foreign-function, or WebAssembly-runtime code — none of it was used, and removing it shrinks the download and the attack surface at the same time.
+- **Read-only documents are enforced one layer deeper.** Edit events arriving from the interface are validated and refused outright on read-only documents.
+
+### Maintenance
+
+- **A real end-to-end test rig for the desktop extension.** A new automated suite drives an actual VS Code instance through opening, editing, saving, reverting, backup/restore, and export on both engines — the class of testing that caught several of the fixes above. The unit suite grew from ~1,100 to ~1,385 tests alongside it.
+- **Reproducible engine builds.** Both bundled engines (WebAssembly and native) are built by CI from pinned, published fork sources, and the artifacts are hash-verified — with the WebAssembly build independently reproduced bit-for-bit locally.
+
 ## 1.6.0
 
 ### Features
