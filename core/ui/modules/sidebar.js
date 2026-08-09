@@ -463,9 +463,14 @@ export async function applyBatchUpdate() {
             }
             identityChanges.set(outcome.rowId, outcome.newRowId);
         }
-        for (const identities of [state.selectedRowIds, state.pinnedRowIds]) {
-            for (const [oldIdentity, newIdentity] of identityChanges) {
-                if (identities.delete(oldIdentity)) identities.add(newIdentity);
+        // The RPC belongs to the snapshotted table. A table switch can expose
+        // opaque identities with identical strings, so never apply table A's
+        // remap to table B's selection or pins.
+        if (state.selectedTable === targetTable) {
+            for (const identities of [state.selectedRowIds, state.pinnedRowIds]) {
+                for (const [oldIdentity, newIdentity] of identityChanges) {
+                    if (identities.delete(oldIdentity)) identities.add(newIdentity);
+                }
             }
         }
         // Update local grid data

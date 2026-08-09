@@ -402,9 +402,11 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
   protected configureEventHandlers(document: DatabaseDocument) {
     super.configureEventHandlers(document);
 
-    // Fire edit events to VS Code
+    // Do not deduplicate this listener across providers: VS Code owns one
+    // custom-document model per viewType, so each model needs the edit stream.
+    // DatabaseDocument keeps the copied callbacks synchronized against its one
+    // shared history tracker.
     this._register(document.onDidChange(edit => {
-      // Tell VS Code that the document has been edited by the user
       this.#editEventEmitter.fire({ document, ...edit });
     }));
 

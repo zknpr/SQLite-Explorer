@@ -288,6 +288,18 @@ function estimateExactIntegerTextsWireBytes(exactIntegerTexts: ExactIntegerTextM
   return bytes;
 }
 
+function estimateReadOnlyRowReasonsWireBytes(
+  readOnlyRowReasons: ReadOnlyRowReasonMap | undefined
+): number {
+  if (!readOnlyRowReasons) return 0;
+  const rows = Object.entries(readOnlyRowReasons);
+  let bytes = 2 + Math.max(0, rows.length - 1);
+  for (const [rowIndex, reason] of rows) {
+    bytes += objectKeyWireBytes(rowIndex) + transportedCellWireBytes(reason);
+  }
+  return bytes;
+}
+
 /** Strip the private metadata column and return sparse, positionally exact sidecars. */
 export function decodeCellContainment(
   transportedRows: readonly (readonly unknown[])[],
@@ -504,6 +516,7 @@ export function remapPrimaryKeyContainment(
     ? input.rowOffset!
     : 0;
   let readOnlyRowReasons: ReadOnlyRowReasonMap | undefined;
+  const mutableRecordIdRows: number[] = [];
   const rows = input.rows.map((row, rowIndex) => {
     const oversizedMembers = input.identity.columns.flatMap((column, keyIndex) => {
       const metadata = input.oversizedCells?.[rowIndex]?.[primaryKeyIndices[keyIndex]];
@@ -525,6 +538,7 @@ export function remapPrimaryKeyContainment(
         input.identity.columns,
         primaryKeyIndices.map(index => identityRow[index])
       );
+      mutableRecordIdRows.push(rowIndex);
     }
     return [recordId, ...row.slice(0, input.visibleColumnCount)];
   });
@@ -537,6 +551,55 @@ export function remapPrimaryKeyContainment(
     input.exactIntegerTexts,
     input.visibleColumnCount
   ) as ExactIntegerTextMap | undefined;
+
+  // PK identities are URL-encoded after the source-cell budget has already
+  // run. Account for that expansion against the same response headroom and
+  // tail-downgrade identities to bounded read-only tokens when necessary.
+  const aggregateBudget =
+    DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES - WEBVIEW_GRID_RESPONSE_HEADROOM_BYTES;
+  let aggregateBytes = estimateRowsWireBytes(rows)
+    + estimateOversizedCellsWireBytes(oversizedCells)
+    + estimateExactIntegerTextsWireBytes(exactIntegerTexts)
+    + estimateReadOnlyRowReasonsWireBytes(readOnlyRowReasons);
+  const transportBudgetReason =
+    'Row is read-only because its encoded WITHOUT ROWID primary-key identity ' +
+    'exceeds the page transport budget.';
+
+  const reasonInsertionBytes = (rowIndex: number): number => {
+    if (readOnlyRowReasons?.[rowIndex] !== undefined) return 0;
+    const entryBytes = objectKeyWireBytes(String(rowIndex))
+      + transportedCellWireBytes(transportBudgetReason);
+    return readOnlyRowReasons ? 1 + entryBytes : 2 + entryBytes;
+  };
+
+  for (
+    let index = mutableRecordIdRows.length - 1;
+    index >= 0 && aggregateBytes > aggregateBudget;
+    index--
+  ) {
+    const rowIndex = mutableRecordIdRows[index];
+    const currentRecordId = rows[rowIndex][0];
+    const readOnlyRecordId = encodeReadOnlyPrimaryKeyRecordId(
+      transportBudgetReason,
+      rowOffset + rowIndex
+    );
+    const delta = transportedCellWireBytes(readOnlyRecordId)
+      - transportedCellWireBytes(currentRecordId)
+      + reasonInsertionBytes(rowIndex);
+    if (delta >= 0) continue;
+    rows[rowIndex][0] = readOnlyRecordId;
+    readOnlyRowReasons ??= {};
+    readOnlyRowReasons[rowIndex] = transportBudgetReason;
+    aggregateBytes += delta;
+  }
+
+  if (aggregateBytes > aggregateBudget) {
+    throw new Error(
+      `Cell containment cannot fit this page within the ` +
+      `${DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES}-byte transport limit`
+    );
+  }
+
   return {
     rows,
     ...(oversizedCells ? { oversizedCells } : {}),

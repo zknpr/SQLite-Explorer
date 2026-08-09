@@ -147,6 +147,7 @@ it('clears and persists a displayed view selection before the demo refresh reloa
                         `,
                         './modules/global-shortcuts.js': 'export function setupGlobalShortcuts() {}',
                         './modules/count-cache.js': `
+                            export function setCountCacheDemoMode() {}
                             export function invalidateAllCounts() {
                                 globalThis.__countInvalidations = (globalThis.__countInvalidations ?? 0) + 1;
                             }

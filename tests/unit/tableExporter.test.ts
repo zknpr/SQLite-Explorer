@@ -684,6 +684,77 @@ describe('streamTableExport cell boundaries', () => {
             (operations as WasmDatabaseEngine).shutdown();
         }
     });
+
+    it('keeps full WITHOUT ROWID export rows coherent across an equal-length ordering shift', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        const payloadFor = (id: number) => `row-${id}|`.padEnd(64 * 1024 + 1, 'x');
+        const initialIds = Array.from({ length: 129 }, (_, index) => index + 2);
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_pk_full_race (' +
+            'id INTEGER PRIMARY KEY, payload TEXT, tag TEXT' +
+            ') WITHOUT ROWID'
+        );
+        await operations.executeQuery(
+            `INSERT INTO stage_e_pk_full_race VALUES ${initialIds.map(() => '(?, ?, ?)').join(', ')}`,
+            initialIds.flatMap(id => [id, payloadFor(id), `row-${id}`])
+        );
+
+        let mutationInjected = false;
+        const racingOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'fetchTableData') {
+                    return async (...args: Parameters<DatabaseOperations['fetchTableData']>) => {
+                        const page = await target.fetchTableData(...args);
+                        if (!mutationInjected && args[0] === 'stage_e_pk_full_race') {
+                            mutationInjected = true;
+                            // Keep 129 rows and every streamed TEXT length unchanged,
+                            // but shift the first 128-row page by one key.
+                            await target.executeQuery(
+                                'DELETE FROM stage_e_pk_full_race WHERE id = 130'
+                            );
+                            await target.executeQuery(
+                                'INSERT INTO stage_e_pk_full_race VALUES (?, ?, ?)',
+                                [1, payloadFor(1), 'row-1']
+                            );
+                        }
+                        return page;
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+
+        try {
+            const exported = await collectStreamingExport(
+                racingOperations,
+                'stage_e_pk_full_race',
+                ['payload', 'tag'],
+                { format: 'csv' }
+            );
+            assert.strictEqual(mutationInjected, true);
+            const rows = exported.content.split('\n').slice(1);
+            assert.strictEqual(rows.length, 129);
+            for (const row of rows) {
+                const separator = row.lastIndexOf(',');
+                const payload = row.slice(0, separator);
+                const tag = row.slice(separator + 1);
+                const payloadId = /^row-(\d+)\|/.exec(payload)?.[1];
+                assert.strictEqual(
+                    tag,
+                    `row-${payloadId}`,
+                    'one exported row combined a streamed identity value with another row\'s inline value'
+                );
+            }
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
 });
 
 describe('exportTableCommand atomic streaming', () => {

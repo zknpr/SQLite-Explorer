@@ -341,24 +341,77 @@ async function* readPrimaryKeyTableRows(
     const identityRows = identities.rows;
     if (identityRows.length === 0) return;
 
-    const result = await operations.executeQuery(
-      `SELECT ${projection} FROM ${escapeIdentifier(table)} ` +
-      `ORDER BY ${orderBy} LIMIT ${EXPORT_ROW_BATCH_SIZE} OFFSET ${offset}`
-    );
-    const rows = result[0]?.rows ?? [];
-    if (rows.length !== identityRows.length) {
-      throw new Error(
-        `Table ${table} changed while export identities were being enumerated`
-      );
-    }
-
-    for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
-      assertNotCancelled(cancellation);
-      const rowId = identityRows[rowIndex]?.[0];
+    const recordIds = identityRows.map(identityRow => {
+      const rowId = identityRow?.[0];
       if (typeof rowId !== 'string' && typeof rowId !== 'number') {
         throw new Error(`SQLite returned an invalid primary-key identity for ${table}`);
       }
-      yield { cells: parseCells(table, columns, rows[rowIndex], 0, textEncoding, rowId) };
+      return rowId;
+    });
+
+    // SQLite guarantees at least 999 bind slots. Cap each stable-identity
+    // projection group so even a wide composite key stays inside that floor.
+    const maxBoundRows = Math.max(1, Math.floor(999 / identity.columns.length));
+    let rowIndex = 0;
+    while (rowIndex < recordIds.length) {
+      assertNotCancelled(cancellation);
+      const rowId = recordIds[rowIndex];
+
+      if (isReadOnlyPrimaryKeyRecordId(rowId)) {
+        // Oversized primary keys deliberately have no bindable identity. They
+        // also cannot open a later cell-read session, so read their projected
+        // values one row at a time instead of attaching the token to a
+        // separately fetched batch. This keeps inline exports coherent while
+        // retaining the existing read-only behavior for streamed cells.
+        const result = await operations.executeQuery(
+          `SELECT ${projection} FROM ${escapeIdentifier(table)} ` +
+          `ORDER BY ${orderBy} LIMIT 1 OFFSET ${offset + rowIndex}`
+        );
+        const row = result[0]?.rows?.[0];
+        if (!row || (result[0]?.rows.length ?? 0) !== 1) {
+          throw new Error(`Table ${table} changed while export identities were being enumerated`);
+        }
+        yield { cells: parseCells(table, columns, row, 0, textEncoding, rowId) };
+        rowIndex++;
+        continue;
+      }
+
+      let groupEnd = rowIndex + 1;
+      while (
+        groupEnd < recordIds.length
+        && groupEnd - rowIndex < maxBoundRows
+        && !isReadOnlyPrimaryKeyRecordId(recordIds[groupEnd])
+      ) {
+        groupEnd++;
+      }
+      const groupIds = recordIds.slice(rowIndex, groupEnd);
+      // Restrict the projection query to the exact identities fetched for
+      // this page. ORDER BY can no longer pull in an unrelated replacement
+      // row after a concurrent equal-cardinality delete+insert.
+      const predicate = buildRecordIdentitiesPredicate(groupIds, identity);
+      const result = await operations.executeQuery(
+        `SELECT ${projection} FROM ${escapeIdentifier(table)} ` +
+        `WHERE ${predicate.sql} ORDER BY ${orderBy}`,
+        predicate.params
+      );
+      const rows = result[0]?.rows ?? [];
+      if (rows.length !== groupIds.length) {
+        throw new Error(`Table ${table} changed while export identities were being enumerated`);
+      }
+      for (let groupIndex = 0; groupIndex < rows.length; groupIndex++) {
+        assertNotCancelled(cancellation);
+        yield {
+          cells: parseCells(
+            table,
+            columns,
+            rows[groupIndex],
+            0,
+            textEncoding,
+            groupIds[groupIndex]
+          )
+        };
+      }
+      rowIndex = groupEnd;
     }
 
     offset += identityRows.length;

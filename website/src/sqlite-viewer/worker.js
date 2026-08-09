@@ -106,6 +106,7 @@ import {
 import {
   buildCountUpperBoundSql,
   resolvePagedExactCountMaxFileBytes,
+  resolveCountUpperBound,
   shouldAnswerCountWithUpperBound
 } from '../../../src/core/paged-count.ts';
 import { createChunkedReadCache } from '../../../src/core/chunked-read-cache.ts';
@@ -1600,7 +1601,8 @@ async function fetchTableCount(table, options = {}) {
         authorityConfirmedRowIdTable
       })) {
         const upperBound = db.exec(buildCountUpperBoundSql(table));
-        return upperBound[0].values[0][0];
+        const resolvedUpperBound = resolveCountUpperBound(upperBound[0]?.values?.[0]);
+        if (resolvedUpperBound !== undefined) return resolvedUpperBound;
       }
     } catch {
       // Authority or bound failures retain exact semantics.

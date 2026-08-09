@@ -359,6 +359,60 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
         assert.equal(shared.documentId, firstState.documentId);
         assert.equal(shared.engineKind, backend);
 
+        await api.updateCell(fixture.uri.toString(), 'items', 1, 'value', 'first-edit');
+        await api.updateCell(fixture.uri.toString(), 'items', 1, 'value', 'second-edit');
+        assertSingleValue(
+          await api.query(fixture.uri.toString(), 'SELECT value FROM items WHERE id = 1'),
+          'second-edit'
+        );
+        await vscode.commands.executeCommand(
+          'vscode.openWith',
+          fixture.uri,
+          viewTypes[0],
+          vscode.ViewColumn.One
+        );
+        await vscode.commands.executeCommand('undo');
+        assertSingleValue(
+          await api.query(fixture.uri.toString(), 'SELECT value FROM items WHERE id = 1'),
+          'first-edit'
+        );
+
+        await vscode.commands.executeCommand(
+          'vscode.openWith',
+          fixture.uri,
+          viewTypes[1],
+          vscode.ViewColumn.Beside
+        );
+        // The URI-level host stack next consumes the other viewType's edit ID
+        // for the same logical Second edit. Its shared callback is a no-op.
+        await vscode.commands.executeCommand('undo');
+        assertSingleValue(
+          await api.query(fixture.uri.toString(), 'SELECT value FROM items WHERE id = 1'),
+          'first-edit'
+        );
+
+        // The next logical entry is First edit, regardless of which shared view
+        // initiated the URI-level command.
+        await vscode.commands.executeCommand(
+          'vscode.openWith',
+          fixture.uri,
+          viewTypes[0],
+          vscode.ViewColumn.One
+        );
+        await vscode.commands.executeCommand('undo');
+        assertSingleValue(
+          await api.query(fixture.uri.toString(), 'SELECT value FROM items WHERE id = 1'),
+          'original'
+        );
+
+        // Drain the other model's duplicate First edit before closing it. This
+        // is a document no-op, but it aligns both VS Code model dirty cursors.
+        await vscode.commands.executeCommand('undo');
+        assertSingleValue(
+          await api.query(fixture.uri.toString(), 'SELECT value FROM items WHERE id = 1'),
+          'original'
+        );
+
         await closeCustomTab(fixture.uri, viewTypes[0]);
         const retained = await waitFor('the remaining document reference', async () => {
           const candidate = await api.inspectDocument(fixture.uri.toString());

@@ -406,11 +406,22 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     // Ensure future stack is cleared so we don't have stale redo actions
     // This is handled by tracker.record, but explicit check in emitter helps
 
+    // VS Code keeps one custom-document model per viewType. When two viewTypes
+    // share this DatabaseDocument, both models receive this event and retain
+    // distinct host edit IDs whose callbacks point at this one logical edit.
+    // Keep those callbacks synchronized so consuming the duplicate host entry
+    // cannot advance the shared tracker to an unrelated modification.
+    let editState: 'applied' | 'undoing' | 'undone' | 'redoing' = 'applied';
+
     this.#modificationEmitter.fire({
       label: modification.label,
       undo: () => this.runTrackedMutation(async () => {
+        if (editState !== 'applied') return;
+        editState = 'undoing';
+
         const undoneEntry = tracker.stepBack();
         if (!undoneEntry) {
+          editState = 'applied';
           if (tracker.isUndoBlockedByBarrier) {
             const blocked = tracker.undoBlockingEntry;
             await vsc.window.showWarningMessage(vsc.l10n.t(
@@ -423,8 +434,22 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
           GlobalOutputChannel?.appendLine('[Undo] No entry found in tracker');
           return;
         }
+        if (undoneEntry !== modification) {
+          const restoredEntry = tracker.stepForward();
+          editState = 'applied';
+          if (restoredEntry !== undoneEntry) {
+            GlobalOutputChannel?.appendLine(
+              '[Undo] Failed to restore tracker after an out-of-order custom-editor callback'
+            );
+          }
+          GlobalOutputChannel?.appendLine(
+            `[Undo] Ignored out-of-order custom-editor callback for ${modification.label}`
+          );
+          return;
+        }
         try {
             await this.databaseOperations.undoModification(undoneEntry);
+            editState = 'undone';
             this.#contentChangeEmitter.fire({
               modification: undoneEntry,
               modificationDirection: 'undo'
@@ -437,19 +462,38 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
                   '[Undo] Failed to restore tracker position after database undo failed'
                 );
             }
+            editState = 'applied';
             const errorMessage = e instanceof Error ? e.message : String(e);
             GlobalOutputChannel?.appendLine(`[Undo] Failed: ${errorMessage}`);
             vsc.window.showErrorMessage(vsc.l10n.t('Undo failed: {0}', errorMessage));
         }
       }),
       redo: () => this.runTrackedMutation(async () => {
+        if (editState !== 'undone') return;
+        editState = 'redoing';
+
         const redoneEntry = tracker.stepForward();
         if (!redoneEntry) {
+            editState = 'undone';
             GlobalOutputChannel?.appendLine('[Redo] No entry found in tracker');
+            return;
+        }
+        if (redoneEntry !== modification) {
+            const restoredEntry = tracker.stepBack();
+            editState = 'undone';
+            if (restoredEntry !== redoneEntry) {
+                GlobalOutputChannel?.appendLine(
+                  '[Redo] Failed to restore tracker after an out-of-order custom-editor callback'
+                );
+            }
+            GlobalOutputChannel?.appendLine(
+              `[Redo] Ignored out-of-order custom-editor callback for ${modification.label}`
+            );
             return;
         }
         try {
             await this.databaseOperations.redoModification(redoneEntry);
+            editState = 'applied';
             this.#contentChangeEmitter.fire({
               modification: redoneEntry,
               modificationDirection: 'forward'
@@ -462,6 +506,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
                    '[Redo] Failed to restore tracker position after database redo failed'
                  );
              }
+             editState = 'undone';
              const errorMessage = e instanceof Error ? e.message : String(e);
              GlobalOutputChannel?.appendLine(`[Redo] Failed: ${errorMessage}`);
              vsc.window.showErrorMessage(vsc.l10n.t('Redo failed: {0}', errorMessage));

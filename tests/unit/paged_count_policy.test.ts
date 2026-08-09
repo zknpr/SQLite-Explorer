@@ -88,11 +88,22 @@ describe('paged count policy (shared layer)', () => {
   it('escapes the upper-bound query identifier', () => {
     assert.strictEqual(
       buildCountUpperBoundSql('fixtures'),
-      'SELECT COALESCE(max(rowid) - min(rowid) + 1, 0) FROM "fixtures"'
+      'SELECT CAST(min(rowid) AS TEXT), CAST(max(rowid) AS TEXT) FROM "fixtures"'
     );
     assert.strictEqual(
       buildCountUpperBoundSql('we"ird'),
-      'SELECT COALESCE(max(rowid) - min(rowid) + 1, 0) FROM "we""ird"'
+      'SELECT CAST(min(rowid) AS TEXT), CAST(max(rowid) AS TEXT) FROM "we""ird"'
+    );
+  });
+
+  it('rejects rowid spans that cannot be represented as an exact JS count', async () => {
+    const pagedCount = await import('../../src/core/paged-count') as any;
+    assert.strictEqual(typeof pagedCount.resolveCountUpperBound, 'function');
+    assert.strictEqual(pagedCount.resolveCountUpperBound([null, null]), 0);
+    assert.strictEqual(pagedCount.resolveCountUpperBound(['-10', '10']), 21);
+    assert.strictEqual(
+      pagedCount.resolveCountUpperBound(['-9223372036854775808', '9223372036854775807']),
+      undefined
     );
   });
 });
@@ -137,6 +148,11 @@ describe('desktop engine paged count policy', () => {
       "INSERT INTO without_rowid_shadow VALUES (-2, 'first'), (-1, 'second'), (0, 'third'); " +
       'CREATE VIEW exposed_rowid AS SELECT 0 AS rowid, label FROM without_rowid_shadow'
     );
+    db.run(
+      'CREATE TABLE extreme_rowids (label TEXT); ' +
+      "INSERT INTO extreme_rowids(rowid, label) VALUES " +
+      "(-9223372036854775808, 'minimum'), (9223372036854775807, 'maximum')"
+    );
     fs.writeFileSync(dbPath, Buffer.from(db.export()));
     db.close();
   });
@@ -175,6 +191,15 @@ describe('desktop engine paged count policy', () => {
     const engine = await openPagedEngine();
     try {
       assert.strictEqual(await engine.fetchTableCount('negative_rowids', {}), 150);
+    } finally {
+      (engine as WasmDatabaseEngine).shutdown();
+    }
+  });
+
+  it('falls back to exact COUNT for an unsafe signed-int64 rowid span', async () => {
+    const engine = await openPagedEngine();
+    try {
+      assert.strictEqual(await engine.fetchTableCount('extreme_rowids', {}), 2);
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }

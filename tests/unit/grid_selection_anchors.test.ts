@@ -81,6 +81,7 @@ async function resetSelectionState() {
     state.editingCellInfo = null;
     state.selectedCells = [];
     state.selectedRowIds.clear();
+    state.pinnedRowIds.clear();
     state.selectedColumns.clear();
     state.lastSelectedCell = null;
     state.lastSelectedColumnIndex = null;
@@ -436,6 +437,68 @@ describe('grid selection anchors', () => {
                 (globalThis as any).document.getElementById('statusText').textContent,
                 'Batch update completed'
             );
+        } finally {
+            backendApi.updateCellBatch = originals.updateCellBatch;
+            backendApi.fetchTableCount = originals.fetchTableCount;
+            backendApi.fetchTableData = originals.fetchTableData;
+        }
+    });
+
+    it('does not remap another table\'s colliding selections after a batch RPC completes', async () => {
+        installDocumentStub({
+            batchInputs: [{ value: 'updated', dataset: { colidx: '0' } }]
+        });
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { applyBatchUpdate } = await import(sidebarModulePath);
+        const originals = {
+            updateCellBatch: backendApi.updateCellBatch,
+            fetchTableCount: backendApi.fetchTableCount,
+            fetchTableData: backendApi.fetchTableData
+        };
+        const collidingIdentity = 'pk:shared-opaque-identity';
+        const tableANewIdentity = 'pk:table-a-new-identity';
+        backendApi.updateCellBatch = async () => {
+            // The user switches to table B while table A's mutation is in flight.
+            state.selectedTable = 'table_b';
+            state.renderedTable = 'table_b';
+            state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+            state.gridData = [[collidingIdentity, 'table-b-value']];
+            return [{
+                rowId: collidingIdentity,
+                newRowId: tableANewIdentity,
+                columnName: 'value'
+            }];
+        };
+        backendApi.fetchTableCount = async () => 1;
+        backendApi.fetchTableData = async () => ({
+            rows: [[collidingIdentity, 'table-b-value']]
+        });
+        state.selectedTable = 'table_a';
+        state.selectedTableType = 'table';
+        state.selectedTableIdentity = { kind: 'primaryKey' };
+        state.renderedTable = 'table_a';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.gridData = [[collidingIdentity, 'old']];
+        state.currentPageIndex = 0;
+        state.rowsPerPage = 500;
+        state.columnFilters = {};
+        state.filterQuery = '';
+        state.editingCellInfo = null;
+        state.selectedCells = [{
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: collidingIdentity,
+            value: 'old'
+        }];
+        state.selectedRowIds = new Set([collidingIdentity]);
+        state.pinnedRowIds = new Set([collidingIdentity]);
+
+        try {
+            await applyBatchUpdate();
+            assert.strictEqual(state.selectedTable, 'table_b');
+            assert.deepStrictEqual([...state.selectedRowIds], [collidingIdentity]);
+            assert.deepStrictEqual([...state.pinnedRowIds], [collidingIdentity]);
         } finally {
             backendApi.updateCellBatch = originals.updateCellBatch;
             backendApi.fetchTableCount = originals.fetchTableCount;

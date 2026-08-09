@@ -279,6 +279,11 @@ before(async () => {
         "INSERT INTO fixtures SELECT n, 'row-' || n FROM seq"
     );
     gappy.run('DELETE FROM fixtures WHERE id % 2 = 0');
+    gappy.run(
+        'CREATE TABLE extreme_rowids (label TEXT); ' +
+        "INSERT INTO extreme_rowids(rowid, label) VALUES " +
+        "(-9223372036854775808, 'minimum'), (9223372036854775807, 'maximum')"
+    );
     gappyDbBytes = gappy.export();
     gappy.close();
 });
@@ -802,6 +807,11 @@ describe('web demo worker File opens', () => {
                 filters: [{ column: 'label', value: 'row-19999' }]
             }),
             1
+        );
+        assert.strictEqual(
+            await harness.invoke('fetchTableCount', 'extreme_rowids', {}),
+            2,
+            'unsafe spans must reject the shortcut and fall through to exact COUNT(*)'
         );
     });
 

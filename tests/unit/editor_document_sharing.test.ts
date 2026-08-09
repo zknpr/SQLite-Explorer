@@ -16,8 +16,9 @@ const originalWorkerFactory = moduleCache[workerFactoryPath];
 let connectionCount = 0;
 let workerDisposalCount = 0;
 let queryCount = 0;
-let undoCount = 0;
 let activeEngineKind: 'native' | 'wasm' = 'native';
+const undoneLabels: string[] = [];
+const redoneLabels: string[] = [];
 
 const engines: DatabaseOperations[] = [];
 
@@ -28,8 +29,12 @@ function createEngine(): DatabaseOperations {
             queryCount++;
             return [{ headers: ['value'], rows: [[1]] }];
         },
-        undoModification: async () => { undoCount++; },
-        redoModification: async () => {},
+        undoModification: async (modification: LabeledModification) => {
+            undoneLabels.push(modification.label);
+        },
+        redoModification: async (modification: LabeledModification) => {
+            redoneLabels.push(modification.label);
+        },
         applyModifications: async () => {},
         discardModifications: async () => {}
     } as unknown as DatabaseOperations;
@@ -85,7 +90,8 @@ beforeEach(() => {
     connectionCount = 0;
     workerDisposalCount = 0;
     queryCount = 0;
-    undoCount = 0;
+    undoneLabels.length = 0;
+    redoneLabels.length = 0;
     activeEngineKind = 'native';
     engines.length = 0;
 });
@@ -114,6 +120,100 @@ function createPanel() {
     } as any;
 }
 
+it('keeps duplicate view-type undo entries synchronized with one shared history', async () => {
+    const defaultProvider = createProvider('sqlite-explorer.view');
+    const optionalProvider = createProvider('sqlite-explorer.option');
+    const uri = fileUri('/workspace/shared-undo.sqlite');
+    const document = await defaultProvider.openCustomDocument(uri, openContext);
+    const optionalDocument = await optionalProvider.openCustomDocument(uri, openContext);
+    const hostStack: Array<{
+        provider: 'default' | 'optional';
+        label: string | undefined;
+        undo: () => any;
+        redo: () => any;
+    }> = [];
+
+    defaultProvider.onDidChangeCustomDocument(event => {
+        hostStack.push({
+            provider: 'default',
+            label: event.label,
+            undo: event.undo,
+            redo: event.redo
+        });
+    });
+    optionalProvider.onDidChangeCustomDocument(event => {
+        hostStack.push({
+            provider: 'optional',
+            label: event.label,
+            undo: event.undo,
+            redo: event.redo
+        });
+    });
+
+    const firstModification: LabeledModification = {
+        label: 'First edit',
+        description: 'First shared edit history entry',
+        modificationType: 'cell_update',
+        targetTable: 'items',
+        targetRowId: 1,
+        targetColumn: 'value',
+        priorValue: 'original',
+        newValue: 'first-edit'
+    };
+    const secondModification: LabeledModification = {
+        ...firstModification,
+        label: 'Second edit',
+        description: 'Second shared edit history entry',
+        priorValue: 'first-edit',
+        newValue: 'second-edit'
+    };
+
+    try {
+        assert.strictEqual(document, optionalDocument);
+        document.recordExternalModification(firstModification);
+        document.recordExternalModification(secondModification);
+
+        // VS Code 1.110 creates one custom-document model per viewType, but
+        // keys both models' undo elements by this same resource URI.
+        assert.deepStrictEqual(
+            hostStack.map(event => [event.provider, event.label]),
+            [
+                ['default', 'First edit'],
+                ['optional', 'First edit'],
+                ['default', 'Second edit'],
+                ['optional', 'Second edit']
+            ]
+        );
+
+        await hostStack[3].undo();
+        assert.deepStrictEqual(undoneLabels, ['Second edit']);
+
+        // The next global host entry names the same logical edit through the
+        // other viewType. It must not advance the shared tracker to First edit.
+        await hostStack[2].undo();
+        assert.deepStrictEqual(undoneLabels, ['Second edit']);
+
+        await hostStack[1].undo();
+        assert.deepStrictEqual(undoneLabels, ['Second edit', 'First edit']);
+
+        // Drain the other model's duplicate First edit so both VS Code model
+        // cursors agree that the shared document is back at its initial state.
+        await hostStack[0].undo();
+        assert.deepStrictEqual(undoneLabels, ['Second edit', 'First edit']);
+
+        await hostStack[0].redo();
+        await hostStack[1].redo();
+        await hostStack[2].redo();
+        await hostStack[3].redo();
+        assert.deepStrictEqual(redoneLabels, ['First edit', 'Second edit']);
+    } finally {
+        await document.dispose();
+        await optionalDocument.dispose();
+        defaultProvider.dispose();
+        optionalProvider.dispose();
+    }
+});
+
 it('shares one document, engine, and edit history across both editor view types until the last close', async () => {
     const defaultProvider = createProvider('sqlite-explorer.view');
     const optionalProvider = createProvider('sqlite-explorer.option');
@@ -141,8 +241,6 @@ it('shares one document, engine, and edit history across both editor view types 
             }
         );
 
-        let undo: (() => any) | undefined;
-        optionalProvider.onDidChangeCustomDocument(event => { undo = event.undo; });
         const modification: LabeledModification = {
             label: 'Shared edit',
             description: 'Shared edit history entry',
@@ -153,11 +251,6 @@ it('shares one document, engine, and edit history across both editor view types 
             priorValue: 'before',
             newValue: 'after'
         };
-        first.recordExternalModification(modification);
-        assert.ok(undo, 'the second provider must observe the shared document history');
-        await undo();
-        assert.strictEqual(undoCount, 1);
-
         const panels = [createPanel(), createPanel(), createPanel()];
         const refreshCounts = [0, 0, 0];
         defaultProvider.webviews.add(uri, panels[0], 'default-one');

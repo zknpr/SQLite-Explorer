@@ -69,6 +69,7 @@ import {
 import { getNodeFs } from '../../platform/fs';
 import {
   buildCountUpperBoundSql,
+  resolveCountUpperBound,
   shouldAnswerCountWithUpperBound
 } from '../../paged-count';
 import {
@@ -3047,8 +3048,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           authorityConfirmedRowIdTable
         })) {
           const bound = await this.executeQuery(buildCountUpperBoundSql(table));
-          const upperBound = bound[0]?.rows?.[0]?.[0];
-          if (typeof upperBound === 'number') return upperBound;
+          const upperBound = resolveCountUpperBound(bound[0]?.rows?.[0]);
+          if (upperBound !== undefined) return upperBound;
         }
       } catch {
         // Authority or bound failures retain exact semantics.

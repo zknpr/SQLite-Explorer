@@ -343,6 +343,38 @@ describe('grid count cache', () => {
         }
     });
 
+    it('refetches the demo unfiltered count after a trigger-bearing cell edit', async () => {
+        installDocumentMock();
+        const { state, backendApi, loadTableData, countCache } = await loadHarness();
+        const originals = {
+            fetchTableCount: backendApi.fetchTableCount,
+            fetchTableData: backendApi.fetchTableData
+        };
+        const countCalls = installCountSpy(
+            backendApi,
+            call => call === 1 ? 40 : 41
+        );
+        backendApi.fetchTableData = async () => ({ rows: [[1, 'row']] });
+        primeTableState(state, 'triggered_items');
+        countCache.setCountCacheDemoMode?.(true);
+
+        try {
+            await loadTableData(false, false);
+            assert.strictEqual(state.totalRecordCount, 40);
+
+            // An uploaded database can carry an AFTER UPDATE trigger that inserts
+            // another row. The demo has no host refresh echo to invalidate this.
+            countCache.noteCellValuesChanged('triggered_items');
+            await loadTableData(false, false);
+
+            assert.strictEqual(countCalls.length, 2);
+            assert.strictEqual(state.totalRecordCount, 41);
+        } finally {
+            countCache.setCountCacheDemoMode?.(false);
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
     it('invalidates filtered counts across column DDL so a re-add cannot revive them', async () => {
         // Column drop/re-add changes what a filter matches without changing
         // the identity key (identities name filters, not schema) — the DDL

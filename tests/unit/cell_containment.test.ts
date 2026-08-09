@@ -96,6 +96,63 @@ describe('grid cell containment limits', () => {
         ));
     });
 
+    it('bounds percent-expanded WITHOUT ROWID identities inside the host response budget', async () => {
+        const {
+            decodeCellContainment,
+            remapPrimaryKeyContainment
+        } = await loadContainmentModule();
+        const rowCount = 16;
+        const primaryKeyBytes = 1024 * 1024 - 1024;
+        const keyTail = ' '.repeat(primaryKeyBytes - 2);
+        const transportedRows = Array.from({ length: rowCount }, (_, rowIndex) => [
+            'visible',
+            `${String(rowIndex).padStart(2, '0')}${keyTail}`,
+            '|'
+        ]);
+        const decoded = decodeCellContainment(
+            transportedRows,
+            2,
+            undefined,
+            16 * 1024 * 1024
+        );
+        const remapped = remapPrimaryKeyContainment({
+            identity: {
+                kind: 'primaryKey',
+                columns: [{ identifier: 'key', declaredType: 'TEXT', position: 1 }]
+            },
+            sourceColumns: ['value', 'key'],
+            visibleColumnCount: 1,
+            identityRows: decoded.rows,
+            rows: decoded.rows,
+            oversizedCells: decoded.oversizedCells,
+            exactIntegerTexts: decoded.exactIntegerTexts,
+            effectiveInlineCellBytes: 1024 * 1024
+        });
+        const response = {
+            channel: 'rpc',
+            content: {
+                kind: 'response',
+                messageId: 'contained-primary-key-identities',
+                success: true,
+                data: {
+                    headers: ['rowid', 'value'],
+                    rows: remapped.rows,
+                    oversizedCells: remapped.oversizedCells,
+                    exactIntegerTexts: remapped.exactIntegerTexts,
+                    readOnlyRowReasons: remapped.readOnlyRowReasons
+                }
+            }
+        };
+
+        assert.match(String(remapped.rows[0][0]), /^pk:/);
+        assert.strictEqual(String(remapped.rows.at(-1)?.[0]).startsWith('readonly-pk:'), true);
+        assert.ok(Object.keys(remapped.readOnlyRowReasons ?? {}).length > 0);
+        assert.doesNotThrow(() => assertWebviewTransportPayload(
+            response,
+            { surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse }
+        ));
+    });
+
     it('returns zero oversized markers for 5000 rows of 50 ordinary UUID cells', async () => {
         const { decodeCellContainment } = await loadContainmentModule();
         const rowCount = 5000;

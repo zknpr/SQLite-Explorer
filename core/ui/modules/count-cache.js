@@ -19,9 +19,11 @@
  * - Webview row inserts/deletes adjust the UNFILTERED identity by their known
  *   delta and drop the table's filtered identities — a mutation's effect on a
  *   filtered count is unknowable webview-side.
- * - Webview cell edits keep the unfiltered identity (COUNT(*) with no
- *   predicate cannot change) and drop the filtered ones (an edited value can
- *   enter or leave a filter's match set).
+ * - VS Code webview cell edits keep the unfiltered identity and drop the
+ *   filtered ones; the host's post-edit refreshContent echo invalidates any
+ *   trigger/cascade side effects. The demo has no echo, so it also drops the
+ *   unfiltered identity: an uploaded database can already contain an UPDATE
+ *   trigger that inserts or deletes rows.
  * - Anything that reloads because of external/unknown changes — table switch,
  *   refreshContent broadcasts (VS Code also echoes one after every local
  *   edit), reload-from-disk, view redefinition — invalidates wholesale.
@@ -41,10 +43,9 @@
  * change the file at any time, but without file watching the whole grid is
  * equally stale until a reload and every reload path invalidates — the cache
  * adds no new staleness class there. A self-referential trigger or cascade
- * that inserts/deletes EXTRA rows in the mutated table itself skews the
- * unfiltered delta until the next invalidation (in VS Code the post-edit
- * refreshContent echo corrects it almost immediately; the web demo has no
- * echo but also no way to define such triggers in the UI).
+ * that inserts/deletes EXTRA rows in the mutated table itself skews a known
+ * insert/delete delta until the next invalidation; in VS Code the post-edit
+ * refreshContent echo corrects it almost immediately.
  */
 
 const UNFILTERED_SUB_KEY = '';
@@ -60,6 +61,14 @@ const countsByTable = new Map();
 
 // Bumped by every mutation/invalidation; gates stores of in-flight fetches.
 let cacheEpoch = 0;
+
+// The demo and VS Code webviews are separate bundles, so this module-local
+// switch cannot leak between surfaces or alter the host cache contract.
+let demoMode = false;
+
+export function setCountCacheDemoMode(enabled) {
+    demoMode = enabled === true;
+}
 
 /**
  * Build the cache identity for the exact inputs a fetchTableCount call would
@@ -162,7 +171,7 @@ export function noteCellValuesChanged(table) {
     if (!tableCounts) return;
     const unfiltered = tableCounts.get(UNFILTERED_SUB_KEY);
     tableCounts.clear();
-    if (unfiltered !== undefined) {
+    if (!demoMode && unfiltered !== undefined) {
         tableCounts.set(UNFILTERED_SUB_KEY, unfiltered);
     }
 }

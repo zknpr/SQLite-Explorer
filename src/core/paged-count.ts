@@ -69,7 +69,44 @@ export function shouldAnswerCountWithUpperBound(
     && input.pagedFileSizeBytes > input.exactCountMaxFileBytes;
 }
 
-/** Distinct integer rowids fit within this inclusive span; empty tables return 0. */
+/** Fetch exact decimal endpoints; subtracting in SQLite can round near int64 limits. */
 export function buildCountUpperBoundSql(table: string): string {
-  return `SELECT COALESCE(max(rowid) - min(rowid) + 1, 0) FROM ${escapeIdentifier(table)}`;
+  return `SELECT CAST(min(rowid) AS TEXT), CAST(max(rowid) AS TEXT) FROM ${escapeIdentifier(table)}`;
+}
+
+function parseExactInteger(value: unknown): bigint | undefined {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) ? BigInt(value) : undefined;
+  }
+  if (typeof value !== 'string' || !/^-?(0|[1-9]\d*)$/.test(value)) {
+    return undefined;
+  }
+  try {
+    const parsed = BigInt(value);
+    return parsed.toString() === value ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolve the inclusive rowid span without losing integer precision. An
+ * unsafe span is not a usable JS pagination count, so callers must fall back
+ * to exact COUNT(*) rather than publish rounded navigation state.
+ */
+export function resolveCountUpperBound(
+  endpoints: readonly unknown[] | undefined
+): number | undefined {
+  if (!endpoints || endpoints.length < 2) return undefined;
+  const [minimumValue, maximumValue] = endpoints;
+  if (minimumValue === null && maximumValue === null) return 0;
+  if (minimumValue === null || maximumValue === null) return undefined;
+
+  const minimum = parseExactInteger(minimumValue);
+  const maximum = parseExactInteger(maximumValue);
+  if (minimum === undefined || maximum === undefined) return undefined;
+  const span = maximum - minimum + 1n;
+  if (span < 1n || span > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+  return Number(span);
 }

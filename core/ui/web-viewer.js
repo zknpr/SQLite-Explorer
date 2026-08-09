@@ -20,7 +20,10 @@ import {
 import {
     initExport
 } from './modules/export.js';
-import { invalidateAllCounts } from './modules/count-cache.js';
+import {
+    invalidateAllCounts,
+    setCountCacheDemoMode
+} from './modules/count-cache.js';
 
 import {
     initCrud
@@ -53,6 +56,10 @@ import {
 import { initViews } from './modules/views.js';
 import { applyConnectionResult } from './modules/connection-state.js';
 import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
+
+// Uploaded databases may contain UPDATE triggers that change row cardinality,
+// and unlike the VS Code host the demo has no refreshContent echo after edits.
+setCountCacheDemoMode(true);
 
 // ============================================================================
 // Web-specific RPC initialization
