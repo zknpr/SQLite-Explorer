@@ -12,6 +12,12 @@ type NodeFs = typeof import('fs');
 type NodeFileHandle = Awaited<ReturnType<NodeFs['promises']['open']>>;
 type PagedSaveLogger = (level: 'warn', message: string, error?: unknown) => void;
 
+export interface PagedSaveWriteLock {
+  release(): void;
+}
+
+export type PagedSaveWriteLockAcquirer = (activeBasePath: string) => PagedSaveWriteLock;
+
 /** One reusable host buffer bounds every copy from the frozen base. */
 const BASE_COPY_BUFFER_BYTES = 1024 * 1024;
 const PAGED_FILE_CHANGED_MESSAGE = 'Database file changed on disk; reload the document.';
@@ -376,8 +382,72 @@ function assertNoSiblingWalFramesSync(fs: NodeFs, activeBasePath: string): void 
 }
 
 /**
- * Final replacement gate. Every operation is synchronous so no extension-host
- * task can interleave after a successful check and before renameSync.
+ * Hold SQLite's own writer lock across the final identity/WAL gate and rename.
+ *
+ * Synchronous host code only excludes another extension-host task. A different
+ * process can still switch a rollback database to WAL and commit after the last
+ * stat unless SQLite itself excludes writers. BEGIN IMMEDIATE takes that lock
+ * in both rollback and WAL modes; if another writer already owns it, saving
+ * fails closed before the active pathname is replaced.
+ */
+function acquireSqliteWriteLock(activeBasePath: string): PagedSaveWriteLock {
+  let DatabaseSync: typeof import('node:sqlite').DatabaseSync;
+  try {
+    ({ DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite'));
+  } catch (error) {
+    throw new Error(
+      'Cannot safely replace the page-on-demand database because this extension host '
+      + 'does not provide SQLite write locking. Use Save As to write a distinct file.',
+      { cause: error }
+    );
+  }
+
+  let database: import('node:sqlite').DatabaseSync | undefined;
+  try {
+    database = new DatabaseSync(activeBasePath);
+    // Do not busy-wait on the extension-host thread. An active external writer
+    // makes this save fail immediately and leaves both its transaction and our
+    // paged overlay intact for an explicit retry.
+    database.exec('PRAGMA busy_timeout = 0; BEGIN IMMEDIATE');
+  } catch (error) {
+    try {
+      database?.close();
+    } catch {
+      // Preserve the lock-acquisition error; a failed constructor/BEGIN owns no
+      // successful save that a secondary close error could usefully describe.
+    }
+    throw new Error(
+      'Cannot acquire the SQLite write lock required for an atomic page-on-demand save; '
+      + 'close other writers and retry.',
+      { cause: error }
+    );
+  }
+
+  let released = false;
+  return {
+    release(): void {
+      if (released) return;
+      released = true;
+      let rollbackError: unknown;
+      try {
+        database!.exec('ROLLBACK');
+      } catch (error) {
+        rollbackError = error;
+      }
+      try {
+        database!.close();
+      } catch (error) {
+        if (rollbackError === undefined) throw error;
+      }
+      if (rollbackError !== undefined) throw rollbackError;
+    }
+  };
+}
+
+/**
+ * Final replacement gate. The caller holds BEGIN IMMEDIATE for in-place saves,
+ * excluding cross-process writers; synchronous operations additionally exclude
+ * extension-host tasks between the successful checks and renameSync.
  */
 function commitReplacementSync(
   fs: NodeFs,
@@ -521,7 +591,8 @@ export async function writePagedWritableOverlayToFile(
   basePath: string,
   targetPath: string,
   snapshot: PagedWritableOverlaySnapshot,
-  logger?: PagedSaveLogger
+  logger?: PagedSaveLogger,
+  acquireWriteLock: PagedSaveWriteLockAcquirer = acquireSqliteWriteLock
 ): Promise<DatabaseWriteResult> {
   validateSnapshot(snapshot);
 
@@ -571,16 +642,52 @@ export async function writePagedWritableOverlayToFile(
     await temporary.close();
     temporary = undefined;
 
-    commitReplacementSync(
-      fs,
-      source.fd,
-      activeBasePath,
-      snapshot.baseIdentity,
-      temporaryPath,
-      completedTemporaryFingerprint,
-      target
-    );
-    renamed = true;
+    let writeLock: PagedSaveWriteLock | undefined;
+    let replacementError: unknown;
+    try {
+      // Save As replaces a distinct pathname and cannot discard a commit to
+      // the active base. Only an in-place replacement needs the SQLite lock.
+      if (target.requiresReopen) writeLock = acquireWriteLock(activeBasePath);
+      commitReplacementSync(
+        fs,
+        source.fd,
+        activeBasePath,
+        snapshot.baseIdentity,
+        temporaryPath,
+        completedTemporaryFingerprint,
+        target
+      );
+      renamed = true;
+    } catch (error) {
+      replacementError = error;
+      throw error;
+    } finally {
+      if (writeLock) {
+        try {
+          writeLock.release();
+        } catch (error) {
+          if (renamed) {
+            warnAfterSuccessfulRename(
+              logger,
+              'Paged save replaced the database, but releasing its SQLite write lock failed:',
+              error
+            );
+          } else if (replacementError !== undefined) {
+            try {
+              logger?.(
+                'warn',
+                'Paged save failed and its SQLite write lock reported a release error:',
+                error
+              );
+            } catch {
+              // Never mask the replacement failure with a diagnostic sink.
+            }
+          } else {
+            throw error;
+          }
+        }
+      }
+    }
 
     if (replacementDirectory) {
       try {

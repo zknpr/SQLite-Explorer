@@ -888,10 +888,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private assertSerializable(): void {
     if (this.pagedState && !this.pagedState.writable) {
       throw new Error(
-        'Database export is unavailable: this file exceeds the in-memory limit '
-        + 'for the WebAssembly backend and is opened page-on-demand as a '
-        + "read-only snapshot. Raise 'sqliteExplorer.maxFileSize' (or set it "
-        + 'to 0 for unlimited) to open it in memory.'
+        'Database export is unavailable for a read-only page-on-demand snapshot. '
+        + 'Reopen with writable page-on-demand support or use the native desktop '
+        + 'backend to edit and save this database.'
       );
     }
   }
@@ -1206,6 +1205,23 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         throw new Error(`Column-drop staging table already exists: ${stagingTable}`);
       }
 
+      let sequenceState: { value: CellValue } | undefined;
+      const sequenceCatalog = await this.executeQuery(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_sequence'"
+      );
+      if ((sequenceCatalog[0]?.rows.length ?? 0) !== 0) {
+        const sequence = await this.executeQuery(
+          'SELECT seq FROM sqlite_sequence WHERE name = ? LIMIT 2',
+          [targetTable]
+        );
+        if ((sequence[0]?.rows.length ?? 0) > 1) {
+          throw new Error(`Cannot undo column drop on ${targetTable}: sqlite_sequence is ambiguous`);
+        }
+        if ((sequence[0]?.rows.length ?? 0) === 1) {
+          sequenceState = { value: sequence[0].rows[0][0] };
+        }
+      }
+
       for (const sql of plan.stageColumns) await this.executeQuery(sql);
       await this.restoreDroppedColumnValues(
         targetTable,
@@ -1217,6 +1233,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       this.runSingleStatement(plan.createOriginalTable);
       await this.executeQuery(plan.copyRows);
       await this.executeQuery(plan.dropStagingTable);
+      if (sequenceState) {
+        // RENAME transfers the retired-ID high-water mark to staging, while
+        // INSERT...SELECT seeds the recreated table only at max(rowid). Restore
+        // the exact pre-rebuild entry after dropping staging removes the old one.
+        await this.executeQuery('DELETE FROM sqlite_sequence WHERE name = ?', [targetTable]);
+        await this.executeQuery(
+          'INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)',
+          [targetTable, sequenceState.value]
+        );
+      }
       for (const sql of plan.restoreSchemaObjects) this.runSingleStatement(sql);
 
       const restored = await this.readColumnDropTableState(targetTable);

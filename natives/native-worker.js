@@ -281,8 +281,8 @@ function probeAsyncDatabase(candidate) {
 }
 
 /** Fail closed to the sync connection unless transaction absence is explicit. */
-function shouldUseAsyncDatabase(database, asyncDatabase) {
-  if (!asyncDatabase || !database) return false;
+function isExplicitlyOutsideTransaction(database) {
+  if (!database) return false;
   try {
     const transactionState = typeof database.inTransaction === 'function'
       ? database.inTransaction()
@@ -291,6 +291,10 @@ function shouldUseAsyncDatabase(database, asyncDatabase) {
   } catch {
     return false;
   }
+}
+
+function shouldUseAsyncDatabase(database, asyncDatabase) {
+  return Boolean(asyncDatabase) && isExplicitlyOutsideTransaction(database);
 }
 
 /** Abort one active async operation without affecting queued or future work. */
@@ -1169,7 +1173,11 @@ async function handleRequest(request) {
           throw new Error(`At most ${MAX_CELL_READ_SESSIONS} cell read sessions may be open`);
         }
 
-        const usesMainConnection = databasePath === null;
+        // A streaming export opens an outer read savepoint on the main
+        // connection. Nest the cell bracket there so its bytes are from the
+        // exact snapshot that produced the row projection. Outside a
+        // transaction, file-backed cells retain their dedicated read handle.
+        const usesMainConnection = databasePath === null || !isExplicitlyOutsideTransaction(db);
         if (usesMainConnection && cellReadSessions.size > 0) {
           throw new Error('Only one in-memory cell read session may be open');
         }

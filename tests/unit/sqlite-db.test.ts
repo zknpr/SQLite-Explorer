@@ -137,6 +137,7 @@ describe('createDatabaseEngine file reading errors', () => {
         content: null,
         filePath: tempFile,
         maxSize: 1,
+        pagedOpenThresholdBytes: 1,
         readOnlyMode: false,
         allowPagedFallback: true
       });

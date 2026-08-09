@@ -805,6 +805,75 @@ describe('SQLiteFileSystemProvider', () => {
             }
         });
 
+        it('retargets an open primary-key editor across database undo and redo', async () => {
+            const engineResult = await createDatabaseEngine({
+                content: null,
+                maxSize: 0,
+                readOnlyMode: false
+            });
+            const engine = engineResult.operations!;
+            await engine.executeQuery(
+                'CREATE TABLE undo_retargeted_editor (' +
+                'id INTEGER PRIMARY KEY, value TEXT' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO undo_retargeted_editor VALUES (1, 'payload')"
+            );
+            const page = await engine.fetchTableData('undo_retargeted_editor', {
+                columns: ['rowid', 'id', 'value'],
+                limit: 10,
+                offset: 0
+            });
+            const originalIdentity = page.rows[0][0];
+            const document = setupMockDocument(docKey, engine);
+            const uri = vscode.Uri.from({
+                scheme: 'vscode-sqlite',
+                path: '/' + [docKey, 'undo_retargeted_editor', 'group', String(originalIdentity), 'id.txt']
+                    .map(part => encodeURIComponent(part))
+                    .join('/')
+            });
+
+            try {
+                await provider.writeFile(
+                    uri,
+                    new TextEncoder().encode('2'),
+                    { create: false, overwrite: true }
+                );
+                const modification = (document.recordExternalModification as any)
+                    .mock.calls[0].arguments[0];
+
+                await engine.undoModification(modification);
+                document.fireContentChange(modification, 'undo');
+                assert.strictEqual(
+                    new TextDecoder().decode(await provider.readFile(uri)),
+                    '1'
+                );
+
+                await engine.redoModification(modification);
+                document.fireContentChange(modification, 'forward');
+                assert.strictEqual(
+                    new TextDecoder().decode(await provider.readFile(uri)),
+                    '2'
+                );
+
+                await provider.writeFile(
+                    uri,
+                    new TextEncoder().encode('3'),
+                    { create: false, overwrite: true }
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'SELECT CAST(id AS TEXT), value FROM undo_retargeted_editor'
+                    ))[0].rows,
+                    [['3', 'payload']]
+                );
+                const nextModification = (document.recordExternalModification as any)
+                    .mock.calls[1].arguments[0];
+                assert.strictEqual(nextModification.targetRowId, modification.newTargetRowId);
+            } finally {
+                (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+
         it('should write binary content if not valid UTF-8', async () => {
             const priorContent = new Uint8Array([1, 2, 3]);
             const dbOps = {

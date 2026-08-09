@@ -375,6 +375,46 @@ describe('grid count cache', () => {
         }
     });
 
+    it('refetches the demo unfiltered count after trigger-sensitive deletes and inserts', async () => {
+        installDocumentMock();
+        const { state, backendApi, loadTableData, countCache } = await loadHarness();
+        const crudModulePath = '../../core/ui/modules/crud.js';
+        const { submitAddRow, submitDelete } = await import(crudModulePath);
+        const originals = {
+            fetchTableCount: backendApi.fetchTableCount,
+            fetchTableData: backendApi.fetchTableData,
+            insertRow: backendApi.insertRow,
+            deleteRows: backendApi.deleteRows
+        };
+        const countCalls = installCountSpy(backendApi, () => 40);
+        backendApi.fetchTableData = async () => ({ rows: [[1, 'row']] });
+        backendApi.deleteRows = async () => {};
+        backendApi.insertRow = async () => 99;
+        primeTableState(state, 'triggered_items');
+        countCache.setCountCacheDemoMode?.(true);
+
+        try {
+            await loadTableData(false, false);
+            assert.strictEqual(state.totalRecordCount, 40);
+
+            // Model BEFORE DELETE RAISE(IGNORE): the RPC resolves but the real
+            // cardinality stays at 40, so applying the selected-id delta lies.
+            state.selectedRowIds = new Set([7]);
+            await submitDelete();
+            assert.strictEqual(countCalls.length, 2);
+            assert.strictEqual(state.totalRecordCount, 40);
+
+            // INSERT triggers have the same exposure (IGNORE, or extra rows).
+            // The demo must refetch rather than assume the RPC added one row.
+            await submitAddRow();
+            assert.strictEqual(countCalls.length, 3);
+            assert.strictEqual(state.totalRecordCount, 40);
+        } finally {
+            countCache.setCountCacheDemoMode?.(false);
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
     it('invalidates filtered counts across column DDL so a re-add cannot revive them', async () => {
         // Column drop/re-add changes what a filter matches without changing
         // the identity key (identities name filters, not schema) — the DDL

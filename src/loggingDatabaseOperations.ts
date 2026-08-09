@@ -6,7 +6,7 @@
  */
 
 import * as vsc from 'vscode';
-import { maskSensitiveData } from './helpers';
+import { hash64, maskSensitiveData } from './helpers';
 import type {
     DatabaseOperations,
     CellValue,
@@ -35,10 +35,15 @@ import type {
 } from './core/types';
 import { escapeIdentifier } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
+import { runReadSnapshot } from './core/operation-serializer';
 
-type DatabaseMethodName = {
+type DatabaseMethodName = Exclude<{
     [K in keyof DatabaseOperations]: DatabaseOperations[K] extends (...args: never[]) => unknown ? K : never
-}[keyof DatabaseOperations];
+}[keyof DatabaseOperations], undefined | 'runReadSnapshot'> & keyof DatabaseOperations;
+
+const MAX_INLINE_LOG_IDENTITY_CHARS = 160;
+const LOG_IDENTITY_PREVIEW_CHARS = 48;
+const MAX_DELETE_LOG_IDENTITIES = 8;
 
 export class LoggingDatabaseOperations implements DatabaseOperations {
     constructor(
@@ -49,6 +54,14 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
 
     get engineKind() {
         return this.wrapped.engineKind;
+    }
+
+    async runReadSnapshot<T>(
+        operation: (snapshotOperations: DatabaseOperations) => Promise<T>
+    ): Promise<T> {
+        return runReadSnapshot(this.wrapped, snapshotOperations => operation(
+            new LoggingDatabaseOperations(snapshotOperations, this.filename, this.outputChannel)
+        ));
     }
 
     private sanitizeValue(value: unknown): string {
@@ -71,6 +84,15 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
              }
         }
         return String(value);
+    }
+
+    private async formatRecordId(rowId: RecordId): Promise<string> {
+        if (typeof rowId === 'number') return String(rowId);
+        if (rowId.length <= MAX_INLINE_LOG_IDENTITY_CHARS) return JSON.stringify(rowId);
+
+        const digest = await hash64(rowId);
+        const preview = `${rowId.slice(0, LOG_IDENTITY_PREVIEW_CHARS)}…`;
+        return `[identity length=${rowId.length} sha256=${digest} preview=${JSON.stringify(preview)}]`;
     }
 
     // Constrain T to only callable (function) members of DatabaseOperations,
@@ -184,11 +206,12 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         maxEditValueBytes?: number
     ): Promise<RecordId | void> {
         // Reconstruct SQL for logging
+        const loggedRowId = await this.formatRecordId(rowId);
         let sql;
         if (patch) {
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(${escapeIdentifier(column)}, ${this.sanitizeValue(patch)}) WHERE rowid = ${rowId}`;
+            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(${escapeIdentifier(column)}, ${this.sanitizeValue(patch)}) WHERE identity = ${loggedRowId}`;
         } else {
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ${this.sanitizeValue(value)} WHERE rowid = ${rowId}`;
+            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ${this.sanitizeValue(value)} WHERE identity = ${loggedRowId}`;
         }
         this.log(sql, true);
         return this.wrapped.updateCell(table, rowId, column, value, patch, maxEditValueBytes);
@@ -246,7 +269,14 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
     }
 
     async deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void> {
-        const sql = `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${rowIds.join(', ')})`;
+        const displayedIds = await Promise.all(
+            rowIds.slice(0, MAX_DELETE_LOG_IDENTITIES).map(rowId => this.formatRecordId(rowId))
+        );
+        const omitted = rowIds.length - displayedIds.length;
+        const sql =
+            `DELETE FROM ${escapeIdentifier(table)} WHERE identity IN (${displayedIds.join(', ')}) ` +
+            `-- ${rowIds.length} identities` +
+            (omitted > 0 ? `, showing ${displayedIds.length}; ${omitted} omitted` : '');
         this.log(sql, true);
         return this.wrapped.deleteRows(table, rowIds);
     }

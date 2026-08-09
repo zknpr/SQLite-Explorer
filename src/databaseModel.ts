@@ -319,8 +319,6 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       throw new Error(vsc.l10n.t('A page-on-demand save is already in progress.'));
     }
     this.#pagedSaveExclusive = true;
-    this.#connectionGeneration++;
-    this.connectionState.isReadOnly = true;
     return (async () => {
       if (this.#activeMutations > 0) {
         await new Promise<void>(resolve => this.#mutationDrainWaiters.add(resolve));
@@ -329,6 +327,12 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       // extra turn also drains promise continuations from backend calls that were
       // already resolving as the exclusive flag was raised.
       await Promise.resolve();
+      // Only a connection replacement invalidates the post-RPC generation
+      // checks captured by an earlier tracked mutation. Advancing this before
+      // the drain makes a successful backend write look like a failed reload
+      // and drops its history entry even though the save persists the edit.
+      this.#connectionGeneration++;
+      this.connectionState.isReadOnly = true;
       // The worker endpoint serializes writable-paged operations. Its ping is a
       // real worker-side drain even if an earlier host RPC timed out first.
       await this.databaseOperations.ping();

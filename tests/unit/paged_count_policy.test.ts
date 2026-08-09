@@ -165,8 +165,10 @@ describe('desktop engine paged count policy', () => {
     const result = await createEngineFromModule(SqlJsModule, {
       content: null,
       filePath: dbPath,
-      // Any positive limit below the fixture size trips the gate.
       maxSize: 4096,
+      // Keep the fixture genuinely paged without coupling that choice to the
+      // independent maxSize refusal cap.
+      pagedOpenThresholdBytes: 4096,
       allowPagedFallback: true,
       // Treat every paged file as too large for an exact scan.
       pagedExactCountMaxFileBytes: 0,
@@ -261,8 +263,9 @@ describe('desktop engine paged count policy', () => {
       content: null,
       filePath: dbPath,
       maxSize: 4096,
+      pagedOpenThresholdBytes: 4096,
       allowPagedFallback: true,
-      // No override: the fixture is far below the 64 MiB default gate.
+      // No exact-count override: the fixture is far below that 64 MiB gate.
       readOnlyMode: false
     });
     assert.strictEqual(result.storage, 'paged');

@@ -415,6 +415,14 @@ export interface DatabaseOperations {
   /** Engine type identifier: 'wasm' for sql.js, 'native' for txiki-js */
   readonly engineKind: Promise<'wasm' | 'native'>;
 
+  /**
+   * Hold one SQLite read snapshot, and the public operation queue when present,
+   * for a multi-call read such as a streaming export.
+   */
+  runReadSnapshot?<T>(
+    operation: (snapshotOperations: DatabaseOperations) => Promise<T>
+  ): Promise<T>;
+
   /** Execute SQL query */
   executeQuery(
     sql: string,
@@ -704,7 +712,7 @@ export interface DatabaseInitConfig {
   content: Uint8Array | null;
   /** Path to database file (for direct reading in worker) */
   filePath?: string;
-  /** Maximum allowed file size */
+  /** Refusal cap in bytes when an in-memory open would be required; 0 = unlimited. */
   maxSize: number;
   /** Path mappings for resources */
   resourceMap?: Record<string, string>;
@@ -715,13 +723,14 @@ export interface DatabaseInitConfig {
   /** Query execution timeout in milliseconds */
   queryTimeout?: number;
   /**
-   * Desktop worker only: permit the page-on-demand fallback when
-   * the file at `filePath` exceeds `maxSize`. Set by workerFactory after its
-   * sibling `-wal` gate has confirmed no frames exist that a paged open would
-   * miss. A writable fork is preferred for editable databases; stale forks
-   * degrade to the read-only paged path and then today's size rejection.
+   * Desktop worker only: permit page-on-demand opens for local `filePath`
+   * inputs above the dedicated paging threshold. Set by workerFactory after
+   * its sibling `-wal` gate; writable paging is preferred, then read-only
+   * paging, then the ordinary maxSize refusal or in-memory fallback.
    */
   allowPagedFallback?: boolean;
+  /** Internal/test override for the paging threshold; not a user setting. */
+  pagedOpenThresholdBytes?: number;
   /** Internal/test override for the paged exact-count gate; not a user setting. */
   pagedExactCountMaxFileBytes?: number;
   /** Internal/test override; not exposed as a user setting. */

@@ -10,8 +10,8 @@ import { mockVscode } from './mocks/vscode';
 import type { DatabaseInitConfig, DatabaseInitResult } from '../../src/core/types';
 
 /**
- * Desktop workerFactory routing for over-limit files (the paged-fallback
- * arm of the size gate), mirroring the wal_wasm_gate.test.ts harness: the
+ * Desktop workerFactory routing for local files eligible for paging,
+ * mirroring the wal_wasm_gate.test.ts harness: the
  * factory is compiled for the desktop environment with the worker RPC
  * seam faked, so the tests pin exactly what establishConnection sends to
  * the worker and how it surfaces the worker's answer.
@@ -120,6 +120,9 @@ function loadDesktopWorkerFactory(options: {
 
   return scriptModule.exports as {
     createDatabaseConnection: typeof import('../../src/workerFactory').createDatabaseConnection;
+    setDesktopTestPagedOpenThresholdBytes: (
+      thresholdBytes: number | undefined
+    ) => void;
   };
 }
 
@@ -156,6 +159,7 @@ async function connectDesktop(options: {
   /** -wal stat outcome: a size, null for FileNotFound, 'stat-error' otherwise. */
   walSize: number | null | 'stat-error';
   scheme?: string;
+  pagedOpenThresholdBytes?: number;
   initResult?: DatabaseInitResult;
   initError?: Error;
 }): Promise<RoutingResult> {
@@ -211,6 +215,11 @@ async function connectDesktop(options: {
       },
       outputChannel: { appendLine: line => result.outputLines.push(line) }
     });
+    if (options.pagedOpenThresholdBytes !== undefined) {
+      workerFactory.setDesktopTestPagedOpenThresholdBytes(
+        options.pagedOpenThresholdBytes
+      );
+    }
 
     const extensionUri = makeFileUri('file', '/ext');
     const fileUri = makeFileUri(scheme, scheme === 'untitled' ? 'test.db' : '/workspace/big.db');
@@ -231,6 +240,29 @@ async function connectDesktop(options: {
 const MB = 1024 * 1024;
 
 describe('desktop workerFactory paged routing', () => {
+  it('forwards the non-production paging-threshold override and otherwise omits it', async () => {
+    const thresholdBytes = 64 * 1024;
+    const overridden = await connectDesktop({
+      fileSize: 128 * 1024,
+      maxFileSizeBytes: 200 * MB,
+      walSize: null,
+      pagedOpenThresholdBytes: thresholdBytes
+    });
+    const ordinary = await connectDesktop({
+      fileSize: 128 * 1024,
+      maxFileSizeBytes: 200 * MB,
+      walSize: null
+    });
+
+    assert.strictEqual(overridden.error, undefined);
+    assert.strictEqual(overridden.config?.pagedOpenThresholdBytes, thresholdBytes);
+    assert.strictEqual(
+      ordinary.config?.pagedOpenThresholdBytes,
+      undefined,
+      'normal extension opens must keep the worker-owned production default'
+    );
+  });
+
   it('propagates a writable paged result without a read-only downgrade warning', async () => {
     const result = await connectDesktop({
       fileSize: 300 * MB,
@@ -269,8 +301,12 @@ describe('desktop workerFactory paged routing', () => {
     assert.strictEqual(result.isReadOnly, true, 'paged result must propagate read-only');
     // Reason surfaces as a toast and an output line, mirroring the WAL gate.
     assert.ok(
-      result.toasts.some(message => /page-on-demand/.test(message) && /maxFileSize/.test(message)),
+      result.toasts.some(message => /page-on-demand/.test(message) && /read-only/.test(message)),
       `expected a paged read-only toast, got: ${JSON.stringify(result.toasts)}`
+    );
+    assert.ok(
+      result.toasts.every(message => !/maxFileSize/.test(message)),
+      'raising or disabling maxFileSize must not be suggested as a way to bypass paging'
     );
     assert.ok(
       result.outputLines.some(line => /page-on-demand/.test(line) && /read-only/.test(line)),
@@ -337,8 +373,8 @@ describe('desktop workerFactory paged routing', () => {
     );
     assert.strictEqual(result.error.cause, workerFailure);
     assert.ok(
-      result.outputLines.some(line => /page-on-demand fallback did not engage/.test(line)),
-      `expected a fallback-failure output line, got: ${JSON.stringify(result.outputLines)}`
+      result.outputLines.some(line => /reporting the configured maxFileSize refusal/.test(line)),
+      `expected a size-refusal output line, got: ${JSON.stringify(result.outputLines)}`
     );
     assert.deepStrictEqual(result.toasts, [], 'a failed open must not toast a downgrade');
   });
@@ -353,8 +389,8 @@ describe('desktop workerFactory paged routing', () => {
     assert.strictEqual(result.error, undefined);
     assert.strictEqual(result.config?.filePath, '/workspace/big.db');
     assert.strictEqual(result.config?.readOnlyMode, false);
-    // The permission flag is inert under the gate: the worker only uses it
-    // past maxSize, and a memory result must never toast.
+    // The permission flag is independent of maxSize: the worker applies its
+    // paging threshold, and a small memory result must never toast.
     assert.strictEqual(result.config?.allowPagedFallback, true);
     assert.strictEqual(result.isReadOnly, false);
     assert.deepStrictEqual(result.toasts, []);
@@ -371,7 +407,7 @@ describe('desktop workerFactory paged routing', () => {
     assert.strictEqual(result.error, workerFailure, 'no substitution under the gate');
   });
 
-  it('keeps the unlimited gate (0) fully on the buffer contract', async () => {
+  it('passes an unlimited refusal cap (0) without disabling paged permission', async () => {
     const result = await connectDesktop({
       fileSize: 4096 * MB,
       maxFileSizeBytes: 0,

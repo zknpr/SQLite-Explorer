@@ -68,6 +68,7 @@ let nativeSupport: {
 
 type DesktopTestBackend = 'native' | 'wasm';
 let desktopTestBackend: DesktopTestBackend | undefined;
+let desktopTestPagedOpenThresholdBytes: number | undefined;
 
 /** Set only by the non-production integration API; normal backend selection is unchanged. */
 export function setDesktopTestDatabaseBackend(backend: DesktopTestBackend | undefined): void {
@@ -75,6 +76,19 @@ export function setDesktopTestDatabaseBackend(backend: DesktopTestBackend | unde
     throw new Error(`Unsupported desktop test backend: ${String(backend)}`);
   }
   desktopTestBackend = backend;
+}
+
+/** Set only by the non-production integration API; normal paging policy is unchanged. */
+export function setDesktopTestPagedOpenThresholdBytes(
+  thresholdBytes: number | undefined
+): void {
+  if (
+    thresholdBytes !== undefined
+    && (!Number.isSafeInteger(thresholdBytes) || thresholdBytes < 1)
+  ) {
+    throw new Error('Desktop test paging threshold must be a positive safe integer');
+  }
+  desktopTestPagedOpenThresholdBytes = thresholdBytes;
 }
 
 // Dynamically import native worker in Node.js environment
@@ -720,10 +734,10 @@ async function createWorkerBackedWasmDatabaseConnection(
       forceReadOnly?: boolean,
       autoCommit?: boolean
     ) {
-      // Over-limit local files used to hard-fail with this size error. They
-      // now prefer a page-on-demand writable overlay in the worker, degrading
-      // to read-only paging and then the original error when a stale vendored
-      // engine lacks the required capability or a paged open fails.
+      // Keep the configured refusal message ready for local files above
+      // maxFileSize. The worker independently selects page-on-demand storage
+      // using its materialization threshold; this message is surfaced only
+      // when that open still requires an over-cap in-memory fallback.
       let oversizedInMemoryMessage: string | undefined;
       try {
         // Read database file
@@ -796,12 +810,16 @@ async function createWorkerBackedWasmDatabaseConnection(
           wasmBinary: wasmContent,
           readOnlyMode: (forceReadOnly ?? false) || hasUncheckpointedWal,
           queryTimeout: getQueryTimeout(),
-          // Desktop local files may fall back to page-on-demand storage when
-          // they exceed maxSize (writable overlay first, then read-only).
+          // Desktop local files may use page-on-demand storage above the
+          // worker's dedicated paging threshold (writable first, then
+          // read-only), independently of maxSize.
           // The browser extension host never reaches this bundle, and paged
           // mode is impossible there anyway: workspace.fs is async-only
           // while the in-process engine needs synchronous reads.
-          allowPagedFallback: filePath !== undefined
+          allowPagedFallback: filePath !== undefined,
+          ...(desktopTestPagedOpenThresholdBytes === undefined
+            ? {}
+            : { pagedOpenThresholdBytes: desktopTestPagedOpenThresholdBytes })
         };
 
         // Initialize database in worker
@@ -1051,15 +1069,13 @@ async function createWorkerBackedWasmDatabaseConnection(
         // Terminate worker on connection failure to prevent leak
         terminateWorker();
         if (oversizedInMemoryMessage !== undefined) {
-          // The over-limit open failed after the paged fallback was offered
-          // (capability absent in the vendored engine, paged open error, or
-          // any later init failure). Before the fallback existed these files
-          // failed with exactly the size-gate message — keep that surface,
-          // with the real reason on the cause chain and in the log.
+          // An over-cap open still failed (paging was not selected, was
+          // unavailable, or failed). Preserve the configured refusal surface,
+          // with the worker's real reason on the cause chain and in the log.
           const reason = err instanceof Error ? err.message : String(err);
           GlobalOutputChannel?.appendLine(
-            `[SQLite Explorer] ${displayName}: page-on-demand fallback did not engage (${reason}); `
-            + 'reporting the in-memory size limit.'
+            `[SQLite Explorer] ${displayName}: WebAssembly open failed (${reason}); `
+            + 'reporting the configured maxFileSize refusal.'
           );
           throw new Error(oversizedInMemoryMessage, { cause: err });
         }
@@ -1158,19 +1174,19 @@ function warnWalReadOnlyDowngrade(displayName: string): void {
  * Surface the paged (page-on-demand) read-only downgrade to the user.
  *
  * Same pattern as the WAL gate above: the webview only receives the bare
- * read-only flag, so the reason is raised here — once as a toast and once
- * in the output channel — when an over-limit file opened as a paged
- * read-only snapshot instead of failing outright.
+ * read-only flag, so the storage limitation is raised here — once as a toast
+ * and once in the output channel. Paging is selected by a dedicated threshold,
+ * so changing maxFileSize is not a way to force materialization.
  */
 function warnPagedReadOnlyDowngrade(displayName: string): void {
   GlobalOutputChannel?.appendLine(
-    `[SQLite Explorer] ${displayName}: file exceeds the in-memory size limit for the WebAssembly ` +
-    "backend ('sqliteExplorer.maxFileSize'), so it is opened page-on-demand as a read-only " +
-    'snapshot. Raise the limit (or set it to 0 for unlimited) to load the file into memory for editing.'
+    `[SQLite Explorer] ${displayName}: the WebAssembly backend opened this database ` +
+    'page-on-demand as a read-only snapshot. Reopen with writable page-on-demand support ' +
+    'or use the native desktop backend to edit and save it.'
   );
   // Fire-and-forget, matching warnWalReadOnlyDowngrade.
   void vsc.window.showWarningMessage(vsc.l10n.t(
-    '{0} exceeds the in-memory size limit for the WebAssembly SQLite backend, so it is opened page-on-demand as read-only. Raise "sqliteExplorer.maxFileSize" (or set it to 0 for unlimited) to load it into memory for editing.',
+    '{0} is open page-on-demand as read-only. Reopen with writable page-on-demand support or use the native desktop backend to edit and save it.',
     displayName
   ));
 }

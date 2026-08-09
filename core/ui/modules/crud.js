@@ -163,8 +163,8 @@ async function submitAddRowOnce() {
     try {
         updateStatus('Inserting row...');
         await backendApi.insertRow(targetTable, rowData);
-        // Keeps the cached count truthful so the reload below (and page turns
-        // after it) need no COUNT(*) refetch.
+        // VS Code retains this known delta until its refreshContent echo. The
+        // demo cache drops it because INSERT triggers can ignore/add rows.
         noteRowCountChanged(targetTable, 1);
 
         closeModal('addRowModal');
@@ -228,9 +228,8 @@ async function submitDeleteRows() {
     try {
         updateStatus('Deleting rows...');
         await backendApi.deleteRows(targetTable, rowIds);
-        // The ids came from the displayed grid, so within this session the
-        // engine deleted exactly this many rows; external divergence lands as
-        // a refreshContent broadcast, which invalidates the cache wholesale.
+        // VS Code retains this requested delta until its refreshContent echo.
+        // The demo drops it because DELETE triggers can ignore/cascade rows.
         noteRowCountChanged(targetTable, -rowIds.length);
 
         closeModal('deleteModal');

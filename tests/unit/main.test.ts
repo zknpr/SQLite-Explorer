@@ -36,7 +36,12 @@ require('module')._cache[path.resolve(baseDir, 'src/virtualFileSystem.ts')] = {
     exports: { SQLiteFileSystemProvider: class {} }
 };
 
-const expectedDesktopTestExports = { desktopTest: { version: 1 } };
+const expectedDesktopTestExports = {
+    desktopTest: {
+        version: 1,
+        setPagedOpenThresholdBytes: (_thresholdBytes: number | undefined) => {}
+    }
+};
 let desktopTestApiCreateCount = 0;
 require('module')._cache[path.resolve(baseDir, 'src/desktopTestApi.ts')] = {
     id: path.resolve(baseDir, 'src/desktopTestApi.ts'),
@@ -158,6 +163,15 @@ describe('main.ts', () => {
             assert.deepStrictEqual(activation, expectedDesktopTestExports);
         }
         assert.strictEqual(desktopTestApiCreateCount, 2);
+    });
+
+    it('keeps the backend and paging-threshold selectors unreachable in Production', async () => {
+        mockContext.extensionMode = vsc.ExtensionMode.Production;
+
+        const activation = await main.activate(mockContext);
+
+        assert.strictEqual(activation, undefined);
+        assert.strictEqual(desktopTestApiCreateCount, 0);
     });
 
     it('should not update firstInstall if already installed', async () => {

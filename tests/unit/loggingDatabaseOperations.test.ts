@@ -3,7 +3,7 @@ import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import * as vsc from 'vscode';
 import { LoggingDatabaseOperations } from '../../src/loggingDatabaseOperations';
-import type { DatabaseOperations, CellValue, QueryResultSet, ModificationEntry, CellUpdate, TableQueryOptions, TableCountOptions, SchemaSnapshot, ColumnMetadata, ColumnDefinition, CellReadTarget, CellMetadata, CellReadSession, CellReadChunk, ColumnDropTableState } from '../../src/core/types';
+import type { DatabaseOperations, CellValue, QueryResultSet, ModificationEntry, CellUpdate, TableQueryOptions, TableCountOptions, SchemaSnapshot, ColumnMetadata, ColumnDefinition, CellReadTarget, CellMetadata, CellReadSession, CellReadChunk, ColumnDropTableState, RecordId } from '../../src/core/types';
 
 class MockDatabaseOperations implements DatabaseOperations {
     engineKind = Promise.resolve('wasm' as const);
@@ -32,11 +32,11 @@ class MockDatabaseOperations implements DatabaseOperations {
     async redoModification(mod: ModificationEntry): Promise<void> {}
     async flushChanges(signal?: AbortSignal): Promise<void> {}
     async discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void> {}
-    async updateCell(table: string, rowId: number, column: string, value: CellValue, patch?: string): Promise<void> {}
+    async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<void> {}
     async replaceOversizedCell(): Promise<void> {}
     async insertRow(table: string, data: Record<string, CellValue>): Promise<number> { return 1; }
     async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {}
-    async deleteRows(table: string, rowIds: number[]): Promise<void> {}
+    async deleteRows(table: string, rowIds: RecordId[]): Promise<void> {}
     async deleteColumns(
         table: string,
         columns: string[],
@@ -233,6 +233,45 @@ describe('LoggingDatabaseOperations', () => {
             assert.ok(line.includes('...[TRUNCATED]'));
             assert.ok(line.includes('(preserve triggers: false)'));
             assert.ok(!line.includes('user@example.com'));
+        });
+    });
+
+    describe('row identity logging', () => {
+        it('fingerprints an oversized opaque primary-key token without retaining its tail', async () => {
+            const tail = 'TAIL-SENSITIVE-PRIMARY-KEY';
+            const rowId = `pk:%5B%22customer-preview%22%2C%22${'x'.repeat(1024 * 1024)}${tail}%22%5D`;
+            let delegatedRowId: RecordId | undefined;
+            mockDb.updateCell = async (_table, actualRowId) => {
+                delegatedRowId = actualRowId;
+            };
+
+            await logger.updateCell('accounts', rowId, 'value', 'after');
+
+            assert.strictEqual(delegatedRowId, rowId, 'logging must not alter the backend identity');
+            const line = mockChannel.lines[0];
+            assert.ok(line.length < 512, `identity log grew to ${line.length} characters`);
+            assert.match(line, new RegExp(`identity length=${rowId.length} sha256=[A-Za-z0-9_-]{8}`));
+            assert.match(line, /preview="pk:%5B%22customer-preview/);
+            assert.doesNotMatch(line, new RegExp(tail));
+        });
+
+        it('bounds delete logging across many oversized opaque identities', async () => {
+            const rowIds = Array.from({ length: 24 }, (_, index) => (
+                `pk:%5B%22row-${index}%22%2C%22${'z'.repeat(128 * 1024)}DELETE-TAIL-${index}%22%5D`
+            ));
+            let delegated: RecordId[] | undefined;
+            mockDb.deleteRows = async (_table, actualRowIds) => {
+                delegated = actualRowIds;
+            };
+
+            await logger.deleteRows('accounts', rowIds);
+
+            assert.strictEqual(delegated, rowIds);
+            const line = mockChannel.lines[0];
+            assert.ok(line.length < 2048, `delete log grew to ${line.length} characters`);
+            assert.match(line, /24 identities/);
+            assert.match(line, /showing 8/);
+            assert.doesNotMatch(line, /DELETE-TAIL-/);
         });
     });
 

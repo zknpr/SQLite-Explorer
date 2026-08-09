@@ -285,6 +285,62 @@ describe('SQLite Engine Undo/Redo', () => {
         );
     });
 
+    it('preserves an AUTOINCREMENT high-water mark across positional column-drop undo', async () => {
+        const createTableSql =
+            'CREATE TABLE column_restore_sequence (' +
+            'id INTEGER PRIMARY KEY AUTOINCREMENT, removed TEXT, tail TEXT)';
+        await engine.executeQuery(createTableSql);
+        await engine.executeQuery(
+            "INSERT INTO column_restore_sequence(id, removed, tail) VALUES " +
+            "(1, 'one', 'tail-1'), (100, 'retired', 'tail-100')"
+        );
+        await engine.executeQuery('DELETE FROM column_restore_sequence WHERE id = 100');
+        const removedData = (await engine.executeQuery(
+            'SELECT rowid, removed FROM column_restore_sequence'
+        ))[0].rows.map((row: any[]) => ({ rowId: row[0], value: row[1] }));
+
+        await engine.deleteColumns('column_restore_sequence', ['removed']);
+        const afterTableSql = (await engine.executeQuery(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'column_restore_sequence'"
+        ))[0].rows[0][0];
+        await engine.undoModification({
+            modificationType: 'column_drop',
+            targetTable: 'column_restore_sequence',
+            description: 'Restore AUTOINCREMENT middle column',
+            deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+            columnDropSnapshot: {
+                before: {
+                    tableSql: createTableSql,
+                    columns: ['id', 'removed', 'tail'],
+                    identity: { kind: 'rowid' },
+                    schemaObjects: []
+                },
+                after: {
+                    tableSql: afterTableSql,
+                    columns: ['id', 'tail'],
+                    identity: { kind: 'rowid' },
+                    schemaObjects: []
+                }
+            }
+        } as any);
+
+        assert.strictEqual(
+            (await engine.executeQuery(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'column_restore_sequence'"
+            ))[0].rows[0][0],
+            100
+        );
+        await engine.executeQuery(
+            "INSERT INTO column_restore_sequence(removed, tail) VALUES ('next', 'tail-next')"
+        );
+        assert.strictEqual(
+            (await engine.executeQuery(
+                "SELECT id FROM column_restore_sequence WHERE tail = 'tail-next'"
+            ))[0].rows[0][0],
+            101
+        );
+    });
+
     it('rolls back a guarded column restore when the post-drop schema changed', async () => {
         const createTableSql =
             'CREATE TABLE guarded_column_restore (id INTEGER PRIMARY KEY, removed TEXT, tail TEXT)';

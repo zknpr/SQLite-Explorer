@@ -1376,6 +1376,23 @@ export async function createNativeDatabaseConnection(
             throw new Error(`Column-drop staging table already exists: ${stagingTable}`);
           }
 
+          let sequenceState: { value: CellValue } | undefined;
+          const sequenceCatalog = await worker.call<NativeQueryResult>('query', [
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_sequence'"
+          ]);
+          if ((sequenceCatalog.values?.length ?? 0) !== 0) {
+            const sequence = await worker.call<NativeQueryResult>('query', [
+              'SELECT seq FROM sqlite_sequence WHERE name = ? LIMIT 2',
+              [table]
+            ]);
+            if ((sequence.values?.length ?? 0) > 1) {
+              throw new Error(`Cannot undo column drop on ${table}: sqlite_sequence is ambiguous`);
+            }
+            if ((sequence.values?.length ?? 0) === 1) {
+              sequenceState = { value: sequence.values[0][0] };
+            }
+          }
+
           for (const sql of plan.stageColumns) await worker.call('run', [sql]);
           await restoreNativeDroppedColumnValues(table, deletedColumns, snapshot.before.identity);
           for (const sql of plan.dropCurrentSchemaObjects) await worker.call('run', [sql]);
@@ -1383,6 +1400,16 @@ export async function createNativeDatabaseConnection(
           await runNativeSingleStatement(plan.createOriginalTable);
           await worker.call('run', [plan.copyRows]);
           await worker.call('run', [plan.dropStagingTable]);
+          if (sequenceState) {
+            await worker.call('run', [
+              'DELETE FROM sqlite_sequence WHERE name = ?',
+              [table]
+            ]);
+            await worker.call('run', [
+              'INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)',
+              [table, sequenceState.value]
+            ]);
+          }
           for (const sql of plan.restoreSchemaObjects) await runNativeSingleStatement(sql);
 
           const restored = await readNativeColumnDropTableState(table);

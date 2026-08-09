@@ -53,6 +53,7 @@ interface DesktopDocumentState {
 interface DesktopTestApi {
   readonly version: 1;
   setBackend(backend: Backend): void;
+  setPagedOpenThresholdBytes(thresholdBytes: number | undefined): void;
   inspectDocument(uri: string): Promise<DesktopDocumentState | null>;
   inspectLifecycle(documentId: string): DesktopDocumentState | null;
   openCustomDocument(
@@ -94,7 +95,7 @@ interface Fixture {
 const EXTENSION_ID = 'zknpr.sqlite-explorer';
 const EXPECTED_VIEW_TYPES = ['sqlite-explorer.view', 'sqlite-explorer.option'] as const;
 const DEFAULT_MAX_FILE_SIZE_MIB = 200;
-const PAGED_TEST_LIMIT_MIB = 0.01;
+const PAGED_TEST_THRESHOLD_BYTES = 64 * 1024;
 
 let api: DesktopTestApi;
 let SQL: SqlJsStatic;
@@ -274,6 +275,7 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
       await disposeDirect(handle);
     }
     await closeAllCustomTabs();
+    api.setPagedOpenThresholdBytes(undefined);
     await setMaxFileSize(DEFAULT_MAX_FILE_SIZE_MIB);
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   });
@@ -282,6 +284,7 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
     suite(`backend=${backend}`, () => {
       setup(async () => {
         await closeAllCustomTabs();
+        api.setPagedOpenThresholdBytes(undefined);
         await setMaxFileSize(DEFAULT_MAX_FILE_SIZE_MIB);
         api.setBackend(backend);
       });
@@ -291,6 +294,7 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
           await disposeDirect(handle);
         }
         await closeAllCustomTabs();
+        api.setPagedOpenThresholdBytes(undefined);
         await setMaxFileSize(DEFAULT_MAX_FILE_SIZE_MIB);
       });
 
@@ -459,8 +463,8 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
           await disposeDirect(handle);
         });
 
-        test('[row 7][native-only] maxFileSize materialization ladder is not applicable to native file I/O', async () => {
-          await setMaxFileSize(PAGED_TEST_LIMIT_MIB);
+        test('[row 7][native-only] WASM paging threshold is not applicable to native file I/O', async () => {
+          api.setPagedOpenThresholdBytes(PAGED_TEST_THRESHOLD_BYTES);
           const fixture = createFixture('materialization-native', { large: true });
           const { handle, state } = await openDirect(fixture);
           assert.equal(state.engineKind, 'native');
@@ -470,18 +474,23 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
         });
       } else {
         test('[row 3][WASM paged-only] worker-to-host streaming save atomically renames and reconnects', async () => {
-          await setMaxFileSize(PAGED_TEST_LIMIT_MIB);
+          api.setPagedOpenThresholdBytes(PAGED_TEST_THRESHOLD_BYTES);
           const fixture = createFixture('save-wasm-paged', { large: true });
           assert.ok(
             fixture.originalBytes.length < 2 ** 20,
             'the forced-paged streaming fixture must remain below 1 MiB'
           );
+          assert.ok(
+            fixture.originalBytes.length > PAGED_TEST_THRESHOLD_BYTES,
+            'the streaming fixture must remain above the test paging threshold'
+          );
           const { handle, state } = await openDirect(fixture);
           assert.equal(state.storage, 'paged');
           assert.equal(state.readOnly, false);
 
-          // The low limit forces edits into the worker's paged overlay. Saving
-          // must stream its runs to the host-side adjacent-temp writer, rename
+          // The test-only threshold forces edits into the worker's paged
+          // overlay without changing the user-facing refusal cap. Saving must
+          // stream its runs to the host-side adjacent-temp writer, rename
           // atomically, and reconnect the document to the replacement inode.
           const originalStat = fs.statSync(fixture.filePath, { bigint: true });
           const frozenDescriptor = fs.openSync(fixture.filePath, 'r');
@@ -571,12 +580,12 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
           await disposeDirect(handle);
         });
 
-        test('[row 7][WASM-only] observable storage selects memory below and paged above the ladder gate', async () => {
-          await setMaxFileSize(PAGED_TEST_LIMIT_MIB);
+        test('[row 7][WASM-only] observable storage selects memory below and paged above the dedicated threshold', async () => {
+          api.setPagedOpenThresholdBytes(PAGED_TEST_THRESHOLD_BYTES);
           const small = createFixture('materialization-wasm-small');
           const large = createFixture('materialization-wasm-large', { large: true });
-          assert.ok(small.originalBytes.length < PAGED_TEST_LIMIT_MIB * 2 ** 20);
-          assert.ok(large.originalBytes.length > PAGED_TEST_LIMIT_MIB * 2 ** 20);
+          assert.ok(small.originalBytes.length < PAGED_TEST_THRESHOLD_BYTES);
+          assert.ok(large.originalBytes.length > PAGED_TEST_THRESHOLD_BYTES);
 
           const smallOpen = await openDirect(small);
           const largeOpen = await openDirect(large);

@@ -60,6 +60,14 @@ import {
 export { WasmDatabaseEngine } from './engine/wasm/WasmDatabaseEngine';
 export { getNodeFs } from './platform/fs';
 
+/**
+ * Desktop WASM's historical default maxFileSize (200 MiB) was also its
+ * effective materialization boundary. Freeze that boundary as an internal
+ * paging threshold so default small-file routing stays unchanged while user
+ * cap changes no longer opt multi-GB files back into full materialization.
+ */
+const DESKTOP_PAGED_OPEN_THRESHOLD_BYTES = 200 * 1024 * 1024;
+
 // ============================================================================
 // Database Factory
 // ============================================================================
@@ -132,13 +140,25 @@ export async function createEngineFromModule(
       );
     }
     try {
-      const openOverLimitFile = (actualSize: number): DatabaseInitResult => {
-        // Over the in-memory gate. Files this size used to be a hard
-        // failure; when the host permits it and the vendored engine
-        // carries the fork's paged APIs, editable documents prefer the
-        // copy-on-write overlay. Stale builds degrade to read-only paging,
-        // then exactly today's size-gate rejection.
-        let pagedFailure: unknown;
+      const pagedOpenThresholdBytes =
+        config.pagedOpenThresholdBytes ?? DESKTOP_PAGED_OPEN_THRESHOLD_BYTES;
+      if (
+        !Number.isSafeInteger(pagedOpenThresholdBytes)
+        || pagedOpenThresholdBytes < 1
+      ) {
+        throw new Error('Paged-open threshold must be a positive safe integer');
+      }
+
+      // Paging policy and refusal policy are intentionally independent:
+      // large local files try the writable/read-only paged ladder even when
+      // maxSize is unlimited or higher than the file. maxSize is consulted
+      // only if paging is unavailable, fails, or is not selected below the
+      // threshold. This prevents an "unlimited" cap from forcing a multi-GB
+      // readFile + sql.js materialization.
+      let pagedFailure: unknown;
+      let pagedAttempted = false;
+      const tryOpenPagedFile = (actualSize: number): DatabaseInitResult | undefined => {
+        pagedAttempted = true;
         if (config.allowPagedFallback) {
           const modes: Array<'writable' | 'readOnly'> = [];
           if (
@@ -162,34 +182,52 @@ export async function createEngineFromModule(
               );
             } catch (pagedError) {
               pagedFailure = pagedError;
+              const fallback = config.maxSize > 0 && actualSize > config.maxSize
+                ? 'falling back to the size-limit rejection'
+                : 'falling back to the in-memory open';
               logger?.(
                 'warn',
                 `${mode === 'writable' ? 'Writable p' : 'P'}age-on-demand open failed for `
                 + `'${config.filePath}'; ${mode === 'writable' && modes.includes('readOnly')
                   ? 'trying the read-only paged fallback'
-                  : 'falling back to the size-limit rejection'}:`,
+                  : fallback}:`,
                 pagedError instanceof Error ? pagedError.message : String(pagedError)
               );
             }
           }
         }
+        return undefined;
+      };
+      const rejectOverLimitFile = (actualSize: number): never => {
         throw new Error(
           `file size (${actualSize} bytes) exceeds the maximum allowed size (${config.maxSize} bytes)`,
           pagedFailure === undefined ? undefined : { cause: pagedFailure }
         );
       };
+      const routeKnownSize = (actualSize: number): DatabaseInitResult | undefined => {
+        if (actualSize > pagedOpenThresholdBytes && !pagedAttempted) {
+          const paged = tryOpenPagedFile(actualSize);
+          if (paged) return paged;
+        }
+        // Below the paging threshold, maxSize is an explicit refusal cap on
+        // full-image materialization. Lowering it must restrict that path, not
+        // implicitly opt the file into a different storage backend; paging is
+        // selected only by the independent threshold above.
+        if (config.maxSize > 0 && actualSize > config.maxSize) {
+          rejectOverLimitFile(actualSize);
+        }
+        return undefined;
+      };
 
-      // Validate the metadata size first, then the bytes actually read. The
-      // second gate closes the stat/read TOCTOU and distrusts providers that
-      // return more data than their stat result advertised.
+      // Route on metadata before allocating the whole image. Re-run the same
+      // policy against the bytes actually read to close the stat/read TOCTOU
+      // for refusal and to distrust providers that exceed their stat result.
       const stats = await fs.promises.stat(config.filePath);
-      if (config.maxSize > 0 && stats.size > config.maxSize) {
-        return openOverLimitFile(stats.size);
-      }
+      const statRoute = routeKnownSize(stats.size);
+      if (statRoute) return statRoute;
       buffer = await fs.promises.readFile(config.filePath);
-      if (config.maxSize > 0 && buffer.byteLength > config.maxSize) {
-        return openOverLimitFile(buffer.byteLength);
-      }
+      const bufferRoute = routeKnownSize(buffer.byteLength);
+      if (bufferRoute) return bufferRoute;
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
       throw new Error(
@@ -315,7 +353,7 @@ function assertNoSiblingWalFrames(fs: NodeFsModule, filePath: string): void {
 }
 
 /**
- * Open an over-limit local database page-on-demand. Writable opens keep all
+ * Open a large local database page-on-demand. Writable opens keep all
  * changes in the fork's host-memory overlay; read-only opens retain the stage-0
  * behavior.
  *

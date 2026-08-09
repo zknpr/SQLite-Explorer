@@ -10,7 +10,10 @@ import { DocumentRegistry } from './documentRegistry';
 import { DatabaseEditorProvider } from './editorController';
 import { GlobalOutputChannel } from './main';
 import { exportTableToLocalFileForTests } from './tableExporter';
-import { setDesktopTestDatabaseBackend } from './workerFactory';
+import {
+  setDesktopTestDatabaseBackend,
+  setDesktopTestPagedOpenThresholdBytes
+} from './workerFactory';
 
 export interface DesktopTestDocumentSnapshot extends DesktopTestDocumentState {
   documentId: string;
@@ -21,6 +24,7 @@ export interface DesktopTestDocumentSnapshot extends DesktopTestDocumentState {
 export interface DesktopTestApi extends vsc.Disposable {
   readonly version: 1;
   setBackend(backend: 'native' | 'wasm'): void;
+  setPagedOpenThresholdBytes(thresholdBytes: number | undefined): void;
   inspectDocument(uri: string): Promise<DesktopTestDocumentSnapshot | null>;
   inspectLifecycle(documentId: string): DesktopTestDocumentSnapshot | null;
   openCustomDocument(
@@ -82,6 +86,14 @@ class DesktopTestController implements DesktopTestApi {
       throw new Error('Close every database document before changing the desktop test backend');
     }
     setDesktopTestDatabaseBackend(backend);
+  }
+
+  setPagedOpenThresholdBytes(thresholdBytes: number | undefined): void {
+    this.#assertActive();
+    if (DocumentRegistry.size !== 0 || this.#handles.size !== 0) {
+      throw new Error('Close every database document before changing the desktop test paging threshold');
+    }
+    setDesktopTestPagedOpenThresholdBytes(thresholdBytes);
   }
 
   async inspectDocument(uri: string): Promise<DesktopTestDocumentSnapshot | null> {
@@ -172,6 +184,7 @@ class DesktopTestController implements DesktopTestApi {
     if (this.#disposed) return;
     this.#disposed = true;
     setDesktopTestDatabaseBackend(undefined);
+    setDesktopTestPagedOpenThresholdBytes(undefined);
     for (const document of new Set(this.#handles.values())) {
       document.dispose().catch(error => {
         GlobalOutputChannel?.appendLine(

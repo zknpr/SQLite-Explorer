@@ -127,7 +127,7 @@ const textEncoder = new TextEncoder();
  * @param length - Number of bytes to use (default 6)
  * @returns Truncated SHA-256 hash encoded as base64url
  */
-async function hash64(input: string, length: number = 6): Promise<string> {
+export async function hash64(input: string, length: number = 6): Promise<string> {
   const hashBuffer = await crypto.subtle.digest('SHA-256', textEncoder.encode(input));
   const hashBytes = new Uint8Array(hashBuffer).subarray(0, length);
   return base64urlnopad.encode(hashBytes);

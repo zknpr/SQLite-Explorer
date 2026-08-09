@@ -23,16 +23,16 @@ import { writePagedWritableOverlayToFile } from '../../src/pagedWritableSave';
  * (createDatabaseEngine / createEngineFromModule / the worker endpoint),
  * against the REAL vendored sql.js fork and real files on disk:
  *
- *   under the gate                        -> buffer, editable, byte-identical
- *   over the gate + openPagedWritable     -> paged writable overlay
- *   over the gate + openPaged only        -> paged read-only snapshot
- *   over the gate + both capabilities absent -> today's size rejection
- *   over the gate + fallback not allowed  -> today's size rejection
- *   over the gate + writable open throws  -> read-only paged fallback
- *   over the gate + both opens throw      -> today's size rejection (cause kept)
- *   over the gate + frame-bearing -wal    -> refused (defensive recheck)
- *   over the gate + WAL-at-rest header    -> paged (no sibling = no frames)
- *   unlimited gate (0)                    -> buffer for everything
+ *   below the paging threshold            -> buffer, editable, byte-identical
+ *   above threshold + openPagedWritable   -> paged writable overlay
+ *   above threshold + openPaged only      -> paged read-only snapshot
+ *   above threshold + both capabilities absent + over cap -> size rejection
+ *   above threshold + fallback not allowed + over cap      -> size rejection
+ *   above threshold + writable open throws -> read-only paged fallback
+ *   above threshold + both opens throw + over cap -> size rejection (cause kept)
+ *   above threshold + frame-bearing -wal  -> refused (defensive recheck)
+ *   above threshold + WAL-at-rest header  -> paged (no sibling = no frames)
+ *   cap 0 or cap above file                -> still paged above the threshold
  *
  * plus fd lifecycle across successful opens, failed opens, and shutdown.
  */
@@ -51,7 +51,7 @@ let garbagePath: string;
 let generationDbPath: string;
 let nextGenerationBytes: Uint8Array;
 
-/** Gate placed below every fixture so all of them count as over-limit. */
+/** Cap and paging threshold placed below every fixture. */
 const TINY_GATE = 4096;
 
 function openFdCount(): number | undefined {
@@ -131,6 +131,7 @@ function overGateConfig(filePath: string, extra: Partial<DatabaseInitConfig> = {
     content: null,
     filePath,
     maxSize: TINY_GATE,
+    pagedOpenThresholdBytes: TINY_GATE,
     readOnlyMode: false,
     allowPagedFallback: true,
     ...extra
@@ -200,6 +201,29 @@ describe('desktop paged fallback routing (engine layer)', () => {
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }
+  });
+
+  it('uses maxSize only as a refusal gate below the paging threshold', async () => {
+    await assert.rejects(
+      createDatabaseEngine({
+        content: null,
+        filePath: dbPath,
+        maxSize: TINY_GATE,
+        pagedOpenThresholdBytes: dbBytes.length + 1024,
+        readOnlyMode: false,
+        allowPagedFallback: true
+      }),
+      SIZE_ERROR_PATTERN
+    );
+  });
+
+  it('pages a file above the threshold when maxSize is above the file size', async () => {
+    const result = await createDatabaseEngine(overGateConfig(dbPath, {
+      maxSize: dbBytes.length + 1024
+    }));
+    assert.strictEqual(result.storage, 'paged');
+    assert.strictEqual(result.isReadOnly, false);
+    (result.operations as WasmDatabaseEngine).shutdown();
   });
 
   it('edits and exports an over-gate file through the real openPagedWritable without touching its base', async () => {
@@ -335,7 +359,7 @@ describe('desktop paged fallback routing (engine layer)', () => {
       await assert.rejects(engine.setPragma('cache_size', 123), /read.?only/i);
       await assert.rejects(
         engine.serializeDatabase(),
-        /page-on-demand as a[\s\S]*read-only snapshot[\s\S]*maxFileSize/
+        /read-only page-on-demand snapshot[\s\S]*writable page-on-demand support/
       );
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
@@ -343,11 +367,17 @@ describe('desktop paged fallback routing (engine layer)', () => {
   });
 
   it('uses read-only paging when the caller explicitly requests read-only mode', async () => {
-    const result = await createDatabaseEngine(overGateConfig(dbPath, { readOnlyMode: true }));
+    const result = await createDatabaseEngine(overGateConfig(dbPath, {
+      maxSize: 0,
+      readOnlyMode: true
+    }));
     assert.strictEqual(result.storage, 'paged');
     assert.strictEqual(result.isReadOnly, true);
     try {
-      await assert.rejects(result.operations!.serializeDatabase(), /read-only snapshot/);
+      await assert.rejects(
+        result.operations!.serializeDatabase(),
+        /read-only page-on-demand snapshot/
+      );
     } finally {
       (result.operations as WasmDatabaseEngine).shutdown();
     }
@@ -494,9 +524,9 @@ describe('desktop paged fallback routing (engine layer)', () => {
     }
   });
 
-  it('keeps an unlimited gate (0) on the buffer path for everything', async () => {
+  it('pages a file above the threshold when maxSize is unlimited (0)', async () => {
     const result = await createDatabaseEngine(overGateConfig(dbPath, { maxSize: 0 }));
-    assert.strictEqual(result.storage, 'memory');
+    assert.strictEqual(result.storage, 'paged');
     assert.strictEqual(result.isReadOnly, false);
     const engine = result.operations!;
     try {

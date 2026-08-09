@@ -444,7 +444,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         assert.strictEqual(doc.connectionGeneration, 1);
     });
 
-    it('save: drains a deferred WITHOUT ROWID edit before snapshot and checkpoint', async () => {
+    it('save: drains a deferred atomic batch before advancing the connection generation', async () => {
         const mutationStarted = createDeferred<void>();
         const finishMutation = createDeferred<void>();
         const events: string[] = [];
@@ -452,26 +452,19 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         let savedValue = 'before';
         const rawOps = {
             engineKind: Promise.resolve('wasm' as const),
-            executeQuery: async (sql: string) => {
-                if (sql.includes('pragma_table_list')) {
-                    return [{ columns: ['type', 'wr'], rows: [['table', 1]] }];
-                }
-                return [{ columns: ['type', 'length', 'value'], rows: [['text', 6, liveValue]] }];
-            },
-            getTableInfo: async () => [{
-                ordinal: 0,
-                identifier: 'key',
-                declaredType: 'TEXT',
-                isRequired: 1,
-                defaultExpression: null,
-                primaryKeyPosition: 1
-            }],
-            updateCell: async () => {
+            updateCellBatch: async () => {
                 events.push('mutation-start');
                 mutationStarted.resolve();
                 await finishMutation.promise;
                 liveValue = 'after';
                 events.push('mutation-finish');
+                return [{
+                    rowId: 1,
+                    columnName: 'value',
+                    priorValue: 'before',
+                    newValue: 'after',
+                    operation: 'set' as const
+                }];
             },
             ping: async () => {
                 events.push('drain');
@@ -494,16 +487,25 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             async () => ({ databaseOps: replacementOps, isReadOnly: false, storage: 'paged' }),
             { initialStorage: 'paged' }
         );
-        const rowId = encodePrimaryKeyRecordId(
-            [{ identifier: 'key', declaredType: 'TEXT', position: 1 }],
-            ['alpha']
-        );
         doc.onDidChangeContent((event: unknown) => contentChanges.push(event));
 
-        const editPromise = doc.hostBridge.updateCell('keyed', rowId, 'value', 'after');
+        const editPromise = doc.hostBridge.updateCellBatch(
+            'keyed',
+            [{ rowId: 1, column: 'value', value: 'after' }],
+            'Deferred batch'
+        );
         await mutationStarted.promise;
         const savePromise = doc.save();
-        while (!doc.isReadOnlyMode) await new Promise(resolve => setImmediate(resolve));
+        await new Promise(resolve => setImmediate(resolve));
+        assert.strictEqual(
+            doc.isReadOnlyMode,
+            false,
+            'the connection generation must remain valid while the tracked mutation drains'
+        );
+        await assert.rejects(
+            doc.runTrackedMutation(async () => 'late mutation'),
+            /temporarily read-only.*save is in progress/i
+        );
         finishMutation.resolve();
 
         await editPromise;

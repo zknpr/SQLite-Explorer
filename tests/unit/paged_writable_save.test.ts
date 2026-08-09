@@ -1,5 +1,6 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import initSqlJs from '../../vendor/sql.js/sql-wasm.js';
@@ -112,6 +113,28 @@ function proxyHandleRead(
   });
 }
 
+function bundledNativeBinary(): string | undefined {
+  let directory: string | undefined;
+  if (process.platform === 'darwin') {
+    directory = process.arch === 'arm64' ? 'aarch64-macos' : 'x86_64-macos';
+  } else if (process.platform === 'linux') {
+    directory = process.arch === 'arm64' ? 'aarch64-linux-gnu' : 'x86_64-linux-gnu';
+  } else if (process.platform === 'win32' && process.arch === 'x64') {
+    directory = 'x86_64-windows';
+  }
+  if (!directory) return undefined;
+  const binary = path.resolve(
+    process.cwd(),
+    'natives',
+    directory,
+    process.platform === 'win32' ? 'tjs.exe' : 'tjs'
+  );
+  return fs.existsSync(binary) ? binary : undefined;
+}
+
+/** File-mechanics fixtures below are intentionally not valid SQLite images. */
+const acquireFixtureWriteLock = () => ({ release() {} });
+
 describe('paged writable host save', () => {
   it('stream-assembles a real VACUUM shrink byte-identically to explicit serialization', async () => {
     const basePath = path.join(fixtureDir, 'vacuum-base.db');
@@ -132,6 +155,7 @@ describe('paged writable host save', () => {
       content: null,
       filePath: basePath,
       maxSize: 4096,
+      pagedOpenThresholdBytes: 4096,
       allowPagedFallback: true,
       readOnlyMode: false
     });
@@ -314,7 +338,9 @@ describe('paged writable host save', () => {
       fs,
       basePath,
       basePath,
-      snapshotFor(basePath)
+      snapshotFor(basePath),
+      undefined,
+      acquireFixtureWriteLock
     );
 
     assert.deepStrictEqual(result, { requiresReopen: true });
@@ -332,7 +358,9 @@ describe('paged writable host save', () => {
       fs,
       basePath,
       targetPath,
-      snapshotFor(basePath)
+      snapshotFor(basePath),
+      undefined,
+      acquireFixtureWriteLock
     );
 
     assert.deepStrictEqual(result, { requiresReopen: true });
@@ -392,7 +420,14 @@ describe('paged writable host save', () => {
     // tightening performed after the paged session opened.
     fs.chmodSync(basePath, 0o600);
 
-    await writePagedWritableOverlayToFile(fs, basePath, basePath, snapshot);
+    await writePagedWritableOverlayToFile(
+      fs,
+      basePath,
+      basePath,
+      snapshot,
+      undefined,
+      acquireFixtureWriteLock
+    );
 
     assert.strictEqual(fs.statSync(basePath).mode & 0o777, 0o600);
   });
@@ -426,7 +461,14 @@ describe('paged writable host save', () => {
     });
 
     await assert.rejects(
-      writePagedWritableOverlayToFile(capability, basePath, basePath, snapshot),
+      writePagedWritableOverlayToFile(
+        capability,
+        basePath,
+        basePath,
+        snapshot,
+        undefined,
+        acquireFixtureWriteLock
+      ),
       /save target changed on disk/i
     );
 
@@ -584,6 +626,67 @@ describe('paged writable host save', () => {
     assert.strictEqual(fs.existsSync(targetPath), false);
     assert.strictEqual(fs.statSync(walPath).size, 33, 'the external WAL must never be deleted');
     assert.ok(!fs.readdirSync(fixtureDir).some(name => name.includes('late-wal-target.db.sqlite-explorer')));
+  });
+
+  it('holds a cross-process SQLite write lock across the final gate and in-place rename', async (t) => {
+    const binary = bundledNativeBinary();
+    if (!binary) {
+      t.skip('no bundled native SQLite runtime for this platform');
+      return;
+    }
+
+    const basePath = path.join(fixtureDir, 'cross-process-lock-base.db');
+    const db = new (SqlJsModule.Database as any)();
+    db.run(
+      'CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT); ' +
+      "INSERT INTO items VALUES (1, 'original')"
+    );
+    fs.writeFileSync(basePath, Buffer.from(db.export()));
+    db.close();
+
+    const snapshot = snapshotFor(basePath, { runs: [], dirtyBytes: 0 });
+    let externalWriter: ReturnType<typeof spawnSync> | undefined;
+    const capability = capabilityWithOpen(fs.promises.open, {}, {
+      renameSync: ((...args: Parameters<typeof fs.renameSync>) => {
+        // This is the exact cross-process window under review: the external
+        // connection switches the rollback database to WAL and commits after
+        // every metadata/WAL check, immediately before the replacement.
+        const script =
+          "const sqlite = await import('tjs:sqlite');" +
+          `const db = new sqlite.Database(${JSON.stringify(basePath)});` +
+          "db.exec(\"PRAGMA busy_timeout=50; PRAGMA journal_mode=WAL; " +
+          "UPDATE items SET value='external' WHERE id=1\");" +
+          'db.close();';
+        externalWriter = spawnSync(binary, ['eval', script], {
+          encoding: 'utf8',
+          timeout: 2_000
+        });
+        return fs.renameSync(...args);
+      }) as typeof fs.renameSync
+    });
+
+    await writePagedWritableOverlayToFile(
+      capability,
+      basePath,
+      basePath,
+      snapshot
+    );
+
+    assert.ok(externalWriter, 'the external writer probe must run inside renameSync');
+    assert.notStrictEqual(
+      externalWriter.status,
+      0,
+      'BEGIN IMMEDIATE must keep the external WAL writer from committing in the final window'
+    );
+    const reopened = new (SqlJsModule.Database as any)(fs.readFileSync(basePath));
+    try {
+      assert.deepStrictEqual(
+        reopened.exec('SELECT value FROM items WHERE id=1')[0].values,
+        [['original']]
+      );
+    } finally {
+      reopened.close();
+    }
   });
 
   it('refuses an in-place temp chmod after close with the same inode and size', async () => {

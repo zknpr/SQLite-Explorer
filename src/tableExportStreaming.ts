@@ -22,6 +22,7 @@ import {
   isPrimaryKeyRecordId,
   isReadOnlyPrimaryKeyRecordId
 } from './core/row-identity';
+import { runReadSnapshot } from './core/operation-serializer';
 
 /**
  * Source window selected so even the worst JSON control-character expansion
@@ -971,72 +972,77 @@ export async function streamTableExport(
   if (!sink || typeof sink.write !== 'function') throw new Error('Export sink is required');
   assertNotCancelled(cancellation);
 
-  const columns = await resolveColumns(operations, table, requestedColumns);
-  const identity = await resolveIdentity(operations, table);
-  const textEncoding = await resolveTextEncoding(operations);
-  const selectedRowIds = options.rowIds ?? [];
-  const containsPrimaryKeyIds = selectedRowIds.some(isPrimaryKeyRecordId);
-  if (containsPrimaryKeyIds && !selectedRowIds.every(isPrimaryKeyRecordId)) {
-    throw new Error('Cannot mix rowid and primary-key row identities');
-  }
-  if (selectedRowIds.length > 0 && !identity) {
-    throw new Error(`Cannot export selected rows: ${table} has no stable row identity`);
-  }
-  if (
-    selectedRowIds.length > 0 &&
-    identity?.kind === 'primaryKey' &&
-    !selectedRowIds.every(isPrimaryKeyRecordId)
-  ) {
-    throw new Error(`Cannot export selected rows: ${table} requires primary-key identities`);
-  }
-  if (containsPrimaryKeyIds && identity?.kind !== 'primaryKey') {
-    throw new Error(`Cannot export selected rows: ${table} has no declared primary-key identity`);
-  }
-  const rows = readRows(
-    operations,
-    table,
-    columns,
-    identity,
-    selectedRowIds,
-    textEncoding,
-    format !== 'csv' && format !== 'excel',
-    cancellation
-  );
+  // The projection intentionally omits oversized values. Keep every later
+  // cell session inside its projection's SQLite snapshot; metadata equality
+  // alone cannot detect a same-class, same-length replacement.
+  return runReadSnapshot(operations, async snapshotOperations => {
+    const columns = await resolveColumns(snapshotOperations, table, requestedColumns);
+    const identity = await resolveIdentity(snapshotOperations, table);
+    const textEncoding = await resolveTextEncoding(snapshotOperations);
+    const selectedRowIds = options.rowIds ?? [];
+    const containsPrimaryKeyIds = selectedRowIds.some(isPrimaryKeyRecordId);
+    if (containsPrimaryKeyIds && !selectedRowIds.every(isPrimaryKeyRecordId)) {
+      throw new Error('Cannot mix rowid and primary-key row identities');
+    }
+    if (selectedRowIds.length > 0 && !identity) {
+      throw new Error(`Cannot export selected rows: ${table} has no stable row identity`);
+    }
+    if (
+      selectedRowIds.length > 0 &&
+      identity?.kind === 'primaryKey' &&
+      !selectedRowIds.every(isPrimaryKeyRecordId)
+    ) {
+      throw new Error(`Cannot export selected rows: ${table} requires primary-key identities`);
+    }
+    if (containsPrimaryKeyIds && identity?.kind !== 'primaryKey') {
+      throw new Error(`Cannot export selected rows: ${table} has no declared primary-key identity`);
+    }
+    const rows = readRows(
+      snapshotOperations,
+      table,
+      columns,
+      identity,
+      selectedRowIds,
+      textEncoding,
+      format !== 'csv' && format !== 'excel',
+      cancellation
+    );
 
-  switch (format) {
-    case 'csv':
-      return writeCsvRows(
-        operations,
-        rows,
-        columns,
-        sink,
-        options.header ?? true,
-        false,
-        cancellation
-      );
-    case 'excel':
-      return writeCsvRows(
-        operations,
-        rows,
-        columns,
-        sink,
-        options.header ?? true,
-        true,
-        cancellation
-      );
-    case 'json':
-      return writeJsonRows(operations, rows, columns, sink, cancellation);
-    case 'sql':
-      return writeSqlRows(
-        operations,
-        rows,
-        table,
-        columns,
-        sink,
-        options.includeTableName ?? true,
-        cancellation
-      );
-    default:
-      throw new Error(`Unsupported export format: ${format}`);
-  }
+    switch (format) {
+      case 'csv':
+        return writeCsvRows(
+          snapshotOperations,
+          rows,
+          columns,
+          sink,
+          options.header ?? true,
+          false,
+          cancellation
+        );
+      case 'excel':
+        return writeCsvRows(
+          snapshotOperations,
+          rows,
+          columns,
+          sink,
+          options.header ?? true,
+          true,
+          cancellation
+        );
+      case 'json':
+        return writeJsonRows(snapshotOperations, rows, columns, sink, cancellation);
+      case 'sql':
+        return writeSqlRows(
+          snapshotOperations,
+          rows,
+          table,
+          columns,
+          sink,
+          options.includeTableName ?? true,
+          cancellation
+        );
+      default:
+        throw new Error(`Unsupported export format: ${format}`);
+    }
+  });
 }

@@ -2469,9 +2469,14 @@ describe('native async bounded-query capability routing', () => {
     });
 
     it('keeps bounded reads on the sync connection unless no transaction is active', () => {
+        const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(
+            'isExplicitlyOutsideTransaction',
+            ['database']
+        );
         const shouldUseAsyncDatabase = loadNativeWorkerFunction(
             'shouldUseAsyncDatabase',
-            ['database', 'asyncDatabase']
+            ['database', 'asyncDatabase'],
+            { isExplicitlyOutsideTransaction }
         );
         const asyncDatabase = {};
 

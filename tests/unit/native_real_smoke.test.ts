@@ -22,7 +22,7 @@ import {
     reconcileRestoredDatabase,
     revertDatabaseToSaved
 } from '../../src/core/restore-reconciler';
-import type { LabeledModification, TableQueryOptions } from '../../src/core/types';
+import type { DatabaseOperations, LabeledModification, TableQueryOptions } from '../../src/core/types';
 
 const BUNDLED_TXIKI_SQLITE_VERSION = '3.51.2';
 const DIVERGENT_REAL_TEXT_BY_NATIVE_SQLITE_VERSION: Record<string, string> = {
@@ -768,6 +768,87 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             await engine.closeCellReadSession(textSession.sessionId);
         });
 
+        await testContext.test('binds native oversized export cells to the row-query snapshot', async () => {
+            const oldPayload = 'old|'.padEnd(64 * 1024 + 1, 'a');
+            const newPayload = 'new|'.padEnd(oldPayload.length, 'b');
+            await engine.executeQuery('PRAGMA journal_mode = WAL');
+            await engine.executeQuery(
+                'CREATE TABLE native_export_cell_snapshot (' +
+                'id INTEGER PRIMARY KEY, payload TEXT, tag TEXT)'
+            );
+            await engine.executeQuery(
+                'INSERT INTO native_export_cell_snapshot VALUES (1, ?, ?)',
+                [oldPayload, 'old-row']
+            );
+
+            const writer = new NativeWorkerProcess(binary, workerScript);
+            await writer.start();
+            await writer.call('open', [databasePath, false]);
+            let mutationInjected = false;
+            const wrapSnapshotOperations = (snapshotOperations: DatabaseOperations) => (
+                new Proxy(snapshotOperations, {
+                    get(target, property, receiver) {
+                        if (property === 'executeQuery') {
+                            return async (...args: Parameters<DatabaseOperations['executeQuery']>) => {
+                                const result = await target.executeQuery(...args);
+                                const sql = String(args[0]);
+                                if (
+                                    !mutationInjected
+                                    && sql.includes('FROM "native_export_cell_snapshot"')
+                                    && sql.includes('__export_type_0')
+                                ) {
+                                    mutationInjected = true;
+                                    await writer.call('run', [
+                                        'UPDATE native_export_cell_snapshot ' +
+                                        'SET payload = ?, tag = ? WHERE id = 1',
+                                        [newPayload, 'new-row']
+                                    ]);
+                                }
+                                return result;
+                            };
+                        }
+                        const value = Reflect.get(target, property, receiver);
+                        return typeof value === 'function' ? value.bind(target) : value;
+                    }
+                })
+            );
+            const racingOperations = new Proxy(engine, {
+                get(target, property, receiver) {
+                    if (property === 'runReadSnapshot') {
+                        return <T>(
+                            operation: (snapshotOperations: DatabaseOperations) => Promise<T>
+                        ) => target.runReadSnapshot!(snapshotOperations => (
+                            operation(wrapSnapshotOperations(snapshotOperations))
+                        ));
+                    }
+                    const value = Reflect.get(target, property, receiver);
+                    return typeof value === 'function' ? value.bind(target) : value;
+                }
+            });
+            const chunks: string[] = [];
+
+            try {
+                await streamTableExport(
+                    racingOperations,
+                    'native_export_cell_snapshot',
+                    ['payload', 'tag'],
+                    { format: 'csv' },
+                    { write: async chunk => { chunks.push(chunk); } }
+                );
+                assert.strictEqual(mutationInjected, true);
+                assert.strictEqual(chunks.join(''), `payload,tag\n${oldPayload},old-row`);
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'SELECT substr(payload, 1, 4), tag FROM native_export_cell_snapshot'
+                    ))[0].rows,
+                    [['new|', 'new-row']],
+                    'the external WAL commit must remain visible after the export snapshot closes'
+                );
+            } finally {
+                writer.stop();
+            }
+        });
+
         await testContext.test('marks an oversized native WITHOUT ROWID primary key read-only', async () => {
             await engine.executeQuery(
                 'CREATE TABLE native_oversized_identity ' +
@@ -1359,6 +1440,64 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.deepStrictEqual(
                 (await engine.executeQuery('SELECT value FROM native_column_restore_audit'))[0].rows,
                 [['changed']]
+            );
+        });
+
+        await testContext.test('preserves a native AUTOINCREMENT high-water mark across positional undo', async () => {
+            const createTableSql =
+                'CREATE TABLE native_column_restore_sequence (' +
+                'id INTEGER PRIMARY KEY AUTOINCREMENT, removed TEXT, tail TEXT)';
+            await engine.executeQuery(createTableSql);
+            await engine.executeQuery(
+                "INSERT INTO native_column_restore_sequence(id, removed, tail) VALUES " +
+                "(1, 'one', 'tail-1'), (100, 'retired', 'tail-100')"
+            );
+            await engine.executeQuery('DELETE FROM native_column_restore_sequence WHERE id = 100');
+            const removedData = (await engine.executeQuery(
+                'SELECT rowid AS grid_rowid, removed FROM native_column_restore_sequence'
+            ))[0].rows.map(row => ({ rowId: row[0] as number, value: row[1] }));
+
+            await engine.deleteColumns('native_column_restore_sequence', ['removed']);
+            const afterTableSql = (await engine.executeQuery(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' " +
+                "AND name = 'native_column_restore_sequence'"
+            ))[0].rows[0][0] as string;
+            await engine.undoModification({
+                modificationType: 'column_drop',
+                targetTable: 'native_column_restore_sequence',
+                description: 'Restore native AUTOINCREMENT middle column',
+                deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+                columnDropSnapshot: {
+                    before: {
+                        tableSql: createTableSql,
+                        columns: ['id', 'removed', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: []
+                    },
+                    after: {
+                        tableSql: afterTableSql,
+                        columns: ['id', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: []
+                    }
+                }
+            } as any);
+
+            assert.strictEqual(
+                (await engine.executeQuery(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'native_column_restore_sequence'"
+                ))[0].rows[0][0],
+                100
+            );
+            await engine.executeQuery(
+                "INSERT INTO native_column_restore_sequence(removed, tail) " +
+                "VALUES ('next', 'tail-next')"
+            );
+            assert.strictEqual(
+                (await engine.executeQuery(
+                    "SELECT id FROM native_column_restore_sequence WHERE tail = 'tail-next'"
+                ))[0].rows[0][0],
+                101
             );
         });
 

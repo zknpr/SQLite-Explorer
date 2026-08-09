@@ -16,9 +16,11 @@
  * identity.
  *
  * Soundness model (within one webview session):
- * - Webview row inserts/deletes adjust the UNFILTERED identity by their known
- *   delta and drop the table's filtered identities — a mutation's effect on a
- *   filtered count is unknowable webview-side.
+ * - VS Code webview row inserts/deletes adjust the UNFILTERED identity by their
+ *   known delta and drop the table's filtered identities — a mutation's effect
+ *   on a filtered count is unknowable webview-side. The demo drops every
+ *   identity because it has no refresh echo and uploaded triggers can ignore a
+ *   mutation or change cardinality by more than the requested row count.
  * - VS Code webview cell edits keep the unfiltered identity and drop the
  *   filtered ones; the host's post-edit refreshContent echo invalidates any
  *   trigger/cascade side effects. The demo has no echo, so it also drops the
@@ -44,8 +46,9 @@
  * equally stale until a reload and every reload path invalidates — the cache
  * adds no new staleness class there. A self-referential trigger or cascade
  * that inserts/deletes EXTRA rows in the mutated table itself skews a known
- * insert/delete delta until the next invalidation; in VS Code the post-edit
- * refreshContent echo corrects it almost immediately.
+ * insert/delete delta until the next invalidation in VS Code; its post-edit
+ * refreshContent echo corrects it almost immediately. Demo row mutations
+ * never retain that delta.
  */
 
 const UNFILTERED_SUB_KEY = '';
@@ -156,7 +159,7 @@ export function noteRowCountChanged(table, delta) {
     // affected rows each filter matches is unknowable here — so filtered
     // identities are dropped rather than adjusted.
     tableCounts.clear();
-    if (unfiltered !== undefined) {
+    if (!demoMode && unfiltered !== undefined) {
         tableCounts.set(UNFILTERED_SUB_KEY, Math.max(0, unfiltered + delta));
     }
 }

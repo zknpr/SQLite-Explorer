@@ -54,6 +54,12 @@ interface ViewDocumentMetadata {
     size?: number;
 }
 
+interface CellDocumentTarget {
+    uri: vsc.Uri;
+    table: string;
+    rowId: RecordId;
+}
+
 function getViewDefinitionErrorDetail(error: unknown): string {
     const rawMessage = error instanceof Error ? error.message : String(error);
     const sqliteMessage = rawMessage
@@ -75,13 +81,13 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
      */
     private readonly cellDocumentTargets = new WeakMap<
         DatabaseDocument,
-        Map<string, RecordId>
+        Map<string, CellDocumentTarget>
     >();
     private readonly viewDocumentMetadata = new Map<
         DatabaseDocument,
         Map<string, ViewDocumentMetadata>
     >();
-    private readonly viewDocumentDisposals = new Map<DatabaseDocument, vsc.Disposable>();
+    private readonly documentDisposals = new Map<DatabaseDocument, vsc.Disposable>();
 
     constructor() {
         this.onDidChangeFile = this._emitter.event;
@@ -223,7 +229,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             }
 
             const colName = column;
-            const targetRowId = this.getCellDocumentTarget(document, uri, rowId);
+            const targetRowId = this.getCellDocumentTarget(document, uri, table, rowId);
             let rowPredicate: ReturnType<typeof buildRecordIdentityPredicate>;
             try {
                 if (isPrimaryKeyRecordId(targetRowId)) {
@@ -402,7 +408,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         }
 
         try {
-            const targetRowId = this.getCellDocumentTarget(document, uri, rowId);
+            const targetRowId = this.getCellDocumentTarget(document, uri, table, rowId);
             let validatedRowId: RecordId;
             let rowPredicate: ReturnType<typeof buildRecordIdentityPredicate>;
             try {
@@ -469,7 +475,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                         );
                         const newTargetRowId = updatedRowId ?? validatedRowId;
                         if (isPrimaryKeyRecordId(validatedRowId)) {
-                            this.setCellDocumentTarget(document, uri, newTargetRowId);
+                            this.setCellDocumentTarget(document, uri, table, newTargetRowId);
                         }
                         // Future file-backed undo would attach its checksummed
                         // snapshot here and replace this forward-only policy.
@@ -540,7 +546,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 }
                 const newTargetRowId = updatedRowId ?? validatedRowId;
                 if (isPrimaryKeyRecordId(validatedRowId)) {
-                    this.setCellDocumentTarget(document, uri, newTargetRowId);
+                    this.setCellDocumentTarget(document, uri, table, newTargetRowId);
                 }
 
                 document.recordExternalModification({
@@ -577,23 +583,32 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     private getCellDocumentTarget(
         document: DatabaseDocument,
         uri: vsc.Uri,
+        table: string,
         uriRowId: string
     ): RecordId {
         if (!isPrimaryKeyRecordId(uriRowId)) return uriRowId;
-        return this.cellDocumentTargets.get(document)?.get(uri.toString()) ?? uriRowId;
+        const existing = this.cellDocumentTargets.get(document)?.get(uri.toString());
+        if (existing) return existing.rowId;
+        // readFile is the point at which VS Code has opened this immutable URI.
+        // Track its initial identity too, so grid-originated PK edits and their
+        // history replay can retarget it even before this editor writes.
+        this.setCellDocumentTarget(document, uri, table, uriRowId);
+        return uriRowId;
     }
 
     private setCellDocumentTarget(
         document: DatabaseDocument,
         uri: vsc.Uri,
+        table: string,
         rowId: RecordId
     ): void {
+        this.ensureDocumentTracking(document);
         let targets = this.cellDocumentTargets.get(document);
         if (!targets) {
-            targets = new Map<string, RecordId>();
+            targets = new Map<string, CellDocumentTarget>();
             this.cellDocumentTargets.set(document, targets);
         }
-        targets.set(uri.toString(), rowId);
+        targets.set(uri.toString(), { uri, table, rowId });
     }
 
     private isLogicalDirectory(uri: vsc.Uri): boolean {
@@ -653,24 +668,8 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         if (!documentMetadata) {
             documentMetadata = new Map();
             this.viewDocumentMetadata.set(document, documentMetadata);
-
-            const contentChangeSubscription = document.onDidChangeContent(change => {
-                this.handleDocumentContentChange(document, change);
-            });
-            let disposeSubscription: vsc.Disposable = { dispose() {} };
-            const combinedSubscription: vsc.Disposable = {
-                dispose: () => {
-                    contentChangeSubscription.dispose();
-                    disposeSubscription.dispose();
-                }
-            };
-            disposeSubscription = document.onDidDispose(() => {
-                this.viewDocumentMetadata.delete(document);
-                this.viewDocumentDisposals.delete(document);
-                combinedSubscription.dispose();
-            });
-            this.viewDocumentDisposals.set(document, combinedSubscription);
         }
+        this.ensureDocumentTracking(document);
 
         const key = uri.toString();
         let metadata = documentMetadata.get(key);
@@ -686,6 +685,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         document: DatabaseDocument,
         change: DocumentContentChange
     ): void {
+        this.retargetCellDocuments(document, change);
         const documentMetadata = this.viewDocumentMetadata.get(document);
         if (!documentMetadata) return;
 
@@ -718,6 +718,80 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 type: fileChangeType,
                 uri: metadata.uri
             });
+        }
+        if (changes.length > 0) this._emitter.fire(changes);
+    }
+
+    private ensureDocumentTracking(document: DatabaseDocument): void {
+        if (this.documentDisposals.has(document)) return;
+
+        const contentChangeSubscription = document.onDidChangeContent(change => {
+            this.handleDocumentContentChange(document, change);
+        });
+        let disposeSubscription: vsc.Disposable = { dispose() {} };
+        const combinedSubscription: vsc.Disposable = {
+            dispose: () => {
+                contentChangeSubscription.dispose();
+                disposeSubscription.dispose();
+            }
+        };
+        disposeSubscription = document.onDidDispose(() => {
+            this.cellDocumentTargets.delete(document);
+            this.viewDocumentMetadata.delete(document);
+            this.documentDisposals.delete(document);
+            combinedSubscription.dispose();
+        });
+        this.documentDisposals.set(document, combinedSubscription);
+    }
+
+    private retargetCellDocuments(
+        document: DatabaseDocument,
+        change: DocumentContentChange
+    ): void {
+        const targets = this.cellDocumentTargets.get(document);
+        const modification = change.modification;
+        if (
+            !targets
+            || !modification
+            || modification.modificationType !== 'cell_update'
+            || !modification.targetTable
+        ) {
+            return;
+        }
+
+        const direction = change.modificationDirection ?? 'forward';
+        const identityPairs: Array<{ before: RecordId; after: RecordId }> = [];
+        if (
+            modification.targetRowId !== undefined
+            && modification.newTargetRowId !== undefined
+        ) {
+            identityPairs.push({
+                before: modification.targetRowId,
+                after: modification.newTargetRowId
+            });
+        }
+        for (const cell of modification.affectedCells ?? []) {
+            if (cell.newRowId !== undefined) {
+                identityPairs.push({ before: cell.rowId, after: cell.newRowId });
+            }
+        }
+        if (identityPairs.length === 0) return;
+
+        const changes: vsc.FileChangeEvent[] = [];
+        for (const target of targets.values()) {
+            if (target.table !== modification.targetTable) continue;
+            const pair = identityPairs.find(candidate => {
+                const source = direction === 'undo' ? candidate.after : candidate.before;
+                return isPrimaryKeyRecordId(source)
+                    && isPrimaryKeyRecordId(target.rowId)
+                    && source === target.rowId;
+            });
+            if (!pair) continue;
+            const replacement = direction === 'undo' ? pair.before : pair.after;
+            if (!isPrimaryKeyRecordId(replacement)) continue;
+            if (replacement === target.rowId) continue;
+            target.rowId = replacement;
+            changes.push({ type: vsc.FileChangeType.Changed, uri: target.uri });
         }
         if (changes.length > 0) this._emitter.fire(changes);
     }

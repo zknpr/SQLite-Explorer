@@ -17,6 +17,7 @@ import { CellValue, DatabaseOperations, ExportOptions } from '../../src/core/typ
 import { mockVscode } from './mocks/vscode';
 import { DocumentRegistry } from '../../src/documentRegistry';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+import { serializeOperations } from '../../src/core/operation-serializer';
 
 async function collectStreamingExport(
     operations: DatabaseOperations,
@@ -751,6 +752,70 @@ describe('streamTableExport cell boundaries', () => {
                     'one exported row combined a streamed identity value with another row\'s inline value'
                 );
             }
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('keeps an oversized cell bound to the row-query snapshot across a same-length replacement', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        const oldPayload = 'old|'.padEnd(64 * 1024 + 1, 'a');
+        const newPayload = 'new|'.padEnd(oldPayload.length, 'b');
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_cell_snapshot (id INTEGER PRIMARY KEY, payload TEXT, tag TEXT)'
+        );
+        await operations.executeQuery(
+            'INSERT INTO stage_e_cell_snapshot VALUES (1, ?, ?)',
+            [oldPayload, 'old-row']
+        );
+
+        let mutationQueued = false;
+        let mutation: Promise<unknown> | undefined;
+        let serialized!: DatabaseOperations;
+        const racingOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'executeQuery') {
+                    return async (...args: Parameters<DatabaseOperations['executeQuery']>) => {
+                        const result = await target.executeQuery(...args);
+                        const sql = String(args[0]);
+                        if (
+                            !mutationQueued &&
+                            sql.includes('FROM "stage_e_cell_snapshot"') &&
+                            sql.includes('__export_type_0')
+                        ) {
+                            mutationQueued = true;
+                            // Queue through the public facade while the projection is
+                            // returning. Without an export-wide lease this write wins
+                            // the race to openCellReadSession and produces a hybrid row.
+                            mutation = serialized.executeQuery(
+                                'UPDATE stage_e_cell_snapshot SET payload = ?, tag = ? WHERE id = 1',
+                                [newPayload, 'new-row']
+                            );
+                        }
+                        return result;
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+        serialized = serializeOperations(racingOperations);
+
+        try {
+            const exported = await collectStreamingExport(
+                serialized,
+                'stage_e_cell_snapshot',
+                ['payload', 'tag'],
+                { format: 'csv' }
+            );
+            assert.strictEqual(mutationQueued, true);
+            assert.strictEqual(exported.content, `payload,tag\n${oldPayload},old-row`);
+            await mutation;
         } finally {
             (operations as WasmDatabaseEngine).shutdown();
         }

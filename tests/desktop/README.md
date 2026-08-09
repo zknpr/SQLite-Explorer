@@ -19,5 +19,8 @@ coverage with webview message injection.
 
 The `sqliteExplorer.fileOperations` setting controls blob-inspector I/O (`native` or
 `web`); it does not select a database backend. The desktop test API therefore forces
-`native` or `wasm` without changing the shipped setting contract. Backend-specific rows
-are labeled directly in their test names rather than silently skipped.
+`native` or `wasm` without changing the shipped setting contract. The same test-only
+bridge can lower the internal WASM paging threshold so compact fixtures exercise both
+storage paths without repurposing the user-facing `maxFileSize` refusal cap.
+Backend-specific rows are labeled directly in their test names rather than silently
+skipped.
