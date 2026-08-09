@@ -34,7 +34,8 @@ import type {
   CellReadTarget,
   CellTextEncoding,
   OversizedCellMetadata,
-  DatabaseWriteResult
+  DatabaseWriteResult,
+  ColumnDropTableState
 } from '../../types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from '../../sql-utils';
 import { crypto } from '../../../platform/cryptoShim';
@@ -116,7 +117,13 @@ import {
   OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE,
   OversizedCellReplacementRequiredError
 } from '../../cell-edit-policy';
-import { executeSchemaPreservingColumnDrop } from '../../column-drop';
+import {
+  assertColumnDropTableStateCurrent,
+  buildColumnDropRestorePlan,
+  COLUMN_DROP_TABLE_STATE_SQL,
+  executeSchemaPreservingColumnDrop,
+  mapColumnDropTableState
+} from '../../column-drop';
 import {
   normalizePagedWritableOverlay,
   shouldWarnForPagedOverlayCopy,
@@ -1111,71 +1118,176 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   private async undoColumnDrop(targetTable: string, mod: ModificationEntry): Promise<void> {
-    const { deletedColumns } = mod;
+    const { deletedColumns, columnDropSnapshot } = mod;
     // Undo drop column = add column + restore values
-    if (deletedColumns) {
-      await this.executeQuery('BEGIN TRANSACTION');
-      try {
-        // Optimize column creation by batching all ADD COLUMN statements into a single executeQuery call.
-        // This avoids N+1 query transaction overhead for multiple columns.
-        const addColumnStatements = deletedColumns.map(col => {
-          validateSqlType(col.type);
-          return `ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(col.name)} ${col.type};`;
-        }).join('\n');
+    if (!deletedColumns || deletedColumns.length === 0) return;
+    if (!columnDropSnapshot) {
+      await this.undoLegacyColumnDrop(targetTable, deletedColumns);
+      return;
+    }
 
-        if (addColumnStatements) {
-          await this.executeQuery(addColumnStatements);
-        }
-
-        // Optimize restoration by grouping rows that have identical column sets
-        // This is done effectively by doing one UPDATE per row for all restored columns
-        // e.g. UPDATE table SET col1 = ?, col2 = ? WHERE rowid = ?
-
-        // First, transform the data into a row-centric map
-        // Keyed by Map, not by object literal: a column may legally be named
-        // "__proto__", where assignment hits the legacy prototype accessor and
-        // reads back as Object.prototype instead of the stored cell value.
-        const rowUpdates = new Map<RecordId, Map<string, CellValue | null>>();
-        for (const col of deletedColumns) {
-          for (const cell of col.data) {
-            const rId = validateRowId(cell.rowId);
-            let rowObj = rowUpdates.get(rId);
-            if (!rowObj) {
-              rowObj = new Map();
-              rowUpdates.set(rId, rowObj);
-            }
-            rowObj.set(col.name, cell.value ?? null);
-          }
-        }
-
-        if (rowUpdates.size > 0) {
-          const statements = new Map<string, WasmPreparedStatement>();
-          try {
-            for (const [rId, rowObj] of rowUpdates.entries()) {
-              const params: CellValue[] = deletedColumns.map(c => rowObj.get(c.name) ?? null);
-              const setClause = deletedColumns.map((column, index) => (
-                `${escapeIdentifier(column.name)} = ${wasmBindPlaceholder(params[index])}`
-              )).join(', ');
-              const sql =
-                `UPDATE ${escapeIdentifier(targetTable)} SET ${setClause} WHERE rowid = ?`;
-              let stmt = statements.get(sql);
-              if (!stmt) {
-                stmt = this.instance.prepare(sql);
-                statements.set(sql, stmt);
-              }
-              params.push(rId);
-              stmt.run(normalizeWasmBindParams(params));
-            }
-          } finally {
-            for (const stmt of statements.values()) stmt.free();
-          }
-        }
-
-        await this.executeQuery('COMMIT');
-      } catch (e) {
-        await this.safeRollback('undoColumnDrop');
-        throw e;
+    const stagingTable = `__sqlite_explorer_column_restore_${crypto.randomUUID().replace(/-/g, '')}`;
+    const plan = buildColumnDropRestorePlan(
+      targetTable,
+      stagingTable,
+      deletedColumns,
+      columnDropSnapshot
+    );
+    const readPragma = async (pragma: 'foreign_keys' | 'legacy_alter_table'): Promise<number> => {
+      const result = await this.executeQuery(`PRAGMA ${pragma}`);
+      const value = Number(result[0]?.rows[0]?.[0]);
+      if (value !== 0 && value !== 1) {
+        throw new Error(`SQLite returned an invalid ${pragma} value`);
       }
+      return value;
+    };
+    const setPragma = async (
+      pragma: 'foreign_keys' | 'legacy_alter_table',
+      value: number
+    ): Promise<void> => {
+      await this.executeQuery(`PRAGMA ${pragma} = ${value ? 'ON' : 'OFF'}`);
+      if (await readPragma(pragma) !== value) {
+        throw new Error(`Unable to set PRAGMA ${pragma} for column-drop undo`);
+      }
+    };
+
+    const foreignKeysBefore = await readPragma('foreign_keys');
+    const legacyAlterBefore = await readPragma('legacy_alter_table');
+    let transactionStarted = false;
+    let operationError: unknown;
+    try {
+      if (foreignKeysBefore !== 0) await setPragma('foreign_keys', 0);
+      if (legacyAlterBefore !== 1) await setPragma('legacy_alter_table', 1);
+
+      await this.executeQuery('BEGIN TRANSACTION');
+      transactionStarted = true;
+      const current = await this.readColumnDropTableState(targetTable);
+      assertColumnDropTableStateCurrent(targetTable, columnDropSnapshot.after, current);
+      const collision = await this.executeQuery(
+        'SELECT 1 FROM sqlite_schema WHERE name = ? COLLATE NOCASE LIMIT 1',
+        [stagingTable]
+      );
+      if ((collision[0]?.rows.length ?? 0) !== 0) {
+        throw new Error(`Column-drop staging table already exists: ${stagingTable}`);
+      }
+
+      for (const sql of plan.stageColumns) await this.executeQuery(sql);
+      await this.restoreDroppedColumnValues(
+        targetTable,
+        deletedColumns,
+        columnDropSnapshot.before.identity
+      );
+      for (const sql of plan.dropCurrentSchemaObjects) await this.executeQuery(sql);
+      await this.executeQuery(plan.renameCurrentTable);
+      this.runSingleStatement(plan.createOriginalTable);
+      await this.executeQuery(plan.copyRows);
+      await this.executeQuery(plan.dropStagingTable);
+      for (const sql of plan.restoreSchemaObjects) this.runSingleStatement(sql);
+
+      const restored = await this.readColumnDropTableState(targetTable);
+      assertColumnDropTableStateCurrent(targetTable, columnDropSnapshot.before, restored);
+      const foreignKeyCheck = await this.executeQuery('PRAGMA foreign_key_check');
+      if ((foreignKeyCheck[0]?.rows.length ?? 0) !== 0) {
+        throw new Error(`Foreign-key check failed while undoing column drop on ${targetTable}`);
+      }
+      await this.executeQuery('COMMIT');
+      transactionStarted = false;
+    } catch (error) {
+      operationError = error;
+      if (transactionStarted) await this.safeRollback('undoColumnDrop');
+    }
+
+    let pragmaRestoreError: unknown;
+    try {
+      if (legacyAlterBefore !== 1) await setPragma('legacy_alter_table', legacyAlterBefore);
+      if (foreignKeysBefore !== 0) await setPragma('foreign_keys', foreignKeysBefore);
+    } catch (error) {
+      pragmaRestoreError = error;
+    }
+    if (operationError !== undefined) {
+      if (pragmaRestoreError !== undefined) {
+        throw new Error(
+          `Column-drop undo failed and connection PRAGMAs could not be restored: ${String(pragmaRestoreError)}`,
+          { cause: operationError }
+        );
+      }
+      throw operationError;
+    }
+    if (pragmaRestoreError !== undefined) throw pragmaRestoreError;
+  }
+
+  /** Map the current catalog state while the undo transaction holds its schema snapshot. */
+  private async readColumnDropTableState(table: string): Promise<ColumnDropTableState> {
+    const [schema, columns, identity] = await Promise.all([
+      this.executeQuery(COLUMN_DROP_TABLE_STATE_SQL, [table, table]),
+      this.getTableInfo(table),
+      this.resolveTableIdentity(table)
+    ]);
+    return mapColumnDropTableState(
+      table,
+      columns.map(column => column.identifier),
+      identity,
+      schema[0]?.rows ?? []
+    );
+  }
+
+  /** Stage recorded values before rebuilding the table from its exact original DDL. */
+  private async restoreDroppedColumnValues(
+    table: string,
+    deletedColumns: NonNullable<ModificationEntry['deletedColumns']>,
+    identity: TableIdentity
+  ): Promise<void> {
+    const rowUpdates = new Map<RecordId, Map<string, CellValue | null>>();
+    for (const column of deletedColumns) {
+      for (const cell of column.data) {
+        const rowId = identity.kind === 'rowid'
+          ? validateRowId(cell.rowId)
+          : cell.rowId;
+        const values = rowUpdates.get(rowId) ?? new Map<string, CellValue | null>();
+        values.set(column.name, cell.value ?? null);
+        rowUpdates.set(rowId, values);
+      }
+    }
+
+    const statements = new Map<string, WasmPreparedStatement>();
+    try {
+      for (const [rowId, values] of rowUpdates) {
+        const params: CellValue[] = deletedColumns.map(column => values.get(column.name) ?? null);
+        const setClause = deletedColumns.map((column, index) => (
+          `${escapeIdentifier(column.name)} = ${wasmBindPlaceholder(params[index])}`
+        )).join(', ');
+        const predicate = buildRecordIdentityPredicate(rowId, identity);
+        const sql =
+          `UPDATE ${escapeIdentifier(table)} SET ${setClause} WHERE ${predicate.sql}`;
+        let statement = statements.get(sql);
+        if (!statement) {
+          statement = this.instance.prepare(sql);
+          statements.set(sql, statement);
+        }
+        statement.run(normalizeWasmBindParams([...params, ...predicate.params]));
+      }
+    } finally {
+      for (const statement of statements.values()) statement.free();
+    }
+  }
+
+  /** Replay older history entries that predate exact schema snapshots. */
+  private async undoLegacyColumnDrop(
+    targetTable: string,
+    deletedColumns: NonNullable<ModificationEntry['deletedColumns']>
+  ): Promise<void> {
+    await this.executeQuery('BEGIN TRANSACTION');
+    try {
+      const addColumnStatements = deletedColumns.map(column => {
+        validateSqlType(column.type);
+        return `ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(column.name)} ${column.type};`;
+      }).join('\n');
+      if (addColumnStatements) await this.executeQuery(addColumnStatements);
+      await this.restoreDroppedColumnValues(targetTable, deletedColumns, { kind: 'rowid' });
+      await this.executeQuery('COMMIT');
+    } catch (error) {
+      await this.safeRollback('undoColumnDrop legacy');
+      throw error;
     }
   }
 

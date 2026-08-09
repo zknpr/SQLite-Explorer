@@ -1467,8 +1467,24 @@ describe('HostBridge', () => {
         const rowsStarted = createDeferred<void>();
         const dbOps = {
             findDependentIndexes: mock.fn(async () => []),
-            getTableInfo: mock.fn(async () => [{ identifier: 'payload', declaredType: 'BLOB' }]),
-            executeQuery: mock.fn(async () => {
+            getTableInfo: mock.fn(async () => [{
+                ordinal: 0,
+                identifier: 'payload',
+                declaredType: 'BLOB',
+                isRequired: 0,
+                defaultExpression: null,
+                primaryKeyPosition: 0
+            }]),
+            executeQuery: mock.fn(async (sql: string) => {
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
+                }
+                if (sql.includes('sqlite_schema')) {
+                    return [{
+                        headers: ['type', 'name', 'sql'],
+                        rows: [['table', 'items', 'CREATE TABLE items (payload BLOB)']]
+                    }];
+                }
                 rowsStarted.resolve();
                 return rows.promise;
             }),
@@ -1496,17 +1512,53 @@ describe('HostBridge', () => {
     });
 
     it('canonicalizes rowids captured for column-drop history', async () => {
+        const beforeColumns = [
+            {
+                ordinal: 0,
+                identifier: 'id',
+                declaredType: 'INTEGER',
+                isRequired: 0,
+                defaultExpression: null,
+                primaryKeyPosition: 1
+            },
+            {
+                ordinal: 1,
+                identifier: 'payload',
+                declaredType: '',
+                isRequired: 0,
+                defaultExpression: null,
+                primaryKeyPosition: 0
+            }
+        ];
+        let dropped = false;
         const dbOps = {
             findDependentIndexes: mock.fn(async () => []),
-            getTableInfo: mock.fn(async () => [{ identifier: 'payload', declaredType: 'TEXT' }]),
-            executeQuery: mock.fn(async () => [{
-                headers: ['rowid', 'payload'],
-                rows: [
-                    ['7', 'safe'],
-                    ['9007199254740993', 'unsafe']
-                ]
-            }]),
-            deleteColumns: mock.fn(async () => {})
+            getTableInfo: mock.fn(async () => dropped ? [beforeColumns[0]] : beforeColumns),
+            executeQuery: mock.fn(async (sql: string) => {
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
+                }
+                if (sql.includes('sqlite_schema')) {
+                    return [{
+                        headers: ['type', 'name', 'sql'],
+                        rows: [[
+                            'table',
+                            'items',
+                            dropped
+                                ? 'CREATE TABLE items (id INTEGER PRIMARY KEY)'
+                                : 'CREATE TABLE items (id INTEGER PRIMARY KEY, payload)'
+                        ]]
+                    }];
+                }
+                return [{
+                    headers: ['rowid', 'payload'],
+                    rows: [
+                        ['7', 'safe'],
+                        ['9007199254740993', 'unsafe']
+                    ]
+                }];
+            }),
+            deleteColumns: mock.fn(async () => { dropped = true; })
         };
         const recordExternalModification = mock.fn();
         const mockDocument = {
@@ -1525,10 +1577,98 @@ describe('HostBridge', () => {
         await bridge.deleteColumns('items', ['payload']);
 
         const modification = recordExternalModification.mock.calls[0].arguments[0] as any;
+        assert.strictEqual(modification.deletedColumns[0].type, '');
         assert.deepStrictEqual(modification.deletedColumns[0].data, [
             { rowId: 7, value: 'safe' },
             { rowId: '9007199254740993', value: 'unsafe' }
         ]);
+    });
+
+    it('records exact pre-drop and post-drop table state for positional undo', async () => {
+        const beforeSql =
+            'CREATE TABLE items (id INTEGER PRIMARY KEY, payload TEXT NOT NULL, tail TEXT)';
+        const afterSql =
+            'CREATE TABLE items (id INTEGER PRIMARY KEY, tail TEXT)';
+        let dropped = false;
+        const beforeColumns = [
+            {
+                ordinal: 0,
+                identifier: 'id',
+                declaredType: 'INTEGER',
+                isRequired: 0,
+                defaultExpression: null,
+                primaryKeyPosition: 1
+            },
+            {
+                ordinal: 1,
+                identifier: 'payload',
+                declaredType: 'TEXT',
+                isRequired: 1,
+                defaultExpression: null,
+                primaryKeyPosition: 0
+            },
+            {
+                ordinal: 2,
+                identifier: 'tail',
+                declaredType: 'TEXT',
+                isRequired: 0,
+                defaultExpression: null,
+                primaryKeyPosition: 0
+            }
+        ];
+        const dbOps = {
+            findDependentIndexes: mock.fn(async () => []),
+            getTableInfo: mock.fn(async () => dropped
+                ? [beforeColumns[0], { ...beforeColumns[2], ordinal: 1 }]
+                : beforeColumns),
+            executeQuery: mock.fn(async (sql: string) => {
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
+                }
+                if (sql.includes('sqlite_schema')) {
+                    return [{
+                        headers: ['type', 'name', 'sql'],
+                        rows: [['table', 'items', dropped ? afterSql : beforeSql]]
+                    }];
+                }
+                return [{
+                    headers: ['rowid', 'payload'],
+                    rows: [[4, 'kept']]
+                }];
+            }),
+            deleteColumns: mock.fn(async () => { dropped = true; })
+        };
+        const recordExternalModification = mock.fn();
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification
+        };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            mockDocument as any
+        );
+
+        await bridge.deleteColumns('items', ['payload']);
+
+        const modification = recordExternalModification.mock.calls[0].arguments[0] as any;
+        assert.deepStrictEqual(modification.columnDropSnapshot, {
+            before: {
+                tableSql: beforeSql,
+                columns: ['id', 'payload', 'tail'],
+                identity: { kind: 'rowid' },
+                schemaObjects: []
+            },
+            after: {
+                tableSql: afterSql,
+                columns: ['id', 'tail'],
+                identity: { kind: 'rowid' },
+                schemaObjects: []
+            }
+        });
     });
 
     it('returns refreshed connection capabilities after reloading from disk', async () => {
@@ -1579,31 +1719,25 @@ describe('HostBridge', () => {
         assert.strictEqual(reloadFromDisk.mock.callCount(), 0);
     });
 
-    it('should catch and log error if fetch columns for undo history fails in deleteColumns', async () => {
-        const consoleWarnMock = mock.method(console, 'warn', () => {});
+    it('propagates a column-history capture failure without dropping the column', async () => {
         const error = new Error('Database disconnected during column info fetch');
         const dbOps = {
             getTableInfo: mock.fn(async () => { throw error; }),
             deleteColumns: mock.fn(async () => {})
         };
+        const recordExternalModification = mock.fn();
         const mockDocument = {
             uri: vscode.Uri.parse('file:///test.db'),
             documentKey: Promise.resolve('test-key'),
-            recordExternalModification: mock.fn(),
+            recordExternalModification,
         };
         const mockProvider = { webviews: new Map(), context: {} };
         const bridge = new HostBridge(mockProvider as any, mockDocument as any);
         (bridge as any).ensureDatabaseInitialized = () => dbOps as any;
 
-        await bridge.deleteColumns('table1', ['col1']);
+        await assert.rejects(bridge.deleteColumns('table1', ['col1']), error);
 
-        assert.strictEqual(consoleWarnMock.mock.callCount(), 1);
-        assert.deepStrictEqual(consoleWarnMock.mock.calls[0].arguments, [
-            'Failed to fetch column data for undo history:',
-            error
-        ]);
-
-        assert.strictEqual(dbOps.deleteColumns.mock.callCount(), 1);
-        assert.deepStrictEqual(dbOps.deleteColumns.mock.calls[0].arguments, ['table1', ['col1'], undefined]);
+        assert.strictEqual(dbOps.deleteColumns.mock.callCount(), 0);
+        assert.strictEqual(recordExternalModification.mock.callCount(), 0);
     });
 });

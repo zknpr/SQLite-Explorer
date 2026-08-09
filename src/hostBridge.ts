@@ -14,17 +14,22 @@ import { ConfigurationSection, ExtensionId, getMaxInlineCellBytes, SidebarLeft, 
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, WebviewQueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, WebviewQueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity, ColumnDropTableState } from './core/types';
 import { prepareCellUpdateForStorage } from './core/json-utils';
 import {
   assertMutableRecordId,
   buildRecordIdentityPredicate,
   classifyTableIdentity,
   decodePrimaryKeyRecordId,
+  encodePrimaryKeyRecordId,
   isPrimaryKeyRecordId,
   primaryKeyColumnsFromTableInfo
 } from './core/row-identity';
 import { escapeIdentifier, validateRowId, validateRowIds } from './core/sql-utils';
+import {
+  COLUMN_DROP_TABLE_STATE_SQL,
+  mapColumnDropTableState
+} from './core/column-drop';
 import { isViewDefinitionConflictError } from './core/view-utils';
 import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './core/cell-containment';
 import { assertDocumentModification } from './core/modification-validation';
@@ -233,7 +238,8 @@ export class HostBridge implements ToastService {
   /** Resolve declared table identity before interpreting an untrusted RecordId. */
   private async resolveTableIdentity(
     dbOps: ReturnType<HostBridge['ensureDatabaseInitialized']>,
-    table: string
+    table: string,
+    knownColumns?: readonly ColumnMetadata[]
   ): Promise<TableIdentity> {
     const metadata = await dbOps.executeQuery(
       `SELECT "type", "wr" FROM pragma_table_list ` +
@@ -246,9 +252,30 @@ export class HostBridge implements ToastService {
     const kind = classifyTableIdentity(metadata[0].rows[0][0], metadata[0].rows[0][1]);
     if (!kind) throw new Error(`Table not found: ${table}`);
     if (kind === 'rowid') return { kind: 'rowid' };
-    const columns = primaryKeyColumnsFromTableInfo(await dbOps.getTableInfo(table));
+    const columns = primaryKeyColumnsFromTableInfo(
+      knownColumns ?? await dbOps.getTableInfo(table)
+    );
     if (columns.length === 0) throw new Error(`WITHOUT ROWID table ${table} has no declared primary key`);
     return { kind: 'primaryKey', columns };
+  }
+
+  /** Capture exact DDL and owned schema objects for guarded column-drop history. */
+  private async captureColumnDropTableState(
+    dbOps: ReturnType<HostBridge['ensureDatabaseInitialized']>,
+    table: string,
+    columns: readonly ColumnMetadata[],
+    identity: TableIdentity
+  ): Promise<ColumnDropTableState> {
+    const result = await dbOps.executeQuery(
+      COLUMN_DROP_TABLE_STATE_SQL,
+      [table, table]
+    );
+    return mapColumnDropTableState(
+      table,
+      columns.map(column => column.identifier),
+      identity,
+      result[0]?.rows ?? []
+    );
   }
 
   /**
@@ -625,54 +652,62 @@ export class HostBridge implements ToastService {
       }
     }
 
-    // Capture column data before deletion for undo
-    let deletedColumnsData: { name: string; type: string; data: { rowId: RecordId; value: CellValue }[] }[] = [];
-    try {
-        // Get column types first
-        const tableInfo = await dbOps.getTableInfo(table);
-        const colMap = new Map(tableInfo.map(c => [c.identifier, c.declaredType]));
-
-        // Fetch data for all columns in a single query to avoid N+1 query overhead
-        if (columns.length > 0) {
-            const escapedCols = columns.map(col => escapeIdentifier(col)).join(', ');
-            const sql =
-                `SELECT CAST(rowid AS TEXT) AS rowid, ${escapedCols} ` +
-                `FROM ${escapeIdentifier(table)}`;
-            const result = await dbOps.executeQuery(sql);
-
-            if (result && result.length > 0 && result[0].rows) {
-                const rows = result[0].rows;
-                const colsData = columns.map(() => [] as { rowId: RecordId; value: CellValue }[]);
-
-                for (const r of rows) {
-                    const rowId = validateRowId(r[0] as RecordId);
-                    for (let i = 0; i < columns.length; i++) {
-                        colsData[i].push({ rowId, value: r[i + 1] });
-                    }
-                }
-
-                for (let i = 0; i < columns.length; i++) {
-                    deletedColumnsData.push({
-                        name: columns[i],
-                        type: colMap.get(columns[i]) || 'TEXT',
-                        data: colsData[i]
-                    });
-                }
-            } else {
-                // Empty table or no results, still track the column definition
-                for (const col of columns) {
-                    deletedColumnsData.push({
-                        name: col,
-                        type: colMap.get(col) || 'TEXT',
-                        data: []
-                    });
-                }
-            }
-        }
-    } catch (e) {
-        console.warn('Failed to fetch column data for undo history:', e);
-        // Proceed with deletion even if history capture fails, but warn
+    // Capture the exact schema and values before deletion. If this fails, do not
+    // perform an operation whose undo record would already be incomplete.
+    const tableInfoBefore = await dbOps.getTableInfo(table);
+    const identityBefore = await this.resolveTableIdentity(dbOps, table, tableInfoBefore);
+    const stateBefore = await this.captureColumnDropTableState(
+      dbOps,
+      table,
+      tableInfoBefore,
+      identityBefore
+    );
+    const colMap = new Map(tableInfoBefore.map(column => [
+      column.identifier,
+      // An empty declared type is meaningful in SQLite: staging it as TEXT
+      // would apply affinity and could change restored INTEGER/BLOB values.
+      column.declaredType
+    ]));
+    for (const column of columns) {
+      if (!colMap.has(column)) {
+        throw new Error(`Column not found in ${table}: ${column}`);
+      }
     }
+
+    const colsData = columns.map(() => [] as { rowId: RecordId; value: CellValue }[]);
+    if (columns.length > 0) {
+      const identityColumns = identityBefore.kind === 'primaryKey'
+        ? identityBefore.columns.map(column => column.identifier)
+        : [];
+      const identityProjection = identityBefore.kind === 'rowid'
+        ? ['CAST(rowid AS TEXT)']
+        : identityColumns.map(escapeIdentifier);
+      const valueProjection = columns.map(escapeIdentifier);
+      const result = await dbOps.executeQuery(
+        `SELECT ${[...identityProjection, ...valueProjection].join(', ')} ` +
+        `FROM ${escapeIdentifier(table)}`
+      );
+      const identityWidth = identityBefore.kind === 'rowid' ? 1 : identityColumns.length;
+      for (const row of result[0]?.rows ?? []) {
+        const rowId = identityBefore.kind === 'rowid'
+          ? validateRowId(row[0] as RecordId)
+          : encodePrimaryKeyRecordId(
+              identityBefore.columns,
+              row.slice(0, identityWidth)
+            );
+        for (let index = 0; index < columns.length; index++) {
+          colsData[index].push({
+            rowId,
+            value: row[identityWidth + index]
+          });
+        }
+      }
+    }
+    const deletedColumnsData = columns.map((column, index) => ({
+      name: column,
+      type: colMap.get(column)!,
+      data: colsData[index]
+    }));
 
     this.assertConnectionGeneration(connectionGeneration);
     if ('deleteColumns' in dbOps) {
@@ -682,6 +717,15 @@ export class HostBridge implements ToastService {
       throw new Error("Backend does not support deleteColumns");
     }
 
+    const tableInfoAfter = await dbOps.getTableInfo(table);
+    const identityAfter = await this.resolveTableIdentity(dbOps, table, tableInfoAfter);
+    const stateAfter = await this.captureColumnDropTableState(
+      dbOps,
+      table,
+      tableInfoAfter,
+      identityAfter
+    );
+
     // Fire edit event
     this.document.recordExternalModification({
       label: 'Delete Columns',
@@ -689,6 +733,7 @@ export class HostBridge implements ToastService {
       modificationType: 'column_drop',
       targetTable: table,
       deletedColumns: deletedColumnsData,
+      columnDropSnapshot: { before: stateBefore, after: stateAfter },
       droppedIndexes: dependentIndexes.length > 0 ? dependentIndexes : undefined
     });
   }

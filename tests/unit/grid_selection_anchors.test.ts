@@ -365,13 +365,22 @@ describe('grid selection anchors', () => {
         }
     });
 
-    it('keeps the post-apply batch selection rebuild working across the reload', async () => {
-        // applyBatchUpdate deliberately clears selectedCells, reloads, then
-        // rebuilds the selection by row identity and column NAME. Clearing
-        // inside loadTableData must not break that reconciliation.
+    it('clears the cell and column-header selection after applying a batch update', async () => {
         installDocumentStub({
             batchInputs: [{ value: 'updated', dataset: { colidx: '1' } }]
         });
+        const selectedHeader = { classList: makeClassListStub() };
+        selectedHeader.classList.add('column-selected');
+        const documentStub = (globalThis as any).document;
+        const originalQuerySelectorAll = documentStub.querySelectorAll;
+        documentStub.querySelectorAll = (selector: string) => {
+            if (selector === '.header-cell.column-selected') return [selectedHeader];
+            return originalQuerySelectorAll(selector);
+        };
+        documentStub.querySelector = (selector: string) => (
+            selector === '.header-cell[data-column="value"]' ? selectedHeader : null
+        );
+        (globalThis as any).CSS = { escape: (value: string) => value };
         const { state } = await import(stateModulePath);
         const { backendApi } = await import(apiModulePath);
         const { applyBatchUpdate } = await import(sidebarModulePath);
@@ -406,6 +415,7 @@ describe('grid selection anchors', () => {
         state.filterQuery = '';
         state.editingCellInfo = null;
         state.selectedCells = [{ rowIdx: 0, colIdx: 1, rowId: 7, value: 'old' }];
+        state.selectedColumns.add('value');
 
         try {
             await applyBatchUpdate();
@@ -416,10 +426,10 @@ describe('grid selection anchors', () => {
                 originalValue: 'old',
                 operation: 'set'
             }]);
-            assert.deepStrictEqual(state.selectedCells, [
-                { rowIdx: 1, colIdx: 1, rowId: 7, value: 'updated' }
-            ]);
-            assert.deepStrictEqual(state.lastSelectedCell, { rowIdx: 1, colIdx: 1 });
+            assert.deepStrictEqual(state.selectedCells, []);
+            assert.deepStrictEqual([...state.selectedColumns], []);
+            assert.strictEqual(state.lastSelectedCell, null);
+            assert.strictEqual(selectedHeader.classList.contains('column-selected'), false);
             // The catch path reports through the status line; requiring the
             // success message proves the flow did not silently fail mid-way.
             assert.strictEqual(

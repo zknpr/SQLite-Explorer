@@ -301,6 +301,28 @@ export type ModificationType =
  */
 export type CellUpdateOperation = 'set' | 'json_patch';
 
+/** One persistent schema object attached to a table and recreated by column-drop undo. */
+export interface ColumnDropSchemaObject {
+  type: 'index' | 'trigger';
+  identifier: string;
+  sql: string;
+}
+
+/** Exact table state on one side of a guarded column-drop history transition. */
+export interface ColumnDropTableState {
+  tableSql: string;
+  /** Insertable columns in their SQLite ordinal order. */
+  columns: string[];
+  identity: TableIdentity;
+  schemaObjects: ColumnDropSchemaObject[];
+}
+
+/** Pre/post schema pair required to rebuild a dropped column in its original position. */
+export interface ColumnDropSnapshot {
+  before: ColumnDropTableState;
+  after: ColumnDropTableState;
+}
+
 /**
  * Record of a single database modification for undo/redo.
  */
@@ -359,6 +381,8 @@ export interface ModificationEntry {
       type: string;
       data: { rowId: RecordId; value: CellValue }[];
   }[];
+  /** Exact guarded schema transition for positional column-drop undo. */
+  columnDropSnapshot?: ColumnDropSnapshot;
   /** Indexes dropped before a column_drop; missing values from older backups mean none. */
   droppedIndexes?: string[];
   /** View definition before an edit/drop. */

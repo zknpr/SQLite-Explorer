@@ -1183,6 +1183,239 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             );
         });
 
+        await testContext.test('restores a deleted native row to its deterministic grid position', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_row_ordinal (id INTEGER PRIMARY KEY, value TEXT); ' +
+                "INSERT INTO native_row_ordinal VALUES (1, 'first'), (2, 'middle'), (3, 'last')"
+            );
+            const before = await engine.fetchTableData('native_row_ordinal', {
+                columns: ['rowid', 'id', 'value'],
+                orderBy: 'id',
+                limit: 10,
+                offset: 0
+            });
+            const deletedRows = await engine.deleteRows('native_row_ordinal', [2]);
+            assert.ok(deletedRows);
+
+            await engine.undoModification({
+                description: 'Restore middle native row',
+                modificationType: 'row_delete',
+                targetTable: 'native_row_ordinal',
+                deletedRows
+            });
+
+            const after = await engine.fetchTableData('native_row_ordinal', {
+                columns: ['rowid', 'id', 'value'],
+                orderBy: 'id',
+                limit: 10,
+                offset: 0
+            });
+            assert.deepStrictEqual(after.rows, before.rows);
+            assert.deepStrictEqual(after.rows.map(row => row[0]), [1, 2, 3]);
+        });
+
+        await testContext.test('restores a dropped native middle column with exact schema and dependents', async () => {
+            const createTableSql =
+                "CREATE TABLE native_column_restore_parent (id INTEGER PRIMARY KEY, removed TEXT NOT NULL DEFAULT 'fallback' CHECK(length(removed) > 0), tail TEXT)";
+            const createRemovedIndexSql =
+                'CREATE INDEX idx_native_column_restore_removed ON native_column_restore_parent(removed)';
+            const createTailIndexSql =
+                'CREATE INDEX idx_native_column_restore_tail ON native_column_restore_parent(tail)';
+            const createTriggerSql =
+                'CREATE TRIGGER trg_native_column_restore_tail AFTER UPDATE OF tail ' +
+                'ON native_column_restore_parent BEGIN ' +
+                'INSERT INTO native_column_restore_audit(value) VALUES (NEW.tail); END';
+            await engine.executeQuery('PRAGMA foreign_keys = ON');
+            await engine.executeQuery('CREATE TABLE native_column_restore_audit (value TEXT)');
+            await engine.executeQuery(createTableSql);
+            await engine.executeQuery(createRemovedIndexSql);
+            await engine.executeQuery(createTailIndexSql);
+            await engine.executeQuery(createTriggerSql);
+            await engine.executeQuery(
+                'CREATE VIEW native_column_restore_view AS ' +
+                'SELECT id, tail FROM native_column_restore_parent'
+            );
+            await engine.executeQuery(
+                'CREATE TABLE native_column_restore_child (' +
+                'id INTEGER PRIMARY KEY, parent_id INTEGER ' +
+                'REFERENCES native_column_restore_parent(id))'
+            );
+            await engine.executeQuery(
+                "INSERT INTO native_column_restore_parent(rowid, id, removed, tail) VALUES " +
+                "(7, 7, 'seven', 'tail-7'), (11, 11, 'eleven', 'tail-11')"
+            );
+            await engine.executeQuery('INSERT INTO native_column_restore_child VALUES (1, 7)');
+
+            const removedData = (await engine.executeQuery(
+                'SELECT rowid, removed FROM native_column_restore_parent ORDER BY rowid'
+            ))[0].rows.map(row => ({ rowId: row[0] as number, value: row[1] }));
+            await engine.deleteColumns(
+                'native_column_restore_parent',
+                ['removed'],
+                ['idx_native_column_restore_removed']
+            );
+            const afterTableSql = (await engine.executeQuery(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' " +
+                "AND name = 'native_column_restore_parent'"
+            ))[0].rows[0][0] as string;
+
+            await engine.undoModification({
+                description: 'Restore constrained native middle column',
+                modificationType: 'column_drop',
+                targetTable: 'native_column_restore_parent',
+                deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+                droppedIndexes: ['idx_native_column_restore_removed'],
+                columnDropSnapshot: {
+                    before: {
+                        tableSql: createTableSql,
+                        columns: ['id', 'removed', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: [
+                            {
+                                type: 'index',
+                                identifier: 'idx_native_column_restore_removed',
+                                sql: createRemovedIndexSql
+                            },
+                            {
+                                type: 'index',
+                                identifier: 'idx_native_column_restore_tail',
+                                sql: createTailIndexSql
+                            },
+                            {
+                                type: 'trigger',
+                                identifier: 'trg_native_column_restore_tail',
+                                sql: createTriggerSql
+                            }
+                        ]
+                    },
+                    after: {
+                        tableSql: afterTableSql,
+                        columns: ['id', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: [
+                            {
+                                type: 'index',
+                                identifier: 'idx_native_column_restore_tail',
+                                sql: createTailIndexSql
+                            },
+                            {
+                                type: 'trigger',
+                                identifier: 'trg_native_column_restore_tail',
+                                sql: createTriggerSql
+                            }
+                        ]
+                    }
+                }
+            } as any);
+
+            const tableInfo = (await engine.executeQuery(
+                'PRAGMA table_info(native_column_restore_parent)'
+            ))[0].rows;
+            assert.deepStrictEqual(
+                tableInfo.map(column => [column[0], column[1], column[2], column[3], column[4]]),
+                [
+                    [0, 'id', 'INTEGER', 0, null],
+                    [1, 'removed', 'TEXT', 1, "'fallback'"],
+                    [2, 'tail', 'TEXT', 0, null]
+                ]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT rowid AS grid_rowid, id, removed, tail ' +
+                    'FROM native_column_restore_parent ORDER BY rowid'
+                ))[0].rows,
+                [[7, 7, 'seven', 'tail-7'], [11, 11, 'eleven', 'tail-11']]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    "SELECT type, name, sql FROM sqlite_schema " +
+                    "WHERE tbl_name = 'native_column_restore_parent' " +
+                    "AND type IN ('index', 'trigger') AND sql IS NOT NULL " +
+                    'ORDER BY type, name'
+                ))[0].rows,
+                [
+                    ['index', 'idx_native_column_restore_removed', createRemovedIndexSql],
+                    ['index', 'idx_native_column_restore_tail', createTailIndexSql],
+                    ['trigger', 'trg_native_column_restore_tail', createTriggerSql]
+                ]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, tail FROM native_column_restore_view ORDER BY id'
+                ))[0].rows,
+                [[7, 'tail-7'], [11, 'tail-11']]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery('PRAGMA foreign_key_check'))[0]?.rows ?? [],
+                []
+            );
+            assert.strictEqual(
+                (await engine.executeQuery('PRAGMA foreign_keys'))[0].rows[0][0],
+                1
+            );
+            await engine.executeQuery(
+                "UPDATE native_column_restore_parent SET tail = 'changed' WHERE id = 7"
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM native_column_restore_audit'))[0].rows,
+                [['changed']]
+            );
+        });
+
+        await testContext.test('rolls back a stale native guarded column restore', async () => {
+            const createTableSql =
+                'CREATE TABLE native_guarded_column_restore (' +
+                'id INTEGER PRIMARY KEY, removed TEXT, tail TEXT)';
+            await engine.executeQuery(createTableSql);
+            await engine.executeQuery(
+                "INSERT INTO native_guarded_column_restore(rowid, id, removed, tail) " +
+                "VALUES (5, 5, 'value', 'tail')"
+            );
+            await engine.deleteColumns('native_guarded_column_restore', ['removed']);
+
+            await assert.rejects(
+                engine.undoModification({
+                    description: 'Reject stale native column history',
+                    modificationType: 'column_drop',
+                    targetTable: 'native_guarded_column_restore',
+                    deletedColumns: [{
+                        name: 'removed',
+                        type: 'TEXT',
+                        data: [{ rowId: 5, value: 'value' }]
+                    }],
+                    columnDropSnapshot: {
+                        before: {
+                            tableSql: createTableSql,
+                            columns: ['id', 'removed', 'tail'],
+                            identity: { kind: 'rowid' },
+                            schemaObjects: []
+                        },
+                        after: {
+                            tableSql:
+                                'CREATE TABLE native_guarded_column_restore (id INTEGER PRIMARY KEY)',
+                            columns: ['id', 'tail'],
+                            identity: { kind: 'rowid' },
+                            schemaObjects: []
+                        }
+                    }
+                } as any),
+                /schema changed/i
+            );
+
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'PRAGMA table_info(native_guarded_column_restore)'
+                ))[0].rows.map(column => column[1]),
+                ['id', 'tail']
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT rowid AS grid_rowid, id, tail FROM native_guarded_column_restore'
+                ))[0].rows,
+                [[5, 5, 'tail']]
+            );
+        });
+
         await testContext.test('preserves an unsafe native INTEGER prior when undoing a typeless cell', async () => {
             await engine.executeQuery(
                 'CREATE TABLE native_typeless_undo (' +

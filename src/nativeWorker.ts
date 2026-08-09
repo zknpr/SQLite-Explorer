@@ -47,7 +47,8 @@ import type {
   CellReadChunk,
   CellReadSession,
   CellReadTarget,
-  OversizedCellMetadata
+  OversizedCellMetadata,
+  ColumnDropTableState
 } from './core/types';
 import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
@@ -119,6 +120,12 @@ import {
   OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE,
   OversizedCellReplacementRequiredError
 } from './core/cell-edit-policy';
+import {
+  assertColumnDropTableStateCurrent,
+  buildColumnDropRestorePlan,
+  COLUMN_DROP_TABLE_STATE_SQL,
+  mapColumnDropTableState
+} from './core/column-drop';
 
 // ============================================================================
 // Utility Functions
@@ -770,6 +777,15 @@ export async function createNativeDatabaseConnection(
         }
       };
 
+      const safeRollbackTransaction = async (context: string): Promise<void> => {
+        try {
+          await worker.call('run', ['ROLLBACK']);
+        } catch (rollbackErr) {
+          const message = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+          outputChannel?.appendLine(`[NativeWorker] Failed to rollback native transaction (${context}): ${message}`);
+        }
+      };
+
       const findNativeViewDefinition = async (
         view: string,
         allowUnparsed: boolean = false
@@ -930,6 +946,51 @@ export async function createNativeDatabaseConnection(
         const identity = await findNativeTableIdentity(table);
         if (!identity) throw new Error(`Table not found: ${table}`);
         return identity;
+      };
+
+      /** Read the current table/catalog state while an undo transaction owns the schema snapshot. */
+      const readNativeColumnDropTableState = async (
+        table: string
+      ): Promise<ColumnDropTableState> => {
+        const [schema, columns, identity] = await Promise.all([
+          worker.call<NativeQueryResult>('query', [COLUMN_DROP_TABLE_STATE_SQL, [table, table]]),
+          getNativeTableInfo(table),
+          resolveNativeTableIdentity(table)
+        ]);
+        return mapColumnDropTableState(
+          table,
+          columns.map(column => column.identifier),
+          identity,
+          schema.values ?? []
+        );
+      };
+
+      /** Stage recorded values in the appended columns before rebuilding exact original DDL. */
+      const restoreNativeDroppedColumnValues = async (
+        table: string,
+        deletedColumns: NonNullable<ModificationEntry['deletedColumns']>,
+        identity: TableIdentity
+      ): Promise<void> => {
+        const batch = deletedColumns.map(column => {
+          const escapedColumn = escapeIdentifier(column.name);
+          let predicateSql: string | undefined;
+          const paramsList = column.data.map(cell => {
+            const rowId = identity.kind === 'rowid'
+              ? validateRowId(cell.rowId)
+              : cell.rowId;
+            const predicate = buildRecordIdentityPredicate(rowId, identity);
+            if (predicateSql !== undefined && predicateSql !== predicate.sql) {
+              throw new Error(`Inconsistent row identity while restoring ${table}.${column.name}`);
+            }
+            predicateSql = predicate.sql;
+            return [cell.value ?? null, ...predicate.params];
+          });
+          const sql =
+            `UPDATE ${escapeIdentifier(table)} SET ${escapedColumn} = ? ` +
+            `WHERE ${predicateSql ?? (identity.kind === 'rowid' ? 'rowid = ?' : '0')}`;
+          return { sql, paramsList };
+        }).filter(item => item.paramsList.length > 0);
+        if (batch.length > 0) await worker.call('execBatch', [batch]);
       };
 
       const buildNativeCellLocator = (
@@ -1208,6 +1269,129 @@ export async function createNativeDatabaseConnection(
         }
       };
 
+      const undoLegacyNativeColumnDrop = async (
+        table: string,
+        deletedColumns: NonNullable<ModificationEntry['deletedColumns']>
+      ): Promise<void> => {
+        const batch: Array<{ sql: string; params?: CellValue[] }> = [];
+        for (const column of deletedColumns) {
+          validateSqlType(column.type);
+          batch.push({
+            sql:
+              `ALTER TABLE ${escapeIdentifier(table)} ADD COLUMN ` +
+              `${escapeIdentifier(column.name)} ${column.type}`
+          });
+        }
+        for (const column of deletedColumns) {
+          for (const { rowId, value } of column.data) {
+            batch.push({
+              sql:
+                `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column.name)} = ? ` +
+                'WHERE rowid = ?',
+              params: [value, validateRowId(rowId)]
+            });
+          }
+        }
+        if (batch.length > 0) await worker.call('execBatch', [batch]);
+      };
+
+      /**
+       * Restore a dropped column from exact pre/post catalog snapshots.
+       *
+       * This owns one raw transaction. It must not be called inside a host
+       * savepoint because PRAGMA foreign_keys can only change outside a
+       * transaction and legacy history operations already use raw BEGIN.
+       */
+      const undoNativeColumnDrop = async (
+        table: string,
+        deletedColumns: NonNullable<ModificationEntry['deletedColumns']>,
+        snapshot: NonNullable<ModificationEntry['columnDropSnapshot']>
+      ): Promise<void> => {
+        const stagingTable = `__sqlite_explorer_column_restore_${crypto.randomUUID().replace(/-/g, '')}`;
+        const plan = buildColumnDropRestorePlan(table, stagingTable, deletedColumns, snapshot);
+        const readPragma = async (
+          pragma: 'foreign_keys' | 'legacy_alter_table'
+        ): Promise<number> => {
+          const result = await worker.call<NativeQueryResult>('query', [`PRAGMA ${pragma}`]);
+          const value = Number(result.values?.[0]?.[0]);
+          if (value !== 0 && value !== 1) {
+            throw new Error(`SQLite returned an invalid ${pragma} value`);
+          }
+          return value;
+        };
+        const setPragma = async (
+          pragma: 'foreign_keys' | 'legacy_alter_table',
+          value: number
+        ): Promise<void> => {
+          await worker.call('run', [`PRAGMA ${pragma} = ${value ? 'ON' : 'OFF'}`]);
+          if (await readPragma(pragma) !== value) {
+            throw new Error(`Unable to set PRAGMA ${pragma} for column-drop undo`);
+          }
+        };
+
+        const foreignKeysBefore = await readPragma('foreign_keys');
+        const legacyAlterBefore = await readPragma('legacy_alter_table');
+        let transactionStarted = false;
+        let operationError: unknown;
+        try {
+          if (foreignKeysBefore !== 0) await setPragma('foreign_keys', 0);
+          if (legacyAlterBefore !== 1) await setPragma('legacy_alter_table', 1);
+
+          await worker.call('run', ['BEGIN TRANSACTION']);
+          transactionStarted = true;
+          const current = await readNativeColumnDropTableState(table);
+          assertColumnDropTableStateCurrent(table, snapshot.after, current);
+          const collision = await worker.call<NativeQueryResult>('query', [
+            'SELECT 1 FROM sqlite_schema WHERE name = ? COLLATE NOCASE LIMIT 1',
+            [stagingTable]
+          ]);
+          if ((collision.values?.length ?? 0) !== 0) {
+            throw new Error(`Column-drop staging table already exists: ${stagingTable}`);
+          }
+
+          for (const sql of plan.stageColumns) await worker.call('run', [sql]);
+          await restoreNativeDroppedColumnValues(table, deletedColumns, snapshot.before.identity);
+          for (const sql of plan.dropCurrentSchemaObjects) await worker.call('run', [sql]);
+          await worker.call('run', [plan.renameCurrentTable]);
+          await runNativeSingleStatement(plan.createOriginalTable);
+          await worker.call('run', [plan.copyRows]);
+          await worker.call('run', [plan.dropStagingTable]);
+          for (const sql of plan.restoreSchemaObjects) await runNativeSingleStatement(sql);
+
+          const restored = await readNativeColumnDropTableState(table);
+          assertColumnDropTableStateCurrent(table, snapshot.before, restored);
+          const foreignKeyCheck = await worker.call<NativeQueryResult>('query', [
+            'PRAGMA foreign_key_check'
+          ]);
+          if ((foreignKeyCheck.values?.length ?? 0) !== 0) {
+            throw new Error(`Foreign-key check failed while undoing column drop on ${table}`);
+          }
+          await worker.call('run', ['COMMIT']);
+          transactionStarted = false;
+        } catch (error) {
+          operationError = error;
+          if (transactionStarted) await safeRollbackTransaction('undoColumnDrop');
+        }
+
+        let pragmaRestoreError: unknown;
+        try {
+          if (legacyAlterBefore !== 1) await setPragma('legacy_alter_table', legacyAlterBefore);
+          if (foreignKeysBefore !== 0) await setPragma('foreign_keys', foreignKeysBefore);
+        } catch (error) {
+          pragmaRestoreError = error;
+        }
+        if (operationError !== undefined) {
+          if (pragmaRestoreError !== undefined) {
+            throw new Error(
+              `Column-drop undo failed and connection PRAGMAs could not be restored: ${String(pragmaRestoreError)}`,
+              { cause: operationError }
+            );
+          }
+          throw operationError;
+        }
+        if (pragmaRestoreError !== undefined) throw pragmaRestoreError;
+      };
+
       const rawOperations: DatabaseOperations = {
         engineKind: Promise.resolve('native'),
 
@@ -1284,7 +1468,7 @@ export async function createNativeDatabaseConnection(
          * Undo a modification by executing the inverse SQL.
          */
         undoModification: async (mod: ModificationEntry) => {
-          const { modificationType, targetTable, targetRowId, newTargetRowId, targetColumn, priorValue, newValue, operation, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
+          const { modificationType, targetTable, targetRowId, newTargetRowId, targetColumn, priorValue, newValue, operation, affectedCells, deletedRows, columnDef, deletedColumns, columnDropSnapshot } = mod;
           if (!targetTable) return;
 
           switch (modificationType) {
@@ -1426,29 +1610,14 @@ export async function createNativeDatabaseConnection(
               break;
 
             case 'column_drop':
-                if (deletedColumns) {
-                    const batch = [];
-                    // 1. Add columns back
-                    for (const col of deletedColumns) {
-                        validateSqlType(col.type); // Validate type
-                        batch.push({
-                            sql: `ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(col.name)} ${col.type}`
-                        });
-                    }
-                    // 2. Restore values
-                    for (const col of deletedColumns) {
-                        for (const { rowId, value } of col.data) {
-                            batch.push({
-                                sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`,
-                                params: [value, validateRowId(rowId)]
-                            });
-                        }
-                    }
-                    if (batch.length > 0) {
-                        await worker.call('execBatch', [batch]);
-                    }
+              if (deletedColumns && deletedColumns.length > 0) {
+                if (columnDropSnapshot) {
+                  await undoNativeColumnDrop(targetTable, deletedColumns, columnDropSnapshot);
+                } else {
+                  await undoLegacyNativeColumnDrop(targetTable, deletedColumns);
                 }
-                break;
+              }
+              break;
 
             case 'table_create':
                 await worker.call('run', [`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`]);

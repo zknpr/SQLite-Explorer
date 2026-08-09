@@ -72,6 +72,34 @@ describe('SQLite Engine Undo/Redo', () => {
         assert.strictEqual(verifyDeletedAgain, 1);
     });
 
+    it('restores a deleted row to its deterministic grid position', async () => {
+        await engine.insertRow('users', { id: 3, name: 'Charlie' });
+        const before = await engine.fetchTableData('users', {
+            columns: ['rowid', 'id', 'name'],
+            orderBy: 'id',
+            limit: 10,
+            offset: 0
+        });
+        const deletedRows = await engine.deleteRows('users', [2]);
+        assert.ok(deletedRows);
+
+        await engine.undoModification({
+            modificationType: 'row_delete',
+            targetTable: 'users',
+            description: 'Delete middle row',
+            deletedRows
+        });
+
+        const after = await engine.fetchTableData('users', {
+            columns: ['rowid', 'id', 'name'],
+            orderBy: 'id',
+            limit: 10,
+            offset: 0
+        });
+        assert.deepStrictEqual(after.rows, before.rows);
+        assert.deepStrictEqual(after.rows.map((row: any[]) => row[0]), [1, 2, 3]);
+    });
+
     it('should undo/redo column drop', async () => {
         // 1. Drop column 'name'
         const colDataResult = await engine.executeQuery("SELECT rowid, name FROM users");
@@ -114,6 +142,176 @@ describe('SQLite Engine Undo/Redo', () => {
         } catch (e) {
             assert.ok(true);
         }
+    });
+
+    it('restores a dropped middle column with its exact schema position and dependents', async () => {
+        const createTableSql =
+            "CREATE TABLE column_restore_parent (id INTEGER PRIMARY KEY, removed TEXT NOT NULL DEFAULT 'fallback' CHECK(length(removed) > 0), tail TEXT)";
+        const createRemovedIndexSql =
+            'CREATE INDEX idx_column_restore_removed ON column_restore_parent(removed)';
+        const createTailIndexSql =
+            'CREATE INDEX idx_column_restore_tail ON column_restore_parent(tail)';
+        const createTriggerSql =
+            'CREATE TRIGGER trg_column_restore_tail AFTER UPDATE OF tail ON column_restore_parent ' +
+            'BEGIN INSERT INTO column_restore_audit(value) VALUES (NEW.tail); END';
+        await engine.executeQuery('PRAGMA foreign_keys = ON');
+        await engine.executeQuery('CREATE TABLE column_restore_audit (value TEXT)');
+        await engine.executeQuery(createTableSql);
+        await engine.executeQuery(createRemovedIndexSql);
+        await engine.executeQuery(createTailIndexSql);
+        await engine.executeQuery(createTriggerSql);
+        await engine.executeQuery(
+            'CREATE VIEW column_restore_view AS SELECT id, tail FROM column_restore_parent'
+        );
+        await engine.executeQuery(
+            'CREATE TABLE column_restore_child (' +
+            'id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES column_restore_parent(id))'
+        );
+        await engine.executeQuery(
+            "INSERT INTO column_restore_parent(rowid, id, removed, tail) VALUES " +
+            "(7, 7, 'seven', 'tail-7'), (11, 11, 'eleven', 'tail-11')"
+        );
+        await engine.executeQuery('INSERT INTO column_restore_child VALUES (1, 7)');
+
+        const removedData = (await engine.executeQuery(
+            'SELECT rowid, removed FROM column_restore_parent ORDER BY rowid'
+        ))[0].rows.map((row: any[]) => ({ rowId: row[0], value: row[1] }));
+        await engine.deleteColumns(
+            'column_restore_parent',
+            ['removed'],
+            ['idx_column_restore_removed']
+        );
+        const afterTableSql = (await engine.executeQuery(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'column_restore_parent'"
+        ))[0].rows[0][0];
+
+        await engine.undoModification({
+            modificationType: 'column_drop',
+            targetTable: 'column_restore_parent',
+            description: 'Drop middle constrained column',
+            deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+            droppedIndexes: ['idx_column_restore_removed'],
+            columnDropSnapshot: {
+                before: {
+                    tableSql: createTableSql,
+                    columns: ['id', 'removed', 'tail'],
+                    identity: { kind: 'rowid' },
+                    schemaObjects: [
+                        { type: 'index', identifier: 'idx_column_restore_removed', sql: createRemovedIndexSql },
+                        { type: 'index', identifier: 'idx_column_restore_tail', sql: createTailIndexSql },
+                        { type: 'trigger', identifier: 'trg_column_restore_tail', sql: createTriggerSql }
+                    ]
+                },
+                after: {
+                    tableSql: afterTableSql,
+                    columns: ['id', 'tail'],
+                    identity: { kind: 'rowid' },
+                    schemaObjects: [
+                        { type: 'index', identifier: 'idx_column_restore_tail', sql: createTailIndexSql },
+                        { type: 'trigger', identifier: 'trg_column_restore_tail', sql: createTriggerSql }
+                    ]
+                }
+            }
+        } as any);
+
+        const tableInfo = (await engine.executeQuery(
+            'PRAGMA table_info(column_restore_parent)'
+        ))[0].rows;
+        assert.deepStrictEqual(
+            tableInfo.map((column: any[]) => [column[0], column[1], column[2], column[3], column[4]]),
+            [
+                [0, 'id', 'INTEGER', 0, null],
+                [1, 'removed', 'TEXT', 1, "'fallback'"],
+                [2, 'tail', 'TEXT', 0, null]
+            ]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT rowid, id, removed, tail FROM column_restore_parent ORDER BY rowid'
+            ))[0].rows,
+            [[7, 7, 'seven', 'tail-7'], [11, 11, 'eleven', 'tail-11']]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                "SELECT type, name, sql FROM sqlite_schema " +
+                "WHERE tbl_name = 'column_restore_parent' AND type IN ('index', 'trigger') " +
+                'AND sql IS NOT NULL ORDER BY type, name'
+            ))[0].rows,
+            [
+                ['index', 'idx_column_restore_removed', createRemovedIndexSql],
+                ['index', 'idx_column_restore_tail', createTailIndexSql],
+                ['trigger', 'trg_column_restore_tail', createTriggerSql]
+            ]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT id, tail FROM column_restore_view ORDER BY id'))[0].rows,
+            [[7, 'tail-7'], [11, 'tail-11']]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('PRAGMA foreign_key_check'))[0]?.rows ?? [],
+            []
+        );
+        assert.strictEqual(
+            (await engine.executeQuery('PRAGMA foreign_keys'))[0].rows[0][0],
+            1
+        );
+        await engine.executeQuery(
+            "UPDATE column_restore_parent SET tail = 'changed' WHERE id = 7"
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT value FROM column_restore_audit'))[0].rows,
+            [['changed']]
+        );
+    });
+
+    it('rolls back a guarded column restore when the post-drop schema changed', async () => {
+        const createTableSql =
+            'CREATE TABLE guarded_column_restore (id INTEGER PRIMARY KEY, removed TEXT, tail TEXT)';
+        await engine.executeQuery(createTableSql);
+        await engine.executeQuery(
+            "INSERT INTO guarded_column_restore(rowid, id, removed, tail) VALUES (5, 5, 'value', 'tail')"
+        );
+        await engine.deleteColumns('guarded_column_restore', ['removed']);
+
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'column_drop',
+                targetTable: 'guarded_column_restore',
+                description: 'Reject stale column history',
+                deletedColumns: [{
+                    name: 'removed',
+                    type: 'TEXT',
+                    data: [{ rowId: 5, value: 'value' }]
+                }],
+                columnDropSnapshot: {
+                    before: {
+                        tableSql: createTableSql,
+                        columns: ['id', 'removed', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: []
+                    },
+                    after: {
+                        tableSql: 'CREATE TABLE guarded_column_restore (id INTEGER PRIMARY KEY)',
+                        columns: ['id', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: []
+                    }
+                }
+            } as any),
+            /schema changed/i
+        );
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery('PRAGMA table_info(guarded_column_restore)'))[0].rows
+                .map((column: any[]) => column[1]),
+            ['id', 'tail']
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT rowid, id, tail FROM guarded_column_restore'
+            ))[0].rows,
+            [[5, 5, 'tail']]
+        );
     });
 
     it('should undo/redo cell update', async () => {

@@ -3,13 +3,12 @@
  */
 import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
-import { updateStatus } from './ui.js';
+import { updateStatus, updateToolbarButtons } from './ui.js';
 import { loadTableData, loadTableColumns } from './grid.js';
 import {
     getCellMutationBlockReason,
     getCellValueForDisplay,
-    getRowDataOffset,
-    getRowId
+    getRowDataOffset
 } from './data-utils.js';
 import { updateSelectionStates } from './grid-selection.js';
 import { openCreateTableModal } from './crud.js';
@@ -465,11 +464,6 @@ export async function applyBatchUpdate() {
                 if (identities.delete(oldIdentity)) identities.add(newIdentity);
             }
         }
-        const selectedCellTargets = state.selectedCells.map(cell => ({
-            rowId: identityChanges.get(cell.rowId) ?? cell.rowId,
-            columnName: state.tableColumns[cell.colIdx]?.name
-        }));
-
         // Update local grid data
         const hasPatch = updates.some(u => u.operation === 'json_patch');
 
@@ -479,36 +473,19 @@ export async function applyBatchUpdate() {
             }
         }
 
-        // Refresh by identity because a PK edit can also move the row in the
-        // table's default ordering.
+        // Applying the batch ends the selection gesture. Clear both halves of
+        // the cell/column selection before replacing the grid so the DOM diff
+        // cache removes the old body and header highlights together.
         state.selectedCells = [];
-        await loadTableData(false);
-
-        const freshSelectedCells = [];
-        for (const target of selectedCellTargets) {
-            if (!target.columnName) continue;
-            const rowIdx = state.gridData.findIndex((row, index) => (
-                getRowId(row, index) === target.rowId
-            ));
-            const colIdx = state.tableColumns.findIndex(column => column.name === target.columnName);
-            if (rowIdx < 0 || colIdx < 0) continue;
-            freshSelectedCells.push({
-                rowIdx,
-                colIdx,
-                rowId: target.rowId,
-                value: getCellValueForDisplay(state.gridData[rowIdx], rowIdx, colIdx)
-            });
-        }
-        state.selectedCells = freshSelectedCells;
-        state.lastSelectedCell = freshSelectedCells.length > 0
-            ? {
-                rowIdx: freshSelectedCells[freshSelectedCells.length - 1].rowIdx,
-                colIdx: freshSelectedCells[freshSelectedCells.length - 1].colIdx
-            }
-            : null;
+        state.selectedColumns.clear();
+        state.lastSelectedCell = null;
+        state.lastSelectedColumnIndex = null;
         updateSelectionStates();
-
+        updateToolbarButtons();
         updateBatchSidebar();
+
+        // A PK edit can move the row in the table's default ordering.
+        await loadTableData(false);
 
         updateStatus('Batch update completed');
 
