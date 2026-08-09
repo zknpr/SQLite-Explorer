@@ -79,6 +79,11 @@ function assertCellUpdate(edit: UnknownRecord): void {
   if (edit.undoPolicy !== undefined && edit.undoPolicy !== 'barrier') {
     invalid('cell_update.undoPolicy must be barrier when present');
   }
+  if (edit.undoBarrierKind !== undefined) {
+    // Barrier classification changes File Revert behavior and is assigned only
+    // after a host-owned operation; never trust the webview to select it.
+    invalid('cell_update.undoBarrierKind is host-owned');
+  }
 
   if (edit.affectedCells !== undefined) {
     if (!Array.isArray(edit.affectedCells) || edit.affectedCells.length === 0) {

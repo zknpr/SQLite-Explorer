@@ -272,10 +272,13 @@ function formatMiB(bytes) {
 
 export async function run(argv = process.argv.slice(2), options = {}) {
   if (argv.includes('--help') || argv.includes('-h')) {
-    console.log('Usage: node scripts/package-vsix.mjs');
+    console.log('Usage: node scripts/package-vsix.mjs [--expected-version VERSION]');
     return [];
   }
-  if (argv.length > 0) {
+  let expectedVersion;
+  if (argv.length === 2 && argv[0] === '--expected-version') {
+    expectedVersion = argv[1];
+  } else if (argv.length > 0) {
     throw new Error(`Unknown option: ${argv[0]}`);
   }
 
@@ -283,6 +286,11 @@ export async function run(argv = process.argv.slice(2), options = {}) {
   const manifest = JSON.parse(await readFile(join(projectRoot, 'package.json'), 'utf8'));
   if (typeof manifest.name !== 'string' || typeof manifest.version !== 'string') {
     throw new Error('package.json must contain string name and version fields');
+  }
+  if (expectedVersion !== undefined && expectedVersion !== manifest.version) {
+    throw new Error(
+      `Release tag version ${expectedVersion} does not match package.json version ${manifest.version}`
+    );
   }
 
   console.log(`Building SQLite Explorer ${manifest.version} once for six VSIX packages...`);

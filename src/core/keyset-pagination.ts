@@ -32,6 +32,13 @@ import type {
 
 const KEYSET_ANCHOR_PREFIX = 'ksa:';
 const KEYSET_ANCHOR_VERSION = 1;
+/**
+ * Two boundary anchors may accompany one page. Keeping each at 128 KiB uses
+ * at most half of the response containment layer's 512 KiB envelope reserve,
+ * leaving the rest for result metadata and RPC framing. Anchor tokens are
+ * encodeURIComponent output, so string length is their exact UTF-8 byte size.
+ */
+export const MAX_KEYSET_ANCHOR_BYTES = 128 * 1024;
 const KEYSET_MODES: readonly KeysetNavigationMode[] =
   ['first', 'after', 'atOrAfter', 'before', 'last'];
 
@@ -211,8 +218,7 @@ function decodeKeysetValue(
   return { value, storageClass: (encoded as EncodedPrimaryKeyValue)[0] };
 }
 
-/** Encode a canonical, RPC-safe opaque anchor token for one boundary row. */
-export function encodeKeysetAnchor(
+function encodeKeysetAnchorUnchecked(
   tag: string,
   values: readonly (CellValue | bigint)[]
 ): string {
@@ -225,6 +231,24 @@ export function encodeKeysetAnchor(
   return KEYSET_ANCHOR_PREFIX + encodeURIComponent(JSON.stringify(payload));
 }
 
+function assertKeysetAnchorWithinBudget(anchor: string): void {
+  if (anchor.length > MAX_KEYSET_ANCHOR_BYTES) {
+    throw new Error(
+      `Keyset anchor exceeds the ${MAX_KEYSET_ANCHOR_BYTES}-byte limit`
+    );
+  }
+}
+
+/** Encode a canonical, RPC-safe opaque anchor token for one boundary row. */
+export function encodeKeysetAnchor(
+  tag: string,
+  values: readonly (CellValue | bigint)[]
+): string {
+  const anchor = encodeKeysetAnchorUnchecked(tag, values);
+  assertKeysetAnchorWithinBudget(anchor);
+  return anchor;
+}
+
 /** Decode and strictly validate an anchor token received from the webview. */
 export function decodeKeysetAnchor(anchor: unknown): {
   tag: string;
@@ -234,6 +258,7 @@ export function decodeKeysetAnchor(anchor: unknown): {
   if (typeof anchor !== 'string' || !anchor.startsWith(KEYSET_ANCHOR_PREFIX)) {
     throw new Error('Invalid keyset anchor');
   }
+  assertKeysetAnchorWithinBudget(anchor);
   let payload: unknown;
   try {
     payload = JSON.parse(decodeURIComponent(anchor.slice(KEYSET_ANCHOR_PREFIX.length)));
@@ -479,7 +504,8 @@ export function mintKeysetAnchors(input: {
       if (typeof value === 'number' && !Number.isFinite(value)) return undefined;
       values.push(value);
     }
-    return encodeKeysetAnchor(input.tag, values);
+    const anchor = encodeKeysetAnchorUnchecked(input.tag, values);
+    return anchor.length <= MAX_KEYSET_ANCHOR_BYTES ? anchor : undefined;
   };
 
   const first = mintRow(0);

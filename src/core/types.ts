@@ -294,7 +294,8 @@ export type ModificationType =
   | 'column_drop'
   | 'view_create'
   | 'view_edit'
-  | 'view_drop';
+  | 'view_drop'
+  | 'pragma_update';
 
 /**
  * How a cell value should be applied when replaying a cell update.
@@ -339,6 +340,8 @@ export interface ModificationEntry {
   newTargetRowId?: RecordId;
   /** Affected column name */
   targetColumn?: string;
+  /** Database-persistent PRAGMA changed by a paged writable overlay. */
+  targetPragma?: string;
   /** Value before modification */
   priorValue?: CellValue;
   /** Value after modification */
@@ -352,6 +355,8 @@ export interface ModificationEntry {
    * checksummed prior-value reference and a restorable undo policy.
    */
   undoPolicy?: 'barrier';
+  /** Why an edit is intentionally forward-only in the in-memory history. */
+  undoBarrierKind?: 'oversized_cell' | 'persistent_pragma';
   /** Raw SQL executed */
   executedQuery?: string;
   /** Multiple affected rows */

@@ -164,6 +164,15 @@ const TRACKED_MUTATION_METHODS = [
   'triggerRedo'
 ] as const;
 
+/** Keep this paired with the settings modal's stored-vs-session-only wording. */
+const PAGED_PERSISTENT_PRAGMAS = new Set(['journal_mode', 'auto_vacuum']);
+
+function sameEffectivePragmaValue(left: CellValue, right: CellValue): boolean {
+  return typeof left === 'string' && typeof right === 'string'
+    ? left.toLowerCase() === right.toLowerCase()
+    : Object.is(left, right);
+}
+
 /**
  * Bridge between VS Code host and webview.
  *
@@ -428,7 +437,8 @@ export class HostBridge implements ToastService {
             targetColumn: column,
             newValue: value,
             operation: 'set',
-            undoPolicy: 'barrier'
+            undoPolicy: 'barrier',
+            undoBarrierKind: 'oversized_cell'
           });
           return newTargetRowId;
         } catch (error) {
@@ -1084,11 +1094,62 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
-    if ('setPragma' in dbOps) {
-      await dbOps.setPragma(pragma, value);
-    } else {
+    if (!('setPragma' in dbOps)) {
       throw new Error("Backend does not support setPragma");
     }
+    const trackPersistentPagedChange = this.document.isPagedWritableMode === true
+      && PAGED_PERSISTENT_PRAGMAS.has(pragma);
+    if (!trackPersistentPagedChange) {
+      await dbOps.setPragma(pragma, value);
+      return;
+    }
+    if (!('getPragmas' in dbOps)) {
+      throw new Error('Backend cannot verify a persistent PRAGMA change');
+    }
+
+    const priorValue = (await dbOps.getPragmas())[pragma];
+    if (priorValue === undefined) {
+      throw new Error(`Backend did not report PRAGMA ${pragma} before changing it`);
+    }
+    await dbOps.setPragma(pragma, value);
+
+    let effectiveValue: CellValue = value;
+    try {
+      const reportedValue = (await dbOps.getPragmas())[pragma];
+      if (reportedValue === undefined) {
+        throw new Error(`Backend did not report PRAGMA ${pragma} after changing it`);
+      }
+      effectiveValue = reportedValue;
+    } catch (error) {
+      // The mutation already succeeded. Preserve a replayable dirty entry even
+      // when the verification read fails, then propagate the diagnostic.
+      this.document.recordExternalModification({
+        label: `Change PRAGMA ${pragma}`,
+        description: `Set PRAGMA ${pragma}`,
+        modificationType: 'pragma_update',
+        targetPragma: pragma,
+        priorValue,
+        newValue: value,
+        undoPolicy: 'barrier',
+        undoBarrierKind: 'persistent_pragma'
+      });
+      throw new Error(
+        `PRAGMA ${pragma} changed, but its effective value could not be verified`,
+        { cause: error }
+      );
+    }
+
+    if (sameEffectivePragmaValue(priorValue, effectiveValue)) return;
+    this.document.recordExternalModification({
+      label: `Change PRAGMA ${pragma}`,
+      description: `Set PRAGMA ${pragma}`,
+      modificationType: 'pragma_update',
+      targetPragma: pragma,
+      priorValue,
+      newValue: effectiveValue,
+      undoPolicy: 'barrier',
+      undoBarrierKind: 'persistent_pragma'
+    });
   }
 
   // History replay (undo/redo/commit/rollback) is driven by DatabaseDocument on the

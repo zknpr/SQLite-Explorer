@@ -7,6 +7,7 @@ import {
   decodeKeysetAnchor,
   encodeKeysetAnchor,
   keysetFallbackOrder,
+  MAX_KEYSET_ANCHOR_BYTES,
   mintKeysetAnchors,
   resolveKeysetPlan,
   type ResolvedKeysetPlan
@@ -215,6 +216,20 @@ describe('keyset anchor codec', () => {
         `expected rejection for ${String(token).slice(0, 80)}`
       );
     }
+  });
+
+  it('rejects encoded anchors that exceed the response-safe per-anchor budget', () => {
+    // '%' expands to three ASCII bytes under encodeURIComponent, so this
+    // crosses the encoded budget without allocating a multi-megabyte fixture.
+    const expansionHeavyText = '%'.repeat(Math.ceil(MAX_KEYSET_ANCHOR_BYTES / 3));
+    assert.throws(
+      () => encodeKeysetAnchor(tag, [expansionHeavyText]),
+      /keyset anchor.*byte limit/i
+    );
+    assert.throws(
+      () => decodeKeysetAnchor('ksa:' + 'a'.repeat(MAX_KEYSET_ANCHOR_BYTES)),
+      /keyset anchor.*byte limit/i
+    );
   });
 });
 
@@ -689,6 +704,20 @@ describe('mintKeysetAnchors', () => {
       mintKeysetAnchors({ tag: 'tag', key, projectionColumns: projection, rows: [] }),
       undefined
     );
+  });
+
+  it('omits an over-budget boundary anchor so navigation falls back to OFFSET', () => {
+    const expansionHeavyText = '%'.repeat(Math.ceil(MAX_KEYSET_ANCHOR_BYTES / 3));
+    const minted = mintKeysetAnchors({
+      tag: 'tag',
+      key,
+      projectionColumns: projection,
+      rows: [[1n, expansionHeavyText], [2n, 'small']]
+    });
+
+    assert.strictEqual(minted?.first, undefined);
+    assert.ok(minted?.last);
+    assert.deepStrictEqual(decodeKeysetAnchor(minted.last).values, ['small', 2]);
   });
 });
 

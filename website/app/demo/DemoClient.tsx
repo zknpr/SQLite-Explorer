@@ -157,6 +157,9 @@ export default function DemoClient() {
   /** Download-only failures leave the active editor usable. */
   const [downloadError, setDownloadError] = useState<string | null>(null);
 
+  /** Why the worker forced the current database into read-only mode. */
+  const [readOnlyNotice, setReadOnlyNotice] = useState<string | null>(null);
+
   /**
    * Name of the currently loaded database file.
    */
@@ -525,7 +528,11 @@ export default function DemoClient() {
           ? { content: source }
           : { file: source }
         // wasmBinary is loaded from the self-hosted runtime by the worker.
-      ]) as { isReadOnly?: boolean; storage?: 'memory' | 'paged' } | undefined;
+      ]) as {
+        isReadOnly?: boolean;
+        storage?: 'memory' | 'paged';
+        readOnlyReason?: string;
+      } | undefined;
 
       databaseBinary.current = source instanceof Uint8Array ? source : null;
       databaseFile.current = source instanceof Uint8Array ? null : source;
@@ -536,12 +543,14 @@ export default function DemoClient() {
         : source.size;
       setCanDownload(!databaseIsReadOnly.current);
       setDownloadError(null);
+      setReadOnlyNotice(result?.readOnlyReason ?? null);
       setDatabaseName(filename);
       setStatus('ready');
     } catch (error) {
       console.error('[Demo] Failed to initialize database:', error);
       setStatus('error');
       setErrorMessage(error instanceof Error ? error.message : 'Failed to load database');
+      setReadOnlyNotice(null);
     }
   }, [callWorker]);
 
@@ -713,6 +722,7 @@ export default function DemoClient() {
     databaseFileSizeBytes.current = 0;
     setCanDownload(false);
     setDownloadError(null);
+    setReadOnlyNotice(null);
     setDatabaseName(null);
     setStatus('idle');
     setErrorMessage(null);
@@ -887,6 +897,14 @@ export default function DemoClient() {
 
         {status === 'ready' && (
           <div className="flex-1 min-w-0 flex flex-col">
+            {readOnlyNotice && (
+              <div
+                role="status"
+                className="px-4 py-2 text-sm text-amber-900 bg-amber-50 border-b border-amber-200"
+              >
+                {readOnlyNotice}
+              </div>
+            )}
             {downloadError && (
               <div
                 role="alert"

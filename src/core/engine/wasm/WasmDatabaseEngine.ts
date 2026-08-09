@@ -910,6 +910,33 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     signal?.throwIfAborted();
     if (mods.length === 0) return;
 
+    const firstPragma = mods.findIndex(mod => mod.modificationType === 'pragma_update');
+    if (firstPragma < 0) {
+      await this.applyTransactionalModificationRun(mods, signal);
+      return;
+    }
+
+    // journal_mode cannot change inside a transaction. Preserve history order
+    // while keeping each ordinary run atomic; a PRAGMA is verified immediately
+    // before replay advances to the next entry.
+    let runStart = 0;
+    for (let index = firstPragma; index < mods.length; index++) {
+      const mod = mods[index];
+      if (mod.modificationType !== 'pragma_update') continue;
+      await this.applyTransactionalModificationRun(mods.slice(runStart, index), signal);
+      signal?.throwIfAborted();
+      await this.forwardApply(mod, true);
+      signal?.throwIfAborted();
+      runStart = index + 1;
+    }
+    await this.applyTransactionalModificationRun(mods.slice(runStart), signal);
+  }
+
+  private async applyTransactionalModificationRun(
+    mods: ModificationEntry[],
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (mods.length === 0) return;
     const savepointName = this.createSavepointName('sp_apply_modifications');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
@@ -933,6 +960,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    */
   async undoModification(mod: ModificationEntry): Promise<void> {
     const { modificationType, targetTable } = mod;
+    if (modificationType === 'pragma_update') {
+      throw new Error('Persistent PRAGMA changes are forward-only history barriers');
+    }
     if (!targetTable) return;
 
     switch (modificationType) {
@@ -1313,6 +1343,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    */
   private async forwardApply(mod: ModificationEntry, strict: boolean): Promise<void> {
     const { modificationType, targetTable, targetRowId, targetColumn, newValue, operation, affectedCells, affectedRowIds, rowData, tableDef, columnDef, deletedColumns, droppedIndexes } = mod;
+    if (modificationType === 'pragma_update') {
+      if (!mod.targetPragma || newValue === undefined) {
+        throw new Error('Cannot apply pragma_update: missing PRAGMA name or new value');
+      }
+      await this.applyPragmaHistoryValue(mod.targetPragma, newValue);
+      return;
+    }
     if (!targetTable) {
       if (strict) throw new Error(`Cannot apply ${modificationType}: missing target table`);
       return;
@@ -3144,6 +3181,18 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
 
     await this.executeQuery(sql);
+  }
+
+  /** Replay a persistent PRAGMA and refuse a normalized/no-op mismatch. */
+  private async applyPragmaHistoryValue(pragma: string, value: CellValue): Promise<void> {
+    await this.setPragma(pragma, value);
+    const effective = (await this.getPragmas())[pragma];
+    const matches = typeof effective === 'string' && typeof value === 'string'
+      ? effective.toLowerCase() === value.toLowerCase()
+      : Object.is(effective, value);
+    if (!matches) {
+      throw new Error(`SQLite did not apply the recorded PRAGMA ${pragma} value`);
+    }
   }
 
   /**

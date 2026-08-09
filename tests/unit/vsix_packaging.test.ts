@@ -169,4 +169,16 @@ describe('VSIX content gate', () => {
       /must not declare a target platform/
     );
   });
+
+  it('rejects a release tag version mismatch before packaging starts', async () => {
+    const { run } = await loadPackager();
+
+    await assert.rejects(
+      () => run(['--expected-version', '0.0.0-release-mismatch']),
+      (error: Error) => {
+        assert.match(error.message, /release tag version .* does not match package\.json version/i);
+        return true;
+      }
+    );
+  });
 });

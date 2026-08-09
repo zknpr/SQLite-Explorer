@@ -258,6 +258,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   #connectionGeneration = 0;
   #activeMutations = 0;
   #pagedSaveExclusive = false;
+  #pagedSaveRecoveryRequired = false;
   readonly #mutationDrainWaiters = new Set<() => void>();
   #referenceCount = 1;
   #workerDisposeRequested = false;
@@ -336,6 +337,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
   #endPagedSaveExclusive(): void {
     this.#pagedSaveExclusive = false;
+    this.#pagedSaveRecoveryRequired = false;
   }
 
   // ============================================================================
@@ -410,8 +412,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         const undoneEntry = tracker.stepBack();
         if (!undoneEntry) {
           if (tracker.isUndoBlockedByBarrier) {
+            const blocked = tracker.undoBlockingEntry;
             await vsc.window.showWarningMessage(vsc.l10n.t(
-              'This oversized cell replacement cannot be undone. Undo cannot cross its history barrier.'
+              blocked?.undoBarrierKind === 'persistent_pragma'
+                ? 'Persistent PRAGMA changes cannot be undone reliably. Use File Revert or Reload to restore the saved database.'
+                : 'This oversized cell replacement cannot be undone. Undo cannot cross its history barrier.'
             ));
             return;
           }
@@ -585,6 +590,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
               // saved file is durable; fail closed because the old engine still
               // references the pre-rename inode (or was shut down while reopening).
               this.connectionState.isReadOnly = true;
+              this.#pagedSaveRecoveryRequired = true;
               throw new Error(
                 'Database was saved, but its page-on-demand session could not be reopened. '
                 + 'Reload the document before making more edits.',
@@ -679,6 +685,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
                  throw e;
                }
                this.connectionState.isReadOnly = true;
+               this.#pagedSaveRecoveryRequired = true;
                throw new Error(
                  'Database was saved, but its page-on-demand session could not be reopened. '
                  + 'Reload the document before making more edits.',
@@ -711,7 +718,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
   async #revert(cancellation: vsc.CancellationToken): Promise<void> {
     await this.ensureWritable();
-    if (this.#modificationTracker.hasUncommittedHistoryBarrier) {
+    const historyBarriers = this.#modificationTracker.getUncommittedHistoryBarriers();
+    if (historyBarriers.some(entry => entry.undoBarrierKind !== 'persistent_pragma')) {
       const message = vsc.l10n.t(
         'The prior value was not retained for an oversized-cell replacement. ' +
         'File Revert cannot cross that edit; save the database first to establish a new baseline.'
@@ -721,13 +729,22 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     }
     let invalidatedByRecoveryReload = false;
     try {
-      // Revert mutates the live engine by replaying retained history; it never
-      // serializes a whole database image, including for paged documents.
-      await revertDatabaseToSaved(
-        this.databaseOperations,
-        this.#modificationTracker,
-        cancelTokenToAbortSignal(cancellation)
-      );
+      if (historyBarriers.length > 0) {
+        // Persistent PRAGMAs are deliberately forward-only: auto_vacuum in
+        // particular cannot always be restored by assigning the prior value.
+        // File Revert can safely discard the overlay by reopening saved bytes.
+        await this.#reloadFromDisk();
+        this.#modificationTracker.rollbackToCheckpoint();
+        invalidatedByRecoveryReload = true;
+      } else {
+        // Revert mutates the live engine by replaying retained history; it never
+        // serializes a whole database image, including for paged documents.
+        await revertDatabaseToSaved(
+          this.databaseOperations,
+          this.#modificationTracker,
+          cancelTokenToAbortSignal(cancellation)
+        );
+      }
     } catch (error) {
       if (!isInvocationTimeoutError(error)) throw error;
 
@@ -814,6 +831,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     return this.connectionState.isReadOnly ?? false;
   }
 
+  /** True only while edits can persist through the page-on-demand overlay. */
+  get isPagedWritableMode(): boolean {
+    return this.connectionState.storage === 'paged' && !this.isReadOnlyMode;
+  }
+
   /** Snapshot for the non-production desktop host-integration API. */
   async getDesktopTestState(): Promise<DesktopTestDocumentState> {
     const engineKind = await this.databaseOperations.engineKind;
@@ -839,6 +861,22 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * Reload database from disk.
    */
   async reloadFromDisk(): Promise<DatabaseOperations> {
+    if (this.#pagedSaveRecoveryRequired) {
+      // The atomic rename already committed the saved image. The stale engine
+      // cannot be mutated while #pagedSaveExclusive remains raised, so this one
+      // disk reopen is safe by construction and is the recovery prescribed by
+      // the post-save error. Claim the attempt before awaiting so concurrent
+      // Reload requests still hit the ordinary exclusive barrier.
+      this.#pagedSaveRecoveryRequired = false;
+      try {
+        const reloaded = await this.#reloadFromDisk();
+        this.#endPagedSaveExclusive();
+        return reloaded;
+      } catch (error) {
+        this.#pagedSaveRecoveryRequired = true;
+        throw error;
+      }
+    }
     return this.runTrackedMutation(() => this.#reloadFromDisk());
   }
 

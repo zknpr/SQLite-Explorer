@@ -38,6 +38,72 @@ describe('HostBridge', () => {
         assert.deepStrictEqual(consumer.rows[0][0], bytes);
     });
 
+    it('tracks only database-persistent PRAGMAs for writable paged documents', async () => {
+        const pragmas: Record<string, unknown> = {
+            journal_mode: 'delete',
+            auto_vacuum: 0,
+            foreign_keys: 0,
+            synchronous: 2,
+            cache_size: -2000,
+            locking_mode: 'normal',
+            temp_store: 0
+        };
+        const recorded: any[] = [];
+        const databaseOperations = {
+            getPragmas: async () => ({ ...pragmas }),
+            setPragma: async (pragma: string, value: unknown) => {
+                pragmas[pragma] = value;
+            }
+        };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            {
+                databaseOperations,
+                isReadOnlyMode: false,
+                isPagedWritableMode: true,
+                runTrackedMutation: async (operation: () => unknown) => await operation(),
+                recordExternalModification: (entry: unknown) => recorded.push(entry)
+            } as any
+        );
+
+        await bridge.setPragma('journal_mode', 'WAL');
+        await bridge.setPragma('auto_vacuum', 1);
+        await bridge.setPragma('foreign_keys', 1);
+        await bridge.setPragma('synchronous', 1);
+        await bridge.setPragma('cache_size', -1000);
+        await bridge.setPragma('locking_mode', 'EXCLUSIVE');
+        await bridge.setPragma('temp_store', 2);
+
+        assert.deepStrictEqual(
+            recorded.map(entry => ({
+                modificationType: entry.modificationType,
+                targetPragma: entry.targetPragma,
+                priorValue: entry.priorValue,
+                newValue: entry.newValue,
+                undoPolicy: entry.undoPolicy,
+                undoBarrierKind: entry.undoBarrierKind
+            })),
+            [
+                {
+                    modificationType: 'pragma_update',
+                    targetPragma: 'journal_mode',
+                    priorValue: 'delete',
+                    newValue: 'WAL',
+                    undoPolicy: 'barrier',
+                    undoBarrierKind: 'persistent_pragma'
+                },
+                {
+                    modificationType: 'pragma_update',
+                    targetPragma: 'auto_vacuum',
+                    priorValue: 0,
+                    newValue: 1,
+                    undoPolicy: 'barrier',
+                    undoBarrierKind: 'persistent_pragma'
+                }
+            ]
+        );
+    });
+
     it('rejects every cell/row mutation for an oversized primary-key identity with its precise reason', async () => {
         const reason = 'Row is read-only because primary-key column "key" is 32 bytes.';
         const rowId = encodeReadOnlyPrimaryKeyRecordId(reason, 0);

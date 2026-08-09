@@ -142,6 +142,8 @@ let db = null;
 let SQL = null;
 let queryTimeout = DEFAULT_QUERY_TIMEOUT_MS;
 let readOnlyMode = false;
+/** User-facing explanation when safety policy forces a read-only open. */
+let readOnlyReason = null;
 /**
  * How the active database is backed: 'memory' (bytes in the WASM-side
  * filesystem — today's buffer path) or 'paged' (page-on-demand reads
@@ -698,6 +700,7 @@ async function initializeDatabase(filename, config) {
     ? config.queryTimeout
     : DEFAULT_QUERY_TIMEOUT_MS;
   readOnlyMode = config.readOnlyMode === true;
+  readOnlyReason = null;
   storageMode = 'memory';
   pagedFileSizeBytes = 0;
   pagedExportMaxBytes = resolvePagedExportMaxBytes(config.pagedExportMaxBytes);
@@ -752,7 +755,8 @@ async function initializeDatabase(filename, config) {
   return {
     operations: {},
     isReadOnly: readOnlyMode,
-    storage: storageMode
+    storage: storageMode,
+    ...(readOnlyReason ? { readOnlyReason } : {})
   };
 }
 
@@ -788,12 +792,22 @@ function openDatabaseFromFile(file, limits) {
   let plan = decideOpenPlan(input, limits);
   let pagedFailure = null;
   if (plan.mode === 'paged') {
+    const writablePagedMaxBytes = Math.min(
+      pagedExportMaxBytes,
+      limits.bufferCeilingBytes ?? BUFFER_OPEN_CEILING_BYTES
+    );
+    const exceedsWritableSaveLimit = file.size > writablePagedMaxBytes;
+    const forcedReadOnlyReason = !readOnlyMode && exceedsWritableSaveLimit
+      ? `This database exceeds the ${writablePagedMaxBytes}-byte browser save limit ` +
+        'and is open read-only so edits cannot be stranded. Use the desktop extension ' +
+        'to edit and save it.'
+      : null;
     // Both VFS variants use exactly the same guarded/cached reader. The
     // writable fork layers changed pages in host memory; base reads remain
     // pinned to the File snapshot captured above.
     const hostIo = createFileHostIo(file, reader);
     const failures = [];
-    if (canOpenPagedWritable) {
+    if (canOpenPagedWritable && !exceedsWritableSaveLimit) {
       try {
         db = SQL.Database.openPagedWritable(hostIo);
         pagedFileSizeBytes = file.size;
@@ -808,6 +822,10 @@ function openDatabaseFromFile(file, limits) {
       try {
         db = SQL.Database.openPaged(hostIo);
         readOnlyMode = true;
+        // Download is the demo's only persistence path. Publish the notice only
+        // after the read-only fallback actually wins; a safe buffer fallback may
+        // still remain available under test-configured limits.
+        readOnlyReason = forcedReadOnlyReason;
         pagedFileSizeBytes = file.size;
         return 'paged';
       } catch (error) {

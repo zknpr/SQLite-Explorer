@@ -22,6 +22,35 @@ describe('WasmDatabaseEngine', () => {
         await engine.executeQuery("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, data TEXT)");
     });
 
+    it('replays persistent PRAGMA history for hot-exit and refuses in-memory undo', async () => {
+        const opened = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const pragmaEngine = opened.operations!;
+        const modification: ModificationEntry = {
+            description: 'Set PRAGMA auto_vacuum',
+            modificationType: 'pragma_update',
+            targetPragma: 'auto_vacuum',
+            priorValue: 0,
+            newValue: 1,
+            undoPolicy: 'barrier',
+            undoBarrierKind: 'persistent_pragma'
+        };
+        try {
+            assert.strictEqual((await pragmaEngine.getPragmas()).auto_vacuum, 0);
+            await pragmaEngine.applyModifications([modification]);
+            assert.strictEqual((await pragmaEngine.getPragmas()).auto_vacuum, 1);
+            await assert.rejects(
+                pragmaEngine.undoModification(modification),
+                /forward-only history barrier/i
+            );
+        } finally {
+            (pragmaEngine as any).shutdown?.();
+        }
+    });
+
     it('should update multiple cells in a batch', async () => {
         // Setup initial data
         await engine.executeQuery("DELETE FROM users");

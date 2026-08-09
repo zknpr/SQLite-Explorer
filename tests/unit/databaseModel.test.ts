@@ -709,6 +709,54 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         assert.strictEqual(doc.connectionGeneration, 1, 'in-flight pre-save mutations remain invalidated');
     });
 
+    for (const operation of ['save', 'saveAs'] as const) {
+        it(`${operation}: Reload recovers a paged session after rename succeeds but reconnect fails`, async () => {
+            const replacementOps = {
+                engineKind: Promise.resolve('wasm' as const),
+                ping: async () => true
+            };
+            let reconnectCalls = 0;
+            const doc = createDocBypassingFactory(
+                {
+                    engineKind: Promise.resolve('wasm' as const),
+                    ping: async () => true,
+                    writeToFile: async () => ({ requiresReopen: true }),
+                    serializeDatabase: async () => {
+                        throw new Error('paged recovery must not materialize a fallback image');
+                    }
+                },
+                createFileUri('/test/paged-recovery.db'),
+                async () => {
+                    reconnectCalls++;
+                    if (reconnectCalls === 1) {
+                        throw new Error('synthetic post-rename reconnect failure');
+                    }
+                    return { databaseOps: replacementOps, isReadOnly: false, storage: 'paged' };
+                },
+                { initialStorage: 'paged' }
+            );
+
+            const save = operation === 'save'
+                ? () => doc.save()
+                : () => doc.saveAs(createFileUri('/test/paged-recovery-alias.db'), undefined);
+            await assert.rejects(save, /database was saved.*reload the document/i);
+            await assert.rejects(
+                doc.runTrackedMutation(async () => 'ordinary mutation'),
+                /temporarily read-only.*save is in progress/i
+            );
+
+            const refreshed = await doc.hostBridge.refreshFile();
+            assert.strictEqual(refreshed.connected, true);
+            assert.strictEqual(doc.databaseOperations, replacementOps);
+            assert.strictEqual(doc.isReadOnlyMode, false);
+            assert.strictEqual(
+                await doc.runTrackedMutation(async () => 'mutations restored'),
+                'mutations restored'
+            );
+            assert.strictEqual(reconnectCalls, 2);
+        });
+    }
+
     it('saveAs: writes a paged merged image directly without reopening the base', async () => {
         let writtenPath: string | undefined;
         let serializeCalled = false;
@@ -1475,6 +1523,38 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         } finally {
             mockVscode.window.showWarningMessage = originalShowWarningMessage;
         }
+    });
+
+    it('File Revert discards a persistent-PRAGMA barrier by reopening saved bytes', async () => {
+        let discardCalls = 0;
+        const originalOps = {
+            engineKind: Promise.resolve('wasm' as const),
+            discardModifications: async () => { discardCalls++; }
+        };
+        const replacementOps = { engineKind: Promise.resolve('wasm' as const) };
+        const doc = createDocBypassingFactory(
+            originalOps,
+            createFileUri('/test/paged-pragma-revert.db'),
+            async () => ({ databaseOps: replacementOps, isReadOnly: false, storage: 'paged' }),
+            { initialStorage: 'paged' }
+        );
+        doc.recordModification({
+            label: 'Change PRAGMA auto_vacuum',
+            description: 'Set PRAGMA auto_vacuum',
+            modificationType: 'pragma_update',
+            targetPragma: 'auto_vacuum',
+            priorValue: 0,
+            newValue: 1,
+            undoPolicy: 'barrier',
+            undoBarrierKind: 'persistent_pragma'
+        });
+        assert.strictEqual((await doc.getDesktopTestState()).dirty, true);
+
+        await doc.revert(undefined);
+
+        assert.strictEqual(discardCalls, 0);
+        assert.strictEqual(doc.databaseOperations, replacementOps);
+        assert.strictEqual((await doc.getDesktopTestState()).dirty, false);
     });
 
     it('invalidates every open view document after File Revert', async () => {

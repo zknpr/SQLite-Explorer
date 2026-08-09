@@ -6,6 +6,7 @@ import {
   type PagedFileIdentity,
   type PagedWritableOverlaySnapshot
 } from './core/paged-writable-overlay';
+import { WAL_HEADER_SIZE_BYTES } from './core/paged-open';
 
 type NodeFs = typeof import('fs');
 type NodeFileHandle = Awaited<ReturnType<NodeFs['promises']['open']>>;
@@ -350,6 +351,31 @@ function assertTemporaryGenerationSync(
 }
 
 /**
+ * The paged-open path already rejects a frame-bearing sibling WAL before and
+ * after opening the frozen base. Recheck at the commit boundary as well: WAL
+ * frames live outside the main file, so a late external commit must block the
+ * rename even when the main-file metadata gate cannot observe it.
+ */
+function assertNoSiblingWalFramesSync(fs: NodeFs, activeBasePath: string): void {
+  const walPath = `${activeBasePath}-wal`;
+  let walSize: bigint;
+  try {
+    walSize = fs.statSync(walPath, { bigint: true }).size;
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return;
+    throw new Error(
+      'Cannot verify sibling WAL state before replacing the database; reload the document.',
+      { cause: error }
+    );
+  }
+  if (walSize > BigInt(WAL_HEADER_SIZE_BYTES)) {
+    throw new Error(
+      'A sibling WAL acquired uncheckpointed frames during save; reload the document before retrying.'
+    );
+  }
+}
+
+/**
  * Final replacement gate. Every operation is synchronous so no extension-host
  * task can interleave after a successful check and before renameSync.
  */
@@ -379,6 +405,7 @@ function commitReplacementSync(
   ) {
     throw new Error(PAGED_FILE_CHANGED_MESSAGE);
   }
+  assertNoSiblingWalFramesSync(fs, activeBasePath);
   fs.renameSync(temporaryPath, target.replacementPath);
 }
 

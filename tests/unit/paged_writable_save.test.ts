@@ -547,6 +547,45 @@ describe('paged writable host save', () => {
     assert.ok(!fs.readdirSync(fixtureDir).some(name => name.includes('toctou-target.db.sqlite-explorer')));
   });
 
+  it('aborts when a frame-bearing WAL appears at the final replacement gate', async () => {
+    const basePath = path.join(fixtureDir, 'late-wal-base.db');
+    const targetPath = path.join(fixtureDir, 'late-wal-target.db');
+    const walPath = `${basePath}-wal`;
+    const original = Buffer.alloc(64, 3);
+    fs.writeFileSync(basePath, original);
+    const snapshot = snapshotFor(basePath, { runs: [], dirtyBytes: 0 });
+    let walCreated = false;
+    let renameCalls = 0;
+    const capability = capabilityWithOpen(fs.promises.open, {}, {
+      statSync: ((...args: Parameters<typeof fs.statSync>) => {
+        const stats = (fs.statSync as any)(...args);
+        if (!walCreated && String(args[0]) === basePath) {
+          // Model the external writer winning the race after the main-file
+          // identity check but before the synchronous rename.
+          fs.writeFileSync(walPath, Buffer.alloc(33, 7));
+          walCreated = true;
+        }
+        return stats;
+      }) as typeof fs.statSync,
+      renameSync: ((...args: Parameters<typeof fs.renameSync>) => {
+        renameCalls++;
+        return fs.renameSync(...args);
+      }) as typeof fs.renameSync
+    });
+
+    await assert.rejects(
+      writePagedWritableOverlayToFile(capability, basePath, targetPath, snapshot),
+      /WAL.*uncheckpointed frames.*reload/i
+    );
+
+    assert.strictEqual(walCreated, true);
+    assert.strictEqual(renameCalls, 0);
+    assert.deepStrictEqual(fs.readFileSync(basePath), original);
+    assert.strictEqual(fs.existsSync(targetPath), false);
+    assert.strictEqual(fs.statSync(walPath).size, 33, 'the external WAL must never be deleted');
+    assert.ok(!fs.readdirSync(fixtureDir).some(name => name.includes('late-wal-target.db.sqlite-explorer')));
+  });
+
   it('refuses an in-place temp chmod after close with the same inode and size', async () => {
     const basePath = path.join(fixtureDir, 'temp-swap-base.db');
     const targetPath = path.join(fixtureDir, 'temp-swap-target.db');

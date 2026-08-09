@@ -594,11 +594,24 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     return this.timeline.at(-1)?.undoPolicy === 'barrier';
   }
 
+  /** The forward-only entry currently stopping Undo, when present. */
+  get undoBlockingEntry(): T | undefined {
+    const entry = this.timeline.at(-1);
+    return entry?.undoPolicy === 'barrier' ? entry : undefined;
+  }
+
   /** True while File Revert would have to cross a prior value we did not retain. */
   get hasUncommittedHistoryBarrier(): boolean {
     return this.timeline
       .slice(this.checkpointIndex)
       .some(entry => entry.undoPolicy === 'barrier');
+  }
+
+  /** Unsaved forward-only entries that File Revert would need to cross. */
+  getUncommittedHistoryBarriers(): T[] {
+    return this.timeline
+      .slice(this.checkpointIndex)
+      .filter(entry => entry.undoPolicy === 'barrier');
   }
 
   /**

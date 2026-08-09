@@ -540,20 +540,38 @@ describe('web demo worker File opens', () => {
         await harness.invoke('runQuery', 'ROLLBACK');
     });
 
-    it('caps a merged paged download before materializing an unsafe full image', async () => {
-        const harness = await createPagedHarness({ openPagedWritable: 'working' });
-        await harness.invoke(
+    it('opens a database above the browser save ceiling paged and read-only', async () => {
+        const harness = await createPagedHarness({
+            openPagedWritable: 'working',
+            openPaged: 'working'
+        });
+        const saveCeiling = plainDbBytes.length - 1;
+        const result = await harness.invoke(
             'initializeDatabase',
             'large.db',
             initConfig({
                 file: new StubFile(plainDbBytes, 'large.db'),
-                ...limitsAboveThreshold(plainDbBytes),
-                pagedExportMaxBytes: plainDbBytes.length - 1
+                pagedOpenThresholdBytes: plainDbBytes.length - 2,
+                bufferOpenCeilingBytes: saveCeiling,
+                pagedExportMaxBytes: saveCeiling
             })
         );
+        const normalizedResult = normalize(result) as any;
+        assert.deepStrictEqual(
+            {
+                operations: normalizedResult.operations,
+                isReadOnly: normalizedResult.isReadOnly,
+                storage: normalizedResult.storage
+            },
+            { operations: {}, isReadOnly: true, storage: 'paged' }
+        );
+        assert.match(normalizedResult.readOnlyReason, /browser save limit.*read-only/i);
+        assert.strictEqual(harness.openPagedWritableCalls, 0);
+        assert.strictEqual(harness.openPagedCalls, 1);
+        assert.ok(harness.pagedSql.includes('PRAGMA query_only = ON'));
         await assert.rejects(
-            harness.invoke('exportDatabase', 'main'),
-            /cannot download.*merged image.*browser memory limit/i
+            harness.invoke('updateCell', 'fixtures', 1, 'label', 'unsavable edit'),
+            /read-only/i
         );
     });
 

@@ -31,7 +31,8 @@ jobs:
         run: npm ci
 
       - name: Build and package all extension targets
-        run: npm run package
+        # package-vsix checks this before invoking the build or creating artifacts.
+        run: npm run package -- --expected-version "${GITHUB_REF_NAME#v}"
 
       - name: Extract version from tag
         id: version
