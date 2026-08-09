@@ -2153,37 +2153,41 @@ async function deleteRows(table, rowIds) {
     }
   }
 
-  const validIds = rowIds.map(validateRowId);
-  const placeholders = validIds.map(() => '?').join(', ');
+  const predicates = buildRecordIdentityPredicateChunks(rowIds, { kind: 'rowid' });
   const savepointName = createViewSavepointName('sp_delete_rowid_rows');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     const insertableColumns = getInsertableColumnNames(table);
-    const current = db.exec(
-      `SELECT CAST(rowid AS TEXT), ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
-      `FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
-      normalizeBindParams(validIds),
-      { useBigInt: true }
-    )[0];
-    const deletedRows = (current?.values ?? []).map(row => {
-      const deletedRowId = validateRowId(row[0]);
-      return {
-        rowId: deletedRowId,
-        row: {
-          ...Object.fromEntries(
-            insertableColumns.map((column, index) => [column, row[index + 1]])
-          ),
-          rowid: deletedRowId
-        }
-      };
-    });
-    if (deletedRows.length !== validIds.length) {
+    const deletedRows = [];
+    for (const predicate of predicates) {
+      const current = db.exec(
+        `SELECT CAST(rowid AS TEXT), ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+        `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+        normalizeBindParams(predicate.params),
+        { useBigInt: true }
+      )[0];
+      deletedRows.push(...(current?.values ?? []).map(row => {
+        const deletedRowId = validateRowId(row[0]);
+        return {
+          rowId: deletedRowId,
+          row: {
+            ...Object.fromEntries(
+              insertableColumns.map((column, index) => [column, row[index + 1]])
+            ),
+            rowid: deletedRowId
+          }
+        };
+      }));
+    }
+    if (deletedRows.length !== rowIds.length) {
       throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
     }
-    db.run(
-      `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
-      normalizeBindParams(validIds)
-    );
+    for (const predicate of predicates) {
+      db.run(
+        `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+        normalizeBindParams(predicate.params)
+      );
+    }
     runSingleStatement(`RELEASE ${savepointName}`);
     return deletedRows;
   } catch (error) {

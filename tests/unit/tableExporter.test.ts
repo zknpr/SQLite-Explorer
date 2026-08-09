@@ -13,7 +13,7 @@ import {
     getFormatHelper,
     streamTableExport
 } from '../../src/tableExporter';
-import { CellValue, DatabaseOperations, ExportOptions } from '../../src/core/types';
+import { CellValue, DatabaseOperations, ExportOptions, RecordId } from '../../src/core/types';
 import { mockVscode } from './mocks/vscode';
 import { DocumentRegistry } from '../../src/documentRegistry';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
@@ -851,6 +851,46 @@ describe('streamTableExport cell boundaries', () => {
                 ),
                 /has no stable row identity/
             );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('chunks a selected rowid export above the SQLite bind limit without gaps or duplicates', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        const selectedRowIds: RecordId[] = Array.from(
+            { length: 32_768 },
+            (_, index) => 32_768 - index
+        );
+        // Preserve the prior IN-predicate behavior for repeated aliases while
+        // forcing the duplicate to straddle the chunk boundary.
+        selectedRowIds.push('1');
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_wide_rowid_selection (value INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 32768' +
+            ') INSERT INTO stage_e_wide_rowid_selection SELECT value FROM ids'
+        );
+
+        try {
+            const exported = await collectStreamingExport(
+                operations,
+                'stage_e_wide_rowid_selection',
+                ['value'],
+                { format: 'csv', rowIds: selectedRowIds }
+            );
+            const values = exported.content.split('\n').slice(1);
+            assert.strictEqual(exported.rowCount, 32_768);
+            assert.strictEqual(values.length, 32_768);
+            assert.strictEqual(new Set(values).size, 32_768);
+            for (let index = 0; index < values.length; index++) {
+                assert.strictEqual(values[index], String(index + 1));
+            }
         } finally {
             (operations as WasmDatabaseEngine).shutdown();
         }

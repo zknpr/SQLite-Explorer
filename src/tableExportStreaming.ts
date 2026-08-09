@@ -10,7 +10,7 @@ import type {
   TableIdentity
 } from './core/types';
 import { crypto as webCrypto } from './platform/cryptoShim';
-import { escapeIdentifier } from './core/sql-utils';
+import { escapeIdentifier, validateRowId } from './core/sql-utils';
 import { normalizeCellTextEncoding } from './core/cell-read';
 import {
   encodeCsvExportCell,
@@ -20,6 +20,7 @@ import {
 } from './core/export-encoding';
 import {
   buildRecordIdentityPredicate,
+  buildRecordIdentityPredicateChunks,
   buildRecordIdentitiesPredicate,
   isPrimaryKeyRecordId,
   isReadOnlyPrimaryKeyRecordId
@@ -259,6 +260,24 @@ function recordIdKey(recordId: RecordId): string {
   return `${typeof recordId}:${String(recordId)}`;
 }
 
+function sortUniqueRowIdsForExport(recordIds: readonly RecordId[]): RecordId[] {
+  const seen = new Set<string>();
+  const unique: RecordId[] = [];
+  for (const recordId of recordIds) {
+    const normalized = validateRowId(recordId);
+    const key = String(normalized);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(normalized);
+  }
+  unique.sort((left, right) => {
+    const leftInteger = BigInt(left);
+    const rightInteger = BigInt(right);
+    return leftInteger < rightInteger ? -1 : leftInteger > rightInteger ? 1 : 0;
+  });
+  return unique;
+}
+
 async function* readRowIdTableRows(
   operations: DatabaseOperations,
   table: string,
@@ -268,43 +287,48 @@ async function* readRowIdTableRows(
   cancellation?: ExportCancellation
 ): AsyncGenerator<ExportRow> {
   const projection = buildCellProjection(columns, EXPORT_INLINE_TEXT_BYTES, false);
-  const selected = selectedRowIds.length > 0
-    ? buildRecordIdentitiesPredicate(selectedRowIds, { kind: 'rowid' })
-    : undefined;
-  let lastId: RecordId | undefined;
+  const selectedPredicates = selectedRowIds.length > 0
+    ? buildRecordIdentityPredicateChunks(
+      sortUniqueRowIdsForExport(selectedRowIds),
+      { kind: 'rowid' }
+    )
+    : [undefined];
 
-  while (true) {
-    assertNotCancelled(cancellation);
-    const predicates: string[] = [];
-    const params: CellValue[] = [];
-    if (lastId !== undefined) {
-      predicates.push('rowid > ?');
-      params.push(lastId);
-    }
-    if (selected) {
-      predicates.push(`(${selected.sql})`);
-      params.push(...selected.params);
-    }
-    let sql =
-      `SELECT CAST(rowid AS TEXT) AS ${escapeIdentifier('__export_rowid__')}` +
-      (projection ? `, ${projection}` : '') +
-      ` FROM ${escapeIdentifier(table)}`;
-    if (predicates.length > 0) sql += ` WHERE ${predicates.join(' AND ')}`;
-    sql += ` ORDER BY rowid ASC LIMIT ${EXPORT_ROW_BATCH_SIZE}`;
-
-    const result = await operations.executeQuery(sql, params);
-    const rows = result[0]?.rows ?? [];
-    if (rows.length === 0) return;
-    for (const row of rows) {
+  for (const selected of selectedPredicates) {
+    let lastId: RecordId | undefined;
+    while (true) {
       assertNotCancelled(cancellation);
-      const rowId = row[0];
-      if (typeof rowId !== 'string' && typeof rowId !== 'number') {
-        throw new Error(`SQLite returned an invalid rowid for ${table}`);
+      const predicates: string[] = [];
+      const params: CellValue[] = [];
+      if (lastId !== undefined) {
+        predicates.push('rowid > ?');
+        params.push(lastId);
       }
-      lastId = rowId;
-      yield { cells: parseCells(table, columns, row, 1, textEncoding, rowId) };
+      if (selected) {
+        predicates.push(`(${selected.sql})`);
+        params.push(...selected.params);
+      }
+      let sql =
+        `SELECT CAST(rowid AS TEXT) AS ${escapeIdentifier('__export_rowid__')}` +
+        (projection ? `, ${projection}` : '') +
+        ` FROM ${escapeIdentifier(table)}`;
+      if (predicates.length > 0) sql += ` WHERE ${predicates.join(' AND ')}`;
+      sql += ` ORDER BY rowid ASC LIMIT ${EXPORT_ROW_BATCH_SIZE}`;
+
+      const result = await operations.executeQuery(sql, params);
+      const rows = result[0]?.rows ?? [];
+      if (rows.length === 0) break;
+      for (const row of rows) {
+        assertNotCancelled(cancellation);
+        const rowId = row[0];
+        if (typeof rowId !== 'string' && typeof rowId !== 'number') {
+          throw new Error(`SQLite returned an invalid rowid for ${table}`);
+        }
+        lastId = rowId;
+        yield { cells: parseCells(table, columns, row, 1, textEncoding, rowId) };
+      }
+      if (rows.length < EXPORT_ROW_BATCH_SIZE) break;
     }
-    if (rows.length < EXPORT_ROW_BATCH_SIZE) return;
   }
 }
 

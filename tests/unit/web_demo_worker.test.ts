@@ -15,7 +15,7 @@ import {
     fromCellEditRpcErrorData
 } from '../../src/core/cell-edit-policy';
 import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
-import type { PrimaryKeyColumn } from '../../src/core/types';
+import type { PrimaryKeyColumn, RecordId } from '../../src/core/types';
 
 interface WorkerHarness {
     invoke(method: string, ...payload: unknown[]): Promise<any>;
@@ -529,6 +529,29 @@ describe('web demo view worker', () => {
         assert.strictEqual(new Set(values).size, 5000);
         assert.ok(values.includes('row-1'));
         assert.ok(values.includes('row-5000'));
+    });
+
+    it('chunks a demo rowid delete above the SQLite bind limit', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_bulk_rowid_delete (value INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 32768' +
+            ') INSERT INTO demo_bulk_rowid_delete SELECT value FROM ids'
+        );
+        const rowIds = Array.from({ length: 32_768 }, (_, index) => index + 1);
+
+        const deleted = await worker.invoke('deleteRows', 'demo_bulk_rowid_delete', rowIds);
+        assert.strictEqual(deleted.length, 32_768);
+        assert.strictEqual(new Set(deleted.map((row: { rowId: RecordId }) => (
+            String(row.rowId)
+        ))).size, 32_768);
+        const remaining = await worker.invoke(
+            'runQuery',
+            'SELECT count(*) FROM demo_bulk_rowid_delete'
+        );
+        assert.deepStrictEqual(remaining[0].rows, [[0]]);
     });
 
     it('preserves an untouched unsafe typeless key member across guarded replacement and PK edits', async () => {

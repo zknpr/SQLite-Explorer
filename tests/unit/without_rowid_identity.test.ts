@@ -838,6 +838,31 @@ describe('WITHOUT ROWID primary-key identity', () => {
         assert.strictEqual(await engine.fetchTableCount('bulk_single', {}), 0);
     });
 
+    it('chunks a rowid delete above the SQLite bind limit atomically', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE bulk_rowid_delete (value INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 32768' +
+            ') INSERT INTO bulk_rowid_delete SELECT value FROM ids'
+        );
+        const rowIds = Array.from({ length: 32_768 }, (_, index) => index + 1);
+
+        await assert.rejects(
+            engine.deleteRows('bulk_rowid_delete', [...rowIds, 32_769]),
+            /one or more row identities no longer exist/
+        );
+        assert.strictEqual(
+            await engine.fetchTableCount('bulk_rowid_delete', {}),
+            32_768,
+            'a missing identity in the final chunk must leave every row intact'
+        );
+
+        const deleted = await engine.deleteRows('bulk_rowid_delete', rowIds);
+        assert.strictEqual(deleted?.length, 32_768);
+        assert.strictEqual(new Set(deleted?.map(row => String(row.rowId))).size, 32_768);
+        assert.strictEqual(await engine.fetchTableCount('bulk_rowid_delete', {}), 0);
+    });
+
     it('bulk-deletes 1000 rows through a composite primary key', async () => {
         await engine.executeQuery(
             'CREATE TABLE bulk_composite (' +

@@ -51,7 +51,7 @@ import type {
   OversizedCellMetadata,
   ColumnDropTableState
 } from './core/types';
-import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
+import { escapeIdentifier, validateSqlType, validateRowId } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
 import {
   computeKeysetKey,
@@ -2176,32 +2176,36 @@ export async function createNativeDatabaseConnection(
 
           // Snapshot rowid rows atomically and return the same replay payload
           // shape as primary-key deletion.
-          const validIds = validateRowIds(rowIds);
-          const placeholders = validIds.map(() => '?').join(', ');
+          const predicates = buildRecordIdentityPredicateChunks(rowIds, { kind: 'rowid' });
           const savepointName = createSavepointName('sp_delete_rowid_rows');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
             const insertableColumns = await getNativeInsertableColumnNames(table);
-            const current = await worker.call<NativeQueryResult>('query', [
-              `SELECT CAST(rowid AS TEXT), ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
-              `FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
-              validIds
-            ]);
-            const deletedRows = current.values.map(row => {
-              const deletedRowId = validateRowId(row[0] as RecordId | bigint);
-              const rowData: Record<string, CellValue> = Object.fromEntries(
-                insertableColumns.map((column, index) => [column, row[index + 1]])
-              );
-              rowData.rowid = deletedRowId;
-              return { rowId: deletedRowId, row: rowData };
-            });
-            if (deletedRows.length !== validIds.length) {
+            const deletedRows: DeletedRow[] = [];
+            for (const predicate of predicates) {
+              const current = await worker.call<NativeQueryResult>('query', [
+                `SELECT CAST(rowid AS TEXT), ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+                `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+                predicate.params
+              ]);
+              deletedRows.push(...current.values.map(row => {
+                const deletedRowId = validateRowId(row[0] as RecordId | bigint);
+                const rowData: Record<string, CellValue> = Object.fromEntries(
+                  insertableColumns.map((column, index) => [column, row[index + 1]])
+                );
+                rowData.rowid = deletedRowId;
+                return { rowId: deletedRowId, row: rowData };
+              }));
+            }
+            if (deletedRows.length !== rowIds.length) {
               throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
             }
-            await worker.call('run', [
-              `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`,
-              validIds
-            ]);
+            for (const predicate of predicates) {
+              await worker.call('run', [
+                `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+                predicate.params
+              ]);
+            }
             await worker.call('run', [`RELEASE ${savepointName}`]);
             return deletedRows;
           } catch (error) {
