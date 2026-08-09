@@ -121,6 +121,10 @@ import {
   OversizedCellReplacementRequiredError
 } from './core/cell-edit-policy';
 import {
+  assertBatchPriorLimitResult,
+  buildBatchPriorLimitQueries
+} from './core/batch-update';
+import {
   assertColumnDropTableStateCurrent,
   buildColumnDropRestorePlan,
   COLUMN_DROP_TABLE_STATE_SQL,
@@ -1063,6 +1067,28 @@ export async function createNativeDatabaseConnection(
             identity
           );
         }
+      };
+
+      const assertNativeRowIdBatchPriorsWithinEditLimit = async (
+        table: string,
+        updates: readonly CellUpdate[],
+        editLimitBytes: number
+      ): Promise<void> => {
+        const queries = buildBatchPriorLimitQueries(table, updates, editLimitBytes);
+        const metadata = await worker.call<NativeQueryBatchResult>('queryBatch', [
+          queries.map(({ sql, params }) => ({ sql, params }))
+        ]);
+        if (metadata.results?.length !== queries.length) {
+          throw new Error('Batch prior metadata fetch returned incomplete results');
+        }
+        queries.forEach((query, index) => {
+          assertBatchPriorLimitResult(
+            table,
+            query,
+            metadata.results[index].values ?? [],
+            editLimitBytes
+          );
+        });
       };
 
       const queryNativeSingleStatement = async <T>(
@@ -2787,11 +2813,10 @@ export async function createNativeDatabaseConnection(
 
           try {
           if (!isHistoryReplay && maxEditValueBytes !== undefined) {
-            await assertNativeBatchPriorsWithinEditLimit(
+            await assertNativeRowIdBatchPriorsWithinEditLimit(
               table,
               updates,
-              editLimitBytes,
-              { kind: 'rowid' }
+              editLimitBytes
             );
           }
           const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];

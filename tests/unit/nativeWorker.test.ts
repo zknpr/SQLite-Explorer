@@ -465,8 +465,16 @@ describe('createNativeDatabaseConnection', () => {
         const patch = JSON.stringify({ b: 'y'.repeat(32) });
         const limit = 64;
         const connection = await createRecordingConnection(call => {
-            if (call.method === 'getCellMetadata') {
-                return { result: { storageClass: 'text', byteLength: prior.length } };
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [unknown[]];
+                return {
+                    result: {
+                        results: queries.map(() => ({
+                            columns: ['storage_class', 'byte_length'],
+                            values: []
+                        }))
+                    }
+                };
             }
             if (call.method === 'query') {
                 return { result: { columns: ['rowid', 'payload'], values: [[1, prior]] } };
@@ -492,6 +500,107 @@ describe('createNativeDatabaseConnection', () => {
                 connection.calls.some(call => call.method === 'execBatch'),
                 false,
                 'native mutation must not run after the policy refusal'
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('preflights bounded rowid batches in one worker round trip', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'open') return { result: { success: true } };
+            if (call.method === 'run' || call.method === 'execBatch') {
+                return { result: { changes: 1, lastInsertRowId: 1 } };
+            }
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [Array<{ sql: string; params: unknown[] }>];
+                return {
+                    result: {
+                        results: queries.map(() => ({
+                            columns: ['storage_class', 'byte_length'],
+                            values: []
+                        }))
+                    }
+                };
+            }
+            if (call.method === 'query') {
+                return {
+                    result: {
+                        columns: ['rowid', 'left_value', 'right_value'],
+                        values: [
+                            [1, 'left-1', 'right-1'],
+                            [2, 'left-2', 'right-2'],
+                            [3, 'left-3', 'right-3']
+                        ]
+                    }
+                };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+        try {
+            connection.calls.length = 0;
+            const outcomes = await connection.databaseOps.updateCellBatch(
+                'native_batch_preflight',
+                [1, 2, 3].flatMap(rowId => [
+                    { rowId, column: 'left_value', value: 'same-left' },
+                    { rowId, column: 'right_value', value: 'same-right' }
+                ]),
+                1024
+            );
+
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['run', 'queryBatch', 'query', 'execBatch', 'run']
+            );
+            const preflightCall = connection.calls[1];
+            const [queries] = preflightCall.args as [Array<{ sql: string; params: unknown[] }>];
+            assert.strictEqual(queries.length, 2);
+            assert.ok(queries.every(query => /rowid\s+IN\s*\(/i.test(query.sql)));
+            assert.ok(queries.some(query => /"left_value"/.test(query.sql)));
+            assert.ok(queries.some(query => /"right_value"/.test(query.sql)));
+            assert.strictEqual(outcomes.length, 6);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('refuses an oversized native batch prior before reading values or writing', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'open') return { result: { success: true } };
+            if (call.method === 'run') return { result: { changes: 0 } };
+            if (call.method === 'queryBatch') {
+                return {
+                    result: {
+                        results: [{
+                            columns: ['storage_class', 'byte_length'],
+                            values: [['blob', 2048]]
+                        }]
+                    }
+                };
+            }
+            throw new Error(`unexpected native call: ${call.method}`);
+        });
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.updateCellBatch(
+                    'native_batch_oversized_prior',
+                    [
+                        { rowId: 1, column: 'payload', value: 'bounded' },
+                        { rowId: 2, column: 'payload', value: 'bounded' }
+                    ],
+                    1024
+                ),
+                error => {
+                    assert.ok(error instanceof OversizedCellReplacementRequiredError);
+                    assert.strictEqual(error.storageClass, 'blob');
+                    assert.strictEqual(error.actualBytes, 2048);
+                    return true;
+                }
+            );
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['run', 'queryBatch', 'run', 'run']
             );
         } finally {
             connection.dispose();

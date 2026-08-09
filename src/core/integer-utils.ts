@@ -11,7 +11,7 @@ const ROWID_COMPANION_TEXT_PREFIX = '__sqlite_explorer_numeric_rowid_text_';
 // valid wide query fail with "too many columns in result set".
 const SQLITE_MAX_RESULT_COLUMNS = 2000;
 const ROWID_COMPANION_COLUMNS_PER_QUERY = 999;
-const SQLITE_MAX_VARIABLE_NUMBER = 32766;
+export const SQLITE_MAX_VARIABLE_NUMBER = 32766;
 
 /**
  * Authoritative main-schema capability check required before companion reads.

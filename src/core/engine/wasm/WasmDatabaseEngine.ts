@@ -118,6 +118,10 @@ import {
   OversizedCellReplacementRequiredError
 } from '../../cell-edit-policy';
 import {
+  assertBatchPriorLimitResult,
+  buildBatchPriorLimitQueries
+} from '../../batch-update';
+import {
   assertColumnDropTableStateCurrent,
   buildColumnDropRestorePlan,
   COLUMN_DROP_TABLE_STATE_SQL,
@@ -2063,6 +2067,23 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
+  private async assertRowIdBatchPriorsWithinEditLimit(
+    table: string,
+    updates: readonly CellUpdate[],
+    editLimitBytes: number
+  ): Promise<void> {
+    const queries = buildBatchPriorLimitQueries(table, updates, editLimitBytes);
+    for (const query of queries) {
+      const result = await this.executeQuery(query.sql, query.params);
+      assertBatchPriorLimitResult(
+        table,
+        query,
+        result[0]?.rows ?? [],
+        editLimitBytes
+      );
+    }
+  }
+
   /** Columns SQLite permits in an INSERT; generated columns have hidden 2/3. */
   private async getInsertableColumnNames(table: string): Promise<string[]> {
     const result = await this.executeQuery(
@@ -2570,7 +2591,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       // Refuse the unconfirmed oversized case before the existing SELECT can
       // materialize any prior value into JavaScript history.
       if (!isHistoryReplay && maxEditValueBytes !== undefined) {
-        await this.assertBatchPriorsWithinEditLimit(table, updates, editLimitBytes);
+        await this.assertRowIdBatchPriorsWithinEditLimit(table, updates, editLimitBytes);
       }
       const escapedTable = escapeIdentifier(table);
       const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
