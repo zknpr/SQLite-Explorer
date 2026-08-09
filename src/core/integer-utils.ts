@@ -15,9 +15,9 @@ export const SQLITE_MAX_VARIABLE_NUMBER = 32766;
 
 /**
  * Authoritative main-schema capability check required before companion reads.
- * A declared column named rowid/_rowid_/oid shadows the intrinsic rowid, so
- * "rowid" in the companion queries would read (possibly duplicated) table data
- * instead of stable row identity; such tables keep the values-only degradation.
+ * SQLite resolves each special rowid alias independently. These queries use
+ * the literal `rowid`, so only a declared column with that name shadows the
+ * intrinsic identity; declared `oid` or `_rowid_` columns do not affect it.
  * Binds the table name twice.
  */
 export const ROWID_TABLE_AUTHORITY_SQL =
@@ -25,7 +25,7 @@ export const ROWID_TABLE_AUTHORITY_SQL =
   `WHERE "schema" = 'main' AND "name" = ? AND (` +
   `("type" = 'table' AND "wr" = 0) OR "type" IN ('virtual', 'shadow')) ` +
   `AND NOT EXISTS (SELECT 1 FROM pragma_table_info(?, 'main') ` +
-  `WHERE lower("name") IN ('rowid', '_rowid_', 'oid')) LIMIT 1`;
+  `WHERE lower("name") = 'rowid') LIMIT 1`;
 
 export interface ExactNumericTextQuery {
   sql: string;

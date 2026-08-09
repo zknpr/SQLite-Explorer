@@ -4,6 +4,7 @@
 import { state } from './state.js';
 import { backendApi } from './api.js';
 import { escapeHtml } from './utils.js';
+import { getSelectedRowActionEligibility } from './data-utils.js';
 
 export function updateStatus(message) {
     const el = document.getElementById('statusText');
@@ -50,7 +51,8 @@ export function showErrorState(message) {
 
 export function updateToolbarButtons() {
     const hasTable = state.selectedTable && state.selectedTableType === 'table';
-    const hasRowSelection = state.selectedRowIds.size > 0;
+    const rowEligibility = getSelectedRowActionEligibility();
+    const hasRowSelection = rowEligibility.rowIds.length > 0;
     const hasColumnSelection = state.selectedColumns.size > 0;
 
     const btnAddRow = document.getElementById('btnAddRow');
@@ -66,6 +68,13 @@ export function updateToolbarButtons() {
             || state.isGridReloading
             || !hasTable
             || (!hasRowSelection && !hasColumnSelection);
+        if (!hasColumnSelection && rowEligibility.readOnlyCount > 0) {
+            btnDeleteRows.title = hasRowSelection
+                ? `${rowEligibility.readOnlyCount} read-only selected row${rowEligibility.readOnlyCount === 1 ? '' : 's'} will be skipped: ${rowEligibility.readOnlyReason}`
+                : `Delete unavailable: ${rowEligibility.readOnlyReason}`;
+        } else {
+            btnDeleteRows.title = 'Delete selected rows or columns';
+        }
     }
     if (btnExport) btnExport.disabled = !state.selectedTable;
 }

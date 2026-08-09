@@ -3,6 +3,10 @@
  * Shared helper functions for accessing grid data to avoid circular dependencies.
  */
 import { state } from './state.js';
+import { isReadOnlyPrimaryKeyRecordId } from '../../../src/core/row-identity.ts';
+
+const READ_ONLY_IDENTITY_FALLBACK_REASON =
+    'Primary-key identity was not transported, so the row cannot be targeted safely.';
 
 export function getRowDataOffset() {
     return state.selectedTableType === 'table' ? 1 : 0;
@@ -49,6 +53,61 @@ export function getOversizedCellMetadata(rowIdx, colIdx) {
 
 export function getReadOnlyRowReason(rowIdx) {
     return state.gridReadOnlyRowReasons?.[rowIdx];
+}
+
+function currentReadOnlyReasonsByRecordId() {
+    const reasons = new Map();
+    for (const [rawRowIdx, reason] of Object.entries(state.gridReadOnlyRowReasons ?? {})) {
+        const rowIdx = Number(rawRowIdx);
+        if (!reason || !state.gridData[rowIdx]) continue;
+        reasons.set(getRowId(state.gridData[rowIdx], rowIdx), reason);
+    }
+    return reasons;
+}
+
+/**
+ * Split row selection into bindable identities and server-authored read-only
+ * tokens. Selection remains available for copy/highlight, but target-based
+ * delete and export paths consume only `rowIds`.
+ */
+export function getSelectedRowActionEligibility() {
+    const rowIds = [];
+    let readOnlyCount = 0;
+    let readOnlyReason;
+    const currentReasons = currentReadOnlyReasonsByRecordId();
+    for (const rowId of state.selectedRowIds) {
+        const currentReason = currentReasons.get(rowId);
+        if (isReadOnlyPrimaryKeyRecordId(rowId) || currentReason) {
+            readOnlyCount++;
+            readOnlyReason ??= currentReason;
+        } else {
+            rowIds.push(rowId);
+        }
+    }
+    if (readOnlyCount > 0) {
+        readOnlyReason ??= READ_ONLY_IDENTITY_FALLBACK_REASON;
+    }
+    return { rowIds, readOnlyCount, readOnlyReason };
+}
+
+/** Staged cells whose row identity can be bound by a batch mutation. */
+export function getBatchSelectionEligibility() {
+    const cells = [];
+    let readOnlyCount = 0;
+    let readOnlyReason;
+    for (const cell of state.selectedCells) {
+        const currentReason = getReadOnlyRowReason(cell.rowIdx);
+        if (isReadOnlyPrimaryKeyRecordId(cell.rowId) || currentReason) {
+            readOnlyCount++;
+            readOnlyReason ??= currentReason;
+        } else {
+            cells.push(cell);
+        }
+    }
+    if (readOnlyCount > 0) {
+        readOnlyReason ??= READ_ONLY_IDENTITY_FALLBACK_REASON;
+    }
+    return { cells, readOnlyCount, readOnlyReason };
 }
 
 /**

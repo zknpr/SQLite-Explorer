@@ -6,6 +6,7 @@ import { backendApi } from './api.js';
 import { updateStatus } from './ui.js';
 import { openModal, closeModal } from './modals.js';
 import { escapeHtml } from './utils.js';
+import { getSelectedRowActionEligibility } from './data-utils.js';
 
 let isSubmittingExport = false;
 
@@ -112,6 +113,32 @@ export function onExportFormatChange() {
         label.appendChild(document.createTextNode(' Include Table Name'));
         optionsContainer.appendChild(label);
     }
+
+    const eligibility = getSelectedRowActionEligibility();
+    const hasSelectedRows = state.selectedTableType === 'table'
+        && state.selectedRowIds.size > 0;
+    const selectedExportBlocked = hasSelectedRows
+        && eligibility.rowIds.length === 0;
+    if (hasSelectedRows && eligibility.readOnlyCount > 0) {
+        const notice = document.createElement('div');
+        notice.className = 'selection-notice';
+        Object.assign(notice.style, {
+            marginTop: '8px',
+            color: 'var(--text-secondary)',
+            fontSize: '12px'
+        });
+        notice.textContent = selectedExportBlocked
+            ? `Selected-row export unavailable: ${eligibility.readOnlyReason} Deselect the row to export the full table.`
+            : `${eligibility.readOnlyCount} read-only selected row${eligibility.readOnlyCount === 1 ? '' : 's'} will be skipped: ${eligibility.readOnlyReason}`;
+        optionsContainer.appendChild(notice);
+    }
+    const submitButton = document.getElementById('btnSubmitExport');
+    if (submitButton) {
+        submitButton.disabled = selectedExportBlocked;
+        submitButton.title = selectedExportBlocked
+            ? `Selected-row export unavailable: ${eligibility.readOnlyReason}`
+            : '';
+    }
 }
 
 export async function submitExport() {
@@ -141,11 +168,17 @@ async function submitExportOnce() {
         options.includeTableName = document.getElementById('exportTableName')?.checked ?? true;
     }
 
+    let skippedReadOnlyRows = 0;
     // Check for row selection (only for tables)
     if (state.selectedTableType === 'table') {
-        const rowIds = Array.from(state.selectedRowIds);
-        if (rowIds.length > 0) {
-            options.rowIds = rowIds;
+        const eligibility = getSelectedRowActionEligibility();
+        if (state.selectedRowIds.size > 0 && eligibility.rowIds.length === 0) {
+            updateStatus(`Selected-row export unavailable: ${eligibility.readOnlyReason}`);
+            return;
+        }
+        if (eligibility.rowIds.length > 0) {
+            options.rowIds = eligibility.rowIds;
+            skippedReadOnlyRows = eligibility.readOnlyCount;
         }
     }
 
@@ -161,7 +194,9 @@ async function submitExportOnce() {
             { format, ...options } // exportOptions
         );
 
-        updateStatus('Export initiated');
+        updateStatus(skippedReadOnlyRows > 0
+            ? `Export initiated; skipped ${skippedReadOnlyRows} read-only selected row${skippedReadOnlyRows === 1 ? '' : 's'}`
+            : 'Export initiated');
     } catch (err) {
         console.error('Export failed:', err);
         updateStatus(`Export failed: ${err.message}`);

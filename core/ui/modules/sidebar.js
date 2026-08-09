@@ -8,6 +8,7 @@ import { loadTableData, loadTableColumns } from './grid.js';
 import {
     getCellMutationBlockReason,
     getCellValueForDisplay,
+    getBatchSelectionEligibility,
     getRowDataOffset
 } from './data-utils.js';
 import { updateSelectionStates } from './grid-selection.js';
@@ -310,9 +311,10 @@ export function updateBatchSidebar() {
 
     if (!title || !list || !countBadge || !fieldsContainer) return;
 
-    const cellCount = state.selectedCells.length;
+    const eligibility = getBatchSelectionEligibility();
+    const cellCount = eligibility.cells.length;
 
-    if (cellCount === 0) {
+    if (state.selectedCells.length === 0) {
         title.classList.add('hidden');
         list.classList.add('hidden');
         return;
@@ -323,9 +325,11 @@ export function updateBatchSidebar() {
     title.classList.remove('collapsed');
 
     countBadge.textContent = cellCount;
+    const applyButton = document.getElementById('btnApplyBatchUpdate');
+    if (applyButton) applyButton.disabled = state.isReadOnly || cellCount === 0;
 
     // Analyze selected cells - group by column (see batch-update-logic.js)
-    const visibleCells = state.selectedCells.map(cell => {
+    const visibleCells = eligibility.cells.map(cell => {
         const row = state.gridData[cell.rowIdx];
         return row
             ? { ...cell, value: getCellValueForDisplay(row, cell.rowIdx, cell.colIdx) }
@@ -335,6 +339,22 @@ export function updateBatchSidebar() {
 
     fieldsContainer.replaceChildren();
     const fragment = document.createDocumentFragment();
+
+    if (eligibility.readOnlyCount > 0) {
+        const notice = document.createElement('div');
+        notice.className = 'batch-selection-notice';
+        Object.assign(notice.style, {
+            marginBottom: '8px',
+            color: 'var(--text-secondary)',
+            fontSize: '11px'
+        });
+        notice.textContent =
+            `${eligibility.readOnlyCount} read-only selected cell${eligibility.readOnlyCount === 1 ? '' : 's'} excluded: ${eligibility.readOnlyReason}`;
+        fragment.appendChild(notice);
+        title.title = notice.textContent;
+    } else {
+        title.title = '';
+    }
 
     for (const [colIdx, colInfo] of columns) {
         const valueDisplay = summarizeColumnValue(colInfo.values);
@@ -393,7 +413,12 @@ export function updateBatchSidebar() {
 
 export async function applyBatchUpdate() {
     if (state.selectedCells.length === 0) return;
-    for (const cell of state.selectedCells) {
+    const eligibility = getBatchSelectionEligibility();
+    if (eligibility.cells.length === 0) {
+        updateStatus(`Batch update unavailable: ${eligibility.readOnlyReason}`);
+        return;
+    }
+    for (const cell of eligibility.cells) {
         const mutationBlockReason = getCellMutationBlockReason(cell.rowIdx, cell.colIdx);
         if (mutationBlockReason) {
             updateStatus(mutationBlockReason);
@@ -422,7 +447,7 @@ export async function applyBatchUpdate() {
 
     // 2. Processing Phase — value coercion / NULL / json_patch (see batch-update-logic.js)
     const updates = prepareBatchUpdates(
-        state.selectedCells,
+        eligibility.cells,
         inputsByCol,
         state.tableColumns,
         state.selectedTableIdentity?.kind === 'primaryKey'
@@ -496,7 +521,9 @@ export async function applyBatchUpdate() {
         // A PK edit can move the row in the table's default ordering.
         await loadTableData(false);
 
-        updateStatus('Batch update completed');
+        updateStatus(eligibility.readOnlyCount > 0
+            ? `Batch update completed; excluded ${eligibility.readOnlyCount} read-only selected cell${eligibility.readOnlyCount === 1 ? '' : 's'}`
+            : 'Batch update completed');
 
     } catch (err) {
         console.error('Batch update failed:', err);

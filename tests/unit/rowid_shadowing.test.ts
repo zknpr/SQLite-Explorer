@@ -32,7 +32,7 @@ describe('rowid shadowing authority', () => {
         return (authority[0]?.rows.length ?? 0) > 0;
     }
 
-    it('denies authority to tables declaring a rowid-shadowing column', async () => {
+    it('denies authority only when the literal rowid alias used by queries is shadowed', async () => {
         await engine.executeQuery(
             'CREATE TABLE plain_rows (value TEXT); ' +
             'CREATE TABLE shadowed_rowid ("rowid" TEXT); ' +
@@ -43,8 +43,8 @@ describe('rowid shadowing authority', () => {
 
         assert.strictEqual(await hasAuthority('plain_rows'), true);
         assert.strictEqual(await hasAuthority('shadowed_rowid'), false);
-        assert.strictEqual(await hasAuthority('shadowed_oid'), false);
-        assert.strictEqual(await hasAuthority('shadowed_rowid_alias'), false);
+        assert.strictEqual(await hasAuthority('shadowed_oid'), true);
+        assert.strictEqual(await hasAuthority('shadowed_rowid_alias'), true);
         assert.strictEqual(await hasAuthority('pk_rows'), false);
     });
 

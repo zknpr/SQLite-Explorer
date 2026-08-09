@@ -9,6 +9,7 @@ import { loadTableData, loadTableColumns } from './grid.js';
 import { refreshSchema } from './sidebar.js';
 import { parseGridInputValue } from './utils.js';
 import { noteRowCountChanged, noteCellValuesChanged } from './count-cache.js';
+import { getSelectedRowActionEligibility } from './data-utils.js';
 
 let isSubmittingAddRow = false;
 let isSubmittingDelete = false;
@@ -188,8 +189,16 @@ export function openDeleteModal() {
             `Are you sure you want to delete ${columnNames.length} column${columnNames.length > 1 ? 's' : ''} (${columnNames.join(', ')})?` +
             ` This will permanently remove the column${columnNames.length > 1 ? 's' : ''} and all their data.`;
     } else if (state.selectedRowIds.size > 0) {
+        const eligibility = getSelectedRowActionEligibility();
+        if (eligibility.rowIds.length === 0) {
+            updateStatus(`Delete unavailable: ${eligibility.readOnlyReason}`);
+            return;
+        }
+        const skipped = eligibility.readOnlyCount > 0
+            ? ` ${eligibility.readOnlyCount} read-only selected row${eligibility.readOnlyCount === 1 ? '' : 's'} will be skipped: ${eligibility.readOnlyReason}`
+            : '';
         document.getElementById('deleteConfirmText').textContent =
-            `Are you sure you want to delete ${state.selectedRowIds.size} row${state.selectedRowIds.size > 1 ? 's' : ''}?`;
+            `Are you sure you want to delete ${eligibility.rowIds.length} row${eligibility.rowIds.length > 1 ? 's' : ''}?${skipped}`;
     } else {
         return;
     }
@@ -220,7 +229,12 @@ async function submitDeleteOnce() {
 async function submitDeleteRows() {
     if (state.selectedRowIds.size === 0) return;
 
-    const rowIds = Array.from(state.selectedRowIds);
+    const eligibility = getSelectedRowActionEligibility();
+    const rowIds = eligibility.rowIds;
+    if (rowIds.length === 0) {
+        updateStatus(`Delete unavailable: ${eligibility.readOnlyReason}`);
+        return;
+    }
     // Snapshot the target so the count delta below can never be applied to a
     // table the user switched to while the delete RPC was in flight.
     const targetTable = state.selectedTable;
@@ -236,7 +250,10 @@ async function submitDeleteRows() {
         state.selectedRowIds.clear();
         await loadTableData();
         updateToolbarButtons();
-        updateStatus(`Deleted ${rowIds.length} row${rowIds.length > 1 ? 's' : ''} - Ctrl+S to save`);
+        const skipped = eligibility.readOnlyCount > 0
+            ? `; skipped ${eligibility.readOnlyCount} read-only selection${eligibility.readOnlyCount === 1 ? '' : 's'}`
+            : '';
+        updateStatus(`Deleted ${rowIds.length} row${rowIds.length > 1 ? 's' : ''}${skipped} - Ctrl+S to save`);
 
     } catch (err) {
         console.error('Delete rows failed:', err);

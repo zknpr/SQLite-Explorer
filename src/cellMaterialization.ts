@@ -192,7 +192,12 @@ export class CellMaterializationService implements vsc.Disposable {
 
             const outputHash = crypto.createHash('sha256');
             const decoder = metadata.storageClass === 'text'
-                ? new TextDecoder(this.requireTextEncoding(metadata), { fatal: true })
+                // U+FEFF may be real cell content. Decoding is a transport
+                // conversion, so a leading BOM must survive the UTF-8 rewrite.
+                ? new TextDecoder(this.requireTextEncoding(metadata), {
+                    fatal: true,
+                    ignoreBOM: true
+                })
                 : undefined;
             const encoder = decoder ? new TextEncoder() : undefined;
             let sourceOffset = 0;

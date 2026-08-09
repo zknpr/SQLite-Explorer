@@ -724,7 +724,89 @@ describe('paged writable host save', () => {
     assert.ok(!fs.readdirSync(fixtureDir).some(name => name.includes('late-wal-target.db.sqlite-explorer')));
   });
 
-  it('holds a cross-process SQLite write lock across the final gate and in-place rename', async (t) => {
+  it('releases a Windows-style SQLite handle before rename and repeats the final gates', async () => {
+    const basePath = path.join(fixtureDir, 'windows-sharing-base.db');
+    fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+    let released = false;
+    let postReleaseBaseChecks = 0;
+    const events: string[] = [];
+    const capability = capabilityWithOpen(fs.promises.open, {}, {
+      statSync: ((...args: Parameters<typeof fs.statSync>) => {
+        if (released && String(args[0]) === basePath) {
+          postReleaseBaseChecks++;
+          events.push('post-release-base-check');
+        }
+        return (fs.statSync as any)(...args);
+      }) as typeof fs.statSync,
+      renameSync: ((...args: Parameters<typeof fs.renameSync>) => {
+        if (!released) {
+          throw Object.assign(
+            new Error('simulated Windows sharing violation: SQLite handle still open'),
+            { code: 'EPERM' }
+          );
+        }
+        assert.ok(postReleaseBaseChecks > 0, 'identity gates must rerun after releasing the lock');
+        events.push('rename');
+        return fs.renameSync(...args);
+      }) as typeof fs.renameSync
+    });
+
+    await writePagedWritableOverlayToFile(
+      capability,
+      basePath,
+      basePath,
+      snapshotFor(basePath),
+      undefined,
+      () => ({
+        releaseBeforeRename: true,
+        release() {
+          released = true;
+          events.push('release');
+        }
+      })
+    );
+
+    assert.deepStrictEqual(events.slice(-2), ['post-release-base-check', 'rename']);
+    assert.ok(events.indexOf('release') < events.indexOf('post-release-base-check'));
+  });
+
+  it('rejects WAL frames that appear after releasing a Windows-style lock', async () => {
+    const basePath = path.join(fixtureDir, 'windows-post-release-wal-base.db');
+    const walPath = `${basePath}-wal`;
+    fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+    let renameCalls = 0;
+    const capability = capabilityWithOpen(fs.promises.open, {}, {
+      renameSync: ((...args: Parameters<typeof fs.renameSync>) => {
+        renameCalls++;
+        return fs.renameSync(...args);
+      }) as typeof fs.renameSync
+    });
+
+    await assert.rejects(
+      writePagedWritableOverlayToFile(
+        capability,
+        basePath,
+        basePath,
+        snapshotFor(basePath),
+        undefined,
+        () => ({
+          releaseBeforeRename: true,
+          release() {
+            fs.writeFileSync(walPath, Buffer.alloc(33, 7));
+          }
+        })
+      ),
+      /WAL.*uncheckpointed frames.*reload/i
+    );
+
+    assert.strictEqual(renameCalls, 0);
+  });
+
+  it('holds a cross-process SQLite write lock through rename on POSIX', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip('Windows must close SQLite handles before rename; covered by unit simulation');
+      return;
+    }
     const binary = bundledNativeBinary();
     if (!binary) {
       t.skip('no bundled native SQLite runtime for this platform');

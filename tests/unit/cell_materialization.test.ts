@@ -100,6 +100,32 @@ describe('CellMaterializationService', () => {
         assert.strictEqual(operations.closeCount, 1);
     });
 
+    it('preserves a leading BOM as text content while materializing oversized TEXT', async () => {
+        const source = Buffer.from('\uFEFFpayload', 'utf8');
+        const operations = makeChunkedOperations(source, {
+            storageClass: 'text',
+            byteLength: source.byteLength,
+            textEncoding: 'utf-8'
+        });
+        service = new CellMaterializationService(vscode.Uri.file(testDir), {
+            maxBytes: 1024,
+            // Split the three-byte UTF-8 BOM across reads as the streaming path does.
+            chunkBytes: 2
+        });
+
+        const materialized = await service.materialize(operations, target, {
+            fileExtension: 'txt'
+        });
+        const actual = fs.readFileSync(materialized.uri.fsPath);
+
+        assert.deepStrictEqual(actual, source);
+        assert.strictEqual(materialized.byteLength, source.byteLength);
+        assert.strictEqual(
+            materialized.checksumSha256,
+            (await import('node:crypto')).createHash('sha256').update(source).digest('hex')
+        );
+    });
+
     it('removes a partial file and closes the read bracket when cancelled between chunks', async () => {
         const controller = new AbortController();
         const source = Uint8Array.from({ length: 32 }, (_, index) => index);

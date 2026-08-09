@@ -148,6 +148,42 @@ describe('keyset engine round-trip (WASM)', () => {
         await assertKeysetSweep(cfg, offsetPages.map(page => page.rows));
     });
 
+    it('keeps keyset active when only oid or _rowid_ is declared, but not when rowid is declared', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE alias_oid ("oid" TEXT, value TEXT); ' +
+            'INSERT INTO alias_oid(rowid, "oid", value) VALUES ' +
+            "(2, 'declared-a', 'a'), (9, 'declared-b', 'b'), (15, 'declared-c', 'c'); " +
+            'CREATE TABLE alias__rowid_ ("_rowid_" TEXT, value TEXT); ' +
+            'INSERT INTO alias__rowid_(rowid, "_rowid_", value) VALUES ' +
+            "(3, 'declared-a', 'a'), (8, 'declared-b', 'b'), (20, 'declared-c', 'c'); " +
+            'CREATE TABLE alias_rowid ("rowid" TEXT, value TEXT); ' +
+            'INSERT INTO alias_rowid("rowid", value) VALUES ' +
+            "('declared-a', 'a'), ('declared-b', 'b'), ('declared-c', 'c')"
+        );
+
+        for (const [table, declaredAlias] of [
+            ['alias_oid', 'oid'],
+            ['alias__rowid_', '_rowid_']
+        ] as const) {
+            const cfg: SweepConfig = {
+                table,
+                columns: ['rowid', declaredAlias, 'value'],
+                pageSize: 2
+            };
+            const first = await fetchPage(cfg, 0, { mode: 'first' });
+            const anchors = requireAnchors(first, table);
+            const second = await fetchPage(cfg, 1, { mode: 'after', anchor: anchors.last });
+            assert.deepEqual(second.rows, (await fetchPage(cfg, 1)).rows);
+        }
+
+        const shadowed = await fetchPage(
+            { table: 'alias_rowid', columns: ['rowid', 'value'], pageSize: 2 },
+            0,
+            { mode: 'first' }
+        );
+        assert.strictEqual(shadowed.keysetAnchors, undefined);
+    });
+
     it('pages WITHOUT ROWID and composite-PK tables through pk: identities', async () => {
         await engine.executeQuery(
             'CREATE TABLE wr_single (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +

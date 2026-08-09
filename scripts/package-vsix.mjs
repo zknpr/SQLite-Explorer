@@ -200,12 +200,14 @@ export async function inspectVsixArchive(vsixPath, expectedVersion, variant, opt
   return { entries, manifest, sourceMapEntries };
 }
 
-function assertSafeRelativeFile(entry) {
+export function assertSafeRelativeFile(entry) {
   if (!entry || isAbsolute(entry)) {
     throw new Error(`VSCE listed an unsafe package path: ${JSON.stringify(entry)}`);
   }
-  const normalized = normalize(entry);
-  if (normalized === '..' || normalized.startsWith(`..${sep}`)) {
+  // VSCE reports archive-relative POSIX paths. `path.normalize()` uses the host
+  // separator, so normalize that result back to the comparison contract.
+  const normalized = normalize(entry).replaceAll('\\', '/');
+  if (normalized === '..' || normalized.startsWith('../')) {
     throw new Error(`VSCE listed a package path outside the project: ${entry}`);
   }
   return normalized;

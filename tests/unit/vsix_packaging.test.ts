@@ -82,6 +82,15 @@ describe('VSIX content gate', () => {
     'extension/assets/sqlite3.wasm'
   ];
 
+  it('normalizes Windows separators to VSCE POSIX paths before comparison', async () => {
+    const { assertSafeRelativeFile } = await loadPackager();
+
+    assert.strictEqual(
+      assertSafeRelativeFile('out\\extension-browser.js'),
+      'out/extension-browser.js'
+    );
+  });
+
   it('allows only the selected native binary and shared native worker', async () => {
     const { NATIVE_VARIANTS } = await loadTargets();
     const { getNativeStageFiles, validatePackageEntries } = await loadPackager();

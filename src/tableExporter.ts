@@ -289,6 +289,34 @@ function workspaceSiblingTempUri(finalUri: vsc.Uri): vsc.Uri {
   );
 }
 
+function nodeErrorCode(error: unknown): string | undefined {
+  return error && typeof error === 'object'
+    ? (error as { code?: string }).code
+    : undefined;
+}
+
+async function resolveLocalExportDestination(fs: NodeFs, finalPath: string): Promise<string> {
+  try {
+    // Replacing the canonical target preserves an existing destination symlink
+    // while retaining the sibling-temp atomic swap on the target filesystem.
+    return await fs.promises.realpath(finalPath);
+  } catch (error) {
+    if (nodeErrorCode(error) !== 'ENOENT') throw error;
+  }
+
+  try {
+    await fs.promises.lstat(finalPath);
+  } catch (error) {
+    if (nodeErrorCode(error) === 'ENOENT') return finalPath;
+    throw error;
+  }
+
+  // realpath can fail with ENOENT for a dangling symlink. Replacing that
+  // directory entry would silently destroy the link instead of exporting to
+  // its intended target, so fail explicitly.
+  throw new Error(`Cannot resolve existing local export destination: ${finalPath}`);
+}
+
 async function removeLocalTemp(fs: NodeFs, tempPath: string, primaryError: unknown): Promise<never> {
   try {
     await fs.promises.rm(tempPath, { force: true });
@@ -310,7 +338,8 @@ async function exportLocalAtomic(
   options: ExportOptions,
   cancellation?: ExportCancellation
 ): Promise<number> {
-  const tempPath = localSiblingTempPath(uri.fsPath);
+  const destinationPath = await resolveLocalExportDestination(fs, uri.fsPath);
+  const tempPath = localSiblingTempPath(destinationPath);
   let sink: AwaitedNodeStreamSink | undefined;
   try {
     const stream = fs.createWriteStream(tempPath, {
@@ -331,7 +360,7 @@ async function exportLocalAtomic(
     assertExportNotCancelled(cancellation);
     await sink.close();
     assertExportNotCancelled(cancellation);
-    await fs.promises.rename(tempPath, uri.fsPath);
+    await fs.promises.rename(tempPath, destinationPath);
     return rowCount;
   } catch (error) {
     let primaryError = error;

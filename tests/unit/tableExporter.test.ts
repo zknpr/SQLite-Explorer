@@ -9,6 +9,7 @@ import {
     exportToCsv,
     exportToSql,
     exportTableCommand,
+    exportTableToLocalFileForTests,
     EXPORT_CELL_CHUNK_BYTES,
     getFormatHelper,
     streamTableExport
@@ -1248,6 +1249,43 @@ describe('exportTableCommand atomic streaming', () => {
             nodeFs.promises.rename = originalRename;
             mockVscode.window.showSaveDialog = originalShowSaveDialog;
             DocumentRegistry.delete('stage-e-atomic');
+            (operations as WasmDatabaseEngine).shutdown();
+            await fsPromises.rm(scratch, { recursive: true, force: true });
+        }
+    });
+
+    it('writes through an existing destination symlink without replacing the link', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            "CREATE TABLE symlink_export (value TEXT); INSERT INTO symlink_export VALUES ('new-content')"
+        );
+        const scratch = await fsPromises.mkdtemp(path.join(process.cwd(), '.stage-e-export-test-'));
+        const targetPath = path.join(scratch, 'target.json');
+        const linkPath = path.join(scratch, 'destination.json');
+        await fsPromises.writeFile(targetPath, 'old-content');
+        await fsPromises.symlink(targetPath, linkPath);
+
+        try {
+            const rowCount = await exportTableToLocalFileForTests(
+                { databaseOperations: operations } as any,
+                linkPath,
+                'symlink_export',
+                ['value'],
+                { format: 'json' }
+            );
+
+            assert.strictEqual(rowCount, 1);
+            assert.strictEqual((await fsPromises.lstat(linkPath)).isSymbolicLink(), true);
+            assert.strictEqual(
+                await fsPromises.readFile(targetPath, 'utf8'),
+                JSON.stringify([{ value: 'new-content' }], null, 2)
+            );
+        } finally {
             (operations as WasmDatabaseEngine).shutdown();
             await fsPromises.rm(scratch, { recursive: true, force: true });
         }

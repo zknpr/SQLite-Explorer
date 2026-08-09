@@ -153,6 +153,15 @@ describe('desktop engine paged count policy', () => {
       "INSERT INTO extreme_rowids(rowid, label) VALUES " +
       "(-9223372036854775808, 'minimum'), (9223372036854775807, 'maximum')"
     );
+    db.run(
+      'CREATE TABLE declared_oid ("oid" TEXT, label TEXT); ' +
+      "INSERT INTO declared_oid(rowid, \"oid\", label) VALUES (2, 'a', 'first'), (8, 'b', 'second'); " +
+      'CREATE TABLE declared__rowid_ ("_rowid_" TEXT, label TEXT); ' +
+      "INSERT INTO declared__rowid_(rowid, \"_rowid_\", label) VALUES (4, 'a', 'first'), (12, 'b', 'second'); " +
+      'CREATE TABLE declared_rowid ("rowid" INTEGER, label TEXT); ' +
+      "INSERT INTO declared_rowid(oid, \"rowid\", label) VALUES " +
+      "(1, 1, 'first'), (2, 99, 'second')"
+    );
     fs.writeFileSync(dbPath, Buffer.from(db.export()));
     db.close();
   });
@@ -184,6 +193,19 @@ describe('desktop engine paged count policy', () => {
       const bound = await engine.fetchTableCount('fixtures', {});
       assert.strictEqual(bound, 19999);
       assert.ok(bound >= 10000, 'the rowid-span result must remain an upper bound');
+    } finally {
+      (engine as WasmDatabaseEngine).shutdown();
+    }
+  });
+
+  it('uses the rowid bound through declared oid/_rowid_ aliases and rejects declared rowid', async () => {
+    const engine = await openPagedEngine();
+    try {
+      // These deliberately differ from COUNT(*)=2, proving the bound path ran.
+      assert.strictEqual(await engine.fetchTableCount('declared_oid', {}), 7);
+      assert.strictEqual(await engine.fetchTableCount('declared__rowid_', {}), 9);
+      // The literal rowid query would see declared values 1..99; exact fallback must win.
+      assert.strictEqual(await engine.fetchTableCount('declared_rowid', {}), 2);
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }

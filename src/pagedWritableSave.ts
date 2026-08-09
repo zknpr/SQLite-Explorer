@@ -13,6 +13,8 @@ type NodeFileHandle = Awaited<ReturnType<NodeFs['promises']['open']>>;
 type PagedSaveLogger = (level: 'warn', message: string, error?: unknown) => void;
 
 export interface PagedSaveWriteLock {
+  /** Close the SQLite database handle before replacing its pathname. */
+  releaseBeforeRename?: boolean;
   release(): void;
 }
 
@@ -441,7 +443,8 @@ function assertNoSiblingWalFramesSync(fs: NodeFs, activeBasePath: string): void 
 }
 
 /**
- * Hold SQLite's own writer lock across the final identity/WAL gate and rename.
+ * Hold SQLite's own writer lock through the final identity/WAL gate and, where
+ * the platform permits renaming an open database, through the rename itself.
  *
  * Synchronous host code only excludes another extension-host task. A different
  * process can still switch a rollback database to WAL and commit after the last
@@ -484,6 +487,9 @@ function acquireSqliteWriteLock(activeBasePath: string): PagedSaveWriteLock {
 
   let released = false;
   return {
+    // SQLite's Windows VFS does not share delete/rename access for the main
+    // database handle. POSIX can retain the stronger lock-through-rename window.
+    releaseBeforeRename: process.platform === 'win32',
     release(): void {
       if (released) return;
       released = true;
@@ -504,11 +510,10 @@ function acquireSqliteWriteLock(activeBasePath: string): PagedSaveWriteLock {
 }
 
 /**
- * Final replacement gate. The caller holds BEGIN IMMEDIATE for in-place saves,
- * excluding cross-process writers; synchronous operations additionally exclude
- * extension-host tasks between the successful checks and renameSync.
+ * Final replacement gates. The caller normally holds BEGIN IMMEDIATE for
+ * in-place saves, excluding cross-process writers while these checks run.
  */
-function commitReplacementSync(
+function assertReplacementReadySync(
   fs: NodeFs,
   sourceFd: number,
   activeBasePath: string,
@@ -535,7 +540,6 @@ function commitReplacementSync(
     throw new Error(PAGED_FILE_CHANGED_MESSAGE);
   }
   assertNoSiblingWalFramesSync(fs, activeBasePath);
-  fs.renameSync(temporaryPath, target.replacementPath);
 }
 
 async function writeAll(
@@ -708,7 +712,7 @@ export async function writePagedWritableOverlayToFile(
       // Save As replaces a distinct pathname and cannot discard a commit to
       // the active base. Only an in-place replacement needs the SQLite lock.
       if (target.requiresReopen) writeLock = acquireWriteLock(activeBasePath);
-      commitReplacementSync(
+      assertReplacementReadySync(
         fs,
         source.fd,
         activeBasePath,
@@ -717,6 +721,28 @@ export async function writePagedWritableOverlayToFile(
         completedTemporaryFingerprint,
         target
       );
+
+      if (writeLock?.releaseBeforeRename) {
+        // Windows cannot rename over SQLite's open main-database handle. Close
+        // it only after a locked gate, then repeat every identity/WAL gate
+        // synchronously immediately before rename. A different process can
+        // still commit in the residual post-check/pre-rename window; unlike
+        // POSIX, Windows cannot retain BEGIN IMMEDIATE across the swap.
+        const lockToRelease = writeLock;
+        writeLock = undefined;
+        lockToRelease.release();
+        assertReplacementReadySync(
+          fs,
+          source.fd,
+          activeBasePath,
+          snapshot.baseIdentity,
+          temporaryPath,
+          completedTemporaryFingerprint,
+          target
+        );
+      }
+
+      fs.renameSync(temporaryPath, target.replacementPath);
       renamed = true;
     } catch (error) {
       replacementError = error;
