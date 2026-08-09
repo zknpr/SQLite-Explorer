@@ -35,6 +35,7 @@ import type {
   ColumnDefinition,
   TableQueryOptions,
   TableCountOptions,
+  TableCountResult,
   SchemaSnapshot,
   ColumnMetadata,
   ViewDefinition,
@@ -169,7 +170,11 @@ interface WorkerMethods {
     rows: Record<string, CellValue>[],
     maxEditValueBytes?: number
   ): Promise<void>;
-  deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void>;
+  deleteRows(
+    table: string,
+    rowIds: RecordId[],
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow[]>;
   deleteColumns(
     table: string,
     columns: string[],
@@ -210,7 +215,7 @@ interface WorkerMethods {
   ): Promise<CellUpdateResult[]>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
-  fetchTableCount(table: string, options: TableCountOptions): Promise<number>;
+  fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult>;
   fetchSchema(): Promise<SchemaSnapshot>;
   getTableInfo(table: string): Promise<ColumnMetadata[]>;
   getPragmas(): Promise<Record<string, CellValue>>;
@@ -609,8 +614,8 @@ async function createInProcessWasmDatabaseConnection(
           rows: Record<string, CellValue>[],
           maxEditValueBytes?: number
         ) => endpoint.insertRowBatch(table, rows, maxEditValueBytes),
-        deleteRows: (table: string, rowIds: RecordId[]) =>
-          endpoint.deleteRows(table, rowIds),
+        deleteRows: (table: string, rowIds: RecordId[], maxUndoSnapshotBytes?: number) =>
+          endpoint.deleteRows(table, rowIds, maxUndoSnapshotBytes),
         deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
           endpoint.deleteColumns(table, columns, dropDependentIndexes),
         findDependentIndexes: (table: string, columns: string[]) =>
@@ -993,8 +998,8 @@ async function createWorkerBackedWasmDatabaseConnection(
             rows: Record<string, CellValue>[],
             maxEditValueBytes?: number
           ) => workerProxy.insertRowBatch(table, rows, maxEditValueBytes),
-          deleteRows: (table: string, rowIds: RecordId[]) =>
-            workerProxy.deleteRows(table, rowIds),
+          deleteRows: (table: string, rowIds: RecordId[], maxUndoSnapshotBytes?: number) =>
+            workerProxy.deleteRows(table, rowIds, maxUndoSnapshotBytes),
           deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
             workerProxy.deleteColumns(table, columns, dropDependentIndexes),
           findDependentIndexes: (table: string, columns: string[]) =>
@@ -1080,7 +1085,7 @@ async function createWorkerBackedWasmDatabaseConnection(
         };
 
         return {
-          databaseOps: operationsFacade,
+          databaseOps: serializeOperations(operationsFacade),
           isReadOnly: result.isReadOnly ?? false,
           storage: result.storage
         };

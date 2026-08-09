@@ -1013,14 +1013,14 @@ describe('editor keyboard and grid selection interactions', () => {
                 undefined,
                 'the snapshot table\'s filtered count must be dropped'
             );
-            assert.strictEqual(
+            assert.deepStrictEqual(
                 getCachedCount(ordersUnfiltered),
-                20,
+                { count: 20, isExact: true },
                 'the snapshot table\'s unfiltered count survives a cell edit'
             );
-            assert.strictEqual(
+            assert.deepStrictEqual(
                 getCachedCount(customersFiltered),
-                7,
+                { count: 7, isExact: true },
                 'the displayed table\'s counts must be untouched'
             );
         } finally {

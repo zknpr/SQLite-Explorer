@@ -36,7 +36,7 @@ class MockDatabaseOperations implements DatabaseOperations {
     async replaceOversizedCell(): Promise<void> {}
     async insertRow(table: string, data: Record<string, CellValue>): Promise<number> { return 1; }
     async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {}
-    async deleteRows(table: string, rowIds: RecordId[]): Promise<void> {}
+    async deleteRows(table: string, rowIds: RecordId[]) { return []; }
     async deleteColumns(
         table: string,
         columns: string[],
@@ -63,7 +63,7 @@ class MockDatabaseOperations implements DatabaseOperations {
     async updateCellBatch(table: string, updates: CellUpdate[]) { return []; }
     async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {}
     async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> { return { headers: [], rows: [] }; }
-    async fetchTableCount(table: string, options: TableCountOptions): Promise<number> { return 0; }
+    async fetchTableCount(table: string, options: TableCountOptions) { return { count: 0, isExact: true }; }
     async fetchSchema(): Promise<SchemaSnapshot> { return { tables: [], views: [], indexes: [] }; }
     async getTableInfo(table: string): Promise<ColumnMetadata[]> { return []; }
     async getPragmas(): Promise<Record<string, CellValue>> { return {}; }
@@ -262,6 +262,7 @@ describe('LoggingDatabaseOperations', () => {
             let delegated: RecordId[] | undefined;
             mockDb.deleteRows = async (_table, actualRowIds) => {
                 delegated = actualRowIds;
+                return [];
             };
 
             await logger.deleteRows('accounts', rowIds);

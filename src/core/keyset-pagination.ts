@@ -318,7 +318,9 @@ export function decodeKeysetAnchor(anchor: unknown): {
  * query — for every legitimate staleness signal: no request, non-anchorable
  * object, missing/invalid page size, tag mismatch (sort/filter/table/page-size
  * changed since minting), key arity mismatch (schema changed under a matching
- * tag), or an out-of-range 'last' remainder. Structurally malformed or
+ * tag), or an out-of-range explicit 'last' remainder. A 'last' request may
+ * omit its remainder when the count is only an upper bound; that reverse seek
+ * reads one full page without trusting the bound for page phase. Structurally malformed or
  * unmintable tokens (bad encoding, NULL in an identity slot) throw instead:
  * engines never mint them, so they signal tampering, not staleness.
  */
@@ -343,7 +345,7 @@ export function resolveKeysetPlan(
     return { ...key, mode: 'first', limit };
   }
   if (request.mode === 'last') {
-    const remainder = request.lastPageRowCount;
+    const remainder = request.lastPageRowCount ?? limit;
     if (
       typeof remainder !== 'number' || !Number.isSafeInteger(remainder)
       || remainder < 1 || remainder > limit

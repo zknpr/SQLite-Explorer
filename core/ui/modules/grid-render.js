@@ -827,7 +827,9 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
 }
 
 export function updatePagination() {
-    document.getElementById('pageIndicator').textContent = `${state.currentPageIndex + 1} / ${state.totalPageCount}`;
+    const boundPrefix = state.totalRecordCountIsExact ? '' : '≤';
+    document.getElementById('pageIndicator').textContent =
+        `${boundPrefix}${state.currentPageIndex + 1} / ${boundPrefix}${state.totalPageCount}`;
     document.getElementById('btnFirst').disabled = state.currentPageIndex === 0;
     document.getElementById('btnPrev').disabled = state.currentPageIndex === 0;
     document.getElementById('btnNext').disabled = state.currentPageIndex >= state.totalPageCount - 1;

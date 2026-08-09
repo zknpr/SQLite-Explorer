@@ -518,7 +518,10 @@ describe('WITHOUT ROWID primary-key identity', () => {
 
         const deleted = await engine.deleteRows('typeless_integer_identity', [changedIdentity]);
         assert.strictEqual(deleted?.length, 1);
-        assert.strictEqual(await engine.fetchTableCount('typeless_integer_identity', {}), 0);
+        assert.deepStrictEqual(
+            await engine.fetchTableCount('typeless_integer_identity', {}),
+            { count: 0, isExact: true }
+        );
 
         await engine.executeQuery(
             'CREATE TABLE strict_any_identity (id ANY PRIMARY KEY, value TEXT) ' +
@@ -558,7 +561,10 @@ describe('WITHOUT ROWID primary-key identity', () => {
 
         const deletedRows = await engine.deleteRows('row_lifecycle', [identity]);
         assert.ok(deletedRows);
-        assert.strictEqual(await engine.fetchTableCount('row_lifecycle', {}), 0);
+        assert.deepStrictEqual(
+            await engine.fetchTableCount('row_lifecycle', {}),
+            { count: 0, isExact: true }
+        );
         assert.deepStrictEqual(deletedRows, [{ rowId: identity, row }]);
 
         await engine.undoModification({
@@ -580,7 +586,10 @@ describe('WITHOUT ROWID primary-key identity', () => {
             targetTable: 'row_lifecycle',
             affectedRowIds: [identity]
         });
-        assert.strictEqual(await engine.fetchTableCount('row_lifecycle', {}), 0);
+        assert.deepStrictEqual(
+            await engine.fetchTableCount('row_lifecycle', {}),
+            { count: 0, isExact: true }
+        );
     });
 
     it('restores a deleted WITHOUT ROWID row without inserting generated columns', async () => {
@@ -640,6 +649,26 @@ describe('WITHOUT ROWID primary-key identity', () => {
                 'SELECT rowid, base, stored_value, virtual_value FROM generated_rowid_row'
             ))[0].rows,
             [[9, 5, 10, 15]]
+        );
+    });
+
+    it('refuses an oversized delete before materializing its exact undo snapshot', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE oversized_delete_history (payload BLOB); ' +
+            'INSERT INTO oversized_delete_history(rowid, payload) VALUES (1, zeroblob(2097152))'
+        );
+
+        await assert.rejects(
+            (engine.deleteRows as unknown as (
+                table: string,
+                rowIds: RecordId[],
+                maxUndoSnapshotBytes: number
+            ) => Promise<unknown>)('oversized_delete_history', [1], 1024),
+            /delete.*undo.*memory|undo.*snapshot.*budget/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT count(*) FROM oversized_delete_history'))[0].rows,
+            [[1]]
         );
     });
 
@@ -835,7 +864,10 @@ describe('WITHOUT ROWID primary-key identity', () => {
         );
 
         assert.strictEqual(deleted?.length, 1500);
-        assert.strictEqual(await engine.fetchTableCount('bulk_single', {}), 0);
+        assert.deepStrictEqual(
+            await engine.fetchTableCount('bulk_single', {}),
+            { count: 0, isExact: true }
+        );
     });
 
     it('chunks a rowid delete above the SQLite bind limit atomically', async () => {
@@ -851,16 +883,19 @@ describe('WITHOUT ROWID primary-key identity', () => {
             engine.deleteRows('bulk_rowid_delete', [...rowIds, 32_769]),
             /one or more row identities no longer exist/
         );
-        assert.strictEqual(
+        assert.deepStrictEqual(
             await engine.fetchTableCount('bulk_rowid_delete', {}),
-            32_768,
+            { count: 32_768, isExact: true },
             'a missing identity in the final chunk must leave every row intact'
         );
 
         const deleted = await engine.deleteRows('bulk_rowid_delete', rowIds);
         assert.strictEqual(deleted?.length, 32_768);
         assert.strictEqual(new Set(deleted?.map(row => String(row.rowId))).size, 32_768);
-        assert.strictEqual(await engine.fetchTableCount('bulk_rowid_delete', {}), 0);
+        assert.deepStrictEqual(
+            await engine.fetchTableCount('bulk_rowid_delete', {}),
+            { count: 0, isExact: true }
+        );
     });
 
     it('bulk-deletes 1000 rows through a composite primary key', async () => {
@@ -887,7 +922,10 @@ describe('WITHOUT ROWID primary-key identity', () => {
         );
 
         assert.strictEqual(deleted?.length, 1000);
-        assert.strictEqual(await engine.fetchTableCount('bulk_composite', {}), 0);
+        assert.deepStrictEqual(
+            await engine.fetchTableCount('bulk_composite', {}),
+            { count: 0, isExact: true }
+        );
     });
 
     it('chunks a 5000-row seven-column primary-key delete atomically below the bind limit', async () => {
@@ -924,9 +962,9 @@ describe('WITHOUT ROWID primary-key identity', () => {
             ),
             /Duplicate row identities are not allowed/
         );
-        assert.strictEqual(
+        assert.deepStrictEqual(
             await engine.fetchTableCount('bulk_wide_composite', {}),
-            5000,
+            { count: 5000, isExact: true },
             'a duplicate identity crossing a chunk boundary must be rejected atomically'
         );
 
@@ -934,14 +972,17 @@ describe('WITHOUT ROWID primary-key identity', () => {
             engine.deleteRows('bulk_wide_composite', [...rowIds, identityFor(5001)]),
             /one or more row identities no longer exist/
         );
-        assert.strictEqual(
+        assert.deepStrictEqual(
             await engine.fetchTableCount('bulk_wide_composite', {}),
-            5000,
+            { count: 5000, isExact: true },
             'a missing identity in a later chunk must roll back earlier chunk deletions'
         );
 
         const deleted = await engine.deleteRows('bulk_wide_composite', rowIds);
         assert.strictEqual(deleted?.length, 5000);
-        assert.strictEqual(await engine.fetchTableCount('bulk_wide_composite', {}), 0);
+        assert.deepStrictEqual(
+            await engine.fetchTableCount('bulk_wide_composite', {}),
+            { count: 0, isExact: true }
+        );
     });
 });

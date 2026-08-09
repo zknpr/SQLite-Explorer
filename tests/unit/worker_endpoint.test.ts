@@ -226,7 +226,7 @@ describe('Worker Endpoint', () => {
 
         await endpoint.deleteRows('users', [1]);
         const count = await endpoint.fetchTableCount('users', {});
-        assert.strictEqual(count, 1);
+        assert.deepStrictEqual(count, { count: 1, isExact: true });
 
         await endpoint.writeToFile('/tmp/test_dump.db');
     });

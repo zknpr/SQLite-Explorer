@@ -10,11 +10,11 @@ import * as vsc from 'vscode';
 import * as path from 'path';
 
 import type { DatabaseEditorProvider, DatabaseViewerProvider } from './editorController';
-import { ConfigurationSection, ExtensionId, getMaxInlineCellBytes, SidebarLeft, SidebarRight, UriScheme } from './config';
+import { ConfigurationSection, ExtensionId, getMaxInlineCellBytes, getMaxUndoMemoryBytes, SidebarLeft, SidebarRight, UriScheme } from './config';
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, WebviewQueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity, ColumnDropTableState } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, TableCountResult, QueryResultSet, WebviewQueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity, ColumnDropTableState } from './core/types';
 import { prepareCellUpdateForStorage } from './core/json-utils';
 import {
   assertMutableRecordId,
@@ -25,7 +25,7 @@ import {
   isPrimaryKeyRecordId,
   primaryKeyColumnsFromTableInfo
 } from './core/row-identity';
-import { escapeIdentifier, validateRowId, validateRowIds } from './core/sql-utils';
+import { escapeIdentifier, validateRowId } from './core/sql-utils';
 import {
   COLUMN_DROP_TABLE_STATE_SQL,
   mapColumnDropTableState
@@ -33,6 +33,7 @@ import {
 import { isViewDefinitionConflictError } from './core/view-utils';
 import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './core/cell-containment';
 import { assertDocumentModification } from './core/modification-validation';
+import { estimateUndoMemoryBytes } from './core/undo-history';
 import type { CellMaterializationService } from './cellMaterialization';
 import {
   assertCellValueWithinEditLimit,
@@ -559,64 +560,37 @@ export class HostBridge implements ToastService {
     }
     rowIds.forEach(assertMutableRecordId);
 
-    // Capture row data before deletion for rowid engines. PK-capable engines
-    // return their atomically captured rows from deleteRows below.
-    let deletedRowsData: { rowId: RecordId; row: Record<string, CellValue> }[] = [];
-    if (!rowIds.some(isPrimaryKeyRecordId)) {
-        const validIds = validateRowIds(rowIds);
-        if (validIds.length > 0) {
-            const placeholders = validIds.map(() => '?').join(', ');
-            const columnResult = await dbOps.executeQuery(
-                'SELECT name FROM pragma_table_xinfo(?) ' +
-                'WHERE hidden NOT IN (2, 3) ORDER BY cid',
-                [table]
-            );
-            const insertableColumns = (columnResult[0]?.rows ?? []).map(row => {
-                if (typeof row[0] !== 'string') {
-                    throw new Error(`SQLite returned invalid column metadata for ${table}`);
-                }
-                return row[0];
-            });
-            const sql =
-                `SELECT CAST(rowid AS TEXT) AS rowid, ` +
-                `${insertableColumns.map(escapeIdentifier).join(', ')} ` +
-                `FROM ${escapeIdentifier(table)} ` +
-                `WHERE rowid IN (${placeholders})`;
-            const result = await dbOps.executeQuery(sql, validIds);
-
-            if (result && result.length > 0 && result[0].rows) {
-                const rows = result[0].rows;
-
-                deletedRowsData = rows.map(r => {
-                    const rowData: Record<string, CellValue> = {};
-                    const rId = validateRowId(r[0] as RecordId);
-                    for (let i = 0; i < insertableColumns.length; i++) {
-                        rowData[insertableColumns[i]] = r[i + 1];
-                    }
-                    // Explicitly include rowid in the row data to ensure it's restored with the same ID
-                    rowData['rowid'] = rId;
-
-                    return { rowId: rId, row: rowData };
-                });
-            }
-        }
+    const modification = {
+      label: 'Delete Rows',
+      description: `Delete ${rowIds.length} rows from ${table}`,
+      modificationType: 'row_delete' as const,
+      targetTable: table,
+      affectedRowIds: rowIds,
+      deletedRows: []
+    };
+    const undoMemoryLimitBytes = this.document.undoMemoryLimitBytes
+      ?? getMaxUndoMemoryBytes();
+    const baseMemoryBytes = estimateUndoMemoryBytes(modification);
+    if (baseMemoryBytes > undoMemoryLimitBytes) {
+      throw new Error(
+        `Delete undo metadata exceeds the ${undoMemoryLimitBytes}-byte memory limit; ` +
+        'delete fewer rows or increase sqliteExplorer.maxUndoMemory.'
+      );
     }
 
-    this.assertConnectionGeneration(connectionGeneration);
-    if ('deleteRows' in dbOps) {
-      const deletedRows = await dbOps.deleteRows(table, rowIds);
-      if (deletedRows) deletedRowsData = deletedRows;
-    } else {
+    if (!('deleteRows' in dbOps)) {
       throw new Error("Backend does not support deleteRows");
     }
+    const deletedRowsData = await dbOps.deleteRows(
+      table,
+      rowIds,
+      undoMemoryLimitBytes - baseMemoryBytes
+    );
+    this.assertConnectionGeneration(connectionGeneration);
 
     // Fire edit event
     this.document.recordExternalModification({
-      label: 'Delete Rows',
-      description: `Delete ${rowIds.length} rows from ${table}`,
-      modificationType: 'row_delete',
-      targetTable: table,
-      affectedRowIds: rowIds,
+      ...modification,
       deletedRows: deletedRowsData
     });
   }
@@ -1036,7 +1010,7 @@ export class HostBridge implements ToastService {
   /**
    * Fetch table count (SELECT COUNT(*)).
    */
-  async fetchTableCount(table: string, options: TableCountOptions): Promise<number> {
+  async fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult> {
     const dbOps = this.ensureDatabaseInitialized();
 
     if ('fetchTableCount' in dbOps) {

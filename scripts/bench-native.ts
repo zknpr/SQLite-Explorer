@@ -232,11 +232,11 @@ async function discoverLargestTable(
   if (schema.tables.length === 0) throw new Error('Benchmark database has no tables');
   const sizes: Array<{ table: TableMetadata; columns: ColumnMetadata[]; rows: number }> = [];
   for (const table of [...schema.tables].sort((left, right) => left.identifier.localeCompare(right.identifier))) {
-    const [rows, columns] = await Promise.all([
+    const [rowCount, columns] = await Promise.all([
       operations.fetchTableCount(table.identifier, {}),
       operations.getTableInfo(table.identifier)
     ]);
-    sizes.push({ table, columns, rows });
+    sizes.push({ table, columns, rows: rowCount.count });
   }
   sizes.sort((left, right) => right.rows - left.rows || left.table.identifier.localeCompare(right.table.identifier));
   if (sizes[0].rows < 1) throw new Error('Benchmark database has no table rows');
@@ -630,9 +630,9 @@ async function runCandidate(
     workloads.aggregate = await measure('aggregate', iterations, async () => {
       const startedAt = performance.now();
       const count = await connection.operations.fetchTableCount(plan.largestTable, {});
-      if (count !== plan.largestTableRows) {
+      if (count.count !== plan.largestTableRows) {
         throw new Error(
-          `Aggregate verification failed: expected ${plan.largestTableRows}, received ${count}`
+          `Aggregate verification failed: expected ${plan.largestTableRows}, received ${count.count}`
         );
       }
       return elapsedMeasurement(startedAt);

@@ -190,9 +190,9 @@ describe('desktop engine paged count policy', () => {
   it('keeps the fast rowid-span bound for a genuine large gappy rowid table', async () => {
     const engine = await openPagedEngine();
     try {
-      const bound = await engine.fetchTableCount('fixtures', {});
-      assert.strictEqual(bound, 19999);
-      assert.ok(bound >= 10000, 'the rowid-span result must remain an upper bound');
+      const result = await engine.fetchTableCount('fixtures', {});
+      assert.deepStrictEqual(result, { count: 19999, isExact: false });
+      assert.ok(result.count >= 10000, 'the rowid-span result must remain an upper bound');
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }
@@ -202,10 +202,19 @@ describe('desktop engine paged count policy', () => {
     const engine = await openPagedEngine();
     try {
       // These deliberately differ from COUNT(*)=2, proving the bound path ran.
-      assert.strictEqual(await engine.fetchTableCount('declared_oid', {}), 7);
-      assert.strictEqual(await engine.fetchTableCount('declared__rowid_', {}), 9);
+      assert.deepStrictEqual(
+        await engine.fetchTableCount('declared_oid', {}),
+        { count: 7, isExact: false }
+      );
+      assert.deepStrictEqual(
+        await engine.fetchTableCount('declared__rowid_', {}),
+        { count: 9, isExact: false }
+      );
       // The literal rowid query would see declared values 1..99; exact fallback must win.
-      assert.strictEqual(await engine.fetchTableCount('declared_rowid', {}), 2);
+      assert.deepStrictEqual(
+        await engine.fetchTableCount('declared_rowid', {}),
+        { count: 2, isExact: true }
+      );
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }
@@ -214,7 +223,10 @@ describe('desktop engine paged count policy', () => {
   it('counts a genuine negative-rowid table without undercounting', async () => {
     const engine = await openPagedEngine();
     try {
-      assert.strictEqual(await engine.fetchTableCount('negative_rowids', {}), 150);
+      assert.deepStrictEqual(
+        await engine.fetchTableCount('negative_rowids', {}),
+        { count: 150, isExact: false }
+      );
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }
@@ -223,7 +235,10 @@ describe('desktop engine paged count policy', () => {
   it('falls back to exact COUNT for an unsafe signed-int64 rowid span', async () => {
     const engine = await openPagedEngine();
     try {
-      assert.strictEqual(await engine.fetchTableCount('extreme_rowids', {}), 2);
+      assert.deepStrictEqual(
+        await engine.fetchTableCount('extreme_rowids', {}),
+        { count: 2, isExact: true }
+      );
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }
@@ -232,7 +247,10 @@ describe('desktop engine paged count policy', () => {
   it('counts a WITHOUT ROWID table with a user rowid column exactly', async () => {
     const engine = await openPagedEngine();
     try {
-      assert.strictEqual(await engine.fetchTableCount('without_rowid_shadow', {}), 3);
+      assert.deepStrictEqual(
+        await engine.fetchTableCount('without_rowid_shadow', {}),
+        { count: 3, isExact: true }
+      );
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }
@@ -241,7 +259,10 @@ describe('desktop engine paged count policy', () => {
   it('counts a view exposing a rowid-named column exactly', async () => {
     const engine = await openPagedEngine();
     try {
-      assert.strictEqual(await engine.fetchTableCount('exposed_rowid', {}), 3);
+      assert.deepStrictEqual(
+        await engine.fetchTableCount('exposed_rowid', {}),
+        { count: 3, isExact: true }
+      );
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }
@@ -250,21 +271,21 @@ describe('desktop engine paged count policy', () => {
   it('keeps filtered paged counts exact', async () => {
     const engine = await openPagedEngine();
     try {
-      assert.strictEqual(
+      assert.deepStrictEqual(
         await engine.fetchTableCount('fixtures', {
           columns: ['id', 'label'],
           filters: [{ column: 'label', value: 'row-19999' }]
         }),
-        1
+        { count: 1, isExact: true }
       );
-      assert.strictEqual(
+      assert.deepStrictEqual(
         await engine.fetchTableCount('fixtures', {
           columns: ['id', 'label'],
           globalFilter: 'row-1999'
         }),
         // row-1999, row-19991..row-19999 (odd ids only): 1999, 19991,
         // 19993, 19995, 19997, 19999.
-        6
+        { count: 6, isExact: true }
       );
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
@@ -274,7 +295,10 @@ describe('desktop engine paged count policy', () => {
   it('falls through to the exact count for views (no rowid to bound with)', async () => {
     const engine = await openPagedEngine();
     try {
-      assert.strictEqual(await engine.fetchTableCount('odd_labels', {}), 10000);
+      assert.deepStrictEqual(
+        await engine.fetchTableCount('odd_labels', {}),
+        { count: 10000, isExact: true }
+      );
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }
@@ -293,7 +317,10 @@ describe('desktop engine paged count policy', () => {
     assert.strictEqual(result.storage, 'paged');
     const engine = result.operations!;
     try {
-      assert.strictEqual(await engine.fetchTableCount('fixtures', {}), 10000);
+      assert.deepStrictEqual(
+        await engine.fetchTableCount('fixtures', {}),
+        { count: 10000, isExact: true }
+      );
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }
@@ -311,7 +338,10 @@ describe('desktop engine paged count policy', () => {
     assert.strictEqual(result.storage, 'memory');
     const engine = result.operations!;
     try {
-      assert.strictEqual(await engine.fetchTableCount('fixtures', {}), 10000);
+      assert.deepStrictEqual(
+        await engine.fetchTableCount('fixtures', {}),
+        { count: 10000, isExact: true }
+      );
     } finally {
       (engine as WasmDatabaseEngine).shutdown();
     }

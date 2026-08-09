@@ -1198,7 +1198,7 @@ describe('web demo view worker', () => {
             Array.from(underscore.rows, (row: unknown[]) => Array.from(row)),
             [['under_score']]
         );
-        assert.strictEqual(underscoreCount, 1);
+        assert.deepStrictEqual({ ...underscoreCount }, { count: 1, isExact: true });
     });
 
     it('matches native/WASM bounded TEXT and BLOB grid previews', async () => {
@@ -1605,7 +1605,7 @@ describe('web demo view worker', () => {
         });
 
         assert.deepStrictEqual(Array.from(data.rows), []);
-        assert.strictEqual(count, 0);
+        assert.deepStrictEqual({ ...count }, { count: 0, isExact: true });
     });
 
     it('pages the demo grid by keyset and re-anchors every page', async () => {
@@ -1828,7 +1828,7 @@ describe('web demo view worker', () => {
             Array.from(data.rows, (row: unknown[]) => Array.from(row)),
             [['needle', 'needle']]
         );
-        assert.strictEqual(count, 1);
+        assert.deepStrictEqual({ ...count }, { count: 1, isExact: true });
     });
 
     it('returns exact unsafe INTEGER text alongside rounded demo grid values', async () => {
@@ -2542,7 +2542,7 @@ describe('web demo view worker', () => {
         const count = await worker.invoke('fetchTableCount', 'scoped_filters', options);
 
         assert.deepStrictEqual(Array.from(data.rows), []);
-        assert.strictEqual(count, 0);
+        assert.deepStrictEqual({ ...count }, { count: 0, isExact: true });
     });
 
     it('falls back to selected columns when count globalFilterColumns is null', async () => {
@@ -2559,7 +2559,7 @@ describe('web demo view worker', () => {
             globalFilter: 'secret'
         });
 
-        assert.strictEqual(count, 0);
+        assert.deepStrictEqual({ ...count }, { count: 0, isExact: true });
     });
 
     it('treats whitespace-only filters as inactive but preserves padded terms', async () => {
@@ -2581,7 +2581,7 @@ describe('web demo view worker', () => {
             });
             const count = await worker.invoke('fetchTableCount', 'whitespace_filters', options);
             assert.strictEqual(data.rows.length, 3);
-            assert.strictEqual(count, 3);
+            assert.deepStrictEqual({ ...count }, { count: 3, isExact: true });
         }
 
         const padded = await worker.invoke('fetchTableData', 'whitespace_filters', {
@@ -2598,7 +2598,7 @@ describe('web demo view worker', () => {
             Array.from(padded.rows, (row: unknown[]) => Array.from(row)),
             [[' needle ']]
         );
-        assert.strictEqual(paddedCount, 1);
+        assert.deepStrictEqual({ ...paddedCount }, { count: 1, isExact: true });
     });
 
     it('validates the CREATE VIEW construct and leaves the schema unchanged', async () => {

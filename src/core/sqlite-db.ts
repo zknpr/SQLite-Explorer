@@ -21,6 +21,7 @@ import type {
   CellUpdateResult,
   TableQueryOptions,
   TableCountOptions,
+  TableCountResult,
   SchemaSnapshot,
   ColumnMetadata,
   ColumnDefinition,
@@ -873,8 +874,12 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().insertRowBatch(table, rows, maxEditValueBytes);
     },
 
-    async deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void> {
-      return requireEngine().deleteRows(table, rowIds);
+    async deleteRows(
+      table: string,
+      rowIds: RecordId[],
+      maxUndoSnapshotBytes?: number
+    ): Promise<DeletedRow[]> {
+      return requireEngine().deleteRows(table, rowIds, maxUndoSnapshotBytes);
     },
 
     async deleteColumns(
@@ -965,7 +970,7 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().fetchTableData(table, options);
     },
 
-    async fetchTableCount(table: string, options: TableCountOptions): Promise<number> {
+    async fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult> {
       return requireEngine().fetchTableCount(table, options);
     },
 

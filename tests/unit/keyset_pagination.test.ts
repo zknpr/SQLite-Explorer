@@ -275,6 +275,14 @@ describe('resolveKeysetPlan', () => {
     assert.strictEqual(last?.mode, 'last');
     assert.strictEqual(last?.limit, 3);
 
+    const inexactLast = resolveKeysetPlan(
+      't',
+      { ...options, keyset: { mode: 'last' } },
+      ROWID_IDENTITY
+    );
+    assert.strictEqual(inexactLast?.mode, 'last');
+    assert.strictEqual(inexactLast?.limit, 5);
+
     for (const mode of ['after', 'atOrAfter', 'before'] as const) {
       const resolved = resolveKeysetPlan(
         't',

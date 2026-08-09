@@ -18,6 +18,7 @@ import type {
     CellUpdateResult,
     TableQueryOptions,
     TableCountOptions,
+    TableCountResult,
     SchemaSnapshot,
     ColumnMetadata,
     ColumnDefinition,
@@ -290,7 +291,11 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.insertRowBatch(table, rows, maxEditValueBytes);
     }
 
-    async deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void> {
+    async deleteRows(
+        table: string,
+        rowIds: RecordId[],
+        maxUndoSnapshotBytes?: number
+    ): Promise<DeletedRow[]> {
         const displayedIds = await Promise.all(
             rowIds.slice(0, MAX_DELETE_LOG_IDENTITIES).map(rowId => this.formatRecordId(rowId))
         );
@@ -300,7 +305,7 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
             `-- ${rowIds.length} identities` +
             (omitted > 0 ? `, showing ${displayedIds.length}; ${omitted} omitted` : '');
         this.log(sql, true);
-        return this.wrapped.deleteRows(table, rowIds);
+        return this.wrapped.deleteRows(table, rowIds, maxUndoSnapshotBytes);
     }
 
     async deleteColumns(
@@ -441,7 +446,7 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.fetchTableData(table, options);
     }
 
-    async fetchTableCount(table: string, options: TableCountOptions): Promise<number> {
+    async fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult> {
         const { sql, params } = buildCountQuery(table, options);
         const paramStr = params && params.length > 0 ? ` -- params: [${params.map(p => this.sanitizeValue(p)).join(', ')}]` : '';
         this.log(`${sql}${paramStr}`, false);

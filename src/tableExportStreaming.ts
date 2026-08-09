@@ -26,6 +26,7 @@ import {
   isReadOnlyPrimaryKeyRecordId
 } from './core/row-identity';
 import { runReadSnapshot } from './core/operation-serializer';
+import { ROWID_TABLE_AUTHORITY_SQL } from './core/integer-utils';
 
 /**
  * Source window selected so even the worst JSON control-character expansion
@@ -243,18 +244,23 @@ async function resolveIdentity(
   operations: DatabaseOperations,
   table: string
 ): Promise<TableIdentity | undefined> {
-  if (typeof operations.fetchSchema !== 'function') {
-    try {
-      await operations.executeQuery(
-        `SELECT rowid FROM ${escapeIdentifier(table)} LIMIT 1`
-      );
-      return { kind: 'rowid' };
-    } catch {
-      return undefined;
-    }
+  const schemaIdentity = typeof operations.fetchSchema === 'function'
+    ? (await operations.fetchSchema()).tables
+      .find(candidate => candidate.identifier === table)?.identity
+    : undefined;
+  if (schemaIdentity?.kind === 'primaryKey') return schemaIdentity;
+  if (schemaIdentity === undefined && typeof operations.fetchSchema === 'function') {
+    return undefined;
   }
-  const schema = await operations.fetchSchema();
-  return schema.tables.find(candidate => candidate.identifier === table)?.identity;
+
+  // Schema identity classifies ordinary rowid tables structurally, but export
+  // seeks use the literal `rowid` alias. Reuse the canonical authority check so
+  // a declared nullable/non-unique `rowid` column can never become a seek key.
+  const authority = await operations.executeQuery(
+    ROWID_TABLE_AUTHORITY_SQL,
+    [table, table]
+  );
+  return (authority[0]?.rows.length ?? 0) > 0 ? { kind: 'rowid' } : undefined;
 }
 
 async function resolveTextEncoding(

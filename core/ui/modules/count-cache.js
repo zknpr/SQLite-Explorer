@@ -58,7 +58,7 @@ const UNFILTERED_SUB_KEY = '';
 // exempt: it is the high-value entry that keeps page turns count-free.
 const MAX_FILTERED_IDENTITIES_PER_TABLE = 32;
 
-// table name -> (identity sub-key -> count). Sub-key '' is the unfiltered
+// table name -> (identity sub-key -> { count, isExact }). Sub-key '' is the unfiltered
 // identity; every other sub-key is the canonical JSON of its predicates.
 const countsByTable = new Map();
 
@@ -71,6 +71,24 @@ let demoMode = false;
 
 export function setCountCacheDemoMode(enabled) {
     demoMode = enabled === true;
+}
+
+/** Normalize the structured production result while keeping older test/demo callers explicit. */
+export function normalizeCountResult(result) {
+    if (typeof result === 'number') {
+        if (!Number.isSafeInteger(result) || result < 0) {
+            throw new Error('Table count must be a non-negative safe integer');
+        }
+        return { count: result, isExact: true };
+    }
+    if (
+        !result || typeof result !== 'object'
+        || !Number.isSafeInteger(result.count) || result.count < 0
+        || typeof result.isExact !== 'boolean'
+    ) {
+        throw new Error('Invalid table count result');
+    }
+    return { count: result.count, isExact: result.isExact };
 }
 
 /**
@@ -104,13 +122,13 @@ export function buildCountIdentity(table, filters, globalFilter, columnNames) {
 export function getCachedCount(identity) {
     const tableCounts = countsByTable.get(identity.table);
     if (!tableCounts) return undefined;
-    const count = tableCounts.get(identity.subKey);
-    if (count !== undefined && identity.subKey !== UNFILTERED_SUB_KEY) {
+    const result = tableCounts.get(identity.subKey);
+    if (result !== undefined && identity.subKey !== UNFILTERED_SUB_KEY) {
         // Re-insert so Map order tracks recency and the cap evicts LRU-first.
         tableCounts.delete(identity.subKey);
-        tableCounts.set(identity.subKey, count);
+        tableCounts.set(identity.subKey, result);
     }
-    return count;
+    return result;
 }
 
 /**
@@ -122,8 +140,9 @@ export function getCachedCount(identity) {
  */
 export function prepareCountStore(identity) {
     const epochAtRequest = cacheEpoch;
-    return count => {
+    return result => {
         if (cacheEpoch !== epochAtRequest) return false;
+        const normalized = normalizeCountResult(result);
         let tableCounts = countsByTable.get(identity.table);
         if (!tableCounts) {
             tableCounts = new Map();
@@ -141,7 +160,7 @@ export function prepareCountStore(identity) {
                 }
             }
         }
-        tableCounts.set(identity.subKey, count);
+        tableCounts.set(identity.subKey, normalized);
         return true;
     };
 }
@@ -159,8 +178,13 @@ export function noteRowCountChanged(table, delta) {
     // affected rows each filter matches is unknowable here — so filtered
     // identities are dropped rather than adjusted.
     tableCounts.clear();
-    if (!demoMode && unfiltered !== undefined) {
-        tableCounts.set(UNFILTERED_SUB_KEY, Math.max(0, unfiltered + delta));
+    // A delta preserves an exact cardinality, but not a rowid-span bound: an
+    // inserted explicit rowid can extend that span by far more than one.
+    if (!demoMode && unfiltered?.isExact === true) {
+        tableCounts.set(UNFILTERED_SUB_KEY, {
+            count: Math.max(0, unfiltered.count + delta),
+            isExact: true
+        });
     }
 }
 

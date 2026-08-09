@@ -30,7 +30,7 @@ function createOperations(overrides: Partial<DatabaseOperations> = {}): Database
         replaceOversizedCell: async () => {},
         insertRow: async () => undefined,
         insertRowBatch: async () => {},
-        deleteRows: async () => {},
+        deleteRows: async () => [],
         deleteColumns: async table => ({
             tableSql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY)`,
             columns: ['id'],
@@ -54,7 +54,7 @@ function createOperations(overrides: Partial<DatabaseOperations> = {}): Database
             headers: [],
             rows: []
         }),
-        fetchTableCount: async () => 0,
+        fetchTableCount: async () => ({ count: 0, isExact: true }),
         fetchSchema: async () => ({
             tables: [],
             views: [],

@@ -51,6 +51,7 @@ export const state = {
     currentPageIndex: 0,
     rowsPerPage: DEFAULT_ROWS_PER_PAGE,
     totalRecordCount: 0,
+    totalRecordCountIsExact: true,
     totalPageCount: 1,
     tableColumns: [],
     sortedColumn: null,

@@ -1626,7 +1626,7 @@ async function fetchTableData(table, options = {}) {
  *
  * @param {string} table - Table name
  * @param {Object} options - Query options
- * @returns {Promise<number>} Row count
+ * @returns {Promise<{count: number, isExact: boolean}>} Exact count or safe upper bound
  */
 async function fetchTableCount(table, options = {}) {
   if (!db) throw new Error('No database initialized');
@@ -1699,7 +1699,9 @@ async function fetchTableCount(table, options = {}) {
       })) {
         const upperBound = db.exec(buildCountUpperBoundSql(table));
         const resolvedUpperBound = resolveCountUpperBound(upperBound[0]?.values?.[0]);
-        if (resolvedUpperBound !== undefined) return resolvedUpperBound;
+        if (resolvedUpperBound !== undefined) {
+          return { count: resolvedUpperBound, isExact: false };
+        }
       }
     } catch {
       // Authority or bound failures retain exact semantics.
@@ -1709,10 +1711,10 @@ async function fetchTableCount(table, options = {}) {
   const results = db.exec(sql, params);
 
   if (results.length === 0 || results[0].values.length === 0) {
-    return 0;
+    return { count: 0, isExact: true };
   }
 
-  return results[0].values[0][0];
+  return { count: results[0].values[0][0], isExact: true };
 }
 
 /**

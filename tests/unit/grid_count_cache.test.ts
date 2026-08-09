@@ -578,6 +578,17 @@ describe('grid count cache', () => {
         }
     });
 
+    it('invalidates an inexact rowid-span bound instead of applying a row delta', async () => {
+        const { countCache } = await loadHarness();
+        const identity = countCache.buildCountIdentity('items', [], undefined, []);
+        countCache.prepareCountStore(identity)({ count: 1_000_000, isExact: false });
+
+        // An explicit inserted rowid could extend the span by much more than
+        // one, so arithmetic adjustment would no longer be a safe upper bound.
+        countCache.noteRowCountChanged('items', 1);
+        assert.strictEqual(countCache.getCachedCount(identity), undefined);
+    });
+
     it('handles an empty table and floors deltas at zero', async () => {
         installDocumentMock();
         const { state, backendApi, loadTableData, countCache } = await loadHarness();
@@ -720,6 +731,82 @@ describe('grid count cache', () => {
             // never speculates.
             assert.strictEqual(dataRequests[0].countWasResolved, true);
             assert.deepStrictEqual(dataRequests[0].keyset, { mode: 'last', lastPageRowCount: 20 });
+        } finally {
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
+    it('uses an inexact rowid-span count only as a bound when seeking the sparse last page', async () => {
+        const elements = installDocumentMock();
+        const { state, backendApi, loadTableData } = await loadHarness();
+        const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+        const dataRequests: any[] = [];
+        backendApi.fetchTableCount = async () => ({ count: 1_000_000, isExact: false });
+        backendApi.fetchTableData = async (_table: string, options: any) => {
+            dataRequests.push(options);
+            return {
+                rows: [[1, 'one'], [1_000_000, 'million']],
+                keysetAnchors: { first: 'F1', last: 'L1000000' }
+            };
+        };
+        primeTableState(state, 'sparse_items', 199);
+        state.rowsPerPage = 5000;
+
+        try {
+            assert.strictEqual(await loadTableData(false, false, 'last'), true);
+            assert.strictEqual(dataRequests.length, 1);
+            assert.deepStrictEqual(dataRequests[0].keyset, { mode: 'last' });
+            assert.strictEqual(dataRequests[0].offset, 995000);
+            // A short reverse seek proves the whole table fits on one page, so
+            // replace the loose span bound with the exact result we just read.
+            assert.strictEqual(state.totalRecordCount, 2);
+            assert.strictEqual(state.totalRecordCountIsExact, true);
+            assert.strictEqual(state.totalPageCount, 1);
+            assert.strictEqual(state.currentPageIndex, 0);
+            assert.strictEqual(elements.pageIndicator.textContent, '1 / 1');
+            assert.strictEqual(elements.statusText.textContent, '2 records');
+        } finally {
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
+    it('collapses an inexact reverse walk when a short seek proves the real first page', async () => {
+        installDocumentMock();
+        const { state, backendApi, loadTableData } = await loadHarness();
+        const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+        const dataRequests: any[] = [];
+        backendApi.fetchTableCount = async () => ({ count: 1_000_000, isExact: false });
+        backendApi.fetchTableData = async (_table: string, options: any) => {
+            dataRequests.push(options);
+            if (options.keyset?.mode === 'last') {
+                return {
+                    rows: Array.from({ length: 5000 }, (_, index) => [5001 + index, 'tail']),
+                    keysetAnchors: { first: 'F5001', last: 'L10000' }
+                };
+            }
+            if (options.keyset?.mode === 'before') {
+                return {
+                    rows: Array.from({ length: 1000 }, (_, index) => [1 + index, 'head']),
+                    keysetAnchors: { first: 'F1', last: 'L1000' }
+                };
+            }
+            throw new Error('reverse walk must not fall back to a deep OFFSET');
+        };
+        primeTableState(state, 'two_sparse_pages', 199);
+        state.rowsPerPage = 5000;
+
+        try {
+            assert.strictEqual(await loadTableData(false, false, 'last'), true);
+            assert.strictEqual(state.totalRecordCountIsExact, false);
+
+            state.currentPageIndex = 198;
+            assert.strictEqual(await loadTableData(false, false, 'prev'), true);
+            assert.deepStrictEqual(dataRequests[1].keyset, { mode: 'before', anchor: 'F5001' });
+            assert.strictEqual(state.totalRecordCount, 6000);
+            assert.strictEqual(state.totalRecordCountIsExact, true);
+            assert.strictEqual(state.totalPageCount, 2);
+            assert.strictEqual(state.currentPageIndex, 0);
+            assert.strictEqual(state.gridData.length, 1000);
         } finally {
             resetHarness(state, backendApi, originals);
         }

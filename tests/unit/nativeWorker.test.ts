@@ -684,6 +684,50 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
+    it('refuses oversized native delete history before selecting row values or deleting', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'open') {
+                return { result: { success: true } };
+            }
+            if (call.method === 'run') {
+                return { result: { changes: 0 } };
+            }
+            if (call.method === 'query') {
+                const sql = String(call.args[0]);
+                if (sql.includes('pragma_table_xinfo')) {
+                    return { result: { columns: ['name'], values: [['payload']] } };
+                }
+                if (/SELECT COUNT\(\*\), COALESCE\(SUM/i.test(sql)) {
+                    return {
+                        result: {
+                            columns: ['COUNT(*)', 'value_bytes'],
+                            values: [[1, 2 * 1024 * 1024]]
+                        }
+                    };
+                }
+            }
+            throw new Error(`unexpected native call: ${call.method}`);
+        });
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.deleteRows('native_large_delete', [1], 1024),
+                /undo snapshot exceeds.*memory budget/i
+            );
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['run', 'query', 'query', 'run', 'run']
+            );
+            assert.ok(connection.calls.every(call => {
+                const sql = String(call.args[0]);
+                return !/SELECT CAST\(rowid AS TEXT\)/i.test(sql)
+                    && !/^DELETE\s/i.test(sql);
+            }));
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('lets native history restore a legacy oversized prior while public edits remain guarded', async () => {
         const connection = await createRecordingConnection(() => ({
             result: { changes: 1, lastInsertRowId: 1 }

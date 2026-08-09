@@ -49,6 +49,9 @@ export const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 const MIN_QUERY_TIMEOUT_MS = 1000;
 const MIN_INLINE_CELL_BYTES = 1024;
 const MAX_INLINE_CELL_BYTES = 16 * 1024 * 1024;
+export const DEFAULT_MAX_UNDO_MEMORY_BYTES = 50 * 1024 * 1024;
+const MIN_UNDO_MEMORY_BYTES = 1024 * 1024;
+const MAX_UNDO_MEMORY_BYTES = 512 * 1024 * 1024;
 
 // ============================================================================
 // Configuration Accessors
@@ -94,5 +97,21 @@ export function getMaxInlineCellBytes(): number {
   return Math.min(
     MAX_INLINE_CELL_BYTES,
     Math.max(MIN_INLINE_CELL_BYTES, Math.floor(configuredValue))
+  );
+}
+
+/** Retrieve the configured undo-history memory ceiling in bytes. */
+export function getMaxUndoMemoryBytes(): number {
+  const config = vsc.workspace.getConfiguration(ConfigurationSection);
+  const configuredValue = config.get<unknown>(
+    'maxUndoMemory',
+    DEFAULT_MAX_UNDO_MEMORY_BYTES
+  );
+  if (typeof configuredValue !== 'number' || !Number.isFinite(configuredValue)) {
+    return DEFAULT_MAX_UNDO_MEMORY_BYTES;
+  }
+  return Math.min(
+    MAX_UNDO_MEMORY_BYTES,
+    Math.max(MIN_UNDO_MEMORY_BYTES, Math.floor(configuredValue))
   );
 }

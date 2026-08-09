@@ -81,6 +81,12 @@ import {
   TABLE_IDENTITY_METADATA_SQL
 } from './core/row-identity';
 import {
+  assertDeleteSnapshotFitsUndoBudget,
+  buildDeleteSnapshotSizeQuery,
+  deleteSnapshotValueColumns,
+  parseDeleteSnapshotSizeRow
+} from './core/delete-history';
+import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
   collectRowIdExactRealTexts,
@@ -941,6 +947,38 @@ export async function createNativeDatabaseConnection(
             throw new Error(`SQLite returned invalid column metadata for ${table}`);
           }
           return row[0];
+        });
+      };
+
+      const assertNativeDeleteSnapshotWithinBudget = async (
+        table: string,
+        insertableColumns: readonly string[],
+        predicates: ReturnType<typeof buildRecordIdentityPredicateChunks>,
+        rowIds: readonly RecordId[],
+        includeSyntheticRowId: boolean,
+        maxSnapshotBytes: number
+      ): Promise<void> => {
+        const valueColumns = deleteSnapshotValueColumns(
+          insertableColumns,
+          includeSyntheticRowId
+        );
+        let rowCount = 0;
+        let valueBytes = 0;
+        for (const predicate of predicates) {
+          const query = buildDeleteSnapshotSizeQuery(table, valueColumns, predicate);
+          const result = await worker.call<NativeQueryResult>('query', [query.sql, query.params]);
+          const chunk = parseDeleteSnapshotSizeRow(result.values?.[0]);
+          rowCount += chunk.rowCount;
+          valueBytes += chunk.valueBytes;
+        }
+        assertDeleteSnapshotFitsUndoBudget({
+          table,
+          insertableColumns,
+          includeSyntheticRowId,
+          rowIds,
+          rowCount,
+          valueBytes,
+          maxSnapshotBytes
         });
       };
 
@@ -2115,7 +2153,11 @@ export async function createNativeDatabaseConnection(
         /**
          * Delete rows by ID.
          */
-        deleteRows: async (table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void> => {
+        deleteRows: async (
+          table: string,
+          rowIds: RecordId[],
+          maxUndoSnapshotBytes?: number
+        ): Promise<DeletedRow[]> => {
           rowIds.forEach(assertMutableRecordId);
           if (rowIds.length === 0) return [];
 
@@ -2132,6 +2174,16 @@ export async function createNativeDatabaseConnection(
             await worker.call('run', [`SAVEPOINT ${savepointName}`]);
             try {
               const insertableColumns = await getNativeInsertableColumnNames(table);
+              if (maxUndoSnapshotBytes !== undefined) {
+                await assertNativeDeleteSnapshotWithinBudget(
+                  table,
+                  insertableColumns,
+                  predicates,
+                  rowIds,
+                  false,
+                  maxUndoSnapshotBytes
+                );
+              }
               const deletedRows: DeletedRow[] = [];
               for (const predicate of predicates) {
                 const current = await worker.call<NativeQueryResult>('query', [
@@ -2181,6 +2233,16 @@ export async function createNativeDatabaseConnection(
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {
             const insertableColumns = await getNativeInsertableColumnNames(table);
+            if (maxUndoSnapshotBytes !== undefined) {
+              await assertNativeDeleteSnapshotWithinBudget(
+                table,
+                insertableColumns,
+                predicates,
+                rowIds,
+                true,
+                maxUndoSnapshotBytes
+              );
+            }
             const deletedRows: DeletedRow[] = [];
             for (const predicate of predicates) {
               const current = await worker.call<NativeQueryResult>('query', [
@@ -2770,9 +2832,9 @@ export async function createNativeDatabaseConnection(
           const result = await worker.call<NativeQueryResult>('query', [sql, params]);
           if (result && result.values && result.values.length > 0) {
             const val = result.values[0][0];
-            return typeof val === 'number' ? val : 0;
+            return { count: typeof val === 'number' ? val : 0, isExact: true };
           }
-          return 0;
+          return { count: 0, isExact: true };
         },
 
         /**

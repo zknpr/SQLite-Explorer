@@ -1031,6 +1031,41 @@ describe('streamTableExport cell boundaries', () => {
         }
     });
 
+    it('exports every declared-rowid row across duplicate 128-row batch boundaries', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_declared_rowid (rowid INTEGER, value TEXT); ' +
+            'WITH RECURSIVE rows(id) AS (' +
+            'VALUES(1) UNION ALL SELECT id + 1 FROM rows WHERE id < 200' +
+            ') INSERT INTO stage_e_declared_rowid ' +
+            "SELECT 7, printf('row-%d', id) FROM rows"
+        );
+
+        try {
+            const exported = await collectStreamingExport(
+                operations,
+                'stage_e_declared_rowid',
+                ['rowid', 'value'],
+                { format: 'csv' }
+            );
+            const rows = exported.content.split('\n').slice(1);
+            assert.strictEqual(exported.rowCount, 200);
+            assert.strictEqual(rows.length, 200);
+            assert.strictEqual(new Set(rows).size, 200);
+            assert.deepStrictEqual(
+                [...rows].sort(),
+                Array.from({ length: 200 }, (_, index) => `7,row-${index + 1}`).sort()
+            );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('does not zip a selected WITHOUT ROWID identity to values from a later snapshot', async () => {
         const database = await createDatabaseEngine({
             content: null,

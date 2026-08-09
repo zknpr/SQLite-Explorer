@@ -105,7 +105,7 @@ export interface KeysetPaginationRequest {
   mode: KeysetNavigationMode;
   /** Opaque anchor token from a prior page; required for after/atOrAfter/before. */
   anchor?: string;
-  /** Row count of the final page (from the fresh total count); required for 'last'. */
+  /** Exact row count of the final page. Omit when the total is only an upper bound. */
   lastPageRowCount?: number;
 }
 
@@ -518,8 +518,12 @@ export interface DatabaseOperations {
     maxEditValueBytes?: number
   ): Promise<void>;
 
-  /** Delete rows by ID */
-  deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void>;
+  /** Delete rows by ID, optionally refusing before an oversized exact undo snapshot. */
+  deleteRows(
+    table: string,
+    rowIds: RecordId[],
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow[]>;
 
   /** Delete columns by name */
   deleteColumns(
@@ -585,8 +589,8 @@ export interface DatabaseOperations {
   /** Fetch table data */
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
 
-  /** Fetch table row count */
-  fetchTableCount(table: string, options: TableCountOptions): Promise<number>;
+  /** Fetch an exact row count or a safe upper bound. */
+  fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult>;
 
   /** Fetch database schema */
   fetchSchema(): Promise<SchemaSnapshot>;
@@ -686,6 +690,12 @@ export interface TableCountOptions {
     value: string;
   }[];
   globalFilter?: string;
+}
+
+/** Count value plus the semantic distinction required for safe page math. */
+export interface TableCountResult {
+  count: number;
+  isExact: boolean;
 }
 
 // ============================================================================

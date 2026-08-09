@@ -50,7 +50,7 @@ describe('SQLite Engine Undo/Redo', () => {
         await engine.deleteRows('users', [2]);
 
         const verifyGone = await engine.fetchTableCount('users', {});
-        assert.strictEqual(verifyGone, 1);
+        assert.deepStrictEqual(verifyGone, { count: 1, isExact: true });
 
         // 2. Undo Delete
         await engine.undoModification({
@@ -61,7 +61,7 @@ describe('SQLite Engine Undo/Redo', () => {
         });
 
         const verifyRestored = await engine.fetchTableCount('users', {});
-        assert.strictEqual(verifyRestored, 2);
+        assert.deepStrictEqual(verifyRestored, { count: 2, isExact: true });
 
         const restoredRow = await engine.executeQuery("SELECT name FROM users WHERE id = 2");
         assert.strictEqual(restoredRow[0].rows[0][0], 'Bob');
@@ -75,7 +75,7 @@ describe('SQLite Engine Undo/Redo', () => {
         });
 
         const verifyDeletedAgain = await engine.fetchTableCount('users', {});
-        assert.strictEqual(verifyDeletedAgain, 1);
+        assert.deepStrictEqual(verifyDeletedAgain, { count: 1, isExact: true });
     });
 
     it('restores a deleted row to its deterministic grid position', async () => {

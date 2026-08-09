@@ -19,6 +19,7 @@ import type {
   CellUpdateResult,
   TableQueryOptions,
   TableCountOptions,
+  TableCountResult,
   SchemaSnapshot,
   ColumnMetadata,
   ColumnDefinition,
@@ -92,6 +93,12 @@ import {
   replacePrimaryKeyRecordIdValues,
   TABLE_IDENTITY_METADATA_SQL
 } from '../../row-identity';
+import {
+  assertDeleteSnapshotFitsUndoBudget,
+  buildDeleteSnapshotSizeQuery,
+  deleteSnapshotValueColumns,
+  parseDeleteSnapshotSizeRow
+} from '../../delete-history';
 import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionStateCurrent,
@@ -1974,7 +1981,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Delete rows by ID.
    */
-  async deleteRows(table: string, rowIds: RecordId[]): Promise<DeletedRow[] | void> {
+  async deleteRows(
+    table: string,
+    rowIds: RecordId[],
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow[]> {
     rowIds.forEach(assertMutableRecordId);
     if (rowIds.length === 0) return [];
 
@@ -1991,6 +2002,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       await this.executeQuery(`SAVEPOINT ${savepointName}`);
       try {
         const insertableColumns = await this.getInsertableColumnNames(table);
+        if (maxUndoSnapshotBytes !== undefined) {
+          this.assertDeleteSnapshotWithinBudget(
+            table,
+            insertableColumns,
+            predicates,
+            rowIds,
+            false,
+            maxUndoSnapshotBytes
+          );
+        }
         const deletedRows: DeletedRow[] = [];
         for (const predicate of predicates) {
           const current = this.queryRaw(
@@ -2037,6 +2058,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const insertableColumns = await this.getInsertableColumnNames(table);
+      if (maxUndoSnapshotBytes !== undefined) {
+        this.assertDeleteSnapshotWithinBudget(
+          table,
+          insertableColumns,
+          predicates,
+          rowIds,
+          true,
+          maxUndoSnapshotBytes
+        );
+      }
       const deletedRows: DeletedRow[] = [];
       for (const predicate of predicates) {
         const current = this.queryRaw(
@@ -2292,6 +2323,38 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         throw new Error(`SQLite returned invalid column metadata for ${table}`);
       }
       return row[0];
+    });
+  }
+
+  private assertDeleteSnapshotWithinBudget(
+    table: string,
+    insertableColumns: readonly string[],
+    predicates: ReturnType<typeof buildRecordIdentityPredicateChunks>,
+    rowIds: readonly RecordId[],
+    includeSyntheticRowId: boolean,
+    maxSnapshotBytes: number
+  ): void {
+    const valueColumns = deleteSnapshotValueColumns(
+      insertableColumns,
+      includeSyntheticRowId
+    );
+    let rowCount = 0;
+    let valueBytes = 0;
+    for (const predicate of predicates) {
+      const query = buildDeleteSnapshotSizeQuery(table, valueColumns, predicate);
+      const result = this.queryRaw(query.sql, query.params);
+      const chunk = parseDeleteSnapshotSizeRow(result.rows[0]);
+      rowCount += chunk.rowCount;
+      valueBytes += chunk.valueBytes;
+    }
+    assertDeleteSnapshotFitsUndoBudget({
+      table,
+      insertableColumns,
+      includeSyntheticRowId,
+      rowIds,
+      rowCount,
+      valueBytes,
+      maxSnapshotBytes
     });
   }
 
@@ -3226,7 +3289,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Fetch table row count using options.
    */
-  async fetchTableCount(table: string, options: TableCountOptions): Promise<number> {
+  async fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult> {
     const queryOptions = { ...options };
     queryOptions.columns = await this.resolveQueryColumns(table, queryOptions.columns, queryOptions.globalFilter);
 
@@ -3256,7 +3319,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         })) {
           const bound = await this.executeQuery(buildCountUpperBoundSql(table));
           const upperBound = resolveCountUpperBound(bound[0]?.rows?.[0]);
-          if (upperBound !== undefined) return upperBound;
+          if (upperBound !== undefined) return { count: upperBound, isExact: false };
         }
       } catch {
         // Authority or bound failures retain exact semantics.
@@ -3265,9 +3328,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const result = await this.executeQuery(sql, params);
     if (result && result.length > 0 && result[0].rows.length > 0) {
       const count = result[0].rows[0][0];
-      return typeof count === 'number' ? count : 0;
+      return { count: typeof count === 'number' ? count : 0, isExact: true };
     }
-    return 0;
+    return { count: 0, isExact: true };
   }
 
   /**

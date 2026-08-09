@@ -344,13 +344,13 @@ describe('WasmDatabaseEngine', () => {
          columns: ['*'],
          globalFilter: 'fruit'
        });
-       assert.strictEqual(count, 2);
+       assert.deepStrictEqual(count, { count: 2, isExact: true });
 
        const countYellow = await engine.fetchTableCount('items', {
         columns: ['*'],
         globalFilter: 'Yellow'
       });
-      assert.strictEqual(countYellow, 1);
+      assert.deepStrictEqual(countYellow, { count: 1, isExact: true });
     });
   });
 

@@ -10,7 +10,7 @@ import type { DatabaseViewerProvider } from './editorController';
 
 import * as vsc from 'vscode';
 
-import { ConfigurationSection, FullExtensionId } from './config';
+import { ConfigurationSection, FullExtensionId, getMaxUndoMemoryBytes } from './config';
 import { Disposable } from './lifecycle';
 import { cancelTokenToAbortSignal, getUriParts, generateDatabaseDocumentKey } from './helpers';
 import { HostBridge } from './hostBridge';
@@ -90,9 +90,6 @@ export const SupportsWriteMode = IsLocalMode || IsRemoteWorkspaceMode || IsBrows
 /** Maximum modifications to track */
 const MODIFICATION_LIMIT = 100;
 
-/** Default maximum memory for undo history (50MB) */
-const DEFAULT_MAX_UNDO_MEMORY = 50 * 1024 * 1024;
-
 /**
  * Get auto-commit setting from configuration.
  */
@@ -107,11 +104,6 @@ export function isAutoCommitEnabled(): boolean {
 /**
  * Get maximum undo memory from configuration.
  */
-function getMaxUndoMemory(): number {
-  const config = vsc.workspace.getConfiguration(ConfigurationSection);
-  return config.get<number>('maxUndoMemory', DEFAULT_MAX_UNDO_MEMORY);
-}
-
 /** Refuse materialization when a paged document cannot reach the local streaming writer. */
 function pagedNonFilePersistenceError(): Error {
   return new Error(vsc.l10n.t(
@@ -277,7 +269,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   ) {
     super();
     this.#forceReadOnlyOnReconnect = forceReadOnlyOnReconnect;
-    this.#modificationTracker = tracker ?? new ModificationTracker<DocumentModification>(MODIFICATION_LIMIT, getMaxUndoMemory());
+    this.#modificationTracker = tracker ?? new ModificationTracker<DocumentModification>(
+      MODIFICATION_LIMIT,
+      getMaxUndoMemoryBytes()
+    );
     this.#hostBridge = new HostBridge(viewerProvider, this);
     this.#documentKey = Promise.resolve(documentKey);
     DocumentRegistry.set(documentKey, this);
@@ -287,6 +282,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   get fileParts() { return getUriParts(this.uri); }
   get hostBridge() { return this.#hostBridge; }
   get documentKey() { return this.#documentKey; }
+  get undoMemoryLimitBytes() { return this.#modificationTracker.memoryLimitBytes; }
   /** Monotonic barrier for host operations that span a database reload. */
   get connectionGeneration() { return this.#connectionGeneration; }
 

@@ -690,12 +690,11 @@ describe('HostBridge', () => {
         }
     });
 
-    it('propagates a row-history read failure without deleting or recording history', async () => {
+    it('propagates an engine-owned undo preflight failure without recording history', async () => {
         const consoleWarnMock = mock.method(console, 'warn', () => {});
         const error = new Error('Database disconnected');
         const dbOps = {
-            executeQuery: mock.fn(async () => { throw error; }),
-            deleteRows: mock.fn(async () => {})
+            deleteRows: mock.fn(async () => { throw error; })
         };
         const mockDocument = {
             uri: vscode.Uri.parse('file:///test.db'),
@@ -708,27 +707,27 @@ describe('HostBridge', () => {
 
         await assert.rejects(bridge.deleteRows('table1', [1]), error);
         assert.strictEqual(consoleWarnMock.mock.callCount(), 0);
-        assert.strictEqual(dbOps.deleteRows.mock.callCount(), 0);
+        assert.strictEqual(dbOps.deleteRows.mock.callCount(), 1);
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
-    it('excludes generated columns from the fallback rowid deletion snapshot', async () => {
+    it('records the engine-owned exact snapshot and passes a pre-materialization budget', async () => {
+        const deletedRows = [{
+            rowId: 9,
+            row: { base: 5, rowid: 9 }
+        }];
         const dbOps = {
-            executeQuery: mock.fn(async (sql: string) => {
-                if (sql.includes('pragma_table_xinfo')) {
-                    return [{ headers: ['name'], rows: [['base']] }];
-                }
-                return [{
-                    headers: ['rowid', 'base', 'stored_value', 'virtual_value'],
-                    rows: [[9, 5, 10, 15]]
-                }];
-            }),
-            deleteRows: mock.fn(async () => undefined)
+            deleteRows: mock.fn(async (
+                _table: string,
+                _rowIds: (string | number)[],
+                _maxUndoSnapshotBytes?: number
+            ) => deletedRows)
         };
         const recordExternalModification = mock.fn();
         const mockDocument = {
             uri: vscode.Uri.parse('file:///test.db'),
             documentKey: Promise.resolve('test-key'),
+            undoMemoryLimitBytes: 1024,
             recordExternalModification
         };
         const bridge = new HostBridge(
@@ -739,11 +738,13 @@ describe('HostBridge', () => {
 
         await bridge.deleteRows('generated_rows', [9]);
 
+        const deleteArguments = dbOps.deleteRows.mock.calls[0].arguments;
+        assert.deepStrictEqual(deleteArguments.slice(0, 2), ['generated_rows', [9]]);
+        const snapshotBudget = deleteArguments[2];
+        assert.ok(typeof snapshotBudget === 'number' && Number.isSafeInteger(snapshotBudget));
+        assert.ok(snapshotBudget > 0 && snapshotBudget < 1024);
         const modification = recordExternalModification.mock.calls[0].arguments[0] as any;
-        assert.deepStrictEqual(modification.deletedRows, [{
-            rowId: 9,
-            row: { base: 5, rowid: 9 }
-        }]);
+        assert.deepStrictEqual(modification.deletedRows, deletedRows);
     });
 
     it('treats connection-level read-only documents as read-only for web mutators', async () => {

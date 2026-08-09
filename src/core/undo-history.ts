@@ -90,7 +90,7 @@ function binaryReviver(_key: string, value: unknown): unknown {
  * Counts primitive sizes and structural overhead.
  * Handles circular references by tracking seen objects.
  */
-function calculateSize(value: unknown): number {
+export function estimateUndoMemoryBytes(value: unknown): number {
   const seen = new Set<unknown>();
   const stack = [value];
   let size = 0;
@@ -210,6 +210,11 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     this.maxMemory = maxMemory;
   }
 
+  /** Memory ceiling used by producers that must preflight before allocation. */
+  get memoryLimitBytes(): number {
+    return this.maxMemory;
+  }
+
   /**
    * Record that the undo/redo history changed.
    */
@@ -251,7 +256,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     this.advanceMutationRevision();
 
     // Calculate size of new entry
-    const entrySize = calculateSize(entry);
+    const entrySize = estimateUndoMemoryBytes(entry);
 
     const savedUndoneCount = this.checkpointIndex - this.timeline.length;
     if (savedUndoneCount > 0) {
@@ -574,9 +579,9 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     // Recalculate sizes for active timeline entries, redo entries, and captured
     // branch-revert entries so restored trackers enforce the same memory
     // accounting as live trackers.
-    tracker.timelineSizes = tracker.timeline.map(calculateSize);
-    tracker.futureStackSizes = tracker.futureStack.map(calculateSize);
-    tracker.revertOnRestoreSizes = tracker.revertOnRestore.map(calculateSize);
+    tracker.timelineSizes = tracker.timeline.map(estimateUndoMemoryBytes);
+    tracker.futureStackSizes = tracker.futureStack.map(estimateUndoMemoryBytes);
+    tracker.revertOnRestoreSizes = tracker.revertOnRestore.map(estimateUndoMemoryBytes);
     tracker.currentSize =
       tracker.timelineSizes.reduce((a, b) => a + b, 0) +
       tracker.futureStackSizes.reduce((a, b) => a + b, 0) +

@@ -783,7 +783,10 @@ describe('web demo worker File opens', () => {
                 // Fixture is far below PAGED_EXACT_COUNT_MAX_FILE_BYTES.
             })
         );
-        assert.strictEqual(await harness.invoke('fetchTableCount', 'fixtures', {}), 10000);
+        assert.deepStrictEqual(
+            { ...await harness.invoke('fetchTableCount', 'fixtures', {}) },
+            { count: 10000, isExact: true }
+        );
     });
 
     it('answers large paged unfiltered counts with the rowid-span upper bound', async () => {
@@ -799,18 +802,21 @@ describe('web demo worker File opens', () => {
             })
         );
         // Exact count is 10000; min(rowid)=1 makes the span 19999.
-        assert.strictEqual(await harness.invoke('fetchTableCount', 'fixtures', {}), 19999);
+        assert.deepStrictEqual(
+            { ...await harness.invoke('fetchTableCount', 'fixtures', {}) },
+            { count: 19999, isExact: false }
+        );
         // Filtered counts keep exact semantics (row-19999 uniquely matches).
-        assert.strictEqual(
-            await harness.invoke('fetchTableCount', 'fixtures', {
+        assert.deepStrictEqual(
+            { ...await harness.invoke('fetchTableCount', 'fixtures', {
                 columns: ['id', 'label'],
                 filters: [{ column: 'label', value: 'row-19999' }]
-            }),
-            1
+            }) },
+            { count: 1, isExact: true }
         );
-        assert.strictEqual(
-            await harness.invoke('fetchTableCount', 'extreme_rowids', {}),
-            2,
+        assert.deepStrictEqual(
+            { ...await harness.invoke('fetchTableCount', 'extreme_rowids', {}) },
+            { count: 2, isExact: true },
             'unsafe spans must reject the shortcut and fall through to exact COUNT(*)'
         );
     });
@@ -822,7 +828,10 @@ describe('web demo worker File opens', () => {
             'bytes.db',
             initConfig({ content: gappyDbBytes, pagedExactCountMaxFileBytes: 0 })
         );
-        assert.strictEqual(await harness.invoke('fetchTableCount', 'fixtures', {}), 10000);
+        assert.deepStrictEqual(
+            { ...await harness.invoke('fetchTableCount', 'fixtures', {}) },
+            { count: 10000, isExact: true }
+        );
     });
 
     it('re-initializes cleanly from paged to bytes (close on a paged handle)', async () => {

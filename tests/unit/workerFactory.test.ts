@@ -17,6 +17,7 @@ let nativeAvailable = false;
 let nativeAvailabilityChecks = 0;
 let nativeConnectionCalls = 0;
 let outputLines: string[] = [];
+let serializeOperationsCalls = 0;
 
 const Module = require('module');
 
@@ -84,7 +85,12 @@ Module.prototype.require = function(id: string) {
         // Exercise the desktop facade's own Promise contract directly. The
         // production serializer is async and would otherwise mask a synchronous
         // throw from the facade method it wraps.
-        return { serializeOperations: (operations: unknown) => operations };
+        return {
+          serializeOperations: (operations: unknown) => {
+            serializeOperationsCalls++;
+            return operations;
+          }
+        };
     }
     if (id.endsWith('pagedWritableSave')) {
         return {
@@ -129,6 +135,7 @@ describe('workerFactory error path tests', () => {
     nativeAvailabilityChecks = 0;
     nativeConnectionCalls = 0;
     outputLines = [];
+    serializeOperationsCalls = 0;
     workerProxy = {
       initializeDatabase: async () => {
         if (connectionFailed) throw new Error('Connection failed');
@@ -181,6 +188,21 @@ describe('workerFactory error path tests', () => {
     assert.strictEqual(await connection.databaseOps.engineKind, 'wasm');
     assert.strictEqual(showErrorMessage.mock.callCount(), 0);
     assert.deepStrictEqual(outputLines, ['[SQLite Explorer] Using WebAssembly SQLite backend']);
+  });
+
+  it('serializes the desktop worker-backed WASM facade as one operation queue', async () => {
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+
+    await bundle.establishConnection(testDbUri(), 'test.sqlite');
+
+    assert.strictEqual(
+      serializeOperationsCalls,
+      1,
+      'runReadSnapshot must hold the same lease as every worker-backed mutation'
+    );
   });
 
   it('should terminate worker and re-throw error if establishConnection fails in WASM factory', async () => {

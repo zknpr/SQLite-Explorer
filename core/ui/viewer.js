@@ -170,7 +170,7 @@ async function restoreSavedState() {
             container.scrollTop = savedScroll.top;
         }
 
-        updateStatus(`${state.totalRecordCount} records`);
+        updateStatus(`${state.totalRecordCountIsExact ? '' : '≤'}${state.totalRecordCount} records`);
     } else {
         updateStatus('Ready');
         showEmptyState();
