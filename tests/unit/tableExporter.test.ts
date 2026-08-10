@@ -1763,6 +1763,60 @@ describe('exportTableCommand atomic streaming', () => {
         );
     });
 
+    it('coalesces local short-row emissions into bounded byte-identical writes', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery('CREATE TABLE local_short_rows (value TEXT)');
+        await operations.executeQuery(
+            'WITH RECURSIVE seq(n) AS (' +
+            'SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 40000' +
+            ") INSERT INTO local_short_rows SELECT 'x' FROM seq"
+        );
+
+        const scratch = await fsPromises.mkdtemp(path.join(process.cwd(), '.stage-e-export-test-'));
+        const destinationPath = path.join(scratch, 'short-rows.csv');
+        const nodeFs = require('node:fs') as any;
+        const originalCreateWriteStream = nodeFs.createWriteStream;
+        let writeCalls = 0;
+        try {
+            nodeFs.createWriteStream = (...args: any[]) => {
+                const stream = originalCreateWriteStream(...args);
+                const originalWrite = stream.write;
+                stream.write = function (...writeArgs: any[]) {
+                    writeCalls++;
+                    return originalWrite.apply(this, writeArgs);
+                };
+                return stream;
+            };
+
+            const rowCount = await exportTableToLocalFileForTests(
+                { databaseOperations: operations } as any,
+                destinationPath,
+                'local_short_rows',
+                ['value'],
+                { format: 'csv', header: false }
+            );
+
+            assert.strictEqual(rowCount, 40000);
+            assert.strictEqual(
+                await fsPromises.readFile(destinationPath, 'utf8'),
+                'x' + '\nx'.repeat(39999)
+            );
+            assert.ok(
+                writeCalls <= 2,
+                `local export issued ${writeCalls} underlying writes for 79,999 output bytes`
+            );
+        } finally {
+            nodeFs.createWriteStream = originalCreateWriteStream;
+            (operations as WasmDatabaseEngine).shutdown();
+            await fsPromises.rm(scratch, { recursive: true, force: true });
+        }
+    });
+
     it('writes a sibling temp and renames it only after the stream has finished', async () => {
         const database = await createDatabaseEngine({
             content: null,

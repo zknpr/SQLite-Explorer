@@ -149,6 +149,12 @@ describe('desktop engine paged count policy', () => {
       'CREATE VIEW exposed_rowid AS SELECT 0 AS rowid, label FROM without_rowid_shadow'
     );
     db.run(
+      'CREATE TABLE without_rowid_large (key TEXT PRIMARY KEY) WITHOUT ROWID; ' +
+      'WITH RECURSIVE seq(n) AS (' +
+      'SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 20000' +
+      ") INSERT INTO without_rowid_large SELECT printf('key-%08d', n) FROM seq"
+    );
+    db.run(
       'CREATE TABLE extreme_rowids (label TEXT); ' +
       "INSERT INTO extreme_rowids(rowid, label) VALUES " +
       "(-9223372036854775808, 'minimum'), (9223372036854775807, 'maximum')"
@@ -250,6 +256,31 @@ describe('desktop engine paged count policy', () => {
       assert.deepStrictEqual(
         await engine.fetchTableCount('without_rowid_shadow', {}),
         { count: 3, isExact: true }
+      );
+    } finally {
+      (engine as WasmDatabaseEngine).shutdown();
+    }
+  });
+
+  it('bounds a large WITHOUT ROWID table without issuing an exact count', async () => {
+    const engine = await openPagedEngine();
+    const observedSql: string[] = [];
+    const originalExecuteQuery = engine.executeQuery.bind(engine);
+    engine.executeQuery = async (sql, params) => {
+      observedSql.push(sql);
+      return originalExecuteQuery(sql, params);
+    };
+    try {
+      const result = await engine.fetchTableCount('without_rowid_large', {});
+      assert.strictEqual(result.isExact, false);
+      assert.ok(result.count >= 20000, 'the published count must remain a safe upper bound');
+      assert.ok(
+        observedSql.some(sql => /LIMIT\s+\?/i.test(sql)),
+        'the bounded row probe did not run'
+      );
+      assert.ok(
+        !observedSql.some(sql => sql === 'SELECT COUNT(*) as count FROM "without_rowid_large"'),
+        'large WITHOUT ROWID count fell through to the exact full-table scan'
       );
     } finally {
       (engine as WasmDatabaseEngine).shutdown();

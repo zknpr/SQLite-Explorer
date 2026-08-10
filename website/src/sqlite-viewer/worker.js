@@ -112,9 +112,14 @@ import {
   SQLITE_HEADER_PROBE_BYTES
 } from '../../../src/core/paged-open.ts';
 import {
+  buildCappedCountProbeSql,
   buildCountUpperBoundSql,
+  PAGED_COUNT_PROBE_MAX_ROWS,
+  resolveCappedCount,
   resolvePagedExactCountMaxFileBytes,
   resolveCountUpperBound,
+  resolveFileSizeRowUpperBound,
+  WITHOUT_ROWID_TABLE_SQL,
   shouldAnswerCountWithUpperBound
 } from '../../../src/core/paged-count.ts';
 import { createChunkedReadCache } from '../../../src/core/chunked-read-cache.ts';
@@ -1856,10 +1861,9 @@ async function fetchTableCount(table, options = {}) {
 
   // Shared paged count policy (src/core/paged-count.ts, also consumed by
   // the desktop WASM engine): large paged opens answer unfiltered counts
-  // with the intrinsic-rowid span upper bound instead of an exact scan — OP_Count
-  // never yields to the progress handler and a full b-tree scan through
-  // per-page host callbacks wedges every queued RPC past the webview
-  // deadline. Filtered counts have no cheap bound and keep exact semantics.
+  // without a complete b-tree scan. OP_Count never yields to the progress
+  // handler and a full scan through per-page host callbacks wedges every
+  // queued RPC past the webview deadline. Filtered counts stay exact.
   const countPolicyInput = {
     storage: storageMode,
     filtered: whereClauses.length > 0,
@@ -1869,9 +1873,10 @@ async function fetchTableCount(table, options = {}) {
     exactCountMaxFileBytes: pagedExactCountMaxFileBytes
   };
   if (shouldAnswerCountWithUpperBound(countPolicyInput)) {
+    let authorityConfirmedRowIdTable = false;
     try {
       const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
-      const authorityConfirmedRowIdTable = (authority[0]?.values.length ?? 0) > 0;
+      authorityConfirmedRowIdTable = (authority[0]?.values.length ?? 0) > 0;
       if (shouldAnswerCountWithUpperBound({
         ...countPolicyInput,
         authorityConfirmedRowIdTable
@@ -1883,7 +1888,36 @@ async function fetchTableCount(table, options = {}) {
         }
       }
     } catch {
-      // Authority or bound failures retain exact semantics.
+      // A failed rowid shortcut may still be a WITHOUT ROWID table below.
+    }
+
+    if (!authorityConfirmedRowIdTable) {
+      let withoutRowIdTable = false;
+      try {
+        const metadata = db.exec(WITHOUT_ROWID_TABLE_SQL, [table]);
+        withoutRowIdTable = (metadata[0]?.values.length ?? 0) > 0;
+      } catch {
+        // Preserve exact semantics for views and relations we cannot classify.
+      }
+      if (withoutRowIdTable) {
+        try {
+          const probe = db.exec(
+            buildCappedCountProbeSql(table),
+            [PAGED_COUNT_PROBE_MAX_ROWS + 1]
+          );
+          const resolved = resolveCappedCount(
+            probe[0]?.values?.[0]?.[0],
+            pagedFileSizeBytes
+          );
+          if (resolved) return resolved;
+        } catch {
+          // Never trade a failed bounded probe for the non-interruptible scan.
+        }
+        return {
+          count: resolveFileSizeRowUpperBound(pagedFileSizeBytes),
+          isExact: false
+        };
+      }
     }
   }
 

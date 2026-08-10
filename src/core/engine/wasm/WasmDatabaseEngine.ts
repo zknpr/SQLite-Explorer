@@ -79,8 +79,13 @@ import {
 } from '../../cell-containment';
 import { getNodeFs } from '../../platform/fs';
 import {
+  buildCappedCountProbeSql,
   buildCountUpperBoundSql,
+  PAGED_COUNT_PROBE_MAX_ROWS,
+  resolveCappedCount,
   resolveCountUpperBound,
+  resolveFileSizeRowUpperBound,
+  WITHOUT_ROWID_TABLE_SQL,
   shouldAnswerCountWithUpperBound
 } from '../../paged-count';
 import {
@@ -3440,7 +3445,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
     const { sql, params } = buildCountQuery(table, queryOptions);
     // Shared paged count policy (see src/core/paged-count.ts): large paged
-    // opens answer unfiltered counts with the intrinsic-rowid span bound —
+    // opens answer unfiltered counts without a complete b-tree scan — rowid
+    // tables use their span, while WITHOUT ROWID tables use a capped probe.
     // OP_Count never yields to the progress handler and a full scan through
     // per-page host reads starves RPC deadlines. Every WHERE condition
     // buildCountQuery emits binds at least one parameter, so params.length
@@ -3455,9 +3461,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         exactCountMaxFileBytes: this.pagedState.exactCountMaxFileBytes
       } as const;
     if (countPolicyInput && shouldAnswerCountWithUpperBound(countPolicyInput)) {
+      let authorityConfirmedRowIdTable = false;
       try {
         const authority = await this.executeQuery(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
-        const authorityConfirmedRowIdTable = (authority[0]?.rows.length ?? 0) > 0;
+        authorityConfirmedRowIdTable = (authority[0]?.rows.length ?? 0) > 0;
         if (shouldAnswerCountWithUpperBound({
           ...countPolicyInput,
           authorityConfirmedRowIdTable
@@ -3467,7 +3474,36 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           if (upperBound !== undefined) return { count: upperBound, isExact: false };
         }
       } catch {
-        // Authority or bound failures retain exact semantics.
+        // A failed rowid shortcut may still be a WITHOUT ROWID table below.
+      }
+
+      if (!authorityConfirmedRowIdTable) {
+        let withoutRowIdTable = false;
+        try {
+          const metadata = await this.executeQuery(WITHOUT_ROWID_TABLE_SQL, [table]);
+          withoutRowIdTable = (metadata[0]?.rows.length ?? 0) > 0;
+        } catch {
+          // Preserve exact semantics for views and relations we cannot classify.
+        }
+        if (withoutRowIdTable) {
+          try {
+            const probe = await this.executeQuery(
+              buildCappedCountProbeSql(table),
+              [PAGED_COUNT_PROBE_MAX_ROWS + 1]
+            );
+            const resolved = resolveCappedCount(
+              probe[0]?.rows?.[0]?.[0],
+              this.pagedState.fileSizeBytes
+            );
+            if (resolved) return resolved;
+          } catch {
+            // Never trade a failed bounded probe for the non-interruptible scan.
+          }
+          return {
+            count: resolveFileSizeRowUpperBound(this.pagedState.fileSizeBytes),
+            isExact: false
+          };
+        }
       }
     }
     const result = await this.executeQuery(sql, params);

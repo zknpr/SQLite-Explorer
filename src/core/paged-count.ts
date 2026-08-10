@@ -9,16 +9,17 @@
  * every queued RPC past the webview deadline — and SQLite serves it with
  * the single OP_Count opcode, which never yields to the progress handler,
  * so the scan cannot be interrupted once started. Large paged databases
- * therefore answer unfiltered counts with the intrinsic-rowid span upper bound
- * instead. The gate is decided up front from the file size (the upper
- * bound on any table scan within it). The bound equals the exact count
- * for gap-free rowid tables and otherwise overshoots, which only renders
- * trailing pages short or empty — never a dead end.
+ * therefore answer unfiltered counts without scanning the complete b-tree.
+ * Intrinsic-rowid tables use their rowid-span upper bound. WITHOUT ROWID
+ * tables first run a capped row probe: small tables remain exact, while larger
+ * tables publish the database byte size as a conservative row upper bound.
+ * Every row occupies a b-tree cell (including its pointer), so the file's byte
+ * length cannot undercount rows. Loose bounds only render trailing pages short
+ * or empty — never a dead end.
  *
- * Exact semantics are kept for: filtered counts (no cheap bound exists),
- * buffer (in-memory) opens, small paged files, and every relation that the
- * shared ROWID_TABLE_AUTHORITY_SQL does not confirm as having an unshadowed
- * intrinsic rowid. A user column named rowid is data, not row identity.
+ * Exact semantics are kept for filtered counts (no cheap bound exists), buffer
+ * (in-memory) opens, small paged files, views, and non-table relations. A user
+ * column named rowid is data, not row identity.
  */
 
 import { escapeIdentifier } from './sql-utils';
@@ -30,6 +31,19 @@ import { escapeIdentifier } from './sql-utils';
  * at 64 MiB the worst-case exact scan stays around two seconds.
  */
 export const PAGED_EXACT_COUNT_MAX_FILE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Maximum rows visited while deciding whether a WITHOUT ROWID table is small
+ * enough to count exactly. At SQLite's usual 4 KiB page size, even one leaf
+ * page per row visits about 40 MiB. Unlike OP_Count, the coroutine remains
+ * progress-handler interruptible for databases using larger pages.
+ */
+export const PAGED_COUNT_PROBE_MAX_ROWS = 10_000;
+
+/** Cheap main-schema classification used only after the large-paged gate. */
+export const WITHOUT_ROWID_TABLE_SQL =
+  `SELECT 1 FROM pragma_table_list ` +
+  `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' AND "wr" = 1 LIMIT 1`;
 
 /**
  * Normalize the internal/test override for the exact-count gate. Any
@@ -72,6 +86,59 @@ export function shouldAnswerCountWithUpperBound(
 /** Fetch exact decimal endpoints; subtracting in SQLite can round near int64 limits. */
 export function buildCountUpperBoundSql(table: string): string {
   return `SELECT CAST(min(rowid) AS TEXT), CAST(max(rowid) AS TEXT) FROM ${escapeIdentifier(table)}`;
+}
+
+/**
+ * COUNT the first N+1 rows through a coroutine. The subquery LIMIT prevents
+ * SQLite from replacing this with the non-interruptible full-table OP_Count.
+ */
+export function buildCappedCountProbeSql(table: string): string {
+  return `SELECT COUNT(*) FROM (SELECT 1 FROM ${escapeIdentifier(table)} LIMIT ?)`;
+}
+
+export interface CappedCountResolution {
+  count: number;
+  isExact: boolean;
+}
+
+/**
+ * Resolve a capped WITHOUT ROWID probe. A result below the cap proves exact
+ * cardinality. Reaching N+1 proves only that more than N rows exist, so retain
+ * the UI's established upper-bound contract using the file byte length.
+ */
+export function resolveCappedCount(
+  probedRows: unknown,
+  pagedFileSizeBytes: number
+): CappedCountResolution | undefined {
+  if (
+    typeof probedRows !== 'number' ||
+    !Number.isSafeInteger(probedRows) ||
+    probedRows < 0 ||
+    probedRows > PAGED_COUNT_PROBE_MAX_ROWS + 1
+  ) {
+    return undefined;
+  }
+  if (probedRows <= PAGED_COUNT_PROBE_MAX_ROWS) {
+    return { count: probedRows, isExact: true };
+  }
+  return {
+    count: resolveFileSizeRowUpperBound(pagedFileSizeBytes, probedRows),
+    isExact: false
+  };
+}
+
+/** Fail safely if the bounded probe itself cannot produce a usable scalar. */
+export function resolveFileSizeRowUpperBound(
+  pagedFileSizeBytes: number,
+  minimum = PAGED_COUNT_PROBE_MAX_ROWS + 1
+): number {
+  if (!Number.isSafeInteger(minimum) || minimum < 0) {
+    minimum = PAGED_COUNT_PROBE_MAX_ROWS + 1;
+  }
+  if (!Number.isSafeInteger(pagedFileSizeBytes) || pagedFileSizeBytes < minimum) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return pagedFileSizeBytes;
 }
 
 function parseExactInteger(value: unknown): bigint | undefined {

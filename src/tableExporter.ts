@@ -41,6 +41,7 @@ export const NON_LOCAL_EXPORT_MAX_BYTES = 16 * 1024 * 1024;
 const NON_LOCAL_CAP_DESCRIPTION =
   '16 MiB (16,777,216 bytes)';
 const NON_LOCAL_EXPORT_PAGE_BYTES = 64 * 1024;
+const LOCAL_EXPORT_BUFFER_BYTES = 64 * 1024;
 
 /**
  * Minimal writable sink consumed by the streaming exporters. Satisfied by Node's
@@ -120,6 +121,8 @@ class AwaitedNodeStreamSink implements AsyncExportSink {
   private ended = false;
   private fileDescriptor: number | undefined;
   private streamError: Error | undefined;
+  private readonly writeBuffer = Buffer.allocUnsafe(LOCAL_EXPORT_BUFFER_BYTES);
+  private bufferedBytes = 0;
   private readonly recordStreamError = (error: Error): void => {
     this.streamError ??= error;
   };
@@ -156,29 +159,80 @@ class AwaitedNodeStreamSink implements AsyncExportSink {
     if (this.streamError) throw this.streamError;
   }
 
-  async write(chunk: string): Promise<void> {
-    if (this.ended) throw new Error('Cannot write to a completed export stream');
-    if (this.streamError) throw this.streamError;
+  private async waitForDrain(): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       let settled = false;
-      const finish = (error?: Error | null) => {
+      const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
+        this.stream.off('drain', onDrain);
         this.stream.off('error', onError);
         if (error) reject(error);
         else resolve();
       };
       const onError = (error: Error) => finish(error);
+      const onDrain = () => finish();
+      this.stream.once('drain', onDrain);
       this.stream.once('error', onError);
-      try {
-        // Waiting for every write callback is stronger than merely observing
-        // `drain`: no formatter emission can outrun the stream's backpressure.
-        this.stream.write(chunk, 'utf8', finish);
-      } catch (error) {
-        finish(error instanceof Error ? error : new Error(String(error)));
-      }
+      if (this.streamError) finish(this.streamError);
     });
+  }
+
+  private async writeToStream(bytes: Buffer): Promise<void> {
     if (this.streamError) throw this.streamError;
+    let accepted: boolean;
+    try {
+      accepted = this.stream.write(bytes);
+    } catch (error) {
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+    // Immutable output buffers let formatter work continue while the stream is
+    // below its high-water mark. Only backpressure requires an async boundary.
+    if (!accepted) await this.waitForDrain();
+    if (this.streamError) throw this.streamError;
+  }
+
+  private async flushBuffered(): Promise<void> {
+    if (this.bufferedBytes === 0) return;
+    // WriteStream retains Buffer references until I/O completes. Copy the used
+    // slab before reusing the bounded scratch buffer; otherwise a fast producer
+    // could mutate bytes still queued in libuv.
+    const output = Buffer.allocUnsafe(this.bufferedBytes);
+    this.writeBuffer.copy(output, 0, 0, this.bufferedBytes);
+    this.bufferedBytes = 0;
+    await this.writeToStream(output);
+  }
+
+  async write(chunk: string): Promise<void> {
+    if (this.ended) throw new Error('Cannot write to a completed export stream');
+    if (this.streamError) throw this.streamError;
+    if (chunk.length === 0) return;
+
+    // Encode every formatter emission independently. Besides avoiding millions
+    // of WriteStream callbacks, this preserves the previous UTF-8 treatment of
+    // an isolated surrogate at an emission boundary byte-for-byte.
+    const chunkBytes = Buffer.byteLength(chunk, 'utf8');
+    if (chunkBytes > this.writeBuffer.byteLength) {
+      await this.flushBuffered();
+      await this.writeToStream(Buffer.from(chunk, 'utf8'));
+      return;
+    }
+    if (this.bufferedBytes + chunkBytes > this.writeBuffer.byteLength) {
+      await this.flushBuffered();
+    }
+    const written = this.writeBuffer.write(
+      chunk,
+      this.bufferedBytes,
+      chunkBytes,
+      'utf8'
+    );
+    if (written !== chunkBytes) {
+      throw new Error('Failed to encode a complete local export chunk');
+    }
+    this.bufferedBytes += written;
+    if (this.bufferedBytes === this.writeBuffer.byteLength) {
+      await this.flushBuffered();
+    }
   }
 
   async restoreMetadata(
@@ -187,6 +241,7 @@ class AwaitedNodeStreamSink implements AsyncExportSink {
   ): Promise<OwnershipPreservationFailure | undefined> {
     if (this.ended) throw new Error('Cannot restore metadata on a completed export stream');
     if (this.streamError) throw this.streamError;
+    await this.flushBuffered();
     const fd = this.fileDescriptor;
     if (fd === undefined) {
       throw new Error('Cannot restore export metadata before its file descriptor is ready');
@@ -206,6 +261,7 @@ class AwaitedNodeStreamSink implements AsyncExportSink {
 
   async close(): Promise<void> {
     if (this.ended) return;
+    await this.flushBuffered();
     this.ended = true;
     if (this.streamError) throw this.streamError;
     await new Promise<void>((resolve, reject) => {
@@ -237,6 +293,7 @@ class AwaitedNodeStreamSink implements AsyncExportSink {
 
   async abort(): Promise<void> {
     this.ended = true;
+    this.bufferedBytes = 0;
     if (!this.stream.closed) {
       await new Promise<void>((resolve, reject) => {
         let settled = false;

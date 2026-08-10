@@ -284,6 +284,14 @@ before(async () => {
         "INSERT INTO extreme_rowids(rowid, label) VALUES " +
         "(-9223372036854775808, 'minimum'), (9223372036854775807, 'maximum')"
     );
+    gappy.run(
+        'CREATE TABLE without_rowid_small (key TEXT PRIMARY KEY) WITHOUT ROWID; ' +
+        "INSERT INTO without_rowid_small VALUES ('a'), ('b'), ('c'); " +
+        'CREATE TABLE without_rowid_large (key TEXT PRIMARY KEY) WITHOUT ROWID; ' +
+        'WITH RECURSIVE seq(n) AS (' +
+        'SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 20000' +
+        ") INSERT INTO without_rowid_large SELECT printf('key-%08d', n) FROM seq"
+    );
     gappyDbBytes = gappy.export();
     gappy.close();
 });
@@ -818,6 +826,20 @@ describe('web demo worker File opens', () => {
             { ...await harness.invoke('fetchTableCount', 'extreme_rowids', {}) },
             { count: 2, isExact: true },
             'unsafe spans must reject the shortcut and fall through to exact COUNT(*)'
+        );
+
+        const smallWithoutRowidCount = {
+            ...await harness.invoke('fetchTableCount', 'without_rowid_small', {})
+        };
+        assert.deepStrictEqual(smallWithoutRowidCount, { count: 3, isExact: true });
+
+        const largeWithoutRowidCount = {
+            ...await harness.invoke('fetchTableCount', 'without_rowid_large', {})
+        };
+        assert.strictEqual(largeWithoutRowidCount.isExact, false);
+        assert.ok(
+            largeWithoutRowidCount.count >= 20000,
+            'the demo must publish a safe upper bound for the large WITHOUT ROWID table'
         );
     });
 
