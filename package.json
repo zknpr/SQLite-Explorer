@@ -207,7 +207,7 @@
     "test:native-smoke": "node --import tsx --test tests/unit/native_real_smoke.test.ts"
   },
   "devDependencies": {
-    "@types/node": "^26.1.2",
+    "@types/node": "^26.2.0",
     "@types/vscode": "=1.110.0",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.9.2",
