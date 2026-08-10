@@ -88,11 +88,13 @@ describe('paged count policy (shared layer)', () => {
   it('escapes the upper-bound query identifier', () => {
     assert.strictEqual(
       buildCountUpperBoundSql('fixtures'),
-      'SELECT CAST(min(rowid) AS TEXT), CAST(max(rowid) AS TEXT) FROM "fixtures"'
+      'SELECT (SELECT CAST(min(rowid) AS TEXT) FROM "fixtures"), ' +
+      '(SELECT CAST(max(rowid) AS TEXT) FROM "fixtures")'
     );
     assert.strictEqual(
       buildCountUpperBoundSql('we"ird'),
-      'SELECT CAST(min(rowid) AS TEXT), CAST(max(rowid) AS TEXT) FROM "we""ird"'
+      'SELECT (SELECT CAST(min(rowid) AS TEXT) FROM "we""ird"), ' +
+      '(SELECT CAST(max(rowid) AS TEXT) FROM "we""ird")'
     );
   });
 
@@ -192,6 +194,32 @@ describe('desktop engine paged count policy', () => {
     assert.strictEqual(result.storage, 'paged');
     return result.operations!;
   }
+
+  it('keeps both rowid-span aggregates on SQLite endpoint searches', () => {
+    const db = new (SqlJsModule.Database as any)();
+    try {
+      db.run(
+        'CREATE TABLE endpoint_plan (value TEXT); ' +
+        "INSERT INTO endpoint_plan(rowid, value) VALUES (3, 'first'), (11, 'last')"
+      );
+      const sql = buildCountUpperBoundSql('endpoint_plan');
+      const plan = db.exec(`EXPLAIN QUERY PLAN ${sql}`)[0]?.values ?? [];
+      const details = plan.map((row: unknown[]) => String(row[3]));
+
+      assert.strictEqual(
+        details.filter((detail: string) => detail === 'SEARCH endpoint_plan').length,
+        2,
+        `each endpoint must be a single b-tree search; plan: ${details.join(' | ')}`
+      );
+      assert.ok(
+        !details.includes('SCAN endpoint_plan'),
+        `the span query must not scan the table; plan: ${details.join(' | ')}`
+      );
+      assert.deepStrictEqual(db.exec(sql)[0]?.values, [['3', '11']]);
+    } finally {
+      db.close();
+    }
+  });
 
   it('keeps the fast rowid-span bound for a genuine large gappy rowid table', async () => {
     const engine = await openPagedEngine();

@@ -98,7 +98,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         table: string
     ): Promise<TableIdentity> {
         const metadata = await document.databaseOperations.executeQuery(
-            `SELECT "type", "wr" FROM pragma_table_list ` +
+            `SELECT "type", "wr" FROM pragma.pragma_table_list ` +
             `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
             [table]
         );

@@ -2233,7 +2233,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /** Discover table identity while allowing callers that also read views. */
   private async findTableIdentity(table: string): Promise<TableIdentity | undefined> {
     const metadata = await this.executeQuery(
-      `SELECT "type", "wr" FROM pragma_table_list ` +
+      `SELECT "type", "wr" FROM pragma.pragma_table_list ` +
       `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
       [table]
     );
@@ -2364,7 +2364,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /** Columns SQLite permits in an INSERT; generated columns have hidden 2/3. */
   private async getInsertableColumnNames(table: string): Promise<string[]> {
     const result = await this.executeQuery(
-      'SELECT name FROM pragma_table_xinfo(?) ' +
+      'SELECT name FROM pragma.pragma_table_xinfo(?) ' +
       'WHERE hidden NOT IN (2, 3) ORDER BY cid',
       [table]
     );

@@ -470,7 +470,7 @@ describe('createNativeDatabaseConnection', () => {
         const connection = await createRecordingConnection(call => {
             if (call.method === 'query') {
                 const sql = String(call.args[0]);
-                if (sql.startsWith('SELECT "type", "wr" FROM pragma_table_list')) {
+                if (sql.startsWith('SELECT "type", "wr" FROM pragma.pragma_table_list')) {
                     return { result: { columns: ['type', 'wr'], values: [['table', 1]] } };
                 }
                 if (sql.startsWith('PRAGMA table_info')) {
@@ -1772,13 +1772,13 @@ describe('createNativeDatabaseConnection', () => {
             }
             if (
                 call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT "type", "wr" FROM pragma_table_list')
+                && String(call.args[0]).startsWith('SELECT "type", "wr" FROM pragma.pragma_table_list')
             ) {
                 return { result: { columns: ['type', 'wr'], values: [['table', 0]] } };
             }
             if (
                 call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT 1 FROM pragma_table_list')
+                && String(call.args[0]).startsWith('SELECT 1 FROM pragma.pragma_table_list')
             ) {
                 return { result: { columns: ['1'], values: [[1]] } };
             }
@@ -1836,7 +1836,7 @@ describe('createNativeDatabaseConnection', () => {
             const mainReadIndex = connection.calls.findIndex(call => call.method === 'queryNumeric');
             const authorityReadIndex = connection.calls.findIndex(call => (
                 call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT 1 FROM pragma_table_list')
+                && String(call.args[0]).startsWith('SELECT 1 FROM pragma.pragma_table_list')
             ));
             const companionBatchIndices = connection.calls
                 .map((call, index) => ({ call, index }))
@@ -1875,13 +1875,13 @@ describe('createNativeDatabaseConnection', () => {
             }
             if (
                 call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT "type", "wr" FROM pragma_table_list')
+                && String(call.args[0]).startsWith('SELECT "type", "wr" FROM pragma.pragma_table_list')
             ) {
                 return { result: { columns: ['type', 'wr'], values: [['table', 0]] } };
             }
             if (
                 call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT 1 FROM pragma_table_list')
+                && String(call.args[0]).startsWith('SELECT 1 FROM pragma.pragma_table_list')
             ) {
                 return { result: { columns: ['1'], values: [[1]] } };
             }

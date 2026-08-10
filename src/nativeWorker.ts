@@ -969,7 +969,7 @@ export async function createNativeDatabaseConnection(
 
       const getNativeInsertableColumnNames = async (table: string): Promise<string[]> => {
         const result = await worker.call<NativeQueryResult>('query', [
-          'SELECT name FROM pragma_table_xinfo(?) ' +
+          'SELECT name FROM pragma.pragma_table_xinfo(?) ' +
           'WHERE hidden NOT IN (2, 3) ORDER BY cid',
           [table]
         ]);
@@ -1015,7 +1015,7 @@ export async function createNativeDatabaseConnection(
 
       const findNativeTableIdentity = async (table: string): Promise<TableIdentity | undefined> => {
         const metadata = await worker.call<NativeQueryResult>('query', [
-          `SELECT "type", "wr" FROM pragma_table_list ` +
+          `SELECT "type", "wr" FROM pragma.pragma_table_list ` +
           `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
           [table]
         ]);

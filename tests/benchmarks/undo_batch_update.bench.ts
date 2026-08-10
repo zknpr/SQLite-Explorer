@@ -346,7 +346,7 @@ async function measureEngineCase(
 
 async function snapshotRowsForHost(db: DatabaseOperations) {
   const columns = await db.executeQuery(
-    `SELECT name FROM pragma_table_xinfo(?) WHERE hidden NOT IN (2, 3) ORDER BY cid`,
+    `SELECT name FROM pragma.pragma_table_xinfo(?) WHERE hidden NOT IN (2, 3) ORDER BY cid`,
     [TABLE]
   );
   const names = columns[0].rows.map(row => String(row[0]));

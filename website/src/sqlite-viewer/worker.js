@@ -1403,7 +1403,7 @@ function exportToSql(table, headers, rows, includeTableName, output) {
 
 async function findTableIdentity(table) {
   const metadata = db.exec(
-    `SELECT "type", "wr" FROM pragma_table_list ` +
+    `SELECT "type", "wr" FROM pragma.pragma_table_list ` +
     `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
     [table]
   );
@@ -2004,7 +2004,7 @@ async function getTableInfo(table) {
 
 function getInsertableColumnNames(table) {
   const result = db.exec(
-    'SELECT name FROM pragma_table_xinfo(?) ' +
+    'SELECT name FROM pragma.pragma_table_xinfo(?) ' +
     'WHERE hidden NOT IN (2, 3) ORDER BY cid',
     [table]
   );

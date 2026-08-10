@@ -42,7 +42,7 @@ export const PAGED_COUNT_PROBE_MAX_ROWS = 10_000;
 
 /** Cheap main-schema classification used only after the large-paged gate. */
 export const WITHOUT_ROWID_TABLE_SQL =
-  `SELECT 1 FROM pragma_table_list ` +
+  `SELECT 1 FROM pragma.pragma_table_list ` +
   `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' AND "wr" = 1 LIMIT 1`;
 
 /**
@@ -83,9 +83,17 @@ export function shouldAnswerCountWithUpperBound(
     && input.pagedFileSizeBytes > input.exactCountMaxFileBytes;
 }
 
-/** Fetch exact decimal endpoints; subtracting in SQLite can round near int64 limits. */
+/**
+ * Fetch exact decimal endpoints in one SQLite snapshot. Each scalar subquery
+ * contains only one aggregate so SQLite can seek directly to that b-tree
+ * endpoint; combining MIN and MAX in one aggregate would scan every row.
+ */
 export function buildCountUpperBoundSql(table: string): string {
-  return `SELECT CAST(min(rowid) AS TEXT), CAST(max(rowid) AS TEXT) FROM ${escapeIdentifier(table)}`;
+  const escapedTable = escapeIdentifier(table);
+  return (
+    `SELECT (SELECT CAST(min(rowid) AS TEXT) FROM ${escapedTable}), ` +
+    `(SELECT CAST(max(rowid) AS TEXT) FROM ${escapedTable})`
+  );
 }
 
 /**

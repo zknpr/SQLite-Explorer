@@ -18,13 +18,15 @@ export const SQLITE_MAX_VARIABLE_NUMBER = 32766;
  * SQLite resolves each special rowid alias independently. These queries use
  * the literal `rowid`, so only a declared column with that name shadows the
  * intrinsic identity; declared `oid` or `_rowid_` columns do not affect it.
+ * The `pragma` schema prevents same-named user tables from shadowing the
+ * metadata virtual tables themselves.
  * Binds the table name twice.
  */
 export const ROWID_TABLE_AUTHORITY_SQL =
-  `SELECT 1 FROM pragma_table_list ` +
+  `SELECT 1 FROM pragma.pragma_table_list ` +
   `WHERE "schema" = 'main' AND "name" = ? AND (` +
   `("type" = 'table' AND "wr" = 0) OR "type" IN ('virtual', 'shadow')) ` +
-  `AND NOT EXISTS (SELECT 1 FROM pragma_table_info(?, 'main') ` +
+  `AND NOT EXISTS (SELECT 1 FROM pragma.pragma_table_info(?, 'main') ` +
   `WHERE lower("name") = 'rowid') LIMIT 1`;
 
 export interface ExactNumericTextQuery {

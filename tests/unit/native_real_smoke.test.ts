@@ -2141,6 +2141,54 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             );
         });
 
+        await testContext.test('enumerates and loads native tables that shadow PRAGMA virtual-table names', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_pragma_shadow_target (' +
+                'id INTEGER PRIMARY KEY, value TEXT); ' +
+                "INSERT INTO native_pragma_shadow_target VALUES (1, 'before'); " +
+                'CREATE TABLE pragma_table_info (dummy TEXT)'
+            );
+
+            const infoShadowSchema = await engine.fetchSchema();
+            assert.ok(
+                infoShadowSchema.tables.some(
+                    table => table.identifier === 'native_pragma_shadow_target'
+                )
+            );
+
+            await engine.executeQuery(
+                'CREATE TABLE pragma_table_list (dummy TEXT); ' +
+                'CREATE TABLE pragma_table_xinfo (dummy TEXT)'
+            );
+            const fullyShadowedSchema = await engine.fetchSchema();
+            const identifiers = new Set(
+                fullyShadowedSchema.tables.map(table => table.identifier)
+            );
+            for (const table of [
+                'native_pragma_shadow_target',
+                'pragma_table_info',
+                'pragma_table_list',
+                'pragma_table_xinfo'
+            ]) {
+                assert.ok(identifiers.has(table), `schema omitted ${table}`);
+            }
+
+            const page = await engine.fetchTableData('native_pragma_shadow_target', {
+                columns: ['rowid', 'id', 'value'],
+                limit: 10,
+                offset: 0
+            });
+            assert.deepStrictEqual(page.rows, [[1, 1, 'before']]);
+
+            await engine.insertRow('native_pragma_shadow_target', { value: 'after' });
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, value FROM native_pragma_shadow_target ORDER BY id'
+                ))[0].rows,
+                [[1, 'before'], [2, 'after']]
+            );
+        });
+
         await testContext.test('loads and edits a native FTS5 virtual table through rowid identity', async (ftsContext) => {
             try {
                 await engine.executeQuery(

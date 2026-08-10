@@ -342,7 +342,7 @@ export class HostBridge implements ToastService {
     knownColumns?: readonly ColumnMetadata[]
   ): Promise<TableIdentity> {
     const metadata = await dbOps.executeQuery(
-      `SELECT "type", "wr" FROM pragma_table_list ` +
+      `SELECT "type", "wr" FROM pragma.pragma_table_list ` +
       `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
       [table]
     );

@@ -2496,6 +2496,58 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('enumerates and loads demo tables that shadow PRAGMA virtual-table names', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_pragma_shadow_target (id INTEGER PRIMARY KEY, value TEXT); ' +
+            "INSERT INTO demo_pragma_shadow_target VALUES (1, 'before'); " +
+            'CREATE TABLE pragma_table_info (dummy TEXT)'
+        );
+
+        const infoShadowSchema = await worker.invoke('fetchSchema');
+        assert.ok(
+            infoShadowSchema.tables.some(
+                (table: any) => table.identifier === 'demo_pragma_shadow_target'
+            )
+        );
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE pragma_table_list (dummy TEXT); ' +
+            'CREATE TABLE pragma_table_xinfo (dummy TEXT)'
+        );
+        const fullyShadowedSchema = await worker.invoke('fetchSchema');
+        const identifiers = new Set(
+            fullyShadowedSchema.tables.map((table: any) => table.identifier)
+        );
+        for (const table of [
+            'demo_pragma_shadow_target',
+            'pragma_table_info',
+            'pragma_table_list',
+            'pragma_table_xinfo'
+        ]) {
+            assert.ok(identifiers.has(table), `schema omitted ${table}`);
+        }
+
+        const page = await worker.invoke('fetchTableData', 'demo_pragma_shadow_target', {
+            columns: ['rowid', 'id', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        assert.deepStrictEqual(Array.from(page.rows[0]), [1, 1, 'before']);
+
+        await worker.invoke('insertRow', 'demo_pragma_shadow_target', { value: 'after' });
+        const rows = await worker.invoke(
+            'runQuery',
+            'SELECT id, value FROM demo_pragma_shadow_target ORDER BY id'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: any) => Array.from(row)),
+            [[1, 'before'], [2, 'after']]
+        );
+    });
+
     it('returns exact unsafe INTEGER text from demo view previews', async () => {
         const worker = await createWorkerHarness();
 

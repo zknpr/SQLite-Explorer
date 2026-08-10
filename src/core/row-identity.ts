@@ -12,7 +12,11 @@ const PRIMARY_KEY_RECORD_ID_VERSION = 1;
 const READ_ONLY_PRIMARY_KEY_RECORD_ID_PREFIX = 'readonly-pk:';
 const READ_ONLY_PRIMARY_KEY_RECORD_ID_VERSION = 1;
 
-/** Set-based identity metadata used by every schema-loading backend. */
+/**
+ * Set-based identity metadata used by every schema-loading backend. SQLite's
+ * special `pragma` schema is required here: unqualified or `main` names can
+ * resolve to ordinary user tables that shadow the PRAGMA virtual tables.
+ */
 export const TABLE_IDENTITY_METADATA_SQL = `
 SELECT
   tl."name" AS table_name,
@@ -22,8 +26,8 @@ SELECT
   ti."name" AS column_name,
   ti."type" AS declared_type,
   ti."pk" AS primary_key_position
-FROM pragma_table_list AS tl
-LEFT JOIN pragma_table_info(tl."name", tl."schema") AS ti
+FROM pragma.pragma_table_list AS tl
+LEFT JOIN pragma.pragma_table_info(tl."name", tl."schema") AS ti
   ON tl."type" = 'table' AND tl."wr" = 1
 WHERE tl."schema" = 'main' AND tl."name" NOT LIKE 'sqlite_%'
 ORDER BY tl."name", ti."cid"`;

@@ -344,6 +344,51 @@ describe('WITHOUT ROWID primary-key identity', () => {
         );
     });
 
+    it('enumerates and loads tables that shadow PRAGMA virtual-table names', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE pragma_shadow_target (id INTEGER PRIMARY KEY, value TEXT); ' +
+            "INSERT INTO pragma_shadow_target VALUES (1, 'before'); " +
+            'CREATE TABLE pragma_table_info (dummy TEXT)'
+        );
+
+        const infoShadowSchema = await engine.fetchSchema();
+        assert.ok(
+            infoShadowSchema.tables.some(table => table.identifier === 'pragma_shadow_target')
+        );
+
+        await engine.executeQuery(
+            'CREATE TABLE pragma_table_list (dummy TEXT); ' +
+            'CREATE TABLE pragma_table_xinfo (dummy TEXT)'
+        );
+        const fullyShadowedSchema = await engine.fetchSchema();
+        const identifiers = new Set(
+            fullyShadowedSchema.tables.map(table => table.identifier)
+        );
+        for (const table of [
+            'pragma_shadow_target',
+            'pragma_table_info',
+            'pragma_table_list',
+            'pragma_table_xinfo'
+        ]) {
+            assert.ok(identifiers.has(table), `schema omitted ${table}`);
+        }
+
+        const page = await engine.fetchTableData('pragma_shadow_target', {
+            columns: ['rowid', 'id', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        assert.deepStrictEqual(page.rows, [[1, 1, 'before']]);
+
+        await engine.insertRow('pragma_shadow_target', { value: 'after' });
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT id, value FROM pragma_shadow_target ORDER BY id'
+            ))[0].rows,
+            [[1, 'before'], [2, 'after']]
+        );
+    });
+
     it('fails clearly and rolls back when an UPDATE trigger rewrites the primary key', async () => {
         await engine.executeQuery(
             'CREATE TABLE trigger_rekey_identity (' +
