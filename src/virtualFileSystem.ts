@@ -318,7 +318,10 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
         const runTrackedMutation = typeof document.runTrackedMutation === 'function'
             ? document.runTrackedMutation.bind(document)
-            : async <T>(operation: () => T | PromiseLike<T>) => operation();
+            : async <T>(
+                operation: () => T | PromiseLike<T>,
+                _recordsHistory: boolean = false
+            ) => operation();
         return runTrackedMutation(async () => {
 
         if (rowId === '__view__.sql') {
@@ -569,7 +572,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error writing cell: ${err instanceof Error ? err.message : String(err)}`);
             throw vsc.FileSystemError.Unavailable(err instanceof Error ? err.message : String(err));
         }
-        });
+        }, true);
     }
 
     async delete(uri: vsc.Uri, options: { recursive: boolean }): Promise<void> {

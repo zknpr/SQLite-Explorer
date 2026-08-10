@@ -724,6 +724,152 @@ describe('paged writable host save', () => {
     assert.ok(!fs.readdirSync(fixtureDir).some(name => name.includes('late-wal-target.db.sqlite-explorer')));
   });
 
+  it('refuses Save As over an open target with uncheckpointed WAL frames', async () => {
+    const basePath = path.join(fixtureDir, 'target-wal-base.db');
+    const targetPath = path.join(fixtureDir, 'target-wal-existing.db');
+    const walPath = `${targetPath}-wal`;
+    const shmPath = `${targetPath}-shm`;
+    fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+
+    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+    const targetDatabase = new DatabaseSync(targetPath);
+    try {
+      targetDatabase.exec(
+        'PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; ' +
+        'CREATE TABLE original_target (value TEXT); ' +
+        "INSERT INTO original_target VALUES ('keep me')"
+      );
+      assert.ok(fs.statSync(walPath).size > 32, 'the target fixture must have WAL frames');
+      assert.ok(fs.statSync(shmPath).size > 0, 'the target fixture must have shared WAL state');
+      const originalTarget = fs.readFileSync(targetPath);
+      const originalWal = fs.readFileSync(walPath);
+      let renameCalls = 0;
+      const capability = capabilityWithOpen(fs.promises.open, {}, {
+        renameSync: ((...args: Parameters<typeof fs.renameSync>) => {
+          renameCalls++;
+          return fs.renameSync(...args);
+        }) as typeof fs.renameSync
+      });
+
+      await assert.rejects(
+        writePagedWritableOverlayToFile(
+          capability,
+          basePath,
+          targetPath,
+          snapshotFor(basePath)
+        ),
+        /Save As target.*WAL.*uncheckpointed frames/i
+      );
+
+      assert.strictEqual(renameCalls, 0);
+      assert.deepStrictEqual(fs.readFileSync(targetPath), originalTarget);
+      assert.deepStrictEqual(fs.readFileSync(walPath), originalWal);
+      assert.ok(fs.statSync(shmPath).size > 0, 'SQLite must retain control of its shared state');
+      assert.ok(
+        !fs.readdirSync(fixtureDir)
+          .some(name => name.includes('target-wal-existing.db.sqlite-explorer'))
+      );
+    } finally {
+      targetDatabase.close();
+    }
+  });
+
+  it('rechecks the Save As target WAL after releasing a Windows-style target lock', async () => {
+    const basePath = path.join(fixtureDir, 'target-windows-base.db');
+    const targetPath = path.join(fixtureDir, 'target-windows-existing.db');
+    const walPath = `${targetPath}-wal`;
+    fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+    const targetDatabase = new (SqlJsModule.Database as any)();
+    targetDatabase.run('CREATE TABLE target_table (id INTEGER PRIMARY KEY)');
+    fs.writeFileSync(targetPath, Buffer.from(targetDatabase.export()));
+    targetDatabase.close();
+
+    let lockedPath: string | undefined;
+    let renameCalls = 0;
+    const capability = capabilityWithOpen(fs.promises.open, {}, {
+      renameSync: ((...args: Parameters<typeof fs.renameSync>) => {
+        renameCalls++;
+        return fs.renameSync(...args);
+      }) as typeof fs.renameSync
+    });
+
+    await assert.rejects(
+      writePagedWritableOverlayToFile(
+        capability,
+        basePath,
+        targetPath,
+        snapshotFor(basePath),
+        undefined,
+        lockPath => {
+          lockedPath = lockPath;
+          return {
+            releaseBeforeRename: true,
+            release() {
+              fs.writeFileSync(walPath, Buffer.alloc(33, 7));
+            }
+          };
+        }
+      ),
+      /Save As target.*WAL.*uncheckpointed frames/i
+    );
+
+    assert.strictEqual(lockedPath, fs.realpathSync(targetPath));
+    assert.strictEqual(renameCalls, 0);
+    assert.strictEqual(fs.statSync(walPath).size, 33);
+  });
+
+  it('keeps the no-lock fast path for a nonexistent Save As target', async () => {
+    const basePath = path.join(fixtureDir, 'new-target-base.db');
+    const targetPath = path.join(fixtureDir, 'new-target.db');
+    fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+    let lockCalls = 0;
+
+    const result = await writePagedWritableOverlayToFile(
+      fs,
+      basePath,
+      targetPath,
+      snapshotFor(basePath),
+      undefined,
+      () => {
+        lockCalls++;
+        throw new Error('a new target must not acquire a SQLite lock');
+      }
+    );
+
+    assert.deepStrictEqual(result, { requiresReopen: false });
+    assert.strictEqual(lockCalls, 0);
+  });
+
+  it('locks and replaces a clean existing SQLite Save As target', async () => {
+    const basePath = path.join(fixtureDir, 'clean-target-base.db');
+    const targetPath = path.join(fixtureDir, 'clean-target-existing.db');
+    const originalBase = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    fs.writeFileSync(basePath, originalBase);
+    const targetDatabase = new (SqlJsModule.Database as any)();
+    targetDatabase.run('CREATE TABLE old_target (id INTEGER PRIMARY KEY)');
+    fs.writeFileSync(targetPath, Buffer.from(targetDatabase.export()));
+    targetDatabase.close();
+    let lockedPath: string | undefined;
+    let releaseCalls = 0;
+
+    const result = await writePagedWritableOverlayToFile(
+      fs,
+      basePath,
+      targetPath,
+      snapshotFor(basePath),
+      undefined,
+      databasePath => {
+        lockedPath = databasePath;
+        return { release: () => { releaseCalls++; } };
+      }
+    );
+
+    assert.deepStrictEqual(result, { requiresReopen: false });
+    assert.strictEqual(lockedPath, fs.realpathSync(targetPath));
+    assert.strictEqual(releaseCalls, 1);
+    assert.deepStrictEqual(fs.readFileSync(targetPath), Buffer.from([9, 8, 7, 6, 5, 6, 7, 8]));
+  });
+
   it('releases a Windows-style SQLite handle before rename and repeats the final gates', async () => {
     const basePath = path.join(fixtureDir, 'windows-sharing-base.db');
     fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));

@@ -25,7 +25,7 @@ export interface PagedSaveWriteLock {
   release(): void;
 }
 
-export type PagedSaveWriteLockAcquirer = (activeBasePath: string) => PagedSaveWriteLock;
+export type PagedSaveWriteLockAcquirer = (databasePath: string) => PagedSaveWriteLock;
 
 /** One reusable host buffer bounds every copy from the frozen base. */
 const BASE_COPY_BUFFER_BYTES = 1024 * 1024;
@@ -45,6 +45,8 @@ type TargetGeneration = ExistingTarget | MissingTarget;
 interface ReplacementTarget extends ReplacementFileMetadata {
   replacementPath: string;
   requiresReopen: boolean;
+  /** Existing ordinary SQLite targets need SQLite's writer lock before replacement. */
+  requiresTargetWriteLock: boolean;
   generation: TargetGeneration;
 }
 
@@ -143,6 +145,24 @@ function sameHostFingerprint(
 
 function sameInode(expected: PagedFileIdentity, actual: PagedFileIdentity): boolean {
   return expected.dev === actual.dev && expected.ino === actual.ino;
+}
+
+const SQLITE_DATABASE_HEADER = new Uint8Array([
+  0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66,
+  0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00
+]);
+
+/** Distinguish SQLite targets from arbitrary files that Save As may overwrite. */
+async function hasSqliteDatabaseHeader(fs: NodeFs, filePath: string): Promise<boolean> {
+  const handle = await fs.promises.open(filePath, 'r');
+  try {
+    const header = new Uint8Array(SQLITE_DATABASE_HEADER.byteLength);
+    const { bytesRead } = await handle.read(header, 0, header.byteLength, 0);
+    if (bytesRead !== header.byteLength) return false;
+    return header.every((byte, index) => byte === SQLITE_DATABASE_HEADER[index]);
+  } finally {
+    await handle.close();
+  }
 }
 
 function assertNonNegativeSafeInteger(value: unknown, name: string): asserts value is number {
@@ -306,6 +326,7 @@ async function resolveReplacementTarget(
     return {
       replacementPath: path.join(canonicalParent, path.basename(absoluteTargetPath)),
       requiresReopen: false,
+      requiresTargetWriteLock: false,
       mode: ordinaryPermissionMode(baseIdentity.mode),
       generation: { exists: false }
     };
@@ -322,6 +343,8 @@ async function resolveReplacementTarget(
   return {
     replacementPath,
     requiresReopen,
+    requiresTargetWriteLock:
+      !targetNamesActiveBase && await hasSqliteDatabaseHeader(fs, canonicalTargetPath),
     // Existing permissions are live host metadata, not part of the frozen
     // SQLite byte generation. Preserve what is present when this save starts
     // (including a chmod performed after open) and verify it again at commit.
@@ -378,19 +401,30 @@ function assertTemporaryGenerationSync(
  * frames live outside the main file, so a late external commit must block the
  * rename even when the main-file metadata gate cannot observe it.
  */
-function assertNoSiblingWalFramesSync(fs: NodeFs, activeBasePath: string): void {
-  const walPath = `${activeBasePath}-wal`;
+function assertNoSiblingWalFramesSync(
+  fs: NodeFs,
+  databasePath: string,
+  targetKind: 'active' | 'saveAsTarget' = 'active'
+): void {
+  const walPath = `${databasePath}-wal`;
   let walSize: bigint;
   try {
     walSize = fs.statSync(walPath, { bigint: true }).size;
   } catch (error) {
     if (errorCode(error) === 'ENOENT') return;
-    throw new Error(
-      'Cannot verify sibling WAL state before replacing the database; reload the document.',
-      { cause: error }
-    );
+    const message = targetKind === 'saveAsTarget'
+      ? 'Cannot verify the Save As target WAL state before replacing it; retry the save.'
+      : 'Cannot verify sibling WAL state before replacing the database; reload the document.';
+    throw new Error(message, { cause: error });
   }
   if (walSize > BigInt(WAL_HEADER_SIZE_BYTES)) {
+    if (targetKind === 'saveAsTarget') {
+      throw new Error(
+        'The Save As target has a WAL with uncheckpointed frames. Close other connections or '
+        + 'checkpoint the target database before retrying; its WAL and SHM files remain under '
+        + "SQLite's control."
+      );
+    }
     throw new Error(
       'A sibling WAL acquired uncheckpointed frames during save; reload the document before retrying.'
     );
@@ -407,21 +441,22 @@ function assertNoSiblingWalFramesSync(fs: NodeFs, activeBasePath: string): void 
  * in both rollback and WAL modes; if another writer already owns it, saving
  * fails closed before the active pathname is replaced.
  */
-function acquireSqliteWriteLock(activeBasePath: string): PagedSaveWriteLock {
+function acquireSqliteWriteLock(databasePath: string): PagedSaveWriteLock {
   let DatabaseSync: typeof import('node:sqlite').DatabaseSync;
   try {
     ({ DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite'));
   } catch (error) {
     throw new Error(
       'Cannot safely replace the page-on-demand database because this extension host '
-      + 'does not provide SQLite write locking. Use Save As to write a distinct file.',
+      + 'does not provide SQLite write locking. Choose a new Save As target that does not '
+      + 'already contain a SQLite database.',
       { cause: error }
     );
   }
 
   let database: import('node:sqlite').DatabaseSync | undefined;
   try {
-    database = new DatabaseSync(activeBasePath);
+    database = new DatabaseSync(databasePath);
     // Do not busy-wait on the extension-host thread. An active external writer
     // makes this save fail immediately and leaves both its transaction and our
     // paged overlay intact for an explicit retry.
@@ -495,6 +530,12 @@ function assertReplacementReadySync(
     throw new Error(PAGED_FILE_CHANGED_MESSAGE);
   }
   assertNoSiblingWalFramesSync(fs, activeBasePath);
+  if (target.requiresTargetWriteLock) {
+    // A hot WAL belongs to the target's old main file. Never rename a fresh main
+    // beside those frames, and never delete WAL/SHM files that another SQLite
+    // connection may still own.
+    assertNoSiblingWalFramesSync(fs, target.replacementPath, 'saveAsTarget');
+  }
 }
 
 async function writeAll(
@@ -664,9 +705,13 @@ export async function writePagedWritableOverlayToFile(
     let writeLock: PagedSaveWriteLock | undefined;
     let replacementError: unknown;
     try {
-      // Save As replaces a distinct pathname and cannot discard a commit to
-      // the active base. Only an in-place replacement needs the SQLite lock.
-      if (target.requiresReopen) writeLock = acquireWriteLock(activeBasePath);
+      // Existing SQLite targets need the same writer exclusion as an in-place
+      // replacement. A new Save As target remains on the lock-free fast path.
+      if (target.requiresReopen) {
+        writeLock = acquireWriteLock(activeBasePath);
+      } else if (target.requiresTargetWriteLock) {
+        writeLock = acquireWriteLock(target.replacementPath);
+      }
       assertReplacementReadySync(
         fs,
         source.fd,

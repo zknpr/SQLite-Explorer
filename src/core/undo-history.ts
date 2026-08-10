@@ -194,6 +194,8 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   private maxEntries: number;
   private maxMemory: number;
   private currentSize: number = 0;
+  /** Further edits must wait for Save once an unsaved barrier segment reaches a limit. */
+  private historyRecordingBlockedByBarrierLimit: boolean = false;
   /** Monotonic counter advanced whenever the undo/redo history changes. */
   private mutationRevision: number = 0;
   /** Monotonic counter advanced when older checkpoint positions may no longer name the same saved state. */
@@ -213,6 +215,20 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   /** Memory ceiling used by producers that must preflight before allocation. */
   get memoryLimitBytes(): number {
     return this.maxMemory;
+  }
+
+  /** Fail before a backend mutation when retaining its forward replay would exceed the cap. */
+  ensureCanRecord(): void {
+    if (!this.historyRecordingBlockedByBarrierLimit) return;
+    throw new Error(
+      'Undo history reached its configured limit after a forward-only edit. '
+      + 'Save the database before making more changes.'
+    );
+  }
+
+  /** True while another edit would make the replay-complete barrier segment unbounded. */
+  get isHistoryRecordingBlockedByBarrierLimit(): boolean {
+    return this.historyRecordingBlockedByBarrierLimit;
   }
 
   /**
@@ -253,6 +269,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
 
   /** Add an entry using the shared branching, retention, and checkpoint rules. */
   private recordEntry(entry: T): void {
+    this.ensureCanRecord();
     this.advanceMutationRevision();
 
     // Calculate size of new entry
@@ -295,8 +312,14 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     this.timelineSizes.push(entrySize);
     this.currentSize += entrySize;
 
-    // Enforce capacity and memory limits
-    // We remove oldest entries until we are within BOTH limits
+    this.enforceRetentionLimits();
+  }
+
+  /** Apply ordinary eviction, or saturate an unsaved replay-complete barrier segment. */
+  private enforceRetentionLimits(): void {
+    // Remove oldest entries until within both limits. An unsaved barrier and
+    // every entry after it are one indivisible forward-replay segment: dropping
+    // only part would make hot-exit restore silently lose database changes.
     while (
       (this.timeline.length > 0) &&
       (this.timeline.length > this.maxEntries || this.currentSize > this.maxMemory)
@@ -326,6 +349,16 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
       this.timelineOffset++;
       this.invalidateCapturedCheckpointPositions();
     }
+
+    // At equality the *next* entry would cross the cap. Stop before that entry's
+    // backend write; the threshold-crossing entry itself remains fully retained.
+    this.historyRecordingBlockedByBarrierLimit =
+      this.checkpointIndex === 0
+      && this.hasUncommittedHistoryBarrier
+      && (
+        this.timeline.length >= this.maxEntries
+        || this.currentSize >= this.maxMemory
+      );
   }
 
   /**
@@ -395,6 +428,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     this.currentSize -= this.revertOnRestoreSizes.reduce((a, b) => a + b, 0);
     this.revertOnRestore = [];
     this.revertOnRestoreSizes = [];
+    this.enforceRetentionLimits();
   }
 
   /**
@@ -439,6 +473,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     this.currentSize -= this.revertOnRestoreSizes.reduce((a, b) => a + b, 0);
     this.revertOnRestore = [];
     this.revertOnRestoreSizes = [];
+    this.enforceRetentionLimits();
   }
 
   /**
@@ -532,6 +567,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     if (changed) {
       this.invalidateCapturedCheckpointPositions();
     }
+    this.historyRecordingBlockedByBarrierLimit = false;
   }
 
   /**
@@ -586,6 +622,13 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
       tracker.timelineSizes.reduce((a, b) => a + b, 0) +
       tracker.futureStackSizes.reduce((a, b) => a + b, 0) +
       tracker.revertOnRestoreSizes.reduce((a, b) => a + b, 0);
+    tracker.historyRecordingBlockedByBarrierLimit =
+      tracker.checkpointIndex === 0
+      && tracker.hasUncommittedHistoryBarrier
+      && (
+        tracker.timeline.length >= tracker.maxEntries
+        || tracker.currentSize >= tracker.maxMemory
+      );
 
     return tracker;
   }

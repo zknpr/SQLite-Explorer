@@ -10,7 +10,86 @@ interface MockMod extends LabeledModification {
 }
 
 describe('Undo/Redo Memory Limit', () => {
-    it('keeps the complete barrier segment until save, then resumes memory eviction', async () => {
+    it('blocks additional records when an unsaved barrier segment reaches the entry cap', () => {
+        const tracker = new ModificationTracker<MockMod>(3, 1024 * 1024);
+        tracker.recordBarrier({
+            label: 'barrier',
+            description: 'forward-only oversized replacement',
+            modificationType: 'cell_update',
+            payload: 'bounded',
+            undoPolicy: 'barrier'
+        } as MockMod);
+        for (let index = 0; index < 2; index++) {
+            tracker.record({
+                label: `normal-${index}`,
+                description: `normal-${index}`,
+                modificationType: 'cell_update',
+                payload: 'small'
+            } as MockMod);
+        }
+
+        const serialized = tracker.serialize();
+        assert.throws(
+            () => tracker.record({
+                label: 'must-not-accumulate',
+                description: 'must-not-accumulate',
+                modificationType: 'cell_update',
+                payload: 'small'
+            } as MockMod),
+            /undo history.*limit.*save.*before making more changes/i
+        );
+        assert.deepStrictEqual(
+            tracker.getUncommittedEntries().map(candidate => candidate.label),
+            ['barrier', 'normal-0', 'normal-1']
+        );
+        assert.deepStrictEqual(tracker.serialize(), serialized);
+
+        const restored = ModificationTracker.deserialize<MockMod>(
+            serialized,
+            3,
+            1024 * 1024
+        );
+        assert.throws(
+            () => restored.record({
+                label: 'restored-must-not-accumulate',
+                description: 'restored-must-not-accumulate',
+                modificationType: 'cell_update',
+                payload: 'small'
+            } as MockMod),
+            /undo history.*limit.*save.*before making more changes/i
+        );
+        assert.deepStrictEqual(
+            restored.getUncommittedEntries().map(candidate => candidate.label),
+            ['barrier', 'normal-0', 'normal-1']
+        );
+    });
+
+    it('accounts an unsaved barrier entry against the memory cap', () => {
+        const tracker = new ModificationTracker<MockMod>(100, 1);
+        tracker.recordBarrier({
+            label: 'barrier',
+            description: 'forward-only oversized replacement',
+            modificationType: 'cell_update',
+            payload: 'bounded',
+            undoPolicy: 'barrier'
+        } as MockMod);
+
+        assert.throws(
+            () => tracker.record({
+                label: 'ordinary edit',
+                description: 'ordinary edit',
+                modificationType: 'cell_update',
+                payload: 'small'
+            } as MockMod),
+            /undo history.*limit.*save.*before making more changes/i
+        );
+        assert.deepStrictEqual(
+            tracker.getUncommittedEntries().map(candidate => candidate.label),
+            ['barrier']
+        );
+    });
+
+    it('keeps the saturated barrier segment complete for backup, then resumes eviction after save', async () => {
         const tracker = new ModificationTracker<MockMod>(100, 700);
         const barrier = {
             label: 'barrier',
@@ -20,33 +99,36 @@ describe('Undo/Redo Memory Limit', () => {
             undoPolicy: 'barrier' as const
         } as MockMod;
         tracker.recordBarrier(barrier);
-
-        for (let index = 0; index < 10; index++) {
-            tracker.record({
-                label: `normal-${index}`,
-                description: `normal-${index}`,
-                modificationType: 'cell_update',
-                payload: 'x'.repeat(200)
-            } as MockMod);
-        }
+        tracker.record({
+            label: 'normal-0',
+            description: 'normal-0',
+            modificationType: 'cell_update',
+            payload: 'x'.repeat(200)
+        } as MockMod);
 
         assert.strictEqual(tracker.hasUncommittedHistoryBarrier, true);
+        assert.strictEqual(tracker.isHistoryRecordingBlockedByBarrierLimit, true);
         assert.deepStrictEqual(
             tracker.getUncommittedEntries().map(candidate => candidate.label),
-            ['barrier', ...Array.from({ length: 10 }, (_, index) => `normal-${index}`)]
+            ['barrier', 'normal-0']
+        );
+        const restored = ModificationTracker.deserialize<MockMod>(tracker.serialize(), 100, 700);
+        assert.deepStrictEqual(
+            restored.getUncommittedEntries().map(candidate => candidate.label),
+            ['barrier', 'normal-0']
         );
 
         await tracker.createCheckpoint();
-        for (let index = 10; index < 20; index++) {
-            tracker.record({
-                label: `normal-${index}`,
-                description: `normal-${index}`,
-                modificationType: 'cell_update',
-                payload: 'x'.repeat(200)
-            } as MockMod);
-        }
         assert.strictEqual(tracker.hasUncommittedHistoryBarrier, false);
+        assert.strictEqual(tracker.isHistoryRecordingBlockedByBarrierLimit, false);
+        tracker.record({
+            label: 'normal-1',
+            description: 'normal-1',
+            modificationType: 'cell_update',
+            payload: 'x'.repeat(200)
+        } as MockMod);
         assert.strictEqual(tracker.entryCount, 1, 'memory retention must resume after saving the barrier');
+        assert.strictEqual(tracker.stepBack()?.label, 'normal-1');
     });
 
     it('should respect memory limit', () => {

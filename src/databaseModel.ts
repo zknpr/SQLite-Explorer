@@ -192,7 +192,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       const backupData = await vsc.workspace.fs.readFile(backupUri);
       tracker = ModificationTracker.deserialize<DocumentModification>(
         backupData,
-        MODIFICATION_LIMIT
+        MODIFICATION_LIMIT,
+        getMaxUndoMemoryBytes()
       );
 
       try {
@@ -249,6 +250,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   readonly #forceReadOnlyOnReconnect: boolean;
   #connectionGeneration = 0;
   #activeMutations = 0;
+  /** Serializes history admission through post-backend recording. */
+  #historyMutationTail: Promise<void> = Promise.resolve();
   #pagedSaveExclusive = false;
   #pagedSaveRecoveryRequired = false;
   readonly #mutationDrainWaiters = new Set<() => void>();
@@ -291,16 +294,35 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * visible to paged save's exclusive barrier. The flag is only raised for a
    * writable paged save, so other storage modes retain their existing behavior.
    */
-  async runTrackedMutation<T>(operation: () => T | PromiseLike<T>): Promise<T> {
+  async runTrackedMutation<T>(
+    operation: () => T | PromiseLike<T>,
+    recordsHistory: boolean = false
+  ): Promise<T> {
     if (this.#pagedSaveExclusive) {
       throw new Error(vsc.l10n.t(
         'The document is temporarily read-only while its page-on-demand save is in progress.'
       ));
     }
     this.#activeMutations++;
+    let waitForHistoryMutation: Promise<void> | undefined;
+    let releaseHistoryMutation: (() => void) | undefined;
+    if (recordsHistory) {
+      // Keep admission, backend mutation, and history recording in one ordered
+      // lifecycle. Otherwise two concurrent edits can both pass the last slot;
+      // the loser would mutate SQLite before recordEntry observes saturation.
+      waitForHistoryMutation = this.#historyMutationTail;
+      this.#historyMutationTail = new Promise<void>(resolve => {
+        releaseHistoryMutation = resolve;
+      });
+    }
     try {
+      if (waitForHistoryMutation) {
+        await waitForHistoryMutation;
+        this.#modificationTracker.ensureCanRecord();
+      }
       return await operation();
     } finally {
+      releaseHistoryMutation?.();
       this.#activeMutations--;
       if (this.#activeMutations === 0) {
         for (const resolve of this.#mutationDrainWaiters) resolve();
@@ -397,6 +419,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   recordModification(modification: DocumentModification): void {
     const tracker = this.#modificationTracker;
+    const historyWasBlocked = tracker.isHistoryRecordingBlockedByBarrierLimit;
     if (modification.undoPolicy === 'barrier') {
       tracker.recordBarrier(modification);
     } else {
@@ -513,6 +536,28 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         }
       })
     });
+
+    if (
+      !historyWasBlocked
+      && tracker.isHistoryRecordingBlockedByBarrierLimit
+    ) {
+      const message = vsc.l10n.t(
+        'Undo history reached its configured limit after a forward-only edit. ' +
+        'Current changes remain dirty and protected for recovery, but further edits are blocked. ' +
+        'Save the database before making more changes.'
+      );
+      try {
+        void Promise.resolve(vsc.window.showWarningMessage(message)).catch(error => {
+          GlobalOutputChannel?.appendLine(
+            `[Undo history warning failed] ${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+      } catch (error) {
+        GlobalOutputChannel?.appendLine(
+          `[Undo history warning failed] ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
 
     this.#autoSaveIfNeeded();
   }

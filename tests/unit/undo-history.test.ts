@@ -10,7 +10,7 @@ const entry = (label: string): LabeledModification => ({
 });
 
 describe('ModificationTracker hot-exit persistence', () => {
-  it('keeps an unsaved barrier pinned through 200 later edits and hot-exit serialization', () => {
+  it('keeps an at-cap unsaved barrier segment complete through hot-exit serialization', () => {
     const tracker = new ModificationTracker<LabeledModification>(100);
     const barrier: LabeledModification = {
       ...entry('oversized replacement'),
@@ -21,7 +21,7 @@ describe('ModificationTracker hot-exit persistence', () => {
       undoPolicy: 'barrier'
     };
     tracker.recordBarrier(barrier);
-    for (let index = 0; index < 200; index++) {
+    for (let index = 0; index < 99; index++) {
       tracker.record({
         ...entry(`later edit ${index}`),
         priorValue: index,
@@ -29,10 +29,19 @@ describe('ModificationTracker hot-exit persistence', () => {
       });
     }
 
+    assert.throws(
+      () => tracker.record({
+        ...entry('blocked edit'),
+        priorValue: 99,
+        newValue: 100
+      }),
+      /undo history.*limit.*save.*before making more changes/i
+    );
+
     assert.strictEqual(tracker.hasUncommittedHistoryBarrier, true);
     assert.deepStrictEqual(
       tracker.getUncommittedEntries().map(candidate => candidate.label),
-      ['oversized replacement', ...Array.from({ length: 200 }, (_, index) => `later edit ${index}`)]
+      ['oversized replacement', ...Array.from({ length: 99 }, (_, index) => `later edit ${index}`)]
     );
 
     const restored = ModificationTracker.deserialize<LabeledModification>(tracker.serialize());

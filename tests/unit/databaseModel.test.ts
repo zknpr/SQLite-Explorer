@@ -1479,6 +1479,154 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         }
     });
 
+    it('blocks backend edits at a saturated barrier segment, warns once, and resumes after Save', async () => {
+        let backendCalls = 0;
+        const dbOps = {
+            engineKind: Promise.resolve('native' as const),
+            executeQuery: async () => [],
+            updateCellBatch: async () => {
+                backendCalls++;
+                return [{
+                    rowId: 1,
+                    columnName: 'value',
+                    priorValue: 'before',
+                    newValue: 'after',
+                    operation: 'set' as const
+                }];
+            }
+        };
+        const doc = createDocBypassingFactory(dbOps);
+        const warnings: string[] = [];
+        const originalShowWarningMessage = mockVscode.window.showWarningMessage;
+        mockVscode.window.showWarningMessage = async (message?: string) => {
+            warnings.push(String(message));
+            return undefined;
+        };
+        let backupContent: Uint8Array | undefined;
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (_uri: unknown, content: Uint8Array) => {
+                    backupContent = content;
+                }
+            },
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            doc.recordModification({
+                label: 'Barrier',
+                description: 'forward-only replacement',
+                modificationType: 'cell_update',
+                undoPolicy: 'barrier'
+            });
+            for (let index = 0; index < 99; index++) {
+                doc.recordModification({
+                    label: `Later ${index}`,
+                    description: `Later ${index}`,
+                    modificationType: 'cell_update'
+                });
+            }
+
+            await doc.backup(createUri('vscode-userdata', '/backups/saturated.db'), undefined);
+            assert.ok(backupContent);
+            const restored = ModificationTracker.deserialize<LabeledModification>(
+                backupContent,
+                100
+            );
+            assert.deepStrictEqual(
+                restored.getUncommittedEntries().map(entry => entry.label),
+                ['Barrier', ...Array.from({ length: 99 }, (_, index) => `Later ${index}`)]
+            );
+
+            await assert.rejects(
+                doc.hostBridge.updateCellBatch(
+                    'items',
+                    [{ rowId: 1, column: 'value', value: 'after' }],
+                    'Blocked edit'
+                ),
+                /undo history.*limit.*save.*before making more changes/i
+            );
+            assert.strictEqual(backendCalls, 0, 'the rejected edit must not reach SQLite');
+            assert.strictEqual((await doc.getDesktopTestState()).dirty, true);
+            assert.strictEqual(warnings.length, 1);
+            assert.match(warnings[0], /undo history.*limit/i);
+            assert.match(warnings[0], /save.*before making more changes/i);
+
+            await doc.save();
+            await doc.hostBridge.updateCellBatch(
+                'items',
+                [{ rowId: 1, column: 'value', value: 'after' }],
+                'Allowed after Save'
+            );
+            assert.strictEqual(backendCalls, 1);
+            assert.strictEqual(warnings.length, 1, 'one saturated segment emits one warning');
+        } finally {
+            mockVscode.window.showWarningMessage = originalShowWarningMessage;
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+
+    it('admits only one concurrent backend edit when a barrier segment has one slot left', async () => {
+        let backendCalls = 0;
+        const dbOps = {
+            engineKind: Promise.resolve('native' as const),
+            executeQuery: async () => [],
+            updateCellBatch: async (_table: string, updates: any[]) => {
+                backendCalls++;
+                return [{
+                    rowId: updates[0].rowId,
+                    columnName: updates[0].column,
+                    priorValue: 'before',
+                    newValue: updates[0].value,
+                    operation: 'set' as const
+                }];
+            }
+        };
+        const doc = createDocBypassingFactory(dbOps);
+        doc.recordModification({
+            label: 'Barrier',
+            description: 'forward-only replacement',
+            modificationType: 'cell_update',
+            undoPolicy: 'barrier'
+        });
+        for (let index = 0; index < 98; index++) {
+            doc.recordModification({
+                label: `Later ${index}`,
+                description: `Later ${index}`,
+                modificationType: 'cell_update'
+            });
+        }
+
+        const outcomes = await Promise.allSettled([
+            doc.hostBridge.updateCellBatch(
+                'items',
+                [{ rowId: 1, column: 'value', value: 'first' }],
+                'First contender'
+            ),
+            doc.hostBridge.updateCellBatch(
+                'items',
+                [{ rowId: 2, column: 'value', value: 'second' }],
+                'Second contender'
+            )
+        ]);
+
+        assert.strictEqual(backendCalls, 1, 'the losing admission must stop before SQLite');
+        assert.strictEqual(outcomes.filter(outcome => outcome.status === 'fulfilled').length, 1);
+        const rejection = outcomes.find(outcome => outcome.status === 'rejected');
+        assert.ok(rejection && rejection.status === 'rejected');
+        assert.match(
+            String(rejection.reason?.message ?? rejection.reason),
+            /undo history.*limit.*save.*before making more changes/i
+        );
+    });
+
     it('refuses File Revert before an unsaved oversized-edit barrier can write a fake prior value', async () => {
         const discardCalls: unknown[][] = [];
         const doc = createDocBypassingFactory({
@@ -1494,7 +1642,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             newValue: 'bounded',
             undoPolicy: 'barrier'
         });
-        for (let index = 0; index < 200; index++) {
+        for (let index = 0; index < 10; index++) {
             doc.recordExternalModification({
                 label: `Later edit ${index}`,
                 description: `Later edit ${index}`,

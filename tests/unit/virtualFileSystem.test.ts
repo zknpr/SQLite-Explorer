@@ -415,6 +415,44 @@ describe('SQLiteFileSystemProvider', () => {
             assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
         });
 
+        it('rejects a saturated history before an external-editor write reaches SQLite', async () => {
+            const dbOps = {
+                getCellMetadata: mock.fn(async () => ({ storageClass: 'text', byteLength: 0 })),
+                executeQuery: mock.fn(async () => [{
+                    headers: ['type', 'bytes', 'value'],
+                    rows: [['text', 0, '']]
+                }]),
+                updateCell: mock.fn(async () => {})
+            };
+            const doc = setupMockDocument(docKey, dbOps) as any;
+            const blocked = new Error(
+                'Undo history reached its configured limit after a forward-only edit. '
+                + 'Save the database before making more changes.'
+            );
+            doc.runTrackedMutation = mock.fn(async (
+                _operation: () => unknown,
+                recordsHistory: boolean
+            ) => {
+                assert.strictEqual(recordsHistory, true);
+                throw blocked;
+            });
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/col.txt`);
+
+            await assert.rejects(
+                provider.writeFile(
+                    uri,
+                    new TextEncoder().encode('blocked write'),
+                    { create: false, overwrite: true }
+                ),
+                error => error === blocked
+            );
+            assert.strictEqual(doc.runTrackedMutation.mock.callCount(), 1);
+            assert.strictEqual(dbOps.getCellMetadata.mock.callCount(), 0);
+            assert.strictEqual(dbOps.executeQuery.mock.callCount(), 0);
+            assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+            assert.strictEqual(doc.recordExternalModification.mock.callCount(), 0);
+        });
+
         it('should write text content correctly', async () => {
             const dbOps = {
                 getCellMetadata: mock.fn(async () => ({ storageClass: 'text', byteLength: 11 })),

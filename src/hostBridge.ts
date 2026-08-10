@@ -148,8 +148,8 @@ interface ToastService {
   showErrorToast<T extends string | DialogButton>(message: string, options?: DialogConfig, ...items: T[]): Promise<T | undefined>;
 }
 
-/** Methods whose complete host-side lifecycle must precede a paged snapshot. */
-const TRACKED_MUTATION_METHODS = [
+/** Calls that create a new history entry after their backend mutation succeeds. */
+const HISTORY_RECORDING_METHODS = [
   'updateCell',
   'insertRow',
   'deleteRows',
@@ -161,10 +161,17 @@ const TRACKED_MUTATION_METHODS = [
   'updateCellBatch',
   'addColumn',
   'setPragma',
-  'fireEditEvent',
+  'fireEditEvent'
+] as const;
+
+/** Methods whose complete host-side lifecycle must precede a paged snapshot. */
+const TRACKED_MUTATION_METHODS = [
+  ...HISTORY_RECORDING_METHODS,
   'triggerUndo',
   'triggerRedo'
 ] as const;
+
+const HISTORY_RECORDING_METHOD_NAMES = new Set<string>(HISTORY_RECORDING_METHODS);
 
 /** Keep this paired with the settings modal's stored-vs-session-only wording. */
 const PAGED_PERSISTENT_PRAGMAS = new Set(['journal_mode', 'auto_vacuum']);
@@ -204,7 +211,8 @@ export class HostBridge implements ToastService {
         configurable: false,
         enumerable: false,
         value: (...args: unknown[]) => this.document.runTrackedMutation(
-          () => implementation(...args)
+          () => implementation(...args),
+          HISTORY_RECORDING_METHOD_NAMES.has(methodName)
         )
       });
     }

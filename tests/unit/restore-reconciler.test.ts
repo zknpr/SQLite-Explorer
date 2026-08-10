@@ -39,7 +39,7 @@ const roundTripTracker = (
   ModificationTracker.deserialize<LabeledModification>(tracker.serialize());
 
 describe('reconcileRestoredDatabase', () => {
-  it('hot-exit round-trip retains an evicted-scenario barrier for conservative WASM replay', async () => {
+  it('hot-exit round-trip retains a complete within-cap barrier segment for WASM replay', async () => {
     const applied: LabeledModification[] = [];
     const operations = {
       applyModifications: async (entries: LabeledModification[]) => {
@@ -47,7 +47,7 @@ describe('reconcileRestoredDatabase', () => {
       },
       undoModification: async () => {}
     } as unknown as DatabaseOperations;
-    const tracker = new ModificationTracker<LabeledModification>(100);
+    const tracker = new ModificationTracker<LabeledModification>(300);
     tracker.recordBarrier({
       ...cellEdit('oversized replacement', 'unretained', 'bounded'),
       priorValue: undefined,
