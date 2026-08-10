@@ -4,6 +4,12 @@ import assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
+import {
+    assertNoNewColumnDropForeignKeyViolations,
+    captureColumnDropForeignKeyBaseline,
+    COLUMN_DROP_FOREIGN_KEY_FIELD_BYTES_LIMIT,
+    COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT
+} from '../../src/core/column-drop';
 
 describe('SQLite Engine Undo/Redo', () => {
     let engine: any;
@@ -44,7 +50,7 @@ describe('SQLite Engine Undo/Redo', () => {
         await engine.deleteRows('users', [2]);
 
         const verifyGone = await engine.fetchTableCount('users', {});
-        assert.strictEqual(verifyGone, 1);
+        assert.deepStrictEqual(verifyGone, { count: 1, isExact: true });
 
         // 2. Undo Delete
         await engine.undoModification({
@@ -55,7 +61,7 @@ describe('SQLite Engine Undo/Redo', () => {
         });
 
         const verifyRestored = await engine.fetchTableCount('users', {});
-        assert.strictEqual(verifyRestored, 2);
+        assert.deepStrictEqual(verifyRestored, { count: 2, isExact: true });
 
         const restoredRow = await engine.executeQuery("SELECT name FROM users WHERE id = 2");
         assert.strictEqual(restoredRow[0].rows[0][0], 'Bob');
@@ -69,7 +75,35 @@ describe('SQLite Engine Undo/Redo', () => {
         });
 
         const verifyDeletedAgain = await engine.fetchTableCount('users', {});
-        assert.strictEqual(verifyDeletedAgain, 1);
+        assert.deepStrictEqual(verifyDeletedAgain, { count: 1, isExact: true });
+    });
+
+    it('restores a deleted row to its deterministic grid position', async () => {
+        await engine.insertRow('users', { id: 3, name: 'Charlie' });
+        const before = await engine.fetchTableData('users', {
+            columns: ['rowid', 'id', 'name'],
+            orderBy: 'id',
+            limit: 10,
+            offset: 0
+        });
+        const deletedRows = await engine.deleteRows('users', [2]);
+        assert.ok(deletedRows);
+
+        await engine.undoModification({
+            modificationType: 'row_delete',
+            targetTable: 'users',
+            description: 'Delete middle row',
+            deletedRows
+        });
+
+        const after = await engine.fetchTableData('users', {
+            columns: ['rowid', 'id', 'name'],
+            orderBy: 'id',
+            limit: 10,
+            offset: 0
+        });
+        assert.deepStrictEqual(after.rows, before.rows);
+        assert.deepStrictEqual(after.rows.map((row: any[]) => row[0]), [1, 2, 3]);
     });
 
     it('should undo/redo column drop', async () => {
@@ -114,6 +148,423 @@ describe('SQLite Engine Undo/Redo', () => {
         } catch (e) {
             assert.ok(true);
         }
+    });
+
+    it('rolls back a column drop when its post-drop snapshot cannot be captured', async () => {
+        const originalGetTableInfo = engine.getTableInfo.bind(engine);
+        engine.getTableInfo = async (table: string) => {
+            const columns = await originalGetTableInfo(table);
+            if (table === 'users' && !columns.some((column: any) => column.identifier === 'name')) {
+                throw new Error('post-drop snapshot failed');
+            }
+            return columns;
+        };
+
+        await assert.rejects(
+            engine.deleteColumns('users', ['name']),
+            /post-drop snapshot failed/
+        );
+
+        assert.deepStrictEqual(
+            (await originalGetTableInfo('users')).map((column: any) => column.identifier),
+            ['id', 'name']
+        );
+    });
+
+    it('restores a dropped middle column with its exact schema position and dependents', async () => {
+        const createTableSql =
+            "CREATE TABLE column_restore_parent (id INTEGER PRIMARY KEY, removed TEXT NOT NULL DEFAULT 'fallback' CHECK(length(removed) > 0), tail TEXT)";
+        const createRemovedIndexSql =
+            'CREATE INDEX idx_column_restore_removed ON column_restore_parent(removed)';
+        const createTailIndexSql =
+            'CREATE INDEX idx_column_restore_tail ON column_restore_parent(tail)';
+        const createTriggerSql =
+            'CREATE TRIGGER trg_column_restore_tail AFTER UPDATE OF tail ON column_restore_parent ' +
+            'BEGIN INSERT INTO column_restore_audit(value) VALUES (NEW.tail); END';
+        await engine.executeQuery('PRAGMA foreign_keys = ON');
+        await engine.executeQuery('CREATE TABLE column_restore_audit (value TEXT)');
+        await engine.executeQuery(createTableSql);
+        await engine.executeQuery(createRemovedIndexSql);
+        await engine.executeQuery(createTailIndexSql);
+        await engine.executeQuery(createTriggerSql);
+        await engine.executeQuery(
+            'CREATE VIEW column_restore_view AS SELECT id, tail FROM column_restore_parent'
+        );
+        await engine.executeQuery(
+            'CREATE TABLE column_restore_child (' +
+            'id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES column_restore_parent(id))'
+        );
+        await engine.executeQuery(
+            "INSERT INTO column_restore_parent(rowid, id, removed, tail) VALUES " +
+            "(7, 7, 'seven', 'tail-7'), (11, 11, 'eleven', 'tail-11')"
+        );
+        await engine.executeQuery('INSERT INTO column_restore_child VALUES (1, 7)');
+
+        const removedData = (await engine.executeQuery(
+            'SELECT rowid, removed FROM column_restore_parent ORDER BY rowid'
+        ))[0].rows.map((row: any[]) => ({ rowId: row[0], value: row[1] }));
+        await engine.deleteColumns(
+            'column_restore_parent',
+            ['removed'],
+            ['idx_column_restore_removed']
+        );
+        const afterTableSql = (await engine.executeQuery(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'column_restore_parent'"
+        ))[0].rows[0][0];
+
+        await engine.undoModification({
+            modificationType: 'column_drop',
+            targetTable: 'column_restore_parent',
+            description: 'Drop middle constrained column',
+            deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+            droppedIndexes: ['idx_column_restore_removed'],
+            columnDropSnapshot: {
+                before: {
+                    tableSql: createTableSql,
+                    columns: ['id', 'removed', 'tail'],
+                    identity: { kind: 'rowid' },
+                    schemaObjects: [
+                        { type: 'index', identifier: 'idx_column_restore_removed', sql: createRemovedIndexSql },
+                        { type: 'index', identifier: 'idx_column_restore_tail', sql: createTailIndexSql },
+                        { type: 'trigger', identifier: 'trg_column_restore_tail', sql: createTriggerSql }
+                    ]
+                },
+                after: {
+                    tableSql: afterTableSql,
+                    columns: ['id', 'tail'],
+                    identity: { kind: 'rowid' },
+                    schemaObjects: [
+                        { type: 'index', identifier: 'idx_column_restore_tail', sql: createTailIndexSql },
+                        { type: 'trigger', identifier: 'trg_column_restore_tail', sql: createTriggerSql }
+                    ]
+                }
+            }
+        } as any);
+
+        const tableInfo = (await engine.executeQuery(
+            'PRAGMA table_info(column_restore_parent)'
+        ))[0].rows;
+        assert.deepStrictEqual(
+            tableInfo.map((column: any[]) => [column[0], column[1], column[2], column[3], column[4]]),
+            [
+                [0, 'id', 'INTEGER', 0, null],
+                [1, 'removed', 'TEXT', 1, "'fallback'"],
+                [2, 'tail', 'TEXT', 0, null]
+            ]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT rowid, id, removed, tail FROM column_restore_parent ORDER BY rowid'
+            ))[0].rows,
+            [[7, 7, 'seven', 'tail-7'], [11, 11, 'eleven', 'tail-11']]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                "SELECT type, name, sql FROM sqlite_schema " +
+                "WHERE tbl_name = 'column_restore_parent' AND type IN ('index', 'trigger') " +
+                'AND sql IS NOT NULL ORDER BY type, name'
+            ))[0].rows,
+            [
+                ['index', 'idx_column_restore_removed', createRemovedIndexSql],
+                ['index', 'idx_column_restore_tail', createTailIndexSql],
+                ['trigger', 'trg_column_restore_tail', createTriggerSql]
+            ]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT id, tail FROM column_restore_view ORDER BY id'))[0].rows,
+            [[7, 'tail-7'], [11, 'tail-11']]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('PRAGMA foreign_key_check'))[0]?.rows ?? [],
+            []
+        );
+        assert.strictEqual(
+            (await engine.executeQuery('PRAGMA foreign_keys'))[0].rows[0][0],
+            1
+        );
+        await engine.executeQuery(
+            "UPDATE column_restore_parent SET tail = 'changed' WHERE id = 7"
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT value FROM column_restore_audit'))[0].rows,
+            [['changed']]
+        );
+    });
+
+    it('preserves an AUTOINCREMENT high-water mark across positional column-drop undo', async () => {
+        const createTableSql =
+            'CREATE TABLE column_restore_sequence (' +
+            'id INTEGER PRIMARY KEY AUTOINCREMENT, removed TEXT, tail TEXT)';
+        await engine.executeQuery(createTableSql);
+        await engine.executeQuery(
+            "INSERT INTO column_restore_sequence(id, removed, tail) VALUES " +
+            "(1, 'one', 'tail-1'), (100, 'retired', 'tail-100')"
+        );
+        await engine.executeQuery('DELETE FROM column_restore_sequence WHERE id = 100');
+        const removedData = (await engine.executeQuery(
+            'SELECT rowid, removed FROM column_restore_sequence'
+        ))[0].rows.map((row: any[]) => ({ rowId: row[0], value: row[1] }));
+
+        await engine.deleteColumns('column_restore_sequence', ['removed']);
+        const afterTableSql = (await engine.executeQuery(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'column_restore_sequence'"
+        ))[0].rows[0][0];
+        await engine.undoModification({
+            modificationType: 'column_drop',
+            targetTable: 'column_restore_sequence',
+            description: 'Restore AUTOINCREMENT middle column',
+            deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+            columnDropSnapshot: {
+                before: {
+                    tableSql: createTableSql,
+                    columns: ['id', 'removed', 'tail'],
+                    identity: { kind: 'rowid' },
+                    schemaObjects: []
+                },
+                after: {
+                    tableSql: afterTableSql,
+                    columns: ['id', 'tail'],
+                    identity: { kind: 'rowid' },
+                    schemaObjects: []
+                }
+            }
+        } as any);
+
+        assert.strictEqual(
+            (await engine.executeQuery(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'column_restore_sequence'"
+            ))[0].rows[0][0],
+            100
+        );
+        await engine.executeQuery(
+            "INSERT INTO column_restore_sequence(removed, tail) VALUES ('next', 'tail-next')"
+        );
+        assert.strictEqual(
+            (await engine.executeQuery(
+                "SELECT id FROM column_restore_sequence WHERE tail = 'tail-next'"
+            ))[0].rows[0][0],
+            101
+        );
+    });
+
+    it('allows positional column-drop undo when an unrelated FK violation pre-existed', async () => {
+        await engine.executeQuery('PRAGMA foreign_keys = OFF');
+        await engine.executeQuery('CREATE TABLE preexisting_fk_parent (id INTEGER PRIMARY KEY)');
+        await engine.executeQuery(
+            'CREATE TABLE preexisting_fk_child (' +
+            'id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES preexisting_fk_parent(id)' +
+            ') WITHOUT ROWID'
+        );
+        await engine.executeQuery('INSERT INTO preexisting_fk_child VALUES (1, 999), (2, 999)');
+        await engine.executeQuery('PRAGMA foreign_keys = ON');
+        assert.deepStrictEqual(
+            (await engine.executeQuery('PRAGMA foreign_key_check'))[0].rows,
+            [
+                ['preexisting_fk_child', null, 'preexisting_fk_parent', 0],
+                ['preexisting_fk_child', null, 'preexisting_fk_parent', 0]
+            ]
+        );
+
+        const createTableSql =
+            'CREATE TABLE fk_baseline_restore (' +
+            'id INTEGER PRIMARY KEY, removed TEXT, tail TEXT)';
+        await engine.executeQuery(createTableSql);
+        await engine.executeQuery(
+            "INSERT INTO fk_baseline_restore(rowid, id, removed, tail) " +
+            "VALUES (7, 7, 'saved', 'tail')"
+        );
+        const removedData = (await engine.executeQuery(
+            'SELECT rowid, removed FROM fk_baseline_restore'
+        ))[0].rows.map((row: any[]) => ({ rowId: row[0], value: row[1] }));
+        await engine.deleteColumns('fk_baseline_restore', ['removed']);
+        const afterTableSql = (await engine.executeQuery(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'fk_baseline_restore'"
+        ))[0].rows[0][0];
+
+        await engine.undoModification({
+            modificationType: 'column_drop',
+            targetTable: 'fk_baseline_restore',
+            description: 'Restore with unrelated pre-existing FK violation',
+            deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+            columnDropSnapshot: {
+                before: {
+                    tableSql: createTableSql,
+                    columns: ['id', 'removed', 'tail'],
+                    identity: { kind: 'rowid' },
+                    schemaObjects: []
+                },
+                after: {
+                    tableSql: afterTableSql,
+                    columns: ['id', 'tail'],
+                    identity: { kind: 'rowid' },
+                    schemaObjects: []
+                }
+            }
+        } as any);
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT rowid, id, removed, tail FROM fk_baseline_restore'
+            ))[0].rows,
+            [[7, 7, 'saved', 'tail']]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('PRAGMA foreign_key_check'))[0].rows,
+            [
+                ['preexisting_fk_child', null, 'preexisting_fk_parent', 0],
+                ['preexisting_fk_child', null, 'preexisting_fk_parent', 0]
+            ]
+        );
+    });
+
+    it('compares bounded foreign-key violations as a multiset', () => {
+        const violation = ['child', null, 'parent', '0'] as const;
+        const baseline = captureColumnDropForeignKeyBaseline('target', [violation, violation]);
+
+        assert.doesNotThrow(() => assertNoNewColumnDropForeignKeyViolations(
+            'target',
+            baseline,
+            [violation, violation]
+        ));
+        assert.throws(
+            () => assertNoNewColumnDropForeignKeyViolations(
+                'target',
+                baseline,
+                [violation, violation, violation]
+            ),
+            /new violations/i
+        );
+        assert.throws(
+            () => captureColumnDropForeignKeyBaseline(
+                'target',
+                Array(COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT + 1).fill(violation)
+            ),
+            /safety bound/i
+        );
+        const longName = 'x'.repeat(20_000);
+        assert.throws(
+            () => captureColumnDropForeignKeyBaseline(
+                'target',
+                Array(60).fill([longName, null, longName, '0'])
+            ),
+            /byte safety bound/i
+        );
+        assert.throws(
+            () => captureColumnDropForeignKeyBaseline(
+                'target',
+                [['x'.repeat(COLUMN_DROP_FOREIGN_KEY_FIELD_BYTES_LIMIT + 1), null, 'p', '0']]
+            ),
+            /field exceeds the safety bound/i
+        );
+    });
+
+    it('rolls back positional undo when restored values introduce an FK violation', async () => {
+        await engine.executeQuery('CREATE TABLE rebuild_fk_parent (id INTEGER PRIMARY KEY)');
+        await engine.executeQuery('INSERT INTO rebuild_fk_parent VALUES (1)');
+        const createTableSql =
+            'CREATE TABLE rebuild_fk_target (' +
+            'id INTEGER PRIMARY KEY, removed INTEGER REFERENCES rebuild_fk_parent(id), tail TEXT)';
+        await engine.executeQuery(createTableSql);
+        await engine.executeQuery(
+            "INSERT INTO rebuild_fk_target(rowid, id, removed, tail) VALUES (7, 7, 1, 'tail')"
+        );
+        await engine.deleteColumns('rebuild_fk_target', ['removed']);
+        const afterTableSql = (await engine.executeQuery(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'rebuild_fk_target'"
+        ))[0].rows[0][0];
+        // A real object with this name shadows the table-valued pragma. The
+        // safety gate must execute the non-shadowable PRAGMA statement.
+        await engine.executeQuery(
+            'CREATE TABLE pragma_foreign_key_check (' +
+            '"table" TEXT, rowid INTEGER, parent TEXT, fkid INTEGER)'
+        );
+
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'column_drop',
+                targetTable: 'rebuild_fk_target',
+                description: 'Reject a new rebuild violation',
+                deletedColumns: [{
+                    name: 'removed',
+                    type: 'INTEGER',
+                    data: [{ rowId: 7, value: 999 }]
+                }],
+                columnDropSnapshot: {
+                    before: {
+                        tableSql: createTableSql,
+                        columns: ['id', 'removed', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: []
+                    },
+                    after: {
+                        tableSql: afterTableSql,
+                        columns: ['id', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: []
+                    }
+                }
+            } as any),
+            /new violations/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('PRAGMA table_info(rebuild_fk_target)'))[0].rows
+                .map((column: any[]) => column[1]),
+            ['id', 'tail']
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('PRAGMA foreign_key_check'))[0]?.rows ?? [],
+            []
+        );
+    });
+
+    it('rolls back a guarded column restore when the post-drop schema changed', async () => {
+        const createTableSql =
+            'CREATE TABLE guarded_column_restore (id INTEGER PRIMARY KEY, removed TEXT, tail TEXT)';
+        await engine.executeQuery(createTableSql);
+        await engine.executeQuery(
+            "INSERT INTO guarded_column_restore(rowid, id, removed, tail) VALUES (5, 5, 'value', 'tail')"
+        );
+        await engine.deleteColumns('guarded_column_restore', ['removed']);
+
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'column_drop',
+                targetTable: 'guarded_column_restore',
+                description: 'Reject stale column history',
+                deletedColumns: [{
+                    name: 'removed',
+                    type: 'TEXT',
+                    data: [{ rowId: 5, value: 'value' }]
+                }],
+                columnDropSnapshot: {
+                    before: {
+                        tableSql: createTableSql,
+                        columns: ['id', 'removed', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: []
+                    },
+                    after: {
+                        tableSql: 'CREATE TABLE guarded_column_restore (id INTEGER PRIMARY KEY)',
+                        columns: ['id', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: []
+                    }
+                }
+            } as any),
+            /schema changed/i
+        );
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery('PRAGMA table_info(guarded_column_restore)'))[0].rows
+                .map((column: any[]) => column[1]),
+            ['id', 'tail']
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT rowid, id, tail FROM guarded_column_restore'
+            ))[0].rows,
+            [[5, 5, 'tail']]
+        );
     });
 
     it('should undo/redo cell update', async () => {

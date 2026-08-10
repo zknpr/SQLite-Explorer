@@ -1,6 +1,14 @@
 /**
  * Modal Management
  */
+import { state } from './state.js';
+
+const modalCloseHandlers = new Map();
+
+/** Register cleanup for modal-owned state that generic dismissal cannot see. */
+export function registerModalCloseHandler(modalId, handler) {
+    modalCloseHandlers.set(modalId, handler);
+}
 
 export function initModals() {
     document.addEventListener('click', (e) => {
@@ -17,16 +25,20 @@ export function initModals() {
 
         // Close on click outside (overlay)
         if (target.classList.contains('modal-overlay')) {
-            target.classList.add('hidden');
+            if (target.id) closeModal(target.id);
+            else target.classList.add('hidden');
         }
     });
 
     // Close on Escape key
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
-            const visibleModal = document.querySelector('.modal-overlay:not(.hidden)');
+            const visibleModal = document.querySelector(
+                '.modal-overlay:not(.hidden), .cell-preview-modal:not(.hidden)'
+            );
             if (visibleModal) {
-                visibleModal.classList.add('hidden');
+                if (visibleModal.id) closeModal(visibleModal.id);
+                else visibleModal.classList.add('hidden');
                 e.preventDefault();
                 e.stopPropagation(); // Prevent other escape handlers (like clearing selection)
                 e.stopImmediatePropagation();
@@ -48,4 +60,6 @@ export function openModal(modalId) {
 export function closeModal(modalId) {
     const el = document.getElementById(modalId);
     if (el) el.classList.add('hidden');
+    if (modalId === 'cellPreviewModal') state.cellPreviewInfo = null;
+    modalCloseHandlers.get(modalId)?.();
 }

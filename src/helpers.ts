@@ -127,7 +127,7 @@ const textEncoder = new TextEncoder();
  * @param length - Number of bytes to use (default 6)
  * @returns Truncated SHA-256 hash encoded as base64url
  */
-async function hash64(input: string, length: number = 6): Promise<string> {
+export async function hash64(input: string, length: number = 6): Promise<string> {
   const hashBuffer = await crypto.subtle.digest('SHA-256', textEncoder.encode(input));
   const hashBytes = new Uint8Array(hashBuffer).subarray(0, length);
   return base64urlnopad.encode(hashBytes);
@@ -137,7 +137,7 @@ async function hash64(input: string, length: number = 6): Promise<string> {
 /**
  * Generate a unique key for a database document.
  *
- * Combines filename with path hash for uniqueness while
+ * Combines filename with a resource-URI hash for uniqueness while
  * remaining human-readable.
  *
  * @param uri - Document URI
@@ -145,8 +145,19 @@ async function hash64(input: string, length: number = 6): Promise<string> {
  */
 export async function generateDatabaseDocumentKey(uri: vsc.Uri): Promise<string> {
   const { basename, extname } = getUriParts(uri);
-  const pathHash = await hash64(uri.path);
-  return `${basename}${extname} <${pathHash}>`;
+  // URI components are kept separate so no delimiter ambiguity can make two
+  // providers with the same path share a database engine or virtual-file root.
+  // Preserve the legacy path hash for ordinary local files so already-open
+  // virtual cell/view URIs remain valid across an extension update.
+  const scheme = uri.scheme.toLowerCase();
+  const resourceIdentity = scheme === 'file' && uri.authority === ''
+    ? uri.path
+    // Query and fragment are provider-defined resource selectors. Omitting
+    // either can alias two distinct virtual databases even when their visible
+    // scheme, authority, and path are identical.
+    : JSON.stringify([scheme, uri.authority, uri.path, uri.query, uri.fragment]);
+  const resourceHash = await hash64(resourceIdentity);
+  return `${basename}${extname} <${resourceHash}>`;
 }
 
 // ============================================================================
@@ -239,4 +250,3 @@ export function maskSensitiveData(message: string): string {
   safeMessage = safeMessage.replace(SSN_REGEX, '***-**-****');
   return safeMessage;
 }
-

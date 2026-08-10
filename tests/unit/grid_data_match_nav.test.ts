@@ -20,9 +20,14 @@ function createClassList(initial: string[] = []) {
 }
 
 describe('grid data match cache', () => {
-    afterEach(() => {
+    afterEach(async () => {
         delete (globalThis as any).document;
         mock.restoreAll();
+        // The count cache is module state shared across this process; clear it
+        // so the next test's count mock always gets its first fetch.
+        const countCacheModulePath = '../../core/ui/modules/count-cache.js';
+        const { invalidateAllCounts } = await import(countCacheModulePath);
+        invalidateAllCounts();
     });
 
     it('omits whitespace-only filters from both count and data requests', async () => {
@@ -87,6 +92,66 @@ describe('grid data match cache', () => {
             state.isLoadingData = false;
             state.isGridReloading = false;
             state.editingCellInfo = null;
+        }
+    });
+
+    it('commits oversized-cell and read-only-row sidecars with the fetched page', async () => {
+        const elements: Record<string, any> = {
+            pageIndicator: { textContent: '' },
+            btnFirst: { disabled: false },
+            btnPrev: { disabled: false },
+            btnNext: { disabled: false },
+            btnLast: { disabled: false },
+            statusText: { textContent: '' },
+            filterMatchCounter: { textContent: '' }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) { return elements[id] ?? null; },
+            querySelectorAll() { return []; }
+        };
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const gridDataModulePath = '../../core/ui/modules/grid-data.js';
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { loadTableData } = await import(gridDataModulePath);
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        backendApi.fetchTableCount = async () => 1;
+        backendApi.fetchTableData = async () => ({
+            rows: [['readonly-pk:test', 'preview']],
+            oversizedCells: {
+                0: { 1: { storageClass: 'text', byteLength: 32 } }
+            },
+            readOnlyRowReasons: { 0: 'Oversized primary key.' }
+        } as any);
+        state.selectedTable = 'rowidless';
+        state.selectedTableType = 'table';
+        state.renderedTable = null;
+        state.tableColumns = [{ name: 'key', type: 'TEXT' }];
+        state.currentPageIndex = 0;
+        state.rowsPerPage = 500;
+        state.columnFilters = {};
+        state.filterQuery = '';
+        state.isLoadingData = false;
+        state.isGridReloading = false;
+
+        try {
+            assert.strictEqual(await loadTableData(false, false), true);
+            assert.deepStrictEqual(state.gridOversizedCells, {
+                0: { 1: { storageClass: 'text', byteLength: 32 } }
+            });
+            assert.deepStrictEqual(state.gridReadOnlyRowReasons, {
+                0: 'Oversized primary key.'
+            });
+        } finally {
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
+            state.selectedTable = null;
+            state.gridOversizedCells = {};
+            state.gridReadOnlyRowReasons = {};
+            state.isLoadingData = false;
+            state.isGridReloading = false;
         }
     });
 
@@ -602,9 +667,10 @@ describe('grid data match cache', () => {
         const originalFetchData = backendApi.fetchTableData;
         mock.method(console, 'error', () => {});
         backendApi.fetchTableCount = async () => counts[countCall++];
-        backendApi.fetchTableData = async () => {
-            throw new Error('fetchTableData should not run in this test');
-        };
+        // A cache miss legitimately issues the data query in parallel with the
+        // count; neither load's result is committed here (the first is
+        // superseded, the second fails on its count), so plain rows suffice.
+        backendApi.fetchTableData = async () => ({ rows: [] });
         state.selectedTable = 'items';
         state.selectedTableType = 'table';
         state.renderedTable = null;

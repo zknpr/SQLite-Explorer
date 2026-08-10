@@ -11,6 +11,8 @@ import { ModificationTracker } from '../../src/core/undo-history';
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
 import { NativeWorkerProcess } from '../../src/nativeWorker';
 import type { DatabaseOperations, LabeledModification, ModificationEntry } from '../../src/core/types';
+import { serializeOperations } from '../../src/core/operation-serializer';
+import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
 
 const databaseModelPath = path.resolve(__dirname, '../../src/databaseModel.ts');
 const databaseModelSource = fs.readFileSync(databaseModelPath, 'utf8');
@@ -291,6 +293,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             autoCommitEnabled?: boolean;
             outputChannel?: { appendLine(message: string): void };
             initialReadOnly?: boolean;
+            initialStorage?: 'memory' | 'paged';
         } = {}
     ) => {
         const mockViewerProvider = {
@@ -298,15 +301,24 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             isVerified: true,
             context: { extensionUri: createFileUri('/ext') },
             forceReadOnly: options.forceReadOnly ?? false,
-            outputChannel: options.outputChannel
+            outputChannel: options.outputChannel,
+            webviews: { get: () => [] }
         };
+
+        // Production DatabaseOperations always includes ping. Supply the
+        // no-op barrier for focused persistence doubles that omit it.
+        dbOps.ping ??= async () => true;
 
         return new (DatabaseDocument as any)(
             mockViewerProvider,
             uri,
             null, // tracker
             options.autoCommitEnabled ?? false,
-            { databaseOps: dbOps, isReadOnly: options.initialReadOnly ?? false },
+            {
+                databaseOps: dbOps,
+                isReadOnly: options.initialReadOnly ?? false,
+                storage: options.initialStorage
+            },
             { [Symbol.dispose]: () => {} }, // workerMethods
             establishConnection,
             {} // reporter
@@ -339,6 +351,642 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         );
         assert.strictEqual(serializeCalled, false, 'serializeDatabase must not run when cancelled');
         assert.strictEqual(writeToFileCalled, false, 'writeToFile must not run when cancelled');
+    });
+
+    it('save: refuses a paged non-file provider before stat, serialization, or write', async () => {
+        const sourceUri = createUri('vscode-vfs', '/github/user/repo/paged.db');
+        let writeToFileCalled = false;
+        let serializeCalled = false;
+        let statCalled = false;
+        let workspaceWriteCalled = false;
+        const doc = createDocBypassingFactory(
+            {
+                engineKind: Promise.resolve('wasm'),
+                writeToFile: async () => { writeToFileCalled = true; },
+                serializeDatabase: async () => {
+                    serializeCalled = true;
+                    return new Uint8Array();
+                }
+            },
+            sourceUri,
+            async () => {},
+            { initialStorage: 'paged' }
+        );
+
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                stat: async () => {
+                    statCalled = true;
+                    return { size: 1 };
+                },
+                writeFile: async () => { workspaceWriteCalled = true; }
+            } as any,
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            await assert.rejects(
+                () => doc.save(),
+                (error: Error) => {
+                    assert.match(error.message, /non-file providers.*required streaming path/i);
+                    assert.match(error.message, /save locally, then copy the file/i);
+                    return true;
+                }
+            );
+            assert.strictEqual(statCalled, false);
+            assert.strictEqual(writeToFileCalled, false);
+            assert.strictEqual(serializeCalled, false);
+            assert.strictEqual(workspaceWriteCalled, false);
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+
+    it('save: freezes mutations, writes the paged base, then reopens before completing', async () => {
+        const events: string[] = [];
+        const replacementOps = { engineKind: Promise.resolve('wasm') };
+        let doc: any;
+        const pagedOps = {
+            engineKind: Promise.resolve('wasm'),
+            writeToFile: async (filePath: string) => {
+                events.push('write');
+                assert.strictEqual(filePath, '/test/paged.db');
+                assert.strictEqual(doc.connectionGeneration, 1);
+                assert.strictEqual(doc.isReadOnlyMode, true, 'new mutations must be gated during replace');
+                return { requiresReopen: true };
+            },
+            serializeDatabase: async () => {
+                throw new Error('paged save must not fall back to a second merged export');
+            }
+        };
+        doc = createDocBypassingFactory(
+            pagedOps,
+            createFileUri('/test/paged.db'),
+            async () => {
+                events.push('reopen');
+                return { databaseOps: replacementOps, isReadOnly: false, storage: 'paged' };
+            },
+            { initialStorage: 'paged' }
+        );
+
+        await doc.save();
+
+        assert.deepStrictEqual(events, ['write', 'reopen']);
+        assert.strictEqual(doc.databaseOperations, replacementOps);
+        assert.strictEqual(doc.isReadOnlyMode, false);
+        assert.strictEqual(doc.connectionGeneration, 1);
+    });
+
+    it('save: drains a deferred atomic batch before advancing the connection generation', async () => {
+        const mutationStarted = createDeferred<void>();
+        const finishMutation = createDeferred<void>();
+        const events: string[] = [];
+        let liveValue = 'before';
+        let savedValue = 'before';
+        const rawOps = {
+            engineKind: Promise.resolve('wasm' as const),
+            updateCellBatch: async () => {
+                events.push('mutation-start');
+                mutationStarted.resolve();
+                await finishMutation.promise;
+                liveValue = 'after';
+                events.push('mutation-finish');
+                return [{
+                    rowId: 1,
+                    columnName: 'value',
+                    priorValue: 'before',
+                    newValue: 'after',
+                    operation: 'set' as const
+                }];
+            },
+            ping: async () => {
+                events.push('drain');
+                return true;
+            },
+            writeToFile: async () => {
+                events.push('write');
+                savedValue = liveValue;
+                return { requiresReopen: true };
+            }
+        };
+        const replacementOps = {
+            engineKind: Promise.resolve('wasm' as const),
+            ping: async () => true
+        };
+        const contentChanges: unknown[] = [];
+        const doc = createDocBypassingFactory(
+            serializeOperations(rawOps as any),
+            createFileUri('/test/paged-deferred-edit.db'),
+            async () => ({ databaseOps: replacementOps, isReadOnly: false, storage: 'paged' }),
+            { initialStorage: 'paged' }
+        );
+        doc.onDidChangeContent((event: unknown) => contentChanges.push(event));
+
+        const editPromise = doc.hostBridge.updateCellBatch(
+            'keyed',
+            [{ rowId: 1, column: 'value', value: 'after' }],
+            'Deferred batch'
+        );
+        await mutationStarted.promise;
+        const savePromise = doc.save();
+        await new Promise(resolve => setImmediate(resolve));
+        assert.strictEqual(
+            doc.isReadOnlyMode,
+            false,
+            'the connection generation must remain valid while the tracked mutation drains'
+        );
+        await assert.rejects(
+            doc.runTrackedMutation(async () => 'late mutation'),
+            /temporarily read-only.*save is in progress/i
+        );
+        finishMutation.resolve();
+
+        await editPromise;
+        await savePromise;
+
+        assert.strictEqual(savedValue, 'after');
+        assert.deepStrictEqual(events, ['mutation-start', 'mutation-finish', 'drain', 'write']);
+        assert.strictEqual(doc.databaseOperations, replacementOps);
+        assert.strictEqual((await doc.getDesktopTestState()).dirty, false);
+        assert.strictEqual(contentChanges.length, 1, 'the saved edit must remain represented in history');
+    });
+
+    it('save: rejects undo for the whole paged replacement window', async () => {
+        const writeStarted = createDeferred<void>();
+        const finishWrite = createDeferred<void>();
+        let undoCalls = 0;
+        const replacementOps = {
+            engineKind: Promise.resolve('wasm' as const),
+            ping: async () => true
+        };
+        const doc = createDocBypassingFactory(
+            {
+                engineKind: Promise.resolve('wasm' as const),
+                ping: async () => true,
+                writeToFile: async () => {
+                    writeStarted.resolve();
+                    await finishWrite.promise;
+                    return { requiresReopen: true };
+                },
+                undoModification: async () => { undoCalls++; }
+            },
+            createFileUri('/test/paged-undo-gate.db'),
+            async () => ({ databaseOps: replacementOps, isReadOnly: false, storage: 'paged' }),
+            { initialStorage: 'paged' }
+        );
+        let undo: (() => Promise<void>) | undefined;
+        doc.onDidChange((event: { undo(): Promise<void> }) => { undo = event.undo; });
+        doc.recordModification({
+            label: 'Update before save',
+            description: 'Update keyed.value',
+            modificationType: 'cell_update',
+            targetTable: 'keyed',
+            targetRowId: 1,
+            targetColumn: 'value',
+            priorValue: 'before',
+            newValue: 'after'
+        });
+
+        const savePromise = doc.save();
+        await writeStarted.promise;
+        await assert.rejects(undo!(), /temporarily read-only.*save is in progress/i);
+        assert.strictEqual(undoCalls, 0);
+
+        finishWrite.resolve();
+        await savePromise;
+        assert.strictEqual((await doc.getDesktopTestState()).dirty, false);
+    });
+
+    it('save: a concurrent paged save cannot thaw the active save owner', async () => {
+        const writeStarted = createDeferred<void>();
+        const finishWrite = createDeferred<void>();
+        let writeCalls = 0;
+        const replacementOps = {
+            engineKind: Promise.resolve('wasm' as const),
+            ping: async () => true
+        };
+        const doc = createDocBypassingFactory(
+            {
+                engineKind: Promise.resolve('wasm' as const),
+                ping: async () => true,
+                writeToFile: async () => {
+                    writeCalls++;
+                    writeStarted.resolve();
+                    await finishWrite.promise;
+                    return { requiresReopen: true };
+                }
+            },
+            createFileUri('/test/paged-concurrent-save.db'),
+            async () => ({ databaseOps: replacementOps, isReadOnly: false, storage: 'paged' }),
+            { initialStorage: 'paged' }
+        );
+
+        const firstSave = doc.save();
+        await writeStarted.promise;
+        await assert.rejects(doc.save(), /document is read-only|save is already in progress/i);
+        assert.strictEqual(doc.isReadOnlyMode, true);
+        assert.strictEqual(writeCalls, 1);
+
+        finishWrite.resolve();
+        await firstSave;
+        assert.strictEqual(doc.isReadOnlyMode, false);
+    });
+
+    it('save: always reconnects after a successful same-path paged write', async () => {
+        const events: string[] = [];
+        let serializeCalled = false;
+        const replacementOps = { engineKind: Promise.resolve('wasm') };
+        const pagedOps = {
+            engineKind: Promise.resolve('wasm'),
+            writeToFile: async () => {
+                events.push('write');
+                // Same-path save owns the active base regardless of metadata.
+                return { requiresReopen: false };
+            },
+            serializeDatabase: async () => {
+                serializeCalled = true;
+                return new Uint8Array();
+            }
+        };
+        const doc = createDocBypassingFactory(
+            pagedOps,
+            createFileUri('/test/paged-no-reopen.db'),
+            async () => {
+                events.push('reopen');
+                return { databaseOps: replacementOps, isReadOnly: false, storage: 'paged' };
+            },
+            { initialStorage: 'paged' }
+        );
+
+        await doc.save();
+
+        assert.strictEqual(serializeCalled, false);
+        assert.deepStrictEqual(events, ['write', 'reopen']);
+        assert.strictEqual(doc.databaseOperations, replacementOps);
+        assert.strictEqual(doc.isReadOnlyMode, false);
+        assert.strictEqual(doc.connectionGeneration, 1);
+    });
+
+    it('save: surfaces a paged mid-transaction refusal without buffer fallback', async () => {
+        const midEditError = new Error(
+            'Cannot save while a database transaction is open; retry after the edit completes.'
+        );
+        let serializeCalled = false;
+        let reconnectCalled = false;
+        const doc = createDocBypassingFactory(
+            {
+                engineKind: Promise.resolve('wasm'),
+                writeToFile: async () => { throw midEditError; },
+                serializeDatabase: async () => {
+                    serializeCalled = true;
+                    return new Uint8Array();
+                }
+            },
+            createFileUri('/test/paged-mid-edit.db'),
+            async () => {
+                reconnectCalled = true;
+                throw new Error('must not reconnect when no rename occurred');
+            },
+            { initialStorage: 'paged' }
+        );
+
+        await assert.rejects(doc.save(), midEditError);
+
+        assert.strictEqual(serializeCalled, false);
+        assert.strictEqual(reconnectCalled, false);
+        assert.strictEqual(doc.isReadOnlyMode, false, 'failed export must leave the overlay editable');
+        assert.strictEqual(doc.connectionGeneration, 1, 'in-flight pre-save mutations remain invalidated');
+    });
+
+    it('save: preserves the dirty paged overlay after a base-generation TOCTOU failure', async () => {
+        const baseChangedError = new Error(
+            'The database base changed while the paged save was in progress.'
+        );
+        let serializeCalled = false;
+        let reconnectCalled = false;
+        const pagedOps = {
+            engineKind: Promise.resolve('wasm'),
+            writeToFile: async () => { throw baseChangedError; },
+            serializeDatabase: async () => {
+                serializeCalled = true;
+                return new Uint8Array();
+            }
+        };
+        const doc = createDocBypassingFactory(
+            pagedOps,
+            createFileUri('/test/paged-base-changed.db'),
+            async () => {
+                reconnectCalled = true;
+                throw new Error('must not reconnect when the active base was not replaced');
+            },
+            { initialStorage: 'paged' }
+        );
+        doc.recordModification({
+            label: 'Unsaved paged update',
+            description: 'Update items.value',
+            modificationType: 'cell_update',
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'value',
+            priorValue: 'before',
+            newValue: 'after'
+        });
+
+        await assert.rejects(doc.save(), baseChangedError);
+
+        const state = await doc.getDesktopTestState();
+        assert.strictEqual(serializeCalled, false, 'TOCTOU refusal must not materialize a fallback image');
+        assert.strictEqual(reconnectCalled, false, 'an unchanged target must not reconnect');
+        assert.strictEqual(doc.databaseOperations, pagedOps, 'the original overlay engine must remain active');
+        assert.strictEqual(state.storage, 'paged');
+        assert.strictEqual(state.dirty, true, 'the rejected save must not checkpoint overlay edits');
+        assert.strictEqual(state.readOnly, false, 'the original overlay must become editable again');
+        assert.strictEqual(doc.connectionGeneration, 1, 'in-flight pre-save mutations remain invalidated');
+    });
+
+    for (const operation of ['save', 'saveAs'] as const) {
+        it(`${operation}: cancellation aborts a paged write and releases the mutation barrier`, async () => {
+            const writerStarted = createDeferred<void>();
+            const releaseWriter = createDeferred<void>();
+            let receivedSignal: AbortSignal | undefined;
+            let reconnectCalls = 0;
+            let cancellationListener: (() => void) | undefined;
+            let cancelled = false;
+            const token = {
+                get isCancellationRequested() { return cancelled; },
+                onCancellationRequested(listener: () => void) {
+                    cancellationListener = listener;
+                    return { dispose() { cancellationListener = undefined; } };
+                }
+            } as any;
+            const pagedOps = {
+                engineKind: Promise.resolve('wasm' as const),
+                ping: async () => true,
+                writeToFile: async (_filePath: string, signal?: AbortSignal) => {
+                    receivedSignal = signal;
+                    writerStarted.resolve();
+                    await releaseWriter.promise;
+                    signal?.throwIfAborted();
+                    return { requiresReopen: operation === 'save' };
+                },
+                serializeDatabase: async () => {
+                    throw new Error('cancelled paged save must not use a whole-image fallback');
+                }
+            };
+            const doc = createDocBypassingFactory(
+                pagedOps,
+                createFileUri('/test/paged-cancel.db'),
+                async () => {
+                    reconnectCalls++;
+                    return {
+                        databaseOps: { engineKind: Promise.resolve('wasm' as const) },
+                        isReadOnly: false,
+                        storage: 'paged'
+                    };
+                },
+                { initialStorage: 'paged' }
+            );
+            doc.recordModification({
+                label: 'Unsaved paged update',
+                description: 'Update items.value',
+                modificationType: 'cell_update',
+                targetTable: 'items',
+                targetRowId: 1,
+                targetColumn: 'value',
+                priorValue: 'before',
+                newValue: 'after'
+            });
+
+            const pending = operation === 'save'
+                ? doc.save(token)
+                : doc.saveAs(createFileUri('/test/paged-cancel-copy.db'), token);
+            await writerStarted.promise;
+            cancelled = true;
+            cancellationListener?.();
+            releaseWriter.resolve();
+
+            await assert.rejects(
+                pending,
+                (error: Error) => error.name === 'Canceled'
+            );
+            assert.strictEqual(receivedSignal?.aborted, true);
+            assert.strictEqual(reconnectCalls, 0);
+            assert.strictEqual(doc.databaseOperations, pagedOps);
+            const state = await doc.getDesktopTestState();
+            assert.strictEqual(state.storage, 'paged');
+            assert.strictEqual(state.dirty, true);
+            assert.strictEqual(state.readOnly, false);
+            assert.strictEqual(
+                await doc.runTrackedMutation(async () => 'mutation admitted'),
+                'mutation admitted'
+            );
+        });
+    }
+
+    for (const operation of ['save', 'saveAs'] as const) {
+        it(`${operation}: Reload recovers a paged session after rename succeeds but reconnect fails`, async () => {
+            const replacementOps = {
+                engineKind: Promise.resolve('wasm' as const),
+                ping: async () => true
+            };
+            let reconnectCalls = 0;
+            const doc = createDocBypassingFactory(
+                {
+                    engineKind: Promise.resolve('wasm' as const),
+                    ping: async () => true,
+                    writeToFile: async () => ({ requiresReopen: true }),
+                    serializeDatabase: async () => {
+                        throw new Error('paged recovery must not materialize a fallback image');
+                    }
+                },
+                createFileUri('/test/paged-recovery.db'),
+                async () => {
+                    reconnectCalls++;
+                    if (reconnectCalls === 1) {
+                        throw new Error('synthetic post-rename reconnect failure');
+                    }
+                    return { databaseOps: replacementOps, isReadOnly: false, storage: 'paged' };
+                },
+                { initialStorage: 'paged' }
+            );
+
+            const save = operation === 'save'
+                ? () => doc.save()
+                : () => doc.saveAs(createFileUri('/test/paged-recovery-alias.db'), undefined);
+            await assert.rejects(save, /database was saved.*reload the document/i);
+            await assert.rejects(
+                doc.runTrackedMutation(async () => 'ordinary mutation'),
+                /temporarily read-only.*save is in progress/i
+            );
+
+            const refreshed = await doc.hostBridge.refreshFile();
+            assert.strictEqual(refreshed.connected, true);
+            assert.strictEqual(doc.databaseOperations, replacementOps);
+            assert.strictEqual(doc.isReadOnlyMode, false);
+            assert.strictEqual(
+                await doc.runTrackedMutation(async () => 'mutations restored'),
+                'mutations restored'
+            );
+            assert.strictEqual(reconnectCalls, 2);
+        });
+    }
+
+    it('saveAs: writes a paged merged image directly without reopening the base', async () => {
+        let writtenPath: string | undefined;
+        let serializeCalled = false;
+        let reconnectCalled = false;
+        const doc = createDocBypassingFactory(
+            {
+                engineKind: Promise.resolve('wasm'),
+                writeToFile: async (filePath: string) => {
+                    assert.strictEqual(doc.isReadOnlyMode, true);
+                    assert.strictEqual(doc.connectionGeneration, 1);
+                    writtenPath = filePath;
+                    return { requiresReopen: false };
+                },
+                serializeDatabase: async () => {
+                    serializeCalled = true;
+                    throw new Error('paged Save As must not export twice');
+                }
+            },
+            createFileUri('/test/paged.db'),
+            async () => {
+                reconnectCalled = true;
+                throw new Error('Save As must not replace the active base');
+            },
+            { initialStorage: 'paged' }
+        );
+
+        await doc.saveAs(createFileUri('/test/paged-copy.db'), undefined);
+
+        assert.strictEqual(writtenPath, '/test/paged-copy.db');
+        assert.strictEqual(serializeCalled, false);
+        assert.strictEqual(reconnectCalled, false);
+        assert.strictEqual(doc.isReadOnlyMode, false);
+        assert.strictEqual(doc.connectionGeneration, 1);
+    });
+
+    it('saveAs: reopens when the target resolves to the active paged base', async () => {
+        const events: string[] = [];
+        const replacementOps = { engineKind: Promise.resolve('wasm') };
+        let doc: any;
+        doc = createDocBypassingFactory(
+            {
+                engineKind: Promise.resolve('wasm'),
+                writeToFile: async () => {
+                    events.push('write');
+                    assert.strictEqual(doc.isReadOnlyMode, true);
+                    return { requiresReopen: true };
+                },
+                serializeDatabase: async () => {
+                    throw new Error('paged Save As must not export twice');
+                }
+            },
+            createFileUri('/test/paged.db'),
+            async () => {
+                events.push('reopen');
+                return { databaseOps: replacementOps, isReadOnly: false, storage: 'paged' };
+            },
+            { initialStorage: 'paged' }
+        );
+
+        await doc.saveAs(createFileUri('/test/paged-alias.db'), undefined);
+
+        assert.deepStrictEqual(events, ['write', 'reopen']);
+        assert.strictEqual(doc.databaseOperations, replacementOps);
+        assert.strictEqual(doc.isReadOnlyMode, false);
+        assert.strictEqual(doc.connectionGeneration, 1);
+    });
+
+    it('saveAs: surfaces a paged mid-transaction refusal without buffer fallback', async () => {
+        const midEditError = new Error(
+            'Cannot save while a database transaction is open; retry after the edit completes.'
+        );
+        let serializeCalled = false;
+        const doc = createDocBypassingFactory(
+            {
+                engineKind: Promise.resolve('wasm'),
+                writeToFile: async () => { throw midEditError; },
+                serializeDatabase: async () => {
+                    serializeCalled = true;
+                    return new Uint8Array();
+                }
+            },
+            createFileUri('/test/paged.db'),
+            async () => {},
+            { initialStorage: 'paged' }
+        );
+
+        await assert.rejects(
+            doc.saveAs(createFileUri('/test/paged-copy.db'), undefined),
+            midEditError
+        );
+        assert.strictEqual(serializeCalled, false);
+        assert.strictEqual(doc.isReadOnlyMode, false);
+        assert.strictEqual(doc.connectionGeneration, 1);
+    });
+
+    it('saveAs: refuses a paged non-file target before stat, serialization, or write', async () => {
+        const targetUri = createUri('vscode-vfs', '/github/user/repo/paged-copy.db');
+        let writeToFileCalled = false;
+        let serializeCalled = false;
+        let statCalled = false;
+        let workspaceWriteCalled = false;
+        const doc = createDocBypassingFactory(
+            {
+                engineKind: Promise.resolve('wasm'),
+                writeToFile: async () => { writeToFileCalled = true; },
+                serializeDatabase: async () => {
+                    serializeCalled = true;
+                    return new Uint8Array();
+                }
+            },
+            createFileUri('/test/paged.db'),
+            async () => {},
+            { initialStorage: 'paged' }
+        );
+
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                stat: async () => {
+                    statCalled = true;
+                    return { size: 1 };
+                },
+                writeFile: async () => { workspaceWriteCalled = true; }
+            } as any,
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            await assert.rejects(
+                () => doc.saveAs(targetUri, undefined),
+                (error: Error) => {
+                    assert.match(error.message, /non-file providers.*required streaming path/i);
+                    assert.match(error.message, /save locally, then copy the file/i);
+                    return true;
+                }
+            );
+            assert.strictEqual(statCalled, false);
+            assert.strictEqual(writeToFileCalled, false);
+            assert.strictEqual(serializeCalled, false);
+            assert.strictEqual(workspaceWriteCalled, false);
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
     });
 
     it('saveAs: falls back to buffer transfer when writeToFile fails for file URI', async () => {
@@ -847,6 +1495,295 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             { modification, direction: 'undo' },
             { modification, direction: 'forward' }
         ]);
+    });
+
+    it('surfaces the oversized-edit barrier while a later normal edit still undoes and redoes', async () => {
+        const undoCalls: unknown[] = [];
+        const redoCalls: unknown[] = [];
+        const dbOps = {
+            undoModification: async (entry: unknown) => { undoCalls.push(entry); },
+            redoModification: async (entry: unknown) => { redoCalls.push(entry); }
+        };
+        const doc = createDocBypassingFactory(dbOps);
+        const actions = new Map<string, { undo(): Promise<void>; redo(): Promise<void> }>();
+        doc.onDidChange((event: any) => actions.set(event.label, event));
+
+        const originalShowWarningMessage = mockVscode.window.showWarningMessage;
+        const warnings: string[] = [];
+        mockVscode.window.showWarningMessage = async (message?: string) => {
+            warnings.push(String(message));
+            return undefined;
+        };
+        try {
+            doc.recordModification({
+                label: 'Before Barrier',
+                description: 'old edit',
+                modificationType: 'cell_update'
+            });
+            doc.recordModification({
+                label: 'Replace Oversized Cell',
+                description: 'forward-only replacement',
+                modificationType: 'cell_update',
+                targetTable: 'items',
+                targetRowId: 1,
+                targetColumn: 'payload',
+                newValue: 'bounded',
+                undoPolicy: 'barrier'
+            });
+            const normal = {
+                label: 'After Barrier',
+                description: 'normal edit',
+                modificationType: 'cell_update' as const,
+                targetTable: 'items',
+                targetRowId: 2,
+                targetColumn: 'name',
+                priorValue: 'a',
+                newValue: 'b'
+            };
+            doc.recordModification(normal);
+
+            await actions.get('After Barrier')!.undo();
+            assert.deepStrictEqual(undoCalls, [normal]);
+
+            await actions.get('Replace Oversized Cell')!.undo();
+            assert.deepStrictEqual(undoCalls, [normal]);
+            assert.strictEqual(warnings.length, 1);
+            assert.match(warnings[0], /cannot be undone/i);
+            assert.match(warnings[0], /oversized cell/i);
+
+            await actions.get('After Barrier')!.redo();
+            assert.deepStrictEqual(redoCalls, [normal]);
+        } finally {
+            mockVscode.window.showWarningMessage = originalShowWarningMessage;
+        }
+    });
+
+    it('blocks backend edits at a saturated barrier segment, warns once, and resumes after Save', async () => {
+        let backendCalls = 0;
+        const dbOps = {
+            engineKind: Promise.resolve('native' as const),
+            executeQuery: async () => [],
+            updateCellBatch: async () => {
+                backendCalls++;
+                return [{
+                    rowId: 1,
+                    columnName: 'value',
+                    priorValue: 'before',
+                    newValue: 'after',
+                    operation: 'set' as const
+                }];
+            }
+        };
+        const doc = createDocBypassingFactory(dbOps);
+        const warnings: string[] = [];
+        const originalShowWarningMessage = mockVscode.window.showWarningMessage;
+        mockVscode.window.showWarningMessage = async (message?: string) => {
+            warnings.push(String(message));
+            return undefined;
+        };
+        let backupContent: Uint8Array | undefined;
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                writeFile: async (_uri: unknown, content: Uint8Array) => {
+                    backupContent = content;
+                }
+            },
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            doc.recordModification({
+                label: 'Barrier',
+                description: 'forward-only replacement',
+                modificationType: 'cell_update',
+                undoPolicy: 'barrier'
+            });
+            for (let index = 0; index < 99; index++) {
+                doc.recordModification({
+                    label: `Later ${index}`,
+                    description: `Later ${index}`,
+                    modificationType: 'cell_update'
+                });
+            }
+
+            await doc.backup(createUri('vscode-userdata', '/backups/saturated.db'), undefined);
+            assert.ok(backupContent);
+            const restored = ModificationTracker.deserialize<LabeledModification>(
+                backupContent,
+                100
+            );
+            assert.deepStrictEqual(
+                restored.getUncommittedEntries().map(entry => entry.label),
+                ['Barrier', ...Array.from({ length: 99 }, (_, index) => `Later ${index}`)]
+            );
+
+            await assert.rejects(
+                doc.hostBridge.updateCellBatch(
+                    'items',
+                    [{ rowId: 1, column: 'value', value: 'after' }],
+                    'Blocked edit'
+                ),
+                /undo history.*limit.*save.*before making more changes/i
+            );
+            assert.strictEqual(backendCalls, 0, 'the rejected edit must not reach SQLite');
+            assert.strictEqual((await doc.getDesktopTestState()).dirty, true);
+            assert.strictEqual(warnings.length, 1);
+            assert.match(warnings[0], /undo history.*limit/i);
+            assert.match(warnings[0], /save.*before making more changes/i);
+
+            await doc.save();
+            await doc.hostBridge.updateCellBatch(
+                'items',
+                [{ rowId: 1, column: 'value', value: 'after' }],
+                'Allowed after Save'
+            );
+            assert.strictEqual(backendCalls, 1);
+            assert.strictEqual(warnings.length, 1, 'one saturated segment emits one warning');
+        } finally {
+            mockVscode.window.showWarningMessage = originalShowWarningMessage;
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+
+    it('admits only one concurrent backend edit when a barrier segment has one slot left', async () => {
+        let backendCalls = 0;
+        const dbOps = {
+            engineKind: Promise.resolve('native' as const),
+            executeQuery: async () => [],
+            updateCellBatch: async (_table: string, updates: any[]) => {
+                backendCalls++;
+                return [{
+                    rowId: updates[0].rowId,
+                    columnName: updates[0].column,
+                    priorValue: 'before',
+                    newValue: updates[0].value,
+                    operation: 'set' as const
+                }];
+            }
+        };
+        const doc = createDocBypassingFactory(dbOps);
+        doc.recordModification({
+            label: 'Barrier',
+            description: 'forward-only replacement',
+            modificationType: 'cell_update',
+            undoPolicy: 'barrier'
+        });
+        for (let index = 0; index < 98; index++) {
+            doc.recordModification({
+                label: `Later ${index}`,
+                description: `Later ${index}`,
+                modificationType: 'cell_update'
+            });
+        }
+
+        const outcomes = await Promise.allSettled([
+            doc.hostBridge.updateCellBatch(
+                'items',
+                [{ rowId: 1, column: 'value', value: 'first' }],
+                'First contender'
+            ),
+            doc.hostBridge.updateCellBatch(
+                'items',
+                [{ rowId: 2, column: 'value', value: 'second' }],
+                'Second contender'
+            )
+        ]);
+
+        assert.strictEqual(backendCalls, 1, 'the losing admission must stop before SQLite');
+        assert.strictEqual(outcomes.filter(outcome => outcome.status === 'fulfilled').length, 1);
+        const rejection = outcomes.find(outcome => outcome.status === 'rejected');
+        assert.ok(rejection && rejection.status === 'rejected');
+        assert.match(
+            String(rejection.reason?.message ?? rejection.reason),
+            /undo history.*limit.*save.*before making more changes/i
+        );
+    });
+
+    it('refuses File Revert before an unsaved oversized-edit barrier can write a fake prior value', async () => {
+        const discardCalls: unknown[][] = [];
+        const doc = createDocBypassingFactory({
+            discardModifications: async (entries: unknown[]) => { discardCalls.push(entries); }
+        });
+        doc.recordExternalModification({
+            label: 'Replace Oversized Cell',
+            description: 'forward-only replacement',
+            modificationType: 'cell_update',
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'payload',
+            newValue: 'bounded',
+            undoPolicy: 'barrier'
+        });
+        for (let index = 0; index < 10; index++) {
+            doc.recordExternalModification({
+                label: `Later edit ${index}`,
+                description: `Later edit ${index}`,
+                modificationType: 'cell_update',
+                targetTable: 'items',
+                targetRowId: index + 2,
+                targetColumn: 'name',
+                priorValue: 'before',
+                newValue: 'after'
+            });
+        }
+
+        const originalShowWarningMessage = mockVscode.window.showWarningMessage;
+        const warnings: string[] = [];
+        mockVscode.window.showWarningMessage = async (message?: string) => {
+            warnings.push(String(message));
+            return undefined;
+        };
+        try {
+            await assert.rejects(
+                doc.revert(undefined),
+                /File Revert cannot cross an unsaved oversized-cell history barrier/
+            );
+            assert.deepStrictEqual(discardCalls, []);
+            assert.strictEqual(warnings.length, 1);
+            assert.match(warnings[0], /save the database first/i);
+            assert.match(warnings[0], /prior value was not retained/i);
+        } finally {
+            mockVscode.window.showWarningMessage = originalShowWarningMessage;
+        }
+    });
+
+    it('File Revert discards a persistent-PRAGMA barrier by reopening saved bytes', async () => {
+        let discardCalls = 0;
+        const originalOps = {
+            engineKind: Promise.resolve('wasm' as const),
+            discardModifications: async () => { discardCalls++; }
+        };
+        const replacementOps = { engineKind: Promise.resolve('wasm' as const) };
+        const doc = createDocBypassingFactory(
+            originalOps,
+            createFileUri('/test/paged-pragma-revert.db'),
+            async () => ({ databaseOps: replacementOps, isReadOnly: false, storage: 'paged' }),
+            { initialStorage: 'paged' }
+        );
+        doc.recordModification({
+            label: 'Change PRAGMA auto_vacuum',
+            description: 'Set PRAGMA auto_vacuum',
+            modificationType: 'pragma_update',
+            targetPragma: 'auto_vacuum',
+            priorValue: 0,
+            newValue: 1,
+            undoPolicy: 'barrier',
+            undoBarrierKind: 'persistent_pragma'
+        });
+        assert.strictEqual((await doc.getDesktopTestState()).dirty, true);
+
+        await doc.revert(undefined);
+
+        assert.strictEqual(discardCalls, 0);
+        assert.strictEqual(doc.databaseOperations, replacementOps);
+        assert.strictEqual((await doc.getDesktopTestState()).dirty, false);
     });
 
     it('invalidates every open view document after File Revert', async () => {
@@ -1406,19 +2343,24 @@ describe('DatabaseDocument undo/redo error handling', () => {
             loaded: true,
             exports: {
                 createDatabaseConnection: () => {
+                    const databaseOps = {
+                        engineKind: Promise.resolve('native' as const),
+                        undoModification: () => Promise.resolve(),
+                        redoModification: () => Promise.resolve(),
+                        close: () => Promise.resolve(),
+                        getSchema: () => Promise.resolve([]),
+                        query: () => Promise.resolve([])
+                    };
                     return Promise.resolve({
                         workerMethods: {
                             open: () => Promise.resolve({ isReadOnly: false, bufferInfo: {} }),
                             exec: () => Promise.resolve(),
                         },
-                        establishConnection: () => Promise.resolve({ isReadOnly: false }),
-                        databaseOps: {
-                            undoModification: () => Promise.resolve(),
-                            redoModification: () => Promise.resolve(),
-                            close: () => Promise.resolve(),
-                            getSchema: () => Promise.resolve([]),
-                            query: () => Promise.resolve([])
-                        }
+                        establishConnection: () => Promise.resolve({
+                            isReadOnly: false,
+                            databaseOps
+                        }),
+                        databaseOps
                     });
                 }
             }

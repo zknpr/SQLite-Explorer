@@ -23,6 +23,7 @@ import {
 } from './grid-actions.js';
 import { openCellPreview } from './edit.js';
 import { clearSelection } from './grid-selection.js';
+import { scheduleVirtualGridUpdate } from './grid-render.js';
 import { validateRowId } from './utils.js';
 
 export function initGridControls() {
@@ -37,10 +38,12 @@ export function initGridControls() {
     document.getElementById('pageSizeSelect')?.addEventListener('change', onPageSizeChange);
     document.getElementById('dateFormatSelect')?.addEventListener('change', onDateFormatChange);
 
-    document.getElementById('btnFirst')?.addEventListener('click', () => goToPage(0));
-    document.getElementById('btnPrev')?.addEventListener('click', () => goToPage(state.currentPageIndex - 1));
-    document.getElementById('btnNext')?.addEventListener('click', () => goToPage(state.currentPageIndex + 1));
-    document.getElementById('btnLast')?.addEventListener('click', () => goToPage(state.totalPageCount - 1));
+    // The nav intent names the page's relationship to the current anchors so
+    // loadTableData can seek (keyset) instead of scanning to OFFSET.
+    document.getElementById('btnFirst')?.addEventListener('click', () => goToPage(0, 'first'));
+    document.getElementById('btnPrev')?.addEventListener('click', () => goToPage(state.currentPageIndex - 1, 'prev'));
+    document.getElementById('btnNext')?.addEventListener('click', () => goToPage(state.currentPageIndex + 1, 'next'));
+    document.getElementById('btnLast')?.addEventListener('click', () => goToPage(state.totalPageCount - 1, 'last'));
 }
 
 export function initGridInteraction() {
@@ -56,6 +59,15 @@ export function initGridInteraction() {
     container.addEventListener('mouseover', handleMouseover);
     container.addEventListener('scroll', handleScroll, { passive: true });
     document.addEventListener('click', handleDocumentClick);
+
+    // A viewport that grows (window resize, panel toggle) can expose rows the
+    // virtualized window has not materialized, and no scroll event fires for
+    // that. Guarded: absent in the unit-test environment, where the full-render
+    // fallback applies anyway. The container element lives for the webview's
+    // lifetime, so the observer needs no disposal.
+    if (typeof ResizeObserver === 'function') {
+        new ResizeObserver(() => scheduleVirtualGridUpdate()).observe(container);
+    }
 }
 
 function handleFilterInput(event) {
@@ -274,6 +286,15 @@ function handleMouseover(event) {
 }
 
 function handleScroll(event) {
+    // Revalidate the virtualized row window on every scroll, BEFORE the reload
+    // guard below: the flicker fix keeps the old grid mounted and scrollable
+    // during a same-table refetch, and its rows must keep materializing. The
+    // window renders from state.gridData, which still holds the rows the
+    // mounted grid was built from until the load commits, so this is always
+    // coherent. (rAF-throttled and a cheap no-op when the window is valid or
+    // the page rendered fully.)
+    scheduleVirtualGridUpdate();
+
     // Ignore scroll while a load is in flight. The flicker fix keeps the grid
     // mounted and scrollable during a refetch; without this, scrolling the old
     // page during a page change (which reset scrollPosition to {0,0}) would

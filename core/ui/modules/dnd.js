@@ -4,12 +4,19 @@
 import { backendApi } from './api.js';
 import { updateStatus } from './ui.js';
 import { state } from './state.js';
-import { clearExactIntegerText, getRowId, getRowDataOffset } from './data-utils.js';
+import {
+    clearExactIntegerText,
+    clearOversizedCellMetadata,
+    getCellMutationBlockReason,
+    getRowId,
+    getRowDataOffset,
+    remapDisplayedRowIdentity,
+    resolveDisplayedCell
+} from './data-utils.js';
+import { noteCellValuesChanged } from './count-cache.js';
 import { formatCellValueAsText } from './utils.js';
 import { renderDataGrid } from './grid.js';
-
-// Maximum blob size in bytes (50MB) to prevent UI freeze during Base64 encoding
-const MAX_BLOB_SIZE_BYTES = 50 * 1024 * 1024;
+import { DEFAULT_MAX_CELL_EDIT_BYTES } from '../../../src/core/cell-edit-policy.ts';
 
 // Track upload state to prevent concurrent uploads and allow proper cleanup
 let isUploading = false;
@@ -50,7 +57,12 @@ function onDragOver(e) {
     e.dataTransfer.dropEffect = 'copy';
 
     const cell = e.target.closest('.data-cell');
-    if (cell && !cell.classList.contains('row-number')) {
+    const rowIdx = cell ? parseInt(cell.dataset.rowidx, 10) : -1;
+    const colIdx = cell ? parseInt(cell.dataset.colidx, 10) : -1;
+    const mutationBlockReason = rowIdx >= 0 && colIdx >= 0
+        ? getCellMutationBlockReason(rowIdx, colIdx, { allowOversizedReplacement: true })
+        : undefined;
+    if (cell && !cell.classList.contains('row-number') && !mutationBlockReason) {
         if (lastHighlightedCell && lastHighlightedCell !== cell) {
             lastHighlightedCell.classList.remove('drag-over');
         }
@@ -125,6 +137,15 @@ function captureUploadTarget(cell) {
 
     const rowIdx = parseInt(cell.dataset.rowidx, 10);
     const colIdx = parseInt(cell.dataset.colidx, 10);
+    const mutationBlockReason = getCellMutationBlockReason(
+        rowIdx,
+        colIdx,
+        { allowOversizedReplacement: true }
+    );
+    if (mutationBlockReason) {
+        updateStatus(mutationBlockReason);
+        return null;
+    }
     const row = state.gridData?.[rowIdx];
     const column = state.tableColumns[colIdx];
     if (!row || !column) return null;
@@ -139,9 +160,9 @@ function captureUploadTarget(cell) {
 
 async function handleFileUpload(uploadTarget, fileName, fileBlob) {
     // Early size check before reading file
-    if (fileBlob.size > MAX_BLOB_SIZE_BYTES) {
+    if (fileBlob.size > DEFAULT_MAX_CELL_EDIT_BYTES) {
         const sizeMB = (fileBlob.size / (1024 * 1024)).toFixed(1);
-        const limitMB = (MAX_BLOB_SIZE_BYTES / (1024 * 1024)).toFixed(0);
+        const limitMB = (DEFAULT_MAX_CELL_EDIT_BYTES / (1024 * 1024)).toFixed(0);
         updateStatus(`File too large (${sizeMB}MB). Maximum is ${limitMB}MB.`);
         return;
     }
@@ -188,10 +209,11 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
         return;
     }
 
-    // Check file size limit to prevent UI freeze during Base64 encoding
-    if (uint8Array.byteLength > MAX_BLOB_SIZE_BYTES) {
+    // URI reads cannot preflight a browser File, so enforce the same edit
+    // ceiling again before serialization or database mutation.
+    if (uint8Array.byteLength > DEFAULT_MAX_CELL_EDIT_BYTES) {
         const sizeMB = (uint8Array.byteLength / (1024 * 1024)).toFixed(1);
-        const limitMB = (MAX_BLOB_SIZE_BYTES / (1024 * 1024)).toFixed(0);
+        const limitMB = (DEFAULT_MAX_CELL_EDIT_BYTES / (1024 * 1024)).toFixed(0);
         updateStatus(`File too large (${sizeMB}MB). Maximum is ${limitMB}MB.`);
         return;
     }
@@ -212,30 +234,47 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
     try {
         updateStatus(`Uploading ${fileName} (${formatBytes(uint8Array.byteLength)})...`);
 
-        await backendApi.updateCell(
+        const updatedRowId = await backendApi.updateCell(
             uploadTarget.table,
             uploadTarget.rowId,
             uploadTarget.columnName,
             uint8Array,
             uploadTarget.originalValue
         );
+        // The uploaded value may enter/leave an active filter's match set,
+        // so the table's cached filtered counts can't be trusted.
+        noteCellValuesChanged(uploadTarget.table);
 
         // A background refresh may reorder rows or columns while the write is
         // in flight. Resolve the current UI position only after the stable
         // database identity has been written, and never paint another table.
         if (state.selectedTable === uploadTarget.table
             && state.selectedTableType === 'table') {
-            const currentRowIdx = state.gridData.findIndex((row, index) => (
-                getRowId(row, index) === uploadTarget.rowId
-            ));
-            const currentColIdx = state.tableColumns.findIndex(column => (
-                column.name === uploadTarget.columnName
-            ));
-            if (currentRowIdx >= 0 && currentColIdx >= 0) {
-                state.gridData[currentRowIdx][currentColIdx + getRowDataOffset()] = uint8Array;
-                clearExactIntegerText(currentRowIdx, currentColIdx);
-                const currentCell = document.getElementById(`cell-${currentRowIdx}-${currentColIdx}`);
-                if (currentCell) updateCellDom(currentCell, uint8Array);
+            const currentCell = resolveDisplayedCell(
+                uploadTarget.table,
+                uploadTarget.rowId,
+                uploadTarget.columnName
+            ) ?? (updatedRowId !== undefined
+                ? resolveDisplayedCell(
+                    uploadTarget.table,
+                    updatedRowId,
+                    uploadTarget.columnName
+                )
+                : null);
+            remapDisplayedRowIdentity(
+                uploadTarget.table,
+                uploadTarget.rowId,
+                updatedRowId,
+                currentCell
+            );
+            if (currentCell) {
+                state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = uint8Array;
+                clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
+                clearOversizedCellMetadata(currentCell.rowIdx, currentCell.colIdx);
+                const cellElement = document.getElementById(
+                    `cell-${currentCell.rowIdx}-${currentCell.colIdx}`
+                );
+                if (cellElement) updateCellDom(cellElement, uint8Array);
             }
         }
         updateStatus(`Uploaded ${fileName}`);

@@ -10,10 +10,27 @@ import {
     createNativeDatabaseConnection,
     NativeWorkerProcess
 } from '../../src/nativeWorker';
+import { cancelTokenToAbortSignal } from '../../src/core/cancellation-utils';
+import { InvocationTimeoutError } from '../../src/core/rpc';
+import {
+    CellEditPolicyError,
+    OversizedCellReplacementRequiredError
+} from '../../src/core/cell-edit-policy';
+import { streamTableExport } from '../../src/tableExporter';
+import { ModificationTracker } from '../../src/core/undo-history';
+import {
+    assertColumnDropHistoryFitsUndoBudget,
+    buildColumnDropHistorySizePreflight
+} from '../../src/core/column-drop';
+import {
+    reconcileRestoredDatabase,
+    revertDatabaseToSaved
+} from '../../src/core/restore-reconciler';
+import type { DatabaseOperations, LabeledModification, TableQueryOptions } from '../../src/core/types';
 
-const BUNDLED_TXIKI_SQLITE_VERSION = '3.50.1';
+const BUNDLED_TXIKI_SQLITE_VERSION = '3.51.2';
 const DIVERGENT_REAL_TEXT_BY_NATIVE_SQLITE_VERSION: Record<string, string> = {
-    '3.50.1': '9.6529377952985e+282'
+    '3.51.2': '9.6529377952985e+282'
 };
 
 const USER_VIEW_BODY = `SELECT
@@ -201,6 +218,193 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 externalWriter.stop();
             }
         });
+
+        const runawayQuery =
+            'WITH RECURSIVE runaway(value) AS (' +
+            'SELECT 1 UNION ALL SELECT value + 1 FROM runaway' +
+            ') SELECT max(value) AS value FROM runaway';
+        const boundedArgs = (sql: string, timeoutMs: number) => {
+            const boundary = '/*sqlite_explorer_boundary_native_interrupt_smoke*/';
+            return [
+                `${sql}\n${boundary}`,
+                sql,
+                boundary,
+                ['value'],
+                undefined,
+                10,
+                timeoutMs
+            ];
+        };
+
+        await testContext.test('interrupts a runaway bounded query at its worker deadline', async () => {
+            const timeoutMs = 100;
+            const startedAt = Date.now();
+            await assert.rejects(
+                activeRawWorker.call(
+                    'queryBounded',
+                    boundedArgs(runawayQuery, timeoutMs),
+                    timeoutMs + 2000
+                ),
+                (error: unknown) => {
+                    assert.ok(error instanceof Error);
+                    assert.strictEqual(
+                        error.message,
+                        `[queryBounded] Query execution timed out after ${timeoutMs}ms`
+                    );
+                    assert.strictEqual(error instanceof InvocationTimeoutError, false);
+                    return true;
+                }
+            );
+            assert.ok(
+                Date.now() - startedAt < 1500,
+                'the worker deadline must interrupt SQLite before the transport margin expires'
+            );
+        });
+
+        await testContext.test('interrupts a runaway bounded query from a host cancellation token', async () => {
+            let cancel: (() => void) | undefined;
+            const token = {
+                isCancellationRequested: false,
+                onCancellationRequested(callback: () => void) {
+                    cancel = callback;
+                    return { dispose() {} };
+                }
+            } as vscode.CancellationToken;
+            const signal = cancelTokenToAbortSignal(token);
+            const startedAt = Date.now();
+            const query = activeRawWorker.call(
+                'queryBounded',
+                boundedArgs(runawayQuery, 5000),
+                7000,
+                signal
+            );
+            const cancelTimer = setTimeout(() => cancel?.(), 100);
+            try {
+                await assert.rejects(query, (error: unknown) => {
+                    assert.ok(error instanceof Error);
+                    assert.strictEqual(error.name, 'AbortError');
+                    return true;
+                });
+            } finally {
+                clearTimeout(cancelTimer);
+            }
+            assert.ok(
+                Date.now() - startedAt < 1500,
+                'host cancellation must stop SQLite before the operation deadline'
+            );
+        });
+
+        await testContext.test('interrupts and cleans a native view-export spool', async () => {
+            const spool = '__sqlite_explorer_export_0123456789abcdef0123456789abcdef';
+            const spoolArgs = (sql: string, timeoutMs: number, params?: unknown[]) => {
+                const boundary = '/*sqlite_explorer_boundary_native_export_spool_smoke*/';
+                return [`${sql}\n${boundary}`, sql, boundary, params, timeoutMs];
+            };
+            const runawaySpool =
+                `CREATE TEMP TABLE "${spool}" AS SELECT value FROM (` +
+                'WITH RECURSIVE runaway(value) AS (' +
+                'SELECT 1 UNION ALL SELECT value + 1 FROM runaway WHERE value < 100000000' +
+                ') SELECT value FROM runaway)';
+            const controller = new AbortController();
+            const cancellation = new DOMException('Cancelled native export spool', 'AbortError');
+            const startedAt = Date.now();
+            const create = activeRawWorker.call(
+                'queryExportSpool',
+                spoolArgs(runawaySpool, 5000),
+                7000,
+                controller.signal
+            );
+            const cancelTimer = setTimeout(() => controller.abort(cancellation), 100);
+            try {
+                await assert.rejects(create, error => error === cancellation);
+            } finally {
+                clearTimeout(cancelTimer);
+                const drop = `DROP TABLE IF EXISTS temp."${spool}"`;
+                await activeRawWorker.call(
+                    'queryExportSpool',
+                    spoolArgs(drop, 1000),
+                    3000
+                );
+            }
+            assert.ok(
+                Date.now() - startedAt < 1500,
+                'host cancellation must interrupt the spool inside SQLite'
+            );
+
+            const finiteCreate = `CREATE TEMP TABLE "${spool}" AS SELECT 'healthy' AS value`;
+            await activeRawWorker.call(
+                'queryExportSpool',
+                spoolArgs(finiteCreate, 1000),
+                3000
+            );
+            const read =
+                `SELECT CAST(rowid AS TEXT), * FROM "${spool}" ` +
+                'WHERE rowid > ? ORDER BY rowid LIMIT 1';
+            const healthy = await activeRawWorker.call<{ values: unknown[][] }>(
+                'queryExportSpool',
+                spoolArgs(read, 1000, [0]),
+                3000
+            );
+            assert.strictEqual(healthy.values[0]?.[1], 'healthy');
+            const finalDrop = `DROP TABLE IF EXISTS temp."${spool}"`;
+            await activeRawWorker.call(
+                'queryExportSpool',
+                spoolArgs(finalDrop, 1000),
+                3000
+            );
+        });
+
+        await testContext.test('keeps the worker and edit connection healthy after interruptions', async () => {
+            const health = await activeRawWorker.call<{ values: unknown[][] }>('query', [
+                'SELECT 6 * 7 AS value'
+            ]);
+            assert.deepStrictEqual(health.values, [[42]]);
+
+            await activeRawWorker.call('run', [
+                'CREATE TABLE native_interrupt_health (id INTEGER PRIMARY KEY, value TEXT)'
+            ]);
+            await activeRawWorker.call('run', [
+                "INSERT INTO native_interrupt_health(value) VALUES ('before')"
+            ]);
+            await activeRawWorker.call('run', [
+                "UPDATE native_interrupt_health SET value = 'after' WHERE id = 1"
+            ]);
+            const edited = await activeRawWorker.call<{ values: unknown[][] }>('query', [
+                'SELECT id, value FROM native_interrupt_health'
+            ]);
+            assert.deepStrictEqual(edited.values, [[1, 'after']]);
+        });
+
+        await testContext.test('keeps bounded reads on the sync savepoint snapshot', async () => {
+            await activeRawWorker.call('run', [
+                'CREATE TABLE native_bounded_snapshot (value INTEGER)'
+            ]);
+            await activeRawWorker.call('run', [
+                'INSERT INTO native_bounded_snapshot VALUES (1)'
+            ]);
+            await activeRawWorker.call('run', ['SAVEPOINT native_bounded_snapshot_read']);
+            try {
+                await activeRawWorker.call('run', [
+                    'INSERT INTO native_bounded_snapshot VALUES (2)'
+                ]);
+                const sql = 'SELECT count(*) AS value FROM native_bounded_snapshot';
+                const result = await activeRawWorker.call<{ values: unknown[][] }>(
+                    'queryBounded',
+                    boundedArgs(sql, 1000),
+                    3000
+                );
+                assert.deepStrictEqual(
+                    result.values,
+                    [[2]],
+                    'a second connection would miss the uncommitted row'
+                );
+            } finally {
+                await activeRawWorker.call('run', [
+                    'ROLLBACK TO native_bounded_snapshot_read'
+                ]);
+                await activeRawWorker.call('run', ['RELEASE native_bounded_snapshot_read']);
+            }
+        });
         activeRawWorker.stop();
         rawWorker = undefined;
 
@@ -210,6 +414,242 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             'native-smoke.sqlite'
         );
         const engine = connection.databaseOps;
+
+        await testContext.test('rejects direct applyModifications replay on the native backend', async () => {
+            await assert.rejects(
+                engine.applyModifications([]),
+                /applyModifications is not supported on the native backend; history replay uses redoModification/
+            );
+        });
+
+        await testContext.test('runs column-drop metadata preflight on native SQLite', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_column_drop_preflight (' +
+                'tenant TEXT, sequence BLOB, payload TEXT, ' +
+                'PRIMARY KEY (tenant, sequence)) WITHOUT ROWID; ' +
+                "INSERT INTO native_column_drop_preflight VALUES " +
+                "('north', X'0102', char(0) || 'quoted\"'), ('south', X'0304', 'plain')"
+            );
+            const preflight = buildColumnDropHistorySizePreflight(
+                'native_column_drop_preflight',
+                ['payload'],
+                {
+                    kind: 'primaryKey',
+                    columns: [
+                        { identifier: 'tenant', declaredType: 'TEXT', position: 1 },
+                        { identifier: 'sequence', declaredType: 'BLOB', position: 2 }
+                    ]
+                }
+            );
+            const resultRows: Array<readonly unknown[] | undefined> = [];
+            for (const query of preflight.queries) {
+                const result = await engine.executeQuery(query.sql, query.params);
+                resultRows.push(result[0]?.rows[0]);
+            }
+
+            assert.ok(resultRows.every(row => row?.[0] === 2));
+            assert.doesNotThrow(() => assertColumnDropHistoryFitsUndoBudget({
+                table: 'native_column_drop_preflight',
+                droppedColumnCount: 1,
+                preflight,
+                resultRows,
+                maxSnapshotBytes: 1024 * 1024
+            }));
+        });
+
+        await testContext.test(
+            'round-trips native hot-exit history and reverts to the saved checkpoint across modification types',
+            async () => {
+                const historyPath = path.join(testDir, 'native-history-round-trip.sqlite');
+                fs.closeSync(fs.openSync(historyPath, 'w'));
+                let historyBundle:
+                    | Awaited<ReturnType<typeof createNativeDatabaseConnection>>
+                    | undefined;
+
+                const table = 'native_history_round_trip';
+                const view = 'native_history_round_trip_view';
+                const baselineJson = '{"base":1,"drop":2}';
+                const patch = '{"base":9,"added":3}';
+                const assertBaselineState = async (ops: typeof engine) => {
+                    const rows = await ops.executeQuery(
+                        `SELECT rowid, value, json_value FROM ${table} ORDER BY rowid`
+                    );
+                    assert.deepStrictEqual(rows[0].rows, [
+                        [1, 'kept', baselineJson],
+                        [2, 'delete-me', '{"row":2}']
+                    ]);
+                    const columns = await ops.executeQuery(`PRAGMA table_info(${table})`);
+                    assert.deepStrictEqual(
+                        columns[0].rows.map(row => row[1]),
+                        ['value', 'json_value']
+                    );
+                    const views = await ops.executeQuery(
+                        `SELECT name FROM sqlite_schema WHERE type = 'view' AND name = '${view}'`
+                    );
+                    assert.deepStrictEqual(views[0].rows, []);
+                };
+                const assertSavedState = async (ops: typeof engine) => {
+                    const rows = await ops.executeQuery(
+                        `SELECT rowid, value, json_value, history_extra FROM ${table} ORDER BY rowid`
+                    );
+                    assert.strictEqual(rows[0].rows.length, 2);
+                    assert.deepStrictEqual(rows[0].rows[0].slice(0, 2), [1, 'edited']);
+                    assert.deepStrictEqual(
+                        JSON.parse(rows[0].rows[0][2] as string),
+                        { base: 9, drop: 2, added: 3 }
+                    );
+                    assert.strictEqual(rows[0].rows[0][3], 'history-default');
+                    assert.deepStrictEqual(rows[0].rows[1], [
+                        3,
+                        'inserted',
+                        '{}',
+                        'history-default'
+                    ]);
+                    const viewRows = await ops.executeQuery(
+                        `SELECT rowid, value FROM ${view} ORDER BY rowid`
+                    );
+                    assert.deepStrictEqual(viewRows[0].rows, [
+                        [1, 'edited'],
+                        [3, 'inserted']
+                    ]);
+                };
+
+                try {
+                    historyBundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
+                    let historyConnection = await historyBundle.establishConnection(
+                        vscode.Uri.file(historyPath),
+                        'native-history-round-trip.sqlite'
+                    );
+                    let historyEngine = historyConnection.databaseOps;
+                    await historyEngine.executeQuery(
+                        `CREATE TABLE ${table} (value TEXT, json_value TEXT); ` +
+                        `INSERT INTO ${table}(rowid, value, json_value) VALUES ` +
+                        `(1, 'kept', '${baselineJson}'), ` +
+                        `(2, 'delete-me', '{"row":2}')`
+                    );
+
+                    const tracker = new ModificationTracker<LabeledModification>();
+                    const modifications: LabeledModification[] = [];
+                    const record = (entry: LabeledModification) => {
+                        modifications.push(entry);
+                        tracker.record(entry);
+                    };
+
+                    await historyEngine.updateCell(table, 1, 'value', 'edited');
+                    record({
+                        label: 'Set native cell',
+                        description: 'Set native cell',
+                        modificationType: 'cell_update',
+                        targetTable: table,
+                        targetRowId: 1,
+                        targetColumn: 'value',
+                        priorValue: 'kept',
+                        newValue: 'edited',
+                        operation: 'set'
+                    });
+
+                    await historyEngine.updateCell(table, 1, 'json_value', null, patch);
+                    record({
+                        label: 'Patch native JSON cell',
+                        description: 'Patch native JSON cell',
+                        modificationType: 'cell_update',
+                        targetTable: table,
+                        targetRowId: 1,
+                        targetColumn: 'json_value',
+                        priorValue: baselineJson,
+                        newValue: patch,
+                        operation: 'json_patch'
+                    });
+
+                    const insertedRowId = await historyEngine.insertRow(table, {
+                        value: 'inserted',
+                        json_value: '{}'
+                    });
+                    assert.strictEqual(insertedRowId, 3);
+                    record({
+                        label: 'Insert native row',
+                        description: 'Insert native row',
+                        modificationType: 'row_insert',
+                        targetTable: table,
+                        targetRowId: insertedRowId,
+                        rowData: { value: 'inserted', json_value: '{}' }
+                    });
+
+                    const deletedRows = await historyEngine.deleteRows(table, [2]);
+                    assert.ok(deletedRows);
+                    record({
+                        label: 'Delete native row',
+                        description: 'Delete native row',
+                        modificationType: 'row_delete',
+                        targetTable: table,
+                        affectedRowIds: [2],
+                        deletedRows
+                    });
+
+                    await historyEngine.addColumn(
+                        table,
+                        'history_extra',
+                        'TEXT',
+                        'history-default'
+                    );
+                    record({
+                        label: 'Add native column',
+                        description: 'Add native column',
+                        modificationType: 'column_add',
+                        targetTable: table,
+                        targetColumn: 'history_extra',
+                        columnDef: { type: 'TEXT', defaultValue: 'history-default' }
+                    });
+
+                    const viewDefinition = await historyEngine.createView(
+                        view,
+                        `SELECT rowid, value FROM ${table}`
+                    );
+                    record({
+                        label: 'Create native view',
+                        description: 'Create native view',
+                        modificationType: 'view_create',
+                        targetTable: view,
+                        viewDefAfter: viewDefinition
+                    });
+
+                    await assertSavedState(historyEngine);
+                    await tracker.createCheckpoint();
+                    for (let index = modifications.length - 1; index >= 0; index--) {
+                        const entry = tracker.stepBack();
+                        assert.strictEqual(entry, modifications[index]);
+                        await historyEngine.undoModification(entry!);
+                    }
+                    await assertBaselineState(historyEngine);
+
+                    const backup = tracker.serialize();
+                    historyBundle.workerMethods[Symbol.dispose]();
+                    historyBundle = undefined;
+
+                    historyBundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
+                    historyConnection = await historyBundle.establishConnection(
+                        vscode.Uri.file(historyPath),
+                        'native-history-round-trip.sqlite'
+                    );
+                    historyEngine = historyConnection.databaseOps;
+                    const restoredTracker = ModificationTracker.deserialize<LabeledModification>(backup);
+
+                    await reconcileRestoredDatabase(
+                        historyEngine,
+                        restoredTracker,
+                        'native'
+                    );
+                    await assertBaselineState(historyEngine);
+                    assert.strictEqual(restoredTracker.canStepForward, true);
+
+                    await revertDatabaseToSaved(historyEngine, restoredTracker);
+                    await assertSavedState(historyEngine);
+                    assert.strictEqual(restoredTracker.hasUncommittedChanges(), false);
+                } finally {
+                    historyBundle?.workerMethods[Symbol.dispose]();
+                }
+            }
+        );
 
         await engine.executeQuery(
             'CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT)'
@@ -223,8 +663,9 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
 
         await testContext.test('carries exact unsafe INTEGER text through native table fetches', async () => {
             await engine.executeQuery(
-                'CREATE TABLE native_unsafe_integers (value INTEGER); ' +
-                'INSERT INTO native_unsafe_integers(value) VALUES (9007199254740993)'
+                'CREATE TABLE native_unsafe_integers (value); ' +
+                'INSERT INTO native_unsafe_integers(value) VALUES ' +
+                '(9007199254740993), (9223372036854775807), (-9223372036854775808)'
             );
             const result = await engine.fetchTableData('native_unsafe_integers', {
                 columns: ['value'],
@@ -236,6 +677,539 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
 
             assert.strictEqual(result.rows[0][0], 9007199254740992);
             assert.strictEqual(result.exactIntegerTexts?.[0]?.[0], '9007199254740993');
+
+            const collect = async (format: 'csv' | 'excel' | 'json' | 'sql') => {
+                const chunks: string[] = [];
+                await streamTableExport(
+                    engine,
+                    'native_unsafe_integers',
+                    ['value'],
+                    { format },
+                    { write: async chunk => { chunks.push(chunk); } }
+                );
+                return chunks.join('');
+            };
+            const decimalLines =
+                '9007199254740993\n' +
+                '9223372036854775807\n' +
+                '-9223372036854775808';
+            assert.strictEqual(await collect('csv'), `value\n${decimalLines}`);
+            assert.strictEqual(await collect('excel'), `\uFEFFvalue\n${decimalLines}`);
+            assert.strictEqual(
+                await collect('json'),
+                '[\n' +
+                '  {\n    "value": 9007199254740993\n  },\n' +
+                '  {\n    "value": 9223372036854775807\n  },\n' +
+                '  {\n    "value": -9223372036854775808\n  }\n' +
+                ']'
+            );
+            const sql = await collect('sql');
+            assert.strictEqual(
+                sql,
+                'INSERT INTO "native_unsafe_integers" ("value") VALUES (9007199254740993);\n' +
+                'INSERT INTO "native_unsafe_integers" ("value") VALUES (9223372036854775807);\n' +
+                'INSERT INTO "native_unsafe_integers" ("value") VALUES (-9223372036854775808);'
+            );
+            await engine.executeQuery('CREATE TABLE native_unsafe_integer_copy (value)');
+            await engine.executeQuery(
+                sql.replaceAll('"native_unsafe_integers"', '"native_unsafe_integer_copy"')
+            );
+            const restored = await engine.executeQuery(
+                'SELECT typeof(value), CAST(value AS TEXT) ' +
+                'FROM native_unsafe_integer_copy ORDER BY rowid'
+            );
+            assert.deepStrictEqual(restored[0].rows, [
+                ['integer', '9007199254740993'],
+                ['integer', '9223372036854775807'],
+                ['integer', '-9223372036854775808']
+            ]);
+        });
+
+        await testContext.test('matches WASM/demo bounded TEXT and BLOB grid previews', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_contained_cells (text_value TEXT, blob_value BLOB); ' +
+                "INSERT INTO native_contained_cells VALUES ('😀😀😀', x'000102030405060708090a0b'); " +
+                "INSERT INTO native_contained_cells VALUES ('ok', x'0102')"
+            );
+            const page = await engine.fetchTableData('native_contained_cells', {
+                columns: ['rowid', 'text_value', 'blob_value'],
+                orderBy: 'rowid',
+                limit: 2,
+                offset: 0,
+                maxInlineCellBytes: 8,
+                maxPageResponseBytes: 64
+            });
+
+            assert.deepStrictEqual(page.rows[0], [
+                1,
+                '😀😀',
+                Uint8Array.from([0, 1, 2, 3, 4, 5, 6, 7])
+            ]);
+            assert.deepStrictEqual(page.rows[1], [2, 'ok', Uint8Array.from([1, 2])]);
+            assert.deepStrictEqual(page.oversizedCells, {
+                0: {
+                    1: { storageClass: 'text', byteLength: 12 },
+                    2: { storageClass: 'blob', byteLength: 12 }
+                }
+            });
+
+            const small = await engine.fetchTableData('native_contained_cells', {
+                columns: ['rowid', 'text_value', 'blob_value'],
+                filters: [{ column: 'text_value', value: 'ok' }],
+                limit: 1,
+                offset: 0,
+                maxInlineCellBytes: 8,
+                maxPageResponseBytes: 64
+            });
+            assert.deepStrictEqual(small.rows, [[2, 'ok', Uint8Array.from([1, 2])]]);
+            assert.strictEqual(small.oversizedCells, undefined);
+        });
+
+        await testContext.test('clips aggregate BLOB previews before native worker transport', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_predecode_page_bound (a BLOB, b BLOB, c BLOB, d BLOB); ' +
+                'INSERT INTO native_predecode_page_bound VALUES ' +
+                '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300)), ' +
+                '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300)), ' +
+                '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300)), ' +
+                '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300))'
+            );
+            const page = await engine.fetchTableData('native_predecode_page_bound', {
+                columns: ['rowid', 'a', 'b', 'c', 'd'],
+                orderBy: 'rowid',
+                limit: 4,
+                offset: 0,
+                maxInlineCellBytes: 1024 * 1024,
+                maxPageResponseBytes: 80
+            });
+
+            assert.strictEqual(page.rows.length, 4);
+            for (let rowIndex = 0; rowIndex < page.rows.length; rowIndex++) {
+                for (let columnIndex = 1; columnIndex < 5; columnIndex++) {
+                    const value = page.rows[rowIndex][columnIndex];
+                    assert.ok(value instanceof Uint8Array);
+                    assert.strictEqual(value.byteLength, 4);
+                    assert.deepStrictEqual(page.oversizedCells?.[rowIndex]?.[columnIndex], {
+                        storageClass: 'blob',
+                        byteLength: 300
+                    });
+                }
+            }
+        });
+
+        await testContext.test('guards and replaces an oversized native cell without a prior payload read', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_stage_d (payload BLOB); ' +
+                'INSERT INTO native_stage_d(payload) VALUES (zeroblob(2048))'
+            );
+
+            await assert.rejects(
+                engine.updateCell(
+                    'native_stage_d',
+                    1,
+                    'payload',
+                    new Uint8Array(1025),
+                    undefined,
+                    1024
+                ),
+                (error: unknown) => {
+                    assert.ok(error instanceof CellEditPolicyError);
+                    assert.strictEqual(error.actualBytes, 1025);
+                    assert.strictEqual(error.limitBytes, 1024);
+                    return true;
+                }
+            );
+            await assert.rejects(
+                engine.updateCell(
+                    'native_stage_d',
+                    1,
+                    'payload',
+                    Uint8Array.from([1, 2, 3]),
+                    undefined,
+                    1024
+                ),
+                (error: unknown) => {
+                    assert.ok(error instanceof OversizedCellReplacementRequiredError);
+                    assert.strictEqual(error.storageClass, 'blob');
+                    assert.strictEqual(error.actualBytes, 2048);
+                    return true;
+                }
+            );
+
+            await engine.replaceOversizedCell(
+                'native_stage_d',
+                1,
+                'payload',
+                Uint8Array.from([1, 2, 3]),
+                { storageClass: 'blob', byteLength: 2048 },
+                1024
+            );
+            const result = await engine.executeQuery(
+                'SELECT typeof(payload), length(payload), hex(payload) FROM native_stage_d'
+            );
+            assert.deepStrictEqual(result[0].rows, [['blob', 3, '010203']]);
+        });
+
+        await testContext.test('keeps chunked cell reads on a dedicated native snapshot', async () => {
+            await engine.executeQuery('PRAGMA journal_mode = WAL');
+            await engine.executeQuery(
+                'CREATE TABLE native_cell_read_sessions (blob_value BLOB, text_value TEXT); ' +
+                "INSERT INTO native_cell_read_sessions VALUES (x'4141414142424242', 'A😀Bé𝄞Z')"
+            );
+
+            const blobSession = await engine.openCellReadSession({
+                table: 'native_cell_read_sessions',
+                rowId: 1,
+                column: 'blob_value'
+            });
+            assert.deepStrictEqual(blobSession.metadata, {
+                storageClass: 'blob',
+                byteLength: 8
+            });
+            const first = await engine.readCellChunk(blobSession.sessionId, 0, 4);
+            assert.deepStrictEqual(first.bytes, Uint8Array.from([65, 65, 65, 65]));
+
+            await engine.updateCell(
+                'native_cell_read_sessions',
+                1,
+                'blob_value',
+                Uint8Array.from([67, 67, 67, 67, 68, 68, 68, 68])
+            );
+            const second = await engine.readCellChunk(blobSession.sessionId, 4, 4);
+            assert.deepStrictEqual(second.bytes, Uint8Array.from([66, 66, 66, 66]));
+            await engine.closeCellReadSession(blobSession.sessionId);
+
+            const textSession = await engine.openCellReadSession({
+                table: 'native_cell_read_sessions',
+                rowId: 1,
+                column: 'text_value'
+            });
+            const expectedText = new TextEncoder().encode('A😀Bé𝄞Z');
+            assert.deepStrictEqual(textSession.metadata, {
+                storageClass: 'text',
+                byteLength: expectedText.byteLength,
+                textEncoding: 'utf-8'
+            });
+            const assembled: number[] = [];
+            for (let offset = 0; offset < expectedText.byteLength; offset += 2) {
+                const chunk = await engine.readCellChunk(textSession.sessionId, offset, 2);
+                assembled.push(...chunk.bytes);
+            }
+            assert.deepStrictEqual(Uint8Array.from(assembled), expectedText);
+            await engine.closeCellReadSession(textSession.sessionId);
+        });
+
+        await testContext.test('binds native oversized export cells to the row-query snapshot', async () => {
+            const oldPayload = 'old|'.padEnd(64 * 1024 + 1, 'a');
+            const newPayload = 'new|'.padEnd(oldPayload.length, 'b');
+            await engine.executeQuery('PRAGMA journal_mode = WAL');
+            await engine.executeQuery(
+                'CREATE TABLE native_export_cell_snapshot (' +
+                'id INTEGER PRIMARY KEY, payload TEXT, tag TEXT)'
+            );
+            await engine.executeQuery(
+                'INSERT INTO native_export_cell_snapshot VALUES (1, ?, ?)',
+                [oldPayload, 'old-row']
+            );
+
+            const writer = new NativeWorkerProcess(binary, workerScript);
+            await writer.start();
+            await writer.call('open', [databasePath, false]);
+            let mutationInjected = false;
+            const wrapSnapshotOperations = (snapshotOperations: DatabaseOperations) => (
+                new Proxy(snapshotOperations, {
+                    get(target, property, receiver) {
+                        if (property === 'executeQuery') {
+                            return async (...args: Parameters<DatabaseOperations['executeQuery']>) => {
+                                const result = await target.executeQuery(...args);
+                                const sql = String(args[0]);
+                                if (
+                                    !mutationInjected
+                                    && sql.includes('FROM "native_export_cell_snapshot"')
+                                ) {
+                                    mutationInjected = true;
+                                    await writer.call('run', [
+                                        'UPDATE native_export_cell_snapshot ' +
+                                        'SET payload = ?, tag = ? WHERE id = 1',
+                                        [newPayload, 'new-row']
+                                    ]);
+                                }
+                                return result;
+                            };
+                        }
+                        const value = Reflect.get(target, property, receiver);
+                        return typeof value === 'function' ? value.bind(target) : value;
+                    }
+                })
+            );
+            const racingOperations = new Proxy(engine, {
+                get(target, property, receiver) {
+                    if (property === 'runReadSnapshot') {
+                        return <T>(
+                            operation: (snapshotOperations: DatabaseOperations) => Promise<T>
+                        ) => target.runReadSnapshot!(snapshotOperations => (
+                            operation(wrapSnapshotOperations(snapshotOperations))
+                        ));
+                    }
+                    const value = Reflect.get(target, property, receiver);
+                    return typeof value === 'function' ? value.bind(target) : value;
+                }
+            });
+            const chunks: string[] = [];
+
+            try {
+                await streamTableExport(
+                    racingOperations,
+                    'native_export_cell_snapshot',
+                    ['payload', 'tag'],
+                    { format: 'csv' },
+                    { write: async chunk => { chunks.push(chunk); } }
+                );
+                assert.strictEqual(mutationInjected, true);
+                assert.strictEqual(chunks.join(''), `payload,tag\n${oldPayload},old-row`);
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'SELECT substr(payload, 1, 4), tag FROM native_export_cell_snapshot'
+                    ))[0].rows,
+                    [['new|', 'new-row']],
+                    'the external WAL commit must remain visible after the export snapshot closes'
+                );
+            } finally {
+                writer.stop();
+            }
+        });
+
+        await testContext.test('marks an oversized native WITHOUT ROWID primary key read-only', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_oversized_identity ' +
+                '(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID; ' +
+                "INSERT INTO native_oversized_identity VALUES ('abcdefghijklmnopqrstuvwxyz012345', 'visible')"
+            );
+            const page = await engine.fetchTableData('native_oversized_identity', {
+                columns: ['rowid', 'key', 'value'],
+                limit: 1,
+                offset: 0,
+                maxInlineCellBytes: 8,
+                maxPageResponseBytes: 64
+            });
+            const identity = page.rows[0][0] as string;
+
+            assert.match(identity, /^readonly-pk:/);
+            assert.deepStrictEqual(page.oversizedCells, {
+                0: { 1: { storageClass: 'text', byteLength: 32 } }
+            });
+            assert.match(
+                page.readOnlyRowReasons?.[0] ?? '',
+                /WITHOUT ROWID primary-key column "key".*32 bytes.*identity was not transported/
+            );
+            await assert.rejects(
+                engine.updateCell('native_oversized_identity', identity, 'value', 'changed'),
+                /WITHOUT ROWID primary-key column "key".*32 bytes.*identity was not transported/
+            );
+        });
+
+        await testContext.test('orders a declared native rowid column as data across keyset pages', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_declared_rowid_order (' +
+                'pk INTEGER PRIMARY KEY, rowid TEXT NOT NULL, value TEXT' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_declared_rowid_order VALUES " +
+                "(1, 'zulu', 'one'), (2, 'alpha', 'two'), (3, 'alpha', 'three')"
+            );
+            const options: TableQueryOptions = {
+                columns: ['rowid', 'pk', 'rowid', 'value'],
+                orderBy: 'rowid',
+                orderDir: 'ASC',
+                limit: 2,
+                offset: 0
+            };
+
+            const offsetPage = await engine.fetchTableData('native_declared_rowid_order', options);
+            assert.deepStrictEqual(
+                offsetPage.rows.map(row => [row[1], row[2]]),
+                [[2, 'alpha'], [3, 'alpha']]
+            );
+            const first = await engine.fetchTableData('native_declared_rowid_order', {
+                ...options,
+                keyset: { mode: 'first' }
+            });
+            assert.deepStrictEqual(
+                first.rows.map(row => [row[1], row[2]]),
+                [[2, 'alpha'], [3, 'alpha']]
+            );
+            assert.ok(first.keysetAnchors?.last);
+            const second = await engine.fetchTableData('native_declared_rowid_order', {
+                ...options,
+                offset: 2,
+                keyset: { mode: 'after', anchor: first.keysetAnchors.last }
+            });
+            assert.deepStrictEqual(
+                second.rows.map(row => [row[1], row[2]]),
+                [[1, 'zulu']]
+            );
+        });
+
+        await testContext.test('round-trips signed infinite native REAL identities', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_infinite_real_identity (' +
+                'key REAL PRIMARY KEY, value TEXT' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_infinite_real_identity VALUES " +
+                "(-1e999, 'negative'), (1e999, 'positive')"
+            );
+            const options: TableQueryOptions = {
+                columns: ['rowid', 'key', 'value'],
+                orderBy: 'key',
+                orderDir: 'ASC',
+                limit: 1,
+                offset: 0
+            };
+
+            const first = await engine.fetchTableData('native_infinite_real_identity', {
+                ...options,
+                keyset: { mode: 'first' }
+            });
+            assert.strictEqual(first.rows[0][1], Number.NEGATIVE_INFINITY);
+            assert.ok(first.keysetAnchors?.last);
+            const second = await engine.fetchTableData('native_infinite_real_identity', {
+                ...options,
+                offset: 1,
+                keyset: { mode: 'after', anchor: first.keysetAnchors.last }
+            });
+            assert.strictEqual(second.rows[0][1], Number.POSITIVE_INFINITY);
+            await engine.updateCell(
+                'native_infinite_real_identity',
+                second.rows[0][0] as string,
+                'value',
+                'edited'
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT value FROM native_infinite_real_identity WHERE key = 1e999'
+                ))[0].rows,
+                [['edited']]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT typeof(0.0/0.0), 0.0/0.0 IS NULL'))[0].rows,
+                [['null', 1]]
+            );
+            await assert.rejects(
+                engine.executeQuery(
+                    "INSERT INTO native_infinite_real_identity VALUES (0.0/0.0, 'nan')"
+                ),
+                /constraint failed/i
+            );
+        });
+
+        await testContext.test('keeps malformed native UTF-8 TEXT identities viewable but read-only', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_malformed_text_identity (' +
+                'key TEXT PRIMARY KEY, value TEXT' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_malformed_text_identity VALUES " +
+                "(CAST(X'80' AS TEXT), 'malformed'), " +
+                "(CAST(X'EFBFBD' AS TEXT), 'replacement-character')"
+            );
+            const page = await engine.fetchTableData('native_malformed_text_identity', {
+                columns: ['rowid', 'key', 'value'],
+                limit: 10,
+                offset: 0,
+                keyset: { mode: 'first' }
+            });
+            const malformedIndex = page.rows.findIndex(row => row[2] === 'malformed');
+            const validIndex = page.rows.findIndex(row => row[2] === 'replacement-character');
+            assert.notStrictEqual(malformedIndex, -1);
+            assert.notStrictEqual(validIndex, -1);
+            const malformedIdentity = page.rows[malformedIndex][0] as string;
+            const validIdentity = page.rows[validIndex][0] as string;
+
+            assert.match(malformedIdentity, /^readonly-pk:/);
+            assert.match(validIdentity, /^pk:/);
+            assert.notStrictEqual(malformedIdentity, validIdentity);
+            assert.match(page.readOnlyRowReasons?.[malformedIndex] ?? '', /not valid UTF-8/i);
+            if (malformedIndex === 0) assert.strictEqual(page.keysetAnchors?.first, undefined);
+            if (malformedIndex === page.rows.length - 1) {
+                assert.strictEqual(page.keysetAnchors?.last, undefined);
+            }
+
+            await assert.rejects(
+                engine.updateCell(
+                    'native_malformed_text_identity',
+                    malformedIdentity,
+                    'value',
+                    'bad-edit'
+                ),
+                /not valid UTF-8/i
+            );
+            await engine.updateCell(
+                'native_malformed_text_identity',
+                validIdentity,
+                'value',
+                'valid-edit'
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT hex(CAST(key AS BLOB)), value ' +
+                    'FROM native_malformed_text_identity ORDER BY 1'
+                ))[0].rows,
+                [['80', 'malformed'], ['EFBFBD', 'valid-edit']]
+            );
+        });
+
+        await testContext.test('suppresses native keyset anchors for malformed ordinary TEXT sort keys', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_malformed_text_sort (' +
+                'id INTEGER PRIMARY KEY, sort_value TEXT NOT NULL' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_malformed_text_sort VALUES " +
+                "(1, CAST(X'80' AS TEXT)), " +
+                "(2, CAST(X'C0' AS TEXT)), " +
+                "(3, CAST(X'EFBFBD' AS TEXT))"
+            );
+            const options: TableQueryOptions = {
+                columns: ['rowid', 'id', 'sort_value'],
+                orderBy: 'sort_value',
+                orderDir: 'ASC',
+                limit: 1,
+                offset: 0
+            };
+            const first = await engine.fetchTableData('native_malformed_text_sort', {
+                ...options,
+                keyset: { mode: 'first' }
+            });
+            assert.strictEqual(first.rows[0][1], 1);
+            assert.strictEqual(first.keysetAnchors, undefined);
+            const second = await engine.fetchTableData('native_malformed_text_sort', {
+                ...options,
+                offset: 1
+            });
+            assert.strictEqual(second.rows[0][1], 2);
+            assert.strictEqual(second.keysetAnchors, undefined);
+        });
+
+        await testContext.test('rolls back a native insert whose generated TEXT key is not byte-faithful', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_generated_malformed_identity (' +
+                "key TEXT PRIMARY KEY DEFAULT (CAST(X'80' AS TEXT)), value TEXT" +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_generated_malformed_identity(key, value) " +
+                "VALUES (CAST(X'EFBFBD' AS TEXT), 'existing-valid')"
+            );
+
+            await assert.rejects(
+                engine.insertRow(
+                    'native_generated_malformed_identity',
+                    { value: 'must-rollback' }
+                ),
+                /byte-faithful editable identity cannot be minted/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT hex(CAST(key AS BLOB)), value ' +
+                    'FROM native_generated_malformed_identity'
+                ))[0].rows,
+                [['EFBFBD', 'existing-valid']]
+            );
         });
 
         await testContext.test('keeps adjacent unsafe native rowids distinct and editable', async () => {
@@ -270,6 +1244,1004 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 ['9007199254740992', 'lower'],
                 ['9007199254740993', 'edited']
             ]);
+        });
+
+        await testContext.test('pages native tables by keyset without OFFSET', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_keyset_pages (value TEXT); ' +
+                'WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 23) ' +
+                "INSERT INTO native_keyset_pages(value) SELECT 'row-' || n FROM seq"
+            );
+            const options = (pageIndex: number, keyset?: TableQueryOptions['keyset']) => ({
+                columns: ['rowid', 'value'],
+                globalFilterColumns: ['value'],
+                limit: 5,
+                offset: pageIndex * 5,
+                ...(keyset ? { keyset } : {})
+            });
+            const offsetPages = [];
+            for (let index = 0; index < 5; index++) {
+                offsetPages.push(
+                    await engine.fetchTableData('native_keyset_pages', options(index))
+                );
+            }
+            assert.strictEqual(offsetPages[4].rows.length, 3, 'short remainder page expected');
+
+            // Forward: 'first' then an after-chain; each page must byte-match
+            // the OFFSET page and carry anchors minted across the native IPC.
+            let page = await engine.fetchTableData(
+                'native_keyset_pages',
+                options(0, { mode: 'first' })
+            );
+            assert.deepStrictEqual(page.rows, offsetPages[0].rows);
+            for (let index = 1; index < 5; index++) {
+                assert.ok(page.keysetAnchors?.last, `missing anchor for page ${index - 1}`);
+                page = await engine.fetchTableData(
+                    'native_keyset_pages',
+                    options(index, { mode: 'after', anchor: page.keysetAnchors.last })
+                );
+                assert.deepStrictEqual(page.rows, offsetPages[index].rows);
+            }
+
+            // Reversed executions: 'last' returns the same short remainder
+            // page as OFFSET; 'before' walks back; refetch reproduces itself.
+            page = await engine.fetchTableData(
+                'native_keyset_pages',
+                options(4, { mode: 'last', lastPageRowCount: 3 })
+            );
+            assert.deepStrictEqual(page.rows, offsetPages[4].rows);
+            assert.ok(page.keysetAnchors?.first);
+            const prev = await engine.fetchTableData(
+                'native_keyset_pages',
+                options(3, { mode: 'before', anchor: page.keysetAnchors.first })
+            );
+            assert.deepStrictEqual(prev.rows, offsetPages[3].rows);
+            assert.ok(prev.keysetAnchors?.first);
+            const refetch = await engine.fetchTableData(
+                'native_keyset_pages',
+                options(3, { mode: 'atOrAfter', anchor: prev.keysetAnchors.first })
+            );
+            assert.deepStrictEqual(refetch.rows, offsetPages[3].rows);
+
+            // Anchors carry unsafe int64 rowids exactly through the native IPC.
+            await engine.executeQuery(
+                'CREATE TABLE native_keyset_bigint (value TEXT); ' +
+                'INSERT INTO native_keyset_bigint(rowid, value) VALUES ' +
+                "(11, 'safe'), (9007199254740992, 'lower'), (9007199254740993, 'higher')"
+            );
+            const bigFirst = await engine.fetchTableData('native_keyset_bigint', {
+                columns: ['rowid', 'value'],
+                limit: 2,
+                offset: 0,
+                keyset: { mode: 'first' }
+            });
+            assert.deepStrictEqual(
+                bigFirst.rows.map(row => row[0]),
+                [11, '9007199254740992']
+            );
+            assert.ok(bigFirst.keysetAnchors?.last);
+            const bigNext = await engine.fetchTableData('native_keyset_bigint', {
+                columns: ['rowid', 'value'],
+                limit: 2,
+                offset: 2,
+                keyset: { mode: 'after', anchor: bigFirst.keysetAnchors.last }
+            });
+            assert.deepStrictEqual(bigNext.rows, [['9007199254740993', 'higher']]);
+
+            // WITHOUT ROWID composite keys page through pk: identities.
+            await engine.executeQuery(
+                'CREATE TABLE native_keyset_wr (tenant TEXT, seq INTEGER, v TEXT, ' +
+                'PRIMARY KEY (tenant, seq)) WITHOUT ROWID; ' +
+                'WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 9) ' +
+                "INSERT INTO native_keyset_wr " +
+                "SELECT CASE WHEN n % 2 THEN 'a' ELSE 'b' END, n, 'v' || n FROM s"
+            );
+            const wrOptions = (pageIndex: number, keyset?: TableQueryOptions['keyset']) => ({
+                columns: ['rowid', 'tenant', 'seq', 'v'],
+                limit: 4,
+                offset: pageIndex * 4,
+                ...(keyset ? { keyset } : {})
+            });
+            const wrOffset = [];
+            for (let index = 0; index < 3; index++) {
+                wrOffset.push(await engine.fetchTableData('native_keyset_wr', wrOptions(index)));
+            }
+            let wrPage = await engine.fetchTableData(
+                'native_keyset_wr',
+                wrOptions(0, { mode: 'first' })
+            );
+            assert.match(String(wrPage.rows[0][0]), /^pk:/);
+            assert.deepStrictEqual(wrPage.rows, wrOffset[0].rows);
+            for (let index = 1; index < 3; index++) {
+                assert.ok(wrPage.keysetAnchors?.last);
+                wrPage = await engine.fetchTableData(
+                    'native_keyset_wr',
+                    wrOptions(index, { mode: 'after', anchor: wrPage.keysetAnchors.last })
+                );
+                assert.deepStrictEqual(wrPage.rows, wrOffset[index].rows);
+            }
+
+            // A stale anchor (minted under a sort) falls back to the exact
+            // OFFSET page for the request; hostile tokens are rejected loudly.
+            const sorted = await engine.fetchTableData('native_keyset_pages', {
+                ...options(0, { mode: 'first' }),
+                orderBy: 'value'
+            });
+            assert.ok(sorted.keysetAnchors?.last);
+            const fallback = await engine.fetchTableData(
+                'native_keyset_pages',
+                options(2, { mode: 'after', anchor: sorted.keysetAnchors.last })
+            );
+            assert.deepStrictEqual(fallback.rows, offsetPages[2].rows);
+            await assert.rejects(
+                engine.fetchTableData(
+                    'native_keyset_pages',
+                    options(1, { mode: 'after', anchor: 'ksa:garbage' })
+                ),
+                /keyset anchor/i
+            );
+
+            // Mixed session under duplicate DESC sort values: an OFFSET page's
+            // anchors must seek in exactly the order the OFFSET page was
+            // produced in — the fallback ORDER BY carries the identity
+            // tiebreak through the native worker (which resolves plan, page,
+            // and anchors under one snapshot savepoint).
+            await engine.executeQuery(
+                'CREATE TABLE native_keyset_ties (s TEXT, v TEXT); ' +
+                'WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 12) ' +
+                "INSERT INTO native_keyset_ties(s, v) SELECT 'dup-' || (n % 2), 'v' || n FROM seq"
+            );
+            const tieOptions = (pageIndex: number, keyset?: TableQueryOptions['keyset']) => ({
+                columns: ['rowid', 's', 'v'],
+                orderBy: 's',
+                orderDir: 'DESC' as const,
+                limit: 4,
+                offset: pageIndex * 4,
+                ...(keyset ? { keyset } : {})
+            });
+            const tieOffset = [];
+            for (let index = 0; index < 3; index++) {
+                tieOffset.push(
+                    await engine.fetchTableData('native_keyset_ties', tieOptions(index))
+                );
+            }
+            assert.ok(tieOffset[1].keysetAnchors?.last);
+            const tieNext = await engine.fetchTableData(
+                'native_keyset_ties',
+                tieOptions(2, { mode: 'after', anchor: tieOffset[1].keysetAnchors.last })
+            );
+            assert.deepStrictEqual(tieNext.rows, tieOffset[2].rows);
+
+            // NONE-affinity sort column: int64 anchor values beyond 2^53
+            // travel as decimal strings across the native IPC and must seek
+            // exactly through CAST(? AS INTEGER) in both directions.
+            await engine.executeQuery(
+                'CREATE TABLE native_keyset_none_affinity (x, v TEXT); ' +
+                'INSERT INTO native_keyset_none_affinity(x, v) VALUES ' +
+                "(9007199254740992, 'a'), (9007199254740993, 'b'), " +
+                "(9007199254740995, 'c'), (2, 'small')"
+            );
+            const noneOptions = (pageIndex: number, keyset?: TableQueryOptions['keyset']) => ({
+                columns: ['rowid', 'x', 'v'],
+                orderBy: 'x',
+                orderDir: 'ASC' as const,
+                limit: 2,
+                offset: pageIndex * 2,
+                ...(keyset ? { keyset } : {})
+            });
+            const nonePage0 = await engine.fetchTableData(
+                'native_keyset_none_affinity',
+                noneOptions(0)
+            );
+            const nonePage1 = await engine.fetchTableData(
+                'native_keyset_none_affinity',
+                noneOptions(1)
+            );
+            assert.ok(nonePage0.keysetAnchors?.last);
+            const noneNext = await engine.fetchTableData(
+                'native_keyset_none_affinity',
+                noneOptions(1, { mode: 'after', anchor: nonePage0.keysetAnchors.last })
+            );
+            assert.deepStrictEqual(noneNext.rows, nonePage1.rows);
+            assert.ok(nonePage1.keysetAnchors?.first);
+            const nonePrev = await engine.fetchTableData(
+                'native_keyset_none_affinity',
+                noneOptions(0, { mode: 'before', anchor: nonePage1.keysetAnchors.first })
+            );
+            assert.deepStrictEqual(nonePrev.rows, nonePage0.rows);
+        });
+
+        await testContext.test('edits and replays a WITHOUT ROWID primary-key identity', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_without_rowid (' +
+                'tenant TEXT, sequence INTEGER, value TEXT, ' +
+                'PRIMARY KEY (tenant, sequence)' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_without_rowid VALUES " +
+                "('north', 9007199254740993, 'before')"
+            );
+            const page = await engine.fetchTableData('native_without_rowid', {
+                columns: ['rowid', 'tenant', 'sequence', 'value'],
+                limit: 10,
+                offset: 0
+            });
+            const oldIdentity = page.rows[0][0] as string;
+            assert.match(oldIdentity, /^pk:/);
+
+            const affectedCells = await engine.updateCellBatch('native_without_rowid', [
+                { rowId: oldIdentity, column: 'tenant', value: 'south' },
+                { rowId: oldIdentity, column: 'value', value: 'after' }
+            ]);
+            assert.ok(affectedCells[0].newRowId);
+            const modification = {
+                description: 'Native WITHOUT ROWID edit',
+                modificationType: 'cell_update' as const,
+                targetTable: 'native_without_rowid',
+                affectedCells
+            };
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT tenant, CAST(sequence AS TEXT), value FROM native_without_rowid'
+                ))[0].rows,
+                [['south', '9007199254740993', 'after']]
+            );
+
+            await engine.undoModification(modification);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT tenant, CAST(sequence AS TEXT), value FROM native_without_rowid'
+                ))[0].rows,
+                [['north', '9007199254740993', 'before']]
+            );
+            await engine.redoModification(modification);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT tenant, CAST(sequence AS TEXT), value FROM native_without_rowid'
+                ))[0].rows,
+                [['south', '9007199254740993', 'after']]
+            );
+        });
+
+        await testContext.test('undoes dependent native composite-key changes in reverse transition order', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_dependent_identity (' +
+                'tenant INTEGER, sequence INTEGER, value TEXT, ' +
+                'PRIMARY KEY (tenant, sequence)' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_dependent_identity VALUES (1, 1, 'first'), (1, 2, 'second')"
+            );
+            const page = await engine.fetchTableData('native_dependent_identity', {
+                columns: ['rowid', 'tenant', 'sequence', 'value'],
+                orderBy: 'sequence',
+                limit: 10,
+                offset: 0
+            });
+            const affectedCells = await engine.updateCellBatch('native_dependent_identity', [
+                { rowId: page.rows[0][0] as string, column: 'tenant', value: 2 },
+                { rowId: page.rows[1][0] as string, column: 'sequence', value: 1 }
+            ]);
+
+            await engine.undoModification({
+                description: 'Undo dependent native composite identities',
+                modificationType: 'cell_update',
+                targetTable: 'native_dependent_identity',
+                affectedCells
+            });
+
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT tenant, sequence, value FROM native_dependent_identity ORDER BY sequence'
+                ))[0].rows,
+                [[1, 1, 'first'], [1, 2, 'second']]
+            );
+        });
+
+        await testContext.test('fails clearly when a native UPDATE trigger rewrites the primary key', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_trigger_rekey_identity (' +
+                'tenant TEXT, sequence INTEGER, value TEXT, PRIMARY KEY (tenant, sequence)' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_trigger_rekey_identity VALUES ('north', 1, 'before'); " +
+                'CREATE TRIGGER native_trigger_rekey_identity_after ' +
+                'AFTER UPDATE OF value ON native_trigger_rekey_identity BEGIN ' +
+                'UPDATE native_trigger_rekey_identity SET sequence = sequence + 1 ' +
+                'WHERE tenant = NEW.tenant AND sequence = NEW.sequence; END'
+            );
+            const page = await engine.fetchTableData('native_trigger_rekey_identity', {
+                columns: ['rowid', 'tenant', 'sequence', 'value'],
+                limit: 1,
+                offset: 0
+            });
+
+            await assert.rejects(
+                engine.updateCell(
+                    'native_trigger_rekey_identity',
+                    page.rows[0][0] as string,
+                    'value',
+                    'after'
+                ),
+                /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+            );
+            await assert.rejects(
+                engine.replaceOversizedCell(
+                    'native_trigger_rekey_identity',
+                    page.rows[0][0] as string,
+                    'value',
+                    'after',
+                    { storageClass: 'text', byteLength: 6 },
+                    5
+                ),
+                /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT tenant, sequence, value FROM native_trigger_rekey_identity'
+                ))[0].rows,
+                [['north', 1, 'before']]
+            );
+        });
+
+        await testContext.test('restores a deleted native WITHOUT ROWID row without generated columns', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_generated_pk_row (' +
+                'id INTEGER PRIMARY KEY, base INTEGER, ' +
+                'stored_value INTEGER GENERATED ALWAYS AS (base * 2) STORED, ' +
+                'virtual_value INTEGER GENERATED ALWAYS AS (base * 3) VIRTUAL' +
+                ') WITHOUT ROWID; ' +
+                'INSERT INTO native_generated_pk_row (id, base) VALUES (7, 5)'
+            );
+            const page = await engine.fetchTableData('native_generated_pk_row', {
+                columns: ['rowid', 'id', 'base', 'stored_value', 'virtual_value'],
+                limit: 10,
+                offset: 0
+            });
+            const deletedRows = await engine.deleteRows(
+                'native_generated_pk_row',
+                [page.rows[0][0] as string]
+            );
+            assert.ok(deletedRows);
+
+            await engine.undoModification({
+                description: 'Restore generated native PK row',
+                modificationType: 'row_delete',
+                targetTable: 'native_generated_pk_row',
+                deletedRows
+            });
+
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, base, stored_value, virtual_value FROM native_generated_pk_row'
+                ))[0].rows,
+                [[7, 5, 10, 15]]
+            );
+        });
+
+        await testContext.test('restores a deleted native rowid row without generated columns', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_generated_rowid_row (' +
+                'base INTEGER, ' +
+                'stored_value INTEGER GENERATED ALWAYS AS (base * 2) STORED, ' +
+                'virtual_value INTEGER GENERATED ALWAYS AS (base * 3) VIRTUAL' +
+                '); ' +
+                'INSERT INTO native_generated_rowid_row (rowid, base) VALUES (9, 5)'
+            );
+            const deletedRows = await engine.deleteRows('native_generated_rowid_row', [9]);
+            assert.ok(deletedRows);
+
+            await engine.undoModification({
+                description: 'Restore generated native rowid row',
+                modificationType: 'row_delete',
+                targetTable: 'native_generated_rowid_row',
+                deletedRows
+            });
+
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT rowid, base, stored_value, virtual_value FROM native_generated_rowid_row'
+                ))[0].rows,
+                [[9, 5, 10, 15]]
+            );
+        });
+
+        await testContext.test('restores a deleted native row to its deterministic grid position', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_row_ordinal (id INTEGER PRIMARY KEY, value TEXT); ' +
+                "INSERT INTO native_row_ordinal VALUES (1, 'first'), (2, 'middle'), (3, 'last')"
+            );
+            const before = await engine.fetchTableData('native_row_ordinal', {
+                columns: ['rowid', 'id', 'value'],
+                orderBy: 'id',
+                limit: 10,
+                offset: 0
+            });
+            const deletedRows = await engine.deleteRows('native_row_ordinal', [2]);
+            assert.ok(deletedRows);
+
+            await engine.undoModification({
+                description: 'Restore middle native row',
+                modificationType: 'row_delete',
+                targetTable: 'native_row_ordinal',
+                deletedRows
+            });
+
+            const after = await engine.fetchTableData('native_row_ordinal', {
+                columns: ['rowid', 'id', 'value'],
+                orderBy: 'id',
+                limit: 10,
+                offset: 0
+            });
+            assert.deepStrictEqual(after.rows, before.rows);
+            assert.deepStrictEqual(after.rows.map(row => row[0]), [1, 2, 3]);
+        });
+
+        await testContext.test('restores a dropped native middle column with exact schema and dependents', async () => {
+            const createTableSql =
+                "CREATE TABLE native_column_restore_parent (id INTEGER PRIMARY KEY, removed TEXT NOT NULL DEFAULT 'fallback' CHECK(length(removed) > 0), tail TEXT)";
+            const createRemovedIndexSql =
+                'CREATE INDEX idx_native_column_restore_removed ON native_column_restore_parent(removed)';
+            const createTailIndexSql =
+                'CREATE INDEX idx_native_column_restore_tail ON native_column_restore_parent(tail)';
+            const createTriggerSql =
+                'CREATE TRIGGER trg_native_column_restore_tail AFTER UPDATE OF tail ' +
+                'ON native_column_restore_parent BEGIN ' +
+                'INSERT INTO native_column_restore_audit(value) VALUES (NEW.tail); END';
+            await engine.executeQuery('PRAGMA foreign_keys = ON');
+            await engine.executeQuery('CREATE TABLE native_column_restore_audit (value TEXT)');
+            await engine.executeQuery(createTableSql);
+            await engine.executeQuery(createRemovedIndexSql);
+            await engine.executeQuery(createTailIndexSql);
+            await engine.executeQuery(createTriggerSql);
+            await engine.executeQuery(
+                'CREATE VIEW native_column_restore_view AS ' +
+                'SELECT id, tail FROM native_column_restore_parent'
+            );
+            await engine.executeQuery(
+                'CREATE TABLE native_column_restore_child (' +
+                'id INTEGER PRIMARY KEY, parent_id INTEGER ' +
+                'REFERENCES native_column_restore_parent(id))'
+            );
+            await engine.executeQuery(
+                "INSERT INTO native_column_restore_parent(rowid, id, removed, tail) VALUES " +
+                "(7, 7, 'seven', 'tail-7'), (11, 11, 'eleven', 'tail-11')"
+            );
+            await engine.executeQuery('INSERT INTO native_column_restore_child VALUES (1, 7)');
+
+            const removedData = (await engine.executeQuery(
+                'SELECT rowid, removed FROM native_column_restore_parent ORDER BY rowid'
+            ))[0].rows.map(row => ({ rowId: row[0] as number, value: row[1] }));
+            await engine.deleteColumns(
+                'native_column_restore_parent',
+                ['removed'],
+                ['idx_native_column_restore_removed']
+            );
+            const afterTableSql = (await engine.executeQuery(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' " +
+                "AND name = 'native_column_restore_parent'"
+            ))[0].rows[0][0] as string;
+
+            await engine.undoModification({
+                description: 'Restore constrained native middle column',
+                modificationType: 'column_drop',
+                targetTable: 'native_column_restore_parent',
+                deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+                droppedIndexes: ['idx_native_column_restore_removed'],
+                columnDropSnapshot: {
+                    before: {
+                        tableSql: createTableSql,
+                        columns: ['id', 'removed', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: [
+                            {
+                                type: 'index',
+                                identifier: 'idx_native_column_restore_removed',
+                                sql: createRemovedIndexSql
+                            },
+                            {
+                                type: 'index',
+                                identifier: 'idx_native_column_restore_tail',
+                                sql: createTailIndexSql
+                            },
+                            {
+                                type: 'trigger',
+                                identifier: 'trg_native_column_restore_tail',
+                                sql: createTriggerSql
+                            }
+                        ]
+                    },
+                    after: {
+                        tableSql: afterTableSql,
+                        columns: ['id', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: [
+                            {
+                                type: 'index',
+                                identifier: 'idx_native_column_restore_tail',
+                                sql: createTailIndexSql
+                            },
+                            {
+                                type: 'trigger',
+                                identifier: 'trg_native_column_restore_tail',
+                                sql: createTriggerSql
+                            }
+                        ]
+                    }
+                }
+            } as any);
+
+            const tableInfo = (await engine.executeQuery(
+                'PRAGMA table_info(native_column_restore_parent)'
+            ))[0].rows;
+            assert.deepStrictEqual(
+                tableInfo.map(column => [column[0], column[1], column[2], column[3], column[4]]),
+                [
+                    [0, 'id', 'INTEGER', 0, null],
+                    [1, 'removed', 'TEXT', 1, "'fallback'"],
+                    [2, 'tail', 'TEXT', 0, null]
+                ]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT rowid AS grid_rowid, id, removed, tail ' +
+                    'FROM native_column_restore_parent ORDER BY rowid'
+                ))[0].rows,
+                [[7, 7, 'seven', 'tail-7'], [11, 11, 'eleven', 'tail-11']]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    "SELECT type, name, sql FROM sqlite_schema " +
+                    "WHERE tbl_name = 'native_column_restore_parent' " +
+                    "AND type IN ('index', 'trigger') AND sql IS NOT NULL " +
+                    'ORDER BY type, name'
+                ))[0].rows,
+                [
+                    ['index', 'idx_native_column_restore_removed', createRemovedIndexSql],
+                    ['index', 'idx_native_column_restore_tail', createTailIndexSql],
+                    ['trigger', 'trg_native_column_restore_tail', createTriggerSql]
+                ]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, tail FROM native_column_restore_view ORDER BY id'
+                ))[0].rows,
+                [[7, 'tail-7'], [11, 'tail-11']]
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery('PRAGMA foreign_key_check'))[0]?.rows ?? [],
+                []
+            );
+            assert.strictEqual(
+                (await engine.executeQuery('PRAGMA foreign_keys'))[0].rows[0][0],
+                1
+            );
+            await engine.executeQuery(
+                "UPDATE native_column_restore_parent SET tail = 'changed' WHERE id = 7"
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery('SELECT value FROM native_column_restore_audit'))[0].rows,
+                [['changed']]
+            );
+        });
+
+        await testContext.test('preserves a native AUTOINCREMENT high-water mark across positional undo', async () => {
+            const createTableSql =
+                'CREATE TABLE native_column_restore_sequence (' +
+                'id INTEGER PRIMARY KEY AUTOINCREMENT, removed TEXT, tail TEXT)';
+            await engine.executeQuery(createTableSql);
+            await engine.executeQuery(
+                "INSERT INTO native_column_restore_sequence(id, removed, tail) VALUES " +
+                "(1, 'one', 'tail-1'), (100, 'retired', 'tail-100')"
+            );
+            await engine.executeQuery('DELETE FROM native_column_restore_sequence WHERE id = 100');
+            const removedData = (await engine.executeQuery(
+                'SELECT rowid AS grid_rowid, removed FROM native_column_restore_sequence'
+            ))[0].rows.map(row => ({ rowId: row[0] as number, value: row[1] }));
+
+            await engine.deleteColumns('native_column_restore_sequence', ['removed']);
+            const afterTableSql = (await engine.executeQuery(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' " +
+                "AND name = 'native_column_restore_sequence'"
+            ))[0].rows[0][0] as string;
+            await engine.undoModification({
+                modificationType: 'column_drop',
+                targetTable: 'native_column_restore_sequence',
+                description: 'Restore native AUTOINCREMENT middle column',
+                deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+                columnDropSnapshot: {
+                    before: {
+                        tableSql: createTableSql,
+                        columns: ['id', 'removed', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: []
+                    },
+                    after: {
+                        tableSql: afterTableSql,
+                        columns: ['id', 'tail'],
+                        identity: { kind: 'rowid' },
+                        schemaObjects: []
+                    }
+                }
+            } as any);
+
+            assert.strictEqual(
+                (await engine.executeQuery(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'native_column_restore_sequence'"
+                ))[0].rows[0][0],
+                100
+            );
+            await engine.executeQuery(
+                "INSERT INTO native_column_restore_sequence(removed, tail) " +
+                "VALUES ('next', 'tail-next')"
+            );
+            assert.strictEqual(
+                (await engine.executeQuery(
+                    "SELECT id FROM native_column_restore_sequence WHERE tail = 'tail-next'"
+                ))[0].rows[0][0],
+                101
+            );
+        });
+
+        await testContext.test('allows native positional undo with a pre-existing FK violation', async () => {
+            await engine.executeQuery('PRAGMA foreign_keys = OFF');
+            try {
+                await engine.executeQuery(
+                    'CREATE TABLE native_preexisting_fk_parent (id INTEGER PRIMARY KEY)'
+                );
+                await engine.executeQuery(
+                    'CREATE TABLE native_preexisting_fk_child (' +
+                    'id INTEGER PRIMARY KEY, parent_id INTEGER ' +
+                    'REFERENCES native_preexisting_fk_parent(id)) WITHOUT ROWID'
+                );
+                await engine.executeQuery(
+                    'INSERT INTO native_preexisting_fk_child VALUES (1, 999), (2, 999)'
+                );
+                await engine.executeQuery('PRAGMA foreign_keys = ON');
+                assert.deepStrictEqual(
+                    (await engine.executeQuery('PRAGMA foreign_key_check'))[0].rows,
+                    [
+                        ['native_preexisting_fk_child', null, 'native_preexisting_fk_parent', 0],
+                        ['native_preexisting_fk_child', null, 'native_preexisting_fk_parent', 0]
+                    ]
+                );
+
+                const createTableSql =
+                    'CREATE TABLE native_fk_baseline_restore (' +
+                    'id INTEGER PRIMARY KEY, removed TEXT, tail TEXT)';
+                await engine.executeQuery(createTableSql);
+                await engine.executeQuery(
+                    "INSERT INTO native_fk_baseline_restore(rowid, id, removed, tail) " +
+                    "VALUES (7, 7, 'saved', 'tail')"
+                );
+                const removedData = (await engine.executeQuery(
+                    'SELECT rowid AS grid_rowid, removed FROM native_fk_baseline_restore'
+                ))[0].rows.map(row => ({ rowId: row[0], value: row[1] }));
+                await engine.deleteColumns('native_fk_baseline_restore', ['removed']);
+                const afterTableSql = (await engine.executeQuery(
+                    "SELECT sql FROM sqlite_schema WHERE type = 'table' " +
+                    "AND name = 'native_fk_baseline_restore'"
+                ))[0].rows[0][0] as string;
+
+                await engine.undoModification({
+                    modificationType: 'column_drop',
+                    targetTable: 'native_fk_baseline_restore',
+                    description: 'Restore with unrelated pre-existing FK violation',
+                    deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+                    columnDropSnapshot: {
+                        before: {
+                            tableSql: createTableSql,
+                            columns: ['id', 'removed', 'tail'],
+                            identity: { kind: 'rowid' },
+                            schemaObjects: []
+                        },
+                        after: {
+                            tableSql: afterTableSql,
+                            columns: ['id', 'tail'],
+                            identity: { kind: 'rowid' },
+                            schemaObjects: []
+                        }
+                    }
+                } as any);
+
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'SELECT rowid AS grid_rowid, id, removed, tail ' +
+                        'FROM native_fk_baseline_restore'
+                    ))[0].rows,
+                    [[7, 7, 'saved', 'tail']]
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery('PRAGMA foreign_key_check'))[0].rows,
+                    [
+                        ['native_preexisting_fk_child', null, 'native_preexisting_fk_parent', 0],
+                        ['native_preexisting_fk_child', null, 'native_preexisting_fk_parent', 0]
+                    ]
+                );
+            } finally {
+                await engine.executeQuery('PRAGMA foreign_keys = OFF');
+                await engine.executeQuery('DROP TABLE IF EXISTS native_preexisting_fk_child');
+                await engine.executeQuery('DROP TABLE IF EXISTS native_preexisting_fk_parent');
+                await engine.executeQuery('PRAGMA foreign_keys = ON');
+            }
+        });
+
+        await testContext.test('uses the non-shadowable native FK check for positional undo', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_rebuild_fk_parent (id INTEGER PRIMARY KEY)'
+            );
+            await engine.executeQuery('INSERT INTO native_rebuild_fk_parent VALUES (1)');
+            const createTableSql =
+                'CREATE TABLE native_rebuild_fk_target (' +
+                'id INTEGER PRIMARY KEY, removed INTEGER ' +
+                'REFERENCES native_rebuild_fk_parent(id), tail TEXT)';
+            await engine.executeQuery(createTableSql);
+            await engine.executeQuery(
+                "INSERT INTO native_rebuild_fk_target(rowid, id, removed, tail) " +
+                "VALUES (7, 7, 1, 'tail')"
+            );
+            await engine.deleteColumns('native_rebuild_fk_target', ['removed']);
+            const afterTableSql = (await engine.executeQuery(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' " +
+                "AND name = 'native_rebuild_fk_target'"
+            ))[0].rows[0][0] as string;
+            await engine.executeQuery(
+                'CREATE TABLE pragma_foreign_key_check (' +
+                '"table" TEXT, rowid INTEGER, parent TEXT, fkid INTEGER)'
+            );
+            try {
+                await assert.rejects(
+                    engine.undoModification({
+                        modificationType: 'column_drop',
+                        targetTable: 'native_rebuild_fk_target',
+                        description: 'Reject a shadowed native FK check',
+                        deletedColumns: [{
+                            name: 'removed',
+                            type: 'INTEGER',
+                            data: [{ rowId: 7, value: 999 }]
+                        }],
+                        columnDropSnapshot: {
+                            before: {
+                                tableSql: createTableSql,
+                                columns: ['id', 'removed', 'tail'],
+                                identity: { kind: 'rowid' },
+                                schemaObjects: []
+                            },
+                            after: {
+                                tableSql: afterTableSql,
+                                columns: ['id', 'tail'],
+                                identity: { kind: 'rowid' },
+                                schemaObjects: []
+                            }
+                        }
+                    } as any),
+                    /new violations/i
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'PRAGMA table_info(native_rebuild_fk_target)'
+                    ))[0].rows.map(column => column[1]),
+                    ['id', 'tail']
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery('PRAGMA foreign_key_check'))[0]?.rows ?? [],
+                    []
+                );
+            } finally {
+                await engine.executeQuery('DROP TABLE pragma_foreign_key_check');
+            }
+        });
+
+        await testContext.test('rolls back a stale native guarded column restore', async () => {
+            const createTableSql =
+                'CREATE TABLE native_guarded_column_restore (' +
+                'id INTEGER PRIMARY KEY, removed TEXT, tail TEXT)';
+            await engine.executeQuery(createTableSql);
+            await engine.executeQuery(
+                "INSERT INTO native_guarded_column_restore(rowid, id, removed, tail) " +
+                "VALUES (5, 5, 'value', 'tail')"
+            );
+            await engine.deleteColumns('native_guarded_column_restore', ['removed']);
+
+            await assert.rejects(
+                engine.undoModification({
+                    description: 'Reject stale native column history',
+                    modificationType: 'column_drop',
+                    targetTable: 'native_guarded_column_restore',
+                    deletedColumns: [{
+                        name: 'removed',
+                        type: 'TEXT',
+                        data: [{ rowId: 5, value: 'value' }]
+                    }],
+                    columnDropSnapshot: {
+                        before: {
+                            tableSql: createTableSql,
+                            columns: ['id', 'removed', 'tail'],
+                            identity: { kind: 'rowid' },
+                            schemaObjects: []
+                        },
+                        after: {
+                            tableSql:
+                                'CREATE TABLE native_guarded_column_restore (id INTEGER PRIMARY KEY)',
+                            columns: ['id', 'tail'],
+                            identity: { kind: 'rowid' },
+                            schemaObjects: []
+                        }
+                    }
+                } as any),
+                /schema changed/i
+            );
+
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'PRAGMA table_info(native_guarded_column_restore)'
+                ))[0].rows.map(column => column[1]),
+                ['id', 'tail']
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT rowid AS grid_rowid, id, tail FROM native_guarded_column_restore'
+                ))[0].rows,
+                [[5, 5, 'tail']]
+            );
+        });
+
+        await testContext.test('preserves an unsafe native INTEGER prior when undoing a typeless cell', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_typeless_undo (' +
+                'id INTEGER PRIMARY KEY, value' +
+                ') WITHOUT ROWID; ' +
+                'INSERT INTO native_typeless_undo VALUES (1, 9007199254740993)'
+            );
+            const page = await engine.fetchTableData('native_typeless_undo', {
+                columns: ['rowid', 'id', 'value'],
+                limit: 10,
+                offset: 0
+            });
+            const affectedCells = await engine.updateCellBatch('native_typeless_undo', [{
+                rowId: page.rows[0][0] as string,
+                column: 'value',
+                value: 'changed'
+            }]);
+            assert.strictEqual(typeof affectedCells[0].priorValue, 'bigint');
+
+            await engine.undoModification({
+                description: 'Restore unsafe native typeless INTEGER',
+                modificationType: 'cell_update',
+                targetTable: 'native_typeless_undo',
+                affectedCells
+            });
+
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT typeof(value), CAST(value AS TEXT) FROM native_typeless_undo'
+                ))[0].rows,
+                [['integer', '9007199254740993']]
+            );
+        });
+
+        await testContext.test('preserves an unsafe native INTEGER when restoring a deleted typeless row', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_typeless_restore (value); ' +
+                'INSERT INTO native_typeless_restore (rowid, value) VALUES (11, 9007199254740993)'
+            );
+            const deletedRows = await engine.deleteRows('native_typeless_restore', [11]);
+            assert.ok(deletedRows);
+            assert.strictEqual(typeof deletedRows[0].row.value, 'bigint');
+
+            await engine.undoModification({
+                description: 'Restore deleted unsafe native typeless INTEGER',
+                modificationType: 'row_delete',
+                targetTable: 'native_typeless_restore',
+                deletedRows
+            });
+
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT rowid, typeof(value), CAST(value AS TEXT) FROM native_typeless_restore'
+                ))[0].rows,
+                [[11, 'integer', '9007199254740993']]
+            );
+        });
+
+        await testContext.test('enumerates and loads native tables that shadow PRAGMA virtual-table names', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_pragma_shadow_target (' +
+                'id INTEGER PRIMARY KEY, value TEXT); ' +
+                "INSERT INTO native_pragma_shadow_target VALUES (1, 'before'); " +
+                'CREATE TABLE pragma_table_info (dummy TEXT)'
+            );
+
+            const infoShadowSchema = await engine.fetchSchema();
+            assert.ok(
+                infoShadowSchema.tables.some(
+                    table => table.identifier === 'native_pragma_shadow_target'
+                )
+            );
+
+            await engine.executeQuery(
+                'CREATE TABLE pragma_table_list (dummy TEXT); ' +
+                'CREATE TABLE pragma_table_xinfo (dummy TEXT)'
+            );
+            const fullyShadowedSchema = await engine.fetchSchema();
+            const identifiers = new Set(
+                fullyShadowedSchema.tables.map(table => table.identifier)
+            );
+            for (const table of [
+                'native_pragma_shadow_target',
+                'pragma_table_info',
+                'pragma_table_list',
+                'pragma_table_xinfo'
+            ]) {
+                assert.ok(identifiers.has(table), `schema omitted ${table}`);
+            }
+
+            const page = await engine.fetchTableData('native_pragma_shadow_target', {
+                columns: ['rowid', 'id', 'value'],
+                limit: 10,
+                offset: 0
+            });
+            assert.deepStrictEqual(page.rows, [[1, 1, 'before']]);
+
+            await engine.insertRow('native_pragma_shadow_target', { value: 'after' });
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, value FROM native_pragma_shadow_target ORDER BY id'
+                ))[0].rows,
+                [[1, 'before'], [2, 'after']]
+            );
+        });
+
+        await testContext.test('loads and edits a native FTS5 virtual table through rowid identity', async (ftsContext) => {
+            try {
+                await engine.executeQuery(
+                    'CREATE VIRTUAL TABLE native_fts_identity USING fts5(body)'
+                );
+            } catch (error) {
+                if (/no such module:\s*fts5/i.test(String(error))) {
+                    ftsContext.skip('bundled native SQLite does not include FTS5');
+                    return;
+                }
+                throw error;
+            }
+
+            await engine.executeQuery(
+                "INSERT INTO native_fts_identity(rowid, body) VALUES (7, 'before')"
+            );
+            const schema = await engine.fetchSchema();
+            assert.deepStrictEqual(
+                schema.tables.find(table => table.identifier === 'native_fts_identity')?.identity,
+                { kind: 'rowid' }
+            );
+
+            const page = await engine.fetchTableData('native_fts_identity', {
+                columns: ['rowid', 'body'],
+                limit: 10,
+                offset: 0
+            });
+            assert.strictEqual(page.rows[0][0], 7);
+            await engine.updateCell('native_fts_identity', page.rows[0][0] as number, 'body', 'after');
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT rowid, body FROM native_fts_identity'
+                ))[0].rows,
+                [[7, 'after']]
+            );
+
+            const shadowPage = await engine.fetchTableData('native_fts_identity_content', {
+                columns: ['rowid', 'c0'],
+                limit: 10,
+                offset: 0
+            });
+            await engine.updateCell(
+                'native_fts_identity_content',
+                shadowPage.rows[0][0] as number,
+                'c0',
+                'shadow-after'
+            );
+            assert.strictEqual(
+                (await engine.executeQuery(
+                    'SELECT c0 FROM native_fts_identity_content'
+                ))[0].rows[0][0],
+                'shadow-after'
+            );
         });
 
         await testContext.test('carries exact unsafe INTEGER text through native view previews', async () => {
@@ -369,6 +2341,45 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 result.exactIntegerTexts?.[0]?.[1],
                 String(result.rows[0][1])
             );
+        });
+
+        await testContext.test('loads native table pages at both maximum-width boundaries', async () => {
+            for (const declaredColumnCount of [1999, 2000]) {
+                for (const withoutRowId of [false, true]) {
+                    const columns = Array.from(
+                        { length: declaredColumnCount },
+                        (_, index) => `c${index}`
+                    );
+                    const table = `native_containment_width_${declaredColumnCount}_${withoutRowId ? 'pk' : 'rowid'}`;
+                    const definitions = columns.map((column, index) => (
+                        withoutRowId && index === 0
+                            ? `"${column}" INTEGER PRIMARY KEY`
+                            : `"${column}" TEXT`
+                    ));
+                    await engine.executeQuery(
+                        `CREATE TABLE "${table}" (${definitions.join(', ')})` +
+                        `${withoutRowId ? ' WITHOUT ROWID' : ''}; ` +
+                        `INSERT INTO "${table}" ("c0", "c${declaredColumnCount - 1}") ` +
+                        `VALUES (1, 'last')`
+                    );
+
+                    const page = await engine.fetchTableData(table, {
+                        columns: ['rowid', ...columns],
+                        globalFilterColumns: columns,
+                        limit: 1,
+                        offset: 0
+                    });
+
+                    assert.strictEqual(page.headers.length, declaredColumnCount + 1);
+                    assert.strictEqual(page.rows[0].length, declaredColumnCount + 1);
+                    assert.strictEqual(page.rows[0][1], withoutRowId ? 1 : '1');
+                    assert.strictEqual(page.rows[0][declaredColumnCount], 'last');
+                    assert.match(
+                        String(page.rows[0][0]),
+                        withoutRowId ? /^(?:pk|readonly-pk):/ : /^1$/
+                    );
+                }
+            }
         });
 
         await testContext.test('nests native batch writes inside a host savepoint', async () => {

@@ -9,7 +9,13 @@ import * as vscode from 'vscode';
 import { isNativeAvailable, NativeWorkerProcess } from '../../src/nativeWorker';
 import { InvocationTimeoutError } from '../../src/core/rpc';
 import type { DatabaseOperations } from '../../src/core/types';
+import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
 import { createDeferred } from './helpers/deferred';
+import {
+    CellEditPolicyError,
+    DEFAULT_MAX_CELL_EDIT_BYTES,
+    OversizedCellReplacementRequiredError
+} from '../../src/core/cell-edit-policy';
 
 const nativeWorkerSource = fs.readFileSync(
     path.resolve(process.cwd(), 'natives', 'native-worker.js'),
@@ -61,7 +67,7 @@ interface RecordedNativeCall {
     args: unknown[];
 }
 
-type RecordedNativeResponse = { result?: unknown; error?: string };
+type RecordedNativeResponse = { result?: unknown; error?: string; cancelled?: boolean };
 type RecordedNativeResponder = (call: RecordedNativeCall) => RecordedNativeResponse | Promise<RecordedNativeResponse>;
 
 function encodeNativeMessage(message: unknown): Buffer {
@@ -285,6 +291,646 @@ describe('createNativeDatabaseConnection', () => {
             dispose: () => bundle.workerMethods[Symbol.dispose]()
         };
     }
+
+    it('routes generated export spool statements through one interruptible native connection', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryExportSpool') {
+                return { result: { columns: ['value'], values: [['one']], rowCount: 1 } };
+            }
+            return { result: { columns: [], values: [] } };
+        });
+        const spool = '__sqlite_explorer_export_0123456789abcdef0123456789abcdef';
+        const controller = new AbortController();
+
+        try {
+            connection.calls.length = 0;
+            await connection.databaseOps.executeQuery(
+                `CREATE TEMP TABLE "${spool}" AS SELECT 'one' AS value`,
+                undefined,
+                controller.signal
+            );
+            await connection.databaseOps.executeQuery(
+                `SELECT CAST(rowid AS TEXT), * FROM "${spool}" ` +
+                'WHERE rowid > ? ORDER BY rowid LIMIT 1',
+                [0],
+                controller.signal
+            );
+            await connection.databaseOps.executeQuery(
+                `DROP TABLE IF EXISTS temp."${spool}"`
+            );
+
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['queryExportSpool', 'queryExportSpool', 'queryExportSpool']
+            );
+            assert.ok(connection.calls.slice(0, 2).every(call => (
+                String(call.args[0]).includes(spool)
+            )));
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('loads native table identities in one schema queryBatch, including virtual and shadow tables', async () => {
+        const identityMetadata = {
+            columns: [
+                'table_name',
+                'object_type',
+                'without_rowid',
+                'column_ordinal',
+                'column_name',
+                'declared_type',
+                'primary_key_position'
+            ],
+            values: [
+                ['docs', 'table', 0, null, null, null, null],
+                ['docs_fts', 'virtual', 0, null, null, null, null],
+                ['docs_fts_data', 'shadow', 0, null, null, null, null],
+                ['records', 'table', 1, 0, 'tenant', 'TEXT', 1],
+                ['records', 'table', 1, 1, 'sequence', 'INTEGER', 2],
+                ['records', 'table', 1, 2, 'value', 'TEXT', 0]
+            ]
+        };
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [Array<{ sql: string }>];
+                return {
+                    result: {
+                        results: [
+                            {
+                                columns: ['name'],
+                                values: [['docs'], ['docs_fts'], ['docs_fts_data'], ['records']]
+                            },
+                            { columns: ['name'], values: [] },
+                            { columns: ['name', 'tbl_name'], values: [] },
+                            ...(queries.length > 3 ? [identityMetadata] : [])
+                        ]
+                    }
+                };
+            }
+            if (call.method === 'query') {
+                throw new Error('schema identity metadata must not use per-table IPC');
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            const schema = await connection.databaseOps.fetchSchema();
+
+            assert.deepStrictEqual(
+                schema.tables.map(table => [table.identifier, table.identity]),
+                [
+                    ['docs', { kind: 'rowid' }],
+                    ['docs_fts', { kind: 'rowid' }],
+                    ['docs_fts_data', { kind: 'rowid' }],
+                    ['records', {
+                        kind: 'primaryKey',
+                        columns: [
+                            { identifier: 'tenant', declaredType: 'TEXT', position: 1 },
+                            { identifier: 'sequence', declaredType: 'INTEGER', position: 2 }
+                        ]
+                    }]
+                ]
+            );
+            assert.deepStrictEqual(connection.calls.map(call => call.method), ['queryBatch']);
+            assert.strictEqual((connection.calls[0].args[0] as unknown[]).length, 4);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('routes bounded cell sessions with a structured validated row locator', async () => {
+        const metadata = { storageClass: 'blob', byteLength: 4 };
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                return {
+                    result: {
+                        columns: ['type', 'wr'],
+                        values: [['table', 0]]
+                    }
+                };
+            }
+            if (call.method === 'getCellMetadata') return { result: metadata };
+            if (call.method === 'openCellReadSession') {
+                return {
+                    result: {
+                        sessionId: 'native-session-1',
+                        metadata,
+                        expiresAt: 1234
+                    }
+                };
+            }
+            if (call.method === 'readCellChunk') {
+                return {
+                    result: {
+                        byteOffset: 0,
+                        bytes: new Uint8Array([0, 1, 2, 3]),
+                        done: true
+                    }
+                };
+            }
+            if (call.method === 'closeCellReadSession') return { result: { closed: true } };
+            return { result: { success: true } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            const target = { table: 'assets', rowId: 7, column: 'payload' };
+            assert.deepStrictEqual(await connection.databaseOps.getCellMetadata(target), metadata);
+            const session = await connection.databaseOps.openCellReadSession(target);
+            const chunk = await connection.databaseOps.readCellChunk(
+                session.sessionId,
+                0,
+                4
+            );
+            await connection.databaseOps.closeCellReadSession(session.sessionId);
+
+            assert.deepStrictEqual(chunk.bytes, new Uint8Array([0, 1, 2, 3]));
+            for (const method of ['getCellMetadata', 'openCellReadSession']) {
+                const call = connection.calls.find(candidate => candidate.method === method);
+                assert.ok(call, `missing ${method} native call`);
+                assert.deepStrictEqual(call.args, [
+                    'assets',
+                    'payload',
+                    { kind: 'rowid', value: 7 }
+                ]);
+            }
+            assert.ok(connection.calls.every(call => (
+                !['getCellMetadata', 'openCellReadSession'].includes(call.method)
+                || !call.args.some(argument => typeof argument === 'string' && /rowid\s*=/.test(argument))
+            )));
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('preserves typeless INTEGER cast flags in native primary-key cell locators', async () => {
+        const metadata = { storageClass: 'blob', byteLength: 4 };
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                const sql = String(call.args[0]);
+                if (sql.startsWith('SELECT "type", "wr" FROM pragma.pragma_table_list')) {
+                    return { result: { columns: ['type', 'wr'], values: [['table', 1]] } };
+                }
+                if (sql.startsWith('PRAGMA table_info')) {
+                    return {
+                        result: {
+                            columns: ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'],
+                            values: [
+                                [0, 'id', '', 1, null, 1],
+                                [1, 'shard', 'TEXT', 1, null, 2],
+                                [2, 'payload', 'BLOB', 0, null, 0]
+                            ]
+                        }
+                    };
+                }
+            }
+            if (call.method === 'getCellMetadata') return { result: metadata };
+            if (call.method === 'openCellReadSession') {
+                return {
+                    result: { sessionId: 'native-pk-session', metadata, expiresAt: 1234 }
+                };
+            }
+            return { result: { success: true } };
+        });
+        const columns = [
+            { identifier: 'id', declaredType: '', position: 1 },
+            { identifier: 'shard', declaredType: 'TEXT', position: 2 }
+        ];
+        const rowId = encodePrimaryKeyRecordId(columns, [9007199254740993n, 'a']);
+        const target = { table: 'assets', rowId, column: 'payload' };
+
+        try {
+            connection.calls.length = 0;
+            assert.deepStrictEqual(await connection.databaseOps.getCellMetadata(target), metadata);
+            await connection.databaseOps.openCellReadSession(target);
+            const expectedLocator = {
+                kind: 'primaryKey',
+                columns: ['id', 'shard'],
+                values: ['9007199254740993', 'a'],
+                integerCasts: [true, false]
+            };
+            for (const method of ['getCellMetadata', 'openCellReadSession']) {
+                const call = connection.calls.find(candidate => candidate.method === method);
+                assert.ok(call, `missing ${method} native call`);
+                assert.deepStrictEqual(call.args, ['assets', 'payload', expectedLocator]);
+            }
+
+            const escapeCellIdentifier = loadNativeWorkerFunction(
+                'escapeCellIdentifier',
+                ['value', 'label']
+            );
+            const isCellBinding = loadNativeWorkerFunction('isCellBinding', ['value']);
+            const buildCellLocator = loadNativeWorkerFunction(
+                'buildCellLocator',
+                ['locator'],
+                { escapeCellIdentifier, isCellBinding }
+            );
+            assert.deepStrictEqual(buildCellLocator(expectedLocator), {
+                sql: '"id" = CAST(? AS INTEGER) AND "shard" = ?',
+                params: ['9007199254740993', 'a']
+            });
+            assert.throws(
+                () => buildCellLocator({ ...expectedLocator, integerCasts: [true, '?'] }),
+                /invalid INTEGER cast flag/
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rejects oversized native new values before crossing the worker boundary', async () => {
+        const connection = await createRecordingConnection(() => ({
+            result: { changes: 1, lastInsertRowId: 1 }
+        }));
+        const limit = 1024;
+        const oversized = new Uint8Array(limit + 1);
+        try {
+            connection.calls.length = 0;
+            for (const mutation of [
+                () => connection.databaseOps.updateCell(
+                    'native_limits', 1, 'payload', oversized, undefined, limit
+                ),
+                () => connection.databaseOps.insertRow(
+                    'native_limits', { payload: oversized }, limit
+                ),
+                () => connection.databaseOps.insertRowBatch(
+                    'native_limits', [{ payload: oversized }], limit
+                ),
+                () => connection.databaseOps.updateCellBatch(
+                    'native_limits',
+                    [{ rowId: 1, column: 'payload', value: oversized }],
+                    limit
+                )
+            ]) {
+                await assert.rejects(mutation, error => {
+                    assert.ok(error instanceof CellEditPolicyError);
+                    assert.strictEqual(error.actualBytes, limit + 1);
+                    return true;
+                });
+            }
+            assert.strictEqual([...connection.calls].length, 0);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rejects a native JSON patch whose resulting stored value is oversized', async () => {
+        const prior = JSON.stringify({ a: 'x'.repeat(32) });
+        const patch = JSON.stringify({ b: 'y'.repeat(32) });
+        const limit = 64;
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [unknown[]];
+                return {
+                    result: {
+                        results: queries.map(() => ({
+                            columns: ['storage_class', 'byte_length'],
+                            values: []
+                        }))
+                    }
+                };
+            }
+            if (call.method === 'query') {
+                return { result: { columns: ['rowid', 'payload'], values: [[1, prior]] } };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.updateCellBatch(
+                    'native_patch_limits',
+                    [{ rowId: 1, column: 'payload', value: patch, operation: 'json_patch' }],
+                    limit
+                ),
+                error => {
+                    assert.ok(error instanceof CellEditPolicyError);
+                    assert.strictEqual(error.storageClass, 'text');
+                    assert.ok(error.actualBytes > limit);
+                    return true;
+                }
+            );
+            assert.strictEqual(
+                connection.calls.some(call => call.method === 'execBatch'),
+                false,
+                'native mutation must not run after the policy refusal'
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('preflights bounded rowid batches in one worker round trip', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'open') return { result: { success: true } };
+            if (call.method === 'run' || call.method === 'execBatch') {
+                return { result: { changes: 1, lastInsertRowId: 1 } };
+            }
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [Array<{ sql: string; params: unknown[] }>];
+                return {
+                    result: {
+                        results: queries.map(() => ({
+                            columns: ['storage_class', 'byte_length'],
+                            values: []
+                        }))
+                    }
+                };
+            }
+            if (call.method === 'query') {
+                return {
+                    result: {
+                        columns: ['rowid', 'left_value', 'right_value'],
+                        values: [
+                            [1, 'left-1', 'right-1'],
+                            [2, 'left-2', 'right-2'],
+                            [3, 'left-3', 'right-3']
+                        ]
+                    }
+                };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+        try {
+            connection.calls.length = 0;
+            const outcomes = await connection.databaseOps.updateCellBatch(
+                'native_batch_preflight',
+                [1, 2, 3].flatMap(rowId => [
+                    { rowId, column: 'left_value', value: 'same-left' },
+                    { rowId, column: 'right_value', value: 'same-right' }
+                ]),
+                1024
+            );
+
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['run', 'queryBatch', 'query', 'execBatch', 'run']
+            );
+            const preflightCall = connection.calls[1];
+            const [queries] = preflightCall.args as [Array<{ sql: string; params: unknown[] }>];
+            assert.strictEqual(queries.length, 2);
+            assert.ok(queries.every(query => /rowid\s+IN\s*\(/i.test(query.sql)));
+            assert.ok(queries.some(query => /"left_value"/.test(query.sql)));
+            assert.ok(queries.some(query => /"right_value"/.test(query.sql)));
+            assert.strictEqual(outcomes.length, 6);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('refuses an oversized native batch prior before reading values or writing', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'open') return { result: { success: true } };
+            if (call.method === 'run') return { result: { changes: 0 } };
+            if (call.method === 'queryBatch') {
+                return {
+                    result: {
+                        results: [{
+                            columns: ['storage_class', 'byte_length'],
+                            values: [['blob', 2048]]
+                        }]
+                    }
+                };
+            }
+            throw new Error(`unexpected native call: ${call.method}`);
+        });
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.updateCellBatch(
+                    'native_batch_oversized_prior',
+                    [
+                        { rowId: 1, column: 'payload', value: 'bounded' },
+                        { rowId: 2, column: 'payload', value: 'bounded' }
+                    ],
+                    1024
+                ),
+                error => {
+                    assert.ok(error instanceof OversizedCellReplacementRequiredError);
+                    assert.strictEqual(error.storageClass, 'blob');
+                    assert.strictEqual(error.actualBytes, 2048);
+                    return true;
+                }
+            );
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['run', 'queryBatch', 'run', 'run']
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('refuses aggregate native batch history before opening a savepoint', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [Array<{ sql: string }>];
+                return {
+                    result: {
+                        results: queries.map(query => (
+                            /SELECT COUNT\(\*\), COALESCE\(SUM/i.test(query.sql)
+                                ? { columns: ['COUNT(*)', 'value_bytes'], values: [[4, 2 * 1024 * 1024]] }
+                                : { columns: ['storage_class', 'byte_length'], values: [] }
+                        ))
+                    }
+                };
+            }
+            if (call.method === 'query') {
+                return {
+                    result: {
+                        columns: ['rowid', 'payload'],
+                        values: [1, 2, 3, 4].map(rowId => [rowId, 'x'])
+                    }
+                };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                (connection.databaseOps.updateCellBatch as any)(
+                    'native_aggregate_history',
+                    [1, 2, 3, 4].map(rowId => ({
+                        rowId,
+                        column: 'payload',
+                        value: 'after'
+                    })),
+                    1024 * 1024,
+                    700 * 1024
+                ),
+                /Batch update undo snapshot exceeds the 716800-byte memory budget/i
+            );
+            assert.strictEqual(
+                connection.calls.some(call => (
+                    call.method === 'run' && /^SAVEPOINT /.test(String(call.args[0]))
+                )),
+                false,
+                'native aggregate refusal must precede the savepoint'
+            );
+            assert.strictEqual(connection.calls.some(call => call.method === 'execBatch'), false);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('refuses oversized native delete history before selecting row values or deleting', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'open') {
+                return { result: { success: true } };
+            }
+            if (call.method === 'run') {
+                return { result: { changes: 0 } };
+            }
+            if (call.method === 'query') {
+                const sql = String(call.args[0]);
+                if (sql.includes('pragma_table_xinfo')) {
+                    return { result: { columns: ['name'], values: [['payload']] } };
+                }
+                if (/SELECT COUNT\(\*\), COALESCE\(SUM/i.test(sql)) {
+                    return {
+                        result: {
+                            columns: ['COUNT(*)', 'value_bytes'],
+                            values: [[1, 2 * 1024 * 1024]]
+                        }
+                    };
+                }
+            }
+            throw new Error(`unexpected native call: ${call.method}`);
+        });
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.deleteRows('native_large_delete', [1], 1024),
+                /undo snapshot exceeds.*memory budget/i
+            );
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['run', 'query', 'query', 'run', 'run']
+            );
+            assert.ok(connection.calls.every(call => {
+                const sql = String(call.args[0]);
+                return !/SELECT CAST\(rowid AS TEXT\)/i.test(sql)
+                    && !/^DELETE\s/i.test(sql);
+            }));
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('lets native history restore a legacy oversized prior while public edits remain guarded', async () => {
+        const connection = await createRecordingConnection(() => ({
+            result: { changes: 1, lastInsertRowId: 1 }
+        }));
+        const legacyValue = new Uint8Array(DEFAULT_MAX_CELL_EDIT_BYTES + 1);
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.updateCell(
+                    'native_legacy_history', 1, 'payload', legacyValue
+                ),
+                CellEditPolicyError
+            );
+
+            await connection.databaseOps.undoModification({
+                modificationType: 'cell_update',
+                description: 'legacy oversized prior',
+                targetTable: 'native_legacy_history',
+                targetRowId: 1,
+                targetColumn: 'payload',
+                priorValue: legacyValue,
+                newValue: Uint8Array.from([1])
+            });
+            assert.deepStrictEqual(connection.calls.map(call => call.method), ['run']);
+            const runParams = connection.calls[0].args[1] as unknown[];
+            const restoredValue = runParams[0];
+            assert.ok(restoredValue instanceof Uint8Array);
+            assert.strictEqual(restoredValue.byteLength, legacyValue.byteLength);
+            assert.strictEqual(restoredValue[0], 0);
+            assert.strictEqual(restoredValue.at(-1), 0);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('uses the native guarded replacement command without reading the prior value', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                return {
+                    result: {
+                        columns: ['type', 'wr'],
+                        values: [['table', 0]]
+                    }
+                };
+            }
+            if (call.method === 'replaceOversizedCell') {
+                return { result: { changes: 1 } };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+        try {
+            connection.calls.length = 0;
+            await connection.databaseOps.replaceOversizedCell(
+                'native_large',
+                7,
+                'payload',
+                'bounded',
+                { storageClass: 'blob', byteLength: 2048 },
+                1024
+            );
+
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['query', 'replaceOversizedCell']
+            );
+            const guarded = connection.calls[1];
+            assert.deepStrictEqual(guarded.args, [
+                'native_large',
+                'payload',
+                { kind: 'rowid', value: 7 },
+                'bounded',
+                { storageClass: 'blob', byteLength: 2048 },
+                1024
+            ]);
+            assert.ok(connection.calls.every(call => (
+                call.method !== 'query'
+                || !/SELECT\s+"payload"/i.test(String(call.args[0]))
+            )));
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('refuses an unconfirmed oversized native prior using metadata only', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'open') return { result: { success: true } };
+            if (call.method === 'run') return { result: { changes: 0 } };
+            if (call.method === 'getCellMetadata') {
+                return { result: { storageClass: 'blob', byteLength: 2048 } };
+            }
+            throw new Error(`unexpected native call: ${call.method}`);
+        });
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.updateCell(
+                    'native_large', 7, 'payload', 'bounded', undefined, 1024
+                ),
+                error => {
+                    assert.ok(error instanceof OversizedCellReplacementRequiredError);
+                    assert.strictEqual(error.actualBytes, 2048);
+                    return true;
+                }
+            );
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['run', 'getCellMetadata']
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
 
     it('should throw an error with context when database opening fails', async () => {
         let mockProcess: any;
@@ -528,7 +1174,7 @@ describe('createNativeDatabaseConnection', () => {
         });
 
         let undoPromise: Promise<void> | undefined;
-        let updatePromise: Promise<void> | undefined;
+        let updatePromise: Promise<unknown> | undefined;
         try {
             connection.calls.length = 0;
             undoPromise = connection.databaseOps.undoModification({
@@ -580,7 +1226,7 @@ describe('createNativeDatabaseConnection', () => {
                 }
             });
             if (undoPromise || updatePromise) {
-                await Promise.allSettled([undoPromise, updatePromise].filter(Boolean) as Promise<void>[]);
+                await Promise.allSettled([undoPromise, updatePromise].filter(Boolean) as Promise<unknown>[]);
             }
             connection.dispose();
         }
@@ -687,7 +1333,36 @@ describe('createNativeDatabaseConnection', () => {
     });
 
     it('replays column_drop redo by dropping recorded dependent indexes first', async () => {
-        const connection = await createRecordingConnection();
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                const sql = String(call.args[0]);
+                if (sql.includes('sqlite_schema')) {
+                    return {
+                        result: {
+                            columns: ['type', 'name', 'sql'],
+                            values: [['table', 'docs', 'CREATE TABLE docs (id INTEGER PRIMARY KEY)']]
+                        }
+                    };
+                }
+                if (sql.startsWith('PRAGMA table_info')) {
+                    return {
+                        result: {
+                            columns: ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'],
+                            values: [[0, 'id', 'INTEGER', 0, null, 1]]
+                        }
+                    };
+                }
+                if (sql.includes('pragma_table_list')) {
+                    return {
+                        result: {
+                            columns: ['type', 'wr'],
+                            values: [['table', 0]]
+                        }
+                    };
+                }
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
 
         try {
             connection.calls.length = 0;
@@ -700,18 +1375,113 @@ describe('createNativeDatabaseConnection', () => {
                 droppedIndexes: ['idx_docs_payload']
             });
 
-            assert.strictEqual(connection.calls.length, 1);
-            const call = connection.calls[0];
-            assert.strictEqual(call.method, 'execBatch');
-
-            const batch = call.args[0] as { sql: string }[];
             assert.deepStrictEqual(
-                batch.map(item => item.sql),
+                connection.calls
+                    .filter(call => call.method === 'run')
+                    .map(call => String(call.args[0]))
+                    .slice(1, -1),
                 [
                     `DROP INDEX IF EXISTS "idx_docs_payload"`,
                     `ALTER TABLE "docs" DROP COLUMN "payload"`
                 ]
             );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('captures native post-drop state before releasing the delete savepoint', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                const sql = String(call.args[0]);
+                if (sql.includes('sqlite_schema')) {
+                    return {
+                        result: {
+                            columns: ['type', 'name', 'sql'],
+                            values: [['table', 'docs', 'CREATE TABLE docs (id INTEGER PRIMARY KEY)']]
+                        }
+                    };
+                }
+                if (sql.startsWith('PRAGMA table_info')) {
+                    return {
+                        result: {
+                            columns: ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'],
+                            values: [[0, 'id', 'INTEGER', 0, null, 1]]
+                        }
+                    };
+                }
+                if (sql.includes('pragma_table_list')) {
+                    return {
+                        result: {
+                            columns: ['type', 'wr'],
+                            values: [['table', 0]]
+                        }
+                    };
+                }
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            connection.calls.length = 0;
+
+            const stateAfter = await connection.databaseOps.deleteColumns(
+                'docs',
+                ['payload'],
+                ['idx_docs_payload']
+            );
+
+            assert.deepStrictEqual(stateAfter, {
+                tableSql: 'CREATE TABLE docs (id INTEGER PRIMARY KEY)',
+                columns: ['id'],
+                identity: { kind: 'rowid' },
+                schemaObjects: []
+            });
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['run', 'run', 'run', 'query', 'query', 'query', 'run']
+            );
+            assert.match(String(connection.calls[0].args[0]), /^SAVEPOINT /);
+            assert.strictEqual(
+                connection.calls[1].args[0],
+                'DROP INDEX IF EXISTS "idx_docs_payload"'
+            );
+            assert.strictEqual(
+                connection.calls[2].args[0],
+                'ALTER TABLE "docs" DROP COLUMN "payload"'
+            );
+            assert.match(String(connection.calls.at(-1)?.args[0]), /^RELEASE /);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rolls back the native column drop when post-drop capture fails', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (
+                call.method === 'query'
+                && String(call.args[0]).includes('sqlite_schema')
+            ) {
+                throw new Error('post-drop snapshot failed');
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            connection.calls.length = 0;
+
+            await assert.rejects(
+                connection.databaseOps.deleteColumns('docs', ['payload']),
+                /post-drop snapshot failed/
+            );
+
+            const runSql = connection.calls
+                .filter(call => call.method === 'run')
+                .map(call => String(call.args[0]));
+            assert.match(runSql[0], /^SAVEPOINT /);
+            assert.strictEqual(runSql[1], 'ALTER TABLE "docs" DROP COLUMN "payload"');
+            assert.strictEqual(runSql[2], `ROLLBACK TO ${runSql[0].slice('SAVEPOINT '.length)}`);
+            assert.strictEqual(runSql[3], `RELEASE ${runSql[0].slice('SAVEPOINT '.length)}`);
         } finally {
             connection.dispose();
         }
@@ -930,14 +1700,71 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
+    it('routes a superseded native preview abort to its bounded worker query', async () => {
+        const queryStarted = createDeferred<RecordedNativeCall>();
+        const queryResponse = createDeferred<RecordedNativeResponse>();
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA main.table_info')) {
+                return { result: { columns: ['cid', 'name'], values: [[0, 'value']] } };
+            }
+            if (call.method === 'queryBounded') {
+                queryStarted.resolve(call);
+                return queryResponse.promise;
+            }
+            return { result: { columns: [], values: [] } };
+        });
+        const controller = new AbortController();
+        const cancellation = new DOMException('Superseded preview', 'AbortError');
+        const preview = connection.databaseOps.previewViewDefinition(
+            'cancelled_preview',
+            'SELECT 1 AS value',
+            10,
+            'create',
+            controller.signal
+        );
+
+        try {
+            const queryCall = await queryStarted.promise;
+            controller.abort(cancellation);
+            await new Promise(resolve => setImmediate(resolve));
+
+            const cancelCall = connection.calls.find(call => call.method === 'cancel');
+            assert.ok(cancelCall, 'preview cancellation must reach the native worker');
+            assert.deepStrictEqual(cancelCall.args, [queryCall.id]);
+            queryResponse.resolve({
+                error: '[queryBounded] Operation cancelled',
+                cancelled: true
+            });
+            await assert.rejects(preview, error => error === cancellation);
+        } finally {
+            queryResponse.resolve({ error: 'test cleanup' });
+            await preview.catch(() => {});
+            connection.dispose();
+        }
+    });
+
     it('merges native and companion exact numeric text maps with native entries winning', async () => {
         const columns = ['rowid', ...Array.from({ length: 1000 }, (_, index) => `c${index}`)];
-        const sourceRow = [1, 1.25, 2.5, ...Array.from({ length: 998 }, () => 0)];
+        // queryNumeric receives the bounded transport SELECT, whose final
+        // private column packs one empty containment token per numeric value.
+        const transportColumns = [
+            ...columns,
+            '__sqlite_explorer_cell_metadata',
+            '__sqlite_explorer_cell_raw_text_0'
+        ];
+        const sourceRow = [
+            1,
+            1.25,
+            2.5,
+            ...Array.from({ length: 998 }, () => 0),
+            '|'.repeat(columns.length - 1),
+            null
+        ];
         const connection = await createRecordingConnection(call => {
             if (call.method === 'queryNumeric') {
                 return {
                     result: {
-                        columns,
+                        columns: transportColumns,
                         values: [sourceRow],
                         exactIntegerTexts: { 0: { 2: '2.50000000000001' } }
                     }
@@ -945,9 +1772,18 @@ describe('createNativeDatabaseConnection', () => {
             }
             if (
                 call.method === 'query'
-                && String(call.args[0]).includes('pragma_table_list')
+                && String(call.args[0]).startsWith('SELECT "type", "wr" FROM pragma.pragma_table_list')
+            ) {
+                return { result: { columns: ['type', 'wr'], values: [['table', 0]] } };
+            }
+            if (
+                call.method === 'query'
+                && String(call.args[0]).startsWith('SELECT 1 FROM pragma.pragma_table_list')
             ) {
                 return { result: { columns: ['1'], values: [[1]] } };
+            }
+            if (call.method === 'query' && call.args[0] === 'PRAGMA encoding') {
+                return { result: { columns: ['encoding'], values: [['UTF-8']] } };
             }
             if (call.method === 'queryBatch') {
                 const [queries] = call.args as [Array<{ sql: string; params: unknown[] }>];
@@ -1000,7 +1836,7 @@ describe('createNativeDatabaseConnection', () => {
             const mainReadIndex = connection.calls.findIndex(call => call.method === 'queryNumeric');
             const authorityReadIndex = connection.calls.findIndex(call => (
                 call.method === 'query'
-                && String(call.args[0]).includes('pragma_table_list')
+                && String(call.args[0]).startsWith('SELECT 1 FROM pragma.pragma_table_list')
             ));
             const companionBatchIndices = connection.calls
                 .map((call, index) => ({ call, index }))
@@ -1039,7 +1875,13 @@ describe('createNativeDatabaseConnection', () => {
             }
             if (
                 call.method === 'query'
-                && String(call.args[0]).includes('pragma_table_list')
+                && String(call.args[0]).startsWith('SELECT "type", "wr" FROM pragma.pragma_table_list')
+            ) {
+                return { result: { columns: ['type', 'wr'], values: [['table', 0]] } };
+            }
+            if (
+                call.method === 'query'
+                && String(call.args[0]).startsWith('SELECT 1 FROM pragma.pragma_table_list')
             ) {
                 return { result: { columns: ['1'], values: [[1]] } };
             }
@@ -1640,10 +2482,12 @@ describe('NativeWorkerProcess', () => {
 
     it('marks native request deadlines as invocation timeouts for recovery', async () => {
         const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
-        (worker as any).process = {
+        let killCount = 0;
+        const fakeProcess = {
             stdin: { write: () => true },
-            kill: () => {}
+            kill: () => { killCount++; }
         };
+        (worker as any).process = fakeProcess;
 
         try {
             await assert.rejects(
@@ -1655,9 +2499,324 @@ describe('NativeWorkerProcess', () => {
                     return true;
                 }
             );
+            assert.strictEqual(killCount, 0);
+            assert.strictEqual((worker as any).process, fakeProcess);
         } finally {
             worker.stop();
         }
+    });
+
+    it('kills abandoned native open work when its host deadline expires', async () => {
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        let killCount = 0;
+        (worker as any).process = {
+            stdin: { write: () => true },
+            kill: () => { killCount++; }
+        };
+
+        await assert.rejects(
+            worker.call('open', [], 1),
+            (error: unknown) => {
+                assert.ok(error instanceof InvocationTimeoutError);
+                assert.strictEqual(error.methodName, 'open');
+                assert.strictEqual(error.message, 'Request open timed out');
+                return true;
+            }
+        );
+        assert.strictEqual(killCount, 1);
+        assert.strictEqual((worker as any).process, null);
+        assert.strictEqual((worker as any).pendingRequests.size, 0);
+    });
+
+    it('routes an in-flight bounded-query abort to the worker correlation id', async () => {
+        const calls: RecordedNativeCall[] = [];
+        const mockProcess = createRecordingNativeProcess(calls);
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        (worker as any).process = {
+            stdin: mockProcess.stdin,
+            kill: () => {}
+        };
+        const controller = new AbortController();
+        const cancellation = new DOMException('Cancelled by test', 'AbortError');
+        let queryPromise: Promise<unknown> | undefined;
+
+        try {
+            queryPromise = worker.call('queryBounded', [], 1000, controller.signal);
+            await new Promise(resolve => setImmediate(resolve));
+            const queryCall = calls.find(call => call.method === 'queryBounded');
+            assert.ok(queryCall, 'bounded query must be dispatched before cancellation');
+
+            controller.abort(cancellation);
+            await new Promise(resolve => setImmediate(resolve));
+
+            const cancelCall = calls.find(call => call.method === 'cancel');
+            assert.ok(cancelCall, 'aborting the host signal must send a cancel verb');
+            assert.deepStrictEqual(cancelCall.args, [queryCall.id]);
+
+            (worker as any).handleMessage({
+                id: queryCall.id,
+                error: '[queryBounded] Operation cancelled',
+                cancelled: true
+            });
+            await assert.rejects(queryPromise, error => error === cancellation);
+            queryPromise = undefined;
+        } finally {
+            if (queryPromise) {
+                const queryCall = calls.find(call => call.method === 'queryBounded');
+                if (queryCall) {
+                    (worker as any).handleMessage({ id: queryCall.id, error: 'test cleanup' });
+                }
+                await queryPromise.catch(() => {});
+            }
+            worker.stop();
+        }
+    });
+
+    it('routes an in-flight export-spool abort to the worker correlation id', async () => {
+        const calls: RecordedNativeCall[] = [];
+        const mockProcess = createRecordingNativeProcess(calls);
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        (worker as any).process = {
+            stdin: mockProcess.stdin,
+            kill: () => {}
+        };
+        const controller = new AbortController();
+        const cancellation = new DOMException('Cancelled export spool', 'AbortError');
+        let queryPromise: Promise<unknown> | undefined;
+
+        try {
+            queryPromise = worker.call('queryExportSpool', [], 1000, controller.signal);
+            await new Promise(resolve => setImmediate(resolve));
+            const queryCall = calls.find(call => call.method === 'queryExportSpool');
+            assert.ok(queryCall, 'export spool must be dispatched before cancellation');
+
+            controller.abort(cancellation);
+            await new Promise(resolve => setImmediate(resolve));
+
+            const cancelCall = calls.find(call => call.method === 'cancel');
+            assert.ok(cancelCall, 'aborting the export signal must send a cancel verb');
+            assert.deepStrictEqual(cancelCall.args, [queryCall.id]);
+
+            (worker as any).handleMessage({
+                id: queryCall.id,
+                error: '[queryExportSpool] Operation cancelled',
+                cancelled: true
+            });
+            await assert.rejects(queryPromise, error => error === cancellation);
+            queryPromise = undefined;
+        } finally {
+            if (queryPromise) {
+                const queryCall = calls.find(call => call.method === 'queryExportSpool');
+                if (queryCall) {
+                    (worker as any).handleMessage({ id: queryCall.id, error: 'test cleanup' });
+                }
+                await queryPromise.catch(() => {});
+            }
+            worker.stop();
+        }
+    });
+});
+
+describe('native async bounded-query capability routing', () => {
+    const loadProbeAsyncDatabase = (dependencies: Record<string, unknown> = {}) => loadNativeWorkerFunction(
+        'probeAsyncDatabase',
+        ['candidate'],
+        dependencies
+    );
+
+    it('requires the complete AsyncDatabase surface', async () => {
+        const probeAsyncDatabase = loadProbeAsyncDatabase();
+
+        assert.strictEqual(await probeAsyncDatabase({ all() {}, run() {} }), false);
+    });
+
+    it('retries an inconclusive completion with a larger query before succeeding', async () => {
+        const probeAsyncDatabase = loadProbeAsyncDatabase();
+        const probeSql: string[] = [];
+        let probeCalls = 0;
+        let healthChecks = 0;
+        const candidate = {
+            close() {},
+            run() {},
+            async all(sql: string, _params: unknown[], options?: { signal?: AbortSignal }) {
+                if (!options?.signal) {
+                    healthChecks++;
+                    return [{ value: 1 }];
+                }
+
+                probeSql.push(sql);
+                probeCalls++;
+                if (probeCalls === 1) {
+                    // Simulate completion winning the event-loop race, so the
+                    // scheduled abort was never delivered in flight.
+                    return [{ value: 1 }];
+                }
+                await new Promise<void>((_resolve, reject) => {
+                    options.signal!.addEventListener(
+                        'abort',
+                        () => reject(new Error('Aborted')),
+                        { once: true }
+                    );
+                });
+                return [{ value: 1 }];
+            }
+        };
+
+        assert.strictEqual(await probeAsyncDatabase(candidate), true);
+        assert.strictEqual(probeCalls, 2);
+        assert.strictEqual(healthChecks, 1);
+        assert.match(probeSql[0], /value < 1000000/);
+        assert.match(probeSql[1], /value < 8000000/);
+    });
+
+    it('keeps a starved abort pending so it can land during the retry', async () => {
+        interface ProbeTimer {
+            callback: () => void;
+            cleared: boolean;
+        }
+        const timers: ProbeTimer[] = [];
+        const probeAsyncDatabase = loadProbeAsyncDatabase({
+            setTimeout(callback: () => void, delayMs: number) {
+                assert.strictEqual(delayMs, 10);
+                const timer = { callback, cleared: false };
+                timers.push(timer);
+                return timer;
+            },
+            clearTimeout(timer: ProbeTimer) {
+                timer.cleared = true;
+            }
+        });
+        let probeCalls = 0;
+        const candidate = {
+            close() {},
+            run() {},
+            async all(_sql: string, _params: unknown[], options?: { signal?: AbortSignal }) {
+                if (!options?.signal) return [{ value: 1 }];
+
+                probeCalls++;
+                if (probeCalls === 1) return [{ value: 1 }];
+                await new Promise<void>((resolve, reject) => {
+                    options.signal!.addEventListener(
+                        'abort',
+                        () => reject(new Error('Aborted')),
+                        { once: true }
+                    );
+                    const originalTimer = timers[0];
+                    if (originalTimer && !originalTimer.cleared) {
+                        originalTimer.callback();
+                    } else {
+                        resolve();
+                    }
+                });
+                return [{ value: 1 }];
+            }
+        };
+
+        assert.strictEqual(await probeAsyncDatabase(candidate), true);
+        assert.strictEqual(probeCalls, 2);
+        assert.strictEqual(timers.length, 1);
+        assert.strictEqual(timers[0].cleared, true);
+    });
+
+    it('reports unsupported when an in-flight abort is demonstrably ignored', async () => {
+        const probeAsyncDatabase = loadProbeAsyncDatabase();
+        let probeCalls = 0;
+        let healthChecks = 0;
+        const candidate = {
+            close() {},
+            run() {},
+            async all(_sql: string, _params: unknown[], options?: { signal?: AbortSignal }) {
+                if (!options?.signal) {
+                    healthChecks++;
+                    return [{ value: 1 }];
+                }
+
+                probeCalls++;
+                await new Promise<void>(resolve => {
+                    options.signal!.addEventListener('abort', () => resolve(), { once: true });
+                });
+                return [{ value: 1 }];
+            }
+        };
+
+        assert.strictEqual(await probeAsyncDatabase(candidate), false);
+        assert.strictEqual(probeCalls, 1);
+        assert.strictEqual(healthChecks, 0);
+    });
+
+    it('accepts first-try signal support and verifies connection health', async () => {
+        const probeAsyncDatabase = loadNativeWorkerFunction(
+            'probeAsyncDatabase',
+            ['candidate']
+        );
+        const calls: string[] = [];
+        const candidate = {
+            close() {},
+            run() {},
+            async all(sql: string, _params: unknown[], options?: { signal?: AbortSignal }) {
+                calls.push(sql);
+                if (options?.signal) {
+                    await new Promise<void>((_resolve, reject) => {
+                        options.signal!.addEventListener(
+                            'abort',
+                            () => reject(new Error('Aborted')),
+                            { once: true }
+                        );
+                    });
+                }
+                return [{ value: 1 }];
+            }
+        };
+
+        assert.strictEqual(await probeAsyncDatabase(candidate), true);
+        assert.strictEqual(calls.length, 2);
+        assert.match(calls[0], /WITH RECURSIVE sqlite_explorer_probe/);
+        assert.strictEqual(calls[1], 'SELECT 1 AS value');
+    });
+
+    it('keeps bounded reads on the sync connection unless no transaction is active', () => {
+        const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(
+            'isExplicitlyOutsideTransaction',
+            ['database']
+        );
+        const shouldUseAsyncDatabase = loadNativeWorkerFunction(
+            'shouldUseAsyncDatabase',
+            ['database', 'asyncDatabase'],
+            { isExplicitlyOutsideTransaction }
+        );
+        const asyncDatabase = {};
+
+        assert.strictEqual(shouldUseAsyncDatabase({ inTransaction: false }, asyncDatabase), true);
+        assert.strictEqual(shouldUseAsyncDatabase({ inTransaction: true }, asyncDatabase), false);
+        assert.strictEqual(shouldUseAsyncDatabase({ inTransaction: () => false }, asyncDatabase), true);
+        assert.strictEqual(shouldUseAsyncDatabase({ inTransaction: () => true }, asyncDatabase), false);
+        assert.strictEqual(shouldUseAsyncDatabase({}, asyncDatabase), false);
+        assert.strictEqual(shouldUseAsyncDatabase({ inTransaction: false }, null), false);
+    });
+
+    it('routes cancel only to the matching active operation', () => {
+        const activeOperations = new Map<number, {
+            controller: { abort(): void };
+            reason?: string;
+        }>();
+        const cancelOperation = loadNativeWorkerFunction(
+            'cancelOperation',
+            ['correlationId'],
+            { activeOperations }
+        );
+        let aborts = 0;
+        const operation = {
+            controller: { abort() { aborts++; } },
+            reason: undefined
+        };
+        activeOperations.set(41, operation);
+
+        assert.strictEqual(cancelOperation(99), false);
+        assert.strictEqual(cancelOperation(41), true);
+        assert.strictEqual(operation.reason, 'host');
+        assert.strictEqual(aborts, 1);
+        assert.strictEqual(cancelOperation(41), true);
+        assert.strictEqual(aborts, 1, 'duplicate cancel frames must not abort twice');
     });
 });
 

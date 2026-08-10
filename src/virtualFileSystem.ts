@@ -2,18 +2,38 @@ import * as vsc from 'vscode';
 import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier, validateRowId } from './core/sql-utils';
 import {
+    buildRecordIdentityPredicate,
+    classifyTableIdentity,
+    isPrimaryKeyRecordId,
+    primaryKeyColumnsFromTableInfo
+} from './core/row-identity';
+import {
     isViewDefinitionConflictError,
     isViewDefinitionSnapshotCurrent,
     isViewTriggerSnapshotCurrent
 } from './core/view-utils';
 import { GlobalOutputChannel } from './main';
+import { getMaxInlineCellBytes } from './config';
+import {
+    assertCellValueWithinEditLimit,
+    DEFAULT_MAX_CELL_EDIT_BYTES,
+    formatOversizedCellReplacementWarning,
+    isOversizedCellReplacementConflictError,
+    isOversizedCellReplacementRequiredError
+} from './core/cell-edit-policy';
 
 import type {
     DatabaseDocument,
     DocumentContentChange,
     DocumentModification
 } from './databaseModel';
-import type { ViewDefinition, ViewEditResult, ViewTriggerDefinition } from './core/types';
+import type {
+    RecordId,
+    TableIdentity,
+    ViewDefinition,
+    ViewEditResult,
+    ViewTriggerDefinition
+} from './core/types';
 
 interface ViewDocumentMetadata {
     ctime: number;
@@ -34,6 +54,12 @@ interface ViewDocumentMetadata {
     size?: number;
 }
 
+interface CellDocumentTarget {
+    uri: vsc.Uri;
+    table: string;
+    rowId: RecordId;
+}
+
 function getViewDefinitionErrorDetail(error: unknown): string {
     const rawMessage = error instanceof Error ? error.message : String(error);
     const sqliteMessage = rawMessage
@@ -47,14 +73,46 @@ function getViewDefinitionErrorDetail(error: unknown): string {
 export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     readonly onDidChangeFile: vsc.Event<vsc.FileChangeEvent[]>;
     private _emitter = new vsc.EventEmitter<vsc.FileChangeEvent[]>();
+    /**
+     * TextDocument URIs are immutable for the lifetime of an open VS Code
+     * document. Keep the current PK target behind that stable resource URI so
+     * saving a key member can retarget subsequent reads and saves without
+     * closing the editor or replacing its buffer.
+     */
+    private readonly cellDocumentTargets = new WeakMap<
+        DatabaseDocument,
+        Map<string, CellDocumentTarget>
+    >();
     private readonly viewDocumentMetadata = new Map<
         DatabaseDocument,
         Map<string, ViewDocumentMetadata>
     >();
-    private readonly viewDocumentDisposals = new Map<DatabaseDocument, vsc.Disposable>();
+    private readonly documentDisposals = new Map<DatabaseDocument, vsc.Disposable>();
 
     constructor() {
         this.onDidChangeFile = this._emitter.event;
+    }
+
+    private async resolveTableIdentity(
+        document: DatabaseDocument,
+        table: string
+    ): Promise<TableIdentity> {
+        const metadata = await document.databaseOperations.executeQuery(
+            `SELECT "type", "wr" FROM pragma.pragma_table_list ` +
+            `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
+            [table]
+        );
+        if ((metadata[0]?.rows.length ?? 0) === 0) throw new Error(`Table not found: ${table}`);
+        const kind = classifyTableIdentity(metadata[0].rows[0][0], metadata[0].rows[0][1]);
+        if (!kind) throw new Error(`Table not found: ${table}`);
+        if (kind === 'rowid') return { kind: 'rowid' };
+        const columns = primaryKeyColumnsFromTableInfo(
+            await document.databaseOperations.getTableInfo(table)
+        );
+        if (columns.length === 0) {
+            throw new Error(`WITHOUT ROWID table ${table} has no declared primary key`);
+        }
+        return { kind: 'primaryKey', columns };
     }
 
     watch(uri: vsc.Uri, options: { recursive: boolean; excludes: string[] }): vsc.Disposable {
@@ -62,6 +120,16 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     }
 
     async stat(uri: vsc.Uri): Promise<vsc.FileStat> {
+        if (this.isLogicalDirectory(uri)) {
+            const now = Date.now();
+            return {
+                type: vsc.FileType.Directory,
+                ctime: now,
+                mtime: now,
+                size: 0
+            };
+        }
+
         const { document, table, rowId } = this.parseUri(uri);
 
         if (rowId === '__view__.sql') {
@@ -112,6 +180,10 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
     }
 
     async createDirectory(uri: vsc.Uri): Promise<void> {
+        // workspace.fs.writeFile has mkdirp semantics. These directories are
+        // logical URI ancestors, so creating an existing one is an idempotent
+        // no-op; actual cell resources remain non-creatable as directories.
+        if (this.isLogicalDirectory(uri)) return;
         throw vsc.FileSystemError.NoPermissions();
     }
 
@@ -157,11 +229,35 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             }
 
             const colName = column;
-            let validatedRowId;
+            const targetRowId = this.getCellDocumentTarget(document, uri, table, rowId);
+            let rowPredicate: ReturnType<typeof buildRecordIdentityPredicate>;
             try {
-                validatedRowId = validateRowId(rowId);
+                if (isPrimaryKeyRecordId(targetRowId)) {
+                    const identity = await this.resolveTableIdentity(document, table);
+                    rowPredicate = buildRecordIdentityPredicate(targetRowId, identity);
+                } else {
+                    const validatedRowId = validateRowId(targetRowId);
+                    rowPredicate = { sql: 'rowid = ?', params: [validatedRowId] };
+                }
             } catch {
                 return new TextEncoder().encode(`Invalid Row ID: ${rowId}`);
+            }
+
+            if (typeof document.databaseOperations.getCellMetadata === 'function') {
+                const metadata = await document.databaseOperations.getCellMetadata({
+                    table,
+                    rowId: targetRowId,
+                    column: colName
+                });
+                if (metadata.byteLength > getMaxInlineCellBytes()) {
+                    throw vsc.FileSystemError.NoPermissions(
+                        `This oversized ${metadata.storageClass.toUpperCase()} cell is ` +
+                        `${metadata.byteLength.toLocaleString()} bytes and cannot be returned by ` +
+                        'FileSystemProvider.readFile. Open it from the grid to use a read-only ' +
+                        'temporary-file document. Export the cell instead if temporary ' +
+                        'materialization is unavailable.'
+                    );
+                }
             }
 
             const escapedColumn = escapeIdentifier(colName);
@@ -172,8 +268,8 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 `SELECT ${escapedColumn}, ` +
                 `CASE WHEN typeof(${escapedColumn}) IN ('integer', 'real') ` +
                 `THEN CAST(${escapedColumn} AS TEXT) END ` +
-                `FROM ${escapeIdentifier(table)} WHERE rowid = ?`;
-            const result = await document.databaseOperations.executeQuery(query, [validatedRowId]);
+                `FROM ${escapeIdentifier(table)} WHERE ${rowPredicate.sql}`;
+            const result = await document.databaseOperations.executeQuery(query, rowPredicate.params);
 
             const value = result?.[0]?.rows?.[0]?.[0];
             const exactNumericText = result?.[0]?.rows?.[0]?.[1];
@@ -219,6 +315,14 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             // writes must stop before decoding content or recording dirty edits.
             throw vsc.FileSystemError.NoPermissions('Database is read-only');
         }
+
+        const runTrackedMutation = typeof document.runTrackedMutation === 'function'
+            ? document.runTrackedMutation.bind(document)
+            : async <T>(
+                operation: () => T | PromiseLike<T>,
+                _recordsHistory: boolean = false
+            ) => operation();
+        return runTrackedMutation(async () => {
 
         if (rowId === '__view__.sql') {
             const metadata = this.getViewDocumentMetadata(document, uri, table);
@@ -307,9 +411,18 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         }
 
         try {
-            let validatedRowId;
+            const targetRowId = this.getCellDocumentTarget(document, uri, table, rowId);
+            let validatedRowId: RecordId;
+            let rowPredicate: ReturnType<typeof buildRecordIdentityPredicate>;
             try {
-                validatedRowId = validateRowId(rowId);
+                if (isPrimaryKeyRecordId(targetRowId)) {
+                    const identity = await this.resolveTableIdentity(document, table);
+                    rowPredicate = buildRecordIdentityPredicate(targetRowId, identity);
+                    validatedRowId = targetRowId;
+                } else {
+                    validatedRowId = validateRowId(targetRowId);
+                    rowPredicate = { sql: 'rowid = ?', params: [validatedRowId] };
+                }
             } catch {
                 throw vsc.FileSystemError.Unavailable('Invalid Row ID');
             }
@@ -328,26 +441,138 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             } catch {
                 // Keep as Uint8Array, treating as BLOB
             }
+            const editLimitBytes = DEFAULT_MAX_CELL_EDIT_BYTES;
+            assertCellValueWithinEditLimit(value, editLimitBytes);
 
-            await document.databaseOperations.updateCell(table, validatedRowId, column, value);
+            while (true) {
+                const metadata = await document.databaseOperations.getCellMetadata({
+                    table,
+                    rowId: validatedRowId,
+                    column
+                });
+                const oversized = (
+                    metadata.storageClass === 'text' || metadata.storageClass === 'blob'
+                ) && metadata.byteLength > editLimitBytes;
 
-            // Trigger refresh
-            document.recordExternalModification({
-                label: 'Edit Cell (External)',
-                description: `Update ${table}.${column} from editor`,
-                modificationType: 'cell_update',
-                targetTable: table,
-                targetRowId: validatedRowId,
-                targetColumn: column,
-                newValue: value
-            });
+                if (oversized) {
+                    const expected = {
+                        storageClass: metadata.storageClass as 'text' | 'blob',
+                        byteLength: metadata.byteLength
+                    };
+                    const answer = await vsc.window.showWarningMessage(
+                        formatOversizedCellReplacementWarning(table, column, expected),
+                        { modal: true },
+                        { title: vsc.l10n.t('Replace Without Undo'), value: true },
+                        { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
+                    );
+                    if (!answer?.value) throw new vsc.CancellationError();
 
-            this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
+                    try {
+                        const updatedRowId = await document.databaseOperations.replaceOversizedCell(
+                            table,
+                            validatedRowId,
+                            column,
+                            value,
+                            expected,
+                            editLimitBytes
+                        );
+                        const newTargetRowId = updatedRowId ?? validatedRowId;
+                        if (isPrimaryKeyRecordId(validatedRowId)) {
+                            this.setCellDocumentTarget(document, uri, table, newTargetRowId);
+                        }
+                        // Future file-backed undo would attach its checksummed
+                        // snapshot here and replace this forward-only policy.
+                        document.recordExternalModification({
+                            label: 'Replace Oversized Cell (External)',
+                            description: `Replace oversized ${table}.${column} from editor without undo`,
+                            modificationType: 'cell_update',
+                            targetTable: table,
+                            targetRowId: validatedRowId,
+                            ...(isPrimaryKeyRecordId(validatedRowId) ? { newTargetRowId } : {}),
+                            targetColumn: column,
+                            newValue: value,
+                            operation: 'set',
+                            undoPolicy: 'barrier'
+                        });
+                        this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
+                        return;
+                    } catch (error) {
+                        if (isOversizedCellReplacementConflictError(error)) continue;
+                        throw error;
+                    }
+                }
+
+                const escapedColumn = escapeIdentifier(column);
+                const byteLengthExpression =
+                    `CASE WHEN ${escapedColumn} IS NULL THEN 0 ` +
+                    `ELSE length(CAST(${escapedColumn} AS BLOB)) END`;
+                const previous = await document.databaseOperations.executeQuery(
+                    `SELECT typeof(${escapedColumn}), ${byteLengthExpression}, ` +
+                    `CASE WHEN typeof(${escapedColumn}) IN ('text', 'blob') ` +
+                    `AND ${byteLengthExpression} > ? THEN NULL ELSE ${escapedColumn} END ` +
+                    `FROM ${escapeIdentifier(table)} WHERE ${rowPredicate.sql} LIMIT 2`,
+                    [editLimitBytes, ...rowPredicate.params]
+                );
+                if (previous[0]?.rows.length !== 1) {
+                    throw new Error(`Cannot update ${table}.${column}: row identity no longer exists`);
+                }
+                const [storageClass, rawByteLength, boundedValue] = previous[0].rows[0];
+                const byteLength = typeof rawByteLength === 'bigint'
+                    ? Number(rawByteLength)
+                    : rawByteLength;
+                if (
+                    (storageClass === 'text' || storageClass === 'blob')
+                    && Number(byteLength) > editLimitBytes
+                ) {
+                    // The CASE above deliberately returned NULL instead of
+                    // the raced oversized payload. Re-read and confirm it.
+                    continue;
+                }
+                const keyColumnIndex = rowPredicate.primaryKey?.columns.indexOf(column) ?? -1;
+                const priorValue = keyColumnIndex >= 0
+                    ? rowPredicate.primaryKey!.values[keyColumnIndex]
+                    : boundedValue;
+
+                let updatedRowId: RecordId | void;
+                try {
+                    updatedRowId = await document.databaseOperations.updateCell(
+                        table,
+                        validatedRowId,
+                        column,
+                        value,
+                        undefined,
+                        editLimitBytes
+                    );
+                } catch (error) {
+                    if (isOversizedCellReplacementRequiredError(error)) continue;
+                    throw error;
+                }
+                const newTargetRowId = updatedRowId ?? validatedRowId;
+                if (isPrimaryKeyRecordId(validatedRowId)) {
+                    this.setCellDocumentTarget(document, uri, table, newTargetRowId);
+                }
+
+                document.recordExternalModification({
+                    label: 'Edit Cell (External)',
+                    description: `Update ${table}.${column} from editor`,
+                    modificationType: 'cell_update',
+                    targetTable: table,
+                    targetRowId: validatedRowId,
+                    ...(isPrimaryKeyRecordId(validatedRowId) ? { newTargetRowId } : {}),
+                    targetColumn: column,
+                    priorValue,
+                    newValue: value
+                });
+
+                this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
+                return;
+            }
 
         } catch (err) {
             GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error writing cell: ${err instanceof Error ? err.message : String(err)}`);
             throw vsc.FileSystemError.Unavailable(err instanceof Error ? err.message : String(err));
         }
+        }, true);
     }
 
     async delete(uri: vsc.Uri, options: { recursive: boolean }): Promise<void> {
@@ -356,6 +581,49 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
     async rename(oldUri: vsc.Uri, newUri: vsc.Uri, options: { overwrite: boolean }): Promise<void> {
         throw vsc.FileSystemError.NoPermissions();
+    }
+
+    private getCellDocumentTarget(
+        document: DatabaseDocument,
+        uri: vsc.Uri,
+        table: string,
+        uriRowId: string
+    ): RecordId {
+        if (!isPrimaryKeyRecordId(uriRowId)) return uriRowId;
+        const existing = this.cellDocumentTargets.get(document)?.get(uri.toString());
+        if (existing) return existing.rowId;
+        // readFile is the point at which VS Code has opened this immutable URI.
+        // Track its initial identity too, so grid-originated PK edits and their
+        // history replay can retarget it even before this editor writes.
+        this.setCellDocumentTarget(document, uri, table, uriRowId);
+        return uriRowId;
+    }
+
+    private setCellDocumentTarget(
+        document: DatabaseDocument,
+        uri: vsc.Uri,
+        table: string,
+        rowId: RecordId
+    ): void {
+        this.ensureDocumentTracking(document);
+        let targets = this.cellDocumentTargets.get(document);
+        if (!targets) {
+            targets = new Map<string, CellDocumentTarget>();
+            this.cellDocumentTargets.set(document, targets);
+        }
+        targets.set(uri.toString(), { uri, table, rowId });
+    }
+
+    private isLogicalDirectory(uri: vsc.Uri): boolean {
+        const pathParts = uri.path.split('/').filter(part => part.length > 0);
+        if (pathParts.length === 0) return true;
+        if (pathParts.length > 4) return false;
+
+        const documentKey = decodeURIComponent(pathParts[0]);
+        if (!DocumentRegistry.has(documentKey)) {
+            throw vsc.FileSystemError.FileNotFound(uri);
+        }
+        return true;
     }
 
     private parseUri(uri: vsc.Uri): { document: DatabaseDocument, table: string, rowId: string, column: string } {
@@ -403,24 +671,8 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         if (!documentMetadata) {
             documentMetadata = new Map();
             this.viewDocumentMetadata.set(document, documentMetadata);
-
-            const contentChangeSubscription = document.onDidChangeContent(change => {
-                this.handleDocumentContentChange(document, change);
-            });
-            let disposeSubscription: vsc.Disposable = { dispose() {} };
-            const combinedSubscription: vsc.Disposable = {
-                dispose: () => {
-                    contentChangeSubscription.dispose();
-                    disposeSubscription.dispose();
-                }
-            };
-            disposeSubscription = document.onDidDispose(() => {
-                this.viewDocumentMetadata.delete(document);
-                this.viewDocumentDisposals.delete(document);
-                combinedSubscription.dispose();
-            });
-            this.viewDocumentDisposals.set(document, combinedSubscription);
         }
+        this.ensureDocumentTracking(document);
 
         const key = uri.toString();
         let metadata = documentMetadata.get(key);
@@ -436,6 +688,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         document: DatabaseDocument,
         change: DocumentContentChange
     ): void {
+        this.retargetCellDocuments(document, change);
         const documentMetadata = this.viewDocumentMetadata.get(document);
         if (!documentMetadata) return;
 
@@ -468,6 +721,80 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 type: fileChangeType,
                 uri: metadata.uri
             });
+        }
+        if (changes.length > 0) this._emitter.fire(changes);
+    }
+
+    private ensureDocumentTracking(document: DatabaseDocument): void {
+        if (this.documentDisposals.has(document)) return;
+
+        const contentChangeSubscription = document.onDidChangeContent(change => {
+            this.handleDocumentContentChange(document, change);
+        });
+        let disposeSubscription: vsc.Disposable = { dispose() {} };
+        const combinedSubscription: vsc.Disposable = {
+            dispose: () => {
+                contentChangeSubscription.dispose();
+                disposeSubscription.dispose();
+            }
+        };
+        disposeSubscription = document.onDidDispose(() => {
+            this.cellDocumentTargets.delete(document);
+            this.viewDocumentMetadata.delete(document);
+            this.documentDisposals.delete(document);
+            combinedSubscription.dispose();
+        });
+        this.documentDisposals.set(document, combinedSubscription);
+    }
+
+    private retargetCellDocuments(
+        document: DatabaseDocument,
+        change: DocumentContentChange
+    ): void {
+        const targets = this.cellDocumentTargets.get(document);
+        const modification = change.modification;
+        if (
+            !targets
+            || !modification
+            || modification.modificationType !== 'cell_update'
+            || !modification.targetTable
+        ) {
+            return;
+        }
+
+        const direction = change.modificationDirection ?? 'forward';
+        const identityPairs: Array<{ before: RecordId; after: RecordId }> = [];
+        if (
+            modification.targetRowId !== undefined
+            && modification.newTargetRowId !== undefined
+        ) {
+            identityPairs.push({
+                before: modification.targetRowId,
+                after: modification.newTargetRowId
+            });
+        }
+        for (const cell of modification.affectedCells ?? []) {
+            if (cell.newRowId !== undefined) {
+                identityPairs.push({ before: cell.rowId, after: cell.newRowId });
+            }
+        }
+        if (identityPairs.length === 0) return;
+
+        const changes: vsc.FileChangeEvent[] = [];
+        for (const target of targets.values()) {
+            if (target.table !== modification.targetTable) continue;
+            const pair = identityPairs.find(candidate => {
+                const source = direction === 'undo' ? candidate.after : candidate.before;
+                return isPrimaryKeyRecordId(source)
+                    && isPrimaryKeyRecordId(target.rowId)
+                    && source === target.rowId;
+            });
+            if (!pair) continue;
+            const replacement = direction === 'undo' ? pair.before : pair.after;
+            if (!isPrimaryKeyRecordId(replacement)) continue;
+            if (replacement === target.rowId) continue;
+            target.rowId = replacement;
+            changes.push({ type: vsc.FileChangeType.Changed, uri: target.uri });
         }
         if (changes.length > 0) this._emitter.fire(changes);
     }

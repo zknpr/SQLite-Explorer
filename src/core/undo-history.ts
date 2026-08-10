@@ -6,6 +6,11 @@
  */
 
 import type { LabeledModification } from './types';
+import {
+  decodeJsonSafeNumberString,
+  encodeJsonSafeNonFiniteNumber,
+  escapeJsonSafeNumberString
+} from './json-safe-numbers';
 
 // ============================================================================
 // JSON Serialization Helpers for Non-JSON Cell Values
@@ -20,6 +25,10 @@ import type { LabeledModification } from './types';
  * This replacer preserves the binary data as base64.
  */
 function binaryReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    return encodeJsonSafeNonFiniteNumber(value);
+  }
+  if (typeof value === 'string') return escapeJsonSafeNumberString(value);
   if (typeof value === 'bigint') {
     return { __type: 'BigInt', text: value.toString() };
   }
@@ -39,6 +48,7 @@ function binaryReplacer(_key: string, value: unknown): unknown {
  * Converts the special object format back to Uint8Array.
  */
 function binaryReviver(_key: string, value: unknown): unknown {
+  if (typeof value === 'string') return decodeJsonSafeNumberString(value);
   if (value && typeof value === 'object' && '__type' in value) {
     const typed = value as { __type: string; data?: unknown; text?: unknown };
     const keys = Object.keys(value);
@@ -80,7 +90,7 @@ function binaryReviver(_key: string, value: unknown): unknown {
  * Counts primitive sizes and structural overhead.
  * Handles circular references by tracking seen objects.
  */
-function calculateSize(value: unknown): number {
+export function estimateUndoMemoryBytes(value: unknown): number {
   const seen = new Set<unknown>();
   const stack = [value];
   let size = 0;
@@ -184,6 +194,8 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   private maxEntries: number;
   private maxMemory: number;
   private currentSize: number = 0;
+  /** Further edits must wait for Save once an unsaved barrier segment reaches a limit. */
+  private historyRecordingBlockedByBarrierLimit: boolean = false;
   /** Monotonic counter advanced whenever the undo/redo history changes. */
   private mutationRevision: number = 0;
   /** Monotonic counter advanced when older checkpoint positions may no longer name the same saved state. */
@@ -198,6 +210,25 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   constructor(maxEntries: number = 100, maxMemory: number = 50 * 1024 * 1024) {
     this.maxEntries = maxEntries;
     this.maxMemory = maxMemory;
+  }
+
+  /** Memory ceiling used by producers that must preflight before allocation. */
+  get memoryLimitBytes(): number {
+    return this.maxMemory;
+  }
+
+  /** Fail before a backend mutation when retaining its forward replay would exceed the cap. */
+  ensureCanRecord(): void {
+    if (!this.historyRecordingBlockedByBarrierLimit) return;
+    throw new Error(
+      'Undo history reached its configured limit after a forward-only edit. '
+      + 'Save the database before making more changes.'
+    );
+  }
+
+  /** True while another edit would make the replay-complete barrier segment unbounded. */
+  get isHistoryRecordingBlockedByBarrierLimit(): boolean {
+    return this.historyRecordingBlockedByBarrierLimit;
   }
 
   /**
@@ -229,10 +260,20 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    * @param entry - Modification to record
    */
   record(entry: T): void {
+    if (entry.undoPolicy === 'barrier') {
+      this.recordBarrier(entry);
+      return;
+    }
+    this.recordEntry(entry);
+  }
+
+  /** Add an entry using the shared branching, retention, and checkpoint rules. */
+  private recordEntry(entry: T): void {
+    this.ensureCanRecord();
     this.advanceMutationRevision();
 
     // Calculate size of new entry
-    const entrySize = calculateSize(entry);
+    const entrySize = estimateUndoMemoryBytes(entry);
 
     const savedUndoneCount = this.checkpointIndex - this.timeline.length;
     if (savedUndoneCount > 0) {
@@ -271,15 +312,29 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     this.timelineSizes.push(entrySize);
     this.currentSize += entrySize;
 
-    // Enforce capacity and memory limits
-    // We remove oldest entries until we are within BOTH limits
+    this.enforceRetentionLimits();
+  }
+
+  /** Apply ordinary eviction, or saturate an unsaved replay-complete barrier segment. */
+  private enforceRetentionLimits(): void {
+    // Remove oldest entries until within both limits. An unsaved barrier and
+    // every entry after it are one indivisible forward-replay segment: dropping
+    // only part would make hot-exit restore silently lose database changes.
     while (
       (this.timeline.length > 0) &&
       (this.timeline.length > this.maxEntries || this.currentSize > this.maxMemory)
     ) {
-      // Don't remove the just-added entry if it's the only one, to preserve ability to undo at least one step if possible.
-      // However, if strict memory limit is required, we might need to, but let's be practical.
+      // Preserve the existing guarantee that even an individually oversized
+      // edit remains available as the sole undo entry.
       if (this.timeline.length === 1) {
+        break;
+      }
+
+      // History replay is ordered: retaining a barrier while evicting entries
+      // after it would create a non-contiguous replay and silently lose later
+      // edits. Once an unsaved barrier reaches the front, pin the complete
+      // uncommitted segment until a save establishes a new checkpoint.
+      if (this.checkpointIndex === 0 && this.hasUncommittedHistoryBarrier) {
         break;
       }
 
@@ -290,11 +345,33 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
         this.currentSize -= removedEntrySize;
       }
 
-      // Adjust checkpoint index since we shifted the array
       this.checkpointIndex = Math.max(0, this.checkpointIndex - 1);
       this.timelineOffset++;
       this.invalidateCapturedCheckpointPositions();
     }
+
+    // At equality the *next* entry would cross the cap. Stop before that entry's
+    // backend write; the threshold-crossing entry itself remains fully retained.
+    this.historyRecordingBlockedByBarrierLimit =
+      this.checkpointIndex === 0
+      && this.hasUncommittedHistoryBarrier
+      && (
+        this.timeline.length >= this.maxEntries
+        || this.currentSize >= this.maxMemory
+      );
+  }
+
+  /**
+   * Insert a bounded, forward-replayable barrier into the current timeline.
+   * Earlier entries remain available to hot-exit/revert reconciliation but are
+   * no longer reachable through Undo. Recording the barrier also applies the
+   * normal branch rule, so stale redo entries are discarded.
+   */
+  recordBarrier(entry: T): void {
+    if (entry.undoPolicy !== 'barrier') {
+      throw new Error('A history barrier entry must declare undoPolicy="barrier"');
+    }
+    this.recordEntry(entry);
   }
 
   /**
@@ -303,6 +380,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    * @returns The modification that was undone, or undefined if at beginning
    */
   stepBack(): T | undefined {
+    if (this.timeline.at(-1)?.undoPolicy === 'barrier') return undefined;
     const entry = this.timeline.pop();
     const size = this.timelineSizes.pop();
 
@@ -350,6 +428,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     this.currentSize -= this.revertOnRestoreSizes.reduce((a, b) => a + b, 0);
     this.revertOnRestore = [];
     this.revertOnRestoreSizes = [];
+    this.enforceRetentionLimits();
   }
 
   /**
@@ -394,6 +473,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     this.currentSize -= this.revertOnRestoreSizes.reduce((a, b) => a + b, 0);
     this.revertOnRestore = [];
     this.revertOnRestoreSizes = [];
+    this.enforceRetentionLimits();
   }
 
   /**
@@ -487,6 +567,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     if (changed) {
       this.invalidateCapturedCheckpointPositions();
     }
+    this.historyRecordingBlockedByBarrierLimit = false;
   }
 
   /**
@@ -534,13 +615,20 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     // Recalculate sizes for active timeline entries, redo entries, and captured
     // branch-revert entries so restored trackers enforce the same memory
     // accounting as live trackers.
-    tracker.timelineSizes = tracker.timeline.map(calculateSize);
-    tracker.futureStackSizes = tracker.futureStack.map(calculateSize);
-    tracker.revertOnRestoreSizes = tracker.revertOnRestore.map(calculateSize);
+    tracker.timelineSizes = tracker.timeline.map(estimateUndoMemoryBytes);
+    tracker.futureStackSizes = tracker.futureStack.map(estimateUndoMemoryBytes);
+    tracker.revertOnRestoreSizes = tracker.revertOnRestore.map(estimateUndoMemoryBytes);
     tracker.currentSize =
       tracker.timelineSizes.reduce((a, b) => a + b, 0) +
       tracker.futureStackSizes.reduce((a, b) => a + b, 0) +
       tracker.revertOnRestoreSizes.reduce((a, b) => a + b, 0);
+    tracker.historyRecordingBlockedByBarrierLimit =
+      tracker.checkpointIndex === 0
+      && tracker.hasUncommittedHistoryBarrier
+      && (
+        tracker.timeline.length >= tracker.maxEntries
+        || tracker.currentSize >= tracker.maxMemory
+      );
 
     return tracker;
   }
@@ -556,7 +644,32 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    * Check if undo is available.
    */
   get canStepBack(): boolean {
-    return this.timeline.length > 0;
+    return this.timeline.length > 0 && this.timeline.at(-1)?.undoPolicy !== 'barrier';
+  }
+
+  /** True when an undo attempt is stopped by the forward-only sentinel. */
+  get isUndoBlockedByBarrier(): boolean {
+    return this.timeline.at(-1)?.undoPolicy === 'barrier';
+  }
+
+  /** The forward-only entry currently stopping Undo, when present. */
+  get undoBlockingEntry(): T | undefined {
+    const entry = this.timeline.at(-1);
+    return entry?.undoPolicy === 'barrier' ? entry : undefined;
+  }
+
+  /** True while File Revert would have to cross a prior value we did not retain. */
+  get hasUncommittedHistoryBarrier(): boolean {
+    return this.timeline
+      .slice(this.checkpointIndex)
+      .some(entry => entry.undoPolicy === 'barrier');
+  }
+
+  /** Unsaved forward-only entries that File Revert would need to cross. */
+  getUncommittedHistoryBarriers(): T[] {
+    return this.timeline
+      .slice(this.checkpointIndex)
+      .filter(entry => entry.undoPolicy === 'barrier');
   }
 
   /**

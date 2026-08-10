@@ -7,7 +7,14 @@ import { updateStatus, updateToolbarButtons } from './ui.js';
 import { openModal, closeModal } from './modals.js';
 import { loadTableData, loadTableColumns } from './grid.js';
 import { refreshSchema } from './sidebar.js';
-// No utils imports needed — CRUD operations delegate to backendApi
+import { parseGridInputValue } from './utils.js';
+import { noteRowCountChanged, noteCellValuesChanged } from './count-cache.js';
+import { getSelectedRowActionEligibility } from './data-utils.js';
+
+let isSubmittingAddRow = false;
+let isSubmittingDelete = false;
+let isSubmittingCreateTable = false;
+let isSubmittingAddColumn = false;
 
 export function initCrud() {
     // --- Toolbar Buttons ---
@@ -49,7 +56,9 @@ export function openAddRowModal() {
     form.replaceChildren(); // Clear existing content
 
     state.tableColumns.forEach(col => {
-        const isRequired = col.notnull === 1 && !col.isPrimaryKey;
+        const usesDeclaredPrimaryKey = state.selectedTableIdentity?.kind === 'primaryKey';
+        const isRequired = (col.notnull === 1 && !col.isPrimaryKey)
+            || (usesDeclaredPrimaryKey && col.isPrimaryKey && col.dflt_value == null);
 
         const div = document.createElement('div');
         div.className = 'form-field';
@@ -76,7 +85,7 @@ export function openAddRowModal() {
         input.dataset.column = col.name;
         input.dataset.required = isRequired.toString();
 
-        if (col.isPrimaryKey) {
+        if (col.isPrimaryKey && !usesDeclaredPrimaryKey) {
             input.placeholder = 'Auto (Primary Key)';
             input.disabled = true;
         } else if (isRequired) {
@@ -94,6 +103,16 @@ export function openAddRowModal() {
 }
 
 export async function submitAddRow() {
+    if (isSubmittingAddRow) return;
+    isSubmittingAddRow = true;
+    try {
+        return await submitAddRowOnce();
+    } finally {
+        isSubmittingAddRow = false;
+    }
+}
+
+async function submitAddRowOnce() {
     const inputs = document.querySelectorAll('#addRowForm input[data-column]:not([disabled])');
     const missingRequired = [];
 
@@ -126,16 +145,28 @@ export async function submitAddRow() {
             if (value.toLowerCase() === 'null') {
                 rowData[colName] = null;
             } else if (!isNaN(Number(value)) && value !== '') {
-                rowData[colName] = Number(value);
+                const column = state.tableColumns.find(candidate => candidate.name === colName);
+                rowData[colName] = parseGridInputValue(
+                    value,
+                    column,
+                    state.selectedTableIdentity?.kind === 'primaryKey'
+                );
             } else {
                 rowData[colName] = value;
             }
         }
     }
 
+    // Snapshot the target so the count delta below can never be applied to a
+    // table the user switched to while the insert RPC was in flight.
+    const targetTable = state.selectedTable;
+
     try {
         updateStatus('Inserting row...');
-        await backendApi.insertRow(state.selectedTable, rowData);
+        await backendApi.insertRow(targetTable, rowData);
+        // VS Code retains this known delta until its refreshContent echo. The
+        // demo cache drops it because INSERT triggers can ignore/add rows.
+        noteRowCountChanged(targetTable, 1);
 
         closeModal('addRowModal');
         await loadTableData();
@@ -158,8 +189,16 @@ export function openDeleteModal() {
             `Are you sure you want to delete ${columnNames.length} column${columnNames.length > 1 ? 's' : ''} (${columnNames.join(', ')})?` +
             ` This will permanently remove the column${columnNames.length > 1 ? 's' : ''} and all their data.`;
     } else if (state.selectedRowIds.size > 0) {
+        const eligibility = getSelectedRowActionEligibility();
+        if (eligibility.rowIds.length === 0) {
+            updateStatus(`Delete unavailable: ${eligibility.readOnlyReason}`);
+            return;
+        }
+        const skipped = eligibility.readOnlyCount > 0
+            ? ` ${eligibility.readOnlyCount} read-only selected row${eligibility.readOnlyCount === 1 ? '' : 's'} will be skipped: ${eligibility.readOnlyReason}`
+            : '';
         document.getElementById('deleteConfirmText').textContent =
-            `Are you sure you want to delete ${state.selectedRowIds.size} row${state.selectedRowIds.size > 1 ? 's' : ''}?`;
+            `Are you sure you want to delete ${eligibility.rowIds.length} row${eligibility.rowIds.length > 1 ? 's' : ''}?${skipped}`;
     } else {
         return;
     }
@@ -167,6 +206,16 @@ export function openDeleteModal() {
 }
 
 export async function submitDelete() {
+    if (isSubmittingDelete) return;
+    isSubmittingDelete = true;
+    try {
+        return await submitDeleteOnce();
+    } finally {
+        isSubmittingDelete = false;
+    }
+}
+
+async function submitDeleteOnce() {
     // The confirmation modal can already be open when a replacement load
     // starts. Never apply its stale row/column selection to the incoming grid.
     if (state.isGridReloading) return;
@@ -180,17 +229,31 @@ export async function submitDelete() {
 async function submitDeleteRows() {
     if (state.selectedRowIds.size === 0) return;
 
-    const rowIds = Array.from(state.selectedRowIds);
+    const eligibility = getSelectedRowActionEligibility();
+    const rowIds = eligibility.rowIds;
+    if (rowIds.length === 0) {
+        updateStatus(`Delete unavailable: ${eligibility.readOnlyReason}`);
+        return;
+    }
+    // Snapshot the target so the count delta below can never be applied to a
+    // table the user switched to while the delete RPC was in flight.
+    const targetTable = state.selectedTable;
 
     try {
         updateStatus('Deleting rows...');
-        await backendApi.deleteRows(state.selectedTable, rowIds);
+        await backendApi.deleteRows(targetTable, rowIds);
+        // VS Code retains this requested delta until its refreshContent echo.
+        // The demo drops it because DELETE triggers can ignore/cascade rows.
+        noteRowCountChanged(targetTable, -rowIds.length);
 
         closeModal('deleteModal');
         state.selectedRowIds.clear();
         await loadTableData();
         updateToolbarButtons();
-        updateStatus(`Deleted ${rowIds.length} row${rowIds.length > 1 ? 's' : ''} - Ctrl+S to save`);
+        const skipped = eligibility.readOnlyCount > 0
+            ? `; skipped ${eligibility.readOnlyCount} read-only selection${eligibility.readOnlyCount === 1 ? '' : 's'}`
+            : '';
+        updateStatus(`Deleted ${rowIds.length} row${rowIds.length > 1 ? 's' : ''}${skipped} - Ctrl+S to save`);
 
     } catch (err) {
         console.error('Delete rows failed:', err);
@@ -202,10 +265,13 @@ async function submitDeleteColumns() {
     if (state.selectedColumns.size === 0) return;
 
     const columnNames = Array.from(state.selectedColumns);
+    // Snapshot: a table switch during the RPC must not misattribute the
+    // count invalidation below.
+    const table = state.selectedTable;
 
     try {
         updateStatus('Deleting columns...');
-        const result = await backendApi.deleteColumns(state.selectedTable, columnNames);
+        const result = await backendApi.deleteColumns(table, columnNames);
 
         // If user cancelled the operation (e.g., declined to drop dependent indexes), don't reload
         if (result && result.cancelled) {
@@ -213,6 +279,12 @@ async function submitDeleteColumns() {
             closeModal('deleteModal');
             return;
         }
+
+        // Dropping a column keeps the row count but changes what filters can
+        // match — and count identities name filters, not schema, so a later
+        // re-add of the same column name must not revive counts cached
+        // against the old column's values.
+        noteCellValuesChanged(table);
 
         closeModal('deleteModal');
         state.selectedColumns.clear();
@@ -338,6 +410,16 @@ export function removeColumnDefinition(colId) {
 }
 
 export async function submitCreateTable() {
+    if (isSubmittingCreateTable) return;
+    isSubmittingCreateTable = true;
+    try {
+        return await submitCreateTableOnce();
+    } finally {
+        isSubmittingCreateTable = false;
+    }
+}
+
+async function submitCreateTableOnce() {
     const tableName = document.getElementById('newTableName').value.trim();
 
     if (!tableName) {
@@ -403,6 +485,16 @@ export function openAddColumnModal() {
 }
 
 export async function submitAddColumn() {
+    if (isSubmittingAddColumn) return;
+    isSubmittingAddColumn = true;
+    try {
+        return await submitAddColumnOnce();
+    } finally {
+        isSubmittingAddColumn = false;
+    }
+}
+
+async function submitAddColumnOnce() {
     const columnName = document.getElementById('newColumnName').value.trim();
     const columnType = document.getElementById('newColumnType').value;
     const defaultValue = document.getElementById('newColumnDefault').value.trim();
@@ -417,9 +509,16 @@ export async function submitAddColumn() {
         return;
     }
 
+    // Snapshot for the same reason as submitDeleteColumns.
+    const table = state.selectedTable;
+
     try {
         updateStatus('Adding column...');
-        await backendApi.addColumn(state.selectedTable, columnName, columnType, defaultValue);
+        await backendApi.addColumn(table, columnName, columnType, defaultValue);
+
+        // Same schema-change rule as submitDeleteColumns: filtered counts
+        // cached before this DDL must not survive it.
+        noteCellValuesChanged(table);
 
         closeModal('addColumnModal');
         await loadTableColumns();

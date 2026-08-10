@@ -332,6 +332,18 @@ The webview provides a UI to configure SQLite PRAGMAs (e.g., WAL mode, Foreign K
 
 `queryBatch` in `nativeWorker.ts` sends multiple SQL queries in a single IPC round-trip. Used for schema fetching (3 queries → 1 call) and pragma reads.
 
+### Keyset Pagination
+
+Grid page turns seek instead of scanning (deep page = first-page cost on every engine). Engines mint opaque anchor tokens (`ksa:` + canonical JSON, `src/core/keyset-pagination.ts`) for the first/last row of every page of an anchorable table (authority-confirmed unshadowed rowid, or WITHOUT ROWID primary key). The webview commits them atomically with the grid rows (inside the superseded-load gate in `grid-data.js`) and round-trips them verbatim with a navigation intent (`first`/`after`/`atOrAfter`/`before`/`last`). Engines strictly re-validate every received anchor — canonical decode, embedded query-identity tag (table, sort, filters, page size), key arity — and fall back to the LIMIT/OFFSET query on any legitimate staleness; structurally malformed tokens throw (engines never mint them, so they signal tampering, not staleness). Both paths emit one deterministic total order — the identity tiebreak is appended to sorts, and the OFFSET fallback adopts the full key ordering via `keysetFallbackOrder` — so mixed OFFSET/keyset sequences can never skip or duplicate rows. NULL sort boundaries decompose per direction (NULLs first ASC / last DESC); INTEGER-class anchor values bind through `CAST(? AS INTEGER)` so int64 beyond 2^53 seeks exactly even on NONE-affinity columns. Views and keyless objects always use OFFSET. `before`/`last` execute reversed with a bounded SQL-side re-sort so row-indexed sidecars (oversizedCells, exactIntegerTexts) stay aligned.
+
+### Count Cache
+
+`core/ui/modules/count-cache.js` makes repeat grid loads count-free: COUNT(*) results are cached per identity (table + active column filters + active global filter, + displayed columns only while a global filter is active), so page turns issue zero count RPCs and a cache miss fetches count and data in parallel (`Promise.allSettled`, speculative data discarded and refetched once if the count clamps the page index; `last` navigation on a cold cache stays sequential because its remainder derives from the count). Webview inserts/deletes adjust the unfiltered identity by their known delta and drop the table's filtered identities. In VS Code, cell edits preserve the unfiltered identity and drop filtered identities; the host's post-edit `refreshContent` echo invalidates trigger/cascade effects. The web demo has no echo, so cell edits also drop its unfiltered identity because uploaded databases can contain UPDATE triggers that change cardinality. Table switch / refreshContent / reload-from-disk / view redefinition invalidate wholesale. In-flight fetches are epoch-gated: a count RPC that overlapped any mutation or invalidation is never stored. Within one load, a single count value feeds the clamp, page count, keyset `last` remainder, retry check, and commit — cached and fetched counts are never mixed. Not persisted; restored webviews re-fetch in parallel with their first data query.
+
+### Virtualized Grid
+
+`grid-render.js` windows the data grid: only the visible rows plus 20 overscan rows per side are materialized in the `<tbody>`, between two `virtual-spacer` rows whose heights preserve exact scroll geometry (26px uniform rows; scrollHeight is byte-identical to a full render, so persisted scroll positions keep their meaning). Scroll/resize revalidation is rAF-throttled (`scheduleVirtualGridUpdate` hooked in grid-events, deliberately before the `isGridReloading` guard) and re-centers when the visible range drifts within 10 rows of a window edge, reusing overlapping row elements by identity. Pages within ~1.5 viewports (and unknown-viewport environments, including minimal test DOMs) render fully — byte-for-byte the pre-virtualization DOM. Pinned rows are always materialized. Code addressing a row's DOM must tolerate absence or call `ensureGridRowMaterialized()` first (match nav and `startCellEdit` do). While an inline edit's editor is live in the DOM the window freezes (`cleanupCellEdit` schedules the catch-up, which also heals a page committed under the render-skip); a leaked edit session whose editor DOM is gone must not freeze the window (`editorHoldsWindow`). Zebra striping is the `stripe-even` class keyed to the display ordinal, never `:nth-child` (spacers shift DOM parity).
+
 ### Blob Inspector
 
 The Blob Inspector (`core/ui/modules/blob-inspector.js`) provides preview and editing for BLOB data:
@@ -347,8 +359,7 @@ Settings in `package.json` → `contributes.configuration`:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `sqliteExplorer.maxFileSize` | 200 | Max file size in MB (0 = unlimited) |
-| `sqliteExplorer.maxRows` | 0 | Max rows to display (0 = unlimited) |
-| `sqliteExplorer.defaultPageSize` | 500 | Default page size for pagination |
+| `sqliteExplorer.defaultPageSize` | 5000 | Default page size for pagination |
 | `sqliteExplorer.instantCommit` | "never" | Auto-save strategy (always/never/remote-only) |
 | `sqliteExplorer.doubleClickBehavior` | "inline" | Double-click action (inline/modal/vscode) |
 | `sqliteExplorer.fileOperations` | "native" | File I/O strategy (native/wasm) |

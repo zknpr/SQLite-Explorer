@@ -1,7 +1,10 @@
 import './vscode_mock_setup';
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { getMaximumFileSizeBytes, getQueryTimeout } from '../../src/config';
+import * as configModule from '../../src/config';
 import * as vsc from 'vscode';
 
 // Access the mock's config store
@@ -54,5 +57,40 @@ describe('getQueryTimeout', () => {
   it('uses the default for a non-finite hand-edited value', () => {
     configStore.set('queryTimeout', Number.POSITIVE_INFINITY);
     assert.strictEqual(getQueryTimeout(), 30000);
+  });
+});
+
+describe('getMaxInlineCellBytes', () => {
+  beforeEach(() => {
+    configStore.clear();
+  });
+
+  it('defaults to the 1 MiB containment threshold', () => {
+    const accessor = (configModule as any).getMaxInlineCellBytes;
+    assert.strictEqual(typeof accessor, 'function');
+    assert.strictEqual(accessor(), 1024 * 1024);
+  });
+
+  it('clamps hand-edited values so the grid can never request unlimited cells', () => {
+    const accessor = (configModule as any).getMaxInlineCellBytes;
+    assert.strictEqual(typeof accessor, 'function');
+
+    configStore.set('maxInlineCellBytes', 0);
+    assert.strictEqual(accessor(), 1024);
+    configStore.set('maxInlineCellBytes', Number.POSITIVE_INFINITY);
+    assert.strictEqual(accessor(), 1024 * 1024);
+  });
+});
+
+describe('extension manifest', () => {
+  it('opens GeoPackage files with the default custom editor', () => {
+    const manifest = JSON.parse(
+      readFileSync(path.resolve(process.cwd(), 'package.json'), 'utf8')
+    );
+    const viewerPatterns = manifest.contributes.customEditors
+      .find((editor: any) => editor.viewType === 'sqlite-explorer.view').selector
+      .map((selector: any) => selector.filenamePattern);
+
+    assert.ok(viewerPatterns.includes('*.gpkg'));
   });
 });

@@ -728,8 +728,11 @@ body {
     background: transparent;
 }
 
-/* Alternating row colors (zebra striping) */
-.data-row:nth-child(even) {
+/* Alternating row colors (zebra striping). Keyed to a class set from the
+   row's display ordinal (grid-render.js) instead of :nth-child: the
+   virtualized tbody contains spacer rows and only a window of data rows, so
+   DOM parity shifts as the window moves and would flip stripes mid-scroll. */
+.data-row.stripe-even {
     background: var(--bg-stripe);
 }
 
@@ -766,6 +769,15 @@ body {
 .data-cell.null-value {
     color: var(--text-secondary);
     font-style: italic;
+}
+
+.data-cell.oversized-cell {
+    color: var(--vscode-editorWarning-foreground, #cca700);
+    cursor: not-allowed;
+}
+
+.data-row.read-only-row .data-cell.row-number {
+    color: var(--vscode-editorWarning-foreground, #cca700);
 }
 
 .data-cell.cell-selected {

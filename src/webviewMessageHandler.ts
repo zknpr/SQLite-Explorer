@@ -1,5 +1,15 @@
 import { MessageCorrelationId, PendingInvocation, processProtocolMessage } from './core/rpc';
 import { deserializeArgs, serializeValue } from './core/serialization';
+import {
+  WEBVIEW_TRANSPORT_SURFACES,
+  assertWebviewTransportPayload,
+  fromWebviewPayloadLimitErrorData,
+  toWebviewPayloadLimitErrorData
+} from './core/webview-transport';
+import {
+  fromCellEditRpcErrorData,
+  toCellEditRpcErrorData
+} from './core/cell-edit-policy';
 import type { HostBridge } from './hostBridge';
 
 interface WebviewRpcInvokeMessage {
@@ -55,6 +65,8 @@ export class WebviewMessageHandler {
    * @param message - The message object received from the webview
    */
   handleMessage(message: unknown) {
+    if (this.#handleCoreRpcResponse(message)) return;
+
     // Handle RPC responses (for calls we make to the webview).
     // Pass the per-proxy pending invocations map so responses are routed correctly.
     processProtocolMessage(message, undefined, undefined, undefined, this.pendingInvocations);
@@ -77,18 +89,44 @@ export class WebviewMessageHandler {
     const hostBridge = this.hostBridge;
 
     // Deserialize payload to restore Uint8Array instances
-    const deserializedPayload = deserializeArgs(payload || []);
+    let deserializedPayload: unknown[];
+    try {
+      assertWebviewTransportPayload(message, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
+      });
+      deserializedPayload = deserializeArgs(payload || [], {
+        surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
+      });
+    } catch (error) {
+      this.#postRpcFailure(messageId, error);
+      return;
+    }
 
     // SECURITY: Block Object.prototype methods to prevent prototype pollution attacks.
     // Allow class prototype methods (e.g., HostBridge.initialize) but reject inherited
     // Object methods like 'constructor', '__defineGetter__', 'toString'.
     if (!BLOCKED_METHODS.has(targetMethod) && targetMethod in hostBridge && typeof (hostBridge as unknown as Record<string, unknown>)[targetMethod] === 'function') {
       const fn = (hostBridge as unknown as Record<string, unknown>)[targetMethod] as Function;
-      Promise.resolve(fn.apply(hostBridge, deserializedPayload))
+      // Start the invocation inside the promise chain so synchronous typed
+      // policy refusals take the same serialized error path as async rejects.
+      Promise.resolve()
+        .then(() => fn.apply(hostBridge, deserializedPayload))
         .then(result => {
-          // Serialize result to handle Uint8Array and other typed arrays
-          // which get converted to {} by postMessage JSON serialization
-          const serializedResult = serializeValue(result);
+          const rawResponse = {
+            channel: 'rpc' as const,
+            content: {
+              kind: 'response' as const,
+              messageId,
+              success: true,
+              data: result
+            }
+          };
+          assertWebviewTransportPayload(rawResponse, {
+            surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
+          });
+          const serializedResult = serializeValue(result, {
+            surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
+          });
           this.postMessage({
             channel: 'rpc',
             content: {
@@ -100,15 +138,7 @@ export class WebviewMessageHandler {
           });
         })
         .catch(err => {
-          this.postMessage({
-            channel: 'rpc',
-            content: {
-              kind: 'response',
-              messageId,
-              success: false,
-              errorMessage: err instanceof Error ? err.message : String(err)
-            }
-          });
+          this.#postRpcFailure(messageId, err);
         });
     } else {
       // Method not found
@@ -134,10 +164,31 @@ export class WebviewMessageHandler {
     if (BLOCKED_METHODS.has(message.method) || !(message.method in hostBridge)) return;
     const fn = (hostBridge as unknown as Record<string, unknown>)[message.method] as Function;
     if (typeof fn === 'function') {
-      Promise.resolve(fn.apply(hostBridge, deserializeArgs(message.args || [])))
+      let deserializedArgs: unknown[];
+      try {
+        assertWebviewTransportPayload(message, {
+          surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
+        });
+        deserializedArgs = deserializeArgs(message.args || [], {
+          surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
+        });
+      } catch (error) {
+        this.#postLegacyFailure(message.id, error);
+        return;
+      }
+      Promise.resolve()
+        .then(() => fn.apply(hostBridge, deserializedArgs))
         .then(result => {
-          // Serialize result to handle Uint8Array
-          const serializedResult = serializeValue(result);
+          assertWebviewTransportPayload({
+            type: 'rpc-response',
+            id: message.id,
+            result
+          }, {
+            surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
+          });
+          const serializedResult = serializeValue(result, {
+            surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
+          });
           this.postMessage({
             type: 'rpc-response',
             id: message.id,
@@ -145,12 +196,65 @@ export class WebviewMessageHandler {
           });
         })
         .catch(err => {
-          this.postMessage({
-            type: 'rpc-response',
-            id: message.id,
-            error: err instanceof Error ? err.message : String(err)
-          });
+          this.#postLegacyFailure(message.id, err);
         });
     }
+  }
+
+  /**
+   * Guard host-initiated RPC responses before protocol routing. A receiver-side
+   * rejection faults the exact pending call instead of throwing from the
+   * message event or waiting for its timeout.
+   */
+  #handleCoreRpcResponse(message: unknown): boolean {
+    if (!message || typeof message !== 'object') return false;
+    const response = message as { kind?: unknown; correlationId?: unknown; error?: unknown };
+    if (response.kind !== 'result' || typeof response.correlationId !== 'string') return false;
+
+    let fault: Error | undefined;
+    try {
+      assertWebviewTransportPayload(message, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.webviewResponse
+      });
+      fault = fromCellEditRpcErrorData(response.error)
+        ?? fromWebviewPayloadLimitErrorData(response.error);
+    } catch (error) {
+      fault = error instanceof Error ? error : new Error(String(error));
+    }
+    if (!fault) return false;
+
+    const pending = this.pendingInvocations?.get(response.correlationId);
+    if (pending) {
+      clearTimeout(pending.expirationTimer);
+      this.pendingInvocations!.delete(response.correlationId);
+      pending.onFault(fault);
+    }
+    return true;
+  }
+
+  #postRpcFailure(messageId: string, error: unknown): void {
+    const errorData = toCellEditRpcErrorData(error)
+      ?? toWebviewPayloadLimitErrorData(error);
+    this.postMessage({
+      channel: 'rpc',
+      content: {
+        kind: 'response',
+        messageId,
+        success: false,
+        errorMessage: error instanceof Error ? error.message : String(error),
+        ...(errorData ? { error: errorData } : {})
+      }
+    });
+  }
+
+  #postLegacyFailure(id: string | number, error: unknown): void {
+    const errorData = toCellEditRpcErrorData(error)
+      ?? toWebviewPayloadLimitErrorData(error);
+    this.postMessage({
+      type: 'rpc-response',
+      id,
+      error: error instanceof Error ? error.message : String(error),
+      ...(errorData ? { errorData } : {})
+    });
   }
 }

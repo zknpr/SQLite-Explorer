@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { ModificationTracker } from '../../src/core/undo-history';
 import { LabeledModification } from '../../src/core/types';
+import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
 
 describe('ModificationTracker Serialization', () => {
 
@@ -105,6 +106,89 @@ describe('ModificationTracker Serialization', () => {
         const restoredModification = restored.stepBack();
         assert.strictEqual(restoredModification?.priorValue, priorValue);
         assert.strictEqual(restoredModification?.newValue, newValue);
+    });
+
+    it('backs up and restores signed REAL infinities exactly', () => {
+        const tracker = new ModificationTracker<LabeledModification>();
+        tracker.record({
+            label: 'Infinite REAL row',
+            description: 'Delete an infinite-key row',
+            modificationType: 'row_delete',
+            targetTable: 'measurements',
+            deletedRows: [{
+                rowId: encodePrimaryKeyRecordId(
+                    [{ identifier: 'value', declaredType: 'REAL', position: 1 }],
+                    [Infinity]
+                ),
+                row: { value: Infinity, mirror: -Infinity }
+            }]
+        });
+
+        const backup = tracker.serialize();
+        assert.doesNotMatch(new TextDecoder().decode(backup), /"value":null|"mirror":null/);
+        const restored = ModificationTracker.deserialize<LabeledModification>(backup).stepBack();
+        assert.strictEqual(restored?.deletedRows?.[0].row.value, Infinity);
+        assert.strictEqual(restored?.deletedRows?.[0].row.mirror, -Infinity);
+    });
+
+    it('does not collide with a legitimate row shaped like the old infinity history marker', () => {
+        const tracker = new ModificationTracker<LabeledModification>();
+        tracker.record({
+            label: 'Marker-shaped row',
+            description: 'Delete a row whose columns resemble an internal marker',
+            modificationType: 'row_delete',
+            targetTable: 'marker_rows',
+            deletedRows: [{
+                rowId: 1,
+                row: { __type: 'NonFiniteNumber', text: 'Infinity' }
+            }]
+        });
+
+        const restored = ModificationTracker.deserialize<LabeledModification>(
+            tracker.serialize()
+        ).stepBack();
+        assert.deepStrictEqual(restored?.deletedRows?.[0].row, {
+            __type: 'NonFiniteNumber',
+            text: 'Infinity'
+        });
+    });
+
+    it('preserves old and new composite primary-key identities in cell history', () => {
+        const columns = [
+            { identifier: 'space', declaredType: 'BLOB', position: 1 },
+            { identifier: 'sequence', declaredType: 'INTEGER', position: 2 }
+        ];
+        const oldRowId = encodePrimaryKeyRecordId(
+            columns,
+            [new Uint8Array([0, 47, 255]), 9007199254740993n]
+        );
+        const newRowId = encodePrimaryKeyRecordId(
+            columns,
+            [new Uint8Array([0, 47, 255]), 9007199254740994n]
+        );
+        const tracker = new ModificationTracker<LabeledModification>();
+        tracker.record({
+            label: 'PK edit',
+            description: 'Change sequence',
+            modificationType: 'cell_update',
+            targetTable: 'items',
+            affectedCells: [{
+                rowId: oldRowId,
+                newRowId,
+                columnName: 'sequence',
+                priorValue: '9007199254740993',
+                newValue: '9007199254740994'
+            }]
+        });
+
+        const restored = ModificationTracker.deserialize<LabeledModification>(tracker.serialize());
+        assert.deepStrictEqual(restored.stepBack()?.affectedCells, [{
+            rowId: oldRowId,
+            newRowId,
+            columnName: 'sequence',
+            priorValue: '9007199254740993',
+            newValue: '9007199254740994'
+        }]);
     });
 
     it('should preserve checkpoint index', async () => {

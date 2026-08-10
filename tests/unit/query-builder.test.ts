@@ -44,6 +44,18 @@ describe('Query Builder', () => {
       assert.strictEqual(sql, 'SELECT * FROM "logs" ORDER BY "created_at" DESC LIMIT 10 OFFSET 20');
     });
 
+    it('orders a synthetic composite identity by every declared key member', () => {
+      const { sql } = buildSelectQuery('entries', {
+        orderByColumns: ['tenant', 'sequence"number'],
+        orderDir: 'DESC'
+      });
+
+      assert.strictEqual(
+        sql,
+        'SELECT * FROM "entries" ORDER BY "tenant" DESC, "sequence""number" DESC'
+      );
+    });
+
     it('should handle global filter with explicit columns', () => {
       const options = {
         columns: ['name', 'description'],

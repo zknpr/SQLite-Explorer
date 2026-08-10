@@ -21,6 +21,10 @@ import {
 } from './utils.js';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 import { revealGridCell } from './grid-reveal.js';
+// Closes a module cycle (grid-render → here for highlight formatting), which
+// is safe because the binding is a hoisted function declaration only called
+// at runtime — the same shape grid-data.js ↔ grid-selection.js already uses.
+import { ensureGridRowMaterialized } from './grid-render.js';
 
 // A Symbol cannot collide with any SQLite column name, unlike the former
 // string sentinel. This value stays entirely inside the webview process.
@@ -187,6 +191,9 @@ function focusActiveMatch() {
     if (currentIndex < 0 || currentIndex >= matches.length) return;
 
     const { rowIdx, colIdx } = matches[currentIndex];
+    // A match can target a row outside the virtualized window; scroll it into
+    // the window (no-op on fully rendered pages) so the id lookup can succeed.
+    ensureGridRowMaterialized(rowIdx);
     const cellEl = document.getElementById(`cell-${rowIdx}-${colIdx}`);
     if (cellEl) {
         cellEl.classList.add('active-match-cell');

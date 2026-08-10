@@ -11,7 +11,10 @@ import {
 } from '../../src/core/integer-utils';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import type { DatabaseOperations, ViewDefinition } from '../../src/core/types';
-import { normalizeViewSelectSql } from '../../src/core/view-utils';
+import {
+    normalizeViewDefinitionError,
+    normalizeViewSelectSql
+} from '../../src/core/view-utils';
 import { HostBridge } from '../../src/hostBridge';
 
 async function createEngine(): Promise<DatabaseOperations> {
@@ -1022,6 +1025,55 @@ describe('view operations', () => {
     it('validates, previews, and edits a view body ending in a block comment', async () => {
         await assertCommentBodyRoundTrip(
             'SELECT MAX(quantity) AS m FROM inventory /* rollup of stock */'
+        );
+    });
+
+    it('normalizes a nonspecific logic error only for a target self-reference', () => {
+        const engineError = new Error('[querySingle] SQL logic error');
+        const normalized = normalizeViewDefinitionError(
+            engineError,
+            'self_shadowed_view',
+            'SELECT value FROM main."self_shadowed_view"'
+        );
+
+        assert.ok(normalized instanceof Error);
+        assert.match(normalized.message, /circular/i);
+    });
+
+    it('does not relabel an unrelated nonspecific logic error as circular', () => {
+        const engineError = new Error('[querySingle] SQL logic error');
+        assert.strictEqual(
+            normalizeViewDefinitionError(
+                engineError,
+                'self_shadowed_view',
+                'SELECT missing_function(value) FROM unrelated_table'
+            ),
+            engineError
+        );
+    });
+
+    it('does not treat a target-named CTE as a view self-reference', () => {
+        const engineError = new Error('[querySingle] SQL logic error');
+        assert.strictEqual(
+            normalizeViewDefinitionError(
+                engineError,
+                'self_shadowed_view',
+                'WITH self_shadowed_view AS (SELECT 1 AS value) ' +
+                'SELECT value FROM self_shadowed_view'
+            ),
+            engineError
+        );
+    });
+
+    it('preserves a specific engine error even when the definition is self-referential', () => {
+        const engineError = new Error('no such column: missing_value');
+        assert.strictEqual(
+            normalizeViewDefinitionError(
+                engineError,
+                'self_shadowed_view',
+                'SELECT missing_value FROM main.self_shadowed_view'
+            ),
+            engineError
         );
     });
 

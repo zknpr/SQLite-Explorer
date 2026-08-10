@@ -20,6 +20,7 @@ import type { TelemetryReporter } from '@vscode/extension-telemetry';
 import type { DatabaseConnectionBundle } from './connectionTypes';
 import type {
   CellValue,
+  CellTextEncoding,
   RecordId,
   QueryResultSet,
   DatabaseOperations,
@@ -40,11 +41,52 @@ import type {
   ViewDefinitionIntent,
   ViewEditResult,
   ViewTriggerDefinition,
-  ExactIntegerTextMap
+  ExactIntegerTextMap,
+  TableIdentity,
+  DeletedRow,
+  CellMetadata,
+  CellReadChunk,
+  CellReadSession,
+  CellReadTarget,
+  OversizedCellMetadata,
+  ColumnDropTableState
 } from './core/types';
-import { escapeIdentifier, validateSqlType, validateRowId, validateRowIds } from './core/sql-utils';
+import { escapeIdentifier, validateSqlType, validateRowId } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
-import { computeJsonPatchUndo, prepareCellUpdateForStorage } from './core/json-utils';
+import {
+  computeKeysetKey,
+  computeKeysetQueryTag,
+  keysetFallbackOrder,
+  mintKeysetAnchors,
+  ordersBySyntheticRowId,
+  resolveKeysetPlan
+} from './core/keyset-pagination';
+import {
+  applyMergePatch,
+  computeJsonPatchUndo,
+  parseJsonValueForPatching,
+  prepareCellUpdateForStorage
+} from './core/json-utils';
+import {
+  assertMutableRecordId,
+  buildRecordIdentitiesPredicate,
+  buildRecordIdentityPredicateChunks,
+  buildRecordIdentityPredicate,
+  buildTableIdentityMap,
+  classifyTableIdentity,
+  encodePrimaryKeyRecordId,
+  isPrimaryKeyRecordId,
+  primaryKeyColumnsFromTableInfo,
+  replacePrimaryKeyRecordIdValues,
+  TABLE_IDENTITY_METADATA_SQL,
+  unresolvableTriggeredPrimaryKeyUpdateError
+} from './core/row-identity';
+import {
+  assertDeleteSnapshotFitsUndoBudget,
+  buildDeleteSnapshotSizeQuery,
+  deleteSnapshotValueColumns,
+  parseDeleteSnapshotSizeRow
+} from './core/delete-history';
 import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
@@ -53,6 +95,18 @@ import {
   normalizeIntegerRowsForTransport,
   ROWID_TABLE_AUTHORITY_SQL
 } from './core/integer-utils';
+import {
+  buildByteFaithfulPrimaryKeyProjection,
+  buildCellContainmentQuery,
+  decodeRawTextColumns,
+  decodeCellContainment,
+  encodeByteFaithfulPrimaryKeyRecordId,
+  findUnrepresentableTextRows,
+  mergeCellContainmentMetadataRows,
+  prependCellContainmentColumn,
+  SQLITE_MAX_RESULT_COLUMNS,
+  remapPrimaryKeyContainment
+} from './core/cell-containment';
 import { serializeOperations } from './core/operation-serializer';
 import { InvocationTimeoutError } from './core/rpc';
 import {
@@ -68,16 +122,134 @@ import {
   escapeMainViewIdentifier,
   mapViewTriggerRows,
   VIEW_TRIGGER_SCHEMA_QUERIES,
+  normalizeViewDefinitionError,
   normalizeViewSelectSql
 } from './core/view-utils';
 import { crypto } from './platform/cryptoShim';
 import { DEFAULT_QUERY_TIMEOUT_MS } from './config';
+import {
+  normalizeCellTextEncoding,
+  validateCellReadTarget,
+  validateCellReadWindow
+} from './core/cell-read';
+import {
+  assertCellValueWithinEditLimit,
+  assertCellValuesWithinEditLimit,
+  assertOversizedCellReplacementExpectation,
+  OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE,
+  OversizedCellReplacementRequiredError
+} from './core/cell-edit-policy';
+import {
+  assertBatchHistoryFitsUndoBudget,
+  assertBatchPriorLimitResult,
+  buildBatchHistorySizePreflight,
+  buildBatchPriorLimitQueries
+} from './core/batch-update';
+import {
+  assertNoNewColumnDropForeignKeyViolations,
+  assertColumnDropTableStateCurrent,
+  buildColumnDropRestorePlan,
+  captureColumnDropForeignKeyBaseline,
+  COLUMN_DROP_FOREIGN_KEY_FIELD_BYTES_LIMIT,
+  COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT,
+  COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT,
+  COLUMN_DROP_TABLE_STATE_SQL,
+  executeSchemaPreservingColumnDrop,
+  mapColumnDropTableState
+} from './core/column-drop';
 
 // ============================================================================
 // Utility Functions
 // ============================================================================
 
 // Utility functions moved to src/core/sql-utils.ts
+
+// This token never crosses RPC. It distinguishes restoration of a value that
+// already existed in history from a user request to create oversized content.
+const HISTORY_REPLAY_EDIT_TOKEN = Symbol('history-replay-edit');
+
+type NativeHistoryUpdateCell = (
+  table: string,
+  rowId: RecordId,
+  column: string,
+  value: CellValue,
+  patch?: string,
+  maxEditValueBytes?: number,
+  historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+) => Promise<RecordId | void>;
+
+type NativeHistoryUpdateCellBatch = (
+  table: string,
+  updates: CellUpdate[],
+  maxEditValueBytes?: number,
+  maxUndoSnapshotBytes?: number,
+  historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+) => Promise<CellUpdateResult[]>;
+
+type NativeHistoryInsertRow = (
+  table: string,
+  data: Record<string, CellValue>,
+  maxEditValueBytes?: number,
+  historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+) => Promise<RecordId | undefined>;
+
+type NativeHistoryInsertRowBatch = (
+  table: string,
+  rows: Record<string, CellValue>[],
+  maxEditValueBytes?: number,
+  historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+) => Promise<void>;
+
+const updateNativeCellForHistory = (
+  operations: DatabaseOperations,
+  table: string,
+  rowId: RecordId,
+  column: string,
+  value: CellValue,
+  patch?: string
+) => (operations.updateCell as NativeHistoryUpdateCell)(
+  table,
+  rowId,
+  column,
+  value,
+  patch,
+  undefined,
+  HISTORY_REPLAY_EDIT_TOKEN
+);
+
+const updateNativeCellBatchForHistory = (
+  operations: DatabaseOperations,
+  table: string,
+  updates: CellUpdate[]
+) => (operations.updateCellBatch as NativeHistoryUpdateCellBatch)(
+  table,
+  updates,
+  undefined,
+  undefined,
+  HISTORY_REPLAY_EDIT_TOKEN
+);
+
+const insertNativeRowForHistory = (
+  operations: DatabaseOperations,
+  table: string,
+  data: Record<string, CellValue>
+) => (operations.insertRow as NativeHistoryInsertRow)(
+  table,
+  data,
+  undefined,
+  HISTORY_REPLAY_EDIT_TOKEN
+);
+
+const insertNativeRowBatchForHistory = (
+  operations: DatabaseOperations,
+  table: string,
+  rows: Record<string, CellValue>[]
+) => (operations.insertRowBatch as NativeHistoryInsertRowBatch)(
+  table,
+  rows,
+  undefined,
+  HISTORY_REPLAY_EDIT_TOKEN
+);
 
 function mergeExactIntegerTextMaps(
   companionTexts: ExactIntegerTextMap | undefined,
@@ -141,6 +313,20 @@ const INIT_TIMEOUT = 10000;
 
 /** Timeout for individual queries (ms) */
 const QUERY_TIMEOUT = DEFAULT_QUERY_TIMEOUT_MS;
+const EXPORT_SPOOL_NAME = '__sqlite_explorer_export_[0-9a-f]{32}';
+
+function isGeneratedExportSpoolStatement(sql: string): boolean {
+  const quotedName = `"${EXPORT_SPOOL_NAME}"`;
+  return (
+    new RegExp(`^CREATE TEMP TABLE ${quotedName} AS SELECT[\\s\\S]+$`, 'i').test(sql)
+    || new RegExp(
+      `^SELECT CAST\\(rowid AS TEXT\\), \\* FROM ${quotedName} ` +
+      'WHERE rowid > \\? ORDER BY rowid LIMIT 1$',
+      'i'
+    ).test(sql)
+    || new RegExp(`^DROP TABLE IF EXISTS temp\\.${quotedName}$`, 'i').test(sql)
+  );
+}
 
 /** Let a bounded worker query report its own precise timeout before RPC expires. */
 const BOUNDED_QUERY_TRANSPORT_MARGIN_MS = 2000;
@@ -219,6 +405,8 @@ export class NativeWorkerProcess {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
     timeout: NodeJS.Timeout;
+    signal?: AbortSignal;
+    abortListener?: () => void;
   }>();
 
   private chunks: Buffer[] = [];
@@ -320,31 +508,70 @@ export class NativeWorkerProcess {
    *
    * @param method - Method name to call
    * @param args - Arguments to pass
+   * @param timeoutMs - Host-side transport deadline
+   * @param signal - Optional cancellation for preemptible worker calls
    * @returns Promise resolving to the result
    */
-  async call<T>(method: string, args: unknown[] = [], timeoutMs: number = QUERY_TIMEOUT): Promise<T> {
+  async call<T>(
+    method: string,
+    args: unknown[] = [],
+    timeoutMs: number = QUERY_TIMEOUT,
+    signal?: AbortSignal
+  ): Promise<T> {
     if (!this.process || !this.process.stdin) {
       throw new Error('Native worker not running');
+    }
+    if (signal?.aborted) {
+      throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
     }
 
     const id = ++this.messageId;
 
     return new Promise((resolve, reject) => {
+      const removeAbortListener = () => {
+        if (signal && abortListener) {
+          signal.removeEventListener('abort', abortListener);
+        }
+      };
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(id);
-        reject(new InvocationTimeoutError(
+        removeAbortListener();
+        const timeoutError = new InvocationTimeoutError(
           method,
           method === 'queryBounded'
             ? `Query execution timed out after ${timeoutMs}ms`
             : `Request ${method} timed out`
-        ));
+        );
+        // open performs the capability probe before serving any useful work.
+        // Once its caller has abandoned the request, the process has no valid
+        // consumer and may otherwise keep running the probe to 41M rows.
+        if (method === 'open') this.stop();
+        reject(timeoutError);
       }, timeoutMs);
+
+      const abortListener = signal && (
+        method === 'queryBounded' || method === 'queryExportSpool'
+      )
+        ? () => {
+            if (!this.pendingRequests.has(id) || !this.process?.stdin) return;
+            const cancelId = ++this.messageId;
+            writeMessage(this.process.stdin, {
+              id: cancelId,
+              method: 'cancel',
+              args: [id]
+            });
+          }
+        : undefined;
 
       this.pendingRequests.set(id, {
         resolve: resolve as (value: unknown) => void,
         reject,
-        timeout
+        timeout,
+        signal,
+        abortListener
       });
+
+      if (abortListener) signal!.addEventListener('abort', abortListener, { once: true });
 
       writeMessage(this.process!.stdin!, { id, method, args });
     });
@@ -413,7 +640,12 @@ export class NativeWorkerProcess {
    * Handle a parsed message.
    */
   private handleMessage(msg: unknown): void {
-    const typedMsg = msg as { id?: number; result?: unknown; error?: string };
+    const typedMsg = msg as {
+      id?: number;
+      result?: unknown;
+      error?: string;
+      cancelled?: boolean;
+    };
 
     if (typedMsg.id === undefined) {
       return;
@@ -426,8 +658,22 @@ export class NativeWorkerProcess {
 
     this.pendingRequests.delete(typedMsg.id);
     clearTimeout(pending.timeout);
+    if (pending.signal && pending.abortListener) {
+      pending.signal.removeEventListener('abort', pending.abortListener);
+    }
 
-    if (typedMsg.error) {
+    if (pending.signal?.aborted) {
+      // SQLite may finish just before the worker observes the cancel RPC. The
+      // caller still cancelled while the request was outstanding, so do not
+      // surface a stale successful result.
+      pending.reject(
+        pending.signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+      );
+    } else if (typedMsg.cancelled) {
+      pending.reject(
+        pending.signal?.reason ?? new DOMException('The operation was aborted', 'AbortError')
+      );
+    } else if (typedMsg.error) {
       pending.reject(new Error(typedMsg.error));
     } else {
       pending.resolve(typedMsg.result);
@@ -440,6 +686,9 @@ export class NativeWorkerProcess {
   private cleanup(): void {
     for (const [, pending] of this.pendingRequests) {
       clearTimeout(pending.timeout);
+      if (pending.signal && pending.abortListener) {
+        pending.signal.removeEventListener('abort', pending.abortListener);
+      }
       pending.reject(new Error('Native worker stopped'));
     }
     this.pendingRequests.clear();
@@ -584,6 +833,15 @@ export async function createNativeDatabaseConnection(
         }
       };
 
+      const safeRollbackTransaction = async (context: string): Promise<void> => {
+        try {
+          await worker.call('run', ['ROLLBACK']);
+        } catch (rollbackErr) {
+          const message = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+          outputChannel?.appendLine(`[NativeWorker] Failed to rollback native transaction (${context}): ${message}`);
+        }
+      };
+
       const findNativeViewDefinition = async (
         view: string,
         allowUnparsed: boolean = false
@@ -687,9 +945,261 @@ export async function createNativeDatabaseConnection(
         });
       };
 
-      const queryNativeSingleStatement = async <T>(sql: string): Promise<T> => {
+      const getNativeTableInfo = async (table: string): Promise<ColumnMetadata[]> => {
+        const result = await worker.call<NativeQueryResult>('query', [
+          `PRAGMA table_info(${escapeIdentifier(table)})`
+        ]);
+        const index = {
+          cid: result.columns.indexOf('cid'),
+          name: result.columns.indexOf('name'),
+          type: result.columns.indexOf('type'),
+          notnull: result.columns.indexOf('notnull'),
+          dfltValue: result.columns.indexOf('dflt_value'),
+          pk: result.columns.indexOf('pk')
+        };
+        return (result.values ?? []).map(row => ({
+          ordinal: (index.cid >= 0 ? row[index.cid] : row[0]) as number,
+          identifier: (index.name >= 0 ? row[index.name] : row[1]) as string,
+          declaredType: (index.type >= 0 ? row[index.type] : row[2]) as string,
+          isRequired: (index.notnull >= 0 ? row[index.notnull] : row[3]) as number,
+          defaultExpression: index.dfltValue >= 0 ? row[index.dfltValue] : row[4],
+          primaryKeyPosition: (index.pk >= 0 ? row[index.pk] : row[5]) as number
+        }));
+      };
+
+      const getNativeInsertableColumnNames = async (table: string): Promise<string[]> => {
+        const result = await worker.call<NativeQueryResult>('query', [
+          'SELECT name FROM pragma.pragma_table_xinfo(?) ' +
+          'WHERE hidden NOT IN (2, 3) ORDER BY cid',
+          [table]
+        ]);
+        return (result.values ?? []).map(row => {
+          if (typeof row[0] !== 'string') {
+            throw new Error(`SQLite returned invalid column metadata for ${table}`);
+          }
+          return row[0];
+        });
+      };
+
+      const assertNativeDeleteSnapshotWithinBudget = async (
+        table: string,
+        insertableColumns: readonly string[],
+        predicates: ReturnType<typeof buildRecordIdentityPredicateChunks>,
+        rowIds: readonly RecordId[],
+        includeSyntheticRowId: boolean,
+        maxSnapshotBytes: number
+      ): Promise<void> => {
+        const valueColumns = deleteSnapshotValueColumns(
+          insertableColumns,
+          includeSyntheticRowId
+        );
+        let rowCount = 0;
+        let valueBytes = 0;
+        for (const predicate of predicates) {
+          const query = buildDeleteSnapshotSizeQuery(table, valueColumns, predicate);
+          const result = await worker.call<NativeQueryResult>('query', [query.sql, query.params]);
+          const chunk = parseDeleteSnapshotSizeRow(result.values?.[0]);
+          rowCount += chunk.rowCount;
+          valueBytes += chunk.valueBytes;
+        }
+        assertDeleteSnapshotFitsUndoBudget({
+          table,
+          insertableColumns,
+          includeSyntheticRowId,
+          rowIds,
+          rowCount,
+          valueBytes,
+          maxSnapshotBytes
+        });
+      };
+
+      const findNativeTableIdentity = async (table: string): Promise<TableIdentity | undefined> => {
+        const metadata = await worker.call<NativeQueryResult>('query', [
+          `SELECT "type", "wr" FROM pragma.pragma_table_list ` +
+          `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
+          [table]
+        ]);
+        if ((metadata.values?.length ?? 0) === 0) return undefined;
+        const kind = classifyTableIdentity(metadata.values[0][0], metadata.values[0][1]);
+        if (!kind) return undefined;
+        if (kind === 'rowid') return { kind: 'rowid' };
+        const columns = primaryKeyColumnsFromTableInfo(await getNativeTableInfo(table));
+        if (columns.length === 0) {
+          throw new Error(`WITHOUT ROWID table ${table} has no declared primary key`);
+        }
+        return { kind: 'primaryKey', columns };
+      };
+
+      const resolveNativeTableIdentity = async (table: string): Promise<TableIdentity> => {
+        const identity = await findNativeTableIdentity(table);
+        if (!identity) throw new Error(`Table not found: ${table}`);
+        return identity;
+      };
+
+      /** Read the current table/catalog state while an undo transaction owns the schema snapshot. */
+      const readNativeColumnDropTableState = async (
+        table: string
+      ): Promise<ColumnDropTableState> => {
+        const [schema, columns, identity] = await Promise.all([
+          worker.call<NativeQueryResult>('query', [COLUMN_DROP_TABLE_STATE_SQL, [table, table]]),
+          getNativeTableInfo(table),
+          resolveNativeTableIdentity(table)
+        ]);
+        return mapColumnDropTableState(
+          table,
+          columns.map(column => column.identifier),
+          identity,
+          schema.values ?? []
+        );
+      };
+
+      /** Stage recorded values in the appended columns before rebuilding exact original DDL. */
+      const restoreNativeDroppedColumnValues = async (
+        table: string,
+        deletedColumns: NonNullable<ModificationEntry['deletedColumns']>,
+        identity: TableIdentity
+      ): Promise<void> => {
+        const batch = deletedColumns.map(column => {
+          const escapedColumn = escapeIdentifier(column.name);
+          let predicateSql: string | undefined;
+          const paramsList = column.data.map(cell => {
+            const rowId = identity.kind === 'rowid'
+              ? validateRowId(cell.rowId)
+              : cell.rowId;
+            const predicate = buildRecordIdentityPredicate(rowId, identity);
+            if (predicateSql !== undefined && predicateSql !== predicate.sql) {
+              throw new Error(`Inconsistent row identity while restoring ${table}.${column.name}`);
+            }
+            predicateSql = predicate.sql;
+            return [cell.value ?? null, ...predicate.params];
+          });
+          const sql =
+            `UPDATE ${escapeIdentifier(table)} SET ${escapedColumn} = ? ` +
+            `WHERE ${predicateSql ?? (identity.kind === 'rowid' ? 'rowid = ?' : '0')}`;
+          return { sql, paramsList };
+        }).filter(item => item.paramsList.length > 0);
+        if (batch.length > 0) await worker.call('execBatch', [batch]);
+      };
+
+      const buildNativeCellLocator = (
+        rowId: RecordId,
+        identity: TableIdentity
+      ): {
+        kind: 'rowid'; value: CellValue;
+      } | {
+        kind: 'primaryKey'; columns: string[]; values: CellValue[]; integerCasts: boolean[];
+      } => {
+        const predicate = buildRecordIdentityPredicate(rowId, identity);
+        return identity.kind === 'rowid'
+          ? { kind: 'rowid', value: predicate.params[0] }
+          : {
+              kind: 'primaryKey',
+              columns: identity.columns.map(column => column.identifier),
+              values: predicate.params,
+              integerCasts: predicate.primaryKeyIntegerCasts!
+            };
+      };
+
+      const readNativeCellMetadata = async (
+        table: string,
+        rowId: RecordId,
+        column: string,
+        identity?: TableIdentity
+      ): Promise<CellMetadata> => worker.call<CellMetadata>('getCellMetadata', [
+        table,
+        column,
+        buildNativeCellLocator(rowId, identity ?? await resolveNativeTableIdentity(table))
+      ]);
+
+      const assertNativeCellPriorWithinEditLimit = async (
+        table: string,
+        rowId: RecordId,
+        column: string,
+        editLimitBytes: number,
+        identity?: TableIdentity
+      ): Promise<void> => {
+        const metadata = await readNativeCellMetadata(table, rowId, column, identity);
+        if (
+          (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
+          && metadata.byteLength > editLimitBytes
+        ) {
+          throw new OversizedCellReplacementRequiredError(
+            table,
+            column,
+            metadata.storageClass,
+            metadata.byteLength,
+            editLimitBytes
+          );
+        }
+      };
+
+      const assertNativeBatchPriorsWithinEditLimit = async (
+        table: string,
+        updates: readonly CellUpdate[],
+        editLimitBytes: number,
+        identity: TableIdentity
+      ): Promise<void> => {
+        const seen = new Set<string>();
+        for (const update of updates) {
+          const key = `${String(update.rowId)}\0${update.column}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          await assertNativeCellPriorWithinEditLimit(
+            table,
+            update.rowId,
+            update.column,
+            editLimitBytes,
+            identity
+          );
+        }
+      };
+
+      const assertNativeRowIdBatchPriorsWithinEditLimit = async (
+        table: string,
+        updates: readonly CellUpdate[],
+        editLimitBytes: number
+      ): Promise<void> => {
+        const queries = buildBatchPriorLimitQueries(table, updates, editLimitBytes);
+        const metadata = await worker.call<NativeQueryBatchResult>('queryBatch', [
+          queries.map(({ sql, params }) => ({ sql, params }))
+        ]);
+        if (metadata.results?.length !== queries.length) {
+          throw new Error('Batch prior metadata fetch returned incomplete results');
+        }
+        queries.forEach((query, index) => {
+          assertBatchPriorLimitResult(
+            table,
+            query,
+            metadata.results[index].values ?? [],
+            editLimitBytes
+          );
+        });
+      };
+
+      const assertNativeBatchHistoryWithinBudget = async (
+        table: string,
+        updates: readonly CellUpdate[],
+        identity: TableIdentity,
+        maxPriorValueBytes: number
+      ): Promise<void> => {
+        const preflight = buildBatchHistorySizePreflight(table, updates, identity);
+        const metadata = await worker.call<NativeQueryBatchResult>('queryBatch', [
+          preflight.queries.map(({ sql, params }) => ({ sql, params }))
+        ]);
+        assertBatchHistoryFitsUndoBudget({
+          table,
+          preflight,
+          resultRows: preflight.queries.map((_, index) => metadata.results?.[index]?.values?.[0]),
+          maxPriorValueBytes
+        });
+      };
+
+      const queryNativeSingleStatement = async <T>(
+        sql: string,
+        params?: CellValue[]
+      ): Promise<T> => {
         const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
-        return worker.call<T>('querySingle', [`${sql}\n${boundary}`, undefined, boundary]);
+        return worker.call<T>('querySingle', [`${sql}\n${boundary}`, params, boundary]);
       };
 
       const runNativeSingleStatement = async (sql: string, params?: CellValue[]): Promise<void> => {
@@ -697,10 +1207,179 @@ export async function createNativeDatabaseConnection(
         await worker.call('runSingle', [`${sql}\n${boundary}`, sql, params, boundary]);
       };
 
+      const readNativeCellTextEncoding = async (): Promise<CellTextEncoding> => (
+        normalizeCellTextEncoding((await worker.call<NativeQueryResult>('query', [
+          'PRAGMA encoding',
+          []
+        ])).values[0]?.[0])
+      );
+
+      const readNativePrimaryKeyRecordId = async (
+        table: string,
+        identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
+        predicate: { sql: string; params: CellValue[] },
+        missingRowError?: Error
+      ): Promise<RecordId> => {
+        const result = await worker.call<NativeQueryResult>('query', [
+          `SELECT ${buildByteFaithfulPrimaryKeyProjection(identity)} ` +
+          `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
+          predicate.params
+        ]);
+        if (result.values.length === 0) {
+          throw missingRowError ?? new Error(`Updated row in ${table} no longer exists`);
+        }
+        if (result.values.length !== 1) {
+          throw new Error(`Primary-key identity for ${table} matched more than one row`);
+        }
+        return encodeByteFaithfulPrimaryKeyRecordId(
+          identity,
+          result.values[0],
+          await readNativeCellTextEncoding(),
+          `Cannot resolve updated identity in ${table}`
+        );
+      };
+
+      const applyNativeJsonPatchValue = (currentValue: CellValue, patch: CellValue): string => {
+        const currentObject = parseJsonValueForPatching(currentValue, 'updateCellBatch');
+        const patchObject = typeof patch === 'string' ? JSON.parse(patch) : patch;
+        return JSON.stringify(applyMergePatch(currentObject, patchObject));
+      };
+
+      const updateNativePrimaryKeyCellBatch = async (
+        table: string,
+        identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
+        updates: CellUpdate[],
+        maxEditValueBytes?: number,
+        maxUndoSnapshotBytes?: number,
+        historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+      ): Promise<CellUpdateResult[]> => {
+        const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+        const editLimitBytes = isHistoryReplay
+          ? 0
+          : assertCellValuesWithinEditLimit(
+              updates.map(update => update.value),
+              maxEditValueBytes
+            );
+        const savepointName = createSavepointName('sp_update_pk_batch');
+        await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+        try {
+          // A second metadata-only gate under the writer savepoint closes the
+          // external-writer race after the pre-savepoint refusal.
+          if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
+            await assertNativeBatchHistoryWithinBudget(
+              table,
+              updates,
+              identity,
+              maxUndoSnapshotBytes
+            );
+          }
+          // Keep the existing full prior-value read below for bounded history,
+          // but refuse oversized priors from metadata before it can run.
+          if (!isHistoryReplay && maxEditValueBytes !== undefined) {
+            await assertNativeBatchPriorsWithinEditLimit(
+              table,
+              updates,
+              editLimitBytes,
+              identity
+            );
+          }
+          const updatesByRow = new Map<RecordId, CellUpdate[]>();
+          for (const update of updates) {
+            const rowUpdates = updatesByRow.get(update.rowId) ?? [];
+            rowUpdates.push(update);
+            updatesByRow.set(update.rowId, rowUpdates);
+          }
+
+          const results: CellUpdateResult[] = [];
+          for (const [rowId, rowUpdates] of updatesByRow) {
+            const oldPredicate = buildRecordIdentityPredicate(rowId, identity);
+            const columns = [...new Set(rowUpdates.map(update => update.column))];
+            if (columns.length !== rowUpdates.length) {
+              throw new Error(`Batch update for ${table} contains the same column more than once`);
+            }
+            const current = await worker.call<NativeQueryResult>('query', [
+              `SELECT ${columns.map(escapeIdentifier).join(', ')} ` +
+              `FROM ${escapeIdentifier(table)} WHERE ${oldPredicate.sql} LIMIT 2`,
+              oldPredicate.params
+            ]);
+            if (current.values.length !== 1) {
+              throw new Error(`Cannot update ${table}: row identity no longer exists`);
+            }
+
+            const preparedUpdates = rowUpdates.map((update, index) => {
+              const priorValue = current.values[0][index];
+              const prepared = prepareCellUpdateForStorage(
+                update.value,
+                priorValue,
+                update.operation ?? 'set'
+              );
+              const storedValue = prepared.operation === 'json_patch'
+                ? applyNativeJsonPatchValue(priorValue, prepared.value)
+                : prepared.value;
+              if (!isHistoryReplay && prepared.operation === 'json_patch') {
+                // Validate the merged value, not only its bounded patch payload.
+                assertCellValueWithinEditLimit(storedValue, editLimitBytes);
+              }
+              return { update, priorValue, prepared, storedValue };
+            });
+            await worker.call('run', [
+              `UPDATE ${escapeIdentifier(table)} SET ` +
+              `${preparedUpdates.map(({ update }) => `${escapeIdentifier(update.column)} = ?`).join(', ')} ` +
+              `WHERE ${oldPredicate.sql}`,
+              [
+                ...preparedUpdates.map(update => update.storedValue),
+                ...oldPredicate.params
+              ]
+            ]);
+
+            const primaryKeyReplacements: Array<{ column: string; value: CellValue }> = [];
+            for (const preparedUpdate of preparedUpdates) {
+              const keyIndex = identity.columns.findIndex(
+                keyColumn => keyColumn.identifier === preparedUpdate.update.column
+              );
+              if (keyIndex >= 0) {
+                primaryKeyReplacements.push({
+                  column: preparedUpdate.update.column,
+                  value: preparedUpdate.storedValue
+                });
+              }
+            }
+            const candidateId = replacePrimaryKeyRecordIdValues(
+              rowId,
+              identity,
+              primaryKeyReplacements
+            );
+            const newRowId = await readNativePrimaryKeyRecordId(
+              table,
+              identity,
+              buildRecordIdentityPredicate(candidateId, identity),
+              unresolvableTriggeredPrimaryKeyUpdateError(table)
+            );
+            for (const preparedUpdate of preparedUpdates) {
+              results.push({
+                rowId,
+                newRowId,
+                columnName: preparedUpdate.update.column,
+                priorValue: preparedUpdate.priorValue,
+                newValue: preparedUpdate.prepared.value,
+                operation: preparedUpdate.prepared.operation
+              });
+            }
+          }
+
+          await worker.call('run', [`RELEASE ${savepointName}`]);
+          return results;
+        } catch (error) {
+          await safeRollbackSavepoint(savepointName, 'updateNativePrimaryKeyCellBatch');
+          throw error;
+        }
+      };
+
       const queryNativeBoundedStatement = async (
         sql: string,
         columns: string[],
-        limit: number
+        limit: number,
+        signal?: AbortSignal
       ): Promise<NativeQueryResult> => {
         const transportQuery = buildExactNumericTextQuery(sql, columns.length);
         const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
@@ -712,7 +1391,7 @@ export async function createNativeDatabaseConnection(
           transportQuery.valueColumnCount,
           limit,
           queryTimeout
-        ], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS);
+        ], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
       };
 
       const compileNativeViewSelect = async (selectSql: string): Promise<void> => {
@@ -753,11 +1432,190 @@ export async function createNativeDatabaseConnection(
         }
       };
 
+      const undoLegacyNativeColumnDrop = async (
+        table: string,
+        deletedColumns: NonNullable<ModificationEntry['deletedColumns']>
+      ): Promise<void> => {
+        const batch: Array<{ sql: string; params?: CellValue[] }> = [];
+        for (const column of deletedColumns) {
+          validateSqlType(column.type);
+          batch.push({
+            sql:
+              `ALTER TABLE ${escapeIdentifier(table)} ADD COLUMN ` +
+              `${escapeIdentifier(column.name)} ${column.type}`
+          });
+        }
+        for (const column of deletedColumns) {
+          for (const { rowId, value } of column.data) {
+            batch.push({
+              sql:
+                `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column.name)} = ? ` +
+                'WHERE rowid = ?',
+              params: [value, validateRowId(rowId)]
+            });
+          }
+        }
+        if (batch.length > 0) await worker.call('execBatch', [batch]);
+      };
+
+      /**
+       * Restore a dropped column from exact pre/post catalog snapshots.
+       *
+       * This owns one raw transaction. It must not be called inside a host
+       * savepoint because PRAGMA foreign_keys can only change outside a
+       * transaction and legacy history operations already use raw BEGIN.
+       */
+      const undoNativeColumnDrop = async (
+        table: string,
+        deletedColumns: NonNullable<ModificationEntry['deletedColumns']>,
+        snapshot: NonNullable<ModificationEntry['columnDropSnapshot']>
+      ): Promise<void> => {
+        const stagingTable = `__sqlite_explorer_column_restore_${crypto.randomUUID().replace(/-/g, '')}`;
+        const plan = buildColumnDropRestorePlan(table, stagingTable, deletedColumns, snapshot);
+        const readPragma = async (
+          pragma: 'foreign_keys' | 'legacy_alter_table'
+        ): Promise<number> => {
+          const result = await worker.call<NativeQueryResult>('query', [`PRAGMA ${pragma}`]);
+          const value = Number(result.values?.[0]?.[0]);
+          if (value !== 0 && value !== 1) {
+            throw new Error(`SQLite returned an invalid ${pragma} value`);
+          }
+          return value;
+        };
+        const setPragma = async (
+          pragma: 'foreign_keys' | 'legacy_alter_table',
+          value: number
+        ): Promise<void> => {
+          await worker.call('run', [`PRAGMA ${pragma} = ${value ? 'ON' : 'OFF'}`]);
+          if (await readPragma(pragma) !== value) {
+            throw new Error(`Unable to set PRAGMA ${pragma} for column-drop undo`);
+          }
+        };
+        const readBoundedForeignKeyViolations = async (): Promise<NativeQueryResult['values']> => {
+          const result = await worker.call<NativeQueryResult>('foreignKeyCheckBounded', [
+            table,
+            COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT,
+            COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT,
+            COLUMN_DROP_FOREIGN_KEY_FIELD_BYTES_LIMIT
+          ]);
+          return result.values ?? [];
+        };
+
+        const foreignKeysBefore = await readPragma('foreign_keys');
+        const legacyAlterBefore = await readPragma('legacy_alter_table');
+        let transactionStarted = false;
+        let operationError: unknown;
+        try {
+          if (foreignKeysBefore !== 0) await setPragma('foreign_keys', 0);
+          if (legacyAlterBefore !== 1) await setPragma('legacy_alter_table', 1);
+
+          await worker.call('run', ['BEGIN TRANSACTION']);
+          transactionStarted = true;
+          const foreignKeyBaseline = captureColumnDropForeignKeyBaseline(
+            table,
+            await readBoundedForeignKeyViolations()
+          );
+          const current = await readNativeColumnDropTableState(table);
+          assertColumnDropTableStateCurrent(table, snapshot.after, current);
+          const collision = await worker.call<NativeQueryResult>('query', [
+            'SELECT 1 FROM sqlite_schema WHERE name = ? COLLATE NOCASE LIMIT 1',
+            [stagingTable]
+          ]);
+          if ((collision.values?.length ?? 0) !== 0) {
+            throw new Error(`Column-drop staging table already exists: ${stagingTable}`);
+          }
+
+          let sequenceState: { value: CellValue } | undefined;
+          const sequenceCatalog = await worker.call<NativeQueryResult>('query', [
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_sequence'"
+          ]);
+          if ((sequenceCatalog.values?.length ?? 0) !== 0) {
+            const sequence = await worker.call<NativeQueryResult>('query', [
+              'SELECT seq FROM sqlite_sequence WHERE name = ? LIMIT 2',
+              [table]
+            ]);
+            if ((sequence.values?.length ?? 0) > 1) {
+              throw new Error(`Cannot undo column drop on ${table}: sqlite_sequence is ambiguous`);
+            }
+            if ((sequence.values?.length ?? 0) === 1) {
+              sequenceState = { value: sequence.values[0][0] };
+            }
+          }
+
+          for (const sql of plan.stageColumns) await worker.call('run', [sql]);
+          await restoreNativeDroppedColumnValues(table, deletedColumns, snapshot.before.identity);
+          for (const sql of plan.dropCurrentSchemaObjects) await worker.call('run', [sql]);
+          await worker.call('run', [plan.renameCurrentTable]);
+          await runNativeSingleStatement(plan.createOriginalTable);
+          await worker.call('run', [plan.copyRows]);
+          await worker.call('run', [plan.dropStagingTable]);
+          if (sequenceState) {
+            await worker.call('run', [
+              'DELETE FROM sqlite_sequence WHERE name = ?',
+              [table]
+            ]);
+            await worker.call('run', [
+              'INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)',
+              [table, sequenceState.value]
+            ]);
+          }
+          for (const sql of plan.restoreSchemaObjects) await runNativeSingleStatement(sql);
+
+          const restored = await readNativeColumnDropTableState(table);
+          assertColumnDropTableStateCurrent(table, snapshot.before, restored);
+          assertNoNewColumnDropForeignKeyViolations(
+            table,
+            foreignKeyBaseline,
+            await readBoundedForeignKeyViolations()
+          );
+          await worker.call('run', ['COMMIT']);
+          transactionStarted = false;
+        } catch (error) {
+          operationError = error;
+          if (transactionStarted) await safeRollbackTransaction('undoColumnDrop');
+        }
+
+        let pragmaRestoreError: unknown;
+        try {
+          if (legacyAlterBefore !== 1) await setPragma('legacy_alter_table', legacyAlterBefore);
+          if (foreignKeysBefore !== 0) await setPragma('foreign_keys', foreignKeysBefore);
+        } catch (error) {
+          pragmaRestoreError = error;
+        }
+        if (operationError !== undefined) {
+          if (pragmaRestoreError !== undefined) {
+            throw new Error(
+              `Column-drop undo failed and connection PRAGMAs could not be restored: ${String(pragmaRestoreError)}`,
+              { cause: operationError }
+            );
+          }
+          throw operationError;
+        }
+        if (pragmaRestoreError !== undefined) throw pragmaRestoreError;
+      };
+
       const rawOperations: DatabaseOperations = {
         engineKind: Promise.resolve('native'),
 
-        executeQuery: async (sql: string, params?: CellValue[]): Promise<QueryResultSet[]> => {
-          const result = await worker.call<NativeQueryResult>('query', [sql, params]);
+        executeQuery: async (
+          sql: string,
+          params?: CellValue[],
+          signal?: AbortSignal
+        ): Promise<QueryResultSet[]> => {
+          let result: NativeQueryResult;
+          if (isGeneratedExportSpoolStatement(sql)) {
+            const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
+            result = await worker.call<NativeQueryResult>(
+              'queryExportSpool',
+              [`${sql}\n${boundary}`, sql, boundary, params, queryTimeout],
+              queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS,
+              signal
+            );
+          } else {
+            signal?.throwIfAborted();
+            result = await worker.call<NativeQueryResult>('query', [sql, params]);
+            signal?.throwIfAborted();
+          }
 
           // Return in QueryResultSet format with multiple property names for compatibility:
           // - headers/rows: new naming convention from src/core/types.ts
@@ -773,18 +1631,55 @@ export async function createNativeDatabaseConnection(
           }];
         },
 
+        getCellMetadata: async (target: CellReadTarget): Promise<CellMetadata> => {
+          validateCellReadTarget(target);
+          return readNativeCellMetadata(target.table, target.rowId, target.column);
+        },
+
+        openCellReadSession: async (target: CellReadTarget): Promise<CellReadSession> => {
+          validateCellReadTarget(target);
+          const identity = await resolveNativeTableIdentity(target.table);
+          return worker.call<CellReadSession>('openCellReadSession', [
+            target.table,
+            target.column,
+            buildNativeCellLocator(target.rowId, identity)
+          ]);
+        },
+
+        readCellChunk: async (
+          sessionId: string,
+          byteOffset: number,
+          maxBytes: number
+        ): Promise<CellReadChunk> => {
+          validateCellReadWindow(byteOffset, maxBytes);
+          return worker.call<CellReadChunk>('readCellChunk', [
+            sessionId,
+            byteOffset,
+            maxBytes
+          ]);
+        },
+
+        closeCellReadSession: async (sessionId: string): Promise<void> => {
+          await worker.call('closeCellReadSession', [sessionId]);
+        },
+
         serializeDatabase: async (): Promise<Uint8Array> => {
           const result = await worker.call<{ content: Uint8Array }>('export', []);
           return result.content;
         },
 
-        applyModifications: async () => {},
+        applyModifications: async () => {
+          throw new Error(
+            'applyModifications is not supported on the native backend; ' +
+            'history replay uses redoModification'
+          );
+        },
 
         /**
          * Undo a modification by executing the inverse SQL.
          */
         undoModification: async (mod: ModificationEntry) => {
-          const { modificationType, targetTable, targetRowId, targetColumn, priorValue, newValue, operation, affectedCells, deletedRows, columnDef, deletedColumns } = mod;
+          const { modificationType, targetTable, targetRowId, newTargetRowId, targetColumn, priorValue, newValue, operation, affectedCells, deletedRows, columnDef, deletedColumns, columnDropSnapshot } = mod;
           if (!targetTable) return;
 
           switch (modificationType) {
@@ -808,77 +1703,115 @@ export async function createNativeDatabaseConnection(
               };
 
               if (affectedCells) {
-                const undoValues: CellValue[] = affectedCells.map(cell => cell.priorValue ?? null);
-                const jsonPatchIndexes: number[] = [];
-                const queries: { sql: string; params: CellValue[] }[] = [];
-
-                for (let index = 0; index < affectedCells.length; index++) {
-                  const cell = affectedCells[index];
-                  if (cell.operation !== 'json_patch') continue;
-                  const rowIdNum = validateRowId(cell.rowId);
-                  jsonPatchIndexes.push(index);
-                  queries.push({
-                    sql: `SELECT ${escapeIdentifier(cell.columnName)} FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`,
-                    params: [rowIdNum]
-                  });
+                // A later forward transition may occupy a key vacated by an
+                // earlier row. Reverse only identity-changing batches so
+                // ordinary edit replay retains its established call order.
+                const hasIdentityTransition = affectedCells.some(cell => (
+                  cell.newRowId !== undefined && cell.newRowId !== cell.rowId
+                ));
+                const undoCells = hasIdentityTransition
+                  ? [...affectedCells].reverse()
+                  : affectedCells;
+                const currentRowIds = undoCells.map(cell => cell.newRowId ?? cell.rowId);
+                const usesPrimaryKey = currentRowIds.some(isPrimaryKeyRecordId);
+                if (usesPrimaryKey && !currentRowIds.every(isPrimaryKeyRecordId)) {
+                  throw new Error('Cannot mix rowid and primary-key row identities');
                 }
-
-                if (queries.length > 0) {
-                  const read = await worker.call<NativeQueryBatchResult>('queryBatch', [queries]);
-                  if (!read || !read.results || read.results.length < queries.length) {
-                    throw new Error('json_patch undo failed: queryBatch returned incomplete results');
+                const identity = usesPrimaryKey
+                  ? await resolveNativeTableIdentity(targetTable)
+                  : { kind: 'rowid' } as const;
+                const patchCells = undoCells.filter(cell => cell.operation === 'json_patch');
+                let patchReads: NativeQueryBatchResult | undefined;
+                if (patchCells.length > 0) {
+                  patchReads = await worker.call<NativeQueryBatchResult>('queryBatch', [
+                    patchCells.map(cell => {
+                      const currentRowId = cell.newRowId ?? cell.rowId;
+                      const predicate = buildRecordIdentityPredicate(currentRowId, identity);
+                      return {
+                        sql:
+                          `SELECT ${escapeIdentifier(cell.columnName)} ` +
+                          `FROM ${escapeIdentifier(targetTable)} WHERE ${predicate.sql}`,
+                        params: predicate.params
+                      };
+                    })
+                  ]);
+                  if (patchReads.results?.length !== patchCells.length) {
+                    throw new Error('JSON patch undo read returned incomplete results');
                   }
-
-                  for (let queryIndex = 0; queryIndex < queries.length; queryIndex++) {
-                    const cellIndex = jsonPatchIndexes[queryIndex];
-                    const cell = affectedCells[cellIndex];
-                    const currentValue = (read.results[queryIndex]?.values?.[0]?.[0] ?? null) as CellValue;
-                    undoValues[cellIndex] = computeUndoValue(
-                      currentValue,
+                }
+                const updates: CellUpdate[] = [];
+                let patchIndex = 0;
+                for (const cell of undoCells) {
+                  const currentRowId = cell.newRowId ?? cell.rowId;
+                  let value = cell.priorValue ?? null;
+                  if (cell.operation === 'json_patch') {
+                    const read = patchReads!.results[patchIndex++];
+                    value = computeUndoValue(
+                      (read.values[0]?.[0] ?? null) as CellValue,
                       cell.priorValue,
                       cell.newValue,
                       cell.operation
                     );
                   }
+                  updates.push({ rowId: currentRowId, column: cell.columnName, value });
                 }
-
-                const batchItems = affectedCells.map((cell, index) => ({
-                  sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(cell.columnName)} = ? WHERE rowid = ?`,
-                  params: [undoValues[index], validateRowId(cell.rowId)]
-                }));
-
-                if (batchItems.length > 0) {
-                  await worker.call('execBatch', [batchItems]);
+                if (usesPrimaryKey) {
+                  await updateNativePrimaryKeyCellBatch(
+                    targetTable,
+                    identity as Extract<TableIdentity, { kind: 'primaryKey' }>,
+                    updates,
+                    undefined,
+                    undefined,
+                    HISTORY_REPLAY_EDIT_TOKEN
+                  );
+                } else {
+                  await worker.call('execBatch', [updates.map(update => ({
+                    sql:
+                      `UPDATE ${escapeIdentifier(targetTable)} ` +
+                      `SET ${escapeIdentifier(update.column)} = ? WHERE rowid = ?`,
+                    params: [update.value, validateRowId(update.rowId)]
+                  }))]);
                 }
               } else if (targetRowId !== undefined && targetColumn) {
-                const rowIdNum = validateRowId(targetRowId);
-                const sql = `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(targetColumn)} = ? WHERE rowid = ?`;
+                const currentRowId = newTargetRowId ?? targetRowId;
                 let value = priorValue ?? null;
                 if (operation === 'json_patch') {
-                  const read = await rawOperations.executeQuery(
-                    `SELECT ${escapeIdentifier(targetColumn)} FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`,
-                    [rowIdNum]
-                  );
-                  const currentValue = (read[0]?.rows[0]?.[0] ?? null) as CellValue;
+                  const identity = isPrimaryKeyRecordId(currentRowId)
+                    ? await resolveNativeTableIdentity(targetTable)
+                    : { kind: 'rowid' } as const;
+                  const predicate = buildRecordIdentityPredicate(currentRowId, identity);
+                  const read = await worker.call<NativeQueryResult>('query', [
+                    `SELECT ${escapeIdentifier(targetColumn)} ` +
+                    `FROM ${escapeIdentifier(targetTable)} WHERE ${predicate.sql}`,
+                    predicate.params
+                  ]);
+                  const currentValue = (read.values[0]?.[0] ?? null) as CellValue;
                   value = computeUndoValue(currentValue, priorValue, newValue, operation);
                 }
-                await worker.call('run', [sql, [value, rowIdNum]]);
+                await updateNativeCellForHistory(
+                  rawOperations,
+                  targetTable,
+                  currentRowId,
+                  targetColumn,
+                  value
+                );
               }
               break;
             }
 
             case 'row_insert':
               if (targetRowId !== undefined) {
-                await worker.call('run', [
-                  `DELETE FROM ${escapeIdentifier(targetTable)} WHERE rowid = ?`,
-                  [validateRowId(targetRowId)]
-                ]);
+                await rawOperations.deleteRows(targetTable, [targetRowId]);
               }
               break;
 
             case 'row_delete':
               if (deletedRows && deletedRows.length > 0) {
-                await rawOperations.insertRowBatch(targetTable, deletedRows.map(dr => dr.row));
+                await insertNativeRowBatchForHistory(
+                  rawOperations,
+                  targetTable,
+                  deletedRows.map(dr => dr.row)
+                );
               }
               break;
 
@@ -889,29 +1822,14 @@ export async function createNativeDatabaseConnection(
               break;
 
             case 'column_drop':
-                if (deletedColumns) {
-                    const batch = [];
-                    // 1. Add columns back
-                    for (const col of deletedColumns) {
-                        validateSqlType(col.type); // Validate type
-                        batch.push({
-                            sql: `ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(col.name)} ${col.type}`
-                        });
-                    }
-                    // 2. Restore values
-                    for (const col of deletedColumns) {
-                        for (const { rowId, value } of col.data) {
-                            batch.push({
-                                sql: `UPDATE ${escapeIdentifier(targetTable)} SET ${escapeIdentifier(col.name)} = ? WHERE rowid = ?`,
-                                params: [value, validateRowId(rowId)]
-                            });
-                        }
-                    }
-                    if (batch.length > 0) {
-                        await worker.call('execBatch', [batch]);
-                    }
+              if (deletedColumns && deletedColumns.length > 0) {
+                if (columnDropSnapshot) {
+                  await undoNativeColumnDrop(targetTable, deletedColumns, columnDropSnapshot);
+                } else {
+                  await undoLegacyNativeColumnDrop(targetTable, deletedColumns);
                 }
-                break;
+              }
+              break;
 
             case 'table_create':
                 await worker.call('run', [`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`]);
@@ -964,7 +1882,7 @@ export async function createNativeDatabaseConnection(
           switch (modificationType) {
             case 'cell_update':
               if (affectedCells) {
-                await rawOperations.updateCellBatch(targetTable, affectedCells.map(c => ({
+                await updateNativeCellBatchForHistory(rawOperations, targetTable, affectedCells.map(c => ({
                   rowId: c.rowId,
                   column: c.columnName,
                   value: c.newValue ?? null,
@@ -974,17 +1892,32 @@ export async function createNativeDatabaseConnection(
                 const replayOperation = normalizeReplayCellOperation(operation);
                 if (replayOperation === 'json_patch') {
                   const patch = typeof newValue === 'string' ? newValue : JSON.stringify(newValue ?? null);
-                  await rawOperations.updateCell(targetTable, targetRowId, targetColumn, null, patch);
+                  await updateNativeCellForHistory(
+                    rawOperations,
+                    targetTable,
+                    targetRowId,
+                    targetColumn,
+                    null,
+                    patch
+                  );
                 } else {
-                  await rawOperations.updateCell(targetTable, targetRowId, targetColumn, newValue ?? null);
+                  await updateNativeCellForHistory(
+                    rawOperations,
+                    targetTable,
+                    targetRowId,
+                    targetColumn,
+                    newValue ?? null
+                  );
                 }
               }
               break;
 
             case 'row_insert':
               if (rowData) {
-                const dataToInsert = targetRowId !== undefined ? { ...rowData, rowid: targetRowId } : rowData;
-                await rawOperations.insertRow(targetTable, dataToInsert);
+                const dataToInsert = targetRowId !== undefined && !isPrimaryKeyRecordId(targetRowId)
+                  ? { ...rowData, rowid: targetRowId }
+                  : rowData;
+                await insertNativeRowForHistory(rawOperations, targetTable, dataToInsert);
               }
               break;
 
@@ -1052,7 +1985,35 @@ export async function createNativeDatabaseConnection(
         /**
          * Update a single cell value.
          */
-        updateCell: async (table: string, rowId: RecordId, column: string, value: CellValue, patch?: string) => {
+        updateCell: async (
+          table: string,
+          rowId: RecordId,
+          column: string,
+          value: CellValue,
+          patch?: string,
+          maxEditValueBytes?: number,
+          historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+        ) => {
+          const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+          const enforcePriorPolicy = !isHistoryReplay && maxEditValueBytes !== undefined;
+          const editLimitBytes = isHistoryReplay
+            ? 0
+            : assertCellValuesWithinEditLimit([value], maxEditValueBytes);
+          assertMutableRecordId(rowId);
+          if (isPrimaryKeyRecordId(rowId)) {
+            const identity = await resolveNativeTableIdentity(table);
+            if (identity.kind !== 'primaryKey') {
+              throw new Error(`Primary-key identity cannot target rowid table ${table}`);
+            }
+            const result = await updateNativePrimaryKeyCellBatch(table, identity, [{
+              rowId,
+              column,
+              value: patch ?? value,
+              operation: patch === undefined ? 'set' : 'json_patch'
+            }], maxEditValueBytes, undefined, historyReplayToken);
+            return result[0]?.newRowId ?? rowId;
+          }
+
           // Validate rowId is a number
           const rowIdNum = validateRowId(rowId);
 
@@ -1062,20 +2023,117 @@ export async function createNativeDatabaseConnection(
           if (patch) {
             // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL,
             // but expected behavior is to treat NULL as empty object (matching WASM path)
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(COALESCE(${escapeIdentifier(column)}, '{}'), ?) WHERE rowid = ?`;
-            params = [patch, rowIdNum];
+            const escapedColumn = escapeIdentifier(column);
+            sql =
+              `UPDATE ${escapeIdentifier(table)} SET ${escapedColumn} = ` +
+              `json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?` +
+              (enforcePriorPolicy
+                ? ` AND NOT (typeof(${escapedColumn}) IN ('text', 'blob') ` +
+                  `AND length(CAST(${escapedColumn} AS BLOB)) > ?)`
+                : '');
+            params = enforcePriorPolicy
+              ? [patch, rowIdNum, editLimitBytes]
+              : [patch, rowIdNum];
           } else {
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ? WHERE rowid = ?`;
-            params = [value, rowIdNum];
+            const escapedColumn = escapeIdentifier(column);
+            sql =
+              `UPDATE ${escapeIdentifier(table)} SET ${escapedColumn} = ? WHERE rowid = ?` +
+              (enforcePriorPolicy
+                ? ` AND NOT (typeof(${escapedColumn}) IN ('text', 'blob') ` +
+                  `AND length(CAST(${escapedColumn} AS BLOB)) > ?)`
+                : '');
+            params = enforcePriorPolicy
+              ? [value, rowIdNum, editLimitBytes]
+              : [value, rowIdNum];
           }
 
-          await worker.call('run', [sql, params]);
+          const result = await worker.call<{ changes: number }>('run', [sql, params]);
+          if (enforcePriorPolicy && result?.changes !== 1) {
+            await assertNativeCellPriorWithinEditLimit(
+              table,
+              rowIdNum,
+              column,
+              editLimitBytes,
+              { kind: 'rowid' }
+            );
+            throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+          }
+          return rowIdNum;
+        },
+
+        replaceOversizedCell: async (
+          table: string,
+          rowId: RecordId,
+          column: string,
+          value: CellValue,
+          expected: OversizedCellMetadata,
+          maxEditValueBytes?: number
+        ) => {
+          const editLimitBytes = assertCellValuesWithinEditLimit(
+            [value],
+            maxEditValueBytes
+          );
+          assertOversizedCellReplacementExpectation(expected, editLimitBytes);
+          assertMutableRecordId(rowId);
+          const identity = await resolveNativeTableIdentity(table);
+          const predicate = buildRecordIdentityPredicate(rowId, identity);
+          const locator = buildNativeCellLocator(rowId, identity);
+
+          const updateAndResolveIdentity = async (): Promise<RecordId> => {
+            const result = await worker.call<{ changes: number }>('replaceOversizedCell', [
+              table,
+              column,
+              locator,
+              value,
+              expected,
+              editLimitBytes
+            ]);
+            if (result?.changes !== 1) {
+              throw new Error(OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE);
+            }
+            if (identity.kind === 'rowid') return validateRowId(rowId);
+
+            const keyIndex = identity.columns.findIndex(key => key.identifier === column);
+            const candidateId = replacePrimaryKeyRecordIdValues(
+              rowId,
+              identity,
+              keyIndex >= 0 ? [{ column, value }] : []
+            );
+            return readNativePrimaryKeyRecordId(
+              table,
+              identity,
+              buildRecordIdentityPredicate(candidateId, identity),
+              unresolvableTriggeredPrimaryKeyUpdateError(table)
+            );
+          };
+
+          if (identity.kind === 'rowid') return updateAndResolveIdentity();
+
+          const savepointName = createSavepointName('sp_replace_oversized_cell');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            const newRowId = await updateAndResolveIdentity();
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return newRowId;
+          } catch (error) {
+            await safeRollbackSavepoint(savepointName, 'replaceOversizedCell');
+            throw error;
+          }
         },
 
         /**
          * Insert a new row.
          */
-        insertRow: async (table: string, data: Record<string, CellValue>) => {
+        insertRow: async (
+          table: string,
+          data: Record<string, CellValue>,
+          maxEditValueBytes?: number,
+          historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+        ) => {
+          if (historyReplayToken !== HISTORY_REPLAY_EDIT_TOKEN) {
+            assertCellValuesWithinEditLimit(Object.values(data), maxEditValueBytes);
+          }
+          const identity = await resolveNativeTableIdentity(table);
           const columns = Object.keys(data);
           let sql: string;
           let params: CellValue[] = [];
@@ -1087,6 +2145,37 @@ export async function createNativeDatabaseConnection(
             const placeholders = columns.map(() => '?').join(', ');
             params = columns.map(col => data[col]);
             sql = `INSERT INTO ${escapeIdentifier(table)} (${colNames}) VALUES (${placeholders})`;
+          }
+
+          if (identity.kind === 'primaryKey') {
+            const savepointName = createSavepointName('sp_insert_pk_row');
+            await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+            try {
+              const returning = await queryNativeSingleStatement<NativeQueryResult>(
+                `${sql} RETURNING ` +
+                buildByteFaithfulPrimaryKeyProjection(identity),
+                params
+              );
+              if (returning.values.length !== 1) {
+                throw new Error(`Insert into ${table} did not return exactly one primary-key identity`);
+              }
+              const candidateId = encodeByteFaithfulPrimaryKeyRecordId(
+                identity,
+                returning.values[0],
+                await readNativeCellTextEncoding(),
+                `Cannot insert into ${table}`
+              );
+              const rowId = await readNativePrimaryKeyRecordId(
+                table,
+                identity,
+                buildRecordIdentityPredicate(candidateId, identity)
+              );
+              await worker.call('run', [`RELEASE ${savepointName}`]);
+              return rowId;
+            } catch (error) {
+              await safeRollbackSavepoint(savepointName, 'insertNativePrimaryKeyRow');
+              throw error;
+            }
           }
 
           const result = await worker.call<{
@@ -1103,8 +2192,19 @@ export async function createNativeDatabaseConnection(
         /**
          * Insert multiple rows in a batch.
          */
-        insertRowBatch: async (table: string, rows: Record<string, CellValue>[]) => {
+        insertRowBatch: async (
+          table: string,
+          rows: Record<string, CellValue>[],
+          maxEditValueBytes?: number,
+          historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+        ) => {
           if (rows.length === 0) return;
+          if (historyReplayToken !== HISTORY_REPLAY_EDIT_TOKEN) {
+            assertCellValuesWithinEditLimit(
+              rows.flatMap(row => Object.values(row)),
+              maxEditValueBytes
+            );
+          }
 
           const batchItems: { sql: string; params: CellValue[] }[] = [];
           const escapedTable = escapeIdentifier(table);
@@ -1133,15 +2233,127 @@ export async function createNativeDatabaseConnection(
         /**
          * Delete rows by ID.
          */
-        deleteRows: async (table: string, rowIds: RecordId[]) => {
-          if (rowIds.length === 0) return;
+        deleteRows: async (
+          table: string,
+          rowIds: RecordId[],
+          maxUndoSnapshotBytes?: number
+        ): Promise<DeletedRow[]> => {
+          rowIds.forEach(assertMutableRecordId);
+          if (rowIds.length === 0) return [];
 
-          // Validate all row IDs
-          const validIds = validateRowIds(rowIds);
+          if (rowIds.some(isPrimaryKeyRecordId)) {
+            if (!rowIds.every(isPrimaryKeyRecordId)) {
+              throw new Error('Cannot mix rowid and primary-key row identities');
+            }
+            const identity = await resolveNativeTableIdentity(table);
+            if (identity.kind !== 'primaryKey') {
+              throw new Error(`Primary-key identity cannot target rowid table ${table}`);
+            }
+            const predicates = buildRecordIdentityPredicateChunks(rowIds, identity);
+            const savepointName = createSavepointName('sp_delete_pk_rows');
+            await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+            try {
+              const insertableColumns = await getNativeInsertableColumnNames(table);
+              if (maxUndoSnapshotBytes !== undefined) {
+                await assertNativeDeleteSnapshotWithinBudget(
+                  table,
+                  insertableColumns,
+                  predicates,
+                  rowIds,
+                  false,
+                  maxUndoSnapshotBytes
+                );
+              }
+              const deletedRows: DeletedRow[] = [];
+              for (const predicate of predicates) {
+                const current = await worker.call<NativeQueryResult>('query', [
+                  `SELECT ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+                  `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+                  predicate.params
+                ]);
+                const primaryKeyIndices = identity.columns.map(column => {
+                  const index = current.columns.indexOf(column.identifier);
+                  if (index < 0) {
+                    throw new Error(`Primary-key column missing from ${table}: ${column.identifier}`);
+                  }
+                  return index;
+                });
+                deletedRows.push(...current.values.map(row => {
+                  const deletedRowId = encodePrimaryKeyRecordId(
+                    identity.columns,
+                    primaryKeyIndices.map(index => row[index])
+                  );
+                  const rowData = Object.fromEntries(
+                    current.columns.map((header, index) => [header, row[index]])
+                  );
+                  return { rowId: deletedRowId, row: rowData };
+                }));
+              }
+              if (deletedRows.length !== rowIds.length) {
+                throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
+              }
+              for (const predicate of predicates) {
+                await worker.call('run', [
+                  `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+                  predicate.params
+                ]);
+              }
+              await worker.call('run', [`RELEASE ${savepointName}`]);
+              return deletedRows;
+            } catch (error) {
+              await safeRollbackSavepoint(savepointName, 'deleteNativePrimaryKeyRows');
+              throw error;
+            }
+          }
 
-          const placeholders = validIds.map(() => '?').join(', ');
-          const sql = `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${placeholders})`;
-          await worker.call('run', [sql, validIds]);
+          // Snapshot rowid rows atomically and return the same replay payload
+          // shape as primary-key deletion.
+          const predicates = buildRecordIdentityPredicateChunks(rowIds, { kind: 'rowid' });
+          const savepointName = createSavepointName('sp_delete_rowid_rows');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            const insertableColumns = await getNativeInsertableColumnNames(table);
+            if (maxUndoSnapshotBytes !== undefined) {
+              await assertNativeDeleteSnapshotWithinBudget(
+                table,
+                insertableColumns,
+                predicates,
+                rowIds,
+                true,
+                maxUndoSnapshotBytes
+              );
+            }
+            const deletedRows: DeletedRow[] = [];
+            for (const predicate of predicates) {
+              const current = await worker.call<NativeQueryResult>('query', [
+                `SELECT CAST(rowid AS TEXT), ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
+                `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+                predicate.params
+              ]);
+              deletedRows.push(...current.values.map(row => {
+                const deletedRowId = validateRowId(row[0] as RecordId | bigint);
+                const rowData: Record<string, CellValue> = Object.fromEntries(
+                  insertableColumns.map((column, index) => [column, row[index + 1]])
+                );
+                rowData.rowid = deletedRowId;
+                return { rowId: deletedRowId, row: rowData };
+              }));
+            }
+            if (deletedRows.length !== rowIds.length) {
+              throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
+            }
+            for (const predicate of predicates) {
+              await worker.call('run', [
+                `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+                predicate.params
+              ]);
+            }
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return deletedRows;
+          } catch (error) {
+            await safeRollbackSavepoint(savepointName, 'deleteNativeRowidRows');
+            throw error;
+          }
         },
 
         /**
@@ -1191,26 +2403,32 @@ export async function createNativeDatabaseConnection(
          * Delete columns by name.
          * If dropDependentIndexes is provided, those indexes will be dropped first.
          */
-        deleteColumns: async (table: string, columns: string[], dropDependentIndexes?: string[]) => {
-          if (columns.length === 0) return;
+        deleteColumns: async (
+          table: string,
+          columns: string[],
+          dropDependentIndexes?: string[]
+        ): Promise<ColumnDropTableState> => {
+          if (columns.length === 0) return readNativeColumnDropTableState(table);
 
-          const escapedTable = escapeIdentifier(table);
-          const batch: { sql: string; params?: CellValue[] }[] = [];
-
-          // Drop specified dependent indexes first
-          if (dropDependentIndexes && dropDependentIndexes.length > 0) {
-            for (const indexName of dropDependentIndexes) {
-              batch.push({ sql: `DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}` });
-            }
-          }
-
-          // Now drop the columns
-          for (const col of columns) {
-            batch.push({ sql: `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(col)}` });
-          }
-
-          if (batch.length > 0) {
-            await worker.call('execBatch', [batch]);
+          // A SAVEPOINT composes with replay's outer transaction. The post-drop
+          // snapshot is read before RELEASE so capture failure rolls the DDL back.
+          const savepointName = createSavepointName('sp_delete_columns');
+          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          try {
+            await executeSchemaPreservingColumnDrop(
+              table,
+              columns,
+              dropDependentIndexes,
+              async sql => {
+                await worker.call('run', [sql]);
+              }
+            );
+            const stateAfter = await readNativeColumnDropTableState(table);
+            await worker.call('run', [`RELEASE ${savepointName}`]);
+            return stateAfter;
+          } catch (error) {
+            await safeRollbackSavepoint(savepointName, 'deleteColumns');
+            throw error;
           }
         },
 
@@ -1262,7 +2480,7 @@ export async function createNativeDatabaseConnection(
             await worker.call('run', [`RELEASE ${savepointName}`]);
           } catch (err) {
             await safeRollbackSavepoint(savepointName, 'validateViewDefinition');
-            throw err;
+            throw normalizeViewDefinitionError(err, view, body);
           }
         },
 
@@ -1270,7 +2488,8 @@ export async function createNativeDatabaseConnection(
           view: string,
           selectSql: string,
           limit: number = 50,
-          intent: ViewDefinitionIntent = 'edit'
+          intent: ViewDefinitionIntent = 'edit',
+          signal?: AbortSignal
         ) => {
           if (forceReadOnly) {
             throw new Error('View preview is unavailable because the database is read-only');
@@ -1286,6 +2505,7 @@ export async function createNativeDatabaseConnection(
           // so even schema-qualified self-references cannot resolve the old view.
           const savepointName = createSavepointName('sp_preview_view');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          let columns: string[];
           try {
             if (typeof existingSql === 'string') {
               await worker.call('run', [`DROP VIEW ${escapeMainViewIdentifier(view)}`]);
@@ -1294,32 +2514,39 @@ export async function createNativeDatabaseConnection(
               buildCreateViewSql(view, body, columnListSql)
             );
             await compileNativeView(view);
-            const columns = await getNativeColumnNames(view, true);
-            const result = await queryNativeBoundedStatement(
-              `SELECT * FROM ${escapeMainViewIdentifier(view)}`,
-              columns,
-              boundedLimit
-            );
-            const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
-              result.values,
-              undefined,
-              result.exactIntegerTexts
-            );
+            columns = await getNativeColumnNames(view, true);
             await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
             await worker.call('run', [`RELEASE ${savepointName}`]);
-            return {
-              headers: columns,
-              rows,
-              columns,
-              values: rows,
-              columnNames: columns,
-              records: rows,
-              exactIntegerTexts
-            };
           } catch (err) {
             await safeRollbackSavepoint(savepointName, 'previewViewDefinition');
-            throw err;
+            throw normalizeViewDefinitionError(err, view, body);
           }
+
+          // The disposable view is needed only to validate CREATE VIEW context
+          // and derive stable positional names. Execute the normalized SELECT
+          // after rolling it back so queryBounded can use the second connection
+          // when no outer transaction is active. The worker falls back to the
+          // sync connection if an outer savepoint still owns uncommitted state.
+          const result = await queryNativeBoundedStatement(
+            body,
+            columns,
+            boundedLimit,
+            signal
+          );
+          const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+            result.values,
+            undefined,
+            result.exactIntegerTexts
+          );
+          return {
+            headers: columns,
+            rows,
+            columns,
+            values: rows,
+            columnNames: columns,
+            records: rows,
+            exactIntegerTexts
+          };
         },
 
         createView: async (view: string, selectSql: string): Promise<ViewDefinition> => {
@@ -1428,19 +2655,38 @@ export async function createNativeDatabaseConnection(
           if (!columns || (columns.length === 1 && columns[0] === '*')) {
             columns = await getNativeColumnNames(table);
           }
-          const queryOptions = { ...options, columns };
-          const { sql, params } = buildSelectQuery(table, queryOptions);
-          const transportQuery = buildExactNumericTextQuery(sql, columns.length);
+          let identity: TableIdentity | undefined;
+          let primaryKeyContext: {
+            identity: Extract<TableIdentity, { kind: 'primaryKey' }>;
+            visibleColumns: string[];
+          } | undefined;
+          let effectiveOrderBy = options.orderBy;
+          let identityOrderBy: string[] | undefined;
+          if (columns[0]?.toLowerCase() === 'rowid') {
+            const syntheticRowIdOrder = ordersBySyntheticRowId({ ...options, columns });
+            identity = await findNativeTableIdentity(table);
+            if (identity?.kind === 'primaryKey') {
+              const visibleColumns = columns.slice(1);
+              const hiddenPrimaryKeyColumns = identity.columns
+                .map(column => column.identifier)
+                .filter(column => !visibleColumns.includes(column));
+              columns = [...visibleColumns, ...hiddenPrimaryKeyColumns];
+              primaryKeyContext = { identity, visibleColumns };
+              if (syntheticRowIdOrder) {
+                effectiveOrderBy = undefined;
+                identityOrderBy = identity.columns.map(column => column.identifier);
+              }
+            }
+          }
           const hasRowIdShape = columns[0]?.toLowerCase() === 'rowid';
-          const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
-            && hasRowIdShape;
-          const snapshotName = hasRowIdShape
+          const snapshotName = hasRowIdShape || columns.length >= SQLITE_MAX_RESULT_COLUMNS
             ? createSavepointName('sp_numeric_snapshot')
             : undefined;
           if (snapshotName) {
             // Unlike the private WASM databases, the native file can receive a
-            // WAL commit from another process between RPCs. The first read below
-            // fixes one SQLite snapshot for both values and companion text.
+            // WAL commit from another process between RPCs. The first read
+            // inside this savepoint fixes one SQLite snapshot for the rowid
+            // authority, the page values, and any companion text alike.
             await worker.call('run', [`SAVEPOINT ${snapshotName}`]);
           }
 
@@ -1449,26 +2695,137 @@ export async function createNativeDatabaseConnection(
             if (hasRowIdShape) {
               // This authority read fixes the WAL snapshot before the main data
               // read, so both exact identities and any companion text describe
-              // one committed database state.
+              // one committed database state. It is also the single authority
+              // for rowid keyset eligibility: the seek plan (or the fallback
+              // ORDER BY), the page execution, and the anchor minting below all
+              // derive from this one in-savepoint answer, so an external WAL
+              // commit between reads can never desynchronize them.
               const authority = await worker.call<NativeQueryResult>('query', [
                 ROWID_TABLE_AUTHORITY_SQL,
-                [table]
+                [table, table]
               ]);
               isRowIdTable = authority.values.length > 0;
             }
-            const result = await worker.call<NativeQueryResult>('queryNumeric', [
+
+            // Keyset eligibility: a declared WITHOUT ROWID key (needs no
+            // authority — that path never opens this savepoint), or an
+            // authority-confirmed unshadowed rowid. Key/tag derive from the
+            // untransformed options so minting and validation agree.
+            const keysetIdentity = identity?.kind === 'primaryKey'
+              ? identity
+              : (identity?.kind === 'rowid' && isRowIdTable ? identity : undefined);
+            const keysetKey = computeKeysetKey(options, keysetIdentity);
+            const keysetTag = keysetKey ? computeKeysetQueryTag(table, options) : undefined;
+            const keysetPlan = keysetKey
+              ? resolveKeysetPlan(table, options, keysetIdentity)
+              : undefined;
+            const queryOptions = {
+              ...options,
+              columns,
+              orderBy: effectiveOrderBy,
+              orderByColumns: identityOrderBy
+            };
+            const fallbackOrder = keysetFallbackOrder(keysetKey, keysetPlan);
+            if (fallbackOrder) {
+              // One total order for both paths: this OFFSET/fallback page
+              // re-anchors the grid, so its row order must match what those
+              // anchors will seek. keysetKey is gated on the in-savepoint
+              // authority above, so a shadowed rowid table keeps the
+              // pre-keyset SQL unchanged.
+              queryOptions.orderBy = undefined;
+              queryOptions.orderByColumns = fallbackOrder.orderByColumns;
+              queryOptions.orderDir = fallbackOrder.orderDir;
+            }
+            const splitSyntheticRowId = isRowIdTable
+              && hasRowIdShape
+              && columns.length > SQLITE_MAX_RESULT_COLUMNS;
+            const valueColumns = splitSyntheticRowId ? columns.slice(1) : columns;
+            const valueQueryOptions = splitSyntheticRowId
+              ? { ...queryOptions, columns: valueColumns }
+              : queryOptions;
+            const { sql, params } = buildSelectQuery(table, valueQueryOptions, keysetPlan);
+            const rowIdQuery = splitSyntheticRowId
+              ? buildSelectQuery(
+                  table,
+                  { ...queryOptions, columns: ['rowid'] },
+                  keysetPlan
+                )
+              : undefined;
+            const primaryKeyColumnIndices = primaryKeyContext
+              ? primaryKeyContext.identity.columns.map(column => {
+                  const index = columns.indexOf(column.identifier);
+                  if (index < 0) {
+                    throw new Error(`Primary-key column missing from table fetch: ${column.identifier}`);
+                  }
+                  return index;
+                })
+              : [];
+            const keysetColumnIndices = keysetKey
+              ? keysetKey.keyColumns
+                  .map(column => columns.indexOf(column))
+                  .filter(index => index >= 0)
+              : [];
+            const rawTextColumnIndices = [
+              ...new Set([...primaryKeyColumnIndices, ...keysetColumnIndices])
+            ];
+            const containmentRawTextColumnIndices = splitSyntheticRowId
+              ? rawTextColumnIndices
+                  .filter(index => index > 0)
+                  .map(index => index - 1)
+              : rawTextColumnIndices;
+            const containmentQuery = buildCellContainmentQuery(
+              sql,
+              valueColumns.length,
+              queryOptions,
+              containmentRawTextColumnIndices
+            );
+            const transportQuery = buildExactNumericTextQuery(
+              containmentQuery.sql,
+              containmentQuery.primaryTransportColumnCount
+            );
+            const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
+              && hasRowIdShape;
+            const primaryResult = await worker.call<NativeQueryResult>('queryNumeric', [
               transportQuery.sql,
               params,
               transportQuery.transportColumns,
               transportQuery.valueColumnCount
             ]);
+            const metadataResult = containmentQuery.metadataSql
+              ? await worker.call<NativeQueryResult>('query', [
+                  containmentQuery.metadataSql,
+                  params
+                ])
+              : undefined;
+            const valueSourceRows = mergeCellContainmentMetadataRows(
+              primaryResult.values,
+              metadataResult?.values,
+              containmentQuery
+            ) as CellValue[][];
+            const rowIdResult = rowIdQuery
+              ? await worker.call<NativeQueryResult>('query', [
+                  rowIdQuery.sql,
+                  rowIdQuery.params
+                ])
+              : undefined;
+            if (rowIdResult && rowIdResult.values.length !== valueSourceRows.length) {
+              throw new Error('Synthetic rowid companion row count does not match the value page');
+            }
+            const sourceRows = rowIdResult
+              ? rowIdResult.values.map((row, rowIndex) => {
+                  if (row.length !== 1) {
+                    throw new Error(`Synthetic rowid companion row ${rowIndex} is not one value`);
+                  }
+                  return [row[0], ...valueSourceRows[rowIndex]];
+                })
+              : valueSourceRows;
 
             const companionResults = [];
-            if (isRowIdTable && needsRowIdCompanions && result.values.length > 0) {
+            if (isRowIdTable && needsRowIdCompanions && sourceRows.length > 0) {
               const companionQueries = buildRowIdExactRealTextQueries(
                 table,
                 columns,
-                result.values.map(row => row[0])
+                sourceRows.map(row => row[0] as CellValue)
               );
               if (companionQueries.length > 0) {
                 const companionBatch = await worker.call<NativeQueryBatchResult>('queryBatch', [
@@ -1484,21 +2841,115 @@ export async function createNativeDatabaseConnection(
               }
             }
             const companionExactTexts = collectRowIdExactRealTexts(
-              result.values,
+              sourceRows,
               companionResults
             );
             const needsExactRowIdIdentity = isRowIdTable
-              && hasUnsafeBigIntAtColumn(result.values, 0);
+              && hasUnsafeBigIntAtColumn(sourceRows, 0);
 
             // txiki preserves SQLite int64 values as BigInt. The generated
             // companion columns also retain authoritative REAL text before V8
             // normalizes the storage class into a JavaScript Number.
-            const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
-              result.values,
+            const normalized = normalizeIntegerRowsForTransport(
+              valueSourceRows,
               undefined,
-              mergeExactIntegerTextMaps(companionExactTexts, result.exactIntegerTexts),
-              needsExactRowIdIdentity ? 0 : undefined
+              splitSyntheticRowId
+                ? primaryResult.exactIntegerTexts
+                : mergeExactIntegerTextMaps(
+                    companionExactTexts,
+                    primaryResult.exactIntegerTexts
+                  ),
+              !splitSyntheticRowId && needsExactRowIdIdentity ? 0 : undefined
             );
+            const valueContained = decodeCellContainment(
+              normalized.rows,
+              valueColumns.length,
+              normalized.exactIntegerTexts,
+              queryOptions.maxPageResponseBytes
+            );
+            const contained = rowIdResult
+              ? prependCellContainmentColumn(
+                  normalizeIntegerRowsForTransport(
+                    rowIdResult.values,
+                    undefined,
+                    undefined,
+                    needsExactRowIdIdentity ? 0 : undefined
+                  ).rows.map(row => row[0]),
+                  valueContained,
+                  companionExactTexts
+                )
+              : valueContained;
+            const { rows, oversizedCells, exactIntegerTexts } = contained;
+            const rawTextRows = decodeRawTextColumns(normalized.rows, containmentQuery);
+            const textEncoding = containmentRawTextColumnIndices.length > 0
+              ? normalizeCellTextEncoding((await worker.call<NativeQueryResult>('query', [
+                  'PRAGMA encoding',
+                  []
+                ])).values[0]?.[0])
+              : undefined;
+            const sourceRawTextColumnIndices = splitSyntheticRowId
+              ? containmentQuery.rawTextColumnIndices.map(index => index + 1)
+              : containmentQuery.rawTextColumnIndices;
+            const remapped = primaryKeyContext && textEncoding
+              ? remapPrimaryKeyContainment({
+                  identity: primaryKeyContext.identity,
+                  sourceColumns: columns,
+                  visibleColumnCount: primaryKeyContext.visibleColumns.length,
+                  identityRows: sourceRows,
+                  rawTextBytes: rawTextRows,
+                  rawTextColumnIndices: sourceRawTextColumnIndices,
+                  rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable,
+                  textEncoding,
+                  rows,
+                  oversizedCells,
+                  exactIntegerTexts,
+                  effectiveInlineCellBytes: containmentQuery.effectiveInlineCellBytes,
+                  rowOffset: queryOptions.offset
+                })
+              : undefined;
+            const unrepresentableKeysetTextRows = keysetKey && textEncoding
+              ? findUnrepresentableTextRows({
+                  sourceRows,
+                  sourceColumnIndices: keysetColumnIndices,
+                  rawTextRows,
+                  rawTextColumnIndices: sourceRawTextColumnIndices,
+                  textEncoding,
+                  rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable
+                })
+              : undefined;
+
+            // Anchors come from the exact source rows (BigInt-preserving,
+            // display order); keysetKey exists only when the in-savepoint
+            // shadowing authority (or the declared PK) authorized seeking.
+            const keysetAnchors = keysetKey && keysetTag !== undefined
+              ? mintKeysetAnchors({
+                  tag: keysetTag,
+                  key: keysetKey,
+                  projectionColumns: columns,
+                  rows: sourceRows,
+                  oversizedCells,
+                  excludedRowIndices: unrepresentableKeysetTextRows
+                })
+              : undefined;
+
+            if (primaryKeyContext && remapped) {
+              const resultHeaders = ['rowid', ...primaryKeyContext.visibleColumns];
+              if (snapshotName) {
+                await worker.call('run', [`RELEASE ${snapshotName}`]);
+              }
+              return {
+                headers: resultHeaders,
+                rows: remapped.rows,
+                columns: resultHeaders,
+                values: remapped.rows,
+                exactIntegerTexts: remapped.exactIntegerTexts,
+                ...(remapped.oversizedCells ? { oversizedCells: remapped.oversizedCells } : {}),
+                ...(remapped.readOnlyRowReasons
+                  ? { readOnlyRowReasons: remapped.readOnlyRowReasons }
+                  : {}),
+                ...(keysetAnchors ? { keysetAnchors } : {})
+              };
+            }
 
             if (snapshotName) {
               await worker.call('run', [`RELEASE ${snapshotName}`]);
@@ -1508,7 +2959,9 @@ export async function createNativeDatabaseConnection(
               rows: rows,
               columns,
               values: rows,
-              exactIntegerTexts
+              exactIntegerTexts,
+              ...(oversizedCells ? { oversizedCells } : {}),
+              ...(keysetAnchors ? { keysetAnchors } : {})
             };
           } catch (err) {
             if (snapshotName) {
@@ -1526,30 +2979,37 @@ export async function createNativeDatabaseConnection(
           const result = await worker.call<NativeQueryResult>('query', [sql, params]);
           if (result && result.values && result.values.length > 0) {
             const val = result.values[0][0];
-            return typeof val === 'number' ? val : 0;
+            return { count: typeof val === 'number' ? val : 0, isExact: true };
           }
-          return 0;
+          return { count: 0, isExact: true };
         },
 
         /**
          * Fetch database schema.
          */
         fetchSchema: async () => {
-          // Batch all 3 schema queries into a single IPC round-trip for efficiency.
+          // Keep schema and identity discovery in one IPC round-trip.
           const queries = [
             { sql: "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name" },
             { sql: "SELECT name FROM sqlite_schema WHERE type='view' ORDER BY name" },
-            { sql: "SELECT name, tbl_name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name" }
+            { sql: "SELECT name, tbl_name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name" },
+            { sql: TABLE_IDENTITY_METADATA_SQL }
           ];
 
           const res = await worker.call<NativeQueryBatchResult>('queryBatch', [queries]);
 
           // Validate the response — throw instead of silently returning empty schema
-          if (!res || !res.results || res.results.length < 3) {
+          if (!res || !res.results || res.results.length < 4) {
             throw new Error('Schema fetch failed: queryBatch returned incomplete results');
           }
 
-          const tables = mapRowsByName<TableMetadata>(res.results[0], { identifier: 'name' });
+          const tableNames = mapRowsByName<TableMetadata>(res.results[0], { identifier: 'name' });
+          const identities = buildTableIdentityMap(res.results[3].values ?? []);
+          const tables = tableNames.map(table => {
+            const identity = identities.get(table.identifier);
+            if (!identity) throw new Error(`Table not found: ${table.identifier}`);
+            return { ...table, identity };
+          });
           const views = mapRowsByName<ViewMetadata>(res.results[1], { identifier: 'name' });
           const indexes = mapRowsByName<IndexMetadata>(res.results[2], { identifier: 'name', parentTable: 'tbl_name' });
 
@@ -1560,27 +3020,7 @@ export async function createNativeDatabaseConnection(
          * Get table metadata.
          */
         getTableInfo: async (table: string) => {
-          const result = await worker.call<NativeQueryResult>('query', [`PRAGMA table_info(${escapeIdentifier(table)})`]);
-
-          // Map columns by name to handle unpredictable column order from native worker
-          const headers = result.columns;
-          const idx = {
-            cid: headers.indexOf('cid'),
-            name: headers.indexOf('name'),
-            type: headers.indexOf('type'),
-            notnull: headers.indexOf('notnull'),
-            dflt_value: headers.indexOf('dflt_value'),
-            pk: headers.indexOf('pk')
-          };
-
-          return (result.values || []).map((row: CellValue[]): ColumnMetadata => ({
-            ordinal: (idx.cid >= 0 ? row[idx.cid] : row[0]) as number,
-            identifier: (idx.name >= 0 ? row[idx.name] : row[1]) as string,
-            declaredType: (idx.type >= 0 ? row[idx.type] : row[2]) as string,
-            isRequired: (idx.notnull >= 0 ? row[idx.notnull] : row[3]) as number,
-            defaultExpression: idx.dflt_value >= 0 ? row[idx.dflt_value] : row[4],
-            primaryKeyPosition: (idx.pk >= 0 ? row[idx.pk] : row[5]) as number
-          }));
+          return getNativeTableInfo(table);
         },
 
         /**
@@ -1681,8 +3121,57 @@ export async function createNativeDatabaseConnection(
         /**
          * Update multiple cells in a batch.
          */
-        updateCellBatch: async (table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> => {
+        updateCellBatch: async (
+          table: string,
+          updates: CellUpdate[],
+          maxEditValueBytes?: number,
+          maxUndoSnapshotBytes?: number,
+          historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
+        ): Promise<CellUpdateResult[]> => {
+          updates.forEach(update => assertMutableRecordId(update.rowId));
           if (updates.length === 0) return [];
+          const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+          const editLimitBytes = isHistoryReplay
+            ? 0
+            : assertCellValuesWithinEditLimit(
+                updates.map(update => update.value),
+                maxEditValueBytes
+              );
+
+          if (updates.some(update => isPrimaryKeyRecordId(update.rowId))) {
+            if (!updates.every(update => isPrimaryKeyRecordId(update.rowId))) {
+              throw new Error('Cannot mix rowid and primary-key row identities');
+            }
+            const identity = await resolveNativeTableIdentity(table);
+            if (identity.kind !== 'primaryKey') {
+              throw new Error(`Primary-key identity cannot target rowid table ${table}`);
+            }
+            if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
+              await assertNativeBatchHistoryWithinBudget(
+                table,
+                updates,
+                identity,
+                maxUndoSnapshotBytes
+              );
+            }
+            return updateNativePrimaryKeyCellBatch(
+              table,
+              identity,
+              updates,
+              maxEditValueBytes,
+              maxUndoSnapshotBytes,
+              historyReplayToken
+            );
+          }
+
+          if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
+            await assertNativeBatchHistoryWithinBudget(
+              table,
+              updates,
+              { kind: 'rowid' },
+              maxUndoSnapshotBytes
+            );
+          }
 
           const batchItems: { sql: string; paramsList?: CellValue[][], params?: CellValue[] }[] = [];
           const escapedTable = escapeIdentifier(table);
@@ -1690,6 +3179,21 @@ export async function createNativeDatabaseConnection(
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
 
           try {
+          if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
+            await assertNativeBatchHistoryWithinBudget(
+              table,
+              updates,
+              { kind: 'rowid' },
+              maxUndoSnapshotBytes
+            );
+          }
+          if (!isHistoryReplay && maxEditValueBytes !== undefined) {
+            await assertNativeRowIdBatchPriorsWithinEditLimit(
+              table,
+              updates,
+              editLimitBytes
+            );
+          }
           const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
           const columns = [...new Set(updates.map(update => update.column))];
           const placeholders = rowIds.map(() => '?').join(', ');
@@ -1711,12 +3215,16 @@ export async function createNativeDatabaseConnection(
             if (!row) {
               throw new Error(`Cannot update ${table}.${update.column}: row ${update.rowId} no longer exists`);
             }
-            const priorValue = row.get(update.column);
+            const priorValue = row.get(update.column) as CellValue;
             const prepared = prepareCellUpdateForStorage(
               update.value,
               priorValue,
               update.operation ?? 'set'
             );
+            if (!isHistoryReplay && prepared.operation === 'json_patch') {
+              const storedValue = applyNativeJsonPatchValue(priorValue, prepared.value);
+              assertCellValueWithinEditLimit(storedValue, editLimitBytes);
+            }
             results.push({
               rowId,
               columnName: update.column,

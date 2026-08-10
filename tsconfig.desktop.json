@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": false,
+    "allowJs": true,
+    "checkJs": false,
+    "esModuleInterop": true,
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "noEmit": false,
+    "outDir": ".desktop-test-out",
+    "rootDir": "tests/desktop",
+    "types": ["node", "vscode"]
+  },
+  "files": [
+    "tests/desktop/suite/desktop.test.ts",
+    "tests/desktop/suite/index.js"
+  ],
+  "exclude": ["node_modules"]
+}

@@ -2,6 +2,9 @@ import './vscode_mock_setup';
 
 import { after, beforeEach, it } from 'node:test';
 import assert from 'node:assert';
+import { DEFAULT_MAX_INLINE_CELL_BYTES } from '../../src/core/cell-containment';
+import { DEFAULT_MAX_CELL_EDIT_BYTES } from '../../src/core/cell-edit-policy';
+import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from '../../src/core/webview-transport';
 import { createDeferred } from './helpers/deferred';
 
 const postedMessages: any[] = [];
@@ -63,6 +66,77 @@ it('re-exports one shared RPC timeout from both UI transports', async () => {
 
 after(() => {
     delete (globalThis as any).window;
+});
+
+it('uses the transport edit ceiling instead of the inline preview ceiling', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const { backendApi, handleRpcResponse } = await import(webApiModulePath);
+    const replacement = new Uint8Array(DEFAULT_MAX_INLINE_CELL_BYTES + 1);
+
+    const update = backendApi.updateCell('items', 1, 'payload', replacement, null);
+    const metadataRequest = await waitForPostedMessage(0);
+    assert.strictEqual(metadataRequest.content.targetMethod, 'getCellMetadata');
+    handleRpcResponse({
+        kind: 'response',
+        messageId: metadataRequest.content.messageId,
+        success: true,
+        data: { storageClass: 'blob', byteLength: 1 }
+    });
+
+    const updateRequest = await waitForPostedMessage(1);
+    assert.strictEqual(updateRequest.content.targetMethod, 'updateCell');
+    assert.strictEqual(updateRequest.content.payload[3].__type, 'Uint8Array');
+    assert.strictEqual(updateRequest.content.payload[5], MAX_WEBVIEW_BINARY_VALUE_BYTES);
+    handleRpcResponse({
+        kind: 'response',
+        messageId: updateRequest.content.messageId,
+        success: true,
+        data: 1
+    });
+
+    assert.strictEqual(await update, 1);
+});
+
+it('rejects an oversized demo file selection before reading it', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const { backendApi } = await import(webApiModulePath);
+    let arrayBufferCalls = 0;
+    let input: any;
+    (globalThis as any).document = {
+        createElement() {
+            input = {
+                type: '',
+                style: {},
+                onchange: undefined,
+                click() {}
+            };
+            return input;
+        },
+        body: {
+            appendChild() {},
+            removeChild() {}
+        }
+    };
+
+    try {
+        const selected = backendApi.selectFile();
+        await input.onchange({
+            target: {
+                files: [{
+                    name: 'too-large.bin',
+                    size: DEFAULT_MAX_CELL_EDIT_BYTES + 1,
+                    async arrayBuffer() {
+                        arrayBufferCalls += 1;
+                        return new ArrayBuffer(0);
+                    }
+                }]
+            }
+        });
+        await assert.rejects(selected, /exceeds the 16777216-byte edit limit/);
+        assert.strictEqual(arrayBufferCalls, 0);
+    } finally {
+        delete (globalThis as any).document;
+    }
 });
 
 it('names demo view triggers before a confirmed drop and forwards that snapshot', async () => {

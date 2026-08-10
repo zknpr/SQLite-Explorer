@@ -2,6 +2,11 @@
  * Utility Functions
  */
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
+import {
+    decodePrimaryKeyRecordId,
+    isPrimaryKeyRecordId,
+    isReadOnlyPrimaryKeyRecordId
+} from '../../../src/core/row-identity.ts';
 
 /**
  * Escape HTML special characters to prevent XSS attacks.
@@ -110,6 +115,13 @@ export function appendHighlightedText(parentEl, text, matcher) {
  * Validate and sanitize a rowid for use in SQL queries.
  */
 export function validateRowId(rowId) {
+    // Read-only identity tokens never enter SQL. Preserve them through DOM event
+    // routing so the host can return the exact server-authored refusal reason.
+    if (isReadOnlyPrimaryKeyRecordId(rowId)) return rowId;
+    if (isPrimaryKeyRecordId(rowId)) {
+        decodePrimaryKeyRecordId(rowId);
+        return rowId;
+    }
     if (typeof rowId === 'number') {
         if (!Number.isSafeInteger(rowId)) throw new Error(`Invalid rowid: ${rowId}`);
         return rowId;
@@ -123,6 +135,39 @@ export function validateRowId(rowId) {
     }
     const num = Number(exact);
     return Number.isSafeInteger(num) ? num : exact.toString();
+}
+
+/** Match SQLite's INTEGER and NUMERIC affinity rules for declared types. */
+export function hasIntegerOrNumericAffinity(declaredType) {
+    const type = String(declaredType ?? '').toUpperCase();
+    if (/INT/.test(type)) return true;
+    if (/(CHAR|CLOB|TEXT)/.test(type)) return false;
+    if (type === '' || /BLOB/.test(type)) return false;
+    if (/(REAL|FLOA|DOUB)/.test(type)) return false;
+    return true;
+}
+
+/** Preserve decimal text when a declared PK integer cannot survive a JS number round-trip. */
+export function parseGridInputValue(value, column, usesDeclaredPrimaryKey = false) {
+    const declaredType = (column?.type ?? '').toUpperCase();
+    if (
+        usesDeclaredPrimaryKey
+        && column?.isPrimaryKey
+        && /(CHAR|CLOB|TEXT)/.test(declaredType)
+    ) {
+        return value;
+    }
+    const numericValue = Number(value);
+    if (
+        usesDeclaredPrimaryKey
+        && column?.isPrimaryKey
+        && hasIntegerOrNumericAffinity(declaredType)
+        && /^[+-]?\d+$/.test(value.trim())
+        && !Number.isSafeInteger(numericValue)
+    ) {
+        return value.trim();
+    }
+    return numericValue;
 }
 
 /**

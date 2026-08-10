@@ -8,6 +8,18 @@ function createOperations(overrides: Partial<DatabaseOperations> = {}): Database
     const operations: DatabaseOperations = {
         engineKind: Promise.resolve('wasm'),
         executeQuery: async (): Promise<QueryResultSet[]> => [],
+        getCellMetadata: async () => ({ storageClass: 'blob', byteLength: 0 }),
+        openCellReadSession: async () => ({
+            sessionId: 'session',
+            metadata: { storageClass: 'blob', byteLength: 0 },
+            expiresAt: Date.now() + 1000
+        }),
+        readCellChunk: async (_sessionId, byteOffset) => ({
+            byteOffset,
+            bytes: new Uint8Array(),
+            done: true
+        }),
+        closeCellReadSession: async () => {},
         serializeDatabase: async () => new Uint8Array(),
         applyModifications: async () => {},
         undoModification: async () => {},
@@ -15,10 +27,16 @@ function createOperations(overrides: Partial<DatabaseOperations> = {}): Database
         flushChanges: async () => {},
         discardModifications: async () => {},
         updateCell: async () => {},
+        replaceOversizedCell: async () => {},
         insertRow: async () => undefined,
         insertRowBatch: async () => {},
-        deleteRows: async () => {},
-        deleteColumns: async () => {},
+        deleteRows: async () => [],
+        deleteColumns: async table => ({
+            tableSql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY)`,
+            columns: ['id'],
+            identity: { kind: 'rowid' },
+            schemaObjects: []
+        }),
         findDependentIndexes: async () => [],
         createTable: async () => {},
         getViewDefinition: async () => ({ identifier: 'v', sql: 'CREATE VIEW v AS SELECT 1', selectSql: 'SELECT 1', triggers: [] }),
@@ -36,7 +54,7 @@ function createOperations(overrides: Partial<DatabaseOperations> = {}): Database
             headers: [],
             rows: []
         }),
-        fetchTableCount: async () => 0,
+        fetchTableCount: async () => ({ count: 0, isExact: true }),
         fetchSchema: async () => ({
             tables: [],
             views: [],

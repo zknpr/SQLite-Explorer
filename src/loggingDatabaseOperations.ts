@@ -6,41 +6,85 @@
  */
 
 import * as vsc from 'vscode';
-import { maskSensitiveData } from './helpers';
+import { hash64, maskSensitiveData } from './helpers';
 import type {
     DatabaseOperations,
     CellValue,
     RecordId,
+    DeletedRow,
     QueryResultSet,
     ModificationEntry,
     CellUpdate,
     CellUpdateResult,
     TableQueryOptions,
     TableCountOptions,
+    TableCountResult,
     SchemaSnapshot,
     ColumnMetadata,
     ColumnDefinition,
     ViewDefinition,
     ViewDefinitionIntent,
     ViewEditResult,
-    ViewTriggerDefinition
+    ViewTriggerDefinition,
+    CellMetadata,
+    CellReadChunk,
+    CellReadSession,
+    CellReadTarget,
+    OversizedCellMetadata,
+    DatabaseWriteResult,
+    ColumnDropTableState
 } from './core/types';
 import { escapeIdentifier } from './core/sql-utils';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
+import { runReadSnapshot } from './core/operation-serializer';
 
-type DatabaseMethodName = {
+type DatabaseMethodName = Exclude<{
     [K in keyof DatabaseOperations]: DatabaseOperations[K] extends (...args: never[]) => unknown ? K : never
-}[keyof DatabaseOperations];
+}[keyof DatabaseOperations], undefined | 'runReadSnapshot'> & keyof DatabaseOperations;
+
+const MAX_INLINE_LOG_IDENTITY_CHARS = 160;
+const LOG_IDENTITY_PREVIEW_CHARS = 48;
+const MAX_DELETE_LOG_IDENTITIES = 8;
 
 export class LoggingDatabaseOperations implements DatabaseOperations {
+    readonly openQueryReadSession?: NonNullable<DatabaseOperations['openQueryReadSession']>;
+    readonly readQueryRows?: NonNullable<DatabaseOperations['readQueryRows']>;
+    readonly closeQueryReadSession?: NonNullable<DatabaseOperations['closeQueryReadSession']>;
+
     constructor(
         private readonly wrapped: DatabaseOperations,
         private readonly filename: string,
         private readonly outputChannel: vsc.OutputChannel
-    ) {}
+    ) {
+        const openQueryReadSession = wrapped.openQueryReadSession;
+        const readQueryRows = wrapped.readQueryRows;
+        const closeQueryReadSession = wrapped.closeQueryReadSession;
+        if (openQueryReadSession && readQueryRows && closeQueryReadSession) {
+            this.openQueryReadSession = async (sql: string) => {
+                this.log('Opening incremental query read');
+                return openQueryReadSession.call(wrapped, sql);
+            };
+            this.readQueryRows = async (sessionId: string, maxRows: number) => {
+                this.log(`Reading up to ${maxRows} incremental query rows`);
+                return readQueryRows.call(wrapped, sessionId, maxRows);
+            };
+            this.closeQueryReadSession = async (sessionId: string) => {
+                this.log('Closing incremental query read');
+                return closeQueryReadSession.call(wrapped, sessionId);
+            };
+        }
+    }
 
     get engineKind() {
         return this.wrapped.engineKind;
+    }
+
+    async runReadSnapshot<T>(
+        operation: (snapshotOperations: DatabaseOperations) => Promise<T>
+    ): Promise<T> {
+        return runReadSnapshot(this.wrapped, snapshotOperations => operation(
+            new LoggingDatabaseOperations(snapshotOperations, this.filename, this.outputChannel)
+        ));
     }
 
     private sanitizeValue(value: unknown): string {
@@ -65,6 +109,15 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return String(value);
     }
 
+    private async formatRecordId(rowId: RecordId): Promise<string> {
+        if (typeof rowId === 'number') return String(rowId);
+        if (rowId.length <= MAX_INLINE_LOG_IDENTITY_CHARS) return JSON.stringify(rowId);
+
+        const digest = await hash64(rowId);
+        const preview = `${rowId.slice(0, LOG_IDENTITY_PREVIEW_CHARS)}…`;
+        return `[identity length=${rowId.length} sha256=${digest} preview=${JSON.stringify(preview)}]`;
+    }
+
     // Constrain T to only callable (function) members of DatabaseOperations,
     // excluding non-function properties like `engineKind` (which is a Promise).
     private async logAndDelegate<T extends DatabaseMethodName>(
@@ -75,7 +128,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
     ): Promise<ReturnType<Extract<DatabaseOperations[T], (...args: never[]) => unknown>>> {
         this.log(message, isWrite);
         const func = this.wrapped[method] as unknown as (...args: unknown[]) => unknown;
-        return func(...args) as ReturnType<Extract<DatabaseOperations[T], (...args: never[]) => unknown>>;
+        // Invoke through the receiver: implementations may rely on `this`.
+        return func.apply(this.wrapped, args) as ReturnType<Extract<DatabaseOperations[T], (...args: never[]) => unknown>>;
     }
 
     private log(message: string, isWrite: boolean = false) {
@@ -89,11 +143,57 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         this.outputChannel.appendLine(`${timestamp} ${type} [${this.filename}] ${safeMessage}`);
     }
 
-    async executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> {
+    async executeQuery(
+        sql: string,
+        params?: CellValue[],
+        signal?: AbortSignal
+    ): Promise<QueryResultSet[]> {
         const isWrite = /^(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|BEGIN|COMMIT|ROLLBACK)/i.test(sql.trim());
         const paramStr = params && params.length > 0 ? ` -- params: [${params.map(p => this.sanitizeValue(p)).join(', ')}]` : '';
         this.log(`${sql}${paramStr}`, isWrite);
-        return this.wrapped.executeQuery(sql, params);
+        return this.wrapped.executeQuery(sql, params, signal);
+    }
+
+    async getCellMetadata(target: CellReadTarget): Promise<CellMetadata> {
+        return this.logAndDelegate(
+            `Reading cell metadata for ${escapeIdentifier(target.table)}.${escapeIdentifier(target.column)}`,
+            false,
+            'getCellMetadata',
+            target
+        );
+    }
+
+    async openCellReadSession(target: CellReadTarget): Promise<CellReadSession> {
+        return this.logAndDelegate(
+            `Opening bounded cell read for ${escapeIdentifier(target.table)}.${escapeIdentifier(target.column)}`,
+            false,
+            'openCellReadSession',
+            target
+        );
+    }
+
+    async readCellChunk(
+        sessionId: string,
+        byteOffset: number,
+        maxBytes: number
+    ): Promise<CellReadChunk> {
+        return this.logAndDelegate(
+            `Reading bounded cell bytes at offset ${byteOffset} (limit ${maxBytes})`,
+            false,
+            'readCellChunk',
+            sessionId,
+            byteOffset,
+            maxBytes
+        );
+    }
+
+    async closeCellReadSession(sessionId: string): Promise<void> {
+        return this.logAndDelegate(
+            'Closing bounded cell read',
+            false,
+            'closeCellReadSession',
+            sessionId
+        );
     }
 
     async serializeDatabase(): Promise<Uint8Array> {
@@ -120,19 +220,54 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.logAndDelegate(`Discarding ${mods.length} modifications`, true, 'discardModifications', mods, signal);
     }
 
-    async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, patch?: string): Promise<void> {
+    async updateCell(
+        table: string,
+        rowId: RecordId,
+        column: string,
+        value: CellValue,
+        patch?: string,
+        maxEditValueBytes?: number
+    ): Promise<RecordId | void> {
         // Reconstruct SQL for logging
+        const loggedRowId = await this.formatRecordId(rowId);
         let sql;
         if (patch) {
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(${escapeIdentifier(column)}, ${this.sanitizeValue(patch)}) WHERE rowid = ${rowId}`;
+            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = json_patch(${escapeIdentifier(column)}, ${this.sanitizeValue(patch)}) WHERE identity = ${loggedRowId}`;
         } else {
-            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ${this.sanitizeValue(value)} WHERE rowid = ${rowId}`;
+            sql = `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ${this.sanitizeValue(value)} WHERE identity = ${loggedRowId}`;
         }
         this.log(sql, true);
-        return this.wrapped.updateCell(table, rowId, column, value, patch);
+        return this.wrapped.updateCell(table, rowId, column, value, patch, maxEditValueBytes);
     }
 
-    async insertRow(table: string, data: Record<string, CellValue>): Promise<RecordId | undefined> {
+    async replaceOversizedCell(
+        table: string,
+        rowId: RecordId,
+        column: string,
+        value: CellValue,
+        expected: OversizedCellMetadata,
+        maxEditValueBytes?: number
+    ): Promise<RecordId | void> {
+        this.log(
+            `Replacing confirmed oversized ${escapeIdentifier(table)}.${escapeIdentifier(column)} ` +
+            `(${expected.storageClass}, ${expected.byteLength} bytes) without in-memory undo`,
+            true
+        );
+        return this.wrapped.replaceOversizedCell(
+            table,
+            rowId,
+            column,
+            value,
+            expected,
+            maxEditValueBytes
+        );
+    }
+
+    async insertRow(
+        table: string,
+        data: Record<string, CellValue>,
+        maxEditValueBytes?: number
+    ): Promise<RecordId | undefined> {
         const columns = Object.keys(data);
         let sql;
         if (columns.length === 0) {
@@ -144,21 +279,40 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
             sql = `INSERT INTO ${escapeIdentifier(table)} (${colNames}) VALUES (${values})`;
         }
         this.log(sql, true);
-        return this.wrapped.insertRow(table, data);
+        return this.wrapped.insertRow(table, data, maxEditValueBytes);
     }
 
-    async insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void> {
+    async insertRowBatch(
+        table: string,
+        rows: Record<string, CellValue>[],
+        maxEditValueBytes?: number
+    ): Promise<void> {
         this.log(`INSERT batch: ${rows.length} rows into ${escapeIdentifier(table)}`, true);
-        return this.wrapped.insertRowBatch(table, rows);
+        return this.wrapped.insertRowBatch(table, rows, maxEditValueBytes);
     }
 
-    async deleteRows(table: string, rowIds: RecordId[]): Promise<void> {
-        const sql = `DELETE FROM ${escapeIdentifier(table)} WHERE rowid IN (${rowIds.join(', ')})`;
+    async deleteRows(
+        table: string,
+        rowIds: RecordId[],
+        maxUndoSnapshotBytes?: number
+    ): Promise<DeletedRow[]> {
+        const displayedIds = await Promise.all(
+            rowIds.slice(0, MAX_DELETE_LOG_IDENTITIES).map(rowId => this.formatRecordId(rowId))
+        );
+        const omitted = rowIds.length - displayedIds.length;
+        const sql =
+            `DELETE FROM ${escapeIdentifier(table)} WHERE identity IN (${displayedIds.join(', ')}) ` +
+            `-- ${rowIds.length} identities` +
+            (omitted > 0 ? `, showing ${displayedIds.length}; ${omitted} omitted` : '');
         this.log(sql, true);
-        return this.wrapped.deleteRows(table, rowIds);
+        return this.wrapped.deleteRows(table, rowIds, maxUndoSnapshotBytes);
     }
 
-    async deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void> {
+    async deleteColumns(
+        table: string,
+        columns: string[],
+        dropDependentIndexes?: string[]
+    ): Promise<ColumnDropTableState> {
         if (dropDependentIndexes && dropDependentIndexes.length > 0) {
             for (const indexName of dropDependentIndexes) {
                 this.log(`DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}`, true);
@@ -205,7 +359,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         view: string,
         selectSql: string,
         limit?: number,
-        intent?: ViewDefinitionIntent
+        intent?: ViewDefinitionIntent,
+        signal?: AbortSignal
     ): Promise<QueryResultSet> {
         return this.logAndDelegate(
             `Previewing view ${escapeIdentifier(view)}`,
@@ -214,7 +369,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
             view,
             selectSql,
             limit,
-            intent
+            intent,
+            signal
         );
     }
 
@@ -262,9 +418,19 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         );
     }
 
-    async updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]> {
+    async updateCellBatch(
+        table: string,
+        updates: CellUpdate[],
+        maxEditValueBytes?: number,
+        maxUndoSnapshotBytes?: number
+    ): Promise<CellUpdateResult[]> {
         this.log(`Batch update ${updates.length} cells in ${table}`, true);
-        return this.wrapped.updateCellBatch(table, updates);
+        return this.wrapped.updateCellBatch(
+            table,
+            updates,
+            maxEditValueBytes,
+            maxUndoSnapshotBytes
+        );
     }
 
     async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {
@@ -279,11 +445,14 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
     async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
         const { sql, params } = buildSelectQuery(table, options);
         const paramStr = params && params.length > 0 ? ` -- params: [${params.map(p => this.sanitizeValue(p)).join(', ')}]` : '';
-        this.log(`${sql}${paramStr}`, false);
+        // The engine resolves keyset requests itself (identity lookup +
+        // anchor validation), so this preview can only show the OFFSET shape.
+        const keysetStr = options.keyset ? ` -- keyset ${options.keyset.mode} requested; OFFSET shape shown` : '';
+        this.log(`${sql}${paramStr}${keysetStr}`, false);
         return this.wrapped.fetchTableData(table, options);
     }
 
-    async fetchTableCount(table: string, options: TableCountOptions): Promise<number> {
+    async fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult> {
         const { sql, params } = buildCountQuery(table, options);
         const paramStr = params && params.length > 0 ? ` -- params: [${params.map(p => this.sanitizeValue(p)).join(', ')}]` : '';
         this.log(`${sql}${paramStr}`, false);
@@ -310,7 +479,16 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.ping();
     }
 
-    async writeToFile(path: string): Promise<void> {
-        return this.logAndDelegate(`Writing to file: ${path}`, true, 'writeToFile', path);
+    async writeToFile(
+        path: string,
+        signal?: AbortSignal
+    ): Promise<DatabaseWriteResult | void> {
+        return this.logAndDelegate(
+            `Writing to file: ${path}`,
+            true,
+            'writeToFile',
+            path,
+            signal
+        );
     }
 }

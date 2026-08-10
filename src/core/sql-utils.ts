@@ -62,6 +62,9 @@ export function cellValueToSql(value: CellValue | undefined): string {
   if (typeof value === 'number') {
     return String(value);
   }
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
   if (typeof value === 'string') {
     // Check for NUL characters which are unsafe in SQL scripts
     // If found, encode as hex blob and cast to TEXT

@@ -3,18 +3,55 @@
  */
 import { saveVsCodeState } from './api.js';
 
+/**
+ * Built-in rows-per-page default. Must match the `selected` option of
+ * `#pageSizeSelect` in viewer.template.html: the two are the same default
+ * expressed in state and in markup, and drifting apart would make the visible
+ * selector disagree with the LIMIT actually queried.
+ */
+export const DEFAULT_ROWS_PER_PAGE = 5000;
+
+// Accepted page-size range. The upper bound mirrors the declared maximum of
+// sqliteExplorer.defaultPageSize in package.json so a hand-edited setting
+// cannot request a LIMIT that starves the per-page inline-cell byte budget
+// into clipping literally everything; the lower bound only rejects nonsense
+// (zero/negative), deliberately looser than the setting's declared minimum.
+const MAX_PAGE_SIZE = 100000;
+
+function toValidPageSize(value) {
+    const parsed = typeof value === 'number' ? value : Number.parseInt(value ?? '', 10);
+    return Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= MAX_PAGE_SIZE
+        ? parsed
+        : undefined;
+}
+
+/**
+ * Resolve the page size the webview starts with. Precedence: the user's
+ * persisted in-grid selection, then a configured sqliteExplorer.defaultPageSize
+ * (delivered as a string via the vscode-env meta dataset), then the built-in
+ * default. The setting is a *default*, so an explicit in-grid choice outlives
+ * it; invalid or absent values fall through to the next source.
+ */
+export function resolveStartupPageSize(configuredValue, persistedValue) {
+    return toValidPageSize(persistedValue)
+        ?? toValidPageSize(configuredValue)
+        ?? DEFAULT_ROWS_PER_PAGE;
+}
+
 export const state = {
     isDbConnected: false,
     isReadOnly: false,
     selectedTable: null,
     selectedTableType: 'table',
+    selectedTableIdentity: null,
     // Name of the table whose grid is currently rendered on screen. Lets
     // loadTableData tell a same-table refetch (keep the grid, no flicker) apart
     // from a table switch (show the spinner instead of the previous table's rows).
     renderedTable: null,
     currentPageIndex: 0,
-    rowsPerPage: 500,
+    rowsPerPage: DEFAULT_ROWS_PER_PAGE,
     totalRecordCount: 0,
+    totalRecordCountIsExact: true,
     totalPageCount: 1,
     tableColumns: [],
     sortedColumn: null,
@@ -25,6 +62,19 @@ export const state = {
     // Sparse row/data-column exact text for SQLite INTEGERs outside JS's safe
     // range. General grid values stay numbers for backward compatibility.
     gridExactIntegerTexts: {},
+    // Sparse row/source-column metadata for TEXT/BLOB values that were bounded
+    // at the query boundary. Source-column indexing includes the identity slot
+    // used by tables, matching gridExactIntegerTexts.
+    gridOversizedCells: {},
+    // Sparse reasons for WITHOUT ROWID rows whose complete primary-key identity
+    // was intentionally not transported because a key member was oversized.
+    gridReadOnlyRowReasons: {},
+    // Engine-issued keyset anchors describing the committed grid page:
+    // { table, pageIndex, first, last }. Owned by loadTableData, which commits
+    // them atomically with gridData inside its superseded-load gate, so they
+    // always describe the rows on screen. Deliberately NOT persisted: restored
+    // webviews re-anchor from their first OFFSET load.
+    keysetAnchors: null,
 
     // Cell editing state
     editingCellInfo: null,
@@ -126,7 +176,6 @@ export function persistState() {
             sidebarFilter: state.sidebarFilter,
             scrollPosition: state.scrollPosition,
             dateFormat: state.dateFormat,
-            cellEditBehavior: state.cellEditBehavior,
         });
     }, 500);
 }

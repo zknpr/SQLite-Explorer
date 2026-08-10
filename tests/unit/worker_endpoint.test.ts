@@ -26,7 +26,7 @@ describe('Worker Endpoint', () => {
 
     beforeEach(() => {
         endpoint = createWorkerEndpoint();
-        wasmBinary = fs.readFileSync('./node_modules/sql.js/dist/sql-wasm.wasm');
+        wasmBinary = fs.readFileSync('./vendor/sql.js/sql-wasm.wasm');
     });
 
     it('should throw Error if database is not initialized', async () => {
@@ -87,6 +87,49 @@ describe('Worker Endpoint', () => {
         const data = await endpoint.exportDatabase();
         assert.ok(data instanceof Uint8Array);
         assert.ok(data.length > 0);
+    });
+
+    it('routes bounded cell and query sessions through the worker endpoint', async () => {
+        await endpoint.initializeDatabase('test.db', {
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false,
+            wasmBinary
+        });
+        await endpoint.runQuery(
+            "CREATE TABLE cell_windows (payload TEXT); " +
+            "INSERT INTO cell_windows VALUES ('A😀B')"
+        );
+        const target = { table: 'cell_windows', rowId: 1, column: 'payload' };
+
+        const metadata = await endpoint.getCellMetadata(target);
+        assert.deepStrictEqual(metadata, {
+            storageClass: 'text',
+            byteLength: 6,
+            textEncoding: 'utf-8'
+        });
+        const session = await endpoint.openCellReadSession(target);
+        const first = await endpoint.readCellChunk(session.sessionId, 0, 3);
+        const second = await endpoint.readCellChunk(session.sessionId, 3, 3);
+        await endpoint.closeCellReadSession(session.sessionId);
+
+        assert.deepStrictEqual(first.bytes, new Uint8Array([65, 240, 159]));
+        assert.deepStrictEqual(second.bytes, new Uint8Array([152, 128, 66]));
+        assert.strictEqual(second.done, true);
+
+        const querySession = await endpoint.openQueryReadSession(
+            'SELECT payload FROM cell_windows'
+        );
+        assert.deepStrictEqual(
+            await endpoint.readQueryRows(querySession.sessionId, 1),
+            { rows: [['A😀B']], done: false }
+        );
+        assert.deepStrictEqual(
+            await endpoint.readQueryRows(querySession.sessionId, 1),
+            { rows: [], done: true }
+        );
+        await endpoint.closeQueryReadSession(querySession.sessionId);
+        await endpoint.closeQueryReadSession(querySession.sessionId);
     });
 
     it('forwards skipped view-undo diagnostics through the endpoint logger', async () => {
@@ -183,7 +226,7 @@ describe('Worker Endpoint', () => {
 
         await endpoint.deleteRows('users', [1]);
         const count = await endpoint.fetchTableCount('users', {});
-        assert.strictEqual(count, 1);
+        assert.deepStrictEqual(count, { count: 1, isExact: true });
 
         await endpoint.writeToFile('/tmp/test_dump.db');
     });

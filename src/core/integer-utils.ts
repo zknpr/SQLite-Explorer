@@ -11,12 +11,23 @@ const ROWID_COMPANION_TEXT_PREFIX = '__sqlite_explorer_numeric_rowid_text_';
 // valid wide query fail with "too many columns in result set".
 const SQLITE_MAX_RESULT_COLUMNS = 2000;
 const ROWID_COMPANION_COLUMNS_PER_QUERY = 999;
-const SQLITE_MAX_VARIABLE_NUMBER = 32766;
+export const SQLITE_MAX_VARIABLE_NUMBER = 32766;
 
-/** Authoritative main-schema capability check required before companion reads. */
+/**
+ * Authoritative main-schema capability check required before companion reads.
+ * SQLite resolves each special rowid alias independently. These queries use
+ * the literal `rowid`, so only a declared column with that name shadows the
+ * intrinsic identity; declared `oid` or `_rowid_` columns do not affect it.
+ * The `pragma` schema prevents same-named user tables from shadowing the
+ * metadata virtual tables themselves.
+ * Binds the table name twice.
+ */
 export const ROWID_TABLE_AUTHORITY_SQL =
-  `SELECT 1 FROM pragma_table_list ` +
-  `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' AND "wr" = 0 LIMIT 1`;
+  `SELECT 1 FROM pragma.pragma_table_list ` +
+  `WHERE "schema" = 'main' AND "name" = ? AND (` +
+  `("type" = 'table' AND "wr" = 0) OR "type" IN ('virtual', 'shadow')) ` +
+  `AND NOT EXISTS (SELECT 1 FROM pragma.pragma_table_info(?, 'main') ` +
+  `WHERE lower("name") = 'rowid') LIMIT 1`;
 
 export interface ExactNumericTextQuery {
   sql: string;
@@ -192,7 +203,14 @@ export function collectRowIdExactRealTexts(
     if (!['bigint', 'number', 'string'].includes(typeof rowId)) {
       throw new Error(`Invalid rowid identity at source row ${rowIndex}`);
     }
-    sourceRowById.set(String(rowId), rowIndex);
+    const rowIdKey = String(rowId);
+    // Intrinsic rowids are unique. A duplicate means the leading column is
+    // table data, and a last-write-wins map would attribute companion text to
+    // the wrong row.
+    if (sourceRowById.has(rowIdKey)) {
+      throw new Error(`Duplicate rowid identity at source row ${rowIndex}`);
+    }
+    sourceRowById.set(rowIdKey, rowIndex);
   });
 
   let exactTexts: ExactIntegerTextMap | undefined;

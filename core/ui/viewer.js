@@ -1,13 +1,14 @@
 /**
  * SQLite Explorer - Main Entry Point
  */
-import { state } from './modules/state.js';
+import { state, resolveStartupPageSize } from './modules/state.js';
 import { initRpc } from './modules/rpc.js';
 import { backendApi, getVsCodeState } from './modules/api.js';
 import {
     initSidebar,
     refreshSchema,
-    renderSidebar
+    renderSidebar,
+    syncSelectedTableIdentity
 } from './modules/sidebar.js';
 import {
     initExport
@@ -76,14 +77,48 @@ async function connectAndLoadSchema() {
     await refreshSchema();
 }
 
+/**
+ * Point the page-size selector at `size`. A configured or previously persisted
+ * size that is not one of the preset options gets its own numerically ordered
+ * option, so the visible control always reports the LIMIT queries actually use.
+ */
+function syncPageSizeSelect(size) {
+    const pageSizeSelect = document.getElementById('pageSizeSelect');
+    if (!pageSizeSelect) return;
+    const value = String(size);
+    const options = Array.from(pageSizeSelect.options);
+    if (!options.some(option => option.value === value)) {
+        const custom = document.createElement('option');
+        custom.value = value;
+        custom.textContent = value;
+        const next = options.find(option => Number(option.value) > size);
+        pageSizeSelect.insertBefore(custom, next ?? null);
+    }
+    pageSizeSelect.value = value;
+}
+
 async function restoreSavedState() {
     const savedState = getVsCodeState();
+
+    // Startup page size: persisted in-grid choice > configured
+    // sqliteExplorer.defaultPageSize (vscode-env meta) > built-in default.
+    // Resolved before any load so the first data query already uses it, and
+    // outside the selectedTable branch so a configured default also applies
+    // to a fresh webview that has no saved table yet.
+    state.rowsPerPage = resolveStartupPageSize(
+        document.getElementById('vscode-env')?.dataset.defaultPageSize,
+        savedState?.rowsPerPage
+    );
+    syncPageSizeSelect(state.rowsPerPage);
+
     if (savedState && savedState.selectedTable) {
         // Restore scalar state fields
         state.selectedTable = savedState.selectedTable;
         state.selectedTableType = savedState.selectedTableType || 'table';
+        // The initial schema load ran before persisted selection restoration.
+        // Rebind identity before any CRUD code can parse primary-key values.
+        syncSelectedTableIdentity();
         state.currentPageIndex = savedState.currentPageIndex || 0;
-        state.rowsPerPage = savedState.rowsPerPage || 500;
         state.sortedColumn = savedState.sortedColumn || null;
         state.sortAscending = savedState.sortAscending !== false;
         state.filterQuery = savedState.filterQuery || '';
@@ -91,7 +126,6 @@ async function restoreSavedState() {
         state.columnFilters = savedState.columnFilters || {};
         state.sidebarFilter = savedState.sidebarFilter || '';
         state.dateFormat = savedState.dateFormat || 'raw';
-        state.cellEditBehavior = savedState.cellEditBehavior || 'inline';
 
         // Restore Set-based state (serialized as arrays)
         state.pinnedColumns = new Set(savedState.pinnedColumns || []);
@@ -116,10 +150,6 @@ async function restoreSavedState() {
         const dateFormatSelect = document.getElementById('dateFormatSelect');
         if (dateFormatSelect) dateFormatSelect.value = state.dateFormat;
 
-        // Restore page size dropdown
-        const pageSizeSelect = document.getElementById('pageSizeSelect');
-        if (pageSizeSelect) pageSizeSelect.value = String(state.rowsPerPage);
-
         // Update table name label
         const tableNameLabel = document.getElementById('tableNameLabel');
         if (tableNameLabel) tableNameLabel.textContent = state.selectedTable;
@@ -140,7 +170,7 @@ async function restoreSavedState() {
             container.scrollTop = savedScroll.top;
         }
 
-        updateStatus(`${state.totalRecordCount} records`);
+        updateStatus(`${state.totalRecordCountIsExact ? '' : '≤'}${state.totalRecordCount} records`);
     } else {
         updateStatus('Ready');
         showEmptyState();

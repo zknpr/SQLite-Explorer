@@ -16,6 +16,7 @@ const editModulePath = '../../core/ui/modules/edit.js';
 const gridEventsModulePath = '../../core/ui/modules/grid-events.js';
 const globalShortcutsModulePath = '../../core/ui/modules/global-shortcuts.js';
 const dndModulePath = '../../core/ui/modules/dnd.js';
+const clipboardModulePath = '../../core/ui/modules/clipboard.js';
 
 function createClassList(initial: string[] = []) {
     const classes = new Set(initial);
@@ -46,6 +47,11 @@ function createTextarea(value: string, selectionStart: number, selectionEnd = se
 describe('editor keyboard and grid selection interactions', () => {
     afterEach(async () => {
         delete (globalThis as any).document;
+        // The count cache is module state shared across this process; clear it
+        // so the next test's count mock always gets its first fetch.
+        const countCacheModulePath = '../../core/ui/modules/count-cache.js';
+        const { invalidateAllCounts } = await import(countCacheModulePath);
+        invalidateAllCounts();
         const { state } = await import(stateModulePath);
         state.editingCellInfo = null;
         state.activeCellInput = null;
@@ -58,10 +64,13 @@ describe('editor keyboard and grid selection interactions', () => {
         state.tableColumns = [];
         state.gridData = [];
         state.gridExactIntegerTexts = {};
+        state.gridOversizedCells = {};
+        state.gridReadOnlyRowReasons = {};
         state.pinnedColumns.clear();
         state.pinnedRowIds.clear();
         state.selectedTable = null;
         state.selectedTableType = 'table';
+        state.selectedTableIdentity = null;
         state.isReadOnly = false;
         state.cellPreviewInfo = null;
         state.isLoadingData = false;
@@ -603,6 +612,10 @@ describe('editor keyboard and grid selection interactions', () => {
             colIdx: 0,
             rowId: 7,
             columnName: 'first',
+            table: 'items',
+            tableType: 'table',
+            column: state.tableColumns[0],
+            identityKind: null,
             originalValue: 'alpha'
         };
         state.activeCellInput = currentInput;
@@ -683,6 +696,10 @@ describe('editor keyboard and grid selection interactions', () => {
             colIdx: 0,
             rowId: 7,
             columnName: 'value',
+            table: 'items',
+            tableType: 'table',
+            column: state.tableColumns[0],
+            identityKind: null,
             originalValue: 'old match'
         };
         state.activeCellInput = {
@@ -768,6 +785,10 @@ describe('editor keyboard and grid selection interactions', () => {
             colIdx: 0,
             rowId: 7,
             columnName: 'value',
+            table: 'source_items',
+            tableType: 'table',
+            column: state.tableColumns[0],
+            identityKind: null,
             originalValue: 'source value'
         };
         state.activeCellInput = {
@@ -812,6 +833,377 @@ describe('editor keyboard and grid selection interactions', () => {
                 currentIndex: 0
             });
             assert.deepStrictEqual(paintedValues, []);
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+        }
+    });
+
+    it('snapshots the full save target into the edit session at edit start', async () => {
+        const container = {
+            scrollLeft: 0,
+            scrollTop: 0,
+            getBoundingClientRect: () => ({
+                left: 0, top: 0, right: 500, bottom: 300, width: 500, height: 300
+            }),
+            querySelector() { return null; },
+            querySelectorAll() { return []; }
+        };
+        const cell = {
+            innerHTML: '',
+            classList: createClassList(),
+            children: [] as any[],
+            closest: () => null,
+            getBoundingClientRect: () => ({
+                left: 80, top: 160, right: 180, bottom: 190, width: 100, height: 30
+            }),
+            appendChild(child: any) { this.children.push(child); }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'gridContainer') return container;
+                if (id === 'cell-0-0') return cell;
+                return null;
+            },
+            createElement() {
+                return {
+                    className: '',
+                    value: '',
+                    spellcheck: false,
+                    addEventListener() {},
+                    removeEventListener() {},
+                    focus() {}
+                };
+            }
+        };
+        const { state } = await import(stateModulePath);
+        const { startCellEdit } = await import(editModulePath);
+        state.selectedTable = 'orders';
+        state.selectedTableType = 'table';
+        state.selectedTableIdentity = { kind: 'primaryKey', columns: ['id'] };
+        state.tableColumns = [{ name: 'amount', type: 'INTEGER', notnull: 1, isPrimaryKey: false }];
+        state.gridData = [[3, 100]];
+
+        startCellEdit(0, 0, 3);
+
+        const session = state.editingCellInfo;
+        assert.ok(session, 'edit session was not created');
+        assert.strictEqual(session.table, 'orders');
+        assert.strictEqual(session.tableType, 'table');
+        assert.strictEqual(session.rowId, 3);
+        assert.strictEqual(session.columnName, 'amount');
+        assert.strictEqual(
+            session.column,
+            state.tableColumns[0],
+            'the session must carry the column the edit was opened on'
+        );
+        assert.strictEqual(session.identityKind, 'primaryKey');
+        assert.strictEqual(session.originalValue, 100);
+    });
+
+    it('commits a blur-deferred save to the snapshot table after a table switch', async () => {
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const countCacheModulePath = '../../core/ui/modules/count-cache.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { onCellInputBlur } = await import(editModulePath);
+        const { buildCountIdentity, prepareCountStore, getCachedCount } =
+            await import(countCacheModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const originalFetchData = backendApi.fetchTableData;
+        const updateCalls: unknown[][] = [];
+        let dataFetches = 0;
+        const status = { textContent: '' };
+        const paintedValues: string[] = [];
+        const cell = {
+            textContent: '',
+            children: [] as any[],
+            classList: createClassList(),
+            appendChild(child: any) {
+                this.children.push(child);
+                if (child.className === 'cell-text') paintedValues.push(child.textContent);
+            }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cell-0-0') return cell;
+                if (id === 'statusText') return status;
+                return null;
+            },
+            querySelectorAll() { return []; },
+            querySelector() { return null; },
+            createElement() {
+                return {
+                    className: '',
+                    textContent: '',
+                    title: '',
+                    scrollWidth: 0,
+                    clientWidth: 0
+                };
+            }
+        };
+        backendApi.updateCell = async (...args: unknown[]) => {
+            updateCalls.push(args);
+        };
+        backendApi.fetchTableData = async () => {
+            dataFetches++;
+            return { rows: [] };
+        };
+
+        // Cached counts on both sides: the save must drop the snapshot table's
+        // filtered identity and leave the displayed table's cache untouched.
+        const ordersFiltered = buildCountIdentity(
+            'orders', [{ column: 'amount', value: '10' }], undefined, ['amount']
+        );
+        const ordersUnfiltered = buildCountIdentity('orders', [], undefined, ['amount']);
+        const customersFiltered = buildCountIdentity(
+            'customers', [{ column: 'amount', value: '10' }], undefined, ['amount']
+        );
+        prepareCountStore(ordersFiltered)(11);
+        prepareCountStore(ordersUnfiltered)(20);
+        prepareCountStore(customersFiltered)(7);
+
+        state.isReadOnly = false;
+        state.selectedTable = 'orders';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'amount', type: 'INTEGER', notnull: 0 }];
+        state.gridData = [[3, 100]];
+        state.editingCellInfo = {
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 3,
+            columnName: 'amount',
+            table: 'orders',
+            tableType: 'table',
+            column: state.tableColumns[0],
+            identityKind: null,
+            originalValue: 100,
+            originalText: '100'
+        };
+        const input = { value: '250', isConnected: true, removeEventListener() {} };
+        state.activeCellInput = input;
+
+        try {
+            // Clicking another sidebar table blurs the textarea (deferring its
+            // commit ~100ms) and lands the switch synchronously first. The new
+            // table exposes the same column name and rowid — the wrong-table
+            // trap the snapshot must sidestep.
+            onCellInputBlur();
+            state.selectedTable = 'customers';
+            state.selectedTableIdentity = null;
+            state.tableColumns = [{ name: 'amount', type: 'INTEGER', notnull: 0 }];
+            state.gridData = [[3, 555]];
+            input.isConnected = false; // the switch re-rendered the grid; editor DOM is gone
+
+            await new Promise(resolve => setTimeout(resolve, 200));
+            await new Promise(resolve => setImmediate(resolve));
+
+            assert.deepStrictEqual(updateCalls, [['orders', 3, 'amount', 250, 100]]);
+            assert.strictEqual(state.editingCellInfo, null, 'the committed session must be cleaned up');
+            assert.strictEqual(state.activeCellInput, null);
+            assert.deepStrictEqual(
+                state.gridData,
+                [[3, 555]],
+                'the displayed table must not absorb the write'
+            );
+            assert.deepStrictEqual(paintedValues, [], 'no cell of the displayed table may be repainted');
+            assert.strictEqual(dataFetches, 0, 'the save must not reload any grid');
+            assert.strictEqual(status.textContent, 'Saved to orders.amount');
+            assert.strictEqual(
+                getCachedCount(ordersFiltered),
+                undefined,
+                'the snapshot table\'s filtered count must be dropped'
+            );
+            assert.deepStrictEqual(
+                getCachedCount(ordersUnfiltered),
+                { count: 20, isExact: true },
+                'the snapshot table\'s unfiltered count survives a cell edit'
+            );
+            assert.deepStrictEqual(
+                getCachedCount(customersFiltered),
+                { count: 7, isExact: true },
+                'the displayed table\'s counts must be untouched'
+            );
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+            backendApi.fetchTableData = originalFetchData;
+        }
+    });
+
+    it('clears a dead-editor session and names the snapshot target when its save fails', async () => {
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { saveCellEdit } = await import(editModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const originalConsoleError = console.error;
+        console.error = () => {};
+        const status = { textContent: '' };
+        (globalThis as any).document = {
+            getElementById(id: string) { return id === 'statusText' ? status : null; },
+            querySelectorAll() { return []; },
+            querySelector() { return null; }
+        };
+        backendApi.updateCell = async () => {
+            throw new Error('CHECK constraint failed: amount');
+        };
+        state.selectedTable = 'customers';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'amount', type: 'INTEGER', notnull: 0 }];
+        state.gridData = [[3, 555]];
+        state.editingCellInfo = {
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 3,
+            columnName: 'amount',
+            table: 'orders',
+            tableType: 'table',
+            column: { name: 'amount', type: 'INTEGER', notnull: 0 },
+            identityKind: null,
+            originalValue: 100,
+            originalText: '100'
+        };
+        state.activeCellInput = { value: '250', isConnected: false, removeEventListener() {} };
+
+        try {
+            assert.strictEqual(await saveCellEdit(), false);
+
+            assert.strictEqual(
+                state.editingCellInfo,
+                null,
+                'a failed save with a dead editor must not leak the session'
+            );
+            assert.strictEqual(state.activeCellInput, null);
+            assert.strictEqual(
+                status.textContent,
+                'Save failed for orders.amount: CHECK constraint failed: amount'
+            );
+            assert.deepStrictEqual(state.gridData, [[3, 555]]);
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+            console.error = originalConsoleError;
+        }
+    });
+
+    it('retains the session and live editor when a same-table save fails', async () => {
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { saveCellEdit } = await import(editModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const originalConsoleError = console.error;
+        console.error = () => {};
+        const status = { textContent: '' };
+        (globalThis as any).document = {
+            getElementById(id: string) { return id === 'statusText' ? status : null; },
+            querySelectorAll() { return []; },
+            querySelector() { return null; }
+        };
+        backendApi.updateCell = async () => {
+            throw new Error('NOT NULL constraint failed: items.value');
+        };
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'value', type: 'TEXT', notnull: 1 }];
+        state.gridData = [[7, 'old']];
+        const session = {
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 7,
+            columnName: 'value',
+            table: 'items',
+            tableType: 'table',
+            column: state.tableColumns[0],
+            identityKind: null,
+            originalValue: 'old',
+            originalText: 'old'
+        };
+        state.editingCellInfo = session;
+        // No isConnected property: like editorHoldsWindow, non-DOM editors
+        // count as live unless explicitly disconnected.
+        const input = { value: 'new', removeEventListener() {} };
+        state.activeCellInput = input;
+
+        try {
+            assert.strictEqual(await saveCellEdit(), false);
+
+            assert.strictEqual(state.editingCellInfo, session, 'the session must be retained for correction');
+            assert.strictEqual(state.activeCellInput, input, 'the editor must be kept');
+            assert.strictEqual(status.textContent, 'Save failed: NOT NULL constraint failed: items.value');
+            assert.deepStrictEqual(state.gridData, [[7, 'old']]);
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+            console.error = originalConsoleError;
+        }
+    });
+
+    it('commits an inline edit to the snapshot target on Enter', async () => {
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { onCellInputKeydown } = await import(editModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const updateCalls: unknown[][] = [];
+        const status = { textContent: '' };
+        const cell = {
+            textContent: '',
+            children: [] as any[],
+            classList: createClassList(['editing']),
+            appendChild(child: any) { this.children.push(child); }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cell-0-0') return cell;
+                if (id === 'statusText') return status;
+                return null;
+            },
+            querySelectorAll() { return []; },
+            querySelector() { return null; },
+            createElement() {
+                return {
+                    className: '',
+                    textContent: '',
+                    title: '',
+                    scrollWidth: 0,
+                    clientWidth: 0
+                };
+            }
+        };
+        backendApi.updateCell = async (...args: unknown[]) => {
+            updateCalls.push(args);
+        };
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'value', type: 'TEXT', notnull: 0 }];
+        state.gridData = [[7, 'old']];
+        state.editingCellInfo = {
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 7,
+            columnName: 'value',
+            table: 'items',
+            tableType: 'table',
+            column: state.tableColumns[0],
+            identityKind: null,
+            originalValue: 'old',
+            originalText: 'old'
+        };
+        state.activeCellInput = { value: 'new text', removeEventListener() {} };
+        let prevented = false;
+
+        try {
+            await onCellInputKeydown({
+                key: 'Enter',
+                shiftKey: false,
+                preventDefault() { prevented = true; }
+            });
+            await new Promise(resolve => setImmediate(resolve));
+
+            assert.strictEqual(prevented, true);
+            assert.deepStrictEqual(updateCalls, [['items', 7, 'value', 'new text', 'old']]);
+            assert.strictEqual(state.editingCellInfo, null);
+            assert.strictEqual(state.activeCellInput, null);
+            assert.deepStrictEqual(state.gridData, [[7, 'new text']]);
+            assert.strictEqual(status.textContent, 'Saved');
         } finally {
             backendApi.updateCell = originalUpdateCell;
         }
@@ -875,6 +1267,125 @@ describe('editor keyboard and grid selection interactions', () => {
 
         assert.strictEqual(container.scrollLeft, 30);
         assert.strictEqual(scrollLeftWhenFocused, 30);
+    });
+
+    it('refuses inline editing of a bounded oversized preview with the exact byte count', async () => {
+        const status = { textContent: '' };
+        const cell = {
+            innerHTML: '',
+            classList: createClassList(),
+            children: [] as any[],
+            appendChild(child: any) { this.children.push(child); }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'statusText') return status;
+                if (id === 'cell-0-0') return cell;
+                return null;
+            }
+        };
+        const { state } = await import(stateModulePath);
+        const { startCellEdit } = await import(editModulePath);
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.gridData = [[1, 'bounded preview']];
+        state.gridOversizedCells = {
+            0: { 1: { storageClass: 'text', byteLength: 268435456 } }
+        };
+
+        startCellEdit(0, 0, 1);
+
+        assert.strictEqual(state.editingCellInfo, null);
+        assert.strictEqual(cell.children.length, 0);
+        assert.strictEqual(
+            status.textContent,
+            'Too large to edit inline — 268,435,456 bytes (TEXT)'
+        );
+    });
+
+    it('keeps batch clear blocked but permits confirmed single-cell replacement affordances', async () => {
+        const listeners = new Map<string, (event: any) => any>();
+        const status = { textContent: '' };
+        const cell = {
+            dataset: { rowidx: '0', colidx: '0' },
+            classList: createClassList(),
+            closest(selector: string) {
+                return selector === '.data-cell' ? this : null;
+            }
+        };
+        const container = {
+            addEventListener(type: string, listener: (event: any) => any) {
+                listeners.set(type, listener);
+            }
+        };
+        (globalThis as any).document = {
+            addEventListener() {},
+            createElement() {
+                return { className: '', textContent: '', title: '' };
+            },
+            getElementById(id: string) {
+                if (id === 'gridContainer') return container;
+                if (id === 'statusText') return status;
+                return null;
+            }
+        };
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { clearSelectedCellValues } = await import(clipboardModulePath);
+        const { initDragAndDrop } = await import(dndModulePath);
+        const originalUpdateCellBatch = backendApi.updateCellBatch;
+        const originalUpdateCell = backendApi.updateCell;
+        const originalReadWorkspaceFileUri = backendApi.readWorkspaceFileUri;
+        let batchUpdateCalls = 0;
+        let singleUpdateCalls = 0;
+        backendApi.updateCellBatch = async () => {
+            batchUpdateCalls++;
+            throw new Error('unexpected backend update');
+        };
+        backendApi.readWorkspaceFileUri = async () => new Uint8Array([1, 2, 3]);
+        backendApi.updateCell = async () => {
+            singleUpdateCalls++;
+            return 1;
+        };
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'payload', type: 'BLOB' }];
+        state.gridData = [[1, new Uint8Array([0xde, 0xad])]];
+        state.gridOversizedCells = {
+            0: { 1: { storageClass: 'blob', byteLength: 4096 } }
+        };
+        state.selectedCells = [{
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 1,
+            value: state.gridData[0][1]
+        }];
+
+        try {
+            await clearSelectedCellValues();
+            assert.strictEqual(batchUpdateCalls, 0);
+            assert.strictEqual(status.textContent, 'Too large to edit inline — 4,096 bytes (BLOB)');
+
+            status.textContent = '';
+            initDragAndDrop();
+            await listeners.get('drop')?.({
+                preventDefault() {},
+                target: cell,
+                dataTransfer: {
+                    files: [],
+                    getData: (type: string) => type === 'text/uri-list' ? 'file:///tmp/new.bin' : ''
+                }
+            });
+            assert.strictEqual(singleUpdateCalls, 1);
+            assert.strictEqual(status.textContent, 'Uploaded new.bin');
+            assert.strictEqual(state.gridOversizedCells[0], undefined);
+        } finally {
+            backendApi.updateCellBatch = originalUpdateCellBatch;
+            backendApi.updateCell = originalUpdateCell;
+            backendApi.readWorkspaceFileUri = originalReadWorkspaceFileUri;
+        }
     });
 
     it('keeps Tab advancement bound to the intended row when the edit changes sort order', async () => {
@@ -996,6 +1507,10 @@ describe('editor keyboard and grid selection interactions', () => {
             colIdx: 0,
             rowId: 1,
             columnName: 'rank',
+            table: 'items',
+            tableType: 'table',
+            column: state.tableColumns[0],
+            identityKind: null,
             originalValue: 'a'
         };
         state.activeCellInput = { value: 'z', removeEventListener() {} };
@@ -1097,6 +1612,10 @@ describe('editor keyboard and grid selection interactions', () => {
             colIdx: 2,
             rowId: 7,
             columnName: 'third',
+            table: 'items',
+            tableType: 'table',
+            column: state.tableColumns[2],
+            identityKind: null,
             originalValue: 'gamma'
         };
         state.activeCellInput = { value: 'gamma', removeEventListener() {} };
@@ -1126,6 +1645,10 @@ describe('editor keyboard and grid selection interactions', () => {
             colIdx: 1,
             rowId: 7,
             columnName: 'second',
+            table: 'items',
+            tableType: 'table',
+            column: state.tableColumns[1],
+            identityKind: null,
             originalValue: 'beta'
         };
         state.activeCellInput = { value: 'beta', removeEventListener() {} };

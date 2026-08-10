@@ -110,12 +110,15 @@ describe('workerFactory browser WASM connection', () => {
 
     Object.defineProperty(mockVscode.workspace, 'fs', {
       value: {
-        stat: async () => ({ size: dbContent.byteLength }),
-        readFile: async (uri: { path?: string; fsPath?: string }) => {
+        stat: async (uri: { path?: string; fsPath?: string }) => {
           const pathValue = uri.path ?? uri.fsPath ?? '';
           if (pathValue.endsWith('-wal')) {
             throw new Error('No WAL file');
           }
+          return { size: dbContent.byteLength };
+        },
+        readFile: async (uri: { path?: string; fsPath?: string }) => {
+          const pathValue = uri.path ?? uri.fsPath ?? '';
           if (pathValue.endsWith('sqlite3.wasm')) {
             return wasmContent;
           }
@@ -172,7 +175,7 @@ describe('workerFactory browser WASM connection', () => {
     const connection = await bundle.establishConnection(fileUri, 'test.db');
 
     assert.strictEqual(initConfig?.content?.byteLength, 3);
-    assert.strictEqual(initConfig?.walContent, null);
+    assert.ok(initConfig && !('walContent' in initConfig), 'WAL bytes are never shipped to the engine');
     assert.strictEqual(initConfig?.wasmBinary?.byteLength, 3);
     assert.strictEqual(connection.isReadOnly, false);
 
@@ -191,18 +194,21 @@ describe('workerFactory browser WASM connection', () => {
 
   it('opens browser WAL databases read-only instead of silently writing without WAL pages', async () => {
     const dbContent = new Uint8Array([1, 2, 3]);
-    const walContent = new Uint8Array([9, 9, 9]);
+    const walSize = 3;
     const wasmContent = new Uint8Array([4, 5, 6]);
     let initConfig: DatabaseInitConfig | undefined;
 
     Object.defineProperty(mockVscode.workspace, 'fs', {
       value: {
-        stat: async () => ({ size: dbContent.byteLength }),
-        readFile: async (uri: { path?: string; fsPath?: string }) => {
+        stat: async (uri: { path?: string; fsPath?: string }) => {
           const pathValue = uri.path ?? uri.fsPath ?? '';
           if (pathValue.endsWith('-wal')) {
-            return walContent;
+            return { size: walSize };
           }
+          return { size: dbContent.byteLength };
+        },
+        readFile: async (uri: { path?: string; fsPath?: string }) => {
+          const pathValue = uri.path ?? uri.fsPath ?? '';
           if (pathValue.endsWith('sqlite3.wasm')) {
             return wasmContent;
           }
@@ -242,7 +248,7 @@ describe('workerFactory browser WASM connection', () => {
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     const connection = await bundle.establishConnection(fileUri, 'test.db');
 
-    assert.strictEqual(initConfig?.walContent, walContent);
+    assert.ok(initConfig && !('walContent' in initConfig), 'WAL bytes are never shipped to the engine');
     assert.strictEqual(initConfig?.readOnlyMode, true);
     assert.strictEqual(connection.isReadOnly, true);
   });

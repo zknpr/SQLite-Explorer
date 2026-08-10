@@ -1,6 +1,6 @@
 import './vscode_mock_setup';
 
-import { describe, it, beforeEach, afterEach } from 'node:test';
+import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert';
 import { DEFAULT_INVOCATION_TIMEOUT_MS } from '../../src/core/rpc';
 
@@ -12,6 +12,12 @@ let workerTerminated = false;
 let exposedWorkerMethods: string[] = [];
 let workerProxy: Record<string, (...args: any[]) => any> = {};
 let workerTimeoutPolicy: ((methodName: string, parameters: readonly unknown[]) => number) | undefined;
+let pagedHostSaveCalls: unknown[][] = [];
+let nativeAvailable = false;
+let nativeAvailabilityChecks = 0;
+let nativeConnectionCalls = 0;
+let outputLines: string[] = [];
+let serializeOperationsCalls = 0;
 
 const Module = require('module');
 
@@ -79,13 +85,35 @@ Module.prototype.require = function(id: string) {
         // Exercise the desktop facade's own Promise contract directly. The
         // production serializer is async and would otherwise mask a synchronous
         // throw from the facade method it wraps.
-        return { serializeOperations: (operations: unknown) => operations };
+        return {
+          serializeOperations: (operations: unknown) => {
+            serializeOperationsCalls++;
+            return operations;
+          }
+        };
+    }
+    if (id.endsWith('pagedWritableSave')) {
+        return {
+          writePagedWritableOverlayToFile: async (...args: unknown[]) => {
+            pagedHostSaveCalls.push(args);
+            return { requiresReopen: true };
+          }
+        };
     }
     if (id.endsWith('main')) {
-        return { GlobalOutputChannel: null };
+        return { GlobalOutputChannel: { appendLine: (line: string) => outputLines.push(line) } };
     }
     if (id.endsWith('nativeWorker')) {
-        return { isNativeAvailable: async () => false };
+        return {
+          isNativeAvailable: async () => {
+            nativeAvailabilityChecks++;
+            return nativeAvailable;
+          },
+          createNativeDatabaseConnection: async () => {
+            nativeConnectionCalls++;
+            throw new Error('native connection must not be created without its binary');
+          }
+        };
     }
     return originalRequire.call(this, id);
 };
@@ -102,6 +130,12 @@ describe('workerFactory error path tests', () => {
     workerTerminated = false;
     exposedWorkerMethods = [];
     workerTimeoutPolicy = undefined;
+    pagedHostSaveCalls = [];
+    nativeAvailable = false;
+    nativeAvailabilityChecks = 0;
+    nativeConnectionCalls = 0;
+    outputLines = [];
+    serializeOperationsCalls = 0;
     workerProxy = {
       initializeDatabase: async () => {
         if (connectionFailed) throw new Error('Connection failed');
@@ -128,6 +162,47 @@ describe('workerFactory error path tests', () => {
   afterEach(() => {
     // Restore the original require implementation to avoid leaking to other tests
     Module.prototype.require = originalRequire;
+    mock.restoreAll();
+  });
+
+  // The factory derives the sibling -wal URI via uri.with() (WAL read-only
+  // gate), so database-file mocks must implement it like real vsc.Uri does.
+  const testDbUri = () => ({
+    scheme: 'file',
+    fsPath: '/test/db.sqlite',
+    path: '/test/db.sqlite',
+    with({ path: nextPath }: { path: string }) {
+      return { ...this, path: nextPath, fsPath: nextPath };
+    }
+  } as any);
+
+  it('opens with WASM without an error notification when the install has no native binary', async () => {
+    const showErrorMessage = mock.method(mockVscode.window, 'showErrorMessage');
+    const extensionUri = { scheme: 'file', fsPath: '/test/natives-less-extension' } as any;
+
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const connection = await bundle.establishConnection(testDbUri(), 'test.sqlite');
+
+    assert.strictEqual(nativeAvailabilityChecks, 1);
+    assert.strictEqual(nativeConnectionCalls, 0);
+    assert.strictEqual(await connection.databaseOps.engineKind, 'wasm');
+    assert.strictEqual(showErrorMessage.mock.callCount(), 0);
+    assert.deepStrictEqual(outputLines, ['[SQLite Explorer] Using WebAssembly SQLite backend']);
+  });
+
+  it('serializes the desktop worker-backed WASM facade as one operation queue', async () => {
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+
+    await bundle.establishConnection(testDbUri(), 'test.sqlite');
+
+    assert.strictEqual(
+      serializeOperationsCalls,
+      1,
+      'runReadSnapshot must hold the same lease as every worker-backed mutation'
+    );
   });
 
   it('should terminate worker and re-throw error if establishConnection fails in WASM factory', async () => {
@@ -141,7 +216,7 @@ describe('workerFactory error path tests', () => {
     // We have to cast to access the returned WASM bundle for testing establishConnection directly
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
 
-    const fileUri = { scheme: 'file', fsPath: '/test/db.sqlite', path: '/test/db.sqlite' } as any;
+    const fileUri = testDbUri();
 
     try {
       await bundle.establishConnection(fileUri, 'test.sqlite');
@@ -150,6 +225,118 @@ describe('workerFactory error path tests', () => {
       assert.strictEqual(err.message, 'Connection failed');
       assert.strictEqual(workerTerminated, true, 'terminateWorker should be called to prevent memory leaks');
     }
+  });
+
+  it('routes writable paged saves through the host streamer without a worker full-image path', async () => {
+    let directWorkerWriteCalls = 0;
+    let fullExportCalls = 0;
+    const runData = new Uint8Array([9, 8, 7, 6]).buffer;
+    const snapshot = {
+      chunkSize: 4,
+      logicalSize: 4,
+      baseLimit: 4,
+      dirtyBytes: 4,
+      baseIdentity: { dev: 1n, ino: 2n, size: 4n, mtimeNs: 3n, mode: 0o600n },
+      runs: [{ startChunkIndex: 0, data: runData }]
+    };
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false, storage: 'paged' }),
+      exportPagedWritableOverlay: async () => snapshot,
+      writeToFile: async () => {
+        directWorkerWriteCalls++;
+        return { requiresReopen: false };
+      },
+      exportDatabase: async () => {
+        fullExportCalls++;
+        return new Uint8Array([1, 2, 3, 4]);
+      }
+    };
+
+    const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
+    const fileUri = testDbUri();
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
+
+    const signal = new AbortController().signal;
+    const result = await databaseOps.writeToFile('/test/save-as.sqlite', signal);
+
+    assert.deepStrictEqual(result, { requiresReopen: true });
+    assert.strictEqual(directWorkerWriteCalls, 0);
+    assert.strictEqual(fullExportCalls, 0);
+    assert.strictEqual(pagedHostSaveCalls.length, 1);
+    assert.strictEqual(pagedHostSaveCalls[0][1], '/test/db.sqlite');
+    assert.strictEqual(pagedHostSaveCalls[0][2], '/test/save-as.sqlite');
+    assert.strictEqual(pagedHostSaveCalls[0][3], snapshot, 'transferred buffers must be consumed directly');
+    assert.strictEqual(pagedHostSaveCalls[0][6], signal);
+  });
+
+  it('stops a paged save cancelled during overlay export before host reconstruction', async () => {
+    let releaseExport!: () => void;
+    let exportStarted!: () => void;
+    const started = new Promise<void>(resolve => { exportStarted = resolve; });
+    const release = new Promise<void>(resolve => { releaseExport = resolve; });
+    const snapshot = {
+      chunkSize: 4,
+      logicalSize: 4,
+      baseLimit: 4,
+      dirtyBytes: 0,
+      baseIdentity: { dev: 1n, ino: 2n, size: 4n, mtimeNs: 3n, mode: 0o600n },
+      runs: []
+    };
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false, storage: 'paged' }),
+      exportPagedWritableOverlay: async (...args: unknown[]) => {
+        assert.strictEqual(args.length, 0, 'AbortSignal must not cross worker RPC');
+        exportStarted();
+        await release;
+        return snapshot;
+      }
+    };
+
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+    const { databaseOps } = await bundle.establishConnection(testDbUri(), 'test.sqlite');
+    const controller = new AbortController();
+    const cancellation = new Error('cancelled during overlay export');
+    const pending = databaseOps.writeToFile('/test/cancelled.sqlite', controller.signal);
+    await started;
+    controller.abort(cancellation);
+    releaseExport();
+
+    let caught: unknown;
+    await pending.catch((error: unknown) => { caught = error; });
+    assert.strictEqual(caught, cancellation);
+    assert.deepStrictEqual(pagedHostSaveCalls, []);
+  });
+
+  it('keeps memory-backed saves on the worker writeToFile path', async () => {
+    let directWorkerWriteCalls = 0;
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false, storage: 'memory' }),
+      writeToFile: async (targetPath: string) => {
+        directWorkerWriteCalls++;
+        assert.strictEqual(targetPath, '/test/memory-save.sqlite');
+        return { requiresReopen: false };
+      },
+      exportPagedWritableOverlay: async () => {
+        throw new Error('memory save must not request a paged overlay');
+      }
+    };
+
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+    const { databaseOps } = await bundle.establishConnection(testDbUri(), 'test.sqlite');
+
+    assert.deepStrictEqual(
+      await databaseOps.writeToFile('/test/memory-save.sqlite'),
+      { requiresReopen: false }
+    );
+    assert.strictEqual(directWorkerWriteCalls, 1);
+    assert.deepStrictEqual(pagedHostSaveCalls, []);
   });
 
   it('routes view history through the desktop worker-backed WASM facade', async () => {
@@ -227,11 +414,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
 
@@ -307,6 +490,7 @@ describe('workerFactory error path tests', () => {
     assert.strictEqual(flushRpcArgumentCounts.at(-1), 0);
 
     for (const method of [
+      'exportPagedWritableOverlay',
       'applyModifications',
       'undoModification',
       'redoModification',
@@ -317,6 +501,73 @@ describe('workerFactory error path tests', () => {
     }
   });
 
+  it('routes bounded read sessions through the desktop WASM worker facade', async () => {
+    const target = { table: 'items', rowId: 7, column: 'payload' };
+    const metadata = { storageClass: 'blob', byteLength: 3 };
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false }),
+      getCellMetadata: async (received: unknown) => {
+        assert.deepStrictEqual(received, target);
+        return metadata;
+      },
+      openCellReadSession: async (received: unknown) => {
+        assert.deepStrictEqual(received, target);
+        return { sessionId: 'session-1', metadata, expiresAt: 1234 };
+      },
+      readCellChunk: async (sessionId: string, byteOffset: number, maxBytes: number) => {
+        assert.deepStrictEqual([sessionId, byteOffset, maxBytes], ['session-1', 0, 3]);
+        return { byteOffset: 0, bytes: new Uint8Array([1, 2, 3]), done: true };
+      },
+      closeCellReadSession: async (sessionId: string) => {
+        assert.strictEqual(sessionId, 'session-1');
+      },
+      openQueryReadSession: async (sql: string) => {
+        assert.strictEqual(sql, 'SELECT value FROM items');
+        return { sessionId: 'query-session-1' };
+      },
+      readQueryRows: async (sessionId: string, maxRows: number) => {
+        assert.deepStrictEqual([sessionId, maxRows], ['query-session-1', 1]);
+        return { rows: [['value']], done: false };
+      },
+      closeQueryReadSession: async (sessionId: string) => {
+        assert.strictEqual(sessionId, 'query-session-1');
+      }
+    };
+
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+    const connection = await bundle.establishConnection(
+      testDbUri(),
+      'test.sqlite'
+    );
+
+    assert.ok(exposedWorkerMethods.includes('getCellMetadata'));
+    assert.ok(exposedWorkerMethods.includes('openCellReadSession'));
+    assert.ok(exposedWorkerMethods.includes('readCellChunk'));
+    assert.ok(exposedWorkerMethods.includes('closeCellReadSession'));
+    assert.ok(exposedWorkerMethods.includes('openQueryReadSession'));
+    assert.ok(exposedWorkerMethods.includes('readQueryRows'));
+    assert.ok(exposedWorkerMethods.includes('closeQueryReadSession'));
+    assert.deepStrictEqual(await connection.databaseOps.getCellMetadata(target), metadata);
+    const session = await connection.databaseOps.openCellReadSession(target);
+    assert.strictEqual(session.sessionId, 'session-1');
+    assert.deepStrictEqual(
+      await connection.databaseOps.readCellChunk(session.sessionId, 0, 3),
+      { byteOffset: 0, bytes: new Uint8Array([1, 2, 3]), done: true }
+    );
+    await connection.databaseOps.closeCellReadSession(session.sessionId);
+    const querySession = await connection.databaseOps.openQueryReadSession!(
+      'SELECT value FROM items'
+    );
+    assert.deepStrictEqual(
+      await connection.databaseOps.readQueryRows!(querySession.sessionId, 1),
+      { rows: [['value']], done: false }
+    );
+    await connection.databaseOps.closeQueryReadSession!(querySession.sessionId);
+  });
+
   it('rejects pre-aborted desktop worker operations instead of throwing synchronously', async () => {
     let applyCalls = 0;
     workerProxy = {
@@ -325,11 +576,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
     const controller = new AbortController();
@@ -345,6 +592,50 @@ describe('workerFactory error path tests', () => {
     await pending!.catch(error => { caught = error; });
     assert.strictEqual(caught, cancellation);
     assert.strictEqual(applyCalls, 0);
+  });
+
+  it('preempts desktop WASM queries through a host-owned shared flag', async () => {
+    let cancellationFlag: Int32Array | undefined;
+    let releaseWorker: (() => void) | undefined;
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false }),
+      runQuery: async (
+        _sql: string,
+        _params?: unknown[],
+        receivedFlag?: Int32Array
+      ) => {
+        cancellationFlag = receivedFlag;
+        await new Promise<void>(resolve => { releaseWorker = resolve; });
+        return [];
+      }
+    };
+
+    const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
+    const fileUri = testDbUri();
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
+    const controller = new AbortController();
+    const cancellation = new Error('cancelled while worker query was running');
+    const pending = databaseOps.executeQuery(
+      'SELECT long_running_query()',
+      [],
+      controller.signal
+    );
+    await Promise.resolve();
+
+    try {
+      assert.ok(cancellationFlag, 'desktop facade did not pass a cancellation flag');
+      assert.ok(cancellationFlag.buffer instanceof SharedArrayBuffer);
+      assert.strictEqual(Atomics.load(cancellationFlag, 0), 0);
+      controller.abort(cancellation);
+      assert.strictEqual(Atomics.load(cancellationFlag, 0), 1);
+    } finally {
+      releaseWorker?.();
+    }
+
+    let caught: unknown;
+    await pending.catch((error: unknown) => { caught = error; });
+    assert.strictEqual(caught, cancellation);
   });
 
   it('keeps BLOB history bytes owned by the host while transferring mutation payloads', async () => {
@@ -370,11 +661,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
     const blob = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
@@ -437,11 +724,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
     const { ModificationTracker } = require('../../src/core/undo-history');
@@ -481,11 +764,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     await bundle.establishConnection(fileUri, 'test.sqlite');
     assert.ok(workerTimeoutPolicy, 'desktop worker should install a timeout policy');
@@ -596,11 +875,7 @@ describe('workerFactory error path tests', () => {
     };
 
     const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
-    const fileUri = {
-      scheme: 'file',
-      fsPath: '/test/db.sqlite',
-      path: '/test/db.sqlite'
-    } as any;
+    const fileUri = testDbUri();
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     await bundle.establishConnection(fileUri, 'test.sqlite');
     const veryLargeHistory = Array.from({ length: 10_000 }, (_, index) => ({ index }));

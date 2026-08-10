@@ -14,6 +14,19 @@
 
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { Upload, Database, FileUp, ArrowLeft, Download, RefreshCw, AlertCircle } from 'lucide-react';
+import { isTrustedViewerMessage } from './messageGuard';
+import { DEMO_INLINE_CONTENT_MAX_BYTES } from '../../../src/core/paged-open';
+import {
+  demoRpcErrorFields,
+  demoRpcErrorFromResponse,
+  deserializeDemoIframeRequest,
+  guardDemoDatabaseExportResponse,
+  guardDemoIframeRequest,
+  guardDemoIframeResponse,
+  guardDemoWorkerRequest,
+  guardDemoWorkerResponse,
+  serializeDemoIframeResponse
+} from './transport';
 
 // ============================================================================
 // Types
@@ -33,7 +46,36 @@ interface RpcMessage {
     success?: boolean;
     data?: unknown;
     errorMessage?: string;
+    error?: unknown;
   };
+}
+
+function postIframeRpcResponse(
+  target: MessageEventSource | null,
+  targetOrigin: string,
+  content: RpcMessage['content']
+): void {
+  const wireContent = content.data === undefined
+    ? content
+    : { ...content, data: serializeDemoIframeResponse(content.data) };
+  let envelope: RpcMessage = { channel: 'rpc', content: wireContent };
+  try {
+    guardDemoIframeResponse(envelope);
+  } catch (error) {
+    envelope = {
+      channel: 'rpc',
+      content: {
+        kind: 'response',
+        messageId: content.messageId,
+        success: false,
+        ...demoRpcErrorFields(error)
+      }
+    };
+    // The replacement is a fixed-shape, scalar error, but keep the same guard
+    // invariant at the actual structured-clone boundary.
+    guardDemoIframeResponse(envelope);
+  }
+  target?.postMessage(envelope, { targetOrigin });
 }
 
 // ============================================================================
@@ -59,6 +101,40 @@ const SAMPLE_DATABASES = [
   }
 ];
 
+const CANCELLATION_PARAMETER_INDEX: Readonly<Record<string, number>> = {
+  runQuery: 2,
+  previewViewDefinition: 4
+};
+
+function createSharedCancellationFlag(signal?: AbortSignal) {
+  // Browsers expose SharedArrayBuffer to this page only when cross-origin
+  // isolation is active. Otherwise the worker retains its SQLite deadline but
+  // cannot observe a host cancellation while synchronous WASM owns the thread.
+  if (
+    !signal ||
+    globalThis.crossOriginIsolated !== true ||
+    typeof SharedArrayBuffer !== 'function'
+  ) {
+    return undefined;
+  }
+
+  let flag: Int32Array;
+  try {
+    flag = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  } catch {
+    return undefined;
+  }
+
+  const markCancelled = () => Atomics.store(flag, 0, 1);
+  if (signal.aborted) markCancelled();
+  else signal.addEventListener('abort', markCancelled, { once: true });
+
+  return {
+    flag,
+    dispose: () => signal.removeEventListener('abort', markCancelled)
+  };
+}
+
 // ============================================================================
 // Demo Page Component
 // ============================================================================
@@ -82,6 +158,12 @@ export default function DemoClient() {
    */
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  /** Download-only failures leave the active editor usable. */
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+
+  /** Why the worker forced the current database into read-only mode. */
+  const [readOnlyNotice, setReadOnlyNotice] = useState<string | null>(null);
+
   /**
    * Name of the currently loaded database file.
    */
@@ -91,6 +173,13 @@ export default function DemoClient() {
    * Whether the drop zone is currently being hovered over.
    */
   const [isDragOver, setIsDragOver] = useState(false);
+
+  /**
+   * Whether the Download button applies to the current database. Every
+   * writable worker database can export its current image; read-only paged
+   * fallbacks and WAL-gated buffers cannot.
+   */
+  const [canDownload, setCanDownload] = useState(false);
 
   // -------------------------------------------------------------------------
   // Refs
@@ -110,9 +199,12 @@ export default function DemoClient() {
    * Pending RPC calls waiting for responses.
    */
   const pendingCalls = useRef<Map<string, {
+    method: string;
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
   }>>(new Map());
+
+  const activePreviewController = useRef<AbortController | null>(null);
 
   /**
    * Message ID counter for RPC calls.
@@ -121,8 +213,30 @@ export default function DemoClient() {
 
   /**
    * Binary content of the loaded database (for download).
+   * Retained only for inline-bytes opens; File-handle opens keep the
+   * handle instead (databaseFile) and never duplicate the bytes.
    */
   const databaseBinary = useRef<Uint8Array | null>(null);
+
+  /**
+   * File handle of the loaded database when it was posted to the worker
+   * as a File (large databases). Used by Reload to re-open from disk.
+   */
+  const databaseFile = useRef<File | null>(null);
+
+  /**
+   * Whether the worker opened the current database read-only (a stale-runtime
+   * paged fallback, or a WAL-marked file routed to the
+   * read-only buffer path). Reported to the viewer iframe on
+   * `initialize` so its mutation UI disables itself. A ref, not state:
+   * it is only read inside the iframe message handler, and the iframe
+   * mounts after initialization completes.
+   */
+  const databaseIsReadOnly = useRef(false);
+
+  /** Worker-reported backing mode and original size for paged-save warnings. */
+  const databaseStorage = useRef<'memory' | 'paged'>('memory');
+  const databaseFileSizeBytes = useRef(0);
 
   // -------------------------------------------------------------------------
   // Worker Communication
@@ -131,15 +245,27 @@ export default function DemoClient() {
   /**
    * Send an RPC request to the worker and wait for response.
    */
-  const callWorker = useCallback((method: string, args: unknown[]): Promise<unknown> => {
-    return new Promise((resolve, reject) => {
+  const callWorker = useCallback((
+    method: string,
+    args: unknown[],
+    signal?: AbortSignal
+  ): Promise<unknown> => {
+    signal?.throwIfAborted();
+    const sharedCancellation = createSharedCancellationFlag(signal);
+    const workerArgs = [...args];
+    const cancellationIndex = CANCELLATION_PARAMETER_INDEX[method];
+    if (sharedCancellation && cancellationIndex !== undefined) {
+      while (workerArgs.length < cancellationIndex) workerArgs.push(undefined);
+      workerArgs[cancellationIndex] = sharedCancellation.flag;
+    }
+
+    const invocation = new Promise<unknown>((resolve, reject) => {
       if (!workerRef.current) {
         reject(new Error('Worker not initialized'));
         return;
       }
 
       const messageId = `rpc_${++messageIdCounter.current}_${Date.now()}`;
-      pendingCalls.current.set(messageId, { resolve, reject });
 
       const message: RpcMessage = {
         channel: 'rpc',
@@ -147,27 +273,49 @@ export default function DemoClient() {
           kind: 'invoke',
           messageId,
           targetMethod: method,
-          payload: args
+          payload: workerArgs
         }
       };
 
+      try {
+        guardDemoWorkerRequest(message);
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+
+      pendingCalls.current.set(messageId, { method, resolve, reject });
       workerRef.current.postMessage(message);
     });
+    return invocation.then(
+      result => {
+        signal?.throwIfAborted();
+        return result;
+      },
+      error => {
+        signal?.throwIfAborted();
+        throw error;
+      }
+    ).finally(() => sharedCancellation?.dispose());
   }, []);
 
   /**
    * Forward RPC calls from iframe to worker and back.
    */
   const handleIframeMessage = useCallback((event: MessageEvent) => {
-    // Only handle messages from our iframe
-    if (event.source !== iframeRef.current?.contentWindow) return;
+    // The viewer iframe is same-origin, and an ancestor can navigate it to a
+    // foreign document without changing its WindowProxy — so require the
+    // browser-verified origin alongside the source identity, and reply only
+    // to our own origin, never to event.origin.
+    const viewerOrigin = window.location.origin;
+    if (!isTrustedViewerMessage(event, iframeRef.current?.contentWindow, viewerOrigin)) return;
 
     const envelope = event.data;
 
     if (envelope?.kind === 'sqlite-explorer-ready') {
       event.source?.postMessage(
         { kind: 'sqlite-explorer-origin' },
-        { targetOrigin: event.origin }
+        { targetOrigin: viewerOrigin }
       );
       return;
     }
@@ -176,47 +324,62 @@ export default function DemoClient() {
     if (envelope?.channel === 'rpc' && envelope.content?.kind === 'invoke') {
       const { messageId, targetMethod, payload } = envelope.content;
 
+      let deserializedPayload: unknown[];
+      try {
+        guardDemoIframeRequest(envelope);
+        const decoded = deserializeDemoIframeRequest(payload ?? []);
+        if (!Array.isArray(decoded)) throw new TypeError('RPC payload must be an array');
+        deserializedPayload = decoded;
+      } catch (error) {
+        postIframeRpcResponse(event.source, viewerOrigin, {
+          kind: 'response',
+          messageId,
+          success: false,
+          ...demoRpcErrorFields(error)
+        });
+        return;
+      }
+
       // Special handling for extension-specific methods
       if (targetMethod === 'initialize') {
-        // Already initialized, just return success
-        event.source?.postMessage({
-          channel: 'rpc',
-          content: {
-            kind: 'response',
-            messageId,
-            success: true,
-            data: { connected: true, isReadOnly: false }
-          }
-        }, { targetOrigin: event.origin });
+        // Already initialized, just return success. Read-only reflects how
+        // the worker actually opened the database (stale-runtime paged
+        // fallbacks and WAL-gated buffers are read-only).
+        postIframeRpcResponse(event.source, viewerOrigin, {
+          kind: 'response',
+          messageId,
+          success: true,
+          data: { connected: true, isReadOnly: databaseIsReadOnly.current }
+        });
         return;
       }
 
       if (targetMethod === 'getExtensionSettings') {
         // Return default settings for web mode
-        event.source?.postMessage({
-          channel: 'rpc',
-          content: {
-            kind: 'response',
-            messageId,
-            success: true,
-            data: {
-              maxRows: 0,
-              defaultPageSize: 1000,
-              instantCommit: 'never',
-              doubleClickBehavior: 'inline'
-            }
+        postIframeRpcResponse(event.source, viewerOrigin, {
+          kind: 'response',
+          messageId,
+          success: true,
+          data: {
+            defaultPageSize: 5000,
+            instantCommit: 'never',
+            doubleClickBehavior: 'inline'
           }
-        }, { targetOrigin: event.origin });
+        });
         return;
       }
 
       // Special handling for exportTable - trigger download after getting result
       if (targetMethod === 'exportTable') {
-        callWorker(targetMethod, payload as unknown[] || [])
+        callWorker(targetMethod, deserializedPayload)
           .then((result) => {
-            const exportResult = result as { content: string; filename: string; mimeType: string };
-            // Trigger download
-            const blob = new Blob([exportResult.content], { type: exportResult.mimeType });
+            const exportResult = result as {
+              contentChunks: string[];
+              filename: string;
+              mimeType: string;
+            };
+            // This is bounded chunk assembly, not progressive worker streaming.
+            const blob = new Blob(exportResult.contentChunks, { type: exportResult.mimeType });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -226,53 +389,56 @@ export default function DemoClient() {
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
 
-            event.source?.postMessage({
-              channel: 'rpc',
-              content: {
-                kind: 'response',
-                messageId,
-                success: true,
-                data: { success: true }
-              }
-            }, { targetOrigin: event.origin });
+            postIframeRpcResponse(event.source, viewerOrigin, {
+              kind: 'response',
+              messageId,
+              success: true,
+              data: { success: true }
+            });
           })
           .catch((error) => {
-            event.source?.postMessage({
-              channel: 'rpc',
-              content: {
-                kind: 'response',
-                messageId,
-                success: false,
-                errorMessage: error.message
-              }
-            }, { targetOrigin: event.origin });
+            postIframeRpcResponse(event.source, viewerOrigin, {
+              kind: 'response',
+              messageId,
+              success: false,
+              ...demoRpcErrorFields(error)
+            });
           });
         return;
       }
 
       // Forward all other calls to worker
-      callWorker(targetMethod as string, payload as unknown[] || [])
+      let previewController: AbortController | undefined;
+      if (targetMethod === 'previewViewDefinition') {
+        activePreviewController.current?.abort();
+        previewController = new AbortController();
+        activePreviewController.current = previewController;
+      }
+      callWorker(
+        targetMethod as string,
+        deserializedPayload,
+        previewController?.signal
+      )
         .then((result) => {
-          event.source?.postMessage({
-            channel: 'rpc',
-            content: {
-              kind: 'response',
-              messageId,
-              success: true,
-              data: result
-            }
-          }, { targetOrigin: event.origin });
+          postIframeRpcResponse(event.source, viewerOrigin, {
+            kind: 'response',
+            messageId,
+            success: true,
+            data: result
+          });
         })
         .catch((error) => {
-          event.source?.postMessage({
-            channel: 'rpc',
-            content: {
-              kind: 'response',
-              messageId,
-              success: false,
-              errorMessage: error.message
-            }
-          }, { targetOrigin: event.origin });
+          postIframeRpcResponse(event.source, viewerOrigin, {
+            kind: 'response',
+            messageId,
+            success: false,
+            ...demoRpcErrorFields(error)
+          });
+        })
+        .finally(() => {
+          if (activePreviewController.current === previewController) {
+            activePreviewController.current = null;
+          }
         });
     }
   }, [callWorker]);
@@ -292,6 +458,8 @@ export default function DemoClient() {
       window.removeEventListener('message', handleIframeMessage);
 
       // Cleanup worker on unmount
+      activePreviewController.current?.abort();
+      activePreviewController.current = null;
       if (workerRef.current) {
         workerRef.current.terminate();
         workerRef.current = null;
@@ -300,10 +468,20 @@ export default function DemoClient() {
   }, [handleIframeMessage]);
 
   /**
-   * Create and initialize the worker with a database file.
+   * Create and initialize the worker with a database.
+   *
+   * `source` is either the full database bytes (small files — today's
+   * path) or the File handle itself. A File is structured-cloned to the
+   * worker as a handle, not bytes: the worker reads it via
+   * FileReaderSync, and databases above the paged threshold open
+   * page-on-demand without the page ever holding a copy. Bytes above
+   * the worker-request transport guard's binary cap must travel as a
+   * File — the guard rejects larger inline Uint8Arrays.
    */
-  const initializeWorker = useCallback(async (binary: Uint8Array, filename: string) => {
+  const initializeWorker = useCallback(async (source: Uint8Array | File, filename: string) => {
     // Terminate existing worker
+    activePreviewController.current?.abort();
+    activePreviewController.current = null;
     if (workerRef.current) {
       workerRef.current.terminate();
     }
@@ -316,14 +494,24 @@ export default function DemoClient() {
     worker.onmessage = (event) => {
       const envelope = event.data as RpcMessage;
       if (envelope?.channel === 'rpc' && envelope.content?.kind === 'response') {
-        const { messageId, success, data, errorMessage } = envelope.content;
+        const { messageId, success, data } = envelope.content;
         const pending = pendingCalls.current.get(messageId);
         if (pending) {
           pendingCalls.current.delete(messageId);
+          try {
+            if (pending.method === 'exportDatabase' && success) {
+              guardDemoDatabaseExportResponse(envelope);
+            } else {
+              guardDemoWorkerResponse(envelope);
+            }
+          } catch (error) {
+            pending.reject(error instanceof Error ? error : new Error(String(error)));
+            return;
+          }
           if (success) {
             pending.resolve(data);
           } else {
-            pending.reject(new Error(errorMessage || 'RPC failed'));
+            pending.reject(demoRpcErrorFromResponse(envelope.content));
           }
         }
       }
@@ -336,23 +524,37 @@ export default function DemoClient() {
     };
 
     // Wait for worker to be ready, then initialize database
-    // The worker loads sql.js WASM from CDN automatically
+    // The worker resolves the self-hosted sql.js runtime beside worker.js.
     try {
-      await callWorker('initializeDatabase', [
+      const result = await callWorker('initializeDatabase', [
         filename,
-        {
-          content: binary
-          // wasmBinary is loaded from CDN by the worker
-        }
-      ]);
+        source instanceof Uint8Array
+          ? { content: source }
+          : { file: source }
+        // wasmBinary is loaded from the self-hosted runtime by the worker.
+      ]) as {
+        isReadOnly?: boolean;
+        storage?: 'memory' | 'paged';
+        readOnlyReason?: string;
+      } | undefined;
 
-      databaseBinary.current = binary;
+      databaseBinary.current = source instanceof Uint8Array ? source : null;
+      databaseFile.current = source instanceof Uint8Array ? null : source;
+      databaseIsReadOnly.current = result?.isReadOnly === true;
+      databaseStorage.current = result?.storage === 'paged' ? 'paged' : 'memory';
+      databaseFileSizeBytes.current = source instanceof Uint8Array
+        ? source.byteLength
+        : source.size;
+      setCanDownload(!databaseIsReadOnly.current);
+      setDownloadError(null);
+      setReadOnlyNotice(result?.readOnlyReason ?? null);
       setDatabaseName(filename);
       setStatus('ready');
     } catch (error) {
       console.error('[Demo] Failed to initialize database:', error);
       setStatus('error');
       setErrorMessage(error instanceof Error ? error.message : 'Failed to load database');
+      setReadOnlyNotice(null);
     }
   }, [callWorker]);
 
@@ -362,23 +564,32 @@ export default function DemoClient() {
 
   /**
    * Load a database from a File object.
+   *
+   * Small files keep today's path: read fully on the main thread and
+   * post the bytes. Larger files post the File handle itself — the
+   * transport guard rejects inline binaries above its cap, and reading
+   * a multi-GB file here would hold a full copy (or two) on the main
+   * thread that the worker's paged path is designed to avoid.
    */
   const loadDatabaseFile = useCallback(async (file: File) => {
     setStatus('loading');
     setErrorMessage(null);
 
     try {
-      const buffer = await file.arrayBuffer();
-      const binary = new Uint8Array(buffer);
-
-      // Basic validation: Check SQLite magic header
+      // Basic validation: Check SQLite magic header (first 16 bytes —
+      // one small slice; never the whole file).
       const magic = 'SQLite format 3\0';
-      const header = new TextDecoder().decode(binary.slice(0, 16));
+      const headerBytes = new Uint8Array(await file.slice(0, 16).arrayBuffer());
+      const header = new TextDecoder().decode(headerBytes);
       if (header !== magic) {
         throw new Error('Not a valid SQLite database file');
       }
 
-      await initializeWorker(binary, file.name);
+      if (file.size <= DEMO_INLINE_CONTENT_MAX_BYTES) {
+        await initializeWorker(new Uint8Array(await file.arrayBuffer()), file.name);
+      } else {
+        await initializeWorker(file, file.name);
+      }
     } catch (error) {
       console.error('[Demo] Failed to load file:', error);
       setStatus('error');
@@ -400,7 +611,14 @@ export default function DemoClient() {
       }
       const buffer = await response.arrayBuffer();
       const binary = new Uint8Array(buffer);
-      await initializeWorker(binary, name);
+      // Samples above the transport guard's inline cap (e.g. Northwind,
+      // 24.7 MB) must cross the worker boundary as a File handle like
+      // any other large database; inline bytes would be rejected at the
+      // RPC guard.
+      const source = binary.byteLength <= DEMO_INLINE_CONTENT_MAX_BYTES
+        ? binary
+        : new File([binary], name, { type: 'application/x-sqlite3' });
+      await initializeWorker(source, name);
     } catch (error) {
       console.error('[Demo] Failed to load sample:', error);
       setStatus('error');
@@ -443,12 +661,30 @@ export default function DemoClient() {
    * Download the current database.
    */
   const handleDownload = useCallback(async () => {
-    if (!databaseBinary.current || !databaseName) return;
+    if (!workerRef.current || !databaseName || databaseIsReadOnly.current) return;
+
+    if (databaseStorage.current === 'paged') {
+      const sizeGiB = (databaseFileSizeBytes.current / (1024 ** 3)).toFixed(2);
+      const confirmed = window.confirm(
+        `Download the edited ${sizeGiB} GiB database? ` +
+        'The page-on-demand write overlay is bounded by changed pages, but ' +
+        'saving must materialize the complete merged image in browser memory.'
+      );
+      if (!confirmed) return;
+    }
 
     try {
+      setDownloadError(null);
       // Get updated database from worker
       const exportedData = await callWorker('exportDatabase', ['main']) as Uint8Array;
-      const blob = new Blob([new Uint8Array(exportedData)], { type: 'application/x-sqlite3' });
+      // The worker transfers a dedicated export buffer. Avoid a second explicit
+      // Uint8Array copy before handing that buffer to the Blob implementation.
+      const exportedBuffer = exportedData.byteOffset === 0
+        && exportedData.byteLength === exportedData.buffer.byteLength
+        && exportedData.buffer instanceof ArrayBuffer
+        ? exportedData.buffer
+        : exportedData.slice().buffer;
+      const blob = new Blob([exportedBuffer], { type: 'application/x-sqlite3' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -457,15 +693,19 @@ export default function DemoClient() {
       URL.revokeObjectURL(url);
     } catch (error) {
       console.error('[Demo] Failed to export database:', error);
+      setDownloadError(error instanceof Error ? error.message : 'Failed to download database');
     }
   }, [callWorker, databaseName]);
 
   /**
-   * Reload the current database (discard changes).
+   * Reload the current database (discard changes). File-handle opens
+   * re-read from disk; if the file changed since (Chromium invalidates
+   * the snapshot), the re-open fails into the normal error surface.
    */
   const handleReload = useCallback(() => {
-    if (databaseBinary.current && databaseName) {
-      initializeWorker(databaseBinary.current, databaseName);
+    const source = databaseBinary.current ?? databaseFile.current;
+    if (source && databaseName) {
+      initializeWorker(source, databaseName);
     }
   }, [initializeWorker, databaseName]);
 
@@ -473,11 +713,20 @@ export default function DemoClient() {
    * Close the current database and return to upload UI.
    */
   const handleClose = useCallback(() => {
+    activePreviewController.current?.abort();
+    activePreviewController.current = null;
     if (workerRef.current) {
       workerRef.current.terminate();
       workerRef.current = null;
     }
     databaseBinary.current = null;
+    databaseFile.current = null;
+    databaseIsReadOnly.current = false;
+    databaseStorage.current = 'memory';
+    databaseFileSizeBytes.current = 0;
+    setCanDownload(false);
+    setDownloadError(null);
+    setReadOnlyNotice(null);
     setDatabaseName(null);
     setStatus('idle');
     setErrorMessage(null);
@@ -517,13 +766,15 @@ export default function DemoClient() {
               >
                 <RefreshCw className="w-4 h-4" />
               </button>
-              <button
-                onClick={handleDownload}
-                className="p-2 text-(--ui-subtle-fg) hover:text-(--ui-fg) transition-colors"
-                title="Download database"
-              >
-                <Download className="w-4 h-4" />
-              </button>
+              {canDownload && (
+                <button
+                  onClick={handleDownload}
+                  className="p-2 text-(--ui-subtle-fg) hover:text-(--ui-fg) transition-colors"
+                  title="Download database"
+                >
+                  <Download className="w-4 h-4" />
+                </button>
+              )}
               <button
                 onClick={handleClose}
                 className="px-3 py-1.5 text-sm bg-(--ui-subtle) hover:opacity-80 rounded-md transition-colors"
@@ -649,12 +900,30 @@ export default function DemoClient() {
         )}
 
         {status === 'ready' && (
-          <iframe
-            ref={iframeRef}
-            src="/sqlite-viewer/viewer.html"
-            className="flex-1 border-0"
-            title="SQLite Viewer"
-          />
+          <div className="flex-1 min-w-0 flex flex-col">
+            {readOnlyNotice && (
+              <div
+                role="status"
+                className="px-4 py-2 text-sm text-amber-900 bg-amber-50 border-b border-amber-200"
+              >
+                {readOnlyNotice}
+              </div>
+            )}
+            {downloadError && (
+              <div
+                role="alert"
+                className="px-4 py-2 text-sm text-red-700 bg-red-50 border-b border-red-200"
+              >
+                {downloadError}
+              </div>
+            )}
+            <iframe
+              ref={iframeRef}
+              src="/sqlite-viewer/viewer.html"
+              className="flex-1 border-0"
+              title="SQLite Viewer"
+            />
+          </div>
         )}
       </main>
     </div>

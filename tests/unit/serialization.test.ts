@@ -1,6 +1,12 @@
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import { serializeValue, deserializeValue, deserializeArgs, uint8ArrayToBase64, base64ToUint8Array } from '../../src/core/serialization';
+import {
+    WEBVIEW_PAYLOAD_LIMIT_ERROR_CODE,
+    WebviewPayloadLimitError,
+    fromWebviewPayloadLimitErrorData,
+    toWebviewPayloadLimitErrorData
+} from '../../src/core/webview-transport';
 
 describe('RPC Serialization', () => {
 
@@ -43,6 +49,127 @@ describe('RPC Serialization', () => {
     });
 
     describe('serializeValue', () => {
+        it('preserves non-finite numbers through a JSON-only webview boundary', () => {
+            const wireValue = serializeValue({ values: [Infinity, -Infinity, Number.NaN] });
+            const jsonValue = JSON.parse(JSON.stringify(wireValue));
+            const restored = deserializeValue(jsonValue) as { values: number[] };
+
+            assert.strictEqual(restored.values[0], Infinity);
+            assert.strictEqual(restored.values[1], -Infinity);
+            assert.ok(Number.isNaN(restored.values[2]));
+            assert.doesNotMatch(JSON.stringify(wireValue), /null/);
+        });
+
+        it('does not collide with a legitimate row shaped like the old non-finite marker', () => {
+            const original = {
+                row: { __type: 'NonFiniteNumber', value: 'Infinity' },
+                number: Infinity
+            };
+            const wireValue = serializeValue(original);
+            const jsonValue = JSON.parse(JSON.stringify(wireValue));
+
+            assert.deepStrictEqual(deserializeValue(jsonValue), original);
+        });
+
+        it('budgets the expanded non-finite marker before serializing it', () => {
+            assert.doesNotThrow(() => serializeValue(1, {
+                surface: 'non-finite expansion test',
+                maxBinaryBytes: 64,
+                maxAggregateBytes: 38
+            }));
+            assert.throws(
+                () => serializeValue(-Infinity, {
+                    surface: 'non-finite expansion test',
+                    maxBinaryBytes: 64,
+                    maxAggregateBytes: 38
+                }),
+                (error: unknown) => {
+                    assert.ok(error instanceof WebviewPayloadLimitError);
+                    assert.strictEqual(error.kind, 'aggregate-payload');
+                    assert.strictEqual(error.actualBytes, 39);
+                    return true;
+                }
+            );
+        });
+
+        it('rejects control-heavy text by its escaped JSON wire size', () => {
+            assert.throws(
+                () => serializeValue('\0'.repeat(3), {
+                    surface: 'escaped text test',
+                    maxBinaryBytes: 64,
+                    maxAggregateBytes: 19
+                }),
+                (error: unknown) => {
+                    assert.ok(error instanceof WebviewPayloadLimitError);
+                    assert.strictEqual(error.kind, 'aggregate-payload');
+                    assert.strictEqual(error.actualBytes, 20);
+                    assert.strictEqual(error.limitBytes, 19);
+                    return true;
+                }
+            );
+        });
+
+        it('rejects a per-value overflow before invoking the base64 encoder', () => {
+            const bytes = new Uint8Array(5);
+            const bufferFrom = mock.method(Buffer, 'from', () => {
+                throw new Error('base64 encoder reached');
+            });
+
+            try {
+                assert.throws(
+                    () => serializeValue(bytes, {
+                        surface: 'serialization outbound test',
+                        maxBinaryBytes: 4,
+                        maxAggregateBytes: 64
+                    }),
+                    (error: unknown) => {
+                        assert.ok(error instanceof WebviewPayloadLimitError);
+                        assert.strictEqual(error.code, WEBVIEW_PAYLOAD_LIMIT_ERROR_CODE);
+                        assert.strictEqual(error.surface, 'serialization outbound test');
+                        assert.strictEqual(error.kind, 'binary-value');
+                        assert.strictEqual(error.actualBytes, 5);
+                        assert.strictEqual(error.limitBytes, 4);
+                        assert.match(error.message, /serialization outbound test/);
+                        assert.match(error.message, /4-byte binary-value limit/);
+                        return true;
+                    }
+                );
+                assert.strictEqual(bufferFrom.mock.callCount(), 0);
+            } finally {
+                bufferFrom.mock.restore();
+            }
+        });
+
+        it('rejects aggregate encoded payload amplification before encoding either value', () => {
+            const bufferFrom = mock.method(Buffer, 'from', () => {
+                throw new Error('base64 encoder reached');
+            });
+
+            try {
+                assert.throws(
+                    () => serializeValue(
+                        [new Uint8Array(4), new Uint8Array(4)],
+                        {
+                            surface: 'serialization aggregate test',
+                            maxBinaryBytes: 8,
+                            maxAggregateBytes: 16
+                        }
+                    ),
+                    (error: unknown) => {
+                        assert.ok(error instanceof WebviewPayloadLimitError);
+                        assert.strictEqual(error.kind, 'aggregate-payload');
+                        assert.strictEqual(error.surface, 'serialization aggregate test');
+                        assert.ok(error.actualBytes > error.limitBytes);
+                        assert.strictEqual(error.limitBytes, 16);
+                        return true;
+                    }
+                );
+                assert.strictEqual(bufferFrom.mock.callCount(), 0);
+            } finally {
+                bufferFrom.mock.restore();
+            }
+        });
+
         it('should serialize Uint8Array to marker object', () => {
             const arr = new Uint8Array([10, 20]);
             const result = serializeValue(arr) as any;
@@ -112,6 +239,11 @@ describe('RPC Serialization', () => {
 
 
     describe('deserializeValue edge cases', () => {
+        it('does not decode non-finite-number marker lookalikes with extra keys', () => {
+            const marker = { __type: 'NonFiniteNumber', value: 'Infinity', extra: true };
+            assert.deepStrictEqual(deserializeValue(marker), marker);
+        });
+
         it('should ignore marker objects with extra keys (Base64 format)', () => {
             const marker = { __type: 'Uint8Array', base64: Buffer.from([1, 2]).toString('base64'), extra: 123 };
             const result = deserializeValue(marker) as any;
@@ -156,6 +288,36 @@ describe('RPC Serialization', () => {
 
     describe('deserializeValue', () => {
 
+        it('rejects an oversized Base64 marker before invoking the decoder', () => {
+            const bufferFrom = mock.method(Buffer, 'from', () => {
+                throw new Error('base64 decoder reached');
+            });
+
+            try {
+                assert.throws(
+                    () => deserializeValue(
+                        { __type: 'Uint8Array', base64: 'AAAA' },
+                        {
+                            surface: 'serialization inbound test',
+                            maxBinaryBytes: 2,
+                            maxAggregateBytes: 64
+                        }
+                    ),
+                    (error: unknown) => {
+                        assert.ok(error instanceof WebviewPayloadLimitError);
+                        assert.strictEqual(error.surface, 'serialization inbound test');
+                        assert.strictEqual(error.kind, 'binary-value');
+                        assert.strictEqual(error.actualBytes, 3);
+                        assert.strictEqual(error.limitBytes, 2);
+                        return true;
+                    }
+                );
+                assert.strictEqual(bufferFrom.mock.callCount(), 0);
+            } finally {
+                bufferFrom.mock.restore();
+            }
+        });
+
         it('should deserialize marker object to Uint8Array', () => {
             const marker = { __type: 'Uint8Array', base64: Buffer.from([1, 2]).toString('base64') };
             const result = deserializeValue(marker);
@@ -179,5 +341,23 @@ describe('RPC Serialization', () => {
             assert.strictEqual(result.a, 1);
             assert.ok(result.b instanceof Uint8Array);
         });
+    });
+
+    it('round-trips the typed payload-limit error shape without trusting arbitrary objects', () => {
+        const original = new WebviewPayloadLimitError({
+            surface: 'extension host -> webview response',
+            kind: 'aggregate-payload',
+            actualBytes: 40,
+            limitBytes: 32
+        });
+        const data = toWebviewPayloadLimitErrorData(original);
+        const restored = fromWebviewPayloadLimitErrorData(data);
+
+        assert.ok(restored instanceof WebviewPayloadLimitError);
+        assert.deepStrictEqual(toWebviewPayloadLimitErrorData(restored), data);
+        assert.strictEqual(fromWebviewPayloadLimitErrorData({
+            ...data,
+            code: 'NOT_THE_TRANSPORT_CODE'
+        }), undefined);
     });
 });

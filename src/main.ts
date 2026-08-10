@@ -6,6 +6,8 @@ import { ExtensionId, FullExtensionId, FileNestingPatternsAdded, FirstInstallMs,
 import type { DbParams, ExportOptions } from './core/types';
 import { registerEditorProvider } from './editorController';
 import { SQLiteFileSystemProvider } from './virtualFileSystem';
+import { CellMaterializationService } from './cellMaterialization';
+import { createDesktopTestApi, type DesktopTestApi } from './desktopTestApi';
 
 export let GlobalOutputChannel: vsc.OutputChannel|null = null;
 
@@ -21,7 +23,9 @@ export function deactivate(): void {
  * Extension activation entry point.
  * Registers custom editors for SQLite files and sets up commands.
  */
-export async function activate(context: vsc.ExtensionContext) {
+export async function activate(
+  context: vsc.ExtensionContext
+): Promise<{ desktopTest: DesktopTestApi } | undefined> {
   // Only create TelemetryReporter if connection string is provided.
   // An empty string causes the reporter to throw errors on every event.
   let reporter: TelemetryReporter | undefined;
@@ -61,6 +65,16 @@ export async function activate(context: vsc.ExtensionContext) {
   if (currVersion) {
     context.globalState.update(FullExtensionId, currVersion);
   }
+
+  // Extension-host integration tests cannot share bundled module state by
+  // importing src/. Expose the narrow controller only in non-production
+  // development/test hosts; marketplace and VSIX installations export nothing.
+  if (context.extensionMode === vsc.ExtensionMode.Development
+    || context.extensionMode === vsc.ExtensionMode.Test) {
+    const desktopTest = createDesktopTestApi(context);
+    context.subscriptions.push(desktopTest);
+    return { desktopTest };
+  }
 }
 
 /**
@@ -70,18 +84,46 @@ export async function activate(context: vsc.ExtensionContext) {
 export async function activateProviders(context: vsc.ExtensionContext, reporter?: TelemetryReporter) {
   const subs = [];
 
-  // Create output channel for SQL logging
+  // Create output channel before startup cleanup so a non-fatal sweep failure
+  // remains visible without preventing the editor providers from activating.
   const channel = GlobalOutputChannel = vsc.window.createOutputChannel(Title, 'sql');
   subs.push(channel);
+
+  const cellMaterializer = !import.meta.env?.VSCODE_BROWSER_EXT && context.globalStorageUri
+    ? new CellMaterializationService(
+        vsc.Uri.joinPath(context.globalStorageUri, 'cell-materializations'),
+        {
+          onCleanupWarning: (message, error) => channel.appendLine(
+            `[Cell materialization cleanup] ${message}: ` +
+            (error instanceof Error ? (error.stack ?? error.message) : String(error))
+          )
+        }
+      )
+    : undefined;
+  if (cellMaterializer) subs.push(cellMaterializer);
 
   // Register file system provider
   subs.push(vsc.workspace.registerFileSystemProvider(UriScheme, new SQLiteFileSystemProvider(), { isCaseSensitive: true }));
 
   // Register the main editor provider (default for .sqlite, .db, etc.)
-  subs.push(registerEditorProvider(`${ExtensionId}.view`, context, reporter, channel, { verified: true }));
+  subs.push(registerEditorProvider(
+    `${ExtensionId}.view`,
+    context,
+    reporter,
+    channel,
+    { verified: true },
+    cellMaterializer
+  ));
 
   // Register optional provider (can be selected from "Open With" menu)
-  subs.push(registerEditorProvider(`${ExtensionId}.option`, context, reporter, channel, { verified: true }));
+  subs.push(registerEditorProvider(
+    `${ExtensionId}.option`,
+    context,
+    reporter,
+    channel,
+    { verified: true },
+    cellMaterializer
+  ));
 
   context.subscriptions.push(...subs);
 }

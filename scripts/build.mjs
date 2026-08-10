@@ -252,17 +252,33 @@ const copyAssets = async () => {
     fs.mkdirSync(assetsDir, { recursive: true });
   }
 
-  // Copy sql.js WASM from node_modules if present
-  try {
-    const wasmSrc = resolve('node_modules', 'sql.js', 'dist', 'sql-wasm.wasm');
-    const wasmDst = resolve(assetsDir, 'sqlite3.wasm');
-    if (fs.existsSync(wasmSrc) && !fs.existsSync(wasmDst)) {
-      fs.copyFileSync(wasmSrc, wasmDst);
-      console.log('Copied sql.js WASM to assets/');
-    }
-  } catch (err) {
-    console.warn('Could not copy sql.js WASM:', err.message);
+  // Always refresh from the pinned fork. A stale stock asset is incompatible
+  // with the vendored glue and would otherwise fail only when the worker boots.
+  const wasmSrc = resolve('vendor', 'sql.js', 'sql-wasm.wasm');
+  const wasmDst = resolve(assetsDir, 'sqlite3.wasm');
+  fs.copyFileSync(wasmSrc, wasmDst);
+  console.log('Copied vendored sql.js WASM to assets/');
+
+  // Ship only the two codicon runtime files (css + the ttf it @font-face's)
+  // under assets/, so the .vsix never carries the 4.6MB @vscode/codicons
+  // package (2.3MB src/ SVGs, a 1.2MB preview HTML, ...). The extension serves
+  // codicons from assets/codicons/ (editorController + hostBridge).
+  const codiconsSrc = resolve('node_modules', '@vscode', 'codicons', 'dist');
+  const codiconsDst = resolve(assetsDir, 'codicons');
+  fs.mkdirSync(codiconsDst, { recursive: true });
+  for (const file of ['codicon.css', 'codicon.ttf']) {
+    fs.copyFileSync(resolve(codiconsSrc, file), resolve(codiconsDst, file));
   }
+  console.log('Copied codicon.css + codicon.ttf to assets/codicons/');
+
+  const demoAssetsDir = resolve('website', 'public', 'sqlite-viewer');
+  fs.mkdirSync(demoAssetsDir, { recursive: true });
+  fs.copyFileSync(
+    resolve('vendor', 'sql.js', 'sql-wasm.js'),
+    resolve(demoAssetsDir, 'sql-wasm.js')
+  );
+  fs.copyFileSync(wasmSrc, resolve(demoAssetsDir, 'sql-wasm.wasm'));
+  console.log('Copied vendored sql.js runtime to website/public/sqlite-viewer/');
 };
 
 /**
@@ -438,7 +454,9 @@ const validateBuildOutputs = () => {
     'out/worker-browser.js',
     'assets/sqlite3.wasm',
     'core/ui/viewer.html',
-    'website/public/sqlite-viewer/worker.js'
+    'website/public/sqlite-viewer/worker.js',
+    'website/public/sqlite-viewer/sql-wasm.js',
+    'website/public/sqlite-viewer/sql-wasm.wasm'
   ];
 
   const missingFiles = requiredFiles.filter(file => !fs.existsSync(resolve(file)));

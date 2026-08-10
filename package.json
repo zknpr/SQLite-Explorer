@@ -3,7 +3,7 @@
   "name": "sqlite-explorer",
   "displayName": "SQLite Explorer",
   "description": "A powerful SQLite database viewer and editor for VS Code",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "publisher": "zknpr",
   "license": "MIT",
   "repository": {
@@ -28,8 +28,30 @@
     "vscode": "^1.110.0"
   },
   "categories": [
+    "Visualization",
+    "Data Science",
     "Other"
   ],
+  "keywords": [
+    "sqlite",
+    "sqlite3",
+    "sqlite viewer",
+    "sqlite editor",
+    "database",
+    "database viewer",
+    "database editor",
+    "db browser",
+    "sql",
+    "db",
+    "db3",
+    "gpkg",
+    "geopackage",
+    "data grid"
+  ],
+  "galleryBanner": {
+    "color": "#1b1f2a",
+    "theme": "dark"
+  },
   "main": "./out/extension.js",
   "browser": "./out/extension-browser.js",
   "extensionKind": [
@@ -74,6 +96,9 @@
           },
           {
             "filenamePattern": "*.s3db"
+          },
+          {
+            "filenamePattern": "*.gpkg"
           }
         ]
       },
@@ -103,15 +128,8 @@
           "type": "number",
           "minimum": 10,
           "maximum": 100000,
-          "default": 500,
+          "default": 5000,
           "markdownDescription": "Default number of rows to display per page."
-        },
-        "sqliteExplorer.maxRows": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 10000000,
-          "default": 0,
-          "markdownDescription": "Maximum number of rows to load from a table. Set to 0 for unlimited."
         },
         "sqliteExplorer.instantCommit": {
           "type": "string",
@@ -121,7 +139,7 @@
             "remote-only"
           ],
           "default": "never",
-          "markdownDescription": "Controls when changes are saved to disk.\n- `always`: Changes are saved immediately.\n- `never`: Changes are kept in memory until manually saved.\n- `remote-only`: Auto-save only in remote workspaces."
+          "markdownDescription": "Controls when changes are saved to disk by the in-memory WASM backend. On the native desktop backend (the default), edits are written to the database file immediately regardless of this setting.\n- `always`: Changes are saved immediately.\n- `never`: Changes are kept in memory until manually saved.\n- `remote-only`: Auto-save only in remote workspaces."
         },
         "sqliteExplorer.doubleClickBehavior": {
           "type": "string",
@@ -149,6 +167,13 @@
           "default": 30000,
           "markdownDescription": "Maximum time in milliseconds for query execution before timeout. Prevents runaway queries from freezing the extension. Set to a higher value for complex queries on large databases."
         },
+        "sqliteExplorer.maxInlineCellBytes": {
+          "type": "number",
+          "minimum": 1024,
+          "maximum": 16777216,
+          "default": 1048576,
+          "markdownDescription": "Maximum source bytes fetched inline for one TEXT or BLOB grid cell. The 1 MiB default keeps ordinary values inline while containing the 609–896 MiB RSS amplification observed when a 256 MiB cell crossed the grid/IPC path. A fixed 16 MiB page budget may reduce the effective preview for wide or large pages."
+        },
         "sqliteExplorer.maxUndoMemory": {
           "type": "number",
           "minimum": 1048576,
@@ -174,17 +199,22 @@
     "compile:ext:js": "node scripts/build.mjs",
     "compile": "npm run clean && npm run compile:ext",
     "build": "npm run compile",
-    "package": "npm run build && npx vsce package",
-    "package-all": "npm run build && npx vsce package",
+    "package": "node scripts/package-vsix.mjs",
+    "package-all": "node scripts/package-vsix.mjs",
     "test": "npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts",
+    "compile:desktop-tests": "rm -rf .desktop-test-out && tsc -p tsconfig.desktop.json",
+    "test:desktop": "npm run compile:desktop-tests && node scripts/run-desktop-tests.mjs",
     "test:native-smoke": "node --import tsx --test tests/unit/native_real_smoke.test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
     "@types/vscode": "=1.110.0",
+    "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.1",
     "esbuild-plugin-polyfill-node": "^0.3.0",
+    "mocha": "^11.7.5",
+    "ovsx": "1.0.2",
     "ts-node": "^10.9.2",
     "tsx": "^4.23.1",
     "typescript": "^6.0.3"

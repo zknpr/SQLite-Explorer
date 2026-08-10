@@ -20,6 +20,10 @@ import {
 import {
     initExport
 } from './modules/export.js';
+import {
+    invalidateAllCounts,
+    setCountCacheDemoMode
+} from './modules/count-cache.js';
 
 import {
     initCrud
@@ -53,6 +57,10 @@ import { initViews } from './modules/views.js';
 import { applyConnectionResult } from './modules/connection-state.js';
 import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
 
+// Uploaded databases may contain UPDATE triggers that change row cardinality,
+// and unlike the VS Code host the demo has no refreshContent echo after edits.
+setCountCacheDemoMode(true);
+
 // ============================================================================
 // Web-specific RPC initialization
 // ============================================================================
@@ -62,6 +70,11 @@ import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
  */
 const webviewMethods = {
     async refreshContent(filename, connectionResult) {
+        // Same contract as the VS Code twin in rpc.js: this broadcast means
+        // the database changed in a way this webview didn't perform itself,
+        // so no cached count survives it. (Currently unused by the demo
+        // host, but the parity keeps it safe to wire.)
+        invalidateAllCounts();
         if (connectionResult) {
             applyConnectionResult(connectionResult);
         }
@@ -122,7 +135,7 @@ function initWebRpc() {
                         sendRpcResult(correlationId, result);
                     })
                     .catch(err => {
-                        sendRpcError(correlationId, err instanceof Error ? err.message : String(err));
+                        sendRpcError(correlationId, err);
                     });
             } else {
                 sendRpcError(correlationId, `Unknown method: ${methodName}`);

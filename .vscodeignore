@@ -25,9 +25,13 @@
 !media/icon.png
 
 # Include codicons for UI (@vscode/codicons package)
-!node_modules/@vscode/
-!node_modules/@vscode/codicons/
-!node_modules/@vscode/codicons/**
+# node_modules is NOT shipped: esbuild bundles the extension's runtime deps into
+# out/, and the only asset we need from a package — the codicon font+css — is
+# copied to assets/codicons/ by build.mjs (2 files, ~160KB) and served from
+# there. Shipping node_modules/@vscode/codicons instead dragged in 4.6MB / 598
+# files (2.3MB src/ SVGs, a 1.2MB preview HTML, ...) — vsce's ignore engine
+# re-includes the whole subtree from any dir-level negation, so it's excluded
+# wholesale here and the runtime files live under assets/ instead.
 
 # Include documentation
 !CHANGELOG.md
@@ -54,5 +58,9 @@ CLAUDE.md
 # Exclude test files
 exampleFiles/
 mySolidTest/
+tests/desktop/
+.desktop-test-out/
+.vscode-test/
+tsconfig.desktop.json
 *.test.ts
 *.spec.ts

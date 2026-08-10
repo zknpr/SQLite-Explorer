@@ -2,7 +2,9 @@
  * UI Helper Functions
  */
 import { state } from './state.js';
+import { backendApi } from './api.js';
 import { escapeHtml } from './utils.js';
+import { getSelectedRowActionEligibility } from './data-utils.js';
 
 export function updateStatus(message) {
     const el = document.getElementById('statusText');
@@ -49,7 +51,8 @@ export function showErrorState(message) {
 
 export function updateToolbarButtons() {
     const hasTable = state.selectedTable && state.selectedTableType === 'table';
-    const hasRowSelection = state.selectedRowIds.size > 0;
+    const rowEligibility = getSelectedRowActionEligibility();
+    const hasRowSelection = rowEligibility.rowIds.length > 0;
     const hasColumnSelection = state.selectedColumns.size > 0;
 
     const btnAddRow = document.getElementById('btnAddRow');
@@ -65,6 +68,13 @@ export function updateToolbarButtons() {
             || state.isGridReloading
             || !hasTable
             || (!hasRowSelection && !hasColumnSelection);
+        if (!hasColumnSelection && rowEligibility.readOnlyCount > 0) {
+            btnDeleteRows.title = hasRowSelection
+                ? `${rowEligibility.readOnlyCount} read-only selected row${rowEligibility.readOnlyCount === 1 ? '' : 's'} will be skipped: ${rowEligibility.readOnlyReason}`
+                : `Delete unavailable: ${rowEligibility.readOnlyReason}`;
+        } else {
+            btnDeleteRows.title = 'Delete selected rows or columns';
+        }
     }
     if (btnExport) btnExport.disabled = !state.selectedTable;
 }
@@ -76,7 +86,21 @@ export function initSidebarResize() {
 
     if (!sidebar || !handle) return;
 
+    const normalizeWidth = value => {
+        const width = Number(value);
+        return Number.isFinite(width)
+            ? Math.max(150, Math.min(400, width))
+            : undefined;
+    };
+    const persistedWidth = normalizeWidth(
+        document.getElementById('vscode-env')?.dataset.sidebarLeft
+    );
+    if (persistedWidth !== undefined) {
+        sidebar.style.width = persistedWidth + 'px';
+    }
+
     let isResizing = false;
+    let resizedWidth = persistedWidth;
 
     handle.addEventListener('mousedown', e => {
         isResizing = true;
@@ -86,14 +110,23 @@ export function initSidebarResize() {
 
     document.addEventListener('mousemove', e => {
         if (!isResizing) return;
-        const newWidth = Math.max(150, Math.min(400, e.clientX));
-        sidebar.style.width = newWidth + 'px';
+        resizedWidth = normalizeWidth(e.clientX);
+        if (resizedWidth !== undefined) {
+            sidebar.style.width = resizedWidth + 'px';
+        }
     });
 
-    document.addEventListener('mouseup', () => {
+    document.addEventListener('mouseup', async () => {
         if (isResizing) {
             isResizing = false;
             document.body.style.cursor = '';
+            if (resizedWidth === undefined) return;
+            try {
+                await backendApi.saveSidebarState('left', resizedWidth);
+            } catch (err) {
+                console.error('Failed to persist sidebar width:', err);
+                updateStatus(`Failed to persist sidebar width: ${err.message}`);
+            }
         }
     });
 }

@@ -237,12 +237,66 @@ describe('generateDatabaseDocumentKey', () => {
     assert.strictEqual(key1, key2);
   });
 
+  it('preserves the legacy key for ordinary local file URIs', async () => {
+    const uri = vsc.Uri.file('/path/to/database.sqlite');
+    assert.strictEqual(
+      await generateDatabaseDocumentKey(uri),
+      'database.sqlite <k-mRCjwv>'
+    );
+  });
+
   it('should generate different keys for different URIs with the same filename', async () => {
     const uri1 = vsc.Uri.file('/path/to/database.sqlite');
     const uri2 = vsc.Uri.file('/another/path/database.sqlite');
     const key1 = await generateDatabaseDocumentKey(uri1);
     const key2 = await generateDatabaseDocumentKey(uri2);
     assert.notStrictEqual(key1, key2);
+  });
+
+  it('includes URI scheme and authority in the document identity', async () => {
+    const makeUri = (scheme: string, authority: string) => ({
+      scheme,
+      authority,
+      path: '/path/to/database.sqlite',
+      query: '',
+      fragment: '',
+      fsPath: '/path/to/database.sqlite',
+      toString: () => `${scheme}://${authority}/path/to/database.sqlite`
+    }) as vsc.Uri;
+    const local = makeUri('file', '');
+    const remoteOne = makeUri('vscode-remote', 'ssh-remote+one');
+    const remoteTwo = makeUri('vscode-remote', 'ssh-remote+two');
+
+    const [localKey, remoteOneKey, remoteTwoKey] = await Promise.all([
+      generateDatabaseDocumentKey(local),
+      generateDatabaseDocumentKey(remoteOne),
+      generateDatabaseDocumentKey(remoteTwo)
+    ]);
+
+    assert.notStrictEqual(localKey, remoteOneKey, 'scheme must affect the key');
+    assert.notStrictEqual(remoteOneKey, remoteTwoKey, 'authority must affect the key');
+  });
+
+  it('includes query and fragment in non-file document identity', async () => {
+    const makeUri = (query: string, fragment: string) => ({
+      scheme: 'memfs',
+      authority: 'host',
+      path: '/path/to/database.sqlite',
+      query,
+      fragment,
+      fsPath: '/path/to/database.sqlite',
+      toString: () => `memfs://host/path/to/database.sqlite?${query}#${fragment}`
+    }) as vsc.Uri;
+
+    const resourceHash = async (uri: vsc.Uri) => (
+      (await generateDatabaseDocumentKey(uri)).match(/<([^>]+)>$/)?.[1]
+    );
+    const base = await resourceHash(makeUri('rev=a', 'snapshot-a'));
+    const differentQuery = await resourceHash(makeUri('rev=b', 'snapshot-a'));
+    const differentFragment = await resourceHash(makeUri('rev=a', 'snapshot-b'));
+
+    assert.notStrictEqual(base, differentQuery, 'query must affect non-file identity');
+    assert.notStrictEqual(base, differentFragment, 'fragment must affect non-file identity');
   });
 
   it('should handle URIs without an extension', async () => {

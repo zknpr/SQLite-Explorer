@@ -16,9 +16,11 @@ import {
 
 const FILTER_DEBOUNCE_MS = 300;
 const FILTER_RELOAD_RETRY_MS = 50;
-// One grid load performs count and data RPCs sequentially, so its legitimate
-// lifetime can approach two RPC deadlines. A missing owner is an impossible
-// production state, but still gets a short fail-safe bound instead of spinning.
+// One grid load fetches count and data in parallel but may still issue one
+// sequential follow-up data fetch (count-first 'last' navigation, a clamp
+// correction, or the keyset OFFSET retry), so its legitimate lifetime can
+// approach two RPC deadlines. A missing owner is an impossible production
+// state, but still gets a short fail-safe bound instead of spinning.
 const FILTER_RELOAD_OWNER_WAIT_MS = RPC_TIMEOUT_MS * 2;
 const FILTER_RELOAD_FALLBACK_WAIT_MS = 5000;
 
@@ -294,12 +296,13 @@ export function onDateFormatChange() {
     }
 }
 
-export function goToPage(pageIndex) {
+export function goToPage(pageIndex, navIntent) {
     if (pageIndex >= 0 && pageIndex < state.totalPageCount) {
         state.currentPageIndex = pageIndex;
         state.scrollPosition = { top: 0, left: 0 };
         resetMatchNav();
-        loadTableData(true, false);
+        // Callers without an intent (arbitrary jumps) load via OFFSET.
+        loadTableData(true, false, navIntent);
     }
 }
 
@@ -393,7 +396,13 @@ export function onColumnHeaderClick(event, columnName) {
         }
 
         const start = Math.min(state.lastSelectedColumnIndex, colIdx);
-        const end = Math.max(state.lastSelectedColumnIndex, colIdx);
+        // Clamp so a stale anchor degrades to a shorter range instead of
+        // reading past the current column set. (start is safe: the clicked
+        // index always lies within the rendered columns.)
+        const end = Math.min(
+            Math.max(state.lastSelectedColumnIndex, colIdx),
+            state.tableColumns.length - 1
+        );
 
         const existingRows = new Array();
         // If appending, index existing selected cells for efficiency
@@ -599,7 +608,12 @@ export function onRowNumberClick(event, rowId, rowIdx) {
         }
 
         const start = Math.min(state.lastSelectedRowIndex, rowIdx);
-        const end = Math.max(state.lastSelectedRowIndex, rowIdx);
+        // Clamp so a stale anchor degrades to a shorter range instead of
+        // reading past the current page's rows.
+        const end = Math.min(
+            Math.max(state.lastSelectedRowIndex, rowIdx),
+            state.gridData.length - 1
+        );
 
         for (let i = start; i <= end; i++) {
             const id = getRowId(state.gridData[i], i);
@@ -679,9 +693,18 @@ export function onCellClick(event, rowIdx, colIdx, rowId) {
         state.selectedRowIds.clear();
 
         const minRow = Math.min(state.lastSelectedCell.rowIdx, rowIdx);
-        const maxRow = Math.max(state.lastSelectedCell.rowIdx, rowIdx);
+        // Clamp so a stale anchor degrades to a shorter range instead of
+        // reading past the current page's rows/columns. (min is safe: the
+        // clicked cell always lies within the rendered grid.)
+        const maxRow = Math.min(
+            Math.max(state.lastSelectedCell.rowIdx, rowIdx),
+            state.gridData.length - 1
+        );
         const minCol = Math.min(state.lastSelectedCell.colIdx, colIdx);
-        const maxCol = Math.max(state.lastSelectedCell.colIdx, colIdx);
+        const maxCol = Math.min(
+            Math.max(state.lastSelectedCell.colIdx, colIdx),
+            state.tableColumns.length - 1
+        );
 
         // Optimization: Map rowIdx -> Set of colIdx using a sparse array
         const existingRows = new Array();
@@ -722,9 +745,18 @@ export function onCellClick(event, rowIdx, colIdx, rowId) {
         state.selectedCells = []; // Reset and select range
 
         const minRow = Math.min(state.lastSelectedCell.rowIdx, rowIdx);
-        const maxRow = Math.max(state.lastSelectedCell.rowIdx, rowIdx);
+        // Clamp so a stale anchor degrades to a shorter range instead of
+        // reading past the current page's rows/columns. (min is safe: the
+        // clicked cell always lies within the rendered grid.)
+        const maxRow = Math.min(
+            Math.max(state.lastSelectedCell.rowIdx, rowIdx),
+            state.gridData.length - 1
+        );
         const minCol = Math.min(state.lastSelectedCell.colIdx, colIdx);
-        const maxCol = Math.max(state.lastSelectedCell.colIdx, colIdx);
+        const maxCol = Math.min(
+            Math.max(state.lastSelectedCell.colIdx, colIdx),
+            state.tableColumns.length - 1
+        );
 
         for (let r = minRow; r <= maxRow; r++) {
             for (let c = minCol; c <= maxCol; c++) {

@@ -10,6 +10,142 @@ const entry = (label: string): LabeledModification => ({
 });
 
 describe('ModificationTracker hot-exit persistence', () => {
+  it('keeps an at-cap unsaved barrier segment complete through hot-exit serialization', () => {
+    const tracker = new ModificationTracker<LabeledModification>(100);
+    const barrier: LabeledModification = {
+      ...entry('oversized replacement'),
+      targetTable: 'items',
+      targetRowId: 1,
+      targetColumn: 'payload',
+      newValue: 'bounded replacement',
+      undoPolicy: 'barrier'
+    };
+    tracker.recordBarrier(barrier);
+    for (let index = 0; index < 99; index++) {
+      tracker.record({
+        ...entry(`later edit ${index}`),
+        priorValue: index,
+        newValue: index + 1
+      });
+    }
+
+    assert.throws(
+      () => tracker.record({
+        ...entry('blocked edit'),
+        priorValue: 99,
+        newValue: 100
+      }),
+      /undo history.*limit.*save.*before making more changes/i
+    );
+
+    assert.strictEqual(tracker.hasUncommittedHistoryBarrier, true);
+    assert.deepStrictEqual(
+      tracker.getUncommittedEntries().map(candidate => candidate.label),
+      ['oversized replacement', ...Array.from({ length: 99 }, (_, index) => `later edit ${index}`)]
+    );
+
+    const restored = ModificationTracker.deserialize<LabeledModification>(tracker.serialize());
+    assert.strictEqual(restored.hasUncommittedHistoryBarrier, true);
+    assert.deepStrictEqual(
+      restored.getUncommittedEntries().map(candidate => candidate.label),
+      tracker.getUncommittedEntries().map(candidate => candidate.label)
+    );
+  });
+
+  it('releases saved barriers back to ordinary front retention', async () => {
+    const tracker = new ModificationTracker<LabeledModification>(2);
+    for (let index = 0; index < 5; index++) {
+      tracker.recordBarrier({
+        ...entry(`saved barrier ${index}`),
+        newValue: index,
+        undoPolicy: 'barrier'
+      });
+      await tracker.createCheckpoint();
+    }
+
+    assert.strictEqual(tracker.hasUncommittedHistoryBarrier, false);
+    assert.strictEqual(tracker.entryCount, 2);
+    assert.deepStrictEqual(
+      tracker['timeline'].map((candidate: LabeledModification) => candidate.label),
+      ['saved barrier 3', 'saved barrier 4']
+    );
+  });
+
+  it('records a forward-only barrier that preserves replay state but cannot be crossed by undo', async () => {
+    const t = new ModificationTracker<LabeledModification>();
+    t.record(entry('saved'));
+    await t.createCheckpoint();
+    const unsavedBeforeBarrier = entry('unsaved before barrier');
+    t.record(unsavedBeforeBarrier);
+    t.record(entry('discarded redo'));
+    t.stepBack();
+
+    const barrier: LabeledModification = {
+      label: 'Replace Oversized Cell',
+      description: 'Replace items.payload without an in-memory prior value',
+      modificationType: 'cell_update',
+      targetTable: 'items',
+      targetRowId: 1,
+      targetColumn: 'payload',
+      newValue: 'bounded replacement',
+      undoPolicy: 'barrier'
+    };
+    t.recordBarrier(barrier);
+
+    assert.strictEqual(t.entryCount, 3);
+    assert.strictEqual(t.canStepBack, false);
+    assert.strictEqual(t.canStepForward, false);
+    assert.strictEqual(t.stepBack(), undefined);
+    assert.strictEqual(t.isUndoBlockedByBarrier, true);
+    assert.strictEqual(t.hasUncommittedHistoryBarrier, true);
+    assert.strictEqual(t.hasUncommittedChanges(), true);
+    assert.deepStrictEqual(t.getUncommittedEntries(), [unsavedBeforeBarrier, barrier]);
+
+    const restored = ModificationTracker.deserialize<LabeledModification>(t.serialize());
+    assert.strictEqual(restored.canStepBack, false);
+    assert.strictEqual(restored.isUndoBlockedByBarrier, true);
+    assert.strictEqual(restored.hasUncommittedHistoryBarrier, true);
+    assert.deepStrictEqual(
+      restored.getUncommittedEntries(),
+      [unsavedBeforeBarrier, barrier]
+    );
+  });
+
+  it('treats a saved barrier as the new File Revert baseline', async () => {
+    const t = new ModificationTracker<LabeledModification>();
+    t.recordBarrier({
+      ...entry('barrier'),
+      newValue: 'bounded replacement',
+      undoPolicy: 'barrier'
+    });
+
+    assert.strictEqual(t.hasUncommittedHistoryBarrier, true);
+    await t.createCheckpoint();
+    assert.strictEqual(t.hasUncommittedHistoryBarrier, false);
+
+    t.record({ ...entry('normal'), priorValue: 'a', newValue: 'b' });
+    assert.strictEqual(t.hasUncommittedHistoryBarrier, false);
+  });
+
+  it('allows a normal edit immediately after a barrier to undo and redo without crossing it', () => {
+    const t = new ModificationTracker<LabeledModification>();
+    t.recordBarrier({
+      ...entry('barrier'),
+      newValue: 'bounded replacement',
+      undoPolicy: 'barrier'
+    });
+    const normal = { ...entry('normal'), priorValue: 'a', newValue: 'b' };
+    t.record(normal);
+
+    assert.strictEqual(t.canStepBack, true);
+    assert.strictEqual(t.stepBack(), normal);
+    assert.strictEqual(t.canStepBack, false);
+    assert.strictEqual(t.isUndoBlockedByBarrier, true);
+    assert.strictEqual(t.canStepForward, true);
+    assert.strictEqual(t.stepForward(), normal);
+    assert.strictEqual(t.canStepBack, true);
+  });
+
   it('T1: serialize/deserialize round-trips futureStack', () => {
     const t = new ModificationTracker<LabeledModification>();
     t.record(entry('e1'));

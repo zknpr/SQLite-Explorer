@@ -1,7 +1,10 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
-import { createDatabaseEngine, getNodeFs, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+import * as nodeFs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { createDatabaseEngine, createWorkerEndpoint, getNodeFs, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import type { Database } from 'sql.js';
 
 describe('getNodeFs', () => {
@@ -21,55 +24,186 @@ describe('getNodeFs', () => {
 });
 
 describe('createDatabaseEngine file reading errors', () => {
-  it('should catch and log error for non-existent file', async () => {
-    const originalConsoleError = console.error;
-    let loggedError: any;
-    console.error = (msg: string, err: any) => {
-      if (msg === 'Failed to read file in worker:') {
-        loggedError = err;
-      }
-    };
-    try {
-      await createDatabaseEngine({
+  // An unreadable filePath must fail the open. The engine must never fall
+  // back to an empty writable database: saving that empty view would
+  // overwrite the real file on disk.
+  it('rejects for a non-existent file instead of opening an empty database', async () => {
+    const missingPath = '/non/existent/path/for/test/db.sqlite';
+    await assert.rejects(
+      createDatabaseEngine({
         content: null,
-        filePath: '/non/existent/path/for/test/db.sqlite',
+        filePath: missingPath,
         maxSize: 1000,
         readOnlyMode: false
-      });
-      assert.ok(loggedError, 'Should have caught and logged an error');
-      assert.strictEqual(loggedError.code, 'ENOENT');
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, 'rejection must be an Error');
+        assert.ok(err.message.includes(missingPath), 'message must name the path');
+        assert.match(err.message, /ENOENT/, 'message must carry the original FS error');
+        const cause = err.cause as NodeJS.ErrnoException | undefined;
+        assert.strictEqual(cause?.code, 'ENOENT', 'original FS error must be preserved as cause');
+        return true;
+      }
+    );
+  });
+
+  it('rejects when the file exceeds maxSize instead of opening an empty database', async () => {
+    const tempDir = nodeFs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-db-test-'));
+    const tempFile = path.join(tempDir, 'too-large.sqlite');
+    nodeFs.writeFileSync(tempFile, 'dummy data for max size test');
+
+    try {
+      await assert.rejects(
+        createDatabaseEngine({
+          content: null,
+          filePath: tempFile,
+          maxSize: 1, // extremely small max size
+          readOnlyMode: false
+        }),
+        (err: unknown) => {
+          assert.ok(err instanceof Error, 'rejection must be an Error');
+          assert.ok(err.message.includes(tempFile), 'message must name the path');
+          assert.match(err.message, /exceeds the maximum allowed size/);
+          assert.ok(err.cause instanceof Error, 'size violation must be preserved as cause');
+          return true;
+        }
+      );
     } finally {
-      console.error = originalConsoleError;
+      nodeFs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 
-  it('should catch and log error when file exceeds maxSize', async () => {
-    const fs = require('fs');
-    const tempFile = 'test-temp.sqlite';
-    fs.writeFileSync(tempFile, 'dummy data for max size test');
-
-    const originalConsoleError = console.error;
-    let loggedError: any;
-    console.error = (msg: string, err: any) => {
-      if (msg === 'Failed to read file in worker:') {
-        loggedError = err;
-      }
-    };
+  it('still opens a fresh database for a zero-byte file (successful read, legitimately empty)', async () => {
+    const tempDir = nodeFs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-db-test-'));
+    const tempFile = path.join(tempDir, 'empty.sqlite');
+    nodeFs.writeFileSync(tempFile, new Uint8Array(0));
 
     try {
-      await createDatabaseEngine({
+      const result = await createDatabaseEngine({
         content: null,
         filePath: tempFile,
-        maxSize: 1, // extremely small max size
+        maxSize: 1000,
         readOnlyMode: false
       });
-      assert.ok(loggedError, 'Should have caught and logged an error');
-      assert.strictEqual(loggedError.message, 'File too large');
-    } finally {
-      console.error = originalConsoleError;
-      if (fs.existsSync(tempFile)) {
-        fs.unlinkSync(tempFile);
+      const engine = result.operations!;
+      try {
+        const sets = await engine.executeQuery('SELECT 1');
+        assert.strictEqual(sets[0].rows[0][0], 1);
+      } finally {
+        (engine as WasmDatabaseEngine).shutdown();
       }
+    } finally {
+      nodeFs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('still opens a fresh database for explicit zero-length content without a filePath', async () => {
+    const result = await createDatabaseEngine({
+      content: new Uint8Array(0),
+      maxSize: 0,
+      readOnlyMode: false
+    });
+    const engine = result.operations!;
+    try {
+      const sets = await engine.executeQuery('SELECT 1');
+      assert.strictEqual(sets[0].rows[0][0], 1);
+    } finally {
+      (engine as WasmDatabaseEngine).shutdown();
+    }
+  });
+
+  it('rechecks bytes read after stat and routes a grown file to paged storage', async () => {
+    const tempDir = nodeFs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-db-test-'));
+    const tempFile = path.join(tempDir, 'grew-after-stat.sqlite');
+    const seed = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+    try {
+      await seed.operations!.executeQuery(
+        "CREATE TABLE gate_probe (value TEXT); INSERT INTO gate_probe VALUES ('present')"
+      );
+      nodeFs.writeFileSync(tempFile, await seed.operations!.serializeDatabase());
+    } finally {
+      (seed.operations as WasmDatabaseEngine).shutdown();
+    }
+
+    const originalStat = nodeFs.promises.stat;
+    (nodeFs.promises as any).stat = async (candidate: nodeFs.PathLike, ...args: unknown[]) => {
+      const actual = await (originalStat as any)(candidate, ...args);
+      return String(candidate) === tempFile ? { ...actual, size: 1 } : actual;
+    };
+
+    let result: Awaited<ReturnType<typeof createDatabaseEngine>> | undefined;
+    try {
+      result = await createDatabaseEngine({
+        content: null,
+        filePath: tempFile,
+        maxSize: 0,
+        pagedOpenThresholdBytes: 1,
+        readOnlyMode: false,
+        allowPagedFallback: true
+      });
+      assert.strictEqual(result.storage, 'paged');
+      assert.strictEqual(result.isReadOnly, false);
+      await result.operations!.updateCell('gate_probe', 1, 'value', 'edited');
+    } finally {
+      (nodeFs.promises as any).stat = originalStat;
+      (result?.operations as WasmDatabaseEngine | undefined)?.shutdown();
+      nodeFs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects provider content whose actual bytes exceed the advertised gate', async () => {
+    const seed = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+    let content: Uint8Array;
+    try {
+      await seed.operations!.executeQuery(
+        "CREATE TABLE provider_probe (value TEXT); INSERT INTO provider_probe VALUES ('present')"
+      );
+      content = await seed.operations!.serializeDatabase();
+    } finally {
+      (seed.operations as WasmDatabaseEngine).shutdown();
+    }
+    assert.ok(content!.byteLength > 1);
+
+    await assert.rejects(
+      createDatabaseEngine({
+        content: content!,
+        maxSize: 1,
+        readOnlyMode: false,
+        allowPagedFallback: false
+      }),
+      /file size \(\d+ bytes\) exceeds the maximum allowed size \(1 bytes\)/
+    );
+  });
+});
+
+describe('createWorkerEndpoint initializeDatabase failure', () => {
+  it('leaves no half-initialized engine behind when a re-open fails', async () => {
+    const endpoint = createWorkerEndpoint();
+    try {
+      await endpoint.initializeDatabase('first.db', {
+        content: null,
+        maxSize: 0,
+        readOnlyMode: false
+      });
+      await endpoint.runQuery('CREATE TABLE t (id INTEGER)');
+
+      // Re-initialization against an unreadable path must reject...
+      await assert.rejects(
+        endpoint.initializeDatabase('missing.db', {
+          content: null,
+          filePath: '/non/existent/path/for/test/db.sqlite',
+          maxSize: 0,
+          readOnlyMode: false
+        }),
+        /Failed to open database file/
+      );
+
+      // ...and must not leave the previous (now shut down) engine reachable:
+      // the endpoint reports "no database" rather than serving a dead engine.
+      assert.strictEqual(await endpoint.ping(), false);
+      await assert.rejects(endpoint.runQuery('SELECT 1'), /No database initialized/);
+    } finally {
+      endpoint.dispose();
     }
   });
 });
@@ -210,13 +344,13 @@ describe('WasmDatabaseEngine', () => {
          columns: ['*'],
          globalFilter: 'fruit'
        });
-       assert.strictEqual(count, 2);
+       assert.deepStrictEqual(count, { count: 2, isExact: true });
 
        const countYellow = await engine.fetchTableCount('items', {
         columns: ['*'],
         globalFilter: 'Yellow'
       });
-      assert.strictEqual(countYellow, 1);
+      assert.deepStrictEqual(countYellow, { count: 1, isExact: true });
     });
   });
 
@@ -228,6 +362,7 @@ describe('WasmDatabaseEngine', () => {
 
       // Mock the WASM Database instance
       const mockDb = {
+        progress_handler: () => {},
         iterateStatements: (sql: string) => {
           return [{
             bind: () => {},
@@ -273,48 +408,39 @@ describe('WasmDatabaseEngine', () => {
       }
     });
 
-    it('should timeout long running queries', async () => {
-      // Create a specific engine instance with a short timeout
+    it('interrupts a long-running statement before its first row is produced', async () => {
       const result = await createDatabaseEngine({
         content: null,
         maxSize: 0,
         readOnlyMode: false,
-        queryTimeout: 100 // 100ms timeout
+        queryTimeout: 20
       });
       const timeoutEngine = result.operations!;
-
-      await timeoutEngine.executeQuery("CREATE TABLE timeout_test (id INTEGER PRIMARY KEY, value TEXT)");
-      await timeoutEngine.insertRow('timeout_test', { id: 1, value: 'test1' });
-      await timeoutEngine.insertRow('timeout_test', { id: 2, value: 'test2' });
-
-      const originalDateNow = Date.now;
-      let callCount = 0;
+      const startedAt = performance.now();
 
       try {
-        Date.now = () => {
-          // First call establishes startTime, subsequent calls simulate elapsed time
-          if (callCount === 0) {
-            callCount++;
-            return 1000;
-          }
-          callCount++;
-          // Return a time far in the future to trigger timeout
-          return 1000 + 200;
-        };
-
-        // This query will hit the while(stmt.step()) loop
         await assert.rejects(
-          async () => {
-            await timeoutEngine!.executeQuery("SELECT * FROM timeout_test");
-          },
-          (err: any) => {
-            assert.strictEqual(err.message, "Query failed: Query execution timed out after 100ms");
+          timeoutEngine.executeQuery(
+            'WITH RECURSIVE counter(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+            ') SELECT sum(value) FROM counter'
+          ),
+          (err: Error) => {
+            assert.strictEqual(
+              err.message,
+              'Query failed: Query execution timed out after 20ms'
+            );
             return true;
           }
         );
       } finally {
-        Date.now = originalDateNow;
+        (timeoutEngine as WasmDatabaseEngine).shutdown();
       }
+
+      assert.ok(
+        performance.now() - startedAt < 500,
+        'recursive CTE completed before timeout rejection instead of being interrupted'
+      );
     });
   });
 });

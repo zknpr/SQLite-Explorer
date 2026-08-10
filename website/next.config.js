@@ -18,11 +18,13 @@ const nextConfig = {
             key: 'X-DNS-Prefetch-Control',
             value: 'on',
           },
-          // X-Frame-Options removed to allow iframe embedding for demo
-          // Security is maintained via Content-Security-Policy frame-ancestors
+          // X-Frame-Options removed so the demo page can frame its
+          // same-origin viewer; frame-ancestors is the framing policy.
+          // Only same-origin framing exists (demo -> /sqlite-viewer/viewer.html),
+          // on production, previews and localhost alike, so 'self' suffices.
           {
             key: 'Content-Security-Policy',
-            value: "frame-ancestors 'self' https://*.vercel.app https://localhost:*",
+            value: "frame-ancestors 'self'",
           },
           {
             key: 'X-Content-Type-Options',

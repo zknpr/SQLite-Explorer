@@ -7,6 +7,22 @@
  */
 
 import { RPC_TIMEOUT_MS, getRpcTimeoutMs } from './rpc-constants.js';
+import {
+    MAX_WEBVIEW_BINARY_VALUE_BYTES,
+    WEBVIEW_TRANSPORT_SURFACES,
+    assertWebviewTransportPayload,
+    decodeJsonSafeNumberString,
+    encodeJsonSafeNonFiniteNumber,
+    errorFromRpcResponse,
+    escapeJsonSafeNumberString,
+    rpcErrorFields
+} from './transport.js';
+import {
+    CellEditPolicyError,
+    DEFAULT_MAX_CELL_EDIT_BYTES,
+    formatOversizedCellReplacementWarning,
+    isOversizedCellReplacementConflictError
+} from '../../../src/core/cell-edit-policy.ts';
 
 export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
 
@@ -164,6 +180,10 @@ function base64ToUint8Array(base64) {
  * @returns {Promise<*>} Serialized value
  */
 async function serializeValueAsync(value) {
+    if (typeof value === 'number' && !Number.isFinite(value)) {
+        return encodeJsonSafeNonFiniteNumber(value);
+    }
+    if (typeof value === 'string') return escapeJsonSafeNumberString(value);
     // Handle Uint8Array by converting to Base64 marker object
     if (value instanceof Uint8Array) {
         const base64 = await uint8ArrayToBase64Async(value);
@@ -197,6 +217,9 @@ async function serializeValueAsync(value) {
  * @returns {Promise<Array>} Serialized arguments
  */
 async function serializeArgsAsync(args) {
+    assertWebviewTransportPayload(args, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeRequest
+    });
     return Promise.all(args.map(serializeValueAsync));
 }
 
@@ -212,9 +235,15 @@ async function serializeArgsAsync(args) {
  * @returns {*} Deserialized value
  */
 function deserializeValue(value) {
+    if (typeof value === 'string') return decodeJsonSafeNumberString(value);
+    if (value instanceof Uint8Array) return value;
+    if (ArrayBuffer.isView(value)) {
+        return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    }
     // Check for Uint8Array serialization marker
     if (value && typeof value === 'object' && !Array.isArray(value)) {
         const keys = Object.keys(value);
+
 
         // Check for Base64 format (new, preferred): { __type: 'Uint8Array', base64: '...' }
         if (value.__type === 'Uint8Array' && typeof value.base64 === 'string') {
@@ -253,10 +282,29 @@ function deserializeValue(value) {
 export async function sendRpcRequest(method, args) {
     const messageId = `rpc_${++rpcMessageId}_${Date.now()}`;
 
+    assertWebviewTransportPayload({
+        channel: 'rpc',
+        content: { kind: 'invoke', messageId, targetMethod: method, payload: args }
+    }, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeRequest
+    });
+
     // Serialize args asynchronously to handle Uint8Array without blocking UI
     // This is done before setting up the timeout to ensure encoding time is included
     const serializedArgs = await serializeArgsAsync(args);
     const targetOrigin = await parentOriginReady;
+    const outboundMessage = {
+        channel: 'rpc',
+        content: {
+            kind: 'invoke',
+            messageId,
+            targetMethod: method,
+            payload: serializedArgs
+        }
+    };
+    assertWebviewTransportPayload(outboundMessage, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeRequest
+    });
 
     return new Promise((resolve, reject) => {
         const timeoutMs = getRpcTimeoutMs(method);
@@ -270,15 +318,7 @@ export async function sendRpcRequest(method, args) {
         pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
 
         // Post message to parent window instead of VS Code API
-        parentWindow.postMessage({
-            channel: 'rpc',
-            content: {
-                kind: 'invoke',
-                messageId,
-                targetMethod: method,
-                payload: serializedArgs
-            }
-        }, targetOrigin);
+        parentWindow.postMessage(outboundMessage, targetOrigin);
     });
 }
 
@@ -294,12 +334,18 @@ export function handleRpcResponse(message) {
         if (pending.timeoutId !== undefined) clearTimeout(pending.timeoutId);
         pendingRpcCalls.delete(message.messageId);
 
-        if (message.success) {
-            // Deserialize the response data to restore Uint8Array instances
-            const deserializedData = deserializeValue(message.data);
-            pending.resolve(deserializedData);
-        } else {
-            pending.reject(new Error(message.errorMessage || 'RPC failed'));
+        try {
+            assertWebviewTransportPayload(message, {
+                surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeResponse
+            });
+            if (message.success) {
+                const deserializedData = deserializeValue(message.data);
+                pending.resolve(deserializedData);
+            } else {
+                pending.reject(errorFromRpcResponse(message));
+            }
+        } catch (error) {
+            pending.reject(error);
         }
     }
 }
@@ -311,11 +357,15 @@ export function handleRpcResponse(message) {
  * @param {*} result - Result to send
  */
 export function sendRpcResult(correlationId, result) {
-    parentWindow.postMessage({
+    const message = {
         kind: 'result',
         correlationId,
         payload: result
-    }, requireTargetOrigin());
+    };
+    assertWebviewTransportPayload(message, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeResult
+    });
+    parentWindow.postMessage(message, requireTargetOrigin());
 }
 
 /**
@@ -323,12 +373,17 @@ export function sendRpcResult(correlationId, result) {
  * @param {string} correlationId - Message ID
  * @param {string} errorText - Error message
  */
-export function sendRpcError(correlationId, errorText) {
-    parentWindow.postMessage({
+export function sendRpcError(correlationId, error) {
+    const message = {
         kind: 'result',
         correlationId,
-        errorText
-    }, requireTargetOrigin());
+        errorText: error instanceof Error ? error.message : String(error),
+        ...rpcErrorFields(error)
+    };
+    assertWebviewTransportPayload(message, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeResult
+    });
+    parentWindow.postMessage(message, requireTargetOrigin());
 }
 
 // Backend API proxy
@@ -336,14 +391,69 @@ export const backendApi = {
     initialize: () => sendRpcRequest('initialize', []),
     exportDb: (filename) => sendRpcRequest('exportDb', [filename]),
     refreshFile: () => sendRpcRequest('refreshFile', []),
+    // The standalone demo has no VS Code globalState; keep the shared resize
+    // lifecycle callable without pretending the width persists outside it.
+    saveSidebarState: async () => undefined,
     fireEditEvent: (edit) => sendRpcRequest('fireEditEvent', [edit]),
     exportTable: (dbParams, columns, dbOptions, tableStore, exportOptions, extras) =>
         sendRpcRequest('exportTable', [dbParams, columns, dbOptions, tableStore, exportOptions, extras]),
 
     // Database operations
-    updateCell: (table, rowId, column, value, originalValue) =>
-        sendRpcRequest('updateCell', [table, rowId, column, value, originalValue]),
-    insertRow: (table, data) => sendRpcRequest('insertRow', [table, data]),
+    updateCell: async (table, rowId, column, value, originalValue) => {
+        while (true) {
+            const metadata = await sendRpcRequest('getCellMetadata', [{
+                table,
+                rowId,
+                column
+            }]);
+            if (
+                (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
+                && metadata.byteLength > DEFAULT_MAX_CELL_EDIT_BYTES
+            ) {
+                if (!window.confirm(formatOversizedCellReplacementWarning(
+                    table,
+                    column,
+                    metadata
+                ))) {
+                    throw new Error('Oversized cell replacement cancelled');
+                }
+                try {
+                    return await sendRpcRequest('replaceOversizedCell', [
+                        table,
+                        rowId,
+                        column,
+                        value,
+                        {
+                            storageClass: metadata.storageClass,
+                            byteLength: metadata.byteLength
+                        },
+                        DEFAULT_MAX_CELL_EDIT_BYTES
+                    ]);
+                } catch (error) {
+                    if (isOversizedCellReplacementConflictError(error)) continue;
+                    throw error;
+                }
+            }
+            return sendRpcRequest('updateCell', [
+                table,
+                rowId,
+                column,
+                value,
+                originalValue,
+                DEFAULT_MAX_CELL_EDIT_BYTES
+            ]);
+        }
+    },
+    getCellMetadata: (target) => sendRpcRequest('getCellMetadata', [target]),
+    openCellReadSession: (target) => sendRpcRequest('openCellReadSession', [target]),
+    readCellChunk: (sessionId, byteOffset, maxBytes) =>
+        sendRpcRequest('readCellChunk', [sessionId, byteOffset, maxBytes]),
+    closeCellReadSession: (sessionId) =>
+        sendRpcRequest('closeCellReadSession', [sessionId]),
+    insertRow: (table, data) => sendRpcRequest(
+        'insertRow',
+        [table, data, DEFAULT_MAX_CELL_EDIT_BYTES]
+    ),
     deleteRows: (table, rowIds) => sendRpcRequest('deleteRows', [table, rowIds]),
     deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),
     createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
@@ -390,7 +500,10 @@ export const backendApi = {
         }
         return sendRpcRequest('dropView', [view, current.sql, triggerSnapshot]);
     },
-    updateCellBatch: (table, updates, label) => sendRpcRequest('updateCellBatch', [table, updates, label]),
+    updateCellBatch: (table, updates, label) => sendRpcRequest(
+        'updateCellBatch',
+        [table, updates, label, DEFAULT_MAX_CELL_EDIT_BYTES]
+    ),
     addColumn: (table, column, type, defaultValue) => sendRpcRequest('addColumn', [table, column, type, defaultValue]),
     fetchTableData: (table, options) => sendRpcRequest('fetchTableData', [table, options]),
     fetchTableCount: (table, options) => sendRpcRequest('fetchTableCount', [table, options]),
@@ -403,7 +516,25 @@ export const backendApi = {
     ping: () => sendRpcRequest('ping', []),
 
     // VS Code specific - disabled in web mode
-    openCellEditor: () => Promise.resolve({ success: false, message: 'Not available in web mode' }),
+    prepareCellMediaPreview: (_params, _rowId, _colName, options = {}) => {
+        const sourceBytes = Number.isSafeInteger(options.sourceByteLength)
+            ? options.sourceByteLength
+            : 'unknown';
+        return Promise.resolve({
+            success: false,
+            message:
+                `Oversized media preview refused in the web demo: ${sourceBytes} bytes ` +
+                `exceeds the ${MAX_WEBVIEW_BINARY_VALUE_BYTES}-byte webview binary limit. ` +
+                'Only the bounded Text/Hex preview is available; transferable streaming is not implemented.'
+        });
+    },
+    releaseCellMediaPreview: () => Promise.resolve(),
+    openCellEditor: (_params, _rowId, _colName, _colTypes, options = {}) => Promise.resolve({
+        success: false,
+        message:
+            `Full oversized content (${options.sourceByteLength ?? 'unknown'} bytes) is unavailable ` +
+            'in the web demo; use the bounded Text/Hex preview.'
+    }),
     openViewEditor: () => Promise.resolve({ success: false, message: 'Not available in web mode' }),
     readWorkspaceFileUri: () => Promise.resolve(null),
     triggerUndo: () => Promise.resolve(),
@@ -423,25 +554,53 @@ export const backendApi = {
         return Promise.resolve();
     },
     selectFile: () => {
-        return new Promise((resolve) => {
+        return new Promise((resolve, reject) => {
             const input = document.createElement('input');
             input.type = 'file';
             input.style.display = 'none';
+            const parent = document.body;
+            let removed = false;
+            const cleanup = () => {
+                if (removed) return;
+                removed = true;
+                parent.removeChild(input);
+            };
             input.onchange = async (e) => {
-                if (e.target.files.length > 0) {
-                    const file = e.target.files[0];
-                    const buffer = await file.arrayBuffer();
-                    resolve({
-                        name: file.name,
-                        data: new Uint8Array(buffer)
-                    });
-                } else {
-                    resolve(undefined);
+                try {
+                    if (e.target.files.length > 0) {
+                        const file = e.target.files[0];
+                        if (!Number.isSafeInteger(file.size) || file.size < 0) {
+                            throw new Error('Unable to determine the selected file size safely.');
+                        }
+                        if (file.size > DEFAULT_MAX_CELL_EDIT_BYTES) {
+                            throw new CellEditPolicyError(
+                                'blob',
+                                file.size,
+                                DEFAULT_MAX_CELL_EDIT_BYTES
+                            );
+                        }
+                        const buffer = await file.arrayBuffer();
+                        const data = new Uint8Array(buffer);
+                        if (data.byteLength > DEFAULT_MAX_CELL_EDIT_BYTES) {
+                            throw new CellEditPolicyError(
+                                'blob',
+                                data.byteLength,
+                                DEFAULT_MAX_CELL_EDIT_BYTES
+                            );
+                        }
+                        resolve({ name: file.name, data });
+                    } else {
+                        resolve(undefined);
+                    }
+                } catch (error) {
+                    reject(error);
+                } finally {
+                    cleanup();
                 }
             };
-            document.body.appendChild(input);
+            parent.appendChild(input);
             input.click();
-            setTimeout(() => document.body.removeChild(input), 1000);
+            setTimeout(cleanup, 1000);
         });
     }
 };

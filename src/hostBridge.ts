@@ -7,20 +7,214 @@
  */
 
 import * as vsc from 'vscode';
-import * as path from 'path';
 
 import type { DatabaseEditorProvider, DatabaseViewerProvider } from './editorController';
-import { ConfigurationSection, ExtensionId, SidebarLeft, SidebarRight, UriScheme } from './config';
+import { ConfigurationSection, ExtensionId, getMaxInlineCellBytes, getMaxUndoMemoryBytes, SidebarLeft, SidebarRight, UriScheme } from './config';
 import { IsCursorIDE } from './helpers';
 
-import type { DatabaseDocument, DocumentModification } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, QueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, ModificationEntry, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition } from './core/types';
+import type { DatabaseDocument } from './databaseModel';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, TableCountResult, QueryResultSet, WebviewQueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity, ColumnDropTableState } from './core/types';
 import { prepareCellUpdateForStorage } from './core/json-utils';
-import { escapeIdentifier, validateRowId, validateRowIds } from './core/sql-utils';
+import {
+  assertMutableRecordId,
+  buildRecordIdentityPredicate,
+  classifyTableIdentity,
+  decodePrimaryKeyRecordId,
+  encodePrimaryKeyRecordId,
+  isPrimaryKeyRecordId,
+  primaryKeyColumnsFromTableInfo
+} from './core/row-identity';
+import { escapeIdentifier, validateRowId } from './core/sql-utils';
+import {
+  assertColumnDropHistoryFitsUndoBudget,
+  buildColumnDropHistorySizePreflight,
+  COLUMN_DROP_TABLE_STATE_SQL,
+  mapColumnDropTableState
+} from './core/column-drop';
+import { runReadSnapshot } from './core/operation-serializer';
 import { isViewDefinitionConflictError } from './core/view-utils';
+import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './core/cell-containment';
+import { assertDocumentModification } from './core/modification-validation';
+import { estimateUndoMemoryBytes } from './core/undo-history';
+import type { CellMaterializationService } from './cellMaterialization';
+import {
+  assertCellValueWithinEditLimit,
+  assertCellValuesWithinEditLimit,
+  CellEditPolicyError,
+  DEFAULT_MAX_CELL_EDIT_BYTES,
+  formatOversizedCellReplacementWarning,
+  isOversizedCellReplacementConflictError,
+  isOversizedCellReplacementRequiredError
+} from './core/cell-edit-policy';
+
+interface ActiveCellMediaPreview {
+  previewId: string;
+  uri: vsc.Uri;
+  panel: vsc.WebviewPanel;
+}
+
+function primaryKeyReplacementGrowthBytes(value: CellValue): number {
+  const sourceUnits = typeof value === 'string'
+    ? value.length
+    : value instanceof Uint8Array
+      ? value.byteLength
+      : typeof value === 'bigint'
+        ? value.toString().length
+        : 32;
+  // A PK TEXT code unit can expand to at most nine URI-encoded characters
+  // after JSON escaping; the history estimator counts two bytes per JS char.
+  const estimate = sourceUnits * 18 + 256;
+  return Number.isSafeInteger(estimate) ? estimate : Number.MAX_SAFE_INTEGER;
+}
+
+/** Upper-bound growth of repeated encoded PK identities returned by a batch. */
+function estimatePrimaryKeyIdentityGrowthReserve(updates: readonly CellUpdate[]): number {
+  const rows = new Map<string, { resultCount: number; replacementBytes: number }>();
+  for (const update of updates) {
+    if (!isPrimaryKeyRecordId(update.rowId)) continue;
+    const rowKey = update.rowId;
+    let row = rows.get(rowKey);
+    if (!row) {
+      row = { resultCount: 0, replacementBytes: 0 };
+      rows.set(rowKey, row);
+    }
+    row.resultCount++;
+    if (decodePrimaryKeyRecordId(update.rowId).columns.includes(update.column)) {
+      row.replacementBytes += primaryKeyReplacementGrowthBytes(update.value);
+    }
+  }
+  let reserve = 0;
+  for (const row of rows.values()) {
+    reserve += row.resultCount * row.replacementBytes;
+  }
+  return reserve;
+}
+
+/** Keep the provisional post-drop schema separately owned for history accounting. */
+function cloneColumnDropTableState(state: ColumnDropTableState): ColumnDropTableState {
+  return {
+    tableSql: state.tableSql,
+    columns: [...state.columns],
+    identity: state.identity.kind === 'rowid'
+      ? { kind: 'rowid' }
+      : {
+          kind: 'primaryKey',
+          columns: state.identity.columns.map(column => ({ ...column }))
+        },
+    schemaObjects: state.schemaObjects.map(object => ({ ...object }))
+  };
+}
+
+interface CellMediaPreviewOptions {
+  type: CellContentType;
+  webviewId: string;
+  /** Informational only; the host re-reads authoritative cell metadata. */
+  sourceByteLength?: number;
+}
+
+const OVERSIZED_MEDIA_TYPES: Readonly<Record<string, {
+  type: 'image' | 'audio' | 'video' | 'pdf';
+  extension: string;
+}>> = {
+  'image/png': { type: 'image', extension: 'png' },
+  'image/jpeg': { type: 'image', extension: 'jpg' },
+  'image/gif': { type: 'image', extension: 'gif' },
+  'image/bmp': { type: 'image', extension: 'bmp' },
+  'image/webp': { type: 'image', extension: 'webp' },
+  'audio/mpeg': { type: 'audio', extension: 'mp3' },
+  'audio/ogg': { type: 'audio', extension: 'ogg' },
+  'audio/wav': { type: 'audio', extension: 'wav' },
+  'audio/flac': { type: 'audio', extension: 'flac' },
+  'video/mp4': { type: 'video', extension: 'mp4' },
+  'video/quicktime': { type: 'video', extension: 'mov' },
+  'video/webm': { type: 'video', extension: 'webm' },
+  'video/avi': { type: 'video', extension: 'avi' },
+  'application/pdf': { type: 'pdf', extension: 'pdf' }
+};
+
+/** A webview result has one canonical row matrix; sql.js aliases stay internal. */
+export function toWebviewQueryResultSet(result: QueryResultSet): WebviewQueryResultSet {
+  const { values: _values, records: _records, ...webviewResult } = result;
+  return webviewResult;
+}
+
+/** Normalize a workspace URI path without importing Node's browser-incompatible path module. */
+function normalizeUriPath(value: string): string {
+  const segments: string[] = [];
+  for (const segment of value.split('/')) {
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') {
+      segments.pop();
+    } else {
+      segments.push(segment);
+    }
+  }
+  return `/${segments.join('/')}`;
+}
+
+function uriPathDirname(value: string): string {
+  const normalized = normalizeUriPath(value);
+  const separator = normalized.lastIndexOf('/');
+  return separator <= 0 ? '/' : normalized.slice(0, separator);
+}
+
+function uriDirectory(uri: vsc.Uri): vsc.Uri {
+  const directoryPath = uriPathDirname(uri.path);
+  // Uri.file derives the platform fsPath without Node's path module. Other
+  // providers must retain their scheme and authority in browser workspaces.
+  return uri.scheme === 'file'
+    ? vsc.Uri.file(directoryPath)
+    : uri.with({ path: directoryPath, query: '', fragment: '' });
+}
+
+function pathLeaf(value: string): string {
+  const withoutTrailingSeparators = value.replace(/[\\/]+$/g, '');
+  const separator = Math.max(
+    withoutTrailingSeparators.lastIndexOf('/'),
+    withoutTrailingSeparators.lastIndexOf('\\')
+  );
+  return withoutTrailingSeparators.slice(separator + 1);
+}
 
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
+
+/**
+ * SECURITY: true when `candidate` names the base directory itself or a resource
+ * inside it, decided on fully normalized paths. This is the single containment
+ * implementation for readWorkspaceFileUri — both the workspace-folder branch
+ * and the document-directory branch must go through it, because two subtly
+ * different checks are exactly what allowed traversal bypasses in the past.
+ *
+ * `base` is either the directory itself (a workspace folder) or a file whose
+ * parent directory is the boundary (the open database document).
+ *
+ * workspace.fs addresses every provider, including file:, by URI. Compare the
+ * normalized POSIX URI path so this guard behaves identically in desktop and
+ * browser extension hosts. A backslash is rejected rather than interpreted:
+ * URI paths use `/`, while some Windows-backed providers may treat `\` as a
+ * second separator. (Module-level on purpose: webviewMessageHandler dispatches
+ * any function-valued HostBridge property by name, and this must not be callable.)
+ */
+function isUriContainedInDirectory(
+  candidate: vsc.Uri,
+  base: vsc.Uri,
+  baseKind: 'directory' | 'parent-of-file'
+): boolean {
+  // An equal path on a different provider/authority is a different resource
+  // space entirely.
+  if (candidate.scheme !== base.scheme || candidate.authority !== base.authority) {
+    return false;
+  }
+  if (candidate.path.includes('\\') || base.path.includes('\\')) {
+    return false;
+  }
+  const baseDir = baseKind === 'directory' ? base.path : uriPathDirname(base.path);
+  const resolvedDir = normalizeUriPath(baseDir);
+  const resolvedCandidate = normalizeUriPath(candidate.path);
+  const prefix = resolvedDir.endsWith('/') ? resolvedDir : resolvedDir + '/';
+  return resolvedCandidate === resolvedDir || resolvedCandidate.startsWith(prefix);
+}
 
 // Column type information
 interface ColumnTypeInfo {
@@ -34,6 +228,40 @@ interface ToastService {
   showErrorToast<T extends string | DialogButton>(message: string, options?: DialogConfig, ...items: T[]): Promise<T | undefined>;
 }
 
+/** Calls that create a new history entry after their backend mutation succeeds. */
+const HISTORY_RECORDING_METHODS = [
+  'updateCell',
+  'insertRow',
+  'deleteRows',
+  'deleteColumns',
+  'createTable',
+  'createView',
+  'editView',
+  'dropView',
+  'updateCellBatch',
+  'addColumn',
+  'setPragma',
+  'fireEditEvent'
+] as const;
+
+/** Methods whose complete host-side lifecycle must precede a paged snapshot. */
+const TRACKED_MUTATION_METHODS = [
+  ...HISTORY_RECORDING_METHODS,
+  'triggerUndo',
+  'triggerRedo'
+] as const;
+
+const HISTORY_RECORDING_METHOD_NAMES = new Set<string>(HISTORY_RECORDING_METHODS);
+
+/** Keep this paired with the settings modal's stored-vs-session-only wording. */
+const PAGED_PERSISTENT_PRAGMAS = new Set(['journal_mode', 'auto_vacuum']);
+
+function sameEffectivePragmaValue(left: CellValue, right: CellValue): boolean {
+  return typeof left === 'string' && typeof right === 'string'
+    ? left.toLowerCase() === right.toLowerCase()
+    : Object.is(left, right);
+}
+
 /**
  * Bridge between VS Code host and webview.
  *
@@ -41,15 +269,42 @@ interface ToastService {
  * They provide access to VS Code APIs and extension functionality.
  */
 export class HostBridge implements ToastService {
+  private activePreviewController: AbortController | undefined;
+  private activeCellMaterializationController: AbortController | undefined;
+  private readonly activeCellMediaPreviews = new Map<string, ActiveCellMediaPreview>();
+  private readonly activeCellMediaControllers = new Map<string, AbortController>();
+  private readonly mediaPanelSubscriptions = new Map<vsc.WebviewPanel, vsc.Disposable>();
+
   constructor(
     private readonly viewerProvider: DatabaseEditorProvider | DatabaseViewerProvider,
     private readonly document: DatabaseDocument,
-  ) { }
+  ) {
+    // Track the whole bridge call rather than only its worker Promise: history
+    // and content-change events are part of the snapshot's logical state.
+    // Lightweight document doubles used by focused HostBridge tests predate
+    // this lifecycle API and intentionally keep their direct method behavior.
+    if (typeof this.document.runTrackedMutation !== 'function') return;
+    const methods = this as unknown as Record<string, (...args: unknown[]) => unknown>;
+    for (const methodName of TRACKED_MUTATION_METHODS) {
+      const implementation = methods[methodName].bind(this);
+      Object.defineProperty(this, methodName, {
+        configurable: false,
+        enumerable: false,
+        value: (...args: unknown[]) => this.document.runTrackedMutation(
+          () => implementation(...args),
+          HISTORY_RECORDING_METHOD_NAMES.has(methodName)
+        )
+      });
+    }
+  }
 
   // Getters for provider properties
   private get webviews() { return this.viewerProvider.webviews; }
   private get reporter() { return this.viewerProvider.reporter; }
   private get context() { return this.viewerProvider.context; }
+  private get cellMaterializer(): CellMaterializationService | undefined {
+    return this.viewerProvider.cellMaterializer;
+  }
 
   /**
    * Ensures the database operations are initialized and returns them.
@@ -80,26 +335,47 @@ export class HostBridge implements ToastService {
     }
   }
 
-  /**
-   * The grid currently identifies rows through SQLite's hidden rowid. A
-   * WITHOUT ROWID table needs a primary-key identity protocol end-to-end;
-   * reject it before opening a write savepoint until that post-release work
-   * is implemented, rather than leaking a raw "no such column: rowid" error.
-   */
-  private async assertTableSupportsRowIdEdits(
+  /** Resolve declared table identity before interpreting an untrusted RecordId. */
+  private async resolveTableIdentity(
     dbOps: ReturnType<HostBridge['ensureDatabaseInitialized']>,
-    table: string
-  ): Promise<void> {
+    table: string,
+    knownColumns?: readonly ColumnMetadata[]
+  ): Promise<TableIdentity> {
     const metadata = await dbOps.executeQuery(
-      `SELECT "wr" FROM pragma_table_list ` +
-      `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' LIMIT 1`,
+      `SELECT "type", "wr" FROM pragma.pragma_table_list ` +
+      `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
       [table]
     );
-    if (Number(metadata[0]?.rows[0]?.[0]) === 1) {
-      throw new Error(vsc.l10n.t(
-        'WITHOUT ROWID tables are not editable yet. Primary-key identity editing is planned for a future release.'
-      ));
+    if ((metadata[0]?.rows.length ?? 0) === 0) {
+      throw new Error(`Table not found: ${table}`);
     }
+    const kind = classifyTableIdentity(metadata[0].rows[0][0], metadata[0].rows[0][1]);
+    if (!kind) throw new Error(`Table not found: ${table}`);
+    if (kind === 'rowid') return { kind: 'rowid' };
+    const columns = primaryKeyColumnsFromTableInfo(
+      knownColumns ?? await dbOps.getTableInfo(table)
+    );
+    if (columns.length === 0) throw new Error(`WITHOUT ROWID table ${table} has no declared primary key`);
+    return { kind: 'primaryKey', columns };
+  }
+
+  /** Capture exact DDL and owned schema objects for guarded column-drop history. */
+  private async captureColumnDropTableState(
+    dbOps: ReturnType<HostBridge['ensureDatabaseInitialized']>,
+    table: string,
+    columns: readonly ColumnMetadata[],
+    identity: TableIdentity
+  ): Promise<ColumnDropTableState> {
+    const result = await dbOps.executeQuery(
+      COLUMN_DROP_TABLE_STATE_SQL,
+      [table, table]
+    );
+    return mapColumnDropTableState(
+      table,
+      columns.map(column => column.identifier),
+      identity,
+      result[0]?.rows ?? []
+    );
   }
 
   /**
@@ -139,7 +415,11 @@ export class HostBridge implements ToastService {
 
   /**
    * Export the database as a Uint8Array.
-   * Exposed directly to avoid nested proxy issues.
+   * This is an explicit user-requested whole-image export, not an automatic
+   * document save, so it intentionally remains materializing. Exposed directly
+   * to avoid nested proxy issues. Writable paged engines return their merged
+   * base-plus-overlay image; read-only paged engines keep the engine's explicit
+   * unsupported-export error.
    *
    * @param filename - The filename for the export
    * @returns The database as a Uint8Array
@@ -160,49 +440,157 @@ export class HostBridge implements ToastService {
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
+    assertMutableRecordId(rowId);
+    const editLimitBytes = DEFAULT_MAX_CELL_EDIT_BYTES;
+    // Refuse values the transport cannot carry before any database read or
+    // confirmation work. Inline preview settings are read-only concerns.
+    assertCellValueWithinEditLimit(value, editLimitBytes);
 
-    await this.assertTableSupportsRowIdEdits(dbOps, table);
+    const identity = await this.resolveTableIdentity(dbOps, table);
+    const predicate = buildRecordIdentityPredicate(rowId, identity);
     this.assertConnectionGeneration(connectionGeneration);
 
-    // The caller's original value may have been captured before asynchronous
-    // work (notably reading a dropped BLOB). Read by stable row identity as
-    // close to the write as possible so undo and JSON patches are based on the
-    // database value that this update actually replaces.
-    const current = await dbOps.executeQuery(
-      `SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} WHERE rowid = ? LIMIT 1`,
-      [rowId]
-    );
-    const currentRow = current[0]?.rows[0];
-    if (!currentRow) {
-      throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+    const escapedColumn = escapeIdentifier(column);
+    const byteLengthExpression =
+      `CASE WHEN ${escapedColumn} IS NULL THEN 0 ` +
+      `ELSE length(CAST(${escapedColumn} AS BLOB)) END`;
+
+    while (true) {
+      // The CASE expression is the containment boundary for edit history: a
+      // bounded prior follows the existing path, while an oversized prior is
+      // represented only by typeof()/exact byte length and is never returned.
+      const current = await dbOps.executeQuery(
+        `SELECT typeof(${escapedColumn}), ${byteLengthExpression}, ` +
+        `CASE WHEN typeof(${escapedColumn}) IN ('text', 'blob') ` +
+        `AND ${byteLengthExpression} > ? THEN NULL ELSE ${escapedColumn} END ` +
+        `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql} LIMIT 1`,
+        [editLimitBytes, ...predicate.params]
+      );
+      this.assertConnectionGeneration(connectionGeneration);
+      const currentRow = current[0]?.rows[0];
+      if (!currentRow) {
+        throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+      }
+      const storageClass = currentRow[0];
+      const rawByteLength = currentRow[1];
+      const byteLength = typeof rawByteLength === 'bigint'
+        ? Number(rawByteLength)
+        : rawByteLength;
+      if (
+        !['null', 'integer', 'real', 'text', 'blob'].includes(String(storageClass))
+        || !Number.isSafeInteger(byteLength)
+        || Number(byteLength) < 0
+      ) {
+        throw new Error(`SQLite returned invalid cell metadata for ${table}.${column}`);
+      }
+
+      const oversized = (storageClass === 'text' || storageClass === 'blob')
+        && Number(byteLength) > editLimitBytes;
+      if (oversized) {
+        const expected = {
+          storageClass,
+          byteLength: Number(byteLength)
+        } as const;
+        const answer = await vsc.window.showWarningMessage(
+          formatOversizedCellReplacementWarning(table, column, expected),
+          { modal: true },
+          { title: vsc.l10n.t('Replace Without Undo'), value: true },
+          { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
+        );
+        if (!answer?.value) throw new vsc.CancellationError();
+
+        this.assertConnectionGeneration(connectionGeneration);
+        if (!('replaceOversizedCell' in dbOps)) {
+          throw new Error('Backend does not support guarded oversized-cell replacement');
+        }
+        try {
+          const updatedRowId = await dbOps.replaceOversizedCell(
+            table,
+            rowId,
+            column,
+            value,
+            expected,
+            editLimitBytes
+          );
+          this.assertConnectionGeneration(connectionGeneration);
+          const newTargetRowId = updatedRowId ?? rowId;
+          // This bounded forward entry is the future file-backed-undo hook: a
+          // later stage can attach a checksummed prior snapshot and remove the
+          // barrier policy without changing the confirmed backend operation.
+          this.document.recordExternalModification({
+            label: 'Replace Oversized Cell',
+            description: `Replace oversized ${table}.${column} without undo`,
+            modificationType: 'cell_update',
+            targetTable: table,
+            targetRowId: rowId,
+            ...(isPrimaryKeyRecordId(rowId) ? { newTargetRowId } : {}),
+            targetColumn: column,
+            newValue: value,
+            operation: 'set',
+            undoPolicy: 'barrier',
+            undoBarrierKind: 'oversized_cell'
+          });
+          return newTargetRowId;
+        } catch (error) {
+          // Metadata is exactly what the user confirmed. Re-read and re-confirm
+          // if another writer changed it while the modal was open.
+          if (isOversizedCellReplacementConflictError(error)) continue;
+          throw error;
+        }
+      }
+
+      const primaryKeyIndex = identity.kind === 'primaryKey'
+        ? identity.columns.findIndex(keyColumn => keyColumn.identifier === column)
+        : -1;
+      const priorValue = primaryKeyIndex >= 0
+        ? predicate.primaryKey!.values[primaryKeyIndex]
+        : currentRow[2];
+      const prepared = prepareCellUpdateForStorage(value, priorValue);
+      const patch = prepared.operation === 'json_patch' ? String(prepared.value) : undefined;
+
+      this.assertConnectionGeneration(connectionGeneration);
+
+      // Use specific method instead of generic exec
+      // This allows the backend to handle safe SQL construction
+      if ('updateCell' in dbOps) {
+        let updatedRowId: RecordId | void;
+        try {
+          updatedRowId = await dbOps.updateCell(
+            table,
+            rowId,
+            column,
+            value,
+            patch,
+            editLimitBytes
+          );
+        } catch (error) {
+          // A concurrent writer can make the prior oversized after our
+          // metadata read. Re-enter the metadata/confirmation loop rather than
+          // bypassing the extension-host confirmation with a normal update.
+          if (isOversizedCellReplacementRequiredError(error)) continue;
+          throw error;
+        }
+        const newTargetRowId = updatedRowId ?? rowId;
+
+        // Fire edit event
+        this.document.recordExternalModification({
+          label: 'Update Cell',
+          description: `Update ${table}.${column}`,
+          modificationType: 'cell_update',
+          targetTable: table,
+          targetRowId: rowId,
+          ...(isPrimaryKeyRecordId(rowId) ? { newTargetRowId } : {}),
+          targetColumn: column,
+          newValue: prepared.value,
+          operation: prepared.operation,
+          priorValue
+        });
+        return newTargetRowId;
+      } else {
+        // Fallback for older backend versions (shouldn't happen if built correctly)
+        throw new Error("Backend does not support updateCell");
+      }
     }
-    const priorValue = currentRow[0];
-    const prepared = prepareCellUpdateForStorage(value, priorValue);
-    const patch = prepared.operation === 'json_patch' ? String(prepared.value) : undefined;
-
-    this.assertConnectionGeneration(connectionGeneration);
-
-    // Use specific method instead of generic exec
-    // This allows the backend to handle safe SQL construction
-    if ('updateCell' in dbOps) {
-      await dbOps.updateCell(table, rowId, column, value, patch);
-    } else {
-      // Fallback for older backend versions (shouldn't happen if built correctly)
-      throw new Error("Backend does not support updateCell");
-    }
-
-    // Fire edit event
-    this.document.recordExternalModification({
-      label: 'Update Cell',
-      description: `Update ${table}.${column}`,
-      modificationType: 'cell_update',
-      targetTable: table,
-      targetRowId: rowId,
-      targetColumn: column,
-      newValue: prepared.value,
-      operation: prepared.operation,
-      priorValue
-    });
   }
 
   /**
@@ -215,12 +603,24 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
+    const editLimitBytes = assertCellValuesWithinEditLimit(
+      Object.values(data),
+      DEFAULT_MAX_CELL_EDIT_BYTES
+    );
     let rowId: RecordId | undefined;
 
     if ('insertRow' in dbOps) {
-      rowId = await dbOps.insertRow(table, data);
+      rowId = await dbOps.insertRow(table, data, editLimitBytes);
     } else {
       throw new Error("Backend does not support insertRow");
+    }
+
+    let historyRowData: Record<string, CellValue> = {};
+    if (rowId !== undefined && isPrimaryKeyRecordId(rowId)) {
+      const primaryKey = decodePrimaryKeyRecordId(rowId);
+      historyRowData = Object.fromEntries(
+        primaryKey.columns.map((column, index) => [column, primaryKey.values[index]])
+      );
     }
 
     // Fire edit event
@@ -230,7 +630,7 @@ export class HostBridge implements ToastService {
       modificationType: 'row_insert',
       targetTable: table,
       targetRowId: rowId,
-      rowData: data
+      rowData: { ...data, ...historyRowData }
     });
 
     return rowId;
@@ -246,61 +646,39 @@ export class HostBridge implements ToastService {
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
+    rowIds.forEach(assertMutableRecordId);
 
-    // Capture row data before deletion for undo
-    let deletedRowsData: { rowId: RecordId; row: Record<string, CellValue> }[] = [];
-    try {
-        const validIds = validateRowIds(rowIds);
-        if (validIds.length > 0) {
-            const placeholders = validIds.map(() => '?').join(', ');
-            // We select rowid to map back correctly, though we already have IDs.
-            // Using * to get all columns.
-            const sql =
-                `SELECT CAST(rowid AS TEXT) AS rowid, * FROM ${escapeIdentifier(table)} ` +
-                `WHERE rowid IN (${placeholders})`;
-            const result = await dbOps.executeQuery(sql, validIds);
-
-            if (result && result.length > 0 && result[0].rows) {
-                const headers = result[0].headers;
-                const rows = result[0].rows;
-
-                deletedRowsData = rows.map(r => {
-                    const rowData: Record<string, CellValue> = {};
-                    // First col is rowid because we asked for it
-                    const rId = validateRowId(r[0] as RecordId);
-                  
-
-                    for (let i = 0; i < headers.length; i++) {
-                        const name = headers[i];
-                        if (name !== 'rowid') {
-                            rowData[name] = r[i];
-                        }
-                    }
-                    // Explicitly include rowid in the row data to ensure it's restored with the same ID
-                    rowData['rowid'] = rId;
-
-                    return { rowId: rId, row: rowData };
-                });
-            }
-        }
-    } catch (e) {
-        console.warn('Failed to fetch rows for undo history:', e);
+    const modification = {
+      label: 'Delete Rows',
+      description: `Delete ${rowIds.length} rows from ${table}`,
+      modificationType: 'row_delete' as const,
+      targetTable: table,
+      affectedRowIds: rowIds,
+      deletedRows: []
+    };
+    const undoMemoryLimitBytes = this.document.undoMemoryLimitBytes
+      ?? getMaxUndoMemoryBytes();
+    const baseMemoryBytes = estimateUndoMemoryBytes(modification);
+    if (baseMemoryBytes > undoMemoryLimitBytes) {
+      throw new Error(
+        `Delete undo metadata exceeds the ${undoMemoryLimitBytes}-byte memory limit; ` +
+        'delete fewer rows or increase sqliteExplorer.maxUndoMemory.'
+      );
     }
 
-    this.assertConnectionGeneration(connectionGeneration);
-    if ('deleteRows' in dbOps) {
-      await dbOps.deleteRows(table, rowIds);
-    } else {
+    if (!('deleteRows' in dbOps)) {
       throw new Error("Backend does not support deleteRows");
     }
+    const deletedRowsData = await dbOps.deleteRows(
+      table,
+      rowIds,
+      undoMemoryLimitBytes - baseMemoryBytes
+    );
+    this.assertConnectionGeneration(connectionGeneration);
 
     // Fire edit event
     this.document.recordExternalModification({
-      label: 'Delete Rows',
-      description: `Delete ${rowIds.length} rows from ${table}`,
-      modificationType: 'row_delete',
-      targetTable: table,
-      affectedRowIds: rowIds,
+      ...modification,
       deletedRows: deletedRowsData
     });
   }
@@ -348,59 +726,138 @@ export class HostBridge implements ToastService {
       }
     }
 
-    // Capture column data before deletion for undo
-    let deletedColumnsData: { name: string; type: string; data: { rowId: RecordId; value: CellValue }[] }[] = [];
-    try {
-        // Get column types first
-        const tableInfo = await dbOps.getTableInfo(table);
-        const colMap = new Map(tableInfo.map(c => [c.identifier, c.declaredType]));
-
-        // Fetch data for all columns in a single query to avoid N+1 query overhead
-        if (columns.length > 0) {
-            const escapedCols = columns.map(col => escapeIdentifier(col)).join(', ');
-            const sql =
-                `SELECT CAST(rowid AS TEXT) AS rowid, ${escapedCols} ` +
-                `FROM ${escapeIdentifier(table)}`;
-            const result = await dbOps.executeQuery(sql);
-
-            if (result && result.length > 0 && result[0].rows) {
-                const rows = result[0].rows;
-                const colsData = columns.map(() => [] as { rowId: RecordId; value: CellValue }[]);
-
-                for (const r of rows) {
-                    const rowId = validateRowId(r[0] as RecordId);
-                    for (let i = 0; i < columns.length; i++) {
-                        colsData[i].push({ rowId, value: r[i + 1] });
-                    }
-                }
-
-                for (let i = 0; i < columns.length; i++) {
-                    deletedColumnsData.push({
-                        name: columns[i],
-                        type: colMap.get(columns[i]) || 'TEXT',
-                        data: colsData[i]
-                    });
-                }
-            } else {
-                // Empty table or no results, still track the column definition
-                for (const col of columns) {
-                    deletedColumnsData.push({
-                        name: col,
-                        type: colMap.get(col) || 'TEXT',
-                        data: []
-                    });
-                }
-            }
+    // Keep the aggregate gate and full-value projection on one read snapshot.
+    // The engine's schema-changing savepoint starts only after this snapshot is
+    // admitted and released.
+    const captured = await runReadSnapshot(dbOps, async snapshotOps => {
+      const tableInfoBefore = await snapshotOps.getTableInfo(table);
+      const identityBefore = await this.resolveTableIdentity(
+        snapshotOps,
+        table,
+        tableInfoBefore
+      );
+      const stateBefore = await this.captureColumnDropTableState(
+        snapshotOps,
+        table,
+        tableInfoBefore,
+        identityBefore
+      );
+      const colMap = new Map(tableInfoBefore.map(column => [
+        column.identifier,
+        // An empty declared type is meaningful in SQLite: staging it as TEXT
+        // would apply affinity and could change restored INTEGER/BLOB values.
+        column.declaredType
+      ]));
+      for (const column of columns) {
+        if (!colMap.has(column)) {
+          throw new Error(`Column not found in ${table}: ${column}`);
         }
-    } catch (e) {
-        console.warn('Failed to fetch column data for undo history:', e);
-        // Proceed with deletion even if history capture fails, but warn
-    }
+      }
+
+      const modificationShape = {
+        label: 'Delete Columns',
+        description: `Delete columns ${columns.join(', ')} from ${table}`,
+        modificationType: 'column_drop' as const,
+        targetTable: table,
+        deletedColumns: columns.map(column => ({
+          name: column,
+          type: colMap.get(column)!,
+          data: [] as { rowId: RecordId; value: CellValue }[]
+        })),
+        // A drop removes schema text and objects. A separately owned copy of
+        // the pre-drop state is therefore a conservative post-drop reserve.
+        columnDropSnapshot: {
+          before: stateBefore,
+          after: cloneColumnDropTableState(stateBefore)
+        },
+        droppedIndexes: dependentIndexes.length > 0 ? dependentIndexes : undefined
+      };
+      const undoMemoryLimitBytes = this.document.undoMemoryLimitBytes
+        ?? getMaxUndoMemoryBytes();
+      const baseMemoryBytes = estimateUndoMemoryBytes(modificationShape);
+      if (!Number.isSafeInteger(baseMemoryBytes) || baseMemoryBytes > undoMemoryLimitBytes) {
+        throw new Error(
+          `Column-drop undo metadata exceeds the ${undoMemoryLimitBytes}-byte memory limit; ` +
+          'drop fewer columns or increase sqliteExplorer.maxUndoMemory.'
+        );
+      }
+
+      const colsData = columns.map(() => [] as { rowId: RecordId; value: CellValue }[]);
+      if (columns.length > 0) {
+        const preflight = buildColumnDropHistorySizePreflight(
+          table,
+          columns,
+          identityBefore
+        );
+        const resultRows: Array<readonly unknown[] | undefined> = [];
+        for (const query of preflight.queries) {
+          const result = await snapshotOps.executeQuery(query.sql, query.params);
+          resultRows.push(result[0]?.rows[0]);
+        }
+        assertColumnDropHistoryFitsUndoBudget({
+          table,
+          droppedColumnCount: columns.length,
+          preflight,
+          resultRows,
+          maxSnapshotBytes: undoMemoryLimitBytes - baseMemoryBytes
+        });
+
+        const identityColumns = identityBefore.kind === 'primaryKey'
+          ? identityBefore.columns.map(column => column.identifier)
+          : [];
+        const identityProjection = identityBefore.kind === 'rowid'
+          ? ['CAST(rowid AS TEXT)']
+          : identityColumns.map(escapeIdentifier);
+        const valueProjection = columns.map(escapeIdentifier);
+        const result = await snapshotOps.executeQuery(
+          `SELECT ${[...identityProjection, ...valueProjection].join(', ')} ` +
+          `FROM ${escapeIdentifier(table)}`
+        );
+        const identityWidth = identityBefore.kind === 'rowid' ? 1 : identityColumns.length;
+        for (const row of result[0]?.rows ?? []) {
+          const rowId = identityBefore.kind === 'rowid'
+            ? validateRowId(row[0] as RecordId)
+            : encodePrimaryKeyRecordId(
+                identityBefore.columns,
+                row.slice(0, identityWidth)
+              );
+          for (let index = 0; index < columns.length; index++) {
+            colsData[index].push({
+              rowId,
+              value: row[identityWidth + index]
+            });
+          }
+        }
+      }
+      const deletedColumnsData = columns.map((column, index) => ({
+        name: column,
+        type: colMap.get(column)!,
+        data: colsData[index]
+      }));
+      // Defend the DDL boundary even if a backend returns malformed aggregate
+      // metadata. This exact check still runs before deleteColumns' savepoint.
+      if (estimateUndoMemoryBytes({
+        ...modificationShape,
+        deletedColumns: deletedColumnsData
+      }) > undoMemoryLimitBytes) {
+        throw new Error(
+          `Column-drop undo snapshot exceeds the ${undoMemoryLimitBytes}-byte memory budget; ` +
+          'drop fewer columns or rows, or increase sqliteExplorer.maxUndoMemory.'
+        );
+      }
+      return { stateBefore, deletedColumnsData };
+    });
+    const { stateBefore, deletedColumnsData } = captured;
 
     this.assertConnectionGeneration(connectionGeneration);
+    let stateAfter: ColumnDropTableState;
     if ('deleteColumns' in dbOps) {
       // Pass dependent indexes to be dropped first if user confirmed
-      await dbOps.deleteColumns(table, columns, dependentIndexes.length > 0 ? dependentIndexes : undefined);
+      stateAfter = await dbOps.deleteColumns(
+        table,
+        columns,
+        dependentIndexes.length > 0 ? dependentIndexes : undefined
+      );
     } else {
       throw new Error("Backend does not support deleteColumns");
     }
@@ -412,6 +869,7 @@ export class HostBridge implements ToastService {
       modificationType: 'column_drop',
       targetTable: table,
       deletedColumns: deletedColumnsData,
+      columnDropSnapshot: { before: stateBefore, after: stateAfter },
       droppedIndexes: dependentIndexes.length > 0 ? dependentIndexes : undefined
     });
   }
@@ -463,7 +921,22 @@ export class HostBridge implements ToastService {
     limit: number = 50,
     intent: ViewDefinitionIntent = 'edit'
   ) {
-    return this.ensureDatabaseInitialized().previewViewDefinition(view, selectSql, limit, intent);
+    this.activePreviewController?.abort();
+    const controller = new AbortController();
+    this.activePreviewController = controller;
+    try {
+      return toWebviewQueryResultSet(await this.ensureDatabaseInitialized().previewViewDefinition(
+        view,
+        selectSql,
+        limit,
+        intent,
+        controller.signal
+      ));
+    } finally {
+      if (this.activePreviewController === controller) {
+        this.activePreviewController = undefined;
+      }
+    }
   }
 
   /** Create a view and record enough state for save, undo, and redo. */
@@ -612,23 +1085,61 @@ export class HostBridge implements ToastService {
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
+    updates.forEach(update => assertMutableRecordId(update.rowId));
 
     if (updates.length === 0) return;
+    const editLimitBytes = assertCellValuesWithinEditLimit(
+      updates.map(update => update.value),
+      DEFAULT_MAX_CELL_EDIT_BYTES
+    );
 
-    await this.assertTableSupportsRowIdEdits(dbOps, table);
+    const modification = {
+      label: label || `Update ${updates.length} cells`,
+      description: `Update ${updates.length} cells in ${table}`,
+      modificationType: 'cell_update' as const,
+      targetTable: table
+    };
+    // Account for every known field before the backend allocates prior values.
+    // newRowId is conservatively present for all cells. A PK replacement can
+    // make that URI-safe identity larger, and the larger ID is repeated in
+    // every result for the affected row, so reserve its bounded growth too.
+    const historyShape = {
+      ...modification,
+      affectedCells: updates.map(update => ({
+        rowId: update.rowId,
+        newRowId: update.rowId,
+        columnName: update.column,
+        priorValue: null,
+        newValue: update.value,
+        operation: update.operation ?? 'set'
+      }))
+    };
+    const identityRewriteReserve = estimatePrimaryKeyIdentityGrowthReserve(updates);
+    const undoMemoryLimitBytes = this.document.undoMemoryLimitBytes
+      ?? getMaxUndoMemoryBytes();
+    const baseMemoryBytes = estimateUndoMemoryBytes(historyShape) + identityRewriteReserve;
+    if (!Number.isSafeInteger(baseMemoryBytes) || baseMemoryBytes > undoMemoryLimitBytes) {
+      throw new Error(
+        `Batch update undo metadata exceeds the ${undoMemoryLimitBytes}-byte memory limit; `
+        + 'update fewer cells or increase sqliteExplorer.maxUndoMemory.'
+      );
+    }
+
     this.assertConnectionGeneration(connectionGeneration);
-
-    const historyCells = await dbOps.updateCellBatch(table, updates);
+    const historyCells = await dbOps.updateCellBatch(
+      table,
+      updates,
+      editLimitBytes,
+      undoMemoryLimitBytes - baseMemoryBytes
+    );
     this.assertConnectionGeneration(connectionGeneration);
 
     // Fire batch edit event
     this.document.recordExternalModification({
-      label: label || `Update ${updates.length} cells`,
-      description: `Update ${updates.length} cells in ${table}`,
-      modificationType: 'cell_update',
-      targetTable: table,
+      ...modification,
       affectedCells: historyCells
     });
+    return historyCells;
   }
 
   /**
@@ -661,11 +1172,24 @@ export class HostBridge implements ToastService {
   /**
    * Fetch table data (SELECT).
    */
-  async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
+  async fetchTableData(table: string, options: TableQueryOptions): Promise<WebviewQueryResultSet> {
     const dbOps = this.ensureDatabaseInitialized();
 
     if ('fetchTableData' in dbOps) {
-      return await dbOps.fetchTableData(table, options);
+      const configuredCellLimit = getMaxInlineCellBytes();
+      const requestedCellLimit = Number.isSafeInteger(options.maxInlineCellBytes)
+        && (options.maxInlineCellBytes ?? 0) > 0
+        ? options.maxInlineCellBytes!
+        : configuredCellLimit;
+      const requestedPageLimit = Number.isSafeInteger(options.maxPageResponseBytes)
+        && (options.maxPageResponseBytes ?? 0) > 0
+        ? options.maxPageResponseBytes!
+        : DEFAULT_MAX_PAGE_RESPONSE_BYTES;
+      return toWebviewQueryResultSet(await dbOps.fetchTableData(table, {
+        ...options,
+        maxInlineCellBytes: Math.min(configuredCellLimit, requestedCellLimit),
+        maxPageResponseBytes: Math.min(DEFAULT_MAX_PAGE_RESPONSE_BYTES, requestedPageLimit)
+      }));
     } else {
       throw new Error("Backend does not support fetchTableData");
     }
@@ -674,7 +1198,7 @@ export class HostBridge implements ToastService {
   /**
    * Fetch table count (SELECT COUNT(*)).
    */
-  async fetchTableCount(table: string, options: TableCountOptions): Promise<number> {
+  async fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult> {
     const dbOps = this.ensureDatabaseInitialized();
 
     if ('fetchTableCount' in dbOps) {
@@ -733,54 +1257,67 @@ export class HostBridge implements ToastService {
       throw new Error("Document is read-only");
     }
 
-    if ('setPragma' in dbOps) {
-      await dbOps.setPragma(pragma, value);
-    } else {
+    if (!('setPragma' in dbOps)) {
       throw new Error("Backend does not support setPragma");
     }
+    const trackPersistentPagedChange = this.document.isPagedWritableMode === true
+      && PAGED_PERSISTENT_PRAGMAS.has(pragma);
+    if (!trackPersistentPagedChange) {
+      await dbOps.setPragma(pragma, value);
+      return;
+    }
+    if (!('getPragmas' in dbOps)) {
+      throw new Error('Backend cannot verify a persistent PRAGMA change');
+    }
+
+    const priorValue = (await dbOps.getPragmas())[pragma];
+    if (priorValue === undefined) {
+      throw new Error(`Backend did not report PRAGMA ${pragma} before changing it`);
+    }
+    await dbOps.setPragma(pragma, value);
+
+    let effectiveValue: CellValue = value;
+    try {
+      const reportedValue = (await dbOps.getPragmas())[pragma];
+      if (reportedValue === undefined) {
+        throw new Error(`Backend did not report PRAGMA ${pragma} after changing it`);
+      }
+      effectiveValue = reportedValue;
+    } catch (error) {
+      // The mutation already succeeded. Preserve a replayable dirty entry even
+      // when the verification read fails, then propagate the diagnostic.
+      this.document.recordExternalModification({
+        label: `Change PRAGMA ${pragma}`,
+        description: `Set PRAGMA ${pragma}`,
+        modificationType: 'pragma_update',
+        targetPragma: pragma,
+        priorValue,
+        newValue: value,
+        undoPolicy: 'barrier',
+        undoBarrierKind: 'persistent_pragma'
+      });
+      throw new Error(
+        `PRAGMA ${pragma} changed, but its effective value could not be verified`,
+        { cause: error }
+      );
+    }
+
+    if (sameEffectivePragmaValue(priorValue, effectiveValue)) return;
+    this.document.recordExternalModification({
+      label: `Change PRAGMA ${pragma}`,
+      description: `Set PRAGMA ${pragma}`,
+      modificationType: 'pragma_update',
+      targetPragma: pragma,
+      priorValue,
+      newValue: effectiveValue,
+      undoPolicy: 'barrier',
+      undoBarrierKind: 'persistent_pragma'
+    });
   }
 
-
-
-  /**
-   * Apply edits to the database.
-   */
-  async applyEdits(edits: ModificationEntry[], signal?: AbortSignal) {
-    const dbOps = this.ensureDatabaseInitialized();
-    return dbOps.applyModifications(edits, signal);
-  }
-
-  /**
-   * Undo a database edit.
-   */
-  async undo(edit: ModificationEntry) {
-    const dbOps = this.ensureDatabaseInitialized();
-    return dbOps.undoModification(edit);
-  }
-
-  /**
-   * Redo a database edit.
-   */
-  async redo(edit: ModificationEntry) {
-    const dbOps = this.ensureDatabaseInitialized();
-    return dbOps.redoModification(edit);
-  }
-
-  /**
-   * Commit changes to the database.
-   */
-  async commit(signal?: AbortSignal) {
-    const dbOps = this.ensureDatabaseInitialized();
-    return dbOps.flushChanges(signal);
-  }
-
-  /**
-   * Rollback changes to the database.
-   */
-  async rollback(edits: ModificationEntry[], signal?: AbortSignal) {
-    const dbOps = this.ensureDatabaseInitialized();
-    return dbOps.discardModifications(edits, signal);
-  }
+  // History replay (undo/redo/commit/rollback) is driven by DatabaseDocument on the
+  // extension side, never by the webview — do not re-add bridge methods for it here:
+  // every function-valued property on this class is dispatchable by name over RPC.
 
   /**
    * Trigger VS Code Undo command.
@@ -834,7 +1371,11 @@ export class HostBridge implements ToastService {
    *
    * @param edit - The edit operation that was performed
    */
-  async fireEditEvent(edit: DocumentModification) {
+  async fireEditEvent(edit: unknown) {
+    if (this.isReadOnly) {
+      throw new Error('Document is read-only');
+    }
+    assertDocumentModification(edit);
     this.document.recordExternalModification(edit);
   }
 
@@ -897,6 +1438,7 @@ export class HostBridge implements ToastService {
     webviewId?: string,
     rowCount?: number,
   } = {}) {
+    assertMutableRecordId(rowId);
     const { document } = this;
     if (document.uri.scheme !== 'untitled') {
       let cellParts: string[];
@@ -906,6 +1448,58 @@ export class HostBridge implements ToastService {
       } else {
         // Determine file extension based on content type
         const extname = await determineCellExtension(value, type);
+        const materializer = this.cellMaterializer;
+        if (materializer && colName) {
+          const target = { table: params.table, rowId, column: colName };
+          const metadata = await this.ensureDatabaseInitialized().getCellMetadata(target);
+          if (metadata.byteLength > getMaxInlineCellBytes()) {
+            let materialized;
+            this.activeCellMaterializationController?.abort();
+            const materializationController = new AbortController();
+            this.activeCellMaterializationController = materializationController;
+            const documentDisposeSubscription = document.onDidDispose(
+              () => materializationController.abort()
+            );
+            try {
+              materialized = await materializer.materialize(
+                this.ensureDatabaseInitialized(),
+                target,
+                {
+                  signal: materializationController.signal,
+                  fileExtension: extname.slice(1),
+                  owner: document
+                }
+              );
+            } catch (error) {
+              const details = error instanceof Error ? error.message : String(error);
+              throw new Error(
+                `The oversized cell could not be opened from a temporary file: ${details}. ` +
+                'Export the cell instead to choose an explicit destination.',
+                { cause: error }
+              );
+            } finally {
+              documentDisposeSubscription.dispose();
+              if (this.activeCellMaterializationController === materializationController) {
+                this.activeCellMaterializationController = undefined;
+              }
+            }
+
+            try {
+              await vsc.commands.executeCommand(
+                'vscode.open',
+                materialized.uri,
+                vsc.ViewColumn.Two
+              );
+              await vsc.commands.executeCommand(
+                'workbench.action.files.setActiveEditorReadonlyInSession'
+              );
+            } catch (error) {
+              materializer.release(materialized.uri);
+              throw error;
+            }
+            return;
+          }
+        }
         const cellFilename = (colName || 'cell') + extname;
 
         // Use simple path structure
@@ -928,6 +1522,158 @@ export class HostBridge implements ToastService {
 
       await vsc.commands.executeCommand('vscode.open', cellUri, vsc.ViewColumn.Two);
     }
+  }
+
+  /**
+   * Materialize an oversized media cell and expose only its webview-local URI.
+   * The complete value never enters the RPC response or a structured clone.
+   */
+  async prepareCellMediaPreview(
+    params: DbParams,
+    rowId: RecordId,
+    colName: string,
+    options: CellMediaPreviewOptions
+  ): Promise<
+    | {
+      success: true;
+      previewId: string;
+      uri: string;
+      mime: string;
+      byteLength: number;
+    }
+    | { success: false; message: string }
+  > {
+    assertMutableRecordId(rowId);
+    if (!params || typeof params.table !== 'string' || params.table.length === 0) {
+      throw new TypeError('Oversized media preview requires a table name');
+    }
+    if (typeof colName !== 'string' || colName.length === 0) {
+      throw new TypeError('Oversized media preview requires a column name');
+    }
+    if (!options || typeof options.webviewId !== 'string' || options.webviewId.length === 0) {
+      throw new TypeError('Oversized media preview requires a webview ID');
+    }
+
+    const media = resolveOversizedMediaType(options.type);
+    const materializer = this.cellMaterializer;
+    if (!materializer) {
+      return {
+        success: false,
+        message: 'Oversized media previews are available only in VS Code Desktop'
+      };
+    }
+
+    const panel = this.webviews.getByWebviewId(options.webviewId);
+    if (!panel || ![...this.webviews.get(this.document.uri)].includes(panel)) {
+      throw new Error('Oversized media preview webview does not belong to this database document');
+    }
+
+    const target = { table: params.table, rowId, column: colName };
+    const operations = this.ensureDatabaseInitialized();
+    const metadata = await operations.getCellMetadata(target);
+    if (metadata.storageClass !== 'blob') {
+      throw new Error('Oversized media preview requires a BLOB cell');
+    }
+    if (metadata.byteLength <= getMaxInlineCellBytes()) {
+      return {
+        success: false,
+        message: 'This media cell is within the inline transport budget and does not need a temp URI'
+      };
+    }
+
+    this.activeCellMediaControllers.get(options.webviewId)?.abort();
+    const controller = new AbortController();
+    this.activeCellMediaControllers.set(options.webviewId, controller);
+    const panelDisposeSubscription = panel.onDidDispose(() => controller.abort());
+
+    let materialized;
+    try {
+      materialized = await materializer.materialize(operations, target, {
+        signal: controller.signal,
+        fileExtension: media.extension,
+        owner: panel
+      });
+    } finally {
+      panelDisposeSubscription.dispose();
+      if (this.activeCellMediaControllers.get(options.webviewId) === controller) {
+        this.activeCellMediaControllers.delete(options.webviewId);
+      }
+    }
+
+    if (this.webviews.getByWebviewId(options.webviewId) !== panel) {
+      materializer.release(materialized.uri);
+      throw new Error('Oversized media preview was cancelled because its webview closed');
+    }
+
+    const previewId = crypto.randomUUID();
+    const runDirectory = uriDirectory(materialized.uri);
+    let resourceUri: string;
+    try {
+      resourceUri = panel.webview.asWebviewUri(materialized.uri).toString();
+      panel.webview.options = {
+        ...panel.webview.options,
+        localResourceRoots: [this.codiconsResourceRoot(), runDirectory]
+      };
+    } catch (error) {
+      materializer.release(materialized.uri);
+      throw error;
+    }
+
+    const previous = this.activeCellMediaPreviews.get(options.webviewId);
+    try {
+      if (previous) materializer.release(previous.uri);
+    } catch (error) {
+      materializer.release(materialized.uri);
+      throw error;
+    }
+    this.activeCellMediaPreviews.set(options.webviewId, {
+      previewId,
+      uri: materialized.uri,
+      panel
+    });
+    this.trackMediaPanel(panel);
+
+    return {
+      success: true,
+      previewId,
+      uri: resourceUri,
+      mime: options.type.mime!,
+      byteLength: materialized.byteLength
+    };
+  }
+
+  /** Release a URI lease. Stale cleanup calls are intentionally idempotent. */
+  async releaseCellMediaPreview(webviewId: string, previewId: string): Promise<void> {
+    const active = this.activeCellMediaPreviews.get(webviewId);
+    if (!active || active.previewId !== previewId) return;
+
+    this.activeCellMediaPreviews.delete(webviewId);
+    this.cellMaterializer?.release(active.uri);
+    if (this.webviews.getByWebviewId(webviewId) === active.panel) {
+      active.panel.webview.options = {
+        ...active.panel.webview.options,
+        localResourceRoots: [this.codiconsResourceRoot()]
+      };
+    }
+  }
+
+  private codiconsResourceRoot(): vsc.Uri {
+    // build.mjs copies codicon.css + codicon.ttf here; the full
+    // @vscode/codicons package is not shipped in the .vsix.
+    return vsc.Uri.joinPath(this.context.extensionUri, 'assets', 'codicons');
+  }
+
+  private trackMediaPanel(panel: vsc.WebviewPanel): void {
+    if (this.mediaPanelSubscriptions.has(panel)) return;
+    const subscription = panel.onDidDispose(() => {
+      for (const [webviewId, active] of this.activeCellMediaPreviews) {
+        if (active.panel === panel) this.activeCellMediaPreviews.delete(webviewId);
+      }
+      this.mediaPanelSubscriptions.delete(panel);
+      // Stage B owns panel-disposal file removal. This listener only drops the
+      // RPC lease so a later stale release cannot affect another preview.
+    });
+    this.mediaPanelSubscriptions.set(panel, subscription);
   }
 
   /** Open a view's SELECT body in the writable virtual filesystem as SQL. */
@@ -1057,54 +1803,41 @@ export class HostBridge implements ToastService {
   async readWorkspaceFileUri(uriString: string): Promise<Uint8Array> {
     const uri = vsc.Uri.parse(uriString);
 
-    // SECURITY: Block dangerous URI schemes that could execute code or fetch remote resources
-    const blockedSchemes = ['http', 'https', 'command', 'javascript', 'data', 'vbscript', 'vscode-command'];
+    // SECURITY: Block dangerous URI schemes that could execute code or fetch remote
+    // resources. Our own virtual scheme is blocked too: it resolves through the global
+    // DocumentRegistry, so it would let this webview read cells out of a different
+    // open database.
+    const blockedSchemes = ['http', 'https', 'command', 'javascript', 'data', 'vbscript', 'vscode-command', UriScheme];
     if (blockedSchemes.includes(uri.scheme)) {
       throw new Error(`Access denied: Cannot read from scheme "${uri.scheme}"`);
     }
 
-    // SECURITY: For file:// URIs, validate the path to prevent directory traversal attacks
-    // and restrict access to sensitive system locations
-    if (uri.scheme === 'file') {
-      const filePath = uri.fsPath;
+    // SECURITY: Whitelist approach for every scheme — workspace.fs applies per-provider
+    // ACLs, not a workspace boundary, so non-file schemes (vscode-userdata:,
+    // vscode-vfs:, ...) must not bypass containment. Only allow access to files in:
+    // 1. Explicit workspace folders
+    // 2. The same directory as the open database (or subdirectories)
+    // Both branches run the same normalized containment check
+    // (isUriContainedInDirectory); membership lookups alone never authorize a read.
 
-      // SECURITY: Whitelist approach
-      // Only allow access to files in:
-      // 1. Explicit workspace folders
-      // 2. The same directory as the open database (or subdirectories)
-
-      // 1. Check if file is within workspace folders
-      const workspaceFolder = vsc.workspace.getWorkspaceFolder(uri);
-      if (workspaceFolder) {
-        return await vsc.workspace.fs.readFile(uri);
-      }
-
-      // 2. Check if file is in the same directory tree as the open document
-      // This allows drag-and-drop from the same directory tree in single-file mode
-      const docDir = path.dirname(this.document.uri.fsPath);
-
-      // Use path.resolve to fully resolve both paths
-      // This automatically normalizes paths, resolves any '..' or '.',
-      // and creates an absolute path, mitigating path traversal attacks.
-      const resolvedDocDir = path.resolve(docDir);
-      const resolvedFilePath = path.resolve(filePath);
-
-      // Ensure the resolved target path is either the document directory itself
-      // or strictly inside it by checking if it starts with the directory path plus a separator.
-      // This prevents prefix spoofing (e.g., '/path/to/dir-fake') and directory traversal.
-      // Note: If resolvedDocDir is root (e.g., '/'), we don't need to append an extra separator.
-      const prefix = resolvedDocDir.endsWith(path.sep) ? resolvedDocDir : resolvedDocDir + path.sep;
-      const isInside = resolvedFilePath === resolvedDocDir || resolvedFilePath.startsWith(prefix);
-
-      if (!isInside) {
-         throw new Error(`Access denied: File "${filePath}" is not in the current workspace or document directory.`);
-      }
-
+    // 1. Check if file is within workspace folders. getWorkspaceFolder matches
+    // scheme/authority/path, so vscode-remote and vscode-vfs workspace folders resolve
+    // here — this is what keeps explorer drag-and-drop working in remote workspaces.
+    // It is only a lookup, though: it prefix-matches literal path segments without
+    // collapsing dot segments ('..' is just another segment to it), so
+    // '<folder>/../../etc/passwd' still returns the folder. Containment must be
+    // re-verified on normalized paths before the read.
+    const workspaceFolder = vsc.workspace.getWorkspaceFolder(uri);
+    if (workspaceFolder && isUriContainedInDirectory(uri, workspaceFolder.uri, 'directory')) {
       return await vsc.workspace.fs.readFile(uri);
     }
 
-    // For other schemes (vscode-remote, ssh, etc.), delegate to VS Code's fs API
-    // which will enforce its own access controls
+    // 2. Check if file is in the same directory tree as the open document.
+    // This allows drag-and-drop from the same directory tree in single-file mode.
+    if (!isUriContainedInDirectory(uri, this.document.uri, 'parent-of-file')) {
+      throw new Error(`Access denied: File "${uri.toString()}" is not in the current workspace or document directory.`);
+    }
+
     return await vsc.workspace.fs.readFile(uri);
   }
 
@@ -1113,12 +1846,11 @@ export class HostBridge implements ToastService {
    */
   async saveFile(filename: string, data: Uint8ArrayLike): Promise<void> {
     // Use the database file's directory as the default location
-    const dbDir = path.dirname(this.document.uri.fsPath);
-    const safeFilename = path.basename(filename);
-    const defaultPath = path.join(dbDir, safeFilename);
+    const safeFilename = pathLeaf(filename);
+    const defaultUri = vsc.Uri.joinPath(uriDirectory(this.document.uri), safeFilename);
     
     const uri = await vsc.window.showSaveDialog({
-        defaultUri: vsc.Uri.file(defaultPath),
+        defaultUri,
         saveLabel: 'Save Blob'
     });
 
@@ -1147,9 +1879,17 @@ export class HostBridge implements ToastService {
 
     if (uris && uris.length > 0) {
         const uri = uris[0];
+        const stat = await vsc.workspace.fs.stat(uri);
+        if (!Number.isSafeInteger(stat.size) || stat.size < 0) {
+            throw new Error('Unable to determine the selected file size safely.');
+        }
+        if (stat.size > DEFAULT_MAX_CELL_EDIT_BYTES) {
+            throw new CellEditPolicyError('blob', stat.size, DEFAULT_MAX_CELL_EDIT_BYTES);
+        }
         const data = await vsc.workspace.fs.readFile(uri);
+        assertCellValueWithinEditLimit(data, DEFAULT_MAX_CELL_EDIT_BYTES);
         return {
-            name: path.basename(uri.fsPath),
+            name: pathLeaf(uri.path),
             data: data
         };
     }
@@ -1211,4 +1951,17 @@ async function determineCellExtension(value?: CellValue, type?: CellContentType)
     return '.bin';
   }
   return '.txt';
+}
+
+function resolveOversizedMediaType(type: CellContentType | undefined): {
+  type: 'image' | 'audio' | 'video' | 'pdf';
+  extension: string;
+} {
+  const media = type?.mime ? OVERSIZED_MEDIA_TYPES[type.mime] : undefined;
+  if (!media || type?.type !== media.type) {
+    throw new Error(
+      `Unsupported oversized media type: ${type?.mime ?? 'unknown'} (${type?.type ?? 'unknown'})`
+    );
+  }
+  return media;
 }

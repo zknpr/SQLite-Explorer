@@ -1,4 +1,4 @@
-# GitHub Actions workflow to automatically create a release with .vsix asset
+# GitHub Actions workflow to automatically create a release with all VSIX assets
 # Triggered when a version tag (v*) is pushed
 name: Release
 
@@ -30,8 +30,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build and package extension
-        run: npm run package
+      - name: Build and package all extension targets
+        # package-vsix checks this before invoking the build or creating artifacts.
+        run: npm run package -- --expected-version "${GITHUB_REF_NAME#v}"
 
       - name: Extract version from tag
         id: version
@@ -47,12 +48,13 @@ jobs:
             See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
 
             ### Installation
-            Download the `.vsix` file and install it in VS Code:
+            Download the `.vsix` matching your platform, or the filename without
+            a platform suffix for the WASM-only universal build, then install it in VS Code:
             - Open VS Code
             - Press `Ctrl+Shift+P` (or `Cmd+Shift+P` on Mac)
             - Type "Install from VSIX"
             - Select the downloaded file
-          files: sqlite-explorer-${{ steps.version.outputs.version }}.vsix
+          files: release/*.vsix
           draft: false
           prerelease: false
         env:

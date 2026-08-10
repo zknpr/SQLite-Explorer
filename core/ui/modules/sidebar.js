@@ -3,14 +3,21 @@
  */
 import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
-import { updateStatus } from './ui.js';
+import { updateStatus, updateToolbarButtons } from './ui.js';
 import { loadTableData, loadTableColumns } from './grid.js';
-import { getCellValueForDisplay, getRowDataOffset } from './data-utils.js';
+import {
+    getCellMutationBlockReason,
+    getCellValueForDisplay,
+    getBatchSelectionEligibility,
+    getRowDataOffset
+} from './data-utils.js';
+import { updateSelectionStates } from './grid-selection.js';
 import { openCreateTableModal } from './crud.js';
 import { openSettingsModal } from './settings.js';
 import { openCreateViewModal, openEditViewModal, dropViewFromSidebar } from './views.js';
 import { groupSelectedCellsByColumn, summarizeColumnValue, prepareBatchUpdates } from './batch-update-logic.js';
 import { applyConnectionResult } from './connection-state.js';
+import { invalidateAllCounts, noteCellValuesChanged } from './count-cache.js';
 
 export function initSidebar() {
     const sidebarPanel = document.getElementById('sidebarPanel');
@@ -125,15 +132,25 @@ export function initSidebar() {
     });
 }
 
+export function syncSelectedTableIdentity() {
+    state.selectedTableIdentity = state.selectedTableType === 'table'
+        ? state.schemaCache.tables.find(table => table.name === state.selectedTable)?.identity ?? null
+        : null;
+}
+
 export async function refreshSchema() {
     if (!state.isDbConnected) return;
 
     try {
         const schema = await backendApi.fetchSchema();
 
-        state.schemaCache.tables = (schema.tables || []).map(t => ({ name: t.identifier }));
+        state.schemaCache.tables = (schema.tables || []).map(t => ({
+            name: t.identifier,
+            ...(t.identity ? { identity: t.identity } : {})
+        }));
         state.schemaCache.views = (schema.views || []).map(v => ({ name: v.identifier }));
         state.schemaCache.indexes = (schema.indexes || []).map(i => ({ name: i.identifier, table: i.parentTable }));
+        syncSelectedTableIdentity();
 
         renderSidebar();
 
@@ -294,9 +311,10 @@ export function updateBatchSidebar() {
 
     if (!title || !list || !countBadge || !fieldsContainer) return;
 
-    const cellCount = state.selectedCells.length;
+    const eligibility = getBatchSelectionEligibility();
+    const cellCount = eligibility.cells.length;
 
-    if (cellCount === 0) {
+    if (state.selectedCells.length === 0) {
         title.classList.add('hidden');
         list.classList.add('hidden');
         return;
@@ -307,9 +325,11 @@ export function updateBatchSidebar() {
     title.classList.remove('collapsed');
 
     countBadge.textContent = cellCount;
+    const applyButton = document.getElementById('btnApplyBatchUpdate');
+    if (applyButton) applyButton.disabled = state.isReadOnly || cellCount === 0;
 
     // Analyze selected cells - group by column (see batch-update-logic.js)
-    const visibleCells = state.selectedCells.map(cell => {
+    const visibleCells = eligibility.cells.map(cell => {
         const row = state.gridData[cell.rowIdx];
         return row
             ? { ...cell, value: getCellValueForDisplay(row, cell.rowIdx, cell.colIdx) }
@@ -319,6 +339,22 @@ export function updateBatchSidebar() {
 
     fieldsContainer.replaceChildren();
     const fragment = document.createDocumentFragment();
+
+    if (eligibility.readOnlyCount > 0) {
+        const notice = document.createElement('div');
+        notice.className = 'batch-selection-notice';
+        Object.assign(notice.style, {
+            marginBottom: '8px',
+            color: 'var(--text-secondary)',
+            fontSize: '11px'
+        });
+        notice.textContent =
+            `${eligibility.readOnlyCount} read-only selected cell${eligibility.readOnlyCount === 1 ? '' : 's'} excluded: ${eligibility.readOnlyReason}`;
+        fragment.appendChild(notice);
+        title.title = notice.textContent;
+    } else {
+        title.title = '';
+    }
 
     for (const [colIdx, colInfo] of columns) {
         const valueDisplay = summarizeColumnValue(colInfo.values);
@@ -377,6 +413,18 @@ export function updateBatchSidebar() {
 
 export async function applyBatchUpdate() {
     if (state.selectedCells.length === 0) return;
+    const eligibility = getBatchSelectionEligibility();
+    if (eligibility.cells.length === 0) {
+        updateStatus(`Batch update unavailable: ${eligibility.readOnlyReason}`);
+        return;
+    }
+    for (const cell of eligibility.cells) {
+        const mutationBlockReason = getCellMutationBlockReason(cell.rowIdx, cell.colIdx);
+        if (mutationBlockReason) {
+            updateStatus(mutationBlockReason);
+            return;
+        }
+    }
 
     const inputs = document.querySelectorAll('.batch-input');
 
@@ -398,12 +446,21 @@ export async function applyBatchUpdate() {
     }
 
     // 2. Processing Phase — value coercion / NULL / json_patch (see batch-update-logic.js)
-    const updates = prepareBatchUpdates(state.selectedCells, inputsByCol, state.tableColumns);
+    const updates = prepareBatchUpdates(
+        eligibility.cells,
+        inputsByCol,
+        state.tableColumns,
+        state.selectedTableIdentity?.kind === 'primaryKey'
+    );
 
     if (updates.length === 0) {
         updateStatus('No values entered for batch update');
         return;
     }
+
+    // Snapshot the target so the count-cache note below can never be applied
+    // to a table the user switched to while the batch RPC was in flight.
+    const targetTable = state.selectedTable;
 
     try {
         updateStatus(`Updating ${updates.length} cells...`);
@@ -418,8 +475,29 @@ export async function applyBatchUpdate() {
             operation: u.operation
         }));
 
-        await backendApi.updateCellBatch(state.selectedTable, backendUpdates, label);
-
+        const outcomes = await backendApi.updateCellBatch(targetTable, backendUpdates, label);
+        // Edited values may enter/leave an active filter's match set, so the
+        // table's cached filtered counts are no longer trustworthy.
+        noteCellValuesChanged(targetTable);
+        const identityChanges = new Map();
+        for (const outcome of outcomes ?? []) {
+            if (outcome.newRowId === undefined || outcome.newRowId === outcome.rowId) continue;
+            const existing = identityChanges.get(outcome.rowId);
+            if (existing !== undefined && existing !== outcome.newRowId) {
+                throw new Error('Batch update returned inconsistent row identities');
+            }
+            identityChanges.set(outcome.rowId, outcome.newRowId);
+        }
+        // The RPC belongs to the snapshotted table. A table switch can expose
+        // opaque identities with identical strings, so never apply table A's
+        // remap to table B's selection or pins.
+        if (state.selectedTable === targetTable) {
+            for (const identities of [state.selectedRowIds, state.pinnedRowIds]) {
+                for (const [oldIdentity, newIdentity] of identityChanges) {
+                    if (identities.delete(oldIdentity)) identities.add(newIdentity);
+                }
+            }
+        }
         // Update local grid data
         const hasPatch = updates.some(u => u.operation === 'json_patch');
 
@@ -429,19 +507,23 @@ export async function applyBatchUpdate() {
             }
         }
 
-        // Refresh grid and sidebar
-        await loadTableData(false);
-
-        const freshSelectedCells = [];
-        for (const oldCell of state.selectedCells) {
-            const newValue = state.gridData[oldCell.rowIdx][oldCell.colIdx + getRowDataOffset()];
-            freshSelectedCells.push({ ...oldCell, value: newValue });
-        }
-        state.selectedCells = freshSelectedCells;
-
+        // Applying the batch ends the selection gesture. Clear both halves of
+        // the cell/column selection before replacing the grid so the DOM diff
+        // cache removes the old body and header highlights together.
+        state.selectedCells = [];
+        state.selectedColumns.clear();
+        state.lastSelectedCell = null;
+        state.lastSelectedColumnIndex = null;
+        updateSelectionStates();
+        updateToolbarButtons();
         updateBatchSidebar();
 
-        updateStatus('Batch update completed');
+        // A PK edit can move the row in the table's default ordering.
+        await loadTableData(false);
+
+        updateStatus(eligibility.readOnlyCount > 0
+            ? `Batch update completed; excluded ${eligibility.readOnlyCount} read-only selected cell${eligibility.readOnlyCount === 1 ? '' : 's'}`
+            : 'Batch update completed');
 
     } catch (err) {
         console.error('Batch update failed:', err);
@@ -498,8 +580,16 @@ export function toggleSection(section) {
 }
 
 export async function selectTableItem(name, type) {
+    // Drop every cached count, not just the target's: views project other
+    // tables and triggers/cascades can fan a mutation out, so counts cached
+    // for objects other than the one being edited are only sound while the
+    // selection cannot have observed such a change — which ends here. A
+    // switch's first load fetches its count in parallel with data, so this
+    // costs no extra latency class.
+    invalidateAllCounts();
     state.selectedTable = name;
     state.selectedTableType = type;
+    syncSelectedTableIdentity();
     state.currentPageIndex = 0;
     state.sortedColumn = null;
     state.sortAscending = true;
@@ -521,6 +611,10 @@ export async function selectTableItem(name, type) {
 
     // Update UI
     renderSidebar();
+    // The cell selection was just cleared; hide the Batch Update panel with it
+    // now, synchronously — the loads below can fail before any commit-time
+    // refresh, which would leave the previous table's staged columns on screen.
+    updateBatchSidebar();
 
     const tableNameLabel = document.getElementById('tableNameLabel');
     if (tableNameLabel) tableNameLabel.textContent = name;
@@ -540,6 +634,9 @@ export async function reloadFromDisk() {
 
     try {
         updateStatus('Reloading...');
+        // The reload exists to pick up changes this webview didn't make, so
+        // no cached count survives it.
+        invalidateAllCounts();
         const connectionResult = await backendApi.refreshFile();
         if (connectionResult?.connected === true) {
             applyConnectionResult(connectionResult);

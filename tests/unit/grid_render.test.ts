@@ -60,6 +60,10 @@ function findAllByClass(root: FakeNode, className: string): FakeNode[] {
     return matches;
 }
 
+function collectText(root: FakeNode): string {
+    return root.textContent + root.children.map(collectText).join('');
+}
+
 describe('grid header rendering', () => {
     afterEach(async () => {
         delete (globalThis as any).document;
@@ -67,6 +71,8 @@ describe('grid header rendering', () => {
         state.tableColumns = [];
         state.gridData = [];
         state.gridExactIntegerTexts = {};
+        state.gridOversizedCells = {};
+        state.gridReadOnlyRowReasons = {};
         state.columnWidths = {};
         state.columnFilters = {};
         state.filterQuery = '';
@@ -178,6 +184,57 @@ describe('grid header rendering', () => {
         const text = findByClass(elements.get('gridContainer')!, 'cell-text');
         assert.ok(text);
         assert.strictEqual(text.children.map(child => child.textContent).join(''), '9007199254740993');
+    });
+
+    it('renders bounded oversized previews with exact storage and byte metadata', async () => {
+        const { state } = await import(stateModulePath);
+        const { renderDataGrid } = await import(gridRenderModulePath);
+        const elements = new Map<string, FakeNode>([
+            ['gridContainer', new FakeNode('div')],
+            ['pageIndicator', new FakeNode('span')],
+            ['btnFirst', new FakeNode('button')],
+            ['btnPrev', new FakeNode('button')],
+            ['btnNext', new FakeNode('button')],
+            ['btnLast', new FakeNode('button')]
+        ]);
+        (globalThis as any).document = {
+            createElement(tagName: string) { return new FakeNode(tagName); },
+            createDocumentFragment() { return new FakeNode('#fragment'); },
+            createTextNode(text: string) {
+                const node = new FakeNode('#text');
+                node.textContent = text;
+                return node;
+            },
+            getElementById(id: string) { return elements.get(id) ?? null; },
+            querySelectorAll() { return []; },
+            querySelector() { return null; }
+        };
+        state.selectedTableType = 'table';
+        state.tableColumns = [
+            { name: 'body', type: 'TEXT', isPrimaryKey: false },
+            { name: 'payload', type: 'BLOB', isPrimaryKey: false }
+        ];
+        state.gridData = [[1, 'ab', new Uint8Array([0xde, 0xad])]];
+        state.gridOversizedCells = {
+            0: {
+                1: { storageClass: 'text', byteLength: 12 },
+                2: { storageClass: 'blob', byteLength: 20 }
+            }
+        };
+        state.gridReadOnlyRowReasons = { 0: 'Primary-key identity was not transported.' };
+        state.totalPageCount = 1;
+        state.currentPageIndex = 0;
+
+        renderDataGrid();
+
+        const oversized = findAllByClass(elements.get('gridContainer')!, 'oversized-cell');
+        assert.strictEqual(oversized.length, 2);
+        assert.match(collectText(oversized[0]), /^ab… · TEXT · 12 bytes · too large to edit inline$/);
+        assert.match(collectText(oversized[1]), /^de ad… · BLOB · 20 bytes · too large to edit inline$/);
+        assert.strictEqual(findAllByClass(elements.get('gridContainer')!, 'expand-icon').length, 0);
+        const readOnlyRow = findByClass(elements.get('gridContainer')!, 'read-only-row');
+        assert.ok(readOnlyRow);
+        assert.strictEqual(readOnlyRow.title, 'Primary-key identity was not transported.');
     });
 
     it('highlights only cells whose SQLite-comparable value matches the global filter', async () => {

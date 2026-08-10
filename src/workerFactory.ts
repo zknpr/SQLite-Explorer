@@ -23,6 +23,8 @@ import { serializeOperations } from './core/operation-serializer';
 import { GlobalOutputChannel } from './main';
 import type {
   CellValue,
+  RecordId,
+  DeletedRow,
   QueryResultSet,
   ModificationEntry,
   DatabaseOperations,
@@ -33,24 +35,64 @@ import type {
   ColumnDefinition,
   TableQueryOptions,
   TableCountOptions,
+  TableCountResult,
   SchemaSnapshot,
   ColumnMetadata,
   ViewDefinition,
   ViewDefinitionIntent,
   ViewEditResult,
-  ViewTriggerDefinition
+  ViewTriggerDefinition,
+  CellMetadata,
+  CellReadChunk,
+  CellReadSession,
+  CellReadTarget,
+  QueryReadChunk,
+  QueryReadSession,
+  OversizedCellMetadata,
+  DatabaseWriteResult,
+  ColumnDropTableState
 } from './core/types';
+import type { PagedWritableOverlaySnapshot } from './core/paged-writable-overlay';
 
 import { Worker } from './platform/threadPool';
 import type { DatabaseConnectionBundle } from './connectionTypes';
 import { getMaximumFileSizeBytes, getQueryTimeout } from './config';
 import { createWorkerEndpoint } from './core/sqlite-db';
+import { getNodeFs } from './core/platform/fs';
+import { WAL_HEADER_SIZE_BYTES } from './core/paged-open';
+import { createSharedCancellationFlag } from './core/cancellation-utils';
+import { writePagedWritableOverlayToFile } from './pagedWritableSave';
 
 // Native worker support (only in Node.js environment)
 let nativeSupport: {
   isNativeAvailable: (path: string) => Promise<boolean>;
   createNativeDatabaseConnection: typeof import('./nativeWorker').createNativeDatabaseConnection;
 } | null = null;
+
+type DesktopTestBackend = 'native' | 'wasm';
+let desktopTestBackend: DesktopTestBackend | undefined;
+let desktopTestPagedOpenThresholdBytes: number | undefined;
+
+/** Set only by the non-production integration API; normal backend selection is unchanged. */
+export function setDesktopTestDatabaseBackend(backend: DesktopTestBackend | undefined): void {
+  if (backend !== undefined && backend !== 'native' && backend !== 'wasm') {
+    throw new Error(`Unsupported desktop test backend: ${String(backend)}`);
+  }
+  desktopTestBackend = backend;
+}
+
+/** Set only by the non-production integration API; normal paging policy is unchanged. */
+export function setDesktopTestPagedOpenThresholdBytes(
+  thresholdBytes: number | undefined
+): void {
+  if (
+    thresholdBytes !== undefined
+    && (!Number.isSafeInteger(thresholdBytes) || thresholdBytes < 1)
+  ) {
+    throw new Error('Desktop test paging threshold must be a positive safe integer');
+  }
+  desktopTestPagedOpenThresholdBytes = thresholdBytes;
+}
 
 // Dynamically import native worker in Node.js environment
 if (!import.meta.env?.VSCODE_BROWSER_EXT) {
@@ -70,26 +112,74 @@ if (!import.meta.env?.VSCODE_BROWSER_EXT) {
  * Methods exposed by the database worker.
  *
  * Keep every parameter structured-cloneable. AbortSignal is deliberately not
- * part of this RPC contract: worker_threads clones it into a plain object, so
- * cancellation is checked in the host facade before dispatch instead.
+ * part of this RPC contract: worker_threads clones it into a plain object.
+ * Bounded query paths mirror it into a probed shared flag; other cancellable
+ * operations retain their existing host-side pre-dispatch check.
  */
 interface WorkerMethods {
   initializeDatabase(
     filename: string,
     config: DatabaseInitConfig
   ): Promise<DatabaseInitResult>;
-  runQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]>;
+  runQuery(
+    sql: string,
+    params?: CellValue[],
+    cancellationFlag?: Int32Array
+  ): Promise<QueryResultSet[]>;
+  getCellMetadata(target: CellReadTarget): Promise<CellMetadata>;
+  openCellReadSession(target: CellReadTarget): Promise<CellReadSession>;
+  readCellChunk(
+    sessionId: string,
+    byteOffset: number,
+    maxBytes: number
+  ): Promise<CellReadChunk>;
+  closeCellReadSession(sessionId: string): Promise<void>;
+  openQueryReadSession(sql: string): Promise<QueryReadSession>;
+  readQueryRows(sessionId: string, maxRows: number): Promise<QueryReadChunk>;
+  closeQueryReadSession(sessionId: string): Promise<void>;
   exportDatabase(): Promise<Uint8Array>;
+  exportPagedWritableOverlay(): Promise<PagedWritableOverlaySnapshot>;
   applyModifications(mods: ModificationEntry[]): Promise<void>;
   undoModification(mod: ModificationEntry): Promise<void>;
   redoModification(mod: ModificationEntry): Promise<void>;
   flushChanges(): Promise<void>;
   discardModifications(mods: ModificationEntry[]): Promise<void>;
-  updateCell(table: string, rowId: string | number, column: string, value: CellValue, patch?: string): Promise<void>;
-  insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
-  insertRowBatch(table: string, rows: Record<string, CellValue>[]): Promise<void>;
-  deleteRows(table: string, rowIds: (string | number)[]): Promise<void>;
-  deleteColumns(table: string, columns: string[], dropDependentIndexes?: string[]): Promise<void>;
+  updateCell(
+    table: string,
+    rowId: RecordId,
+    column: string,
+    value: CellValue,
+    patch?: string,
+    maxEditValueBytes?: number
+  ): Promise<RecordId | void>;
+  replaceOversizedCell(
+    table: string,
+    rowId: RecordId,
+    column: string,
+    value: CellValue,
+    expected: OversizedCellMetadata,
+    maxEditValueBytes?: number
+  ): Promise<RecordId | void>;
+  insertRow(
+    table: string,
+    data: Record<string, CellValue>,
+    maxEditValueBytes?: number
+  ): Promise<RecordId | undefined>;
+  insertRowBatch(
+    table: string,
+    rows: Record<string, CellValue>[],
+    maxEditValueBytes?: number
+  ): Promise<void>;
+  deleteRows(
+    table: string,
+    rowIds: RecordId[],
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow[]>;
+  deleteColumns(
+    table: string,
+    columns: string[],
+    dropDependentIndexes?: string[]
+  ): Promise<ColumnDropTableState>;
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
   createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
   getViewDefinition(view: string): Promise<ViewDefinition>;
@@ -102,7 +192,8 @@ interface WorkerMethods {
     view: string,
     selectSql: string,
     limit?: number,
-    intent?: ViewDefinitionIntent
+    intent?: ViewDefinitionIntent,
+    cancellationFlag?: Int32Array
   ): Promise<QueryResultSet>;
   createView(view: string, selectSql: string): Promise<ViewDefinition>;
   editView(
@@ -117,28 +208,42 @@ interface WorkerMethods {
     expectedSql?: string,
     expectedTriggers?: readonly ViewTriggerDefinition[]
   ): Promise<ViewDefinition>;
-  updateCellBatch(table: string, updates: CellUpdate[]): Promise<CellUpdateResult[]>;
+  updateCellBatch(
+    table: string,
+    updates: CellUpdate[],
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
+  ): Promise<CellUpdateResult[]>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
-  fetchTableCount(table: string, options: TableCountOptions): Promise<number>;
+  fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult>;
   fetchSchema(): Promise<SchemaSnapshot>;
   getTableInfo(table: string): Promise<ColumnMetadata[]>;
   getPragmas(): Promise<Record<string, CellValue>>;
   setPragma(pragma: string, value: CellValue): Promise<void>;
   ping(): Promise<boolean>;
-  writeToFile(path: string): Promise<void>;
+  writeToFile(path: string): Promise<DatabaseWriteResult | void>;
 }
 
 const WORKER_METHOD_NAMES = [
   'initializeDatabase',
   'runQuery',
+  'getCellMetadata',
+  'openCellReadSession',
+  'readCellChunk',
+  'closeCellReadSession',
+  'openQueryReadSession',
+  'readQueryRows',
+  'closeQueryReadSession',
   'exportDatabase',
+  'exportPagedWritableOverlay',
   'applyModifications',
   'undoModification',
   'redoModification',
   'flushChanges',
   'discardModifications',
   'updateCell',
+  'replaceOversizedCell',
   'insertRow',
   'insertRowBatch',
   'deleteRows',
@@ -188,6 +293,25 @@ function forwardWorkerLog(level: WorkerLogLevel, args: unknown[]): void {
     GlobalOutputChannel.appendLine(`[Worker/${level}] ${text}`);
   } else {
     console[level]('[Worker]', ...args);
+  }
+}
+
+/** Keep AbortSignal host-local while exposing its state to synchronous worker code. */
+async function callWorkerWithCancellation<T>(
+  signal: AbortSignal,
+  call: (cancellationFlag?: Int32Array) => Promise<T>
+): Promise<T> {
+  signal.throwIfAborted();
+  const sharedCancellation = createSharedCancellationFlag(signal);
+  try {
+    const result = await call(sharedCancellation?.flag);
+    signal.throwIfAborted();
+    return result;
+  } catch (error) {
+    if (signal.aborted) signal.throwIfAborted();
+    throw error;
+  } finally {
+    sharedCancellation?.dispose();
   }
 }
 
@@ -263,6 +387,11 @@ export async function createDatabaseConnection(
   extensionUri: vsc.Uri,
   _reporter?: TelemetryReporter
 ): Promise<DatabaseConnectionBundle> {
+  if (desktopTestBackend === 'wasm') {
+    GlobalOutputChannel?.appendLine('[DesktopTest] Forcing WebAssembly SQLite backend');
+    return createWasmDatabaseConnection(extensionUri, _reporter);
+  }
+
   // Try native SQLite first (desktop Node.js only)
   if (!import.meta.env?.VSCODE_BROWSER_EXT && nativeSupport) {
     const extensionPath = extensionUri.fsPath;
@@ -279,7 +408,9 @@ export async function createDatabaseConnection(
         // Wrap the native bundle to provide fallback to WASM if file open fails
         // This handles cases where native SQLite can't access a specific file
         // (e.g., macOS sandboxing, permission issues, file locked)
-        const wasmBundlePromise = createWasmDatabaseConnection(extensionUri, _reporter);
+        const wasmBundlePromise = desktopTestBackend === 'native'
+          ? undefined
+          : createWasmDatabaseConnection(extensionUri, _reporter);
         let wasmBundle: DatabaseConnectionBundle | null = null;
 
         return {
@@ -289,19 +420,28 @@ export async function createDatabaseConnection(
               // Try native first
               return await nativeBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
             } catch (nativeErr) {
+              if (desktopTestBackend === 'native') {
+                nativeBundle.workerMethods[Symbol.dispose]();
+                throw nativeErr;
+              }
               // Native failed - fall back to WASM
               GlobalOutputChannel?.appendLine(`[SQLite Explorer] Native file open failed, falling back to WASM: ${nativeErr instanceof Error ? nativeErr.message : String(nativeErr)}`);
               if (!wasmBundle) {
-                wasmBundle = await wasmBundlePromise;
+                wasmBundle = await wasmBundlePromise!;
               }
               return wasmBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
             }
           }
         };
       } catch (err) {
+        if (desktopTestBackend === 'native') throw err;
         GlobalOutputChannel?.appendLine(`[SQLite Explorer] Native SQLite failed, falling back to WASM: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+  }
+
+  if (desktopTestBackend === 'native') {
+    throw new Error('Native SQLite backend is unavailable on this platform');
   }
 
   // Fall back to WASM (sql.js)
@@ -377,8 +517,11 @@ async function createInProcessWasmDatabaseConnection(
       // Browser mode always reads database bytes through the VS Code filesystem.
       // There is no file-path fast path because the web extension host cannot
       // access local disk paths directly.
-      const [dbContent, walContent] = await loadDatabaseFiles(fileUri);
-      const hasActiveWal = !!walContent && walContent.byteLength > 0;
+      const [dbContent, walSize] = await Promise.all([
+        loadDatabaseFile(fileUri),
+        statWalSize(fileUri)
+      ]);
+      const hasActiveWal = walSize > 0;
       // sql.js opens one main database image and cannot merge a separate WAL
       // file, so browser editing is disabled when committed WAL pages may be
       // absent from the main database bytes that save() would later overwrite.
@@ -391,7 +534,6 @@ async function createInProcessWasmDatabaseConnection(
 
       const initConfig: DatabaseInitConfig = {
         content: dbContent,
-        walContent,
         maxSize: getMaximumFileSizeBytes(),
         resourceMap: {},
         wasmBinary: wasmContent,
@@ -403,8 +545,23 @@ async function createInProcessWasmDatabaseConnection(
 
       const operationsFacade: DatabaseOperations = {
         engineKind: Promise.resolve('wasm'),
-        executeQuery: (sql: string, params?: CellValue[]) =>
-          endpoint.runQuery(sql, params),
+        executeQuery: (sql: string, params?: CellValue[], signal?: AbortSignal) =>
+          endpoint.runQuery(sql, params, signal),
+        getCellMetadata: (target: CellReadTarget) =>
+          endpoint.getCellMetadata(target),
+        openCellReadSession: (target: CellReadTarget) =>
+          endpoint.openCellReadSession(target),
+        readCellChunk: (sessionId: string, byteOffset: number, maxBytes: number) =>
+          endpoint.readCellChunk(sessionId, byteOffset, maxBytes),
+        closeCellReadSession: (sessionId: string) =>
+          endpoint.closeCellReadSession(sessionId),
+        openQueryReadSession: (sql: string) =>
+          endpoint.openQueryReadSession(sql),
+        readQueryRows: (sessionId: string, maxRows: number) =>
+          endpoint.readQueryRows(sessionId, maxRows),
+        closeQueryReadSession: (sessionId: string) =>
+          endpoint.closeQueryReadSession(sessionId),
+        // In-process facade plumbing; persistence policy belongs to the caller.
         serializeDatabase: () => endpoint.exportDatabase(),
         applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
           endpoint.applyModifications(mods, signal),
@@ -418,14 +575,48 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.discardModifications(mods, signal),
         // Preserve JSON merge patches when the browser facade calls the
         // in-process endpoint directly.
-        updateCell: (table: string, rowId: string | number, column: string, value: CellValue, patch?: string) =>
-          endpoint.updateCell(table, rowId, column, value, patch),
-        insertRow: (table: string, data: Record<string, CellValue>) =>
-          endpoint.insertRow(table, data),
-        insertRowBatch: (table: string, rows: Record<string, CellValue>[]) =>
-          endpoint.insertRowBatch(table, rows),
-        deleteRows: (table: string, rowIds: (string | number)[]) =>
-          endpoint.deleteRows(table, rowIds),
+        updateCell: (
+          table: string,
+          rowId: RecordId,
+          column: string,
+          value: CellValue,
+          patch?: string,
+          maxEditValueBytes?: number
+        ) => endpoint.updateCell(
+          table,
+          rowId,
+          column,
+          value,
+          patch,
+          maxEditValueBytes
+        ),
+        replaceOversizedCell: (
+          table: string,
+          rowId: RecordId,
+          column: string,
+          value: CellValue,
+          expected: OversizedCellMetadata,
+          maxEditValueBytes?: number
+        ) => endpoint.replaceOversizedCell(
+          table,
+          rowId,
+          column,
+          value,
+          expected,
+          maxEditValueBytes
+        ),
+        insertRow: (
+          table: string,
+          data: Record<string, CellValue>,
+          maxEditValueBytes?: number
+        ) => endpoint.insertRow(table, data, maxEditValueBytes),
+        insertRowBatch: (
+          table: string,
+          rows: Record<string, CellValue>[],
+          maxEditValueBytes?: number
+        ) => endpoint.insertRowBatch(table, rows, maxEditValueBytes),
+        deleteRows: (table: string, rowIds: RecordId[], maxUndoSnapshotBytes?: number) =>
+          endpoint.deleteRows(table, rowIds, maxUndoSnapshotBytes),
         deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
           endpoint.deleteColumns(table, columns, dropDependentIndexes),
         findDependentIndexes: (table: string, columns: string[]) =>
@@ -443,8 +634,9 @@ async function createInProcessWasmDatabaseConnection(
           view: string,
           selectSql: string,
           limit?: number,
-          intent?: ViewDefinitionIntent
-        ) => endpoint.previewViewDefinition(view, selectSql, limit, intent),
+          intent?: ViewDefinitionIntent,
+          signal?: AbortSignal
+        ) => endpoint.previewViewDefinition(view, selectSql, limit, intent, signal),
         createView: (view: string, selectSql: string) =>
           endpoint.createView(view, selectSql),
         editView: (
@@ -465,8 +657,17 @@ async function createInProcessWasmDatabaseConnection(
           expectedSql?: string,
           expectedTriggers?: readonly ViewTriggerDefinition[]
         ) => endpoint.dropView(view, expectedSql, expectedTriggers),
-        updateCellBatch: (table: string, updates: CellUpdate[]) =>
-          endpoint.updateCellBatch(table, updates),
+        updateCellBatch: (
+          table: string,
+          updates: CellUpdate[],
+          maxEditValueBytes?: number,
+          maxUndoSnapshotBytes?: number
+        ) => endpoint.updateCellBatch(
+          table,
+          updates,
+          maxEditValueBytes,
+          maxUndoSnapshotBytes
+        ),
         addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
           endpoint.addColumn(table, column, type, defaultValue),
         fetchTableData: (table: string, options: TableQueryOptions) =>
@@ -489,7 +690,8 @@ async function createInProcessWasmDatabaseConnection(
 
       return {
         databaseOps: serializeOperations(operationsFacade),
-        isReadOnly: result.isReadOnly ?? false
+        isReadOnly: result.isReadOnly ?? false,
+        storage: result.storage
       };
     }
   };
@@ -558,15 +760,18 @@ async function createWorkerBackedWasmDatabaseConnection(
       forceReadOnly?: boolean,
       autoCommit?: boolean
     ) {
+      // Keep the configured refusal message ready for local files above
+      // maxFileSize. The worker owns the authoritative backend-agnostic gate;
+      // the host substitutes the existing user-facing units when it refuses.
+      let oversizedFileMessage: string | undefined;
       try {
-        // Read database and WAL files
+        // Read database file
         // Optimization: If running in Node and file is local, pass path to worker instead of reading content here
         // This avoids blocking the extension host and transferring large buffers
         const isNode = !import.meta.env?.VSCODE_BROWSER_EXT;
         const isLocal = fileUri.scheme === 'file';
 
         let dbContent: Uint8Array | null = null;
-        let walContent: Uint8Array | null = null;
         let filePath: string | undefined;
 
         if (isNode && isLocal) {
@@ -574,12 +779,47 @@ async function createWorkerBackedWasmDatabaseConnection(
             const maxSize = getMaximumFileSizeBytes();
             const fileStat = await vsc.workspace.fs.stat(fileUri);
             if (maxSize !== 0 && fileStat.size > maxSize) {
-               throw new Error(`File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
-            } else {
-               filePath = fileUri.fsPath;
+               oversizedFileMessage = `File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`;
             }
+            filePath = fileUri.fsPath;
         } else {
-            [dbContent, walContent] = await loadDatabaseFiles(fileUri);
+            dbContent = await loadDatabaseFile(fileUri);
+        }
+
+        // Like the browser guard above, sql.js only ever opens the main
+        // database image: committed transactions still sitting in a sibling
+        // -wal file are invisible to it, and saving that stale view would
+        // erase them from disk. Force read-only whenever the -wal holds
+        // frames (size > header; empty or header-only files are clean
+        // checkpoint leftovers — see WAL_HEADER_SIZE_BYTES).
+        const walSize = await statWalSize(fileUri);
+        const hasUncheckpointedWal = walSize > WAL_HEADER_SIZE_BYTES;
+        if (oversizedFileMessage !== undefined && hasUncheckpointedWal) {
+          // Over the in-memory gate AND carrying (or possibly carrying) WAL
+          // frames: the file can neither buffer (over the gate) nor open
+          // page-on-demand (the snapshot reads only the main file and would
+          // miss the committed WAL transactions). Reject with the actionable
+          // checkpoint instruction instead of the bare size error.
+          //
+          // A WAL-at-rest HEADER (bytes 18/19 == 0x02) with no frame-bearing
+          // sibling is a different case and deliberately stays pageable: with
+          // this sibling gate clean there are no invisible frames, and the
+          // worker-side sniff in openPagedDatabaseEngine (core/sqlite-db.ts)
+          // presents such headers to the engine in pageable form.
+          //
+          // Deliberate final rejection: clear the size-error substitution so
+          // the catch below surfaces the checkpoint instruction itself.
+          oversizedFileMessage = undefined;
+          throw new Error(
+            `${displayName} has uncheckpointed WAL data and exceeds the in-memory size limit for the `
+            + 'WebAssembly backend, so it cannot be opened: a page-on-demand snapshot reads only the '
+            + 'main database file and would miss the WAL transactions. Run '
+            + '"PRAGMA wal_checkpoint(TRUNCATE)" on the database (or close the program writing to '
+            + 'it), then reopen it.'
+          );
+        }
+        if (hasUncheckpointedWal) {
+          warnWalReadOnlyDowngrade(displayName);
         }
 
         // Load WASM binary from assets directory
@@ -590,12 +830,21 @@ async function createWorkerBackedWasmDatabaseConnection(
         const initConfig: DatabaseInitConfig = {
           content: dbContent,
           filePath,
-          walContent,
           maxSize: getMaximumFileSizeBytes(),
           resourceMap: {},
           wasmBinary: wasmContent,
-          readOnlyMode: forceReadOnly ?? false,
-          queryTimeout: getQueryTimeout()
+          readOnlyMode: (forceReadOnly ?? false) || hasUncheckpointedWal,
+          queryTimeout: getQueryTimeout(),
+          // Desktop local files may use page-on-demand storage above the
+          // worker's dedicated paging threshold (writable first, then
+          // read-only) after the independent maxSize refusal gate passes.
+          // The browser extension host never reaches this bundle, and paged
+          // mode is impossible there anyway: workspace.fs is async-only
+          // while the in-process engine needs synchronous reads.
+          allowPagedFallback: filePath !== undefined,
+          ...(desktopTestPagedOpenThresholdBytes === undefined
+            ? {}
+            : { pagedOpenThresholdBytes: desktopTestPagedOpenThresholdBytes })
         };
 
         // Initialize database in worker
@@ -603,9 +852,6 @@ async function createWorkerBackedWasmDatabaseConnection(
         const transferables: Transferable[] = [];
         if (initConfig.content && initConfig.content.buffer) {
             transferables.push(initConfig.content.buffer);
-        }
-        if (initConfig.walContent && initConfig.walContent.buffer) {
-            transferables.push(initConfig.walContent.buffer);
         }
         if (initConfig.wasmBinary && initConfig.wasmBinary.buffer) {
             transferables.push(initConfig.wasmBinary.buffer);
@@ -615,6 +861,13 @@ async function createWorkerBackedWasmDatabaseConnection(
             displayName,
             new Transfer(initConfig, transferables) as unknown as DatabaseInitConfig
         );
+
+        // Mirror the WAL gate's surfacing: the webview only ever receives the
+        // bare read-only flag, so the reason is raised here (toast + output
+        // channel) when the worker chose the page-on-demand fallback.
+        if (result.storage === 'paged' && result.isReadOnly) {
+          warnPagedReadOnlyDowngrade(displayName);
+        }
 
         // Create operations facade that routes to worker
         // Transfer a private copy. postMessage detaches transfer-list buffers, while
@@ -633,9 +886,8 @@ async function createWorkerBackedWasmDatabaseConnection(
         };
 
         // AbortSignal cannot cross worker_threads RPC without losing its
-        // prototype. Preserve cancellation that was already requested, but do
-        // not serialize the signal. Mid-operation cancellation will require a
-        // dedicated cancel message and worker-local AbortController.
+        // prototype. Mutation replays retain their existing pre-dispatch check;
+        // bounded queries use callWorkerWithCancellation's shared flag instead.
         const callWorkerAfterAbortCheck = async <T>(
           signal: AbortSignal | undefined,
           call: () => Promise<T>
@@ -644,10 +896,64 @@ async function createWorkerBackedWasmDatabaseConnection(
           return call();
         };
 
+        const writeToFile = result.storage === 'paged' && result.isReadOnly !== true
+          ? async (
+              targetPath: string,
+              signal?: AbortSignal
+            ): Promise<DatabaseWriteResult> => {
+              signal?.throwIfAborted();
+              if (!filePath) {
+                throw new Error(
+                  'Internal error: writable paged save has no local frozen base path.'
+                );
+              }
+              const fs = getNodeFs();
+              if (!fs) {
+                throw new Error(
+                  'Internal error: writable paged save requires desktop filesystem access.'
+                );
+              }
+              const snapshot = await workerProxy.exportPagedWritableOverlay();
+              // AbortSignal cannot cross worker_threads. Re-check after the
+              // serialized export before starting host filesystem I/O.
+              signal?.throwIfAborted();
+              return writePagedWritableOverlayToFile(
+                fs,
+                filePath,
+                targetPath,
+                snapshot,
+                (level, message, error) => forwardWorkerLog(level, [message, error]),
+                undefined,
+                signal
+              );
+            }
+          : (targetPath: string) => workerProxy.writeToFile(targetPath);
+
         const operationsFacade: DatabaseOperations = {
           engineKind: Promise.resolve('wasm'),
-          executeQuery: (sql: string, params?: CellValue[]) =>
-            workerProxy.runQuery(sql, params),
+          executeQuery: (sql: string, params?: CellValue[], signal?: AbortSignal) => (
+            signal
+              ? callWorkerWithCancellation(
+                  signal,
+                  cancellationFlag => workerProxy.runQuery(sql, params, cancellationFlag)
+                )
+              : workerProxy.runQuery(sql, params)
+          ),
+          getCellMetadata: (target: CellReadTarget) =>
+            workerProxy.getCellMetadata(target),
+          openCellReadSession: (target: CellReadTarget) =>
+            workerProxy.openCellReadSession(target),
+          readCellChunk: (sessionId: string, byteOffset: number, maxBytes: number) =>
+            workerProxy.readCellChunk(sessionId, byteOffset, maxBytes),
+          closeCellReadSession: (sessionId: string) =>
+            workerProxy.closeCellReadSession(sessionId),
+          openQueryReadSession: (sql: string) =>
+            workerProxy.openQueryReadSession(sql),
+          readQueryRows: (sessionId: string, maxRows: number) =>
+            workerProxy.readQueryRows(sessionId, maxRows),
+          closeQueryReadSession: (sessionId: string) =>
+            workerProxy.closeQueryReadSession(sessionId),
+          // Worker facade plumbing; persistence policy belongs to the caller.
           serializeDatabase: () => workerProxy.exportDatabase(),
           applyModifications: (mods: ModificationEntry[], signal?: AbortSignal) =>
             callWorkerAfterAbortCheck(signal, () => workerProxy.applyModifications(mods)),
@@ -661,20 +967,55 @@ async function createWorkerBackedWasmDatabaseConnection(
             callWorkerAfterAbortCheck(signal, () => workerProxy.discardModifications(mods)),
           // Preserve JSON merge patches through worker RPC while transferring
           // a private Uint8Array copy (the host may retain the original in history).
-          updateCell: (table: string, rowId: string | number, column: string, value: CellValue, patch?: string) =>
-            workerProxy.updateCell(table, rowId, column, wrapForTransfer(value), patch),
-          insertRow: (table: string, data: Record<string, CellValue>) => {
+          updateCell: (
+            table: string,
+            rowId: RecordId,
+            column: string,
+            value: CellValue,
+            patch?: string,
+            maxEditValueBytes?: number
+          ) => workerProxy.updateCell(
+            table,
+            rowId,
+            column,
+            wrapForTransfer(value),
+            patch,
+            maxEditValueBytes
+          ),
+          replaceOversizedCell: (
+            table: string,
+            rowId: RecordId,
+            column: string,
+            value: CellValue,
+            expected: OversizedCellMetadata,
+            maxEditValueBytes?: number
+          ) => workerProxy.replaceOversizedCell(
+            table,
+            rowId,
+            column,
+            wrapForTransfer(value),
+            expected,
+            maxEditValueBytes
+          ),
+          insertRow: (
+            table: string,
+            data: Record<string, CellValue>,
+            maxEditValueBytes?: number
+          ) => {
             // Retain caller-owned values because insert history records this object.
             const wrappedData: Record<string, CellValue> = {};
             for (const key of Object.keys(data)) {
               wrappedData[key] = wrapForTransfer(data[key]);
             }
-            return workerProxy.insertRow(table, wrappedData);
+            return workerProxy.insertRow(table, wrappedData, maxEditValueBytes);
           },
-          insertRowBatch: (table: string, rows: Record<string, CellValue>[]) =>
-            workerProxy.insertRowBatch(table, rows),
-          deleteRows: (table: string, rowIds: (string | number)[]) =>
-            workerProxy.deleteRows(table, rowIds),
+          insertRowBatch: (
+            table: string,
+            rows: Record<string, CellValue>[],
+            maxEditValueBytes?: number
+          ) => workerProxy.insertRowBatch(table, rows, maxEditValueBytes),
+          deleteRows: (table: string, rowIds: RecordId[], maxUndoSnapshotBytes?: number) =>
+            workerProxy.deleteRows(table, rowIds, maxUndoSnapshotBytes),
           deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
             workerProxy.deleteColumns(table, columns, dropDependentIndexes),
           findDependentIndexes: (table: string, columns: string[]) =>
@@ -692,8 +1033,22 @@ async function createWorkerBackedWasmDatabaseConnection(
             view: string,
             selectSql: string,
             limit?: number,
-            intent?: ViewDefinitionIntent
-          ) => workerProxy.previewViewDefinition(view, selectSql, limit, intent),
+            intent?: ViewDefinitionIntent,
+            signal?: AbortSignal
+          ) => (
+            signal
+              ? callWorkerWithCancellation(
+                  signal,
+                  cancellationFlag => workerProxy.previewViewDefinition(
+                    view,
+                    selectSql,
+                    limit,
+                    intent,
+                    cancellationFlag
+                  )
+                )
+              : workerProxy.previewViewDefinition(view, selectSql, limit, intent)
+          ),
           createView: (view: string, selectSql: string) =>
             workerProxy.createView(view, selectSql),
           editView: (
@@ -714,13 +1069,23 @@ async function createWorkerBackedWasmDatabaseConnection(
             expectedSql?: string,
             expectedTriggers?: readonly ViewTriggerDefinition[]
           ) => workerProxy.dropView(view, expectedSql, expectedTriggers),
-          updateCellBatch: (table: string, updates: CellUpdate[]) => {
+          updateCellBatch: (
+            table: string,
+            updates: CellUpdate[],
+            maxEditValueBytes?: number,
+            maxUndoSnapshotBytes?: number
+          ) => {
             // Retain caller-owned values because batch history records these updates.
             const wrappedUpdates = updates.map(u => ({
               ...u,
               value: wrapForTransfer(u.value)
             }));
-            return workerProxy.updateCellBatch(table, wrappedUpdates);
+            return workerProxy.updateCellBatch(
+              table,
+              wrappedUpdates,
+              maxEditValueBytes,
+              maxUndoSnapshotBytes
+            );
           },
           addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
             workerProxy.addColumn(table, column, type, defaultValue),
@@ -738,17 +1103,27 @@ async function createWorkerBackedWasmDatabaseConnection(
             workerProxy.setPragma(pragma, value),
           ping: () =>
             workerProxy.ping(),
-          writeToFile: (path: string) =>
-            workerProxy.writeToFile(path)
+          writeToFile
         };
 
         return {
-          databaseOps: operationsFacade,
-          isReadOnly: result.isReadOnly ?? false
+          databaseOps: serializeOperations(operationsFacade),
+          isReadOnly: result.isReadOnly ?? false,
+          storage: result.storage
         };
       } catch (err) {
         // Terminate worker on connection failure to prevent leak
         terminateWorker();
+        if (oversizedFileMessage !== undefined) {
+          // Preserve the configured refusal surface while retaining the
+          // worker's authoritative byte-level reason on the cause chain.
+          const reason = err instanceof Error ? err.message : String(err);
+          GlobalOutputChannel?.appendLine(
+            `[SQLite Explorer] ${displayName}: WebAssembly open failed (${reason}); `
+            + 'reporting the configured maxFileSize refusal.'
+          );
+          throw new Error(oversizedFileMessage, { cause: err });
+        }
         throw err;
       }
     }
@@ -760,17 +1135,15 @@ async function createWorkerBackedWasmDatabaseConnection(
 // ============================================================================
 
 /**
- * Load database file and optional WAL file.
+ * Load the database file content.
  *
  * @param uri - Database file URI
- * @returns Tuple of [database content, WAL content]
+ * @returns Database content (empty for untitled documents)
  */
-async function loadDatabaseFiles(
-  uri: vsc.Uri
-): Promise<[Uint8Array | null, Uint8Array | null]> {
+async function loadDatabaseFile(uri: vsc.Uri): Promise<Uint8Array> {
   // Untitled documents start empty
   if (uri.scheme === 'untitled') {
-    return [new Uint8Array(), null];
+    return new Uint8Array();
   }
 
   const maxSize = getMaximumFileSizeBytes();
@@ -781,12 +1154,84 @@ async function loadDatabaseFiles(
     throw new Error(`File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
   }
 
-  // Construct WAL file URI
-  const walUri = uri.with({ path: uri.path + '-wal' });
+  return vsc.workspace.fs.readFile(uri);
+}
 
-  // Read both files concurrently
-  return Promise.all([
-    vsc.workspace.fs.readFile(uri),
-    Promise.resolve(vsc.workspace.fs.readFile(walUri)).catch(() => null)
-  ]);
+// WAL_HEADER_SIZE_BYTES (frame-detection threshold for sibling -wal files,
+// with the full rationale) lives in ./core/paged-open so the engine-side
+// paged fallback shares the identical definition.
+
+/**
+ * Measure the -wal file next to a database.
+ *
+ * @param uri - Database file URI
+ * @returns Size of the sibling -wal file in bytes, or 0 when it is absent
+ */
+async function statWalSize(uri: vsc.Uri): Promise<number> {
+  if (uri.scheme === 'untitled') {
+    return 0;
+  }
+  const walUri = uri.with({ path: uri.path + '-wal' });
+  try {
+    return (await vsc.workspace.fs.stat(walUri)).size;
+  } catch (err) {
+    const code = (err as { code?: string } | undefined)?.code;
+    if (code === 'FileNotFound' || code === 'ENOENT') {
+      // No -wal file: the database has no separate WAL state to merge.
+      return 0;
+    }
+    // Any other stat failure (permissions, transient provider error) leaves
+    // the WAL state unknowable while committed frames may be invisible to
+    // sql.js — fail toward the read-only gate rather than silently disarming
+    // the only defense against saving a stale view over the real file.
+    GlobalOutputChannel?.appendLine(
+      `SQLite Explorer: could not inspect ${walUri.toString()} (`
+      + `${err instanceof Error ? err.message : String(err)}); `
+      + 'treating WAL state as unknown and opening read-only'
+    );
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+/**
+ * Surface the WAL read-only downgrade to the user.
+ *
+ * The webview only ever receives the bare read-only flag (the browser WAL
+ * guard is silent for the same reason), so the desktop gate raises the reason
+ * here: once as a toast and once in the output channel.
+ */
+function warnWalReadOnlyDowngrade(displayName: string): void {
+  GlobalOutputChannel?.appendLine(
+    `[SQLite Explorer] ${displayName}: uncheckpointed WAL data found next to the database. ` +
+    'The WebAssembly backend reads only the main database file, so the database opens ' +
+    'read-only to avoid saving a stale copy over the WAL transactions. Run ' +
+    '"PRAGMA wal_checkpoint(TRUNCATE)" on it (or close the program writing to it), then reopen.'
+  );
+  // Fire-and-forget: the toast resolves when dismissed and must not block
+  // connection establishment.
+  void vsc.window.showWarningMessage(vsc.l10n.t(
+    '{0} has WAL changes the WebAssembly SQLite backend cannot read, so it is opened read-only and the data shown may be incomplete. Run "PRAGMA wal_checkpoint(TRUNCATE)" on the database (or close the program writing to it), then reopen it.',
+    displayName
+  ));
+}
+
+/**
+ * Surface the paged (page-on-demand) read-only downgrade to the user.
+ *
+ * Same pattern as the WAL gate above: the webview only receives the bare
+ * read-only flag, so the storage limitation is raised here — once as a toast
+ * and once in the output channel. Paging is selected by a dedicated threshold,
+ * so changing maxFileSize is not a way to force materialization.
+ */
+function warnPagedReadOnlyDowngrade(displayName: string): void {
+  GlobalOutputChannel?.appendLine(
+    `[SQLite Explorer] ${displayName}: the WebAssembly backend opened this database ` +
+    'page-on-demand as a read-only snapshot. Reopen with writable page-on-demand support ' +
+    'or use the native desktop backend to edit and save it.'
+  );
+  // Fire-and-forget, matching warnWalReadOnlyDowngrade.
+  void vsc.window.showWarningMessage(vsc.l10n.t(
+    '{0} is open page-on-demand as read-only. Reopen with writable page-on-demand support or use the native desktop backend to edit and save it.',
+    displayName
+  ));
 }

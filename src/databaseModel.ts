@@ -10,11 +10,14 @@ import type { DatabaseViewerProvider } from './editorController';
 
 import * as vsc from 'vscode';
 
-import { ConfigurationSection, FullExtensionId } from './config';
+import { ConfigurationSection, FullExtensionId, getMaxUndoMemoryBytes } from './config';
 import { Disposable } from './lifecycle';
 import { cancelTokenToAbortSignal, getUriParts, generateDatabaseDocumentKey } from './helpers';
 import { HostBridge } from './hostBridge';
-import { DatabaseConnectionBundle } from './connectionTypes';
+import type {
+  DatabaseConnectionBundle,
+  EstablishedDatabaseConnection
+} from './connectionTypes';
 import { DocumentRegistry } from './documentRegistry';
 
 import { createDatabaseConnection } from './workerFactory';
@@ -45,6 +48,20 @@ export interface DocumentContentChange {
   readonly invalidateAllViewDocuments?: boolean;
 }
 
+/**
+ * Narrow state exposed only through the non-production desktop test API.
+ * It observes lifecycle decisions without giving tests an alternate mutation path.
+ */
+export interface DesktopTestDocumentState {
+  referenceCount: number;
+  engineKind: 'native' | 'wasm';
+  storage: 'native' | 'memory' | 'paged';
+  readOnly: boolean;
+  dirty: boolean;
+  workerDisposeRequested: boolean;
+  resolvedEditorCount: number;
+}
+
 // ============================================================================
 // Environment Detection
 // ============================================================================
@@ -73,24 +90,26 @@ export const SupportsWriteMode = IsLocalMode || IsRemoteWorkspaceMode || IsBrows
 /** Maximum modifications to track */
 const MODIFICATION_LIMIT = 100;
 
-/** Default maximum memory for undo history (50MB) */
-const DEFAULT_MAX_UNDO_MEMORY = 50 * 1024 * 1024;
-
 /**
  * Get auto-commit setting from configuration.
  */
 export function isAutoCommitEnabled(): boolean {
   const config = vsc.workspace.getConfiguration(ConfigurationSection);
   const setting = config.get<string>('instantCommit', 'never');
+  // Deliberately configuration-only: the settings modal is a boolean toggle
+  // for always/never and cannot represent the remote-only third state.
   return setting === 'always' || (setting === 'remote-only' && IsRemoteWorkspaceMode);
 }
 
 /**
  * Get maximum undo memory from configuration.
  */
-function getMaxUndoMemory(): number {
-  const config = vsc.workspace.getConfiguration(ConfigurationSection);
-  return config.get<number>('maxUndoMemory', DEFAULT_MAX_UNDO_MEMORY);
+/** Refuse materialization when a paged document cannot reach the local streaming writer. */
+function pagedNonFilePersistenceError(): Error {
+  return new Error(vsc.l10n.t(
+    'Page-on-demand databases cannot be saved to non-file providers because they do not offer ' +
+    'the required streaming path. Save locally, then copy the file.'
+  ));
 }
 
 /** Apply the document's SQL logging decorator consistently across reconnects. */
@@ -129,7 +148,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     viewerProvider: DatabaseViewerProvider,
     fileUri: vsc.Uri,
     openContext: vsc.CustomDocumentOpenContext,
-    cancellation?: vsc.CancellationToken
+    cancellation?: vsc.CancellationToken,
+    knownDocumentKey?: string
   ): Promise<DatabaseDocument> {
     const { reporter, isVerified, context: { extensionUri } } = viewerProvider;
     const configuredForceReadOnly = viewerProvider.forceReadOnly ?? false;
@@ -139,6 +159,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const connectionFactory = createDatabaseConnection;
 
     const { filename } = getUriParts(fileUri);
+    const documentKey = knownDocumentKey ?? await generateDatabaseDocumentKey(fileUri);
     const autoCommit = isAutoCommitEnabled();
 
     let connectionBundle: DatabaseConnectionBundle;
@@ -153,6 +174,14 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     );
     databaseOps = result.databaseOps;
     let isReadOnly = result.isReadOnly ?? configuredForceReadOnly;
+    const engineKind = await databaseOps.engineKind;
+
+    if (engineKind === 'native' && !autoCommit) {
+      viewerProvider.outputChannel?.appendLine(
+        '[Persistence] Native backend active: edits are written to the database file ' +
+        'immediately; sqliteExplorer.instantCommit only controls the in-memory WASM backend.'
+      );
+    }
 
     databaseOps = withSqlLogging(databaseOps, filename, viewerProvider.outputChannel);
 
@@ -163,7 +192,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       const backupData = await vsc.workspace.fs.readFile(backupUri);
       tracker = ModificationTracker.deserialize<DocumentModification>(
         backupData,
-        MODIFICATION_LIMIT
+        MODIFICATION_LIMIT,
+        getMaxUndoMemoryBytes()
       );
 
       try {
@@ -173,7 +203,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         await reconcileRestoredDatabase(
           databaseOps,
           tracker,
-          await databaseOps.engineKind,
+          engineKind,
           cancelTokenToAbortSignal(cancellation)
         );
       } catch (err) {
@@ -200,11 +230,12 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       fileUri,
       tracker,
       autoCommit,
-      { databaseOps, isReadOnly },
+      { databaseOps, isReadOnly, storage: result.storage },
       connectionBundle.workerMethods,
       connectionBundle.establishConnection.bind(connectionBundle),
       reporter,
-      forceReadOnlyOnReconnect
+      forceReadOnlyOnReconnect,
+      documentKey
     );
   }
 
@@ -218,32 +249,118 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   readonly #hostBridge: HostBridge;
   readonly #forceReadOnlyOnReconnect: boolean;
   #connectionGeneration = 0;
+  #activeMutations = 0;
+  /** Serializes history admission through post-backend recording. */
+  #historyMutationTail: Promise<void> = Promise.resolve();
+  #pagedSaveExclusive = false;
+  #pagedSaveRecoveryRequired = false;
+  readonly #mutationDrainWaiters = new Set<() => void>();
+  #referenceCount = 1;
+  #workerDisposeRequested = false;
 
   private constructor(
     readonly viewerProvider: DatabaseViewerProvider,
     readonly uri: vsc.Uri,
     tracker: ModificationTracker<DocumentModification> | null,
     public autoCommitEnabled: boolean,
-    private connectionState: { databaseOps: DatabaseOperations; isReadOnly?: boolean },
+    private connectionState: EstablishedDatabaseConnection,
     private readonly workerMethods: DatabaseConnectionBundle['workerMethods'],
     private readonly establishConnection: DatabaseConnectionBundle['establishConnection'],
     private readonly reporter?: TelemetryReporter,
-    forceReadOnlyOnReconnect: boolean = viewerProvider.forceReadOnly ?? false
+    forceReadOnlyOnReconnect: boolean = viewerProvider.forceReadOnly ?? false,
+    documentKey: string = ''
   ) {
     super();
     this.#forceReadOnlyOnReconnect = forceReadOnlyOnReconnect;
-    this.#modificationTracker = tracker ?? new ModificationTracker<DocumentModification>(MODIFICATION_LIMIT, getMaxUndoMemory());
+    this.#modificationTracker = tracker ?? new ModificationTracker<DocumentModification>(
+      MODIFICATION_LIMIT,
+      getMaxUndoMemoryBytes()
+    );
     this.#hostBridge = new HostBridge(viewerProvider, this);
-    this.#documentKey = generateDatabaseDocumentKey(this.uri);
-    this.#documentKey.then(key => DocumentRegistry.set(key, this));
+    this.#documentKey = Promise.resolve(documentKey);
+    DocumentRegistry.set(documentKey, this);
   }
 
   // Public accessors
   get fileParts() { return getUriParts(this.uri); }
   get hostBridge() { return this.#hostBridge; }
   get documentKey() { return this.#documentKey; }
+  get undoMemoryLimitBytes() { return this.#modificationTracker.memoryLimitBytes; }
   /** Monotonic barrier for host operations that span a database reload. */
   get connectionGeneration() { return this.#connectionGeneration; }
+
+  /**
+   * Keep a complete host mutation (backend write plus history/event update)
+   * visible to paged save's exclusive barrier. The flag is only raised for a
+   * writable paged save, so other storage modes retain their existing behavior.
+   */
+  async runTrackedMutation<T>(
+    operation: () => T | PromiseLike<T>,
+    recordsHistory: boolean = false
+  ): Promise<T> {
+    if (this.#pagedSaveExclusive) {
+      throw new Error(vsc.l10n.t(
+        'The document is temporarily read-only while its page-on-demand save is in progress.'
+      ));
+    }
+    this.#activeMutations++;
+    let waitForHistoryMutation: Promise<void> | undefined;
+    let releaseHistoryMutation: (() => void) | undefined;
+    if (recordsHistory) {
+      // Keep admission, backend mutation, and history recording in one ordered
+      // lifecycle. Otherwise two concurrent edits can both pass the last slot;
+      // the loser would mutate SQLite before recordEntry observes saturation.
+      waitForHistoryMutation = this.#historyMutationTail;
+      this.#historyMutationTail = new Promise<void>(resolve => {
+        releaseHistoryMutation = resolve;
+      });
+    }
+    try {
+      if (waitForHistoryMutation) {
+        await waitForHistoryMutation;
+        this.#modificationTracker.ensureCanRecord();
+      }
+      return await operation();
+    } finally {
+      releaseHistoryMutation?.();
+      this.#activeMutations--;
+      if (this.#activeMutations === 0) {
+        for (const resolve of this.#mutationDrainWaiters) resolve();
+        this.#mutationDrainWaiters.clear();
+      }
+    }
+  }
+
+  /** Reject new mutations, then wait until prior writes have updated history. */
+  #beginPagedSaveExclusive(): Promise<void> {
+    if (this.#pagedSaveExclusive) {
+      throw new Error(vsc.l10n.t('A page-on-demand save is already in progress.'));
+    }
+    this.#pagedSaveExclusive = true;
+    return (async () => {
+      if (this.#activeMutations > 0) {
+        await new Promise<void>(resolve => this.#mutationDrainWaiters.add(resolve));
+      }
+      // A tracked mutation releases only after its history/event work, but this
+      // extra turn also drains promise continuations from backend calls that were
+      // already resolving as the exclusive flag was raised.
+      await Promise.resolve();
+      // Only a connection replacement invalidates the post-RPC generation
+      // checks captured by an earlier tracked mutation. Advancing this before
+      // the drain makes a successful backend write look like a failed reload
+      // and drops its history entry even though the save persists the edit.
+      this.#connectionGeneration++;
+      this.connectionState.isReadOnly = true;
+      // The worker endpoint serializes writable-paged operations. Its ping is a
+      // real worker-side drain even if an earlier host RPC timed out first.
+      await this.databaseOperations.ping();
+    })();
+  }
+
+  #endPagedSaveExclusive(): void {
+    this.#pagedSaveExclusive = false;
+    this.#pagedSaveRecoveryRequired = false;
+  }
 
   // ============================================================================
   // Event Emitters
@@ -268,10 +385,25 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   // Lifecycle
   // ============================================================================
 
+  /** Retain the shared document for another provider-level custom document. */
+  retainReference(): void {
+    if (this.#referenceCount === 0 || this.isDisposed) {
+      throw new Error('Cannot retain a disposed database document');
+    }
+    this.#referenceCount++;
+  }
+
   async dispose(): Promise<void> {
+    if (this.#referenceCount === 0) return;
+    this.#referenceCount--;
+    if (this.#referenceCount > 0) return;
+
     const key = await this.#documentKey;
-    DocumentRegistry.delete(key);
+    if (DocumentRegistry.get(key) === this) {
+      DocumentRegistry.delete(key);
+    }
     this.workerMethods[Symbol.dispose]();
+    this.#workerDisposeRequested = true;
     // Consumers must see disposal before the registered emitter itself is
     // disposed by the base class, otherwise their cleanup callbacks never run.
     this.#disposeEmitter.fire();
@@ -287,21 +419,60 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    */
   recordModification(modification: DocumentModification): void {
     const tracker = this.#modificationTracker;
-    tracker.record(modification);
+    const historyWasBlocked = tracker.isHistoryRecordingBlockedByBarrierLimit;
+    if (modification.undoPolicy === 'barrier') {
+      tracker.recordBarrier(modification);
+    } else {
+      tracker.record(modification);
+    }
 
     // Ensure future stack is cleared so we don't have stale redo actions
     // This is handled by tracker.record, but explicit check in emitter helps
 
+    // VS Code keeps one custom-document model per viewType. When two viewTypes
+    // share this DatabaseDocument, both models receive this event and retain
+    // distinct host edit IDs whose callbacks point at this one logical edit.
+    // Keep those callbacks synchronized so consuming the duplicate host entry
+    // cannot advance the shared tracker to an unrelated modification.
+    let editState: 'applied' | 'undoing' | 'undone' | 'redoing' = 'applied';
+
     this.#modificationEmitter.fire({
       label: modification.label,
-      undo: async () => {
+      undo: () => this.runTrackedMutation(async () => {
+        if (editState !== 'applied') return;
+        editState = 'undoing';
+
         const undoneEntry = tracker.stepBack();
         if (!undoneEntry) {
-            GlobalOutputChannel?.appendLine('[Undo] No entry found in tracker');
+          editState = 'applied';
+          if (tracker.isUndoBlockedByBarrier) {
+            const blocked = tracker.undoBlockingEntry;
+            await vsc.window.showWarningMessage(vsc.l10n.t(
+              blocked?.undoBarrierKind === 'persistent_pragma'
+                ? 'Persistent PRAGMA changes cannot be undone reliably. Use File Revert or Reload to restore the saved database.'
+                : 'This oversized cell replacement cannot be undone. Undo cannot cross its history barrier.'
+            ));
             return;
+          }
+          GlobalOutputChannel?.appendLine('[Undo] No entry found in tracker');
+          return;
+        }
+        if (undoneEntry !== modification) {
+          const restoredEntry = tracker.stepForward();
+          editState = 'applied';
+          if (restoredEntry !== undoneEntry) {
+            GlobalOutputChannel?.appendLine(
+              '[Undo] Failed to restore tracker after an out-of-order custom-editor callback'
+            );
+          }
+          GlobalOutputChannel?.appendLine(
+            `[Undo] Ignored out-of-order custom-editor callback for ${modification.label}`
+          );
+          return;
         }
         try {
             await this.databaseOperations.undoModification(undoneEntry);
+            editState = 'undone';
             this.#contentChangeEmitter.fire({
               modification: undoneEntry,
               modificationDirection: 'undo'
@@ -314,19 +485,38 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
                   '[Undo] Failed to restore tracker position after database undo failed'
                 );
             }
+            editState = 'applied';
             const errorMessage = e instanceof Error ? e.message : String(e);
             GlobalOutputChannel?.appendLine(`[Undo] Failed: ${errorMessage}`);
             vsc.window.showErrorMessage(vsc.l10n.t('Undo failed: {0}', errorMessage));
         }
-      },
-      redo: async () => {
+      }),
+      redo: () => this.runTrackedMutation(async () => {
+        if (editState !== 'undone') return;
+        editState = 'redoing';
+
         const redoneEntry = tracker.stepForward();
         if (!redoneEntry) {
+            editState = 'undone';
             GlobalOutputChannel?.appendLine('[Redo] No entry found in tracker');
+            return;
+        }
+        if (redoneEntry !== modification) {
+            const restoredEntry = tracker.stepBack();
+            editState = 'undone';
+            if (restoredEntry !== redoneEntry) {
+                GlobalOutputChannel?.appendLine(
+                  '[Redo] Failed to restore tracker after an out-of-order custom-editor callback'
+                );
+            }
+            GlobalOutputChannel?.appendLine(
+              `[Redo] Ignored out-of-order custom-editor callback for ${modification.label}`
+            );
             return;
         }
         try {
             await this.databaseOperations.redoModification(redoneEntry);
+            editState = 'applied';
             this.#contentChangeEmitter.fire({
               modification: redoneEntry,
               modificationDirection: 'forward'
@@ -339,12 +529,35 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
                    '[Redo] Failed to restore tracker position after database redo failed'
                  );
              }
+             editState = 'undone';
              const errorMessage = e instanceof Error ? e.message : String(e);
              GlobalOutputChannel?.appendLine(`[Redo] Failed: ${errorMessage}`);
              vsc.window.showErrorMessage(vsc.l10n.t('Redo failed: {0}', errorMessage));
         }
-      }
+      })
     });
+
+    if (
+      !historyWasBlocked
+      && tracker.isHistoryRecordingBlockedByBarrierLimit
+    ) {
+      const message = vsc.l10n.t(
+        'Undo history reached its configured limit after a forward-only edit. ' +
+        'Current changes remain dirty and protected for recovery, but further edits are blocked. ' +
+        'Save the database before making more changes.'
+      );
+      try {
+        void Promise.resolve(vsc.window.showWarningMessage(message)).catch(error => {
+          GlobalOutputChannel?.appendLine(
+            `[Undo history warning failed] ${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+      } catch (error) {
+        GlobalOutputChannel?.appendLine(
+          `[Undo history warning failed] ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
 
     this.#autoSaveIfNeeded();
   }
@@ -377,12 +590,14 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * For native SQLite engine: changes are already persisted to disk via SQLite's
    * auto-commit, so we just need to create a checkpoint for undo/redo tracking.
    *
-   * For WASM engine: we need to serialize the in-memory database and write to disk.
+   * For WASM engine: memory-backed databases serialize to a full image, while
+   * writable paged databases use the local streaming writer.
    */
   async save(cancellation?: vsc.CancellationToken): Promise<void> {
     if (cancellation?.isCancellationRequested) {
       throw new vsc.CancellationError();
     }
+    const saveSignal = cancelTokenToAbortSignal(cancellation);
     await this.ensureWritable();
 
     // Check if using native engine - changes are already on disk
@@ -407,31 +622,90 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       throw new vsc.CancellationError();
     }
 
+    const pagedSave = this.connectionState.storage === 'paged';
+    if (pagedSave && this.uri.scheme !== 'file') {
+      throw pagedNonFilePersistenceError();
+    }
+
     // Export in-memory database to file (WASM engine only)
     // We always do this for WASM, regardless of auto-commit setting, because WASM is in-memory.
     if (this.uri.scheme === 'file') {
+        const priorReadOnlyState = this.connectionState.isReadOnly;
+        let baseReplaced = false;
+        let pagedExclusiveOwned = false;
         try {
+            if (pagedSave) {
+              const drain = this.#beginPagedSaveExclusive();
+              pagedExclusiveOwned = true;
+              await drain;
+              saveSignal?.throwIfAborted();
+            }
             // Capture the tracker position that matches the database snapshot
             // exported by writeToFile(). If undo, rollback, or history eviction
             // changes the retained timeline while the async filesystem write is
             // pending, the saved bytes no longer match the live tracker state.
+            // Paged saves take this position only after their mutation drain.
             const fileCheckpoint = this.#modificationTracker.getCurrentPosition();
             const fileCheckpointInvalidationRevision =
               this.#modificationTracker.getCheckpointInvalidationRevision();
-            await this.databaseOperations.writeToFile(this.uri.fsPath);
+            await this.databaseOperations.writeToFile(
+              this.uri.fsPath,
+              pagedSave ? saveSignal : undefined
+            );
+            baseReplaced = true;
+            if (pagedSave) {
+              // The old hostIo still owns a descriptor for the frozen pre-save
+              // inode. Reopen before exposing writability so later overlay reads
+              // are based on the atomically replaced merged image.
+              await this.#reconnectFromDisk();
+            }
             if (
               this.#modificationTracker.getCheckpointInvalidationRevision() ===
               fileCheckpointInvalidationRevision
             ) {
               this.#modificationTracker.createCheckpointAt(fileCheckpoint);
             }
+            if (pagedExclusiveOwned) {
+              this.#endPagedSaveExclusive();
+              pagedExclusiveOwned = false;
+            }
             return;
         } catch (e) {
+            if (pagedSave) {
+              if (!baseReplaced) {
+                // Export/temporary-write failure leaves the original overlay and
+                // base intact, so the user can finish the edit and retry.
+                if (pagedExclusiveOwned) {
+                  this.#endPagedSaveExclusive();
+                  this.connectionState.isReadOnly = priorReadOnlyState;
+                }
+                if (saveSignal?.aborted && e === saveSignal.reason) {
+                  throw new vsc.CancellationError();
+                }
+                throw e;
+              }
+              // Rename completed but the replacement connection failed. The
+              // saved file is durable; fail closed because the old engine still
+              // references the pre-rename inode (or was shut down while reopening).
+              this.connectionState.isReadOnly = true;
+              this.#pagedSaveRecoveryRequired = true;
+              throw new Error(
+                'Database was saved, but its page-on-demand session could not be reopened. '
+                + 'Reload the document before making more edits.',
+                { cause: e }
+              );
+            }
+            if (saveSignal?.aborted && e === saveSignal.reason) {
+              throw new vsc.CancellationError();
+            }
             // Fallback if direct write fails
             this.viewerProvider.outputChannel?.appendLine(`[Fallback] Direct write failed, falling back to buffer transfer: ${e instanceof Error ? e.message : String(e)}`);
         }
     }
 
+    // Paged documents were refused above unless the local streaming writer
+    // handled them. Whole-image materialization remains only for memory-backed
+    // WASM saves (including memory-backed non-file providers).
     const { filename } = this.fileParts;
     const binaryContent = await this.databaseOperations.serializeDatabase();
     // Capture the tracker position immediately after serialization. The bytes
@@ -468,18 +742,78 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * Save document to new location.
    */
   async saveAs(targetUri: vsc.Uri, cancellation: vsc.CancellationToken): Promise<void> {
+    if (cancellation?.isCancellationRequested) {
+      throw new vsc.CancellationError();
+    }
+    const saveSignal = cancelTokenToAbortSignal(cancellation);
     await this.ensureWritable();
 
+    const pagedSaveAs = this.connectionState.storage === 'paged';
+    if (pagedSaveAs && targetUri.scheme !== 'file') {
+      throw pagedNonFilePersistenceError();
+    }
+
     if (targetUri.scheme === 'file') {
+        const priorReadOnlyState = this.connectionState.isReadOnly;
+        let baseReplaced = false;
+        let pagedExclusiveOwned = false;
         try {
+            if (pagedSaveAs) {
+              // Freeze and drain for the whole export/write window. This is
+              // also required when an alias makes Save As replace the base.
+              const drain = this.#beginPagedSaveExclusive();
+              pagedExclusiveOwned = true;
+              await drain;
+              saveSignal?.throwIfAborted();
+            }
             // Use optimized write/vacuum if available
-            await this.databaseOperations.writeToFile(targetUri.fsPath);
+            const result = await this.databaseOperations.writeToFile(
+              targetUri.fsPath,
+              pagedSaveAs ? saveSignal : undefined
+            );
+            baseReplaced = result?.requiresReopen === true;
+            if (baseReplaced) {
+              await this.#reconnectFromDisk();
+            } else if (pagedSaveAs) {
+              this.connectionState.isReadOnly = priorReadOnlyState;
+            }
+            if (pagedExclusiveOwned) {
+              this.#endPagedSaveExclusive();
+              pagedExclusiveOwned = false;
+            }
             return;
         } catch (e) {
+             if (pagedSaveAs) {
+               if (!baseReplaced) {
+                 // No rename of the active base occurred, so the original
+                 // overlay remains valid and can be edited/retried.
+                 if (pagedExclusiveOwned) {
+                   this.#endPagedSaveExclusive();
+                   this.connectionState.isReadOnly = priorReadOnlyState;
+                 }
+                 if (saveSignal?.aborted && e === saveSignal.reason) {
+                   throw new vsc.CancellationError();
+                 }
+                 throw e;
+               }
+               this.connectionState.isReadOnly = true;
+               this.#pagedSaveRecoveryRequired = true;
+               throw new Error(
+                 'Database was saved, but its page-on-demand session could not be reopened. '
+                 + 'Reload the document before making more edits.',
+                 { cause: e }
+               );
+             }
+             if (saveSignal?.aborted && e === saveSignal.reason) {
+               throw new vsc.CancellationError();
+             }
              this.viewerProvider.outputChannel?.appendLine(`[Fallback] Direct write failed, falling back to buffer transfer: ${e instanceof Error ? e.message : String(e)}`);
         }
     }
 
+    // The paged case cannot reach this full-image fallback. Memory-backed WASM
+    // Save As retains the existing materialization behavior for file and
+    // non-file targets.
     const fileStat = await vsc.workspace.fs.stat(this.uri);
     if (fileStat.size > this.getFileSizeLimit()) {
       throw new Error(vsc.l10n.t('Database too large for copy operation'));
@@ -494,14 +828,38 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * Revert to last saved state.
    */
   async revert(cancellation: vsc.CancellationToken): Promise<void> {
+    return this.runTrackedMutation(() => this.#revert(cancellation));
+  }
+
+  async #revert(cancellation: vsc.CancellationToken): Promise<void> {
     await this.ensureWritable();
+    const historyBarriers = this.#modificationTracker.getUncommittedHistoryBarriers();
+    if (historyBarriers.some(entry => entry.undoBarrierKind !== 'persistent_pragma')) {
+      const message = vsc.l10n.t(
+        'The prior value was not retained for an oversized-cell replacement. ' +
+        'File Revert cannot cross that edit; save the database first to establish a new baseline.'
+      );
+      await vsc.window.showWarningMessage(message);
+      throw new Error('File Revert cannot cross an unsaved oversized-cell history barrier');
+    }
     let invalidatedByRecoveryReload = false;
     try {
-      await revertDatabaseToSaved(
-        this.databaseOperations,
-        this.#modificationTracker,
-        cancelTokenToAbortSignal(cancellation)
-      );
+      if (historyBarriers.length > 0) {
+        // Persistent PRAGMAs are deliberately forward-only: auto_vacuum in
+        // particular cannot always be restored by assigning the prior value.
+        // File Revert can safely discard the overlay by reopening saved bytes.
+        await this.#reloadFromDisk();
+        this.#modificationTracker.rollbackToCheckpoint();
+        invalidatedByRecoveryReload = true;
+      } else {
+        // Revert mutates the live engine by replaying retained history; it never
+        // serializes a whole database image, including for paged documents.
+        await revertDatabaseToSaved(
+          this.databaseOperations,
+          this.#modificationTracker,
+          cancelTokenToAbortSignal(cancellation)
+        );
+      }
     } catch (error) {
       if (!isInvocationTimeoutError(error)) throw error;
 
@@ -548,7 +906,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   async #autoSaveIfNeeded(): Promise<void> {
     try {
       if (this.autoCommitEnabled) {
-        if (this.#hasActiveViewer) {
+        if (this.#activeViewers.size > 0) {
           await this.triggerSave();
         } else {
           this.#savePending = true;
@@ -561,9 +919,20 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     }
   }
 
-  #hasActiveViewer = false;
-  set hasActiveViewer(value: boolean) {
-    this.#hasActiveViewer = value;
+  // A document can be shared by panels owned by different editor providers.
+  // Track every panel here so an inactive sibling cannot hide an active view.
+  readonly #activeViewers = new Set<vsc.WebviewPanel>();
+
+  setViewerActive(viewer: vsc.WebviewPanel, active: boolean): void {
+    if (active) {
+      this.#activeViewers.add(viewer);
+    } else {
+      this.#activeViewers.delete(viewer);
+    }
+  }
+
+  removeViewer(viewer: vsc.WebviewPanel): void {
+    this.#activeViewers.delete(viewer);
   }
 
   #savePending = false;
@@ -588,6 +957,27 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     return this.connectionState.isReadOnly ?? false;
   }
 
+  /** True only while edits can persist through the page-on-demand overlay. */
+  get isPagedWritableMode(): boolean {
+    return this.connectionState.storage === 'paged' && !this.isReadOnlyMode;
+  }
+
+  /** Snapshot for the non-production desktop host-integration API. */
+  async getDesktopTestState(): Promise<DesktopTestDocumentState> {
+    const engineKind = await this.databaseOperations.engineKind;
+    return {
+      referenceCount: this.#referenceCount,
+      engineKind,
+      storage: engineKind === 'native'
+        ? 'native'
+        : this.connectionState.storage ?? 'memory',
+      readOnly: this.isReadOnlyMode,
+      dirty: this.#modificationTracker.hasUncommittedChanges(),
+      workerDisposeRequested: this.#workerDisposeRequested,
+      resolvedEditorCount: Array.from(this.viewerProvider.webviews.get(this.uri)).length
+    };
+  }
+
   get cellEditBehavior(): string {
     const config = vsc.workspace.getConfiguration(ConfigurationSection);
     return config.get<string>('doubleClickBehavior', 'inline');
@@ -597,6 +987,26 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * Reload database from disk.
    */
   async reloadFromDisk(): Promise<DatabaseOperations> {
+    if (this.#pagedSaveRecoveryRequired) {
+      // The atomic rename already committed the saved image. The stale engine
+      // cannot be mutated while #pagedSaveExclusive remains raised, so this one
+      // disk reopen is safe by construction and is the recovery prescribed by
+      // the post-save error. Claim the attempt before awaiting so concurrent
+      // Reload requests still hit the ordinary exclusive barrier.
+      this.#pagedSaveRecoveryRequired = false;
+      try {
+        const reloaded = await this.#reloadFromDisk();
+        this.#endPagedSaveExclusive();
+        return reloaded;
+      } catch (error) {
+        this.#pagedSaveRecoveryRequired = true;
+        throw error;
+      }
+    }
+    return this.runTrackedMutation(() => this.#reloadFromDisk());
+  }
+
+  async #reloadFromDisk(): Promise<DatabaseOperations> {
     // Advance before the first await. Host mutations that already captured this
     // document must not finish a preliminary read and then dispatch their write
     // into the replacement worker endpoint.
@@ -631,7 +1041,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     );
     this.connectionState = {
       databaseOps,
-      isReadOnly: this.#forceReadOnlyOnReconnect || !!result.isReadOnly
+      isReadOnly: this.#forceReadOnlyOnReconnect || !!result.isReadOnly,
+      storage: result.storage
     };
     return databaseOps;
   }
@@ -644,6 +1055,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     destination: vsc.Uri,
     _cancellation: vsc.CancellationToken
   ): Promise<vsc.CustomDocumentBackup> {
+    // Hot-exit persists only ModificationTracker history. It never copies the
+    // database image, so a multi-gigabyte paged base is not materialized here.
     const serializedState = this.#modificationTracker.serialize();
     await vsc.workspace.fs.writeFile(destination, serializedState);
 

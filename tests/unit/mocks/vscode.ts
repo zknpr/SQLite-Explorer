@@ -15,6 +15,8 @@ class classEventEmitter {
     }
 }
 
+const closeTextDocumentEmitter = new classEventEmitter();
+
 export const mockVscode = {
     Uri: {
         parse: (path: string) => {
@@ -105,11 +107,18 @@ export const mockVscode = {
         executeCommand: (command: string, ...args: any[]) => Promise.resolve()
     },
     window: {
-        showInformationMessage: () => Promise.resolve(),
-        showWarningMessage: () => Promise.resolve(),
-        showErrorMessage: () => Promise.resolve(),
-        showSaveDialog: () => Promise.resolve(),
-        showOpenDialog: () => Promise.resolve(),
+        showInformationMessage: (_message: string, ..._items: any[]) => Promise.resolve(),
+        showWarningMessage: (_message: string, ..._items: any[]) => Promise.resolve(),
+        showErrorMessage: (_message: string, ..._items: any[]) => Promise.resolve(),
+        showSaveDialog: (_options?: any) => Promise.resolve(),
+        showOpenDialog: (_options?: any) => Promise.resolve(),
+        withProgress: (_options: unknown, task: Function) => task(
+            { report: () => {} },
+            {
+                isCancellationRequested: false,
+                onCancellationRequested: () => ({ dispose: () => {} })
+            }
+        ),
     },
     workspace: {
         _config: new Map<string, unknown>(),
@@ -123,10 +132,23 @@ export const mockVscode = {
             };
         },
         getWorkspaceFolder: () => undefined,
+        onDidCloseTextDocument: closeTextDocumentEmitter.event,
+        __fireDidCloseTextDocument: (document: any) => closeTextDocumentEmitter.fire(document),
         fs: {
-            readFile: () => Promise.resolve(new Uint8Array()),
-            writeFile: () => Promise.resolve()
+            stat: (_uri: any) => Promise.resolve({
+                type: 1,
+                ctime: 0,
+                mtime: 0,
+                size: 0
+            }),
+            readFile: (_uri: any) => Promise.resolve(new Uint8Array()),
+            writeFile: (_uri: any, _bytes: Uint8Array) => Promise.resolve(),
+            rename: (_from: any, _to: any, _options?: any) => Promise.resolve(),
+            delete: (_uri: any, _options?: any) => Promise.resolve()
         }
+    },
+    ProgressLocation: {
+        Notification: 15
     },
     ViewColumn: {
         Two: 2

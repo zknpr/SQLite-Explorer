@@ -5,11 +5,48 @@ import { state } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus, updateToolbarButtons } from './ui.js';
 import { loadTableData } from './grid.js';
-import { getCellValueForDisplay, getRowDataOffset } from './data-utils.js';
+import { noteCellValuesChanged } from './count-cache.js';
+import {
+    getCellValueForDisplay,
+    getCellMutationBlockReason,
+    getOversizedCellMetadata,
+    getRowDataOffset,
+    remapDisplayedRowIdentity,
+    resolveDisplayedCell
+} from './data-utils.js';
 import { validateRowId, escapeIdentifier } from './utils.js';
+
+const TRUNCATED_COPY_NOTICE =
+    'Copy blocked: selection contains truncated data. Use Open Full Content for one cell or Export for complete rows.';
+
+function refuseTruncatedCellSelection() {
+    if (state.selectedCells.some(cell => getOversizedCellMetadata(cell.rowIdx, cell.colIdx))) {
+        updateStatus(TRUNCATED_COPY_NOTICE);
+        return true;
+    }
+    return false;
+}
+
+function refuseTruncatedRowSelection() {
+    for (let rowIdx = 0; rowIdx < state.gridData.length; rowIdx++) {
+        const row = state.gridData[rowIdx];
+        const rowId = state.selectedTableType === 'table'
+            ? row[0]
+            : state.currentPageIndex * state.rowsPerPage + rowIdx;
+        if (!state.selectedRowIds.has(rowId)) continue;
+        if (state.tableColumns.some((_column, colIdx) => (
+            getOversizedCellMetadata(rowIdx, colIdx)
+        ))) {
+            updateStatus(TRUNCATED_COPY_NOTICE);
+            return true;
+        }
+    }
+    return false;
+}
 
 export async function copyCellsToClipboard() {
     if (state.selectedCells.length === 0) return;
+    if (refuseTruncatedCellSelection()) return;
 
     try {
         let clipboardText;
@@ -72,6 +109,7 @@ export async function copyCellsToClipboard() {
 
 export async function copySelectedRowsToClipboard() {
     if (state.selectedRowIds.size === 0) return;
+    if (refuseTruncatedRowSelection()) return;
 
     try {
         // Collect rows
@@ -117,6 +155,13 @@ export async function clearSelectedCellValues() {
         updateStatus('Views are read-only');
         return;
     }
+    for (const cell of state.selectedCells) {
+        const mutationBlockReason = getCellMutationBlockReason(cell.rowIdx, cell.colIdx);
+        if (mutationBlockReason) {
+            updateStatus(mutationBlockReason);
+            return;
+        }
+    }
 
     try {
         updateStatus('Clearing cells...');
@@ -141,7 +186,32 @@ export async function clearSelectedCellValues() {
         }
 
         const label = `Clear ${updates.length} cell${updates.length > 1 ? 's' : ''}`;
-        await backendApi.updateCellBatch(state.selectedTable, updates, label);
+        // Snapshot the target so the cache note below can never be applied to
+        // a table the user switched to while the batch RPC was in flight.
+        const targetTable = state.selectedTable;
+        const outcomes = await backendApi.updateCellBatch(targetTable, updates, label);
+        // Cleared values may leave an active filter's match set, so the
+        // table's cached filtered counts are no longer trustworthy.
+        noteCellValuesChanged(targetTable);
+        for (const outcome of outcomes ?? []) {
+            const currentCell = resolveDisplayedCell(
+                state.selectedTable,
+                outcome.rowId,
+                outcome.columnName
+            ) ?? (outcome.newRowId !== undefined
+                ? resolveDisplayedCell(
+                    state.selectedTable,
+                    outcome.newRowId,
+                    outcome.columnName
+                )
+                : null);
+            remapDisplayedRowIdentity(
+                state.selectedTable,
+                outcome.rowId,
+                outcome.newRowId,
+                currentCell
+            );
+        }
 
         // Update local grid
         for (const update of updates) {

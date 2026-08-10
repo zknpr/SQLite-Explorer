@@ -9,6 +9,7 @@ import { clearSelection, loadTableColumns, loadTableData } from './grid.js';
 import { showEmptyState, updateStatus, updateToolbarButtons } from './ui.js';
 import { formatCellValueAsText } from './utils.js';
 import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
+import { invalidateAllCounts } from './count-cache.js';
 import {
     isViewDefinitionConflictError,
     isViewDefinitionSnapshotCurrent,
@@ -57,8 +58,8 @@ function renderPreview(result) {
     if (!preview) return;
     preview.replaceChildren();
 
-    const headers = result?.headers ?? result?.columns ?? [];
-    const rows = result?.rows ?? result?.values ?? [];
+    const headers = result?.headers ?? [];
+    const rows = result?.rows ?? [];
     const table = document.createElement('table');
     table.className = 'view-preview-table';
 
@@ -257,7 +258,7 @@ async function previewDraft() {
         );
         if (!isCurrentPreview()) return;
         renderPreview(result);
-        const rowCount = result?.rows?.length ?? result?.values?.length ?? 0;
+        const rowCount = result?.rows?.length ?? 0;
         setFeedback(`Preview returned ${rowCount} row${rowCount === 1 ? '' : 's'} (maximum 50).`);
     } catch (err) {
         if (!isCurrentPreview()) return;
@@ -329,6 +330,12 @@ async function saveDraft() {
         }
 
         const changedView = targetView ?? draft.name;
+        // A redefined view is a different query — and any OTHER view that
+        // projects it changed row set too, without a table switch to
+        // invalidate for it (the modal can edit view B while view A stays
+        // selected). Wholesale invalidation is the only sound scope here;
+        // it costs one count refetch on the next load.
+        invalidateAllCounts();
         if (isCurrentModalSession(modalSession)) closeModal('viewModal');
         await refreshSchema();
         if (state.selectedTable === changedView && state.selectedTableType === 'view') {
@@ -431,6 +438,9 @@ export async function dropViewFromSidebar(view) {
             state.renderedTable = null;
             state.tableColumns = [];
             state.gridData = [];
+            state.gridExactIntegerTexts = {};
+            state.gridOversizedCells = {};
+            state.gridReadOnlyRowReasons = {};
             document.getElementById('tableNameLabel').textContent = 'No table selected';
             showEmptyState();
             updateToolbarButtons();

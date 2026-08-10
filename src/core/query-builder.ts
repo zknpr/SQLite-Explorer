@@ -5,15 +5,25 @@
  */
 import { escapeIdentifier, escapeLikePattern } from './sql-utils';
 import { getActiveFilterValue } from './filter-utils';
+import { assembleKeysetSelect, type ResolvedKeysetPlan } from './keyset-pagination';
 import type { CellValue, TableQueryOptions, TableCountOptions } from './types';
 
 /**
  * Build a SELECT query from options.
+ *
+ * `keysetPlan` is an engine-resolved (never webview-supplied) seek plan; when
+ * present it owns ORDER BY and LIMIT, and the options' orderBy/limit/offset
+ * are ignored. Without it the emitted SQL is unchanged.
  */
-export function buildSelectQuery(table: string, options: TableQueryOptions): { sql: string; params: CellValue[] } {
+export function buildSelectQuery(
+  table: string,
+  options: TableQueryOptions,
+  keysetPlan?: ResolvedKeysetPlan
+): { sql: string; params: CellValue[] } {
   const {
     columns = ['*'],
     orderBy,
+    orderByColumns,
     orderDir = 'ASC',
     limit,
     offset,
@@ -41,12 +51,28 @@ export function buildSelectQuery(table: string, options: TableQueryOptions): { s
   whereClauses.push(...conditions);
   params.push(...filterParams);
 
+  if (keysetPlan) {
+    return assembleKeysetSelect({
+      selectListSql: escapedColumns,
+      escapedTable,
+      whereClauses,
+      filterParams: params,
+      plan: keysetPlan
+    });
+  }
+
   if (whereClauses.length > 0) {
     sql += ` WHERE ${whereClauses.join(' AND ')}`;
   }
 
-  if (orderBy) {
-    sql += ` ORDER BY ${escapeIdentifier(orderBy)} ${orderDir === 'DESC' ? 'DESC' : 'ASC'}`;
+  const orderedColumns = orderByColumns?.length
+    ? orderByColumns
+    : (orderBy ? [orderBy] : []);
+  if (orderedColumns.length > 0) {
+    const direction = orderDir === 'DESC' ? 'DESC' : 'ASC';
+    sql += ` ORDER BY ${orderedColumns
+      .map(column => `${escapeIdentifier(column)} ${direction}`)
+      .join(', ')}`;
   }
 
   if (typeof limit === 'number') {

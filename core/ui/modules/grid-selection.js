@@ -102,3 +102,20 @@ export function clearSelection() {
     updateToolbarButtons();
     updateBatchSidebar();
 }
+
+/**
+ * Drop only the staged cell selection. Each entry's rowIdx/colIdx index the
+ * grid rendered at selection time, so the selection must not survive a commit
+ * that replaces the rendered rows or columns: batch Apply resolves colIdx
+ * against the CURRENT column set while rowId still names a row fetched with
+ * the old one, silently writing a column the user never chose. Identity-keyed
+ * selections (selectedRowIds by row id, selectedColumns by name) stay valid
+ * across reloads and are deliberately left alone — use clearSelection() when
+ * those must go too. No-op (and DOM-free) when nothing is selected.
+ */
+export function clearCellSelection() {
+    if (state.selectedCells.length === 0) return;
+    state.selectedCells = [];
+    updateSelectionStates();
+    updateBatchSidebar();
+}

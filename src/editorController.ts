@@ -12,13 +12,57 @@ import * as vsc from 'vscode';
 import { crypto } from './platform/cryptoShim';
 import { ConfigurationSection, CopilotChatId, ExtensionId, FirstInstallMs, FullExtensionId, Ns, SidebarLeft, SidebarRight } from './config';
 import { Disposable } from './lifecycle';
-import { IsVSCode, IsVSCodium, cspUtil, doTry, toDatasetAttrs, themeToCss, uiKindToString, BoolString, toBoolString, IsCursorIDE, lang } from './helpers';
+import { cspUtil, doTry, toDatasetAttrs, themeToCss, uiKindToString, BoolString, toBoolString, IsCursorIDE, lang, generateDatabaseDocumentKey } from './helpers';
 import { WebviewCollection } from './webview-collection';
+import { DocumentRegistry } from './documentRegistry';
 
 import { SupportsWriteMode, IsRemoteWorkspaceMode, DatabaseDocument, isAutoCommitEnabled } from './databaseModel';
 
 import { buildMethodProxy } from './core/rpc';
+import { WEBVIEW_TRANSPORT_SURFACES, assertWebviewTransportPayload } from './core/webview-transport';
 import { WebviewMessageHandler } from './webviewMessageHandler';
+import { HostBridge } from './hostBridge';
+import type { CellMaterializationService } from './cellMaterialization';
+
+/** Coalesce provider opens that race before their shared document is registered. */
+const PendingDocumentOpens = new Map<string, Promise<DatabaseDocument>>();
+
+async function acquireDatabaseDocument(
+  provider: DatabaseViewerProvider,
+  uri: vsc.Uri,
+  openContext: vsc.CustomDocumentOpenContext,
+  token?: vsc.CancellationToken
+): Promise<DatabaseDocument> {
+  const documentKey = await generateDatabaseDocumentKey(uri);
+  const existing = DocumentRegistry.get(documentKey);
+  if (existing) {
+    existing.retainReference();
+    return existing;
+  }
+
+  const pending = PendingDocumentOpens.get(documentKey);
+  if (pending) {
+    const document = await pending;
+    document.retainReference();
+    return document;
+  }
+
+  const creation = DatabaseDocument.create(
+    provider,
+    uri,
+    openContext,
+    token,
+    documentKey
+  );
+  PendingDocumentOpens.set(documentKey, creation);
+  try {
+    return await creation;
+  } finally {
+    if (PendingDocumentOpens.get(documentKey) === creation) {
+      PendingDocumentOpens.delete(documentKey);
+    }
+  }
+}
 
 // Webview functions interface - methods the webview exposes to extension
 interface WebviewBridgeFunctions {
@@ -50,7 +94,6 @@ type VSCODE_ENV = {
   remoteWorkspace?: BoolString,
   cellEditBehavior?: string,
   defaultPageSize?: string,
-  maxRows?: string,
 };
 
 /**
@@ -62,6 +105,8 @@ type VSCODE_ENV = {
 export class DatabaseViewerProvider extends Disposable implements vsc.CustomReadonlyEditorProvider<DatabaseDocument> {
   readonly webviews = new WebviewCollection();
   readonly webviewBridges = new Map<vsc.WebviewPanel, WebviewBridgeFunctions>();
+  readonly #configuredDocuments = new WeakSet<DatabaseDocument>();
+  readonly #hostBridges = new WeakMap<DatabaseDocument, HostBridge>();
 
   constructor(
     readonly viewType: string,
@@ -71,6 +116,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     readonly isVerified: boolean,
     readonly accessToken?: string,
     readonly forceReadOnly?: boolean,
+    readonly cellMaterializer?: CellMaterializationService,
   ) {
     super();
   }
@@ -96,9 +142,14 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     token?: vsc.CancellationToken
   ): Promise<DatabaseDocument> {
 
-    const document = await DatabaseDocument.create(this, uri, openContext, token);
+    const document = await acquireDatabaseDocument(this, uri, openContext, token);
 
-    this.configureEventHandlers(document);
+    // A provider needs exactly one listener set for the shared document. The
+    // other view type installs its own set so refreshes reach both collections.
+    if (!this.#configuredDocuments.has(document)) {
+      this.#configuredDocuments.add(document);
+      this.configureEventHandlers(document);
+    }
 
     return document;
   }
@@ -148,20 +199,21 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
   /**
    * Create handler for webview panel disposal.
    */
-  #createPanelDisposeHandler(webviewPanel: vsc.WebviewPanel) {
+  #createPanelDisposeHandler(webviewPanel: vsc.WebviewPanel, document: DatabaseDocument) {
     return () => {
       this.webviewBridges.delete(webviewPanel);
+      document.removeViewer(webviewPanel);
     };
   }
 
   /**
    * Create handler for webview panel view state changes.
    */
-  #createViewStateChangeHandler(_webviewPanel: vsc.WebviewPanel, document: DatabaseDocument) {
-    return (e: vsc.WebviewPanelOnDidChangeViewStateEvent) => {
+  #createViewStateChangeHandler(webviewPanel: vsc.WebviewPanel, document: DatabaseDocument) {
+    return () => {
       // If the webview panel is active and there is a pending save, save the document
-      document.hasActiveViewer = e.webviewPanel.active;
-      if (e.webviewPanel.active && document.hasPendingSave) {
+      document.setViewerActive(webviewPanel, webviewPanel.active);
+      if (webviewPanel.active && document.hasPendingSave) {
         document.triggerSave().catch(() => { });
       }
     };
@@ -185,7 +237,12 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
 
     // Create RPC proxy for webview communication
     const webviewBridge = buildMethodProxy<WebviewBridgeFunctions>(
-      (msg) => webviewPanel.webview.postMessage(msg),
+      (msg) => {
+        assertWebviewTransportPayload(msg, {
+          surface: WEBVIEW_TRANSPORT_SURFACES.hostRequest
+        });
+        webviewPanel.webview.postMessage(msg);
+      },
       ['updateColorScheme', 'updateCellEditBehavior', 'refreshContent']
     );
     this.webviewBridges.set(webviewPanel, webviewBridge);
@@ -194,20 +251,39 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     // Pass the per-proxy pending invocations map so RPC responses from the webview
     // are correctly routed to the bridge proxy for this specific panel.
     const pendingMap = webviewBridge.__pendingInvocations;
+    let hostBridge = this.#hostBridges.get(document);
+    if (!hostBridge) {
+      // A shared document can be resolved by both registered view types. Keep
+      // panel lookup and read-only gating bound to the provider that owns this
+      // webview while the database engine/history remain document-scoped.
+      hostBridge = new HostBridge(this, document);
+      this.#hostBridges.set(document, hostBridge);
+    }
     const messageHandler = new WebviewMessageHandler(
       (msg) => webviewPanel.webview.postMessage(msg),
-      document.hostBridge,
+      hostBridge,
       pendingMap
     );
     webviewPanel.webview.onDidReceiveMessage((message) => messageHandler.handleMessage(message));
 
-    webviewPanel.webview.options = { enableScripts: true };
+    // Keep the default file grant to the one extension asset directory the
+    // page loads. HostBridge temporarily adds exactly one Stage-B run
+    // directory while an oversized media URI lease is active.
+    const codiconsRoot = vsc.Uri.joinPath(
+      this.context.extensionUri,
+      'assets',
+      'codicons'
+    );
+    webviewPanel.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [codiconsRoot]
+    };
     webviewPanel.webview.html = await this.#generateWebviewHtml(webviewPanel, document, webviewId);
 
-    document.hasActiveViewer = webviewPanel.active;
+    document.setViewerActive(webviewPanel, webviewPanel.active);
 
     webviewPanel.onDidChangeViewState(this.#createViewStateChangeHandler(webviewPanel, document)),
-      webviewPanel.onDidDispose(this.#createPanelDisposeHandler(webviewPanel));
+      webviewPanel.onDidDispose(this.#createPanelDisposeHandler(webviewPanel, document));
   }
 
   /**
@@ -226,8 +302,9 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     const htmlUri = vsc.Uri.joinPath(this.context.extensionUri, 'core', 'ui', 'viewer.html');
     const html = new TextDecoder().decode(await vsc.workspace.fs.readFile(htmlUri));
 
-    // Load codicons CSS from @vscode/codicons package
-    const codiconsUri = vsc.Uri.joinPath(this.context.extensionUri, 'node_modules', '@vscode', 'codicons', 'dist', 'codicon.css');
+    // Load codicons CSS from assets/codicons (copied by build.mjs; the full
+    // @vscode/codicons package is not shipped in the .vsix).
+    const codiconsUri = vsc.Uri.joinPath(this.context.extensionUri, 'assets', 'codicons', 'codicon.css');
 
     // Build Content Security Policy
     const cspObj = {
@@ -244,13 +321,20 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       [cspUtil.styleSrc]: [webview.cspSource, `'nonce-${nonce}'`],
       [cspUtil.imgSrc]: [webview.cspSource, cspUtil.data, cspUtil.blob],
       [cspUtil.fontSrc]: [webview.cspSource],
-      [cspUtil.frameSrc]: [cspUtil.none],
-      [cspUtil.childSrc]: [cspUtil.blob],
-      [cspUtil.mediaSrc]: [cspUtil.blob],  // Required for video/audio blob playback in blob inspector
+      // Oversized media uses asWebviewUri for a 0600 Stage-B file. PDFs are
+      // additionally rendered in an empty-sandbox iframe in the inspector.
+      [cspUtil.frameSrc]: [webview.cspSource],
+      [cspUtil.childSrc]: [webview.cspSource, cspUtil.blob],
+      [cspUtil.mediaSrc]: [webview.cspSource, cspUtil.blob],
     };
 
-    // Only set csp for hosts that are known to correctly set `webview.cspSource`
-    const cspStr = IsVSCode || IsVSCodium
+    // Only set csp for hosts that actually populate `webview.cspSource`. The
+    // former VS Code/VSCodium brand check approximated this capability but left
+    // Open VSX hosts (Cursor, Windsurf, ...) that report neither brand yet set
+    // cspSource correctly with no CSP at all. A host that leaves it empty still
+    // falls back to no CSP rather than a policy whose blank source lists would
+    // block the webview's own scripts and styles.
+    const cspStr = webview.cspSource
       ? cspUtil.build(cspObj)
       : '';
 
@@ -261,8 +345,9 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
 
     // Get configuration settings for the webview
     const config = vsc.workspace.getConfiguration(ConfigurationSection);
-    const defaultPageSize = config.get<number>('defaultPageSize', 1000);
-    const maxRows = config.get<number>('maxRows', 0);
+    // Fallback must match the declared package.json default (5000) so a host
+    // that fails to register the configuration still reports the real default.
+    const defaultPageSize = config.get<number>('defaultPageSize', 5000);
 
     // Build environment data for webview
     const vscodeEnv = {
@@ -280,7 +365,6 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       remoteWorkspace: toBoolString(IsRemoteWorkspaceMode),
       cellEditBehavior: document.cellEditBehavior,
       defaultPageSize: defaultPageSize.toString(),
-      maxRows: maxRows.toString(),
     } satisfies VSCODE_ENV;
 
     // Replace placeholders in HTML template
@@ -319,9 +403,11 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
   protected configureEventHandlers(document: DatabaseDocument) {
     super.configureEventHandlers(document);
 
-    // Fire edit events to VS Code
+    // Do not deduplicate this listener across providers: VS Code owns one
+    // custom-document model per viewType, so each model needs the edit stream.
+    // DatabaseDocument keeps the copied callbacks synchronized against its one
+    // shared history tracker.
     this._register(document.onDidChange(edit => {
-      // Tell VS Code that the document has been edited by the user
       this.#editEventEmitter.fire({ document, ...edit });
     }));
 
@@ -386,7 +472,8 @@ export function registerEditorProvider(
   context: vsc.ExtensionContext,
   reporter: TelemetryReporter | undefined,
   outputChannel: vsc.OutputChannel | null,
-  { verified, accessToken, readOnly }: { verified: boolean, accessToken?: string, readOnly?: boolean }
+  { verified, accessToken, readOnly }: { verified: boolean, accessToken?: string, readOnly?: boolean },
+  cellMaterializer?: CellMaterializationService
 ) {
   // Optional chaining is required: `import.meta.env` is undefined when this module is require()'d
   // under tsx (unit tests); esbuild's `define` substitutes the value in real builds. Do not make
@@ -397,7 +484,16 @@ export function registerEditorProvider(
   const Provider = enableReadWrite ? DatabaseEditorProvider : DatabaseViewerProvider;
   return vsc.window.registerCustomEditorProvider(
     viewType,
-    new Provider(viewType, context, reporter, outputChannel, verified, accessToken, readOnly),
+    new Provider(
+      viewType,
+      context,
+      reporter,
+      outputChannel,
+      verified,
+      accessToken,
+      readOnly,
+      cellMaterializer
+    ),
     {
       webviewOptions: {
         enableFindWidget: false,

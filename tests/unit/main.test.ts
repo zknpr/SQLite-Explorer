@@ -36,6 +36,25 @@ require('module')._cache[path.resolve(baseDir, 'src/virtualFileSystem.ts')] = {
     exports: { SQLiteFileSystemProvider: class {} }
 };
 
+const expectedDesktopTestExports = {
+    desktopTest: {
+        version: 1,
+        setPagedOpenThresholdBytes: (_thresholdBytes: number | undefined) => {}
+    }
+};
+let desktopTestApiCreateCount = 0;
+require('module')._cache[path.resolve(baseDir, 'src/desktopTestApi.ts')] = {
+    id: path.resolve(baseDir, 'src/desktopTestApi.ts'),
+    filename: path.resolve(baseDir, 'src/desktopTestApi.ts'),
+    loaded: true,
+    exports: {
+        createDesktopTestApi: () => {
+            desktopTestApiCreateCount++;
+            return expectedDesktopTestExports.desktopTest;
+        }
+    }
+};
+
 import { mockVscode } from './mocks/vscode';
 
 // Ensure mockVscode properties are completely overridable functions
@@ -45,6 +64,7 @@ import { mockVscode } from './mocks/vscode';
 (mockVscode.window as any).createOutputChannel = () => ({ dispose: () => {} });
 (mockVscode.window as any).registerCustomEditorProvider = () => ({ dispose: () => {} });
 (mockVscode as any).ConfigurationTarget = { Global: 1 };
+(mockVscode as any).ExtensionMode = { Production: 1, Development: 2, Test: 3 };
 (mockVscode.workspace as any).getConfiguration = () => {
     return {
         get: () => ({}),
@@ -80,6 +100,7 @@ describe('main.ts', () => {
     beforeEach(() => {
         mockContext = {
             subscriptions: [],
+            extensionMode: vsc.ExtensionMode.Production,
             globalState: {
                 _store: new Map(),
                 get(key: string, defaultValue?: any) {
@@ -92,6 +113,7 @@ describe('main.ts', () => {
                 setKeysForSync: mock.fn()
             }
         };
+        desktopTestApiCreateCount = 0;
 
         // Reset vscode mocks
         mock.method(vsc.commands, 'registerCommand', (id: string, cb: any) => {
@@ -121,12 +143,35 @@ describe('main.ts', () => {
     });
 
     it('should run activation sequence successfully', async () => {
-        await assert.doesNotReject(main.activate(mockContext));
+        const activation = await main.activate(mockContext);
+        await new Promise(resolve => setImmediate(resolve));
 
+        assert.strictEqual(activation, undefined);
+        assert.strictEqual(desktopTestApiCreateCount, 0);
         assert(mockContext.subscriptions.length > 0);
         assert.strictEqual(mockContext.globalState.setKeysForSync.mock.calls.length, 1);
         assert.ok(mockContext.globalState.get(config.FirstInstallMs) !== undefined);
         assert.strictEqual(mockContext.globalState.get(config.FileNestingPatternsAdded), true);
+    });
+
+    it('exposes the desktop integration API in non-production extension hosts', async () => {
+        for (const extensionMode of [vsc.ExtensionMode.Development, vsc.ExtensionMode.Test]) {
+            mockContext.extensionMode = extensionMode;
+
+            const activation = await main.activate(mockContext);
+
+            assert.deepStrictEqual(activation, expectedDesktopTestExports);
+        }
+        assert.strictEqual(desktopTestApiCreateCount, 2);
+    });
+
+    it('keeps the backend and paging-threshold selectors unreachable in Production', async () => {
+        mockContext.extensionMode = vsc.ExtensionMode.Production;
+
+        const activation = await main.activate(mockContext);
+
+        assert.strictEqual(activation, undefined);
+        assert.strictEqual(desktopTestApiCreateCount, 0);
     });
 
     it('should not update firstInstall if already installed', async () => {

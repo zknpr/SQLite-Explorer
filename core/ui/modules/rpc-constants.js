@@ -2,12 +2,19 @@
 export const RPC_TIMEOUT_MS = 60000;
 
 const INTERACTIVE_RPC_METHODS = new Set([
-    // Audited HostBridge waits: deleteColumns, editView, dropView, confirms, save/select/export pickers, and all button-returning toasts.
+    // Audited HostBridge waits: modal UI plus calls whose file/cell materialization
+    // or database work has no safe client-side deadline.
     'deleteColumns',
     'editView',
     'dropView',
+    'updateCell',
+    'updateCellBatch',
     'confirmLargeChanges',
     'confirmLargeSelection',
+    'openCellEditor',
+    'prepareCellMediaPreview',
+    'exportDb',
+    'refreshFile',
     'saveFile',
     'selectFile',
     'exportTable',

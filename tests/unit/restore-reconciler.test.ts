@@ -39,6 +39,34 @@ const roundTripTracker = (
   ModificationTracker.deserialize<LabeledModification>(tracker.serialize());
 
 describe('reconcileRestoredDatabase', () => {
+  it('hot-exit round-trip retains a complete within-cap barrier segment for WASM replay', async () => {
+    const applied: LabeledModification[] = [];
+    const operations = {
+      applyModifications: async (entries: LabeledModification[]) => {
+        applied.push(...entries);
+      },
+      undoModification: async () => {}
+    } as unknown as DatabaseOperations;
+    const tracker = new ModificationTracker<LabeledModification>(300);
+    tracker.recordBarrier({
+      ...cellEdit('oversized replacement', 'unretained', 'bounded'),
+      priorValue: undefined,
+      undoPolicy: 'barrier'
+    });
+    for (let index = 0; index < 200; index++) {
+      tracker.record(cellEdit(`later edit ${index}`, String(index), String(index + 1)));
+    }
+
+    const restored = roundTripTracker(tracker);
+    await reconcileRestoredDatabase(operations, restored, 'wasm');
+
+    assert.strictEqual(restored.hasUncommittedHistoryBarrier, true);
+    assert.deepStrictEqual(
+      applied.map(entry => entry.label),
+      ['oversized replacement', ...Array.from({ length: 200 }, (_, index) => `later edit ${index}`)]
+    );
+  });
+
   it('W1: WASM restore reverts a saved-then-undone edit to the undone value', async () => {
     const ops = await freshEngine();
     await ops.insertRow('t', { id: 1, data: 'original' });
@@ -307,13 +335,10 @@ describe('reconcileRestoredDatabase', () => {
     assert.strictEqual(r[0].rows[0][0], 'v1');
   });
 
-  it('BC-revert native: re-applies saved-undone edits via redoModification, not the native no-op applyModifications', async () => {
-    // The native engine implements replay in redoModification and treats
-    // applyModifications as a no-op (src/nativeWorker.ts). Mimic that contract:
-    // applyModifications records nothing, redoModification records. If
-    // revertDatabaseToSaved ever re-applies the redo via applyModifications, a
-    // native database would silently stay at the undone state — so assert it
-    // uses redoModification.
+  it('BC-revert native: re-applies saved-undone edits via redoModification, not unsupported applyModifications', async () => {
+    // Native history replay belongs to redoModification; applyModifications is
+    // unsupported. Record both calls so this unit test pins the branch even when
+    // the bundled native binary is unavailable.
     const redone: string[] = [];
     const applied: string[] = [];
     const discarded: string[] = [];

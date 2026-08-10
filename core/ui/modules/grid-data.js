@@ -1,9 +1,19 @@
-import { state, persistState } from './state.js';
+import { state } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus, showLoading, showErrorState, updateToolbarButtons } from './ui.js';
 import { updatePagination, renderDataGrid } from './grid-render.js';
+// Closes a module cycle (grid-selection → sidebar → grid.js → here), which is
+// safe because the binding is a hoisted function declaration only called at
+// runtime — the same shape grid-actions.js already relies on.
+import { clearCellSelection } from './grid-selection.js';
 import { resetMatchNav } from './match-nav.js';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
+import {
+    buildCountIdentity,
+    getCachedCount,
+    normalizeCountResult,
+    prepareCountStore
+} from './count-cache.js';
 
 export async function loadTableColumns() {
     if (!state.selectedTable) return;
@@ -34,6 +44,20 @@ export async function loadTableColumns() {
                 delete state.columnFilters[col];
             }
         }
+
+        // 3. Drop shift-range anchors: they index the previous column set (and
+        // the page rendered against it), so they must not seed a range here even
+        // if the follow-up data reload fails before its own anchor reset.
+        state.lastSelectedCell = null;
+        state.lastSelectedColumnIndex = null;
+        state.lastSelectedRowIndex = null;
+
+        // 4. Drop the staged cell selection for the same reason: its colIdx
+        // indexes the previous column set, so a batch Apply after this commit
+        // would write whichever column now sits at that index. Table switches
+        // clear it upstream, but same-table schema reloads (undo/redo
+        // broadcasts, reload-from-disk) reach here with it still staged.
+        clearCellSelection();
     } catch (err) {
         console.error('Error loading columns:', err);
         updateStatus('Error loading columns');
@@ -58,7 +82,80 @@ export function getGridReloadOwner() {
     return { token: activeLoadToken, startedAt: activeLoadStartedAt };
 }
 
-export async function loadTableData(showSpinner = true, saveScrollPosition = true) {
+/**
+ * Build the keyset (seek) request for this load, or undefined for the plain
+ * OFFSET query. `nav` is the page's relationship to the committed grid
+ * ('first'/'next'/'prev'/'last' from the nav buttons, 'refetch' otherwise).
+ * Anchors are only usable when they describe the exact page the intent
+ * expects for this table — a clamped index after a shrunken count, a table
+ * switch, or a rapid double-click whose first load never committed all fail
+ * these checks and fall back to OFFSET. The engine independently re-validates
+ * the anchor's embedded query tag, so sort/filter/page-size staleness needs no
+ * tracking here.
+ *
+ * `recordCount`/`pageCount` are undefined for the speculative data query a
+ * cache miss fires in parallel with its count; anchor-based modes never need
+ * them, and 'last' (whose remainder derives from the count) is unreachable
+ * there because 'last' navigation resolves its count first.
+ */
+function buildKeysetRequest(nav, pageIndex, pageCount, recordCount, countIsExact, table, pageSize) {
+    // Page 0 needs no anchor and no OFFSET scan; covers 'first', 'prev' to 0,
+    // any refetch at 0, and single-page tables.
+    if (pageIndex === 0) return { mode: 'first' };
+    const anchors = state.keysetAnchors;
+    const usable = anchors && anchors.table === table;
+    if (nav === 'next' && usable && anchors.pageIndex === pageIndex - 1 && anchors.last) {
+        return { mode: 'after', anchor: anchors.last };
+    }
+    if (nav === 'prev' && usable && anchors.pageIndex === pageIndex + 1 && anchors.first) {
+        return { mode: 'before', anchor: anchors.first };
+    }
+    if (nav === 'last' && recordCount !== undefined && pageIndex === pageCount - 1) {
+        if (!countIsExact) return { mode: 'last' };
+        // The reversed query must return the same short remainder page as
+        // OFFSET so the page phase never shifts; computed from the count this
+        // same load resolved (cached, or fetched moments ago).
+        return { mode: 'last', lastPageRowCount: recordCount - pageIndex * pageSize };
+    }
+    if (nav === 'refetch' && usable && anchors.pageIndex === pageIndex && anchors.first) {
+        return { mode: 'atOrAfter', anchor: anchors.first };
+    }
+    return undefined;
+}
+
+/**
+ * True when a keyset page disagrees with the count this load resolved — rows
+ * past the anchor were deleted (or filtered away) since it was minted. The
+ * caller re-runs the load once with the OFFSET query, which both restores
+ * today's exact behavior for the race and re-anchors from its result. 'first'
+ * and 'last' are self-consistent and never retried.
+ */
+function keysetResultNeedsOffsetRetry(
+    keyset, dataResult, recordCount, countIsExact, pageIndex, pageSize
+) {
+    if (keyset.mode === 'first' || keyset.mode === 'last') return false;
+    // An upper bound cannot prove that a short/empty anchor page is stale.
+    // Falling back to its deep OFFSET is precisely what creates ghost pages.
+    if (!countIsExact) return false;
+    const rowCount = (dataResult.rows || []).length;
+    const expectedRows = recordCount - pageIndex * pageSize;
+    if (rowCount === 0) return expectedRows > 0;
+    // 'before' targets an interior page, which the load's count says is full;
+    // a short result would shift the page phase, so prefer the OFFSET truth.
+    if (keyset.mode === 'before') return rowCount < Math.min(pageSize, expectedRows);
+    return false;
+}
+
+function keysetModeCanProveInexactCount(keyset) {
+    return keyset && (
+        keyset.mode === 'first'
+        || keyset.mode === 'after'
+        || keyset.mode === 'last'
+        || keyset.mode === 'before'
+    );
+}
+
+export async function loadTableData(showSpinner = true, saveScrollPosition = true, navIntent) {
     if (!state.selectedTable) return;
 
     const loadToken = ++activeLoadToken;
@@ -143,17 +240,19 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             globalFilterColumns: columnNames
         };
 
-        // Get total count
-        const totalRecordCount = await backendApi.fetchTableCount(requestedTable, countOptions);
-        if (isSuperseded()) return; // a newer load started, or the user switched tables
-        const totalPageCount = Math.max(1, Math.ceil(totalRecordCount / state.rowsPerPage));
-        let currentPageIndex = state.currentPageIndex;
+        // The count's cache identity, built from the exact inputs countOptions
+        // carries so a cached value is interchangeable with a fetch. Page size
+        // and sort order don't change the count and are not part of it.
+        const countIdentity = buildCountIdentity(
+            requestedTable, filters, globalFilter, columnNames
+        );
 
-        if (currentPageIndex >= totalPageCount) {
-            currentPageIndex = Math.max(0, totalPageCount - 1);
-        }
+        // Snapshot the page size once so the clamp, OFFSET, keyset remainder,
+        // and committed page math all derive from the same value across the
+        // awaits below. (A mid-load page-size change also supersedes this
+        // load; the snapshot makes the consistency structural, not reasoned.)
+        const requestedPageSize = state.rowsPerPage;
 
-        // Get data
         const isTable = requestedTableType === 'table';
 
         // For tables, we need to explicitly request the 'rowid' column to handle row identification.
@@ -161,35 +260,256 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // Query builder handles the construction: SELECT "rowid", "col1", ...
         const queryColumns = isTable ? ['rowid', ...columnNames] : columnNames;
 
-        const queryOptions = {
-            columns: queryColumns,
-            // rowid stays in SELECT for table identity, but users filter only
-            // the displayed schema columns scanned by match navigation.
-            globalFilterColumns: columnNames,
-            orderBy: state.sortedColumn,
-            orderDir: state.sortAscending ? 'ASC' : 'DESC',
-            limit: state.rowsPerPage,
-            offset: currentPageIndex * state.rowsPerPage,
-            filters,
-            globalFilter
+        // One builder for every data request this load can issue (speculative,
+        // clamped, retry), so they can never disagree on anything but the page
+        // index and count knowledge. OFFSET always stays in the request: it is
+        // the engine's validated fallback whenever the keyset does not hold up.
+        const buildDataQueryOptions = (pageIndex, countResult, pageCount) => {
+            const recordCount = countResult?.count;
+            const options = {
+                columns: queryColumns,
+                // rowid stays in SELECT for table identity, but users filter only
+                // the displayed schema columns scanned by match navigation.
+                globalFilterColumns: columnNames,
+                orderBy: state.sortedColumn,
+                orderDir: state.sortAscending ? 'ASC' : 'DESC',
+                limit: requestedPageSize,
+                offset: pageIndex * requestedPageSize,
+                filters,
+                globalFilter
+            };
+            const keyset = isTable
+                ? buildKeysetRequest(
+                    navIntent ?? 'refetch',
+                    pageIndex,
+                    pageCount,
+                    recordCount,
+                    countResult?.isExact,
+                    requestedTable,
+                    requestedPageSize
+                  )
+                : undefined;
+            if (keyset) options.keyset = keyset;
+            return options;
         };
 
-        const dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
-        if (isSuperseded()) return; // superseded (newer load or table switch) during the fetch
+        // Resolve the count: cached when the identity is known, otherwise
+        // fetched — in parallel with the data query wherever possible. From
+        // here on this single totalRecordCount value feeds the clamp, the
+        // page count, the keyset 'last' remainder, the retry check, and the
+        // commit; cached and fetched counts are never mixed within one load.
+        let countResult = getCachedCount(countIdentity);
+
+        if (countResult === undefined && navIntent === 'last') {
+            // 'last' must resolve the count before the data query: both its
+            // page index and the keyset remainder derive from it, and on huge
+            // tables the reversed remainder scan is far cheaper than the
+            // deep-OFFSET scan a count-blind query would need. This is exactly
+            // the original sequential flow.
+            const storeCount = prepareCountStore(countIdentity);
+            countResult = normalizeCountResult(
+                await backendApi.fetchTableCount(requestedTable, countOptions)
+            );
+            if (isSuperseded()) return; // a newer load started, or the user switched tables
+            storeCount(countResult);
+        }
+
+        let totalPageCount;
+        let totalRecordCount;
+        let totalRecordCountIsExact;
+        let currentPageIndex = state.currentPageIndex;
+        let dataResult;
+        let queryOptions;
+        let exactBoundStore;
+
+        if (countResult !== undefined) {
+            // Count known synchronously (cache hit) or resolved above: page
+            // turns run a single data query and no count RPC at all.
+            totalRecordCount = countResult.count;
+            totalRecordCountIsExact = countResult.isExact;
+            totalPageCount = Math.max(1, Math.ceil(totalRecordCount / requestedPageSize));
+            if (currentPageIndex >= totalPageCount) {
+                currentPageIndex = Math.max(0, totalPageCount - 1);
+            }
+            queryOptions = buildDataQueryOptions(currentPageIndex, countResult, totalPageCount);
+            if (!totalRecordCountIsExact && keysetModeCanProveInexactCount(queryOptions.keyset)) {
+                exactBoundStore = prepareCountStore(countIdentity);
+            }
+            dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
+            if (isSuperseded()) return; // superseded (newer load or table switch) during the fetch
+        } else {
+            // Cache miss: fetch count and data in parallel instead of serially,
+            // so the miss costs the slower of the two rather than their sum.
+            // The data query is speculative in one narrow way: it assumes the
+            // current page index needs no clamp. That only fails when the
+            // count shrank below the current page through changes this webview
+            // didn't make (its own deletes adjust the cache and take the
+            // count-known branch), and then the speculative result is
+            // discarded and refetched at the clamped index.
+            const storeCount = prepareCountStore(countIdentity);
+            const speculativeOptions = buildDataQueryOptions(currentPageIndex, undefined, undefined);
+            // allSettled: a rejection on either leg must not surface as an
+            // unhandled rejection while the other is pending. Failures rethrow
+            // below in count-then-data order, matching the sequential flow
+            // this replaces.
+            const [countOutcome, dataOutcome] = await Promise.allSettled([
+                backendApi.fetchTableCount(requestedTable, countOptions),
+                backendApi.fetchTableData(requestedTable, speculativeOptions)
+            ]);
+            if (isSuperseded()) return; // superseded during the parallel fetch
+            if (countOutcome.status === 'rejected') throw countOutcome.reason;
+            countResult = normalizeCountResult(countOutcome.value);
+            totalRecordCount = countResult.count;
+            totalRecordCountIsExact = countResult.isExact;
+            // Store before inspecting the data outcome: the count is engine
+            // truth for this identity regardless of the data query's fate, so
+            // even a failed load seeds the reload that follows it. The store
+            // itself refuses the write if any mutation/invalidation happened
+            // while the fetch was in flight, and the isSuperseded gate above
+            // kept a stale load from reaching it.
+            storeCount(countResult);
+            totalPageCount = Math.max(1, Math.ceil(totalRecordCount / requestedPageSize));
+            if (currentPageIndex >= totalPageCount) {
+                // The speculative query targeted a page past the new end; its
+                // (empty) result never surfaces. Refetch at the clamped index
+                // with the count-aware keyset, as the sequential flow did.
+                currentPageIndex = Math.max(0, totalPageCount - 1);
+                queryOptions = buildDataQueryOptions(currentPageIndex, countResult, totalPageCount);
+                dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
+                if (isSuperseded()) return;
+            } else {
+                if (dataOutcome.status === 'rejected') throw dataOutcome.reason;
+                dataResult = dataOutcome.value;
+                queryOptions = speculativeOptions;
+            }
+            if (!totalRecordCountIsExact && keysetModeCanProveInexactCount(queryOptions.keyset)) {
+                // Reuse the pre-fetch epoch guard: a mutation that raced either
+                // parallel leg must also prevent this row-proved exact store.
+                exactBoundStore = storeCount;
+            }
+        }
+
+        if (queryOptions.keyset && keysetResultNeedsOffsetRetry(
+            queryOptions.keyset,
+            dataResult,
+            totalRecordCount,
+            totalRecordCountIsExact,
+            currentPageIndex,
+            requestedPageSize
+        )) {
+            // Concurrent writes invalidated the anchor's position. One retry
+            // with the plain OFFSET query (identical to the pre-keyset SQL)
+            // restores today's behavior and re-anchors from its result.
+            delete queryOptions.keyset;
+            dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
+            if (isSuperseded()) return;
+        }
+
+        const returnedRows = dataResult.rows || [];
+        if (!totalRecordCountIsExact
+            && (queryOptions.keyset?.mode === 'first' || queryOptions.keyset?.mode === 'after')
+            && returnedRows.length < requestedPageSize) {
+            // A short forward seek exhausted the filtered/table identity. Every
+            // preceding page in an `after` walk was full; `first` has none.
+            totalRecordCount = currentPageIndex * requestedPageSize + returnedRows.length;
+            totalRecordCountIsExact = true;
+            totalPageCount = Math.max(1, Math.ceil(totalRecordCount / requestedPageSize));
+            exactBoundStore?.({ count: totalRecordCount, isExact: true });
+
+            if (queryOptions.keyset.mode === 'after' && returnedRows.length === 0) {
+                // The requested page lies just beyond the proven end. Retain
+                // the prior anchored page instead of committing a ghost page.
+                currentPageIndex = Math.max(0, totalPageCount - 1);
+                dataResult = {
+                    rows: state.gridData,
+                    exactIntegerTexts: state.gridExactIntegerTexts,
+                    oversizedCells: state.gridOversizedCells,
+                    readOnlyRowReasons: state.gridReadOnlyRowReasons,
+                    keysetAnchors: state.keysetAnchors
+                        ? {
+                            first: state.keysetAnchors.first ?? undefined,
+                            last: state.keysetAnchors.last ?? undefined
+                          }
+                        : undefined
+                };
+            }
+        } else if (!totalRecordCountIsExact && queryOptions.keyset?.mode === 'last'
+            && returnedRows.length < requestedPageSize) {
+            // A short unanchored reverse seek exhausted the table, so this is
+            // both the first and last page. Replace the loose span bound with
+            // the exact cardinality proved by the rows already transported.
+            totalRecordCount = returnedRows.length;
+            totalRecordCountIsExact = true;
+            totalPageCount = 1;
+            currentPageIndex = 0;
+            exactBoundStore?.({ count: totalRecordCount, isExact: true });
+        } else if (!totalRecordCountIsExact && queryOptions.keyset?.mode === 'before'
+            && returnedRows.length < requestedPageSize) {
+            // Each full reverse-seek page already traversed from the tail is
+            // known to contain pageSize rows. A short `before` result exhausts
+            // the prefix, proving the exact count and eliminating every loose
+            // upper-bound page between this page and zero.
+            const fullPagesAfter = totalPageCount - 1 - currentPageIndex;
+            totalRecordCount = returnedRows.length + fullPagesAfter * requestedPageSize;
+            totalRecordCountIsExact = true;
+            totalPageCount = Math.max(1, Math.ceil(totalRecordCount / requestedPageSize));
+            currentPageIndex = 0;
+            exactBoundStore?.({ count: totalRecordCount, isExact: true });
+
+            if (returnedRows.length === 0) {
+                // The attempted page precedes the real first page. Keep the
+                // prior anchored rows instead of flashing an empty ghost page.
+                dataResult = {
+                    rows: state.gridData,
+                    exactIntegerTexts: state.gridExactIntegerTexts,
+                    oversizedCells: state.gridOversizedCells,
+                    readOnlyRowReasons: state.gridReadOnlyRowReasons,
+                    keysetAnchors: state.keysetAnchors
+                        ? {
+                            first: state.keysetAnchors.first ?? undefined,
+                            last: state.keysetAnchors.last ?? undefined
+                          }
+                        : undefined
+                };
+            }
+        }
 
         // Commit count, page, rows, and their filter identity together. A data
         // query failure therefore leaves the prior successful grid coherent.
         state.totalRecordCount = totalRecordCount;
+        state.totalRecordCountIsExact = totalRecordCountIsExact;
         state.totalPageCount = totalPageCount;
         state.currentPageIndex = currentPageIndex;
         state.gridData = dataResult.rows || [];
         state.gridExactIntegerTexts = dataResult.exactIntegerTexts || {};
+        state.gridOversizedCells = dataResult.oversizedCells || {};
+        state.gridReadOnlyRowReasons = dataResult.readOnlyRowReasons || {};
+        // Anchors commit atomically with the rows they describe; a superseded
+        // load bailed above, so its anchors can never survive into state. On
+        // error paths the previous grid stays mounted together with the
+        // anchors that still describe it. Views/keyless objects store nulls.
+        state.keysetAnchors = {
+            table: requestedTable,
+            pageIndex: currentPageIndex,
+            first: dataResult.keysetAnchors?.first ?? null,
+            last: dataResult.keysetAnchors?.last ?? null
+        };
         state.lastSuccessfulFilterState = {
             table: requestedTable,
             filterQuery: requestedFilterQuery,
             columnFilters: requestedColumnFilters
         };
         state.lastGridLoadError = null;
+        // Shift-range anchors are indices into the rows/columns just replaced;
+        // a stale anchor would make the next shift-click select the wrong block
+        // of rows, or read past the new page's bounds.
+        state.lastSelectedCell = null;
+        state.lastSelectedColumnIndex = null;
+        state.lastSelectedRowIndex = null;
+        // The staged cell selection is index-bearing in the same way, so it
+        // must not survive the commit either. Flows that need a selection
+        // across a reload rebuild it by identity afterwards (applyBatchUpdate).
+        clearCellSelection();
         resetMatchNav();
 
         // When preserving scroll, re-capture the latest position right before
@@ -223,7 +543,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         }
 
         updatePagination();
-        updateStatus(`${state.totalRecordCount} records`);
+        updateStatus(`${state.totalRecordCountIsExact ? '' : '≤'}${state.totalRecordCount} records`);
         return true; // signals callers (e.g. filter submit) that the load applied
 
     } catch (err) {

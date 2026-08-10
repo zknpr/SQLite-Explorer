@@ -9,6 +9,11 @@
  * - Extension Host <-> Webview Panel
  */
 
+import {
+  fromCellEditRpcErrorData,
+  toCellEditRpcErrorData
+} from './cell-edit-policy';
+
 // ============================================================================
 // Message Protocol Types
 // ============================================================================
@@ -96,10 +101,16 @@ export class InvocationTimeoutError extends Error {
 }
 
 // Error objects do not retain their prototype when flattened through the
-// worker response's text-only fault field. Only this private, structured prefix
-// may restore timeout identity; ordinary messages that happen to mention a
-// timeout remain ordinary Error instances.
-const INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX = '\u001eSQLiteExplorerInvocationTimeout:';
+// worker response's text-only fault field. Only these private, structured
+// prefixes may restore typed identity; ordinary messages that happen to
+// mention a timeout remain ordinary Error instances. Every prefix begins with
+// PRIVATE_MARKER_LEAD; serializeInvocationError escapes ordinary messages
+// starting with that byte (engine errors can carry attacker-chosen text, e.g.
+// RAISE() in a trigger from a hostile database) so remote text can never
+// impersonate a typed marker.
+const PRIVATE_MARKER_LEAD = '\u001e';
+const INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX = PRIVATE_MARKER_LEAD + 'SQLiteExplorerInvocationTimeout:';
+const CELL_EDIT_ERROR_TEXT_PREFIX = PRIVATE_MARKER_LEAD + 'SQLiteExplorerCellEditPolicy:';
 
 export function isInvocationTimeoutError(error: unknown): error is InvocationTimeoutError {
   if (error instanceof InvocationTimeoutError) return true;
@@ -110,30 +121,53 @@ export function isInvocationTimeoutError(error: unknown): error is InvocationTim
 }
 
 function serializeInvocationError(error: unknown): string {
-  if (!isInvocationTimeoutError(error)) {
-    return error instanceof Error ? error.message : String(error);
+  if (isInvocationTimeoutError(error)) {
+    const message = error instanceof Error ? error.message : String(error);
+    return INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX + JSON.stringify({
+      methodName: error.methodName,
+      message
+    });
+  }
+  const cellEditError = toCellEditRpcErrorData(error);
+  if (cellEditError) {
+    return CELL_EDIT_ERROR_TEXT_PREFIX + JSON.stringify(cellEditError);
   }
   const message = error instanceof Error ? error.message : String(error);
-  return INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX + JSON.stringify({
-    methodName: error.methodName,
-    message
-  });
+  // Doubling a leading marker byte keeps ordinary text out of the reserved
+  // namespace; deserializeInvocationError strips it back off.
+  return message.startsWith(PRIVATE_MARKER_LEAD) ? PRIVATE_MARKER_LEAD + message : message;
 }
 
 function deserializeInvocationError(errorText: string): Error {
-  if (!errorText.startsWith(INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX)) {
+  if (errorText.startsWith(INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX)) {
+    try {
+      const payload = JSON.parse(errorText.slice(INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX.length));
+      if (typeof payload?.methodName === 'string' && typeof payload?.message === 'string') {
+        return new InvocationTimeoutError(payload.methodName, payload.message);
+      }
+    } catch {
+      // A malformed marker is an ordinary remote failure, never timeout recovery.
+    }
     return new Error(errorText);
   }
 
-  try {
-    const payload = JSON.parse(errorText.slice(INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX.length));
-    if (typeof payload?.methodName === 'string' && typeof payload?.message === 'string') {
-      return new InvocationTimeoutError(payload.methodName, payload.message);
+  if (errorText.startsWith(CELL_EDIT_ERROR_TEXT_PREFIX)) {
+    try {
+      const payload = JSON.parse(errorText.slice(CELL_EDIT_ERROR_TEXT_PREFIX.length));
+      const typed = fromCellEditRpcErrorData(payload);
+      if (typed) return typed;
+    } catch {
+      // A malformed private marker remains an ordinary remote failure.
     }
-  } catch {
-    // A malformed marker is an ordinary remote failure, never timeout recovery.
+    return new Error(errorText);
   }
-  return new Error(errorText);
+
+  // Strip the escape doubled onto ordinary messages by serializeInvocationError.
+  return new Error(
+    errorText.startsWith(PRIVATE_MARKER_LEAD)
+      ? errorText.slice(PRIVATE_MARKER_LEAD.length)
+      : errorText
+  );
 }
 
 /** Resolve a deadline from the method and its structured-clone-ready arguments. */
@@ -246,13 +280,20 @@ export function buildMethodProxy<T extends object>(
           expirationTimer
         });
 
-        // Dispatch the invocation
-        dispatcher({
-          kind: 'invoke',
-          correlationId,
-          methodName,
-          parameters: cleanParameters
-        }, transferList);
+        // A synchronous boundary guard/dispatcher failure must not leave a
+        // pending call and timer behind after the Promise has rejected.
+        try {
+          dispatcher({
+            kind: 'invoke',
+            correlationId,
+            methodName,
+            parameters: cleanParameters
+          }, transferList);
+        } catch (error) {
+          clearTimeout(expirationTimer);
+          pendingInvocations.delete(correlationId);
+          reject(error);
+        }
       });
     };
   }
