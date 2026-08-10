@@ -213,7 +213,7 @@
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.1",
     "esbuild-plugin-polyfill-node": "^0.3.0",
-    "mocha": "^11.7.5",
+    "mocha": "^11.8.0",
     "ovsx": "1.0.2",
     "ts-node": "^10.9.2",
     "tsx": "^4.23.1",
