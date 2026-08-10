@@ -349,6 +349,37 @@ it('keeps documents with the same path but different URI schemes distinct', asyn
     }
 });
 
+it('keeps non-file documents with the same path but different queries distinct', async () => {
+    const provider = createProvider('sqlite-explorer.view');
+    const makeUri = (revision: string) => ({
+        ...fileUri('/workspace/revisioned.sqlite'),
+        scheme: 'memfs',
+        authority: 'host',
+        // A shared trailing query path defeats the old key's accidental use of
+        // the URI string's final filename segment, exposing the hash collision.
+        query: `rev=${revision}/snapshot`,
+        fragment: '',
+        toString: () => `memfs://host/workspace/revisioned.sqlite?rev=${revision}/snapshot`
+    }) as Uri;
+    const first = await provider.openCustomDocument(makeUri('a'), openContext);
+    const second = await provider.openCustomDocument(makeUri('b'), openContext);
+
+    try {
+        const [firstKey, secondKey] = await Promise.all([
+            first.documentKey,
+            second.documentKey
+        ]);
+        assert.notStrictEqual(first, second);
+        assert.notStrictEqual(first.databaseOperations, second.databaseOperations);
+        assert.notStrictEqual(firstKey, secondKey);
+        assert.strictEqual(connectionCount, 2);
+    } finally {
+        await first.dispose();
+        await second.dispose();
+        provider.dispose();
+    }
+});
+
 it('binds optional-view RPC to the provider that owns its webview panel', async () => {
     const defaultProvider = createProvider('sqlite-explorer.view');
     const optionalProvider = createProvider('sqlite-explorer.option');

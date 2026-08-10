@@ -51,6 +51,43 @@ interface ActiveCellMediaPreview {
   panel: vsc.WebviewPanel;
 }
 
+function primaryKeyReplacementGrowthBytes(value: CellValue): number {
+  const sourceUnits = typeof value === 'string'
+    ? value.length
+    : value instanceof Uint8Array
+      ? value.byteLength
+      : typeof value === 'bigint'
+        ? value.toString().length
+        : 32;
+  // A PK TEXT code unit can expand to at most nine URI-encoded characters
+  // after JSON escaping; the history estimator counts two bytes per JS char.
+  const estimate = sourceUnits * 18 + 256;
+  return Number.isSafeInteger(estimate) ? estimate : Number.MAX_SAFE_INTEGER;
+}
+
+/** Upper-bound growth of repeated encoded PK identities returned by a batch. */
+function estimatePrimaryKeyIdentityGrowthReserve(updates: readonly CellUpdate[]): number {
+  const rows = new Map<string, { resultCount: number; replacementBytes: number }>();
+  for (const update of updates) {
+    if (!isPrimaryKeyRecordId(update.rowId)) continue;
+    const rowKey = update.rowId;
+    let row = rows.get(rowKey);
+    if (!row) {
+      row = { resultCount: 0, replacementBytes: 0 };
+      rows.set(rowKey, row);
+    }
+    row.resultCount++;
+    if (decodePrimaryKeyRecordId(update.rowId).columns.includes(update.column)) {
+      row.replacementBytes += primaryKeyReplacementGrowthBytes(update.value);
+    }
+  }
+  let reserve = 0;
+  for (const row of rows.values()) {
+    reserve += row.resultCount * row.replacementBytes;
+  }
+  return reserve;
+}
+
 interface CellMediaPreviewOptions {
   type: CellContentType;
   webviewId: string;
@@ -947,16 +984,50 @@ export class HostBridge implements ToastService {
       DEFAULT_MAX_CELL_EDIT_BYTES
     );
 
+    const modification = {
+      label: label || `Update ${updates.length} cells`,
+      description: `Update ${updates.length} cells in ${table}`,
+      modificationType: 'cell_update' as const,
+      targetTable: table
+    };
+    // Account for every known field before the backend allocates prior values.
+    // newRowId is conservatively present for all cells. A PK replacement can
+    // make that URI-safe identity larger, and the larger ID is repeated in
+    // every result for the affected row, so reserve its bounded growth too.
+    const historyShape = {
+      ...modification,
+      affectedCells: updates.map(update => ({
+        rowId: update.rowId,
+        newRowId: update.rowId,
+        columnName: update.column,
+        priorValue: null,
+        newValue: update.value,
+        operation: update.operation ?? 'set'
+      }))
+    };
+    const identityRewriteReserve = estimatePrimaryKeyIdentityGrowthReserve(updates);
+    const undoMemoryLimitBytes = this.document.undoMemoryLimitBytes
+      ?? getMaxUndoMemoryBytes();
+    const baseMemoryBytes = estimateUndoMemoryBytes(historyShape) + identityRewriteReserve;
+    if (!Number.isSafeInteger(baseMemoryBytes) || baseMemoryBytes > undoMemoryLimitBytes) {
+      throw new Error(
+        `Batch update undo metadata exceeds the ${undoMemoryLimitBytes}-byte memory limit; `
+        + 'update fewer cells or increase sqliteExplorer.maxUndoMemory.'
+      );
+    }
+
     this.assertConnectionGeneration(connectionGeneration);
-    const historyCells = await dbOps.updateCellBatch(table, updates, editLimitBytes);
+    const historyCells = await dbOps.updateCellBatch(
+      table,
+      updates,
+      editLimitBytes,
+      undoMemoryLimitBytes - baseMemoryBytes
+    );
     this.assertConnectionGeneration(connectionGeneration);
 
     // Fire batch edit event
     this.document.recordExternalModification({
-      label: label || `Update ${updates.length} cells`,
-      description: `Update ${updates.length} cells in ${table}`,
-      modificationType: 'cell_update',
-      targetTable: table,
+      ...modification,
       affectedCells: historyCells
     });
     return historyCells;

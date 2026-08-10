@@ -24,7 +24,8 @@ async function collectStreamingExport(
     operations: DatabaseOperations,
     table: string,
     columns: string[],
-    options: ExportOptions
+    options: ExportOptions,
+    cancellation?: Parameters<typeof streamTableExport>[5]
 ): Promise<{ content: string; chunks: string[]; rowCount: number }> {
     const chunks: string[] = [];
     const rowCount = await streamTableExport(
@@ -36,7 +37,8 @@ async function collectStreamingExport(
             write: async (chunk: string) => {
                 chunks.push(chunk);
             }
-        }
+        },
+        cancellation
     );
     return { content: chunks.join(''), chunks, rowCount };
 }
@@ -959,6 +961,105 @@ describe('streamTableExport cell boundaries', () => {
             assert.strictEqual(fallbackExport.rowCount, 3);
             assert.strictEqual(invocations, 3, 'the spool fallback must also evaluate the view once');
         } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('aborts an in-flight spool inside the engine, cleans it, and releases the serializer', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery('CREATE TABLE cancelled_spool_source (value TEXT)');
+        await operations.executeQuery("INSERT INTO cancelled_spool_source VALUES ('one')");
+        await operations.executeQuery(
+            'CREATE VIEW cancelled_spool_view AS SELECT value FROM cancelled_spool_source'
+        );
+
+        let resolveSpoolStarted!: () => void;
+        const spoolStarted = new Promise<void>(resolve => { resolveSpoolStarted = resolve; });
+        let cancelListener: (() => void) | undefined;
+        let cancelled = false;
+        let engineAbortObserved = false;
+        let dropAttempts = 0;
+        const cancellation = {
+            get isCancellationRequested() { return cancelled; },
+            onCancellationRequested(listener: () => void) {
+                cancelListener = listener;
+                return { dispose() { if (cancelListener === listener) cancelListener = undefined; } };
+            }
+        };
+        const spoolOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (
+                    property === 'openQueryReadSession'
+                    || property === 'readQueryRows'
+                    || property === 'closeQueryReadSession'
+                ) {
+                    return undefined;
+                }
+                if (property === 'executeQuery') {
+                    return async (...args: Parameters<DatabaseOperations['executeQuery']>) => {
+                        const sql = String(args[0]);
+                        if (/^CREATE TEMP TABLE "__sqlite_explorer_export_/i.test(sql)) {
+                            await target.executeQuery(sql, args[1]);
+                            resolveSpoolStarted();
+                            const signal = args[2];
+                            if (!signal) throw new Error('spool query did not receive an AbortSignal');
+                            await new Promise<void>((_resolve, reject) => {
+                                signal.addEventListener('abort', () => {
+                                    engineAbortObserved = true;
+                                    reject(signal.reason ?? new Error('aborted'));
+                                }, { once: true });
+                            });
+                        }
+                        if (/^DROP TABLE IF EXISTS temp\."__sqlite_explorer_export_/i.test(sql)) {
+                            dropAttempts++;
+                        }
+                        return target.executeQuery(...args);
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+        const serialized = serializeOperations(spoolOperations);
+        const exported = collectStreamingExport(
+            serialized,
+            'cancelled_spool_view',
+            ['value'],
+            { format: 'csv' },
+            cancellation
+        );
+
+        try {
+            await spoolStarted;
+            const queuedMutation = serialized.executeQuery(
+                "INSERT INTO cancelled_spool_source VALUES ('after-cancel')"
+            );
+            cancelled = true;
+            cancelListener?.();
+
+            await assert.rejects(exported, /Export cancelled/);
+            await queuedMutation;
+            assert.strictEqual(engineAbortObserved, true);
+            assert.strictEqual(dropAttempts, 1);
+            assert.deepStrictEqual(
+                (await operations.executeQuery(
+                    "SELECT name FROM sqlite_temp_schema WHERE name LIKE '__sqlite_explorer_export_%'"
+                ))[0].rows,
+                []
+            );
+            assert.deepStrictEqual(
+                (await operations.executeQuery(
+                    'SELECT value FROM cancelled_spool_source ORDER BY rowid'
+                ))[0].rows,
+                [['one'], ['after-cancel']]
+            );
+        } finally {
+            await exported.catch(() => {});
             (operations as WasmDatabaseEngine).shutdown();
         }
     });

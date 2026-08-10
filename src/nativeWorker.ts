@@ -136,7 +136,9 @@ import {
   OversizedCellReplacementRequiredError
 } from './core/cell-edit-policy';
 import {
+  assertBatchHistoryFitsUndoBudget,
   assertBatchPriorLimitResult,
+  buildBatchHistorySizePreflight,
   buildBatchPriorLimitQueries
 } from './core/batch-update';
 import {
@@ -176,6 +178,7 @@ type NativeHistoryUpdateCellBatch = (
   table: string,
   updates: CellUpdate[],
   maxEditValueBytes?: number,
+  maxUndoSnapshotBytes?: number,
   historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
 ) => Promise<CellUpdateResult[]>;
 
@@ -217,6 +220,7 @@ const updateNativeCellBatchForHistory = (
 ) => (operations.updateCellBatch as NativeHistoryUpdateCellBatch)(
   table,
   updates,
+  undefined,
   undefined,
   HISTORY_REPLAY_EDIT_TOKEN
 );
@@ -305,6 +309,20 @@ const INIT_TIMEOUT = 10000;
 
 /** Timeout for individual queries (ms) */
 const QUERY_TIMEOUT = DEFAULT_QUERY_TIMEOUT_MS;
+const EXPORT_SPOOL_NAME = '__sqlite_explorer_export_[0-9a-f]{32}';
+
+function isGeneratedExportSpoolStatement(sql: string): boolean {
+  const quotedName = `"${EXPORT_SPOOL_NAME}"`;
+  return (
+    new RegExp(`^CREATE TEMP TABLE ${quotedName} AS SELECT[\\s\\S]+$`, 'i').test(sql)
+    || new RegExp(
+      `^SELECT CAST\\(rowid AS TEXT\\), \\* FROM ${quotedName} ` +
+      'WHERE rowid > \\? ORDER BY rowid LIMIT 1$',
+      'i'
+    ).test(sql)
+    || new RegExp(`^DROP TABLE IF EXISTS temp\\.${quotedName}$`, 'i').test(sql)
+  );
+}
 
 /** Let a bounded worker query report its own precise timeout before RPC expires. */
 const BOUNDED_QUERY_TRANSPORT_MARGIN_MS = 2000;
@@ -527,7 +545,9 @@ export class NativeWorkerProcess {
         reject(timeoutError);
       }, timeoutMs);
 
-      const abortListener = signal && method === 'queryBounded'
+      const abortListener = signal && (
+        method === 'queryBounded' || method === 'queryExportSpool'
+      )
         ? () => {
             if (!this.pendingRequests.has(id) || !this.process?.stdin) return;
             const cancelId = ++this.messageId;
@@ -638,7 +658,14 @@ export class NativeWorkerProcess {
       pending.signal.removeEventListener('abort', pending.abortListener);
     }
 
-    if (typedMsg.cancelled) {
+    if (pending.signal?.aborted) {
+      // SQLite may finish just before the worker observes the cancel RPC. The
+      // caller still cancelled while the request was outstanding, so do not
+      // surface a stale successful result.
+      pending.reject(
+        pending.signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+      );
+    } else if (typedMsg.cancelled) {
       pending.reject(
         pending.signal?.reason ?? new DOMException('The operation was aborted', 'AbortError')
       );
@@ -1145,6 +1172,24 @@ export async function createNativeDatabaseConnection(
         });
       };
 
+      const assertNativeBatchHistoryWithinBudget = async (
+        table: string,
+        updates: readonly CellUpdate[],
+        identity: TableIdentity,
+        maxPriorValueBytes: number
+      ): Promise<void> => {
+        const preflight = buildBatchHistorySizePreflight(table, updates, identity);
+        const metadata = await worker.call<NativeQueryBatchResult>('queryBatch', [
+          preflight.queries.map(({ sql, params }) => ({ sql, params }))
+        ]);
+        assertBatchHistoryFitsUndoBudget({
+          table,
+          preflight,
+          resultRows: preflight.queries.map((_, index) => metadata.results?.[index]?.values?.[0]),
+          maxPriorValueBytes
+        });
+      };
+
       const queryNativeSingleStatement = async <T>(
         sql: string,
         params?: CellValue[]
@@ -1201,6 +1246,7 @@ export async function createNativeDatabaseConnection(
         identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
         updates: CellUpdate[],
         maxEditValueBytes?: number,
+        maxUndoSnapshotBytes?: number,
         historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
       ): Promise<CellUpdateResult[]> => {
         const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
@@ -1213,6 +1259,16 @@ export async function createNativeDatabaseConnection(
         const savepointName = createSavepointName('sp_update_pk_batch');
         await worker.call('run', [`SAVEPOINT ${savepointName}`]);
         try {
+          // A second metadata-only gate under the writer savepoint closes the
+          // external-writer race after the pre-savepoint refusal.
+          if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
+            await assertNativeBatchHistoryWithinBudget(
+              table,
+              updates,
+              identity,
+              maxUndoSnapshotBytes
+            );
+          }
           // Keep the existing full prior-value read below for bounded history,
           // but refuse oversized priors from metadata before it can run.
           if (!isHistoryReplay && maxEditValueBytes !== undefined) {
@@ -1536,8 +1592,25 @@ export async function createNativeDatabaseConnection(
       const rawOperations: DatabaseOperations = {
         engineKind: Promise.resolve('native'),
 
-        executeQuery: async (sql: string, params?: CellValue[]): Promise<QueryResultSet[]> => {
-          const result = await worker.call<NativeQueryResult>('query', [sql, params]);
+        executeQuery: async (
+          sql: string,
+          params?: CellValue[],
+          signal?: AbortSignal
+        ): Promise<QueryResultSet[]> => {
+          let result: NativeQueryResult;
+          if (isGeneratedExportSpoolStatement(sql)) {
+            const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
+            result = await worker.call<NativeQueryResult>(
+              'queryExportSpool',
+              [`${sql}\n${boundary}`, sql, boundary, params, queryTimeout],
+              queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS,
+              signal
+            );
+          } else {
+            signal?.throwIfAborted();
+            result = await worker.call<NativeQueryResult>('query', [sql, params]);
+            signal?.throwIfAborted();
+          }
 
           // Return in QueryResultSet format with multiple property names for compatibility:
           // - headers/rows: new naming convention from src/core/types.ts
@@ -1682,6 +1755,7 @@ export async function createNativeDatabaseConnection(
                     targetTable,
                     identity as Extract<TableIdentity, { kind: 'primaryKey' }>,
                     updates,
+                    undefined,
                     undefined,
                     HISTORY_REPLAY_EDIT_TOKEN
                   );
@@ -1931,7 +2005,7 @@ export async function createNativeDatabaseConnection(
               column,
               value: patch ?? value,
               operation: patch === undefined ? 'set' : 'json_patch'
-            }], maxEditValueBytes, historyReplayToken);
+            }], maxEditValueBytes, undefined, historyReplayToken);
             return result[0]?.newRowId ?? rowId;
           }
 
@@ -2978,6 +3052,7 @@ export async function createNativeDatabaseConnection(
           table: string,
           updates: CellUpdate[],
           maxEditValueBytes?: number,
+          maxUndoSnapshotBytes?: number,
           historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
         ): Promise<CellUpdateResult[]> => {
           updates.forEach(update => assertMutableRecordId(update.rowId));
@@ -2998,12 +3073,30 @@ export async function createNativeDatabaseConnection(
             if (identity.kind !== 'primaryKey') {
               throw new Error(`Primary-key identity cannot target rowid table ${table}`);
             }
+            if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
+              await assertNativeBatchHistoryWithinBudget(
+                table,
+                updates,
+                identity,
+                maxUndoSnapshotBytes
+              );
+            }
             return updateNativePrimaryKeyCellBatch(
               table,
               identity,
               updates,
               maxEditValueBytes,
+              maxUndoSnapshotBytes,
               historyReplayToken
+            );
+          }
+
+          if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
+            await assertNativeBatchHistoryWithinBudget(
+              table,
+              updates,
+              { kind: 'rowid' },
+              maxUndoSnapshotBytes
             );
           }
 
@@ -3013,6 +3106,14 @@ export async function createNativeDatabaseConnection(
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
 
           try {
+          if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
+            await assertNativeBatchHistoryWithinBudget(
+              table,
+              updates,
+              { kind: 'rowid' },
+              maxUndoSnapshotBytes
+            );
+          }
           if (!isHistoryReplay && maxEditValueBytes !== undefined) {
             await assertNativeRowIdBatchPriorsWithinEditLimit(
               table,

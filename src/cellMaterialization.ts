@@ -19,6 +19,9 @@ type NodeCrypto = typeof import('node:crypto');
  */
 export const DEFAULT_CELL_MATERIALIZATION_QUOTA_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_CELL_MATERIALIZATION_CHUNK_BYTES = MAX_CELL_READ_CHUNK_BYTES;
+export const DEFAULT_CELL_MATERIALIZATION_STALE_RUN_AGE_MS = 24 * 60 * 60 * 1000;
+export const CELL_MATERIALIZATION_RUN_PREFIX = 'sqlite-explorer-cell-materializations-';
+export const CELL_MATERIALIZATION_OWNER_MARKER = '.owner.json';
 
 export interface CellMaterializationOwner {
     onDidDispose(listener: () => void): vsc.Disposable;
@@ -27,14 +30,22 @@ export interface CellMaterializationOwner {
 export interface MaterializedCell {
     uri: vsc.Uri;
     metadata: CellMetadata;
-    /** Bytes in the materialized file; TEXT is normalized to UTF-8. */
+    /** Bytes in the materialized file. */
     byteLength: number;
     checksumSha256: string;
+    /** Invalidly encoded SQLite TEXT is exposed honestly as raw database bytes. */
+    contentEncoding: 'utf-8' | 'raw-database-bytes';
 }
 
 export interface CellMaterializationServiceOptions {
     maxBytes?: number;
     chunkBytes?: number;
+    staleRunAgeMs?: number;
+    /** @internal deterministic clock used by startup-cleanup tests. */
+    now?: () => number;
+    /** @internal process probe used by startup-cleanup tests. */
+    isProcessAlive?: (pid: number) => boolean;
+    onCleanupWarning?: (message: string, error: unknown) => void;
 }
 
 export interface MaterializeCellOptions {
@@ -63,6 +74,27 @@ function assertNotCancelled(signal: AbortSignal | undefined): void {
     if (signal?.aborted) throw abortError();
 }
 
+class InvalidCellTextEncodingError extends Error {
+    constructor(cause: unknown) {
+        super('SQLite TEXT contains bytes invalid for its declared database encoding', { cause });
+        this.name = 'InvalidCellTextEncodingError';
+    }
+}
+
+function decodeCellText(
+    decoder: TextDecoder,
+    bytes?: Uint8Array,
+    stream: boolean = false
+): string {
+    try {
+        return bytes === undefined
+            ? decoder.decode()
+            : decoder.decode(bytes, { stream });
+    } catch (error) {
+        throw new InvalidCellTextEncodingError(error);
+    }
+}
+
 function checkedPositiveInteger(value: number | undefined, fallback: number, label: string): number {
     const resolved = value ?? fallback;
     if (!Number.isSafeInteger(resolved) || resolved < 1) {
@@ -78,6 +110,31 @@ function safeExtension(extension: string | undefined, metadata: CellMetadata): s
     return /^[a-z0-9]{1,12}$/i.test(normalized) ? normalized.toLowerCase() : fallback;
 }
 
+interface CellMaterializationRunOwner {
+    version: 1;
+    runId: string;
+    pid: number;
+    createdAtMs: number;
+    uid?: number;
+}
+
+const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function currentUid(): number | undefined {
+    return typeof process.getuid === 'function' ? process.getuid() : undefined;
+}
+
+function defaultProcessAlive(pid: number): boolean {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        // EPERM proves a process exists but is not signalable. Unknown failures
+        // also fail closed: retaining bytes is safer than deleting a live host's files.
+        return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+    }
+}
+
 /**
  * Pulls one snapshot session into a private file without ever assembling the
  * complete cell in JavaScript memory.
@@ -85,6 +142,10 @@ function safeExtension(extension: string | undefined, metadata: CellMetadata): s
 export class CellMaterializationService implements vsc.Disposable {
     private readonly maxBytes: number;
     private readonly chunkBytes: number;
+    private readonly staleRunAgeMs: number;
+    private readonly now: () => number;
+    private readonly isProcessAlive: (pid: number) => boolean;
+    private readonly onCleanupWarning: (message: string, error: unknown) => void;
     private readonly trackedFiles = new Map<string, MaterializedCell>();
     private readonly ownerFiles = new Map<CellMaterializationOwner, Set<string>>();
     private readonly ownerSubscriptions = new Map<CellMaterializationOwner, vsc.Disposable>();
@@ -113,6 +174,18 @@ export class CellMaterializationService implements vsc.Disposable {
                 `Cell materialization chunk size cannot exceed ${MAX_CELL_READ_CHUNK_BYTES}`
             );
         }
+        this.staleRunAgeMs = checkedPositiveInteger(
+            options.staleRunAgeMs,
+            DEFAULT_CELL_MATERIALIZATION_STALE_RUN_AGE_MS,
+            'Cell materialization stale-run age'
+        );
+        this.now = options.now ?? Date.now;
+        this.isProcessAlive = options.isProcessAlive ?? defaultProcessAlive;
+        this.onCleanupWarning = options.onCleanupWarning ?? ((message, error) => {
+            console.warn(`[SQLite Explorer] ${message}`, error);
+        });
+
+        this.sweepStaleRunDirectories();
 
         const onDidCloseTextDocument = vsc.workspace.onDidCloseTextDocument;
         this.closeDocumentSubscription = typeof onDidCloseTextDocument === 'function'
@@ -190,56 +263,87 @@ export class CellMaterializationService implements vsc.Disposable {
             await fileHandle.chmod(0o600);
             this.assertActive(options.signal);
 
-            const outputHash = crypto.createHash('sha256');
-            const decoder = metadata.storageClass === 'text'
-                // U+FEFF may be real cell content. Decoding is a transport
-                // conversion, so a leading BOM must survive the UTF-8 rewrite.
-                ? new TextDecoder(this.requireTextEncoding(metadata), {
-                    fatal: true,
-                    ignoreBOM: true
-                })
-                : undefined;
-            const encoder = decoder ? new TextEncoder() : undefined;
-            let sourceOffset = 0;
-            let outputBytes = 0;
+            const streamCell = async (decodeText: boolean) => {
+                const decoder = decodeText
+                    // U+FEFF may be real cell content. Decoding is a transport
+                    // conversion, so a leading BOM must survive the UTF-8 rewrite.
+                    ? new TextDecoder(this.requireTextEncoding(metadata), {
+                        fatal: true,
+                        ignoreBOM: true
+                    })
+                    : undefined;
+                const encoder = decoder ? new TextEncoder() : undefined;
+                const outputHash = crypto.createHash('sha256');
+                let sourceOffset = 0;
+                let outputBytes = 0;
 
-            while (sourceOffset < metadata.byteLength) {
-                this.assertActive(options.signal);
-                const requestedBytes = Math.min(
-                    this.chunkBytes,
-                    metadata.byteLength - sourceOffset
-                );
-                const chunk = await operations.readCellChunk(
-                    session.sessionId,
-                    sourceOffset,
-                    requestedBytes
-                );
-                this.assertActive(options.signal);
-                this.validateChunk(chunk, sourceOffset, requestedBytes, metadata.byteLength);
+                while (sourceOffset < metadata.byteLength) {
+                    this.assertActive(options.signal);
+                    const requestedBytes = Math.min(
+                        this.chunkBytes,
+                        metadata.byteLength - sourceOffset
+                    );
+                    const chunk = await operations.readCellChunk(
+                        session!.sessionId,
+                        sourceOffset,
+                        requestedBytes
+                    );
+                    this.assertActive(options.signal);
+                    this.validateChunk(chunk, sourceOffset, requestedBytes, metadata.byteLength);
 
-                const output = decoder && encoder
-                    ? encoder.encode(decoder.decode(chunk.bytes, { stream: true }))
-                    : chunk.bytes;
-                outputBytes = this.checkedOutputSize(outputBytes, output.byteLength);
-                reservedBytes = this.ensureOutputReservation(reservedBytes, outputBytes);
-                await this.writeFully(fileHandle, output, options.signal);
-                outputHash.update(output);
-                sourceOffset += chunk.bytes.byteLength;
+                    const output = decoder && encoder
+                        ? encoder.encode(decodeCellText(decoder, chunk.bytes, true))
+                        : chunk.bytes;
+                    const outputPosition = outputBytes;
+                    outputBytes = this.checkedOutputSize(outputBytes, output.byteLength);
+                    reservedBytes = this.ensureOutputReservation(reservedBytes, outputBytes);
+                    await this.writeFully(fileHandle!, output, outputPosition, options.signal);
+                    outputHash.update(output);
+                    sourceOffset += chunk.bytes.byteLength;
+                }
+
+                if (decoder && encoder) {
+                    const finalBytes = encoder.encode(decodeCellText(decoder));
+                    const outputPosition = outputBytes;
+                    outputBytes = this.checkedOutputSize(outputBytes, finalBytes.byteLength);
+                    reservedBytes = this.ensureOutputReservation(reservedBytes, outputBytes);
+                    await this.writeFully(fileHandle!, finalBytes, outputPosition, options.signal);
+                    outputHash.update(finalBytes);
+                }
+                return { outputBytes, outputHash };
+            };
+
+            let rawDatabaseBytes = false;
+            let streamed: Awaited<ReturnType<typeof streamCell>>;
+            try {
+                streamed = await streamCell(metadata.storageClass === 'text');
+            } catch (error) {
+                if (!(error instanceof InvalidCellTextEncodingError)) throw error;
+                // The still-open snapshot supports absolute-offset rereads. Reset
+                // the partial transcoding and preserve the exact SQLite bytes;
+                // presenting them as .txt would falsely claim valid Unicode.
+                await fileHandle.truncate(0);
+                streamed = await streamCell(false);
+                rawDatabaseBytes = true;
             }
-
-            if (decoder && encoder) {
-                const finalBytes = encoder.encode(decoder.decode());
-                outputBytes = this.checkedOutputSize(outputBytes, finalBytes.byteLength);
-                reservedBytes = this.ensureOutputReservation(reservedBytes, outputBytes);
-                await this.writeFully(fileHandle, finalBytes, options.signal);
-                outputHash.update(finalBytes);
-            }
+            const { outputBytes, outputHash } = streamed;
             this.assertActive(options.signal);
             await fileHandle.sync();
             this.assertActive(options.signal);
             await fileHandle.close();
             fileHandle = undefined;
             this.assertActive(options.signal);
+
+            if (rawDatabaseBytes) {
+                const path = require('path') as typeof import('node:path');
+                const rawPath = path.join(
+                    path.dirname(filePath),
+                    `${path.basename(filePath, path.extname(filePath))}.bin`
+                );
+                if (rawPath !== filePath) await fs.promises.rename(filePath, rawPath);
+                filePath = rawPath;
+                this.assertActive(options.signal);
+            }
 
             const assembledChecksum = outputHash.digest('hex');
             const verified = await this.verifyFile(fs, crypto, filePath, options.signal);
@@ -254,7 +358,10 @@ export class CellMaterializationService implements vsc.Disposable {
                 uri: vsc.Uri.file(filePath),
                 metadata,
                 byteLength: outputBytes,
-                checksumSha256: assembledChecksum
+                checksumSha256: assembledChecksum,
+                contentEncoding: metadata.storageClass === 'text' && !rawDatabaseBytes
+                    ? 'utf-8'
+                    : 'raw-database-bytes'
             };
             this.releaseReservedBytes(reservedBytes - outputBytes);
             reservedBytes = outputBytes;
@@ -356,14 +463,126 @@ export class CellMaterializationService implements vsc.Disposable {
         if (this.runDirectory) return this.runDirectory;
         const path = require('path') as typeof import('node:path');
         fs.mkdirSync(this.storageRoot.fsPath, { recursive: true, mode: 0o700 });
+        const runId = webCrypto.randomUUID();
         const runDirectory = path.join(
             this.storageRoot.fsPath,
-            `sqlite-explorer-cell-materializations-${webCrypto.randomUUID()}`
+            `${CELL_MATERIALIZATION_RUN_PREFIX}${runId}`
         );
         fs.mkdirSync(runDirectory, { mode: 0o700 });
-        fs.chmodSync(runDirectory, 0o700);
-        this.runDirectory = runDirectory;
-        return runDirectory;
+        try {
+            fs.chmodSync(runDirectory, 0o700);
+            const uid = currentUid();
+            const owner: CellMaterializationRunOwner = {
+                version: 1,
+                runId,
+                pid: process.pid,
+                createdAtMs: this.now(),
+                ...(uid === undefined ? {} : { uid })
+            };
+            const markerPath = path.join(runDirectory, CELL_MATERIALIZATION_OWNER_MARKER);
+            fs.writeFileSync(markerPath, JSON.stringify(owner), {
+                encoding: 'utf8',
+                flag: 'wx',
+                mode: 0o600
+            });
+            fs.chmodSync(markerPath, 0o600);
+            this.runDirectory = runDirectory;
+            return runDirectory;
+        } catch (error) {
+            fs.rmSync(runDirectory, { recursive: true, force: true });
+            throw error;
+        }
+    }
+
+    /**
+     * Reclaim only directories whose marker proves same-user ownership, whose
+     * host PID is dead, and whose age clears the grace window. Unmarked or
+     * malformed legacy directories are retained because a concurrently running
+     * pre-marker extension host cannot be distinguished from a crash leak.
+     */
+    private sweepStaleRunDirectories(): void {
+        let fs: NodeFs;
+        try {
+            ({ fs } = requireNodeModules());
+        } catch (error) {
+            this.warnCleanup('Could not initialize materialization startup cleanup.', error);
+            return;
+        }
+
+        try {
+            let entries: import('node:fs').Dirent[];
+            try {
+                entries = fs.readdirSync(this.storageRoot.fsPath, { withFileTypes: true });
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+                throw error;
+            }
+
+            for (const entry of entries) {
+                if (!entry.isDirectory() || !entry.name.startsWith(CELL_MATERIALIZATION_RUN_PREFIX)) {
+                    continue;
+                }
+                const runId = entry.name.slice(CELL_MATERIALIZATION_RUN_PREFIX.length);
+                if (!RUN_ID_PATTERN.test(runId)) continue;
+                try {
+                    this.sweepOneRunDirectory(fs, entry.name, runId);
+                } catch (error) {
+                    this.warnCleanup(`Could not inspect stale materialization run ${entry.name}.`, error);
+                }
+            }
+        } catch (error) {
+            this.warnCleanup('Could not sweep stale cell materializations.', error);
+        }
+    }
+
+    private sweepOneRunDirectory(fs: NodeFs, name: string, runId: string): void {
+        const path = require('path') as typeof import('node:path');
+        const directory = path.join(this.storageRoot.fsPath, name);
+        const directoryStats = fs.lstatSync(directory);
+        if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink()) return;
+        const uid = currentUid();
+        if (uid !== undefined && directoryStats.uid !== uid) return;
+
+        const markerPath = path.join(directory, CELL_MATERIALIZATION_OWNER_MARKER);
+        let markerStats: import('node:fs').Stats;
+        try {
+            markerStats = fs.lstatSync(markerPath);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+            throw error;
+        }
+        if (!markerStats.isFile() || markerStats.isSymbolicLink() || markerStats.size > 4096) return;
+
+        let owner: Partial<CellMaterializationRunOwner>;
+        try {
+            owner = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as Partial<CellMaterializationRunOwner>;
+        } catch {
+            return;
+        }
+        if (
+            owner.version !== 1
+            || owner.runId !== runId
+            || !Number.isSafeInteger(owner.pid)
+            || Number(owner.pid) < 1
+            || !Number.isSafeInteger(owner.createdAtMs)
+            || Number(owner.createdAtMs) < 0
+            || (uid !== undefined && owner.uid !== uid)
+        ) {
+            return;
+        }
+        const ageMs = this.now() - Number(owner.createdAtMs);
+        if (!Number.isFinite(ageMs) || ageMs < this.staleRunAgeMs) return;
+        if (this.isProcessAlive(Number(owner.pid))) return;
+
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+
+    private warnCleanup(message: string, error: unknown): void {
+        try {
+            this.onCleanupWarning(message, error);
+        } catch {
+            // Startup cleanup is best-effort and its logger is not trusted to stay non-throwing.
+        }
     }
 
     private requireTextEncoding(metadata: CellMetadata): 'utf-8' | 'utf-16le' | 'utf-16be' {
@@ -435,6 +654,7 @@ export class CellMaterializationService implements vsc.Disposable {
     private async writeFully(
         file: import('node:fs/promises').FileHandle,
         bytes: Uint8Array,
+        position: number,
         signal: AbortSignal | undefined
     ): Promise<void> {
         let offset = 0;
@@ -444,7 +664,7 @@ export class CellMaterializationService implements vsc.Disposable {
                 bytes,
                 offset,
                 bytes.byteLength - offset,
-                null
+                position + offset
             );
             this.assertActive(signal);
             if (bytesWritten < 1) throw new Error('Temp-file write made no progress');
@@ -509,6 +729,21 @@ export class CellMaterializationService implements vsc.Disposable {
         if (!this.runDirectory || this.trackedFiles.size > 0) return;
         const { fs } = requireNodeModules();
         try {
+            const entries = fs.readdirSync(this.runDirectory);
+            if (
+                entries.length === 1
+                && entries[0] === CELL_MATERIALIZATION_OWNER_MARKER
+            ) {
+                fs.rmSync(
+                    (require('path') as typeof import('node:path')).join(
+                        this.runDirectory,
+                        CELL_MATERIALIZATION_OWNER_MARKER
+                    ),
+                    { force: true }
+                );
+            } else if (entries.length > 0) {
+                return;
+            }
             fs.rmdirSync(this.runDirectory);
             this.runDirectory = undefined;
         } catch (error) {

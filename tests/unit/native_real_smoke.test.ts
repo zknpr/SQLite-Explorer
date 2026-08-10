@@ -290,6 +290,66 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             );
         });
 
+        await testContext.test('interrupts and cleans a native view-export spool', async () => {
+            const spool = '__sqlite_explorer_export_0123456789abcdef0123456789abcdef';
+            const spoolArgs = (sql: string, timeoutMs: number, params?: unknown[]) => {
+                const boundary = '/*sqlite_explorer_boundary_native_export_spool_smoke*/';
+                return [`${sql}\n${boundary}`, sql, boundary, params, timeoutMs];
+            };
+            const runawaySpool =
+                `CREATE TEMP TABLE "${spool}" AS SELECT value FROM (` +
+                'WITH RECURSIVE runaway(value) AS (' +
+                'SELECT 1 UNION ALL SELECT value + 1 FROM runaway WHERE value < 100000000' +
+                ') SELECT value FROM runaway)';
+            const controller = new AbortController();
+            const cancellation = new DOMException('Cancelled native export spool', 'AbortError');
+            const startedAt = Date.now();
+            const create = activeRawWorker.call(
+                'queryExportSpool',
+                spoolArgs(runawaySpool, 5000),
+                7000,
+                controller.signal
+            );
+            const cancelTimer = setTimeout(() => controller.abort(cancellation), 100);
+            try {
+                await assert.rejects(create, error => error === cancellation);
+            } finally {
+                clearTimeout(cancelTimer);
+                const drop = `DROP TABLE IF EXISTS temp."${spool}"`;
+                await activeRawWorker.call(
+                    'queryExportSpool',
+                    spoolArgs(drop, 1000),
+                    3000
+                );
+            }
+            assert.ok(
+                Date.now() - startedAt < 1500,
+                'host cancellation must interrupt the spool inside SQLite'
+            );
+
+            const finiteCreate = `CREATE TEMP TABLE "${spool}" AS SELECT 'healthy' AS value`;
+            await activeRawWorker.call(
+                'queryExportSpool',
+                spoolArgs(finiteCreate, 1000),
+                3000
+            );
+            const read =
+                `SELECT CAST(rowid AS TEXT), * FROM "${spool}" ` +
+                'WHERE rowid > ? ORDER BY rowid LIMIT 1';
+            const healthy = await activeRawWorker.call<{ values: unknown[][] }>(
+                'queryExportSpool',
+                spoolArgs(read, 1000, [0]),
+                3000
+            );
+            assert.strictEqual(healthy.values[0]?.[1], 'healthy');
+            const finalDrop = `DROP TABLE IF EXISTS temp."${spool}"`;
+            await activeRawWorker.call(
+                'queryExportSpool',
+                spoolArgs(finalDrop, 1000),
+                3000
+            );
+        });
+
         await testContext.test('keeps the worker and edit connection healthy after interruptions', async () => {
             const health = await activeRawWorker.call<{ values: unknown[][] }>('query', [
                 'SELECT 6 * 7 AS value'

@@ -152,7 +152,10 @@ export async function generateDatabaseDocumentKey(uri: vsc.Uri): Promise<string>
   const scheme = uri.scheme.toLowerCase();
   const resourceIdentity = scheme === 'file' && uri.authority === ''
     ? uri.path
-    : JSON.stringify([scheme, uri.authority, uri.path]);
+    // Query and fragment are provider-defined resource selectors. Omitting
+    // either can alias two distinct virtual databases even when their visible
+    // scheme, authority, and path are identical.
+    : JSON.stringify([scheme, uri.authority, uri.path, uri.query, uri.fragment]);
   const resourceHash = await hash64(resourceIdentity);
   return `${basename}${extname} <${resourceHash}>`;
 }

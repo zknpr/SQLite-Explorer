@@ -3,12 +3,20 @@ import {
 } from './cell-edit-policy';
 import { SQLITE_MAX_VARIABLE_NUMBER } from './integer-utils';
 import { escapeIdentifier, validateRowId } from './sql-utils';
-import type { CellUpdate, CellValue } from './types';
+import {
+  buildRecordIdentityPredicateChunks
+} from './row-identity';
+import type { CellUpdate, CellValue, TableIdentity } from './types';
 
 export interface BatchPriorLimitQuery {
   column: string;
   sql: string;
   params: CellValue[];
+}
+
+export interface BatchHistorySizePreflight {
+  queries: Array<{ sql: string; params: CellValue[] }>;
+  expectedCellCount: number;
 }
 
 // Each query reserves one bind for the edit limit. Staying below SQLite's
@@ -90,4 +98,99 @@ export function assertBatchPriorLimitResult(
     Number(byteLength),
     editLimitBytes
   );
+}
+
+function batchHistoryValueBytes(column: string): string {
+  const escaped = escapeIdentifier(column);
+  return (
+    `CASE typeof(${escaped}) `
+    + `WHEN 'text' THEN 2 * octet_length(${escaped}) `
+    + `WHEN 'blob' THEN octet_length(${escaped}) `
+    + `WHEN 'integer' THEN 8 WHEN 'real' THEN 8 ELSE 0 END`
+  );
+}
+
+/**
+ * Build chunked metadata-only aggregates for exactly the cells whose prior
+ * values will be retained by batch undo. No TEXT/BLOB value crosses the engine
+ * boundary until the complete aggregate has been admitted.
+ */
+export function buildBatchHistorySizePreflight(
+  table: string,
+  updates: readonly CellUpdate[],
+  identity: TableIdentity
+): BatchHistorySizePreflight {
+  const rowIdsByColumn = new Map<string, Map<string, CellUpdate['rowId']>>();
+  let expectedCellCount = 0;
+  for (const update of updates) {
+    const rowKey = String(update.rowId);
+    let rowIds = rowIdsByColumn.get(update.column);
+    if (!rowIds) {
+      rowIds = new Map();
+      rowIdsByColumn.set(update.column, rowIds);
+    }
+    if (rowIds.has(rowKey)) {
+      throw new Error(`Batch update for ${table} contains the same cell more than once`);
+    }
+    rowIds.set(rowKey, update.rowId);
+    expectedCellCount++;
+  }
+
+  const queries: BatchHistorySizePreflight['queries'] = [];
+  for (const [column, rowIds] of rowIdsByColumn) {
+    for (const predicate of buildRecordIdentityPredicateChunks([...rowIds.values()], identity)) {
+      queries.push({
+        sql:
+          `SELECT COUNT(*), COALESCE(SUM(${batchHistoryValueBytes(column)}), 0) `
+          + `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+        params: predicate.params
+      });
+    }
+  }
+  return { queries, expectedCellCount };
+}
+
+function safeHistoryAggregateInteger(value: unknown, label: string): number {
+  const normalized = typeof value === 'bigint' ? Number(value) : value;
+  if (!Number.isSafeInteger(normalized) || Number(normalized) < 0) {
+    throw new Error(`SQLite returned an unsafe ${label} during batch undo preflight`);
+  }
+  return Number(normalized);
+}
+
+/** Refuse the full-value SELECT when aggregate prior values cannot fit history. */
+export function assertBatchHistoryFitsUndoBudget(input: {
+  table: string;
+  preflight: BatchHistorySizePreflight;
+  resultRows: readonly (readonly unknown[] | undefined)[];
+  maxPriorValueBytes: number;
+}): void {
+  if (!Number.isSafeInteger(input.maxPriorValueBytes) || input.maxPriorValueBytes < 0) {
+    throw new Error('Batch update undo snapshot budget must be a non-negative safe integer');
+  }
+  if (input.resultRows.length !== input.preflight.queries.length) {
+    throw new Error('SQLite returned incomplete batch undo preflight metadata');
+  }
+
+  let cellCount = 0;
+  let valueBytes = 0;
+  for (const row of input.resultRows) {
+    if (!row || row.length < 2) {
+      throw new Error('SQLite omitted batch undo preflight metadata');
+    }
+    cellCount += safeHistoryAggregateInteger(row[0], 'cell count');
+    valueBytes += safeHistoryAggregateInteger(row[1], 'value byte count');
+    if (!Number.isSafeInteger(cellCount) || !Number.isSafeInteger(valueBytes)) {
+      throw new Error('SQLite returned unsafe aggregate batch undo metadata');
+    }
+  }
+  if (cellCount !== input.preflight.expectedCellCount) {
+    throw new Error(`Cannot update ${input.table}: one or more row identities no longer exist`);
+  }
+  if (valueBytes > input.maxPriorValueBytes) {
+    throw new Error(
+      `Batch update undo snapshot exceeds the ${input.maxPriorValueBytes}-byte memory budget; `
+      + 'update fewer cells or increase sqliteExplorer.maxUndoMemory.'
+    );
+  }
 }

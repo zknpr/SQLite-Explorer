@@ -116,4 +116,32 @@ describe('WasmDatabaseEngine paged overlay export', () => {
     );
     engine.shutdown();
   });
+
+  it('warns once that a large logical database is fully rewritten on atomic save', () => {
+    const oneGiB = 1024 * 1024 * 1024;
+    const warnings: string[] = [];
+    const largeIdentity = { ...baseIdentity, size: BigInt(oneGiB) };
+    const engine = new WasmDatabaseEngine(
+      fakeInstance(() => ({
+        chunkSize: 4096,
+        logicalSize: oneGiB,
+        baseLimit: oneGiB,
+        chunks: []
+      })),
+      5000,
+      false,
+      (level, ...args) => {
+        if (level === 'warn') warnings.push(args.map(String).join(' '));
+      },
+      {},
+      pagedState({ baseIdentity: largeIdentity, fileSizeBytes: oneGiB })
+    );
+
+    engine.exportPagedWritableOverlay();
+    engine.exportPagedWritableOverlay();
+
+    assert.strictEqual(warnings.length, 1);
+    assert.match(warnings[0], /atomic save.*rewrites the full.*1073741824 bytes/i);
+    engine.shutdown();
+  });
 });

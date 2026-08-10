@@ -135,7 +135,9 @@ import {
   OversizedCellReplacementRequiredError
 } from '../../cell-edit-policy';
 import {
+  assertBatchHistoryFitsUndoBudget,
   assertBatchPriorLimitResult,
+  buildBatchHistorySizePreflight,
   buildBatchPriorLimitQueries
 } from '../../batch-update';
 import {
@@ -153,6 +155,7 @@ import {
 } from '../../column-drop';
 import {
   normalizePagedWritableOverlay,
+  shouldWarnForPagedAtomicRewrite,
   shouldWarnForPagedOverlayCopy,
   type PagedFileIdentity,
   type PagedWritableOverlaySnapshot,
@@ -323,6 +326,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /** Set only for page-on-demand opens; undefined for buffer opens. */
   private readonly pagedState: WasmEnginePagedState | undefined;
   private pagedOverlayMemoryWarningEmitted = false;
+  private pagedAtomicRewriteWarningEmitted = false;
   readonly engineKind = Promise.resolve('wasm' as const);
 
   constructor(
@@ -959,6 +963,20 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         + `${snapshot.dirtyBytes} dirty overlay bytes in worker memory.`
       );
     }
+    if (
+      shouldWarnForPagedAtomicRewrite(
+        snapshot.logicalSize,
+        this.pagedAtomicRewriteWarningEmitted
+      )
+    ) {
+      this.pagedAtomicRewriteWarningEmitted = true;
+      this.logger(
+        'warn',
+        'Atomic save rewrites the full '
+        + `${snapshot.logicalSize} bytes to an adjacent temporary file; `
+        + 'save time, disk I/O, and required free space scale with the database size.'
+      );
+    }
     return snapshot;
   }
 
@@ -1146,6 +1164,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       await this.updateCellBatch(
         targetTable,
         updates,
+        undefined,
         undefined,
         HISTORY_REPLAY_EDIT_TOKEN
       );
@@ -1511,6 +1530,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                 await this.updateCellBatch(
                   targetTable,
                   updates,
+                  undefined,
                   undefined,
                   HISTORY_REPLAY_EDIT_TOKEN
                 );
@@ -2311,6 +2331,26 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
+  private async assertBatchHistoryWithinBudget(
+    table: string,
+    updates: readonly CellUpdate[],
+    identity: TableIdentity,
+    maxPriorValueBytes: number
+  ): Promise<void> {
+    const preflight = buildBatchHistorySizePreflight(table, updates, identity);
+    const resultRows: Array<readonly unknown[] | undefined> = [];
+    for (const query of preflight.queries) {
+      const result = await this.executeQuery(query.sql, query.params);
+      resultRows.push(result[0]?.rows[0]);
+    }
+    assertBatchHistoryFitsUndoBudget({
+      table,
+      preflight,
+      resultRows,
+      maxPriorValueBytes
+    });
+  }
+
   /** Columns SQLite permits in an INSERT; generated columns have hidden 2/3. */
   private async getInsertableColumnNames(table: string): Promise<string[]> {
     const result = await this.executeQuery(
@@ -2825,6 +2865,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     table: string,
     updates: CellUpdate[],
     maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number,
     historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
   ): Promise<CellUpdateResult[]> {
     updates.forEach(update => assertMutableRecordId(update.rowId));
@@ -2845,12 +2886,29 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       if (identity.kind !== 'primaryKey') {
         throw new Error(`Primary-key identity cannot target rowid table ${table}`);
       }
+      if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
+        await this.assertBatchHistoryWithinBudget(
+          table,
+          updates,
+          identity,
+          maxUndoSnapshotBytes
+        );
+      }
       return this.updatePrimaryKeyCellBatch(
         table,
         identity,
         updates,
         maxEditValueBytes,
         historyReplayToken
+      );
+    }
+
+    if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
+      await this.assertBatchHistoryWithinBudget(
+        table,
+        updates,
+        { kind: 'rowid' },
+        maxUndoSnapshotBytes
       );
     }
 

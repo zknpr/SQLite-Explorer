@@ -421,10 +421,16 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
     async updateCellBatch(
         table: string,
         updates: CellUpdate[],
-        maxEditValueBytes?: number
+        maxEditValueBytes?: number,
+        maxUndoSnapshotBytes?: number
     ): Promise<CellUpdateResult[]> {
         this.log(`Batch update ${updates.length} cells in ${table}`, true);
-        return this.wrapped.updateCellBatch(table, updates, maxEditValueBytes);
+        return this.wrapped.updateCellBatch(
+            table,
+            updates,
+            maxEditValueBytes,
+            maxUndoSnapshotBytes
+        );
     }
 
     async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {

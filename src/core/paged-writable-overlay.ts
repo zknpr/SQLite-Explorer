@@ -1,6 +1,7 @@
 /** Maximum payload carried by one worker-to-host dirty-overlay run. */
 export const MAX_PAGED_OVERLAY_RUN_BYTES = 8 * 1024 * 1024;
 const PAGED_OVERLAY_COPY_WARNING_BYTES = 1024 * 1024 * 1024;
+const PAGED_ATOMIC_REWRITE_WARNING_BYTES = 1024 * 1024 * 1024;
 
 /** Immutable identity of the base file descriptor opened by the worker. */
 export interface PagedFileIdentity {
@@ -69,6 +70,14 @@ export function shouldWarnForPagedOverlayCopy(
   warningAlreadyEmitted: boolean = false
 ): boolean {
   return !warningAlreadyEmitted && dirtyBytes >= PAGED_OVERLAY_COPY_WARNING_BYTES;
+}
+
+/** Large saves remain bounded in memory but still rewrite the complete file. */
+export function shouldWarnForPagedAtomicRewrite(
+  logicalSize: number,
+  warningAlreadyEmitted: boolean = false
+): boolean {
+  return !warningAlreadyEmitted && logicalSize >= PAGED_ATOMIC_REWRITE_WARNING_BYTES;
 }
 
 /**

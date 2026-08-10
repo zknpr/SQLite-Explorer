@@ -211,7 +211,8 @@ interface WorkerMethods {
   updateCellBatch(
     table: string,
     updates: CellUpdate[],
-    maxEditValueBytes?: number
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
   ): Promise<CellUpdateResult[]>;
   addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
@@ -659,8 +660,14 @@ async function createInProcessWasmDatabaseConnection(
         updateCellBatch: (
           table: string,
           updates: CellUpdate[],
-          maxEditValueBytes?: number
-        ) => endpoint.updateCellBatch(table, updates, maxEditValueBytes),
+          maxEditValueBytes?: number,
+          maxUndoSnapshotBytes?: number
+        ) => endpoint.updateCellBatch(
+          table,
+          updates,
+          maxEditValueBytes,
+          maxUndoSnapshotBytes
+        ),
         addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
           endpoint.addColumn(table, column, type, defaultValue),
         fetchTableData: (table: string, options: TableQueryOptions) =>
@@ -1056,14 +1063,20 @@ async function createWorkerBackedWasmDatabaseConnection(
           updateCellBatch: (
             table: string,
             updates: CellUpdate[],
-            maxEditValueBytes?: number
+            maxEditValueBytes?: number,
+            maxUndoSnapshotBytes?: number
           ) => {
             // Retain caller-owned values because batch history records these updates.
             const wrappedUpdates = updates.map(u => ({
               ...u,
               value: wrapForTransfer(u.value)
             }));
-            return workerProxy.updateCellBatch(table, wrappedUpdates, maxEditValueBytes);
+            return workerProxy.updateCellBatch(
+              table,
+              wrappedUpdates,
+              maxEditValueBytes,
+              maxUndoSnapshotBytes
+            );
           },
           addColumn: (table: string, column: string, type: string, defaultValue?: string) =>
             workerProxy.addColumn(table, column, type, defaultValue),

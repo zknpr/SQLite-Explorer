@@ -7,10 +7,13 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import * as vscode from 'vscode';
 
 import {
+    CELL_MATERIALIZATION_OWNER_MARKER,
+    CELL_MATERIALIZATION_RUN_PREFIX,
     CellMaterializationService,
     type CellMaterializationOwner
 } from '../../src/cellMaterialization';
 import { serializeOperations } from '../../src/core/operation-serializer';
+import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import type {
     CellMetadata,
     CellReadTarget,
@@ -126,6 +129,82 @@ describe('CellMaterializationService', () => {
         );
     });
 
+    it('materializes oversized invalid-encoding TEXT as byte-faithful binary content', async () => {
+        const initialized = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = initialized.operations!;
+        const prefix = 'a'.repeat(70 * 1024);
+        const expected = Buffer.concat([Buffer.from(prefix), Buffer.from([0x80])]);
+        await operations.executeQuery('CREATE TABLE invalid_text (payload TEXT)');
+        await operations.executeQuery(
+            "INSERT INTO invalid_text VALUES (CAST(? AS TEXT) || CAST(X'80' AS TEXT))",
+            [prefix]
+        );
+        service = new CellMaterializationService(vscode.Uri.file(testDir), {
+            maxBytes: 128 * 1024,
+            chunkBytes: 4096
+        });
+
+        try {
+            const materialized = await service.materialize(
+                operations,
+                { table: 'invalid_text', rowId: 1, column: 'payload' },
+                { fileExtension: 'txt' }
+            );
+
+            assert.deepStrictEqual(fs.readFileSync(materialized.uri.fsPath), expected);
+            assert.match(materialized.uri.fsPath, /\.bin$/);
+            assert.strictEqual(materialized.contentEncoding, 'raw-database-bytes');
+            assert.strictEqual(materialized.byteLength, expected.byteLength);
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('sweeps only stale dead-host materialization runs at startup', () => {
+        const prefix = CELL_MATERIALIZATION_RUN_PREFIX;
+        const markerName = CELL_MATERIALIZATION_OWNER_MARKER;
+        const staleId = '11111111-1111-4111-8111-111111111111';
+        const liveId = '22222222-2222-4222-8222-222222222222';
+        const unmarkedId = '33333333-3333-4333-8333-333333333333';
+        const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+        const writeRun = (runId: string, pid: number, marked: boolean) => {
+            const directory = path.join(testDir, `${prefix}${runId}`);
+            fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+            fs.writeFileSync(path.join(directory, 'leaked.bin'), 'leaked');
+            if (marked) {
+                fs.writeFileSync(path.join(directory, markerName), JSON.stringify({
+                    version: 1,
+                    runId,
+                    pid,
+                    createdAtMs: 1_000,
+                    ...(uid === undefined ? {} : { uid })
+                }));
+            }
+            return directory;
+        };
+        const staleDirectory = writeRun(staleId, 12345, true);
+        const liveDirectory = writeRun(liveId, process.pid, true);
+        const unmarkedDirectory = writeRun(unmarkedId, 54321, false);
+
+        service = new CellMaterializationService(vscode.Uri.file(testDir), {
+            staleRunAgeMs: 1_000,
+            now: () => 10_000,
+            isProcessAlive: pid => pid === process.pid
+        });
+
+        assert.strictEqual(fs.existsSync(staleDirectory), false, 'dead stale run must be swept');
+        assert.strictEqual(fs.existsSync(liveDirectory), true, 'concurrent live host must be retained');
+        assert.strictEqual(
+            fs.existsSync(unmarkedDirectory),
+            true,
+            'legacy/unowned directories cannot be deleted safely during a dual-window activation'
+        );
+    });
+
     it('removes a partial file and closes the read bracket when cancelled between chunks', async () => {
         const controller = new AbortController();
         const source = Uint8Array.from({ length: 32 }, (_, index) => index);
@@ -191,7 +270,9 @@ describe('CellMaterializationService', () => {
         assert.strictEqual(firstOperations.closeCount, 1);
         assert.strictEqual(secondOperations.closeCount, 1);
         assert.strictEqual(
-            fs.readdirSync(path.dirname(first.uri.fsPath)).length,
+            fs.readdirSync(path.dirname(first.uri.fsPath)).filter(
+                entry => entry !== CELL_MATERIALIZATION_OWNER_MARKER
+            ).length,
             1,
             'refusal must not evict or create another live file'
         );

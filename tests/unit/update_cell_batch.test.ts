@@ -20,20 +20,25 @@ describe('atomic cell batches', () => {
                 `INSERT INTO docs VALUES ('{"count":1,"concurrent":true}', 'database-current')`
             );
 
-            const outcomes = await engine.updateCellBatch('docs', [
-                {
-                    rowId: 1,
-                    column: 'payload',
-                    value: '{"count":2,"concurrent":true}',
-                    originalValue: '{"count":0}'
-                },
-                {
-                    rowId: 1,
-                    column: 'label',
-                    value: 'after',
-                    originalValue: 'caller-stale'
-                }
-            ]);
+            const outcomes = await engine.updateCellBatch(
+                'docs',
+                [
+                    {
+                        rowId: 1,
+                        column: 'payload',
+                        value: '{"count":2,"concurrent":true}',
+                        originalValue: '{"count":0}'
+                    },
+                    {
+                        rowId: 1,
+                        column: 'label',
+                        value: 'after',
+                        originalValue: 'caller-stale'
+                    }
+                ],
+                1024,
+                64 * 1024
+            );
 
             assert.deepStrictEqual(outcomes, [
                 {
@@ -146,6 +151,57 @@ describe('atomic cell batches', () => {
                     'FROM batch_oversized_prior ORDER BY rowid'
                 ))[0].rows,
                 [['blob', 1], ['blob', 2048]]
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('refuses aggregate oversized undo history before opening the update savepoint', async () => {
+        const initialized = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const engine = initialized.operations!;
+        const originalExecuteQuery = engine.executeQuery.bind(engine);
+        try {
+            await originalExecuteQuery('CREATE TABLE aggregate_history (payload TEXT)');
+            const prior = 'x'.repeat(256 * 1024);
+            await originalExecuteQuery(
+                'INSERT INTO aggregate_history VALUES (?), (?), (?), (?)',
+                [prior, prior, prior, prior]
+            );
+
+            const observedSql: string[] = [];
+            engine.executeQuery = async (sql, params, signal) => {
+                observedSql.push(sql);
+                return originalExecuteQuery(sql, params, signal);
+            };
+
+            await assert.rejects(
+                (engine.updateCellBatch as any)(
+                    'aggregate_history',
+                    [1, 2, 3, 4].map(rowId => ({
+                        rowId,
+                        column: 'payload',
+                        value: 'after'
+                    })),
+                    1024 * 1024,
+                    700 * 1024
+                ),
+                /Batch update undo snapshot exceeds the 716800-byte memory budget/i
+            );
+            assert.strictEqual(
+                observedSql.some(sql => /^\s*SAVEPOINT\s+/i.test(sql)),
+                false,
+                'aggregate history refusal must happen before the savepoint'
+            );
+            assert.deepStrictEqual(
+                (await originalExecuteQuery(
+                    'SELECT count(*), min(length(payload)), max(length(payload)) FROM aggregate_history'
+                ))[0].rows,
+                [[4, prior.length, prior.length]]
             );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();

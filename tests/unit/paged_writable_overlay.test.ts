@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import {
   MAX_PAGED_OVERLAY_RUN_BYTES,
   normalizePagedWritableOverlay,
+  shouldWarnForPagedAtomicRewrite,
   shouldWarnForPagedOverlayCopy,
   type PagedFileIdentity,
   type RawPagedWritableOverlay
@@ -136,5 +137,9 @@ describe('paged writable overlay normalization', () => {
     assert.strictEqual(shouldWarnForPagedOverlayCopy(oneGiB), true);
     assert.strictEqual(shouldWarnForPagedOverlayCopy(oneGiB + 1), true);
     assert.strictEqual(shouldWarnForPagedOverlayCopy(oneGiB, true), false);
+    assert.strictEqual(shouldWarnForPagedAtomicRewrite(oneGiB - 1), false);
+    assert.strictEqual(shouldWarnForPagedAtomicRewrite(oneGiB), true);
+    assert.strictEqual(shouldWarnForPagedAtomicRewrite(oneGiB + 1), true);
+    assert.strictEqual(shouldWarnForPagedAtomicRewrite(oneGiB, true), false);
   });
 });

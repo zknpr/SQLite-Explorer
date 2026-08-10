@@ -50,6 +50,9 @@ let asyncCapabilitySupported = false;
 /** AbortControllers for async operations addressable by their request id. */
 const activeOperations = new Map();
 
+/** TEMP export spools owned by the interruptible secondary connection. */
+const exportSpools = new Set();
+
 /** Map of prepared statements by ID */
 const statements = new Map();
 let stmtCounter = 0;
@@ -312,6 +315,7 @@ function closeAsyncDatabase() {
   return (async () => {
     const connection = asyncDb;
     asyncDb = null;
+    exportSpools.clear();
     if (!connection || typeof connection.close !== 'function') return;
     await connection.close();
   })();
@@ -1217,6 +1221,130 @@ function executeBoundedQueryAsync(asyncDatabase, validationDb, requestId, marked
   })();
 }
 
+/** Recognize only the private TEMP-table statements minted by the exporter. */
+function parseExportSpoolStatement(sql) {
+  const namePattern = '(__sqlite_explorer_export_[0-9a-f]{32})';
+  let match = sql.match(new RegExp(
+    `^CREATE TEMP TABLE "${namePattern}" AS SELECT[\\s\\S]+$`,
+    'i'
+  ));
+  if (match) return { kind: 'create', name: match[1] };
+
+  match = sql.match(new RegExp(
+    `^SELECT CAST\\(rowid AS TEXT\\), \\* FROM "${namePattern}" ` +
+    'WHERE rowid > \\? ORDER BY rowid LIMIT 1$',
+    'i'
+  ));
+  if (match) return { kind: 'read', name: match[1] };
+
+  match = sql.match(new RegExp(
+    `^DROP TABLE IF EXISTS temp\\."${namePattern}"$`,
+    'i'
+  ));
+  if (match) return { kind: 'drop', name: match[1] };
+  throw new Error('Invalid export spool statement');
+}
+
+/** Validate the host marker when the main connection cannot prepare async TEMP SQL. */
+function assertExportSpoolPayload(markedSql, sql, requiredSuffix) {
+  const marker = requiredSuffix ? `\n${requiredSuffix}` : '';
+  if (!marker || !markedSql.endsWith(marker)) {
+    throw new Error('Exactly one SQL statement is required');
+  }
+  const validatedSql = markedSql.slice(0, -marker.length);
+  if (validatedSql !== sql) {
+    throw new Error('Single-statement SQL payload mismatch');
+  }
+  // read/drop are exact generated grammars with no free SQL tail. CREATE has
+  // a free SELECT body and is therefore still prepared on the main connection.
+  parseExportSpoolStatement(validatedSql);
+  return validatedSql;
+}
+
+/**
+ * Keep CREATE/read/DROP on one AsyncDatabase connection so TEMP ownership and
+ * engine-side AbortSignal interruption are both real. The main connection may
+ * hold the export's read SAVEPOINT; its transaction state is intentionally not
+ * used to downgrade this private path to a non-interruptible sync call.
+ */
+function executeExportSpoolQuery(asyncDatabase, validationDb, requestId, markedSql, sql, requiredSuffix, params, timeoutMs) {
+  return (async () => {
+    if (!asyncDatabase) {
+      throw new Error('Interruptible native view export is unavailable in this runtime');
+    }
+    const candidate = parseExportSpoolStatement(sql);
+    const validatedSql = candidate.kind === 'create'
+      ? assertSingleStatementPayload(validationDb, markedSql, sql, requiredSuffix)
+      : assertExportSpoolPayload(markedSql, sql, requiredSuffix);
+    const statement = parseExportSpoolStatement(validatedSql);
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new Error('Query timeout must be a positive finite number');
+    }
+    if (statement.kind === 'create' && exportSpools.has(statement.name)) {
+      throw new Error(`Export spool already exists: ${statement.name}`);
+    }
+    if (statement.kind === 'read' && !exportSpools.has(statement.name)) {
+      throw new Error(`Export spool is not active: ${statement.name}`);
+    }
+
+    const operation = {
+      controller: new AbortController(),
+      reason: undefined
+    };
+    activeOperations.set(requestId, operation);
+    const deadline = setTimeout(() => {
+      if (operation.reason === undefined) {
+        operation.reason = 'deadline';
+        operation.controller.abort();
+      }
+    }, timeoutMs);
+
+    try {
+      if (statement.kind === 'read') {
+        const rows = await asyncDatabase.all(
+          validatedSql,
+          params || [],
+          { signal: operation.controller.signal }
+        );
+        const columns = Array.isArray(rows) && rows.length > 0
+          ? Object.keys(rows[0])
+          : [];
+        return {
+          columns,
+          values: (rows || []).map(row => columns.map(column => row[column])),
+          rowCount: rows?.length ?? 0
+        };
+      }
+
+      await asyncDatabase.run(
+        validatedSql,
+        params || [],
+        { signal: operation.controller.signal }
+      );
+      if (statement.kind === 'create') exportSpools.add(statement.name);
+      else exportSpools.delete(statement.name);
+      return { columns: [], values: [], rowCount: 0 };
+    } catch (err) {
+      if ((err && err.message) !== 'Aborted') throw err;
+      if (operation.reason === 'deadline') {
+        throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+      }
+      if (operation.reason === 'host') {
+        const cancellationError = new Error('Operation cancelled');
+        cancellationError.name = 'AbortError';
+        cancellationError.cancelled = true;
+        throw cancellationError;
+      }
+      throw err;
+    } finally {
+      clearTimeout(deadline);
+      if (activeOperations.get(requestId) === operation) {
+        activeOperations.delete(requestId);
+      }
+    }
+  })();
+}
+
 /**
  * Handle incoming RPC request.
  *
@@ -1533,6 +1661,22 @@ async function handleRequest(request) {
               limit,
               timeoutMs
             );
+        break;
+      }
+
+      case "queryExportSpool": {
+        const [markedSql, sql, requiredSuffix, params, timeoutMs] = args;
+        if (!db) throw new Error("Database not open");
+        result = await executeExportSpoolQuery(
+          asyncDb,
+          db,
+          id,
+          markedSql,
+          sql,
+          requiredSuffix,
+          params,
+          timeoutMs
+        );
         break;
       }
 

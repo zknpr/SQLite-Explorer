@@ -580,7 +580,8 @@ export interface DatabaseOperations {
   updateCellBatch(
     table: string,
     updates: CellUpdate[],
-    maxEditValueBytes?: number
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
   ): Promise<CellUpdateResult[]>;
 
   /** Add a new column to a table */

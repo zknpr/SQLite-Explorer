@@ -277,6 +277,28 @@ describe('generateDatabaseDocumentKey', () => {
     assert.notStrictEqual(remoteOneKey, remoteTwoKey, 'authority must affect the key');
   });
 
+  it('includes query and fragment in non-file document identity', async () => {
+    const makeUri = (query: string, fragment: string) => ({
+      scheme: 'memfs',
+      authority: 'host',
+      path: '/path/to/database.sqlite',
+      query,
+      fragment,
+      fsPath: '/path/to/database.sqlite',
+      toString: () => `memfs://host/path/to/database.sqlite?${query}#${fragment}`
+    }) as vsc.Uri;
+
+    const resourceHash = async (uri: vsc.Uri) => (
+      (await generateDatabaseDocumentKey(uri)).match(/<([^>]+)>$/)?.[1]
+    );
+    const base = await resourceHash(makeUri('rev=a', 'snapshot-a'));
+    const differentQuery = await resourceHash(makeUri('rev=b', 'snapshot-a'));
+    const differentFragment = await resourceHash(makeUri('rev=a', 'snapshot-b'));
+
+    assert.notStrictEqual(base, differentQuery, 'query must affect non-file identity');
+    assert.notStrictEqual(base, differentFragment, 'fragment must affect non-file identity');
+  });
+
   it('should handle URIs without an extension', async () => {
     const uri = vsc.Uri.file('/path/to/database');
     const key = await generateDatabaseDocumentKey(uri);

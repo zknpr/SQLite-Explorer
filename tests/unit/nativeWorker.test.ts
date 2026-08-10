@@ -292,6 +292,45 @@ describe('createNativeDatabaseConnection', () => {
         };
     }
 
+    it('routes generated export spool statements through one interruptible native connection', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryExportSpool') {
+                return { result: { columns: ['value'], values: [['one']], rowCount: 1 } };
+            }
+            return { result: { columns: [], values: [] } };
+        });
+        const spool = '__sqlite_explorer_export_0123456789abcdef0123456789abcdef';
+        const controller = new AbortController();
+
+        try {
+            connection.calls.length = 0;
+            await connection.databaseOps.executeQuery(
+                `CREATE TEMP TABLE "${spool}" AS SELECT 'one' AS value`,
+                undefined,
+                controller.signal
+            );
+            await connection.databaseOps.executeQuery(
+                `SELECT CAST(rowid AS TEXT), * FROM "${spool}" ` +
+                'WHERE rowid > ? ORDER BY rowid LIMIT 1',
+                [0],
+                controller.signal
+            );
+            await connection.databaseOps.executeQuery(
+                `DROP TABLE IF EXISTS temp."${spool}"`
+            );
+
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['queryExportSpool', 'queryExportSpool', 'queryExportSpool']
+            );
+            assert.ok(connection.calls.slice(0, 2).every(call => (
+                String(call.args[0]).includes(spool)
+            )));
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('loads native table identities in one schema queryBatch, including virtual and shadow tables', async () => {
         const identityMetadata = {
             columns: [
@@ -679,6 +718,58 @@ describe('createNativeDatabaseConnection', () => {
                 connection.calls.map(call => call.method),
                 ['run', 'queryBatch', 'run', 'run']
             );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('refuses aggregate native batch history before opening a savepoint', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'queryBatch') {
+                const [queries] = call.args as [Array<{ sql: string }>];
+                return {
+                    result: {
+                        results: queries.map(query => (
+                            /SELECT COUNT\(\*\), COALESCE\(SUM/i.test(query.sql)
+                                ? { columns: ['COUNT(*)', 'value_bytes'], values: [[4, 2 * 1024 * 1024]] }
+                                : { columns: ['storage_class', 'byte_length'], values: [] }
+                        ))
+                    }
+                };
+            }
+            if (call.method === 'query') {
+                return {
+                    result: {
+                        columns: ['rowid', 'payload'],
+                        values: [1, 2, 3, 4].map(rowId => [rowId, 'x'])
+                    }
+                };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                (connection.databaseOps.updateCellBatch as any)(
+                    'native_aggregate_history',
+                    [1, 2, 3, 4].map(rowId => ({
+                        rowId,
+                        column: 'payload',
+                        value: 'after'
+                    })),
+                    1024 * 1024,
+                    700 * 1024
+                ),
+                /Batch update undo snapshot exceeds the 716800-byte memory budget/i
+            );
+            assert.strictEqual(
+                connection.calls.some(call => (
+                    call.method === 'run' && /^SAVEPOINT /.test(String(call.args[0]))
+                )),
+                false,
+                'native aggregate refusal must precede the savepoint'
+            );
+            assert.strictEqual(connection.calls.some(call => call.method === 'execBatch'), false);
         } finally {
             connection.dispose();
         }
@@ -2472,6 +2563,50 @@ describe('NativeWorkerProcess', () => {
         } finally {
             if (queryPromise) {
                 const queryCall = calls.find(call => call.method === 'queryBounded');
+                if (queryCall) {
+                    (worker as any).handleMessage({ id: queryCall.id, error: 'test cleanup' });
+                }
+                await queryPromise.catch(() => {});
+            }
+            worker.stop();
+        }
+    });
+
+    it('routes an in-flight export-spool abort to the worker correlation id', async () => {
+        const calls: RecordedNativeCall[] = [];
+        const mockProcess = createRecordingNativeProcess(calls);
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        (worker as any).process = {
+            stdin: mockProcess.stdin,
+            kill: () => {}
+        };
+        const controller = new AbortController();
+        const cancellation = new DOMException('Cancelled export spool', 'AbortError');
+        let queryPromise: Promise<unknown> | undefined;
+
+        try {
+            queryPromise = worker.call('queryExportSpool', [], 1000, controller.signal);
+            await new Promise(resolve => setImmediate(resolve));
+            const queryCall = calls.find(call => call.method === 'queryExportSpool');
+            assert.ok(queryCall, 'export spool must be dispatched before cancellation');
+
+            controller.abort(cancellation);
+            await new Promise(resolve => setImmediate(resolve));
+
+            const cancelCall = calls.find(call => call.method === 'cancel');
+            assert.ok(cancelCall, 'aborting the export signal must send a cancel verb');
+            assert.deepStrictEqual(cancelCall.args, [queryCall.id]);
+
+            (worker as any).handleMessage({
+                id: queryCall.id,
+                error: '[queryExportSpool] Operation cancelled',
+                cancelled: true
+            });
+            await assert.rejects(queryPromise, error => error === cancellation);
+            queryPromise = undefined;
+        } finally {
+            if (queryPromise) {
+                const queryCall = calls.find(call => call.method === 'queryExportSpool');
                 if (queryCall) {
                     (worker as any).handleMessage({ id: queryCall.id, error: 'test cleanup' });
                 }

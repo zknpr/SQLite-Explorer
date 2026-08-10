@@ -1300,6 +1300,80 @@ describe('HostBridge', () => {
         ]);
     });
 
+    it('passes only the residual undo-entry budget into an atomic batch', async () => {
+        let updateArguments: unknown[] | undefined;
+        const dbOps = {
+            updateCellBatch: mock.fn(async (...args: unknown[]) => {
+                updateArguments = args;
+                return [{
+                    rowId: 1,
+                    columnName: 'payload',
+                    priorValue: 'before',
+                    newValue: 'after',
+                    operation: 'set' as const
+                }];
+            })
+        };
+        const recordExternalModification = mock.fn();
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            undoMemoryLimitBytes: 4096,
+            recordExternalModification
+        };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            mockDocument as any
+        );
+
+        await bridge.updateCellBatch(
+            'items',
+            [{ rowId: 1, column: 'payload', value: 'after' }],
+            'Budgeted batch'
+        );
+
+        assert.ok(updateArguments);
+        assert.strictEqual(updateArguments.length, 4);
+        assert.strictEqual(updateArguments[0], 'items');
+        assert.strictEqual(updateArguments[2], 16 * 1024 * 1024);
+        assert.ok(Number.isSafeInteger(updateArguments[3]));
+        assert.ok(Number(updateArguments[3]) >= 0 && Number(updateArguments[3]) < 4096);
+        assert.strictEqual(recordExternalModification.mock.callCount(), 1);
+    });
+
+    it('reserves a rewritten primary-key identity for every affected cell in its row', async () => {
+        const updateCellBatch = mock.fn(async () => []);
+        const rowId = encodePrimaryKeyRecordId(
+            [{ identifier: 'tenant', declaredType: 'TEXT', position: 1 }],
+            ['old']
+        );
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: { updateCellBatch },
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            undoMemoryLimitBytes: 6000,
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            mockDocument as any
+        );
+
+        await assert.rejects(
+            bridge.updateCellBatch('items', [
+                { rowId, column: 'tenant', value: '\u0800'.repeat(200) },
+                { rowId, column: 'payload', value: 'after' }
+            ], 'Rewrite key'),
+            /Batch update undo metadata exceeds the 6000-byte memory limit/
+        );
+        assert.strictEqual(updateCellBatch.mock.callCount(), 0);
+    });
+
     it('does not lose an interleaved single edit when an atomic batch rolls back', async () => {
         const database = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
         const raw = database.operations as WasmDatabaseEngine;

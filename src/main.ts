@@ -83,16 +83,24 @@ export async function activate(
  */
 export async function activateProviders(context: vsc.ExtensionContext, reporter?: TelemetryReporter) {
   const subs = [];
+
+  // Create output channel before startup cleanup so a non-fatal sweep failure
+  // remains visible without preventing the editor providers from activating.
+  const channel = GlobalOutputChannel = vsc.window.createOutputChannel(Title, 'sql');
+  subs.push(channel);
+
   const cellMaterializer = !import.meta.env?.VSCODE_BROWSER_EXT && context.globalStorageUri
     ? new CellMaterializationService(
-        vsc.Uri.joinPath(context.globalStorageUri, 'cell-materializations')
+        vsc.Uri.joinPath(context.globalStorageUri, 'cell-materializations'),
+        {
+          onCleanupWarning: (message, error) => channel.appendLine(
+            `[Cell materialization cleanup] ${message}: ` +
+            (error instanceof Error ? (error.stack ?? error.message) : String(error))
+          )
+        }
       )
     : undefined;
   if (cellMaterializer) subs.push(cellMaterializer);
-
-  // Create output channel for SQL logging
-  const channel = GlobalOutputChannel = vsc.window.createOutputChannel(Title, 'sql');
-  subs.push(channel);
 
   // Register file system provider
   subs.push(vsc.workspace.registerFileSystemProvider(UriScheme, new SQLiteFileSystemProvider(), { isCaseSensitive: true }));

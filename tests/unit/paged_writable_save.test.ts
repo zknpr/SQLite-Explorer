@@ -136,6 +136,42 @@ function bundledNativeBinary(): string | undefined {
 const acquireFixtureWriteLock = () => ({ release() {} });
 
 describe('paged writable host save', () => {
+  it('refuses insufficient adjacent-temp space before creating the temp file', async () => {
+    const basePath = path.join(fixtureDir, 'free-space-base.db');
+    const targetPath = path.join(fixtureDir, 'free-space-target.db');
+    fs.writeFileSync(basePath, Buffer.alloc(64, 3));
+    let temporaryCreates = 0;
+    const open = async (...args: Parameters<typeof fs.promises.open>) => {
+      if (args[1] === 'wx') temporaryCreates++;
+      return fs.promises.open(...args);
+    };
+    const capability = capabilityWithOpen(open as typeof fs.promises.open, {
+      statfs: (async () => ({
+        type: 0n,
+        bsize: 4096n,
+        frsize: 4096n,
+        blocks: 0n,
+        bfree: 0n,
+        bavail: 0n,
+        files: 0n,
+        ffree: 0n
+      })) as unknown as typeof fs.promises.statfs
+    });
+
+    await assert.rejects(
+      writePagedWritableOverlayToFile(
+        capability,
+        basePath,
+        targetPath,
+        snapshotFor(basePath)
+      ),
+      /atomic paged save needs approximately 4096 bytes.*only 0 bytes.*available/i
+    );
+
+    assert.strictEqual(temporaryCreates, 0);
+    assert.strictEqual(fs.existsSync(targetPath), false);
+  });
+
   it('stream-assembles a real VACUUM shrink byte-identically to explicit serialization', async () => {
     const basePath = path.join(fixtureDir, 'vacuum-base.db');
     const targetPath = path.join(fixtureDir, 'vacuum-save-as.db');

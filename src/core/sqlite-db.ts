@@ -957,9 +957,15 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
     async updateCellBatch(
       table: string,
       updates: CellUpdate[],
-      maxEditValueBytes?: number
+      maxEditValueBytes?: number,
+      maxUndoSnapshotBytes?: number
     ): Promise<CellUpdateResult[]> {
-      return requireEngine().updateCellBatch(table, updates, maxEditValueBytes);
+      return requireEngine().updateCellBatch(
+        table,
+        updates,
+        maxEditValueBytes,
+        maxUndoSnapshotBytes
+      );
     },
 
     async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {

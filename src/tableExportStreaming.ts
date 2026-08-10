@@ -54,6 +54,9 @@ export interface AsyncExportSink {
 
 export interface ExportCancellation {
   readonly isCancellationRequested: boolean;
+  readonly onCancellationRequested?: (
+    listener: () => void
+  ) => { dispose(): void };
 }
 
 interface ExportCell {
@@ -90,6 +93,28 @@ function cancellationError(): Error {
 
 function assertNotCancelled(cancellation?: ExportCancellation): void {
   if (cancellation?.isCancellationRequested) throw cancellationError();
+}
+
+function bindCancellationSignal(cancellation?: ExportCancellation): {
+  signal: AbortSignal | undefined;
+  dispose(): void;
+} {
+  if (!cancellation) return { signal: undefined, dispose() {} };
+
+  const controller = new AbortController();
+  const abort = (): void => {
+    if (!controller.signal.aborted) controller.abort(cancellationError());
+  };
+  const subscription = cancellation.onCancellationRequested?.(abort);
+  // Close the subscribe/check race for token implementations whose callback
+  // registration does not synchronously report an earlier cancellation.
+  if (cancellation.isCancellationRequested) abort();
+  return {
+    signal: controller.signal,
+    dispose() {
+      subscription?.dispose();
+    }
+  };
 }
 
 async function emit(
@@ -563,7 +588,8 @@ async function* readUnstableSpoolRows(
 ): AsyncGenerator<ExportRow> {
   const spoolTable = `__sqlite_explorer_export_${webCrypto.randomUUID().replace(/-/g, '')}`;
   const escapedSpool = escapeIdentifier(spoolTable);
-  let spoolCreated = false;
+  const cancellationBinding = bindCancellationSignal(cancellation);
+  let spoolAttempted = false;
   let primaryError: unknown;
   try {
     assertNotCancelled(cancellation);
@@ -571,11 +597,14 @@ async function* readUnstableSpoolRows(
     // and ORDER BY random() are re-evaluated by every LIMIT/OFFSET statement.
     // Evaluate once into SQLite-owned TEMP storage, then stream bounded rows
     // from its intrinsic rowid order without transporting the full result.
+    spoolAttempted = true;
     await operations.executeQuery(
       `CREATE TEMP TABLE ${escapedSpool} AS ` +
-      `SELECT ${projection} FROM ${escapeIdentifier(table)}`
+      `SELECT ${projection} FROM ${escapeIdentifier(table)}`,
+      undefined,
+      cancellationBinding.signal
     );
-    spoolCreated = true;
+    assertNotCancelled(cancellation);
 
     let lastSpoolRowId: RecordId = 0;
     while (true) {
@@ -583,8 +612,10 @@ async function* readUnstableSpoolRows(
       const result = await operations.executeQuery(
         `SELECT CAST(rowid AS TEXT), * FROM ${escapedSpool} ` +
         `WHERE rowid > ? ORDER BY rowid LIMIT 1`,
-        [lastSpoolRowId]
+        [lastSpoolRowId],
+        cancellationBinding.signal
       );
+      assertNotCancelled(cancellation);
       const row = result[0]?.rows[0];
       if (!row) return;
       if (typeof row[0] !== 'string' && typeof row[0] !== 'number') {
@@ -597,9 +628,12 @@ async function* readUnstableSpoolRows(
     primaryError = error;
     throw error;
   } finally {
-    if (spoolCreated) {
+    cancellationBinding.dispose();
+    if (spoolAttempted) {
       try {
-        await operations.executeQuery(`DROP TABLE temp.${escapedSpool}`);
+        // Do not forward an already-aborted signal to cleanup. CREATE may have
+        // completed just before its cancelled response was observed.
+        await operations.executeQuery(`DROP TABLE IF EXISTS temp.${escapedSpool}`);
       } catch (cleanupError) {
         if (primaryError !== undefined) {
           throw new AggregateError(

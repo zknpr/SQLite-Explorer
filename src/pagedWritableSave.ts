@@ -277,6 +277,96 @@ function validateSnapshot(snapshot: unknown): asserts snapshot is PagedWritableO
   }
 }
 
+interface AllocationInterval {
+  start: bigint;
+  end: bigint;
+}
+
+function alignAllocationInterval(
+  start: bigint,
+  end: bigint,
+  blockSize: bigint
+): AllocationInterval | undefined {
+  if (end <= start) return undefined;
+  return {
+    start: (start / blockSize) * blockSize,
+    end: ((end + blockSize - 1n) / blockSize) * blockSize
+  };
+}
+
+/**
+ * The base prefix is written densely even when its source was sparse. Above
+ * baseLimit, only dirty runs allocate blocks; untouched growth remains holes.
+ */
+function estimateTemporaryAllocationBytes(
+  snapshot: PagedWritableOverlaySnapshot,
+  blockSize: bigint
+): bigint {
+  if (blockSize <= 0n) throw new Error('Filesystem reported an invalid allocation block size');
+  const logicalSize = BigInt(snapshot.logicalSize);
+  const baseLimit = BigInt(Math.min(snapshot.logicalSize, snapshot.baseLimit));
+  const intervals: AllocationInterval[] = [];
+  const base = alignAllocationInterval(0n, baseLimit, blockSize);
+  if (base) intervals.push(base);
+
+  for (const run of snapshot.runs) {
+    const start = BigInt(run.startChunkIndex) * BigInt(snapshot.chunkSize);
+    const end = start + BigInt(run.data.byteLength);
+    const dirty = alignAllocationInterval(
+      start > baseLimit ? start : baseLimit,
+      end < logicalSize ? end : logicalSize,
+      blockSize
+    );
+    if (dirty) intervals.push(dirty);
+  }
+
+  intervals.sort((left, right) => left.start < right.start ? -1 : left.start > right.start ? 1 : 0);
+  let allocated = 0n;
+  let current: AllocationInterval | undefined;
+  for (const interval of intervals) {
+    if (!current) {
+      current = { ...interval };
+    } else if (interval.start <= current.end) {
+      if (interval.end > current.end) current.end = interval.end;
+    } else {
+      allocated += current.end - current.start;
+      current = { ...interval };
+    }
+  }
+  if (current) allocated += current.end - current.start;
+  return allocated;
+}
+
+async function assertAdjacentTemporarySpace(
+  fs: NodeFs,
+  replacementPath: string,
+  snapshot: PagedWritableOverlaySnapshot
+): Promise<void> {
+  const directory = path.dirname(replacementPath);
+  let stats: Awaited<ReturnType<NodeFs['promises']['statfs']>>;
+  try {
+    stats = await fs.promises.statfs(directory, { bigint: true });
+  } catch (error) {
+    throw new Error(
+      `Cannot verify free space for the atomic paged save in '${directory}'.`,
+      { cause: error }
+    );
+  }
+  const blockSize = BigInt(stats.bsize);
+  const availableBlocks = BigInt(stats.bavail);
+  if (blockSize <= 0n || availableBlocks < 0n) {
+    throw new Error(`Filesystem reported invalid free-space metadata for '${directory}'.`);
+  }
+  const requiredBytes = estimateTemporaryAllocationBytes(snapshot, blockSize);
+  const availableBytes = blockSize * availableBlocks;
+  if (requiredBytes > availableBytes) {
+    throw new Error(
+      `Atomic paged save needs approximately ${requiredBytes} bytes of adjacent temporary `
+      + `space, but only ${availableBytes} bytes are available in '${directory}'.`
+    );
+  }
+}
+
 async function assertBaseGeneration(
   fs: NodeFs,
   source: NodeFileHandle,
@@ -675,6 +765,7 @@ export async function writePagedWritableOverlayToFile(
       targetPath,
       snapshot.baseIdentity
     );
+    await assertAdjacentTemporarySpace(fs, target.replacementPath, snapshot);
     try {
       // Open before assembly so the post-rename durability step needs no path
       // lookup in the commit window. Some platforms cannot open directories;
