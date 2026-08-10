@@ -251,6 +251,53 @@ describe('grid cell containment limits', () => {
         }
     });
 
+    for (const declaredColumnCount of [1999, 2000]) {
+        for (const withoutRowId of [false, true]) {
+            const tableKind = withoutRowId ? 'WITHOUT ROWID' : 'rowid';
+            it(`loads a ${declaredColumnCount}-column ${tableKind} table at SQLite's result-width boundary`, async () => {
+                const columns = Array.from(
+                    { length: declaredColumnCount },
+                    (_, index) => `c${index}`
+                );
+                const table = `containment_width_${declaredColumnCount}_${withoutRowId ? 'pk' : 'rowid'}`;
+                const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+                const engine = result.operations!;
+                try {
+                    const definitions = columns.map((column, index) => (
+                        withoutRowId && index === 0
+                            ? `"${column}" INTEGER PRIMARY KEY`
+                            : `"${column}" TEXT`
+                    ));
+                    await engine.executeQuery(
+                        `CREATE TABLE "${table}" (${definitions.join(', ')})` +
+                        `${withoutRowId ? ' WITHOUT ROWID' : ''}; ` +
+                        `INSERT INTO "${table}" ("c0", "c${declaredColumnCount - 1}") ` +
+                        `VALUES (1, 'last')`
+                    );
+
+                    const page = await engine.fetchTableData(table, {
+                        columns: ['rowid', ...columns],
+                        globalFilterColumns: columns,
+                        limit: 1,
+                        offset: 0
+                    });
+
+                    assert.strictEqual(page.headers.length, declaredColumnCount + 1);
+                    assert.strictEqual(page.rows[0].length, declaredColumnCount + 1);
+                    assert.strictEqual(page.rows[0][1], withoutRowId ? 1 : '1');
+                    assert.strictEqual(page.rows[0][declaredColumnCount], 'last');
+                    if (withoutRowId) {
+                        assert.match(String(page.rows[0][0]), /^(?:pk|readonly-pk):/);
+                    } else {
+                        assert.strictEqual(page.rows[0][0], 1);
+                    }
+                } finally {
+                    (engine as WasmDatabaseEngine).shutdown();
+                }
+            });
+        }
+    }
+
     it('fails closed instead of exceeding SQLite result width for a 1000-column key', async () => {
         const { buildCellContainmentQuery } = await loadContainmentModule();
         const keyColumns = Array.from({ length: 1000 }, (_, index) => index);

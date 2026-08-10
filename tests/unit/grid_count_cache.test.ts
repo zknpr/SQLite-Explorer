@@ -770,6 +770,119 @@ describe('grid count cache', () => {
         }
     });
 
+    it('collapses an inexact rowid-span bound when the first page proves the real end', async () => {
+        const elements = installDocumentMock();
+        const { state, backendApi, loadTableData } = await loadHarness();
+        const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+        const dataRequests: any[] = [];
+        backendApi.fetchTableCount = async () => ({ count: 1_000_000, isExact: false });
+        backendApi.fetchTableData = async (_table: string, options: any) => {
+            dataRequests.push(options);
+            return {
+                rows: [[1, 'one'], [1_000_000, 'million']],
+                keysetAnchors: { first: 'F1', last: 'L1000000' }
+            };
+        };
+        primeTableState(state, 'sparse_forward_items');
+        state.rowsPerPage = 5000;
+
+        try {
+            assert.strictEqual(await loadTableData(false, false, 'first'), true);
+            assert.strictEqual(dataRequests.length, 1);
+            assert.deepStrictEqual(dataRequests[0].keyset, { mode: 'first' });
+            assert.strictEqual(state.totalRecordCount, 2);
+            assert.strictEqual(state.totalRecordCountIsExact, true);
+            assert.strictEqual(state.totalPageCount, 1);
+            assert.strictEqual(state.currentPageIndex, 0);
+            assert.strictEqual(elements.btnNext.disabled, true);
+            assert.strictEqual(elements.pageIndicator.textContent, '1 / 1');
+        } finally {
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
+    it('collapses an inexact forward walk when a short after seek proves the real last page', async () => {
+        installDocumentMock();
+        const { state, backendApi, loadTableData } = await loadHarness();
+        const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+        const dataRequests: any[] = [];
+        backendApi.fetchTableCount = async () => ({ count: 1_000_000, isExact: false });
+        backendApi.fetchTableData = async (_table: string, options: any) => {
+            dataRequests.push(options);
+            if (options.keyset?.mode === 'first') {
+                return {
+                    rows: Array.from({ length: 5000 }, (_, index) => [index + 1, 'head']),
+                    keysetAnchors: { first: 'F1', last: 'L5000' }
+                };
+            }
+            if (options.keyset?.mode === 'after') {
+                return {
+                    rows: Array.from({ length: 1000 }, (_, index) => [5001 + index, 'tail']),
+                    keysetAnchors: { first: 'F5001', last: 'L6000' }
+                };
+            }
+            throw new Error('forward walk must not fall back to a deep OFFSET');
+        };
+        primeTableState(state, 'two_sparse_forward_pages');
+        state.rowsPerPage = 5000;
+
+        try {
+            assert.strictEqual(await loadTableData(false, false, 'first'), true);
+            assert.strictEqual(state.totalRecordCountIsExact, false);
+
+            state.currentPageIndex = 1;
+            assert.strictEqual(await loadTableData(false, false, 'next'), true);
+            assert.deepStrictEqual(dataRequests[1].keyset, { mode: 'after', anchor: 'L5000' });
+            assert.strictEqual(state.totalRecordCount, 6000);
+            assert.strictEqual(state.totalRecordCountIsExact, true);
+            assert.strictEqual(state.totalPageCount, 2);
+            assert.strictEqual(state.currentPageIndex, 1);
+            assert.strictEqual(state.gridData.length, 1000);
+        } finally {
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
+    it('retains the prior page when an empty after seek proves an exact page boundary', async () => {
+        installDocumentMock();
+        const { state, backendApi, loadTableData } = await loadHarness();
+        const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+        backendApi.fetchTableCount = async () => ({ count: 1_000_000, isExact: false });
+        backendApi.fetchTableData = async (_table: string, options: any) => {
+            if (options.keyset?.mode === 'first') {
+                return {
+                    rows: Array.from({ length: 5000 }, (_, index) => [index + 1, 'only-page']),
+                    keysetAnchors: { first: 'F1', last: 'L5000' }
+                };
+            }
+            if (options.keyset?.mode === 'after') return { rows: [] };
+            throw new Error('empty forward boundary must not fall back to a deep OFFSET');
+        };
+        primeTableState(state, 'one_sparse_forward_page');
+        state.rowsPerPage = 5000;
+
+        try {
+            assert.strictEqual(await loadTableData(false, false, 'first'), true);
+            state.currentPageIndex = 1;
+            assert.strictEqual(await loadTableData(false, false, 'next'), true);
+
+            assert.strictEqual(state.totalRecordCount, 5000);
+            assert.strictEqual(state.totalRecordCountIsExact, true);
+            assert.strictEqual(state.totalPageCount, 1);
+            assert.strictEqual(state.currentPageIndex, 0);
+            assert.strictEqual(state.gridData.length, 5000);
+            assert.deepStrictEqual(state.gridData[0], [1, 'only-page']);
+            assert.deepStrictEqual(state.keysetAnchors, {
+                table: 'one_sparse_forward_page',
+                pageIndex: 0,
+                first: 'F1',
+                last: 'L5000'
+            });
+        } finally {
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
     it('collapses an inexact reverse walk when a short seek proves the real first page', async () => {
         installDocumentMock();
         const { state, backendApi, loadTableData } = await loadHarness();

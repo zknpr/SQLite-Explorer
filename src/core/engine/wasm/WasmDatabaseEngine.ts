@@ -72,6 +72,9 @@ import {
   decodeCellContainment,
   encodeByteFaithfulPrimaryKeyRecordId,
   findUnrepresentableTextRows,
+  mergeCellContainmentMetadataRows,
+  prependCellContainmentColumn,
+  SQLITE_MAX_RESULT_COLUMNS,
   remapPrimaryKeyContainment
 } from '../../cell-containment';
 import { getNodeFs } from '../../platform/fs';
@@ -3135,6 +3138,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const executionState: {
       headerStmt?: WasmPreparedStatement;
       stmt?: WasmPreparedStatement;
+      metadataStmt?: WasmPreparedStatement;
+      rowIdStmt?: WasmPreparedStatement;
     } = {};
     try {
       // executeWithProgressHandler is strictly synchronous and its handler is
@@ -3171,13 +3176,27 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         queryOptions.orderDir = fallbackOrder.orderDir;
       }
 
-      const { sql, params } = buildSelectQuery(table, queryOptions, keysetPlan);
+      const splitSyntheticRowId = isRowIdTable
+        && firstColumn === 'rowid'
+        && (queryOptions.columns?.length ?? 0) > SQLITE_MAX_RESULT_COLUMNS;
+      const valueQueryOptions = splitSyntheticRowId
+        ? { ...queryOptions, columns: queryOptions.columns!.slice(1) }
+        : queryOptions;
+      const { sql, params } = buildSelectQuery(table, valueQueryOptions, keysetPlan);
+      const rowIdQuery = splitSyntheticRowId
+        ? buildSelectQuery(
+            table,
+            { ...queryOptions, columns: ['rowid'] },
+            keysetPlan
+          )
+        : undefined;
 
       return this.executeWithProgressHandler(() => {
         const bindParams = normalizeWasmBindParams(params);
         const headerStmt = this.instance.prepare(sql, bindParams);
         executionState.headerStmt = headerStmt;
-        const headers = headerStmt.getColumnNames();
+        const valueHeaders = headerStmt.getColumnNames();
+        const headers = splitSyntheticRowId ? ['rowid', ...valueHeaders] : valueHeaders;
         headerStmt.free();
         executionState.headerStmt = undefined;
 
@@ -3198,27 +3217,75 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const rawTextColumnIndices = [
           ...new Set([...primaryKeyColumnIndices, ...keysetColumnIndices])
         ];
+        const containmentRawTextColumnIndices = splitSyntheticRowId
+          ? rawTextColumnIndices
+              .filter(index => index > 0)
+              .map(index => index - 1)
+          : rawTextColumnIndices;
         const containmentQuery = buildCellContainmentQuery(
           sql,
-          headers.length,
+          valueHeaders.length,
           queryOptions,
-          rawTextColumnIndices
+          containmentRawTextColumnIndices
         );
         const transportQuery = buildExactNumericTextQuery(
           containmentQuery.sql,
-          containmentQuery.transportColumnCount
+          containmentQuery.primaryTransportColumnCount
         );
         const stmt = this.instance.prepare(transportQuery.sql, bindParams);
         executionState.stmt = stmt;
-        const sourceRows: Array<Array<CellValue | bigint>> = [];
+        const primaryRows: Array<Array<CellValue | bigint>> = [];
 
         while (stmt.step()) {
             // We know a row exists because step() returned true
             const row = stmt.get(null, { useBigInt: true });
             if (row) {
-                sourceRows.push(row);
+                primaryRows.push(row);
             }
         }
+        let metadataRows: Array<Array<CellValue | bigint>> | undefined;
+        if (containmentQuery.metadataSql) {
+          const metadataStmt = this.instance.prepare(containmentQuery.metadataSql, bindParams);
+          executionState.metadataStmt = metadataStmt;
+          metadataRows = [];
+          while (metadataStmt.step()) {
+            const row = metadataStmt.get(null, { useBigInt: true });
+            if (row) metadataRows.push(row);
+          }
+          metadataStmt.free();
+          executionState.metadataStmt = undefined;
+        }
+        const valueSourceRows = mergeCellContainmentMetadataRows(
+          primaryRows,
+          metadataRows,
+          containmentQuery
+        ) as Array<Array<CellValue | bigint>>;
+        let rowIdRows: Array<Array<CellValue | bigint>> | undefined;
+        if (rowIdQuery) {
+          const rowIdStmt = this.instance.prepare(
+            rowIdQuery.sql,
+            normalizeWasmBindParams(rowIdQuery.params)
+          );
+          executionState.rowIdStmt = rowIdStmt;
+          rowIdRows = [];
+          while (rowIdStmt.step()) {
+            const row = rowIdStmt.get(null, { useBigInt: true });
+            if (row) rowIdRows.push(row);
+          }
+          rowIdStmt.free();
+          executionState.rowIdStmt = undefined;
+          if (rowIdRows.length !== valueSourceRows.length) {
+            throw new Error('Synthetic rowid companion row count does not match the value page');
+          }
+        }
+        const sourceRows = rowIdRows
+          ? rowIdRows.map((row, rowIndex) => {
+              if (row.length !== 1) {
+                throw new Error(`Synthetic rowid companion row ${rowIndex} is not one value`);
+              }
+              return [row[0], ...valueSourceRows[rowIndex]];
+            })
+          : valueSourceRows;
 
         const companionResults = [];
         const hasRowIdShape = headers[0]?.toLowerCase() === 'rowid';
@@ -3255,22 +3322,37 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         );
 
         const normalized = normalizeIntegerRowsForTransport(
-          sourceRows,
+          valueSourceRows,
           transportQuery.valueColumnCount,
-          companionExactTexts,
-          isRowIdTable && needsExactRowIdIdentity ? 0 : undefined
+          splitSyntheticRowId ? undefined : companionExactTexts,
+          !splitSyntheticRowId && isRowIdTable && needsExactRowIdIdentity ? 0 : undefined
         );
-        const contained = decodeCellContainment(
+        const valueContained = decodeCellContainment(
           normalized.rows,
-          headers.length,
+          valueHeaders.length,
           normalized.exactIntegerTexts,
           queryOptions.maxPageResponseBytes
         );
+        const contained = rowIdRows
+          ? prependCellContainmentColumn(
+              normalizeIntegerRowsForTransport(
+                rowIdRows,
+                undefined,
+                undefined,
+                needsExactRowIdIdentity ? 0 : undefined
+              ).rows.map(row => row[0]),
+              valueContained,
+              companionExactTexts
+            )
+          : valueContained;
         const { rows, oversizedCells, exactIntegerTexts } = contained;
         const rawTextRows = decodeRawTextColumns(normalized.rows, containmentQuery);
-        const textEncoding = rawTextColumnIndices.length > 0
+        const textEncoding = containmentRawTextColumnIndices.length > 0
           ? this.getCellTextEncoding()
           : undefined;
+        const sourceRawTextColumnIndices = splitSyntheticRowId
+          ? containmentQuery.rawTextColumnIndices.map(index => index + 1)
+          : containmentQuery.rawTextColumnIndices;
         const remapped = primaryKeyContext
           ? remapPrimaryKeyContainment({
               identity: primaryKeyContext.identity,
@@ -3278,7 +3360,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
               visibleColumnCount: primaryKeyContext.visibleColumns.length,
               identityRows: sourceRows,
               rawTextBytes: rawTextRows,
-              rawTextColumnIndices: containmentQuery.rawTextColumnIndices,
+              rawTextColumnIndices: sourceRawTextColumnIndices,
               rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable,
               textEncoding: textEncoding!,
               rows,
@@ -3293,7 +3375,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
               sourceRows,
               sourceColumnIndices: keysetColumnIndices,
               rawTextRows,
-              rawTextColumnIndices: containmentQuery.rawTextColumnIndices,
+              rawTextColumnIndices: sourceRawTextColumnIndices,
               textEncoding,
               rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable
             })
@@ -3339,8 +3421,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const errorDetail = err instanceof Error ? err.message : String(err);
         throw new Error(`Fetch failed: ${errorDetail}`);
     } finally {
-        executionState.headerStmt?.free();
-        executionState.stmt?.free();
+      executionState.headerStmt?.free();
+      executionState.stmt?.free();
+      executionState.metadataStmt?.free();
+      executionState.rowIdStmt?.free();
     }
   }
 

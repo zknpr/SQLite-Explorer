@@ -101,6 +101,9 @@ import {
   decodeCellContainment,
   encodeByteFaithfulPrimaryKeyRecordId,
   findUnrepresentableTextRows,
+  mergeCellContainmentMetadataRows,
+  prependCellContainmentColumn,
+  SQLITE_MAX_RESULT_COLUMNS,
   remapPrimaryKeyContainment
 } from './core/cell-containment';
 import { serializeOperations } from './core/operation-serializer';
@@ -2673,7 +2676,7 @@ export async function createNativeDatabaseConnection(
             }
           }
           const hasRowIdShape = columns[0]?.toLowerCase() === 'rowid';
-          const snapshotName = hasRowIdShape
+          const snapshotName = hasRowIdShape || columns.length >= SQLITE_MAX_RESULT_COLUMNS
             ? createSavepointName('sp_numeric_snapshot')
             : undefined;
           if (snapshotName) {
@@ -2730,7 +2733,21 @@ export async function createNativeDatabaseConnection(
               queryOptions.orderByColumns = fallbackOrder.orderByColumns;
               queryOptions.orderDir = fallbackOrder.orderDir;
             }
-            const { sql, params } = buildSelectQuery(table, queryOptions, keysetPlan);
+            const splitSyntheticRowId = isRowIdTable
+              && hasRowIdShape
+              && columns.length > SQLITE_MAX_RESULT_COLUMNS;
+            const valueColumns = splitSyntheticRowId ? columns.slice(1) : columns;
+            const valueQueryOptions = splitSyntheticRowId
+              ? { ...queryOptions, columns: valueColumns }
+              : queryOptions;
+            const { sql, params } = buildSelectQuery(table, valueQueryOptions, keysetPlan);
+            const rowIdQuery = splitSyntheticRowId
+              ? buildSelectQuery(
+                  table,
+                  { ...queryOptions, columns: ['rowid'] },
+                  keysetPlan
+                )
+              : undefined;
             const primaryKeyColumnIndices = primaryKeyContext
               ? primaryKeyContext.identity.columns.map(column => {
                   const index = columns.indexOf(column.identifier);
@@ -2748,31 +2765,64 @@ export async function createNativeDatabaseConnection(
             const rawTextColumnIndices = [
               ...new Set([...primaryKeyColumnIndices, ...keysetColumnIndices])
             ];
+            const containmentRawTextColumnIndices = splitSyntheticRowId
+              ? rawTextColumnIndices
+                  .filter(index => index > 0)
+                  .map(index => index - 1)
+              : rawTextColumnIndices;
             const containmentQuery = buildCellContainmentQuery(
               sql,
-              columns.length,
+              valueColumns.length,
               queryOptions,
-              rawTextColumnIndices
+              containmentRawTextColumnIndices
             );
             const transportQuery = buildExactNumericTextQuery(
               containmentQuery.sql,
-              containmentQuery.transportColumnCount
+              containmentQuery.primaryTransportColumnCount
             );
             const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
               && hasRowIdShape;
-            const result = await worker.call<NativeQueryResult>('queryNumeric', [
+            const primaryResult = await worker.call<NativeQueryResult>('queryNumeric', [
               transportQuery.sql,
               params,
               transportQuery.transportColumns,
               transportQuery.valueColumnCount
             ]);
+            const metadataResult = containmentQuery.metadataSql
+              ? await worker.call<NativeQueryResult>('query', [
+                  containmentQuery.metadataSql,
+                  params
+                ])
+              : undefined;
+            const valueSourceRows = mergeCellContainmentMetadataRows(
+              primaryResult.values,
+              metadataResult?.values,
+              containmentQuery
+            ) as CellValue[][];
+            const rowIdResult = rowIdQuery
+              ? await worker.call<NativeQueryResult>('query', [
+                  rowIdQuery.sql,
+                  rowIdQuery.params
+                ])
+              : undefined;
+            if (rowIdResult && rowIdResult.values.length !== valueSourceRows.length) {
+              throw new Error('Synthetic rowid companion row count does not match the value page');
+            }
+            const sourceRows = rowIdResult
+              ? rowIdResult.values.map((row, rowIndex) => {
+                  if (row.length !== 1) {
+                    throw new Error(`Synthetic rowid companion row ${rowIndex} is not one value`);
+                  }
+                  return [row[0], ...valueSourceRows[rowIndex]];
+                })
+              : valueSourceRows;
 
             const companionResults = [];
-            if (isRowIdTable && needsRowIdCompanions && result.values.length > 0) {
+            if (isRowIdTable && needsRowIdCompanions && sourceRows.length > 0) {
               const companionQueries = buildRowIdExactRealTextQueries(
                 table,
                 columns,
-                result.values.map(row => row[0])
+                sourceRows.map(row => row[0] as CellValue)
               );
               if (companionQueries.length > 0) {
                 const companionBatch = await worker.call<NativeQueryBatchResult>('queryBatch', [
@@ -2788,43 +2838,63 @@ export async function createNativeDatabaseConnection(
               }
             }
             const companionExactTexts = collectRowIdExactRealTexts(
-              result.values,
+              sourceRows,
               companionResults
             );
             const needsExactRowIdIdentity = isRowIdTable
-              && hasUnsafeBigIntAtColumn(result.values, 0);
+              && hasUnsafeBigIntAtColumn(sourceRows, 0);
 
             // txiki preserves SQLite int64 values as BigInt. The generated
             // companion columns also retain authoritative REAL text before V8
             // normalizes the storage class into a JavaScript Number.
             const normalized = normalizeIntegerRowsForTransport(
-              result.values,
+              valueSourceRows,
               undefined,
-              mergeExactIntegerTextMaps(companionExactTexts, result.exactIntegerTexts),
-              needsExactRowIdIdentity ? 0 : undefined
+              splitSyntheticRowId
+                ? primaryResult.exactIntegerTexts
+                : mergeExactIntegerTextMaps(
+                    companionExactTexts,
+                    primaryResult.exactIntegerTexts
+                  ),
+              !splitSyntheticRowId && needsExactRowIdIdentity ? 0 : undefined
             );
-            const contained = decodeCellContainment(
+            const valueContained = decodeCellContainment(
               normalized.rows,
-              columns.length,
+              valueColumns.length,
               normalized.exactIntegerTexts,
               queryOptions.maxPageResponseBytes
             );
+            const contained = rowIdResult
+              ? prependCellContainmentColumn(
+                  normalizeIntegerRowsForTransport(
+                    rowIdResult.values,
+                    undefined,
+                    undefined,
+                    needsExactRowIdIdentity ? 0 : undefined
+                  ).rows.map(row => row[0]),
+                  valueContained,
+                  companionExactTexts
+                )
+              : valueContained;
             const { rows, oversizedCells, exactIntegerTexts } = contained;
             const rawTextRows = decodeRawTextColumns(normalized.rows, containmentQuery);
-            const textEncoding = rawTextColumnIndices.length > 0
+            const textEncoding = containmentRawTextColumnIndices.length > 0
               ? normalizeCellTextEncoding((await worker.call<NativeQueryResult>('query', [
                   'PRAGMA encoding',
                   []
                 ])).values[0]?.[0])
               : undefined;
+            const sourceRawTextColumnIndices = splitSyntheticRowId
+              ? containmentQuery.rawTextColumnIndices.map(index => index + 1)
+              : containmentQuery.rawTextColumnIndices;
             const remapped = primaryKeyContext && textEncoding
               ? remapPrimaryKeyContainment({
                   identity: primaryKeyContext.identity,
                   sourceColumns: columns,
                   visibleColumnCount: primaryKeyContext.visibleColumns.length,
-                  identityRows: result.values,
+                  identityRows: sourceRows,
                   rawTextBytes: rawTextRows,
-                  rawTextColumnIndices: containmentQuery.rawTextColumnIndices,
+                  rawTextColumnIndices: sourceRawTextColumnIndices,
                   rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable,
                   textEncoding,
                   rows,
@@ -2836,10 +2906,10 @@ export async function createNativeDatabaseConnection(
               : undefined;
             const unrepresentableKeysetTextRows = keysetKey && textEncoding
               ? findUnrepresentableTextRows({
-                  sourceRows: result.values,
+                  sourceRows,
                   sourceColumnIndices: keysetColumnIndices,
                   rawTextRows,
-                  rawTextColumnIndices: containmentQuery.rawTextColumnIndices,
+                  rawTextColumnIndices: sourceRawTextColumnIndices,
                   textEncoding,
                   rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable
                 })
@@ -2853,7 +2923,7 @@ export async function createNativeDatabaseConnection(
                   tag: keysetTag,
                   key: keysetKey,
                   projectionColumns: columns,
-                  rows: result.values,
+                  rows: sourceRows,
                   oversizedCells,
                   excludedRowIndices: unrepresentableKeysetTextRows
                 })

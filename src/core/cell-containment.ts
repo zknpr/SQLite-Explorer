@@ -37,10 +37,14 @@ const MAX_UTF8_BYTES_PER_CODE_POINT = 4;
 // Both bundled SQLite builds use SQLite's default SQLITE_MAX_COLUMN. Private
 // raw-TEXT companions must never turn an otherwise valid grid projection into
 // a statement that exceeds this result-column ceiling.
-const SQLITE_MAX_RESULT_COLUMNS = 2000;
+export const SQLITE_MAX_RESULT_COLUMNS = 2000;
 
 export interface CellContainmentQuery {
   sql: string;
+  /** Separate one-column metadata read when the value projection fills SQLite's width. */
+  metadataSql?: string;
+  /** Columns returned by sql before separately fetched metadata is inserted. */
+  primaryTransportColumnCount: number;
   /** Original value columns, excluding the packed metadata transport column. */
   valueColumnCount: number;
   /** Value-column index occupied by the packed metadata transport column. */
@@ -206,17 +210,32 @@ export function buildCellContainmentQuery(
   const privateProjection = rawTextExpressions.length > 0
     ? `, ${rawTextExpressions.join(', ')}`
     : '';
+  const sourceCte =
+    `WITH ${quotedSource} (${quotedValues.join(', ')}) AS (\n` +
+    `SELECT * FROM (\n${sourceSql}\n) LIMIT -1 OFFSET 0\n)\n`;
+  const metadataMustBeFetchedSeparately = columnCount + 1 > SQLITE_MAX_RESULT_COLUMNS;
+  const primaryMetadataProjection = metadataMustBeFetchedSeparately
+    ? ''
+    : `, ${metadataExpression} AS ${escapeIdentifier(CELL_METADATA_ALIAS)}`;
 
   return {
     // OFFSET prevents query flattening so volatile view expressions are
     // evaluated once before their value, typeof, and octet_length are reused.
     sql:
-      `WITH ${quotedSource} (${quotedValues.join(', ')}) AS (\n` +
-      `SELECT * FROM (\n${sourceSql}\n) LIMIT -1 OFFSET 0\n)\n` +
-      `SELECT ${projectedValues.join(', ')}, ` +
-      `${metadataExpression} AS ${escapeIdentifier(CELL_METADATA_ALIAS)} ` +
-      `${privateProjection} ` +
+      sourceCte +
+      `SELECT ${projectedValues.join(', ')}` +
+      `${primaryMetadataProjection}${privateProjection} ` +
       `FROM ${quotedSource}`,
+    ...(metadataMustBeFetchedSeparately ? {
+      // Grid callers execute this before releasing the same serialized read
+      // (and, for native files, the same WAL snapshot) as the value query.
+      metadataSql:
+        sourceCte +
+        `SELECT ${metadataExpression} AS ${escapeIdentifier(CELL_METADATA_ALIAS)} ` +
+        `FROM ${quotedSource}`
+    } : {}),
+    primaryTransportColumnCount:
+      columnCount + (metadataMustBeFetchedSeparately ? 0 : 1) + projectedRawTextColumnIndices.length,
     valueColumnCount: columnCount,
     metadataColumnIndex: columnCount,
     transportColumnCount: columnCount + 1 + projectedRawTextColumnIndices.length,
@@ -225,6 +244,90 @@ export function buildCellContainmentQuery(
     rawTextColumnIndices: projectedRawTextColumnIndices,
     rawTextValidationUnavailable,
     effectiveInlineCellBytes
+  };
+}
+
+/** Insert a separately fetched metadata column at its logical transport slot. */
+export function mergeCellContainmentMetadataRows(
+  primaryRows: readonly (readonly unknown[])[],
+  metadataRows: readonly (readonly unknown[])[] | undefined,
+  query: Pick<
+    CellContainmentQuery,
+    'metadataSql' | 'metadataColumnIndex' | 'primaryTransportColumnCount'
+  >
+): Array<Array<unknown>> {
+  if (!query.metadataSql) {
+    if (metadataRows !== undefined) {
+      throw new Error('Cell containment received unexpected separate metadata rows');
+    }
+    return primaryRows as Array<Array<unknown>>;
+  }
+  if (metadataRows === undefined) {
+    if (primaryRows.length === 0) return [];
+    throw new Error('Cell containment metadata row count does not match the value page');
+  }
+  if (metadataRows.length !== primaryRows.length) {
+    throw new Error('Cell containment metadata row count does not match the value page');
+  }
+
+  return primaryRows.map((row, rowIndex) => {
+    if (row.length < query.primaryTransportColumnCount) {
+      throw new Error(`Cell containment value row ${rowIndex} is missing transport columns`);
+    }
+    const metadataRow = metadataRows[rowIndex];
+    if (!metadataRow || metadataRow.length !== 1 || typeof metadataRow[0] !== 'string') {
+      throw new Error(`Cell containment metadata row ${rowIndex} is not one packed text value`);
+    }
+    return [
+      ...row.slice(0, query.metadataColumnIndex),
+      metadataRow[0],
+      ...row.slice(query.metadataColumnIndex)
+    ];
+  });
+}
+
+/** Prepend one synthetic value while preserving positionally indexed sidecars. */
+export function prependCellContainmentColumn(
+  leadingValues: readonly CellValue[],
+  contained: DecodedCellContainment,
+  fallbackExactIntegerTexts?: ExactIntegerTextMap
+): DecodedCellContainment {
+  if (leadingValues.length !== contained.rows.length) {
+    throw new Error('Synthetic containment column row count does not match the value page');
+  }
+
+  const shiftColumns = <T>(
+    source: Record<number, Record<number, T>> | undefined
+  ): Record<number, Record<number, T>> | undefined => {
+    if (!source) return undefined;
+    const shifted: Record<number, Record<number, T>> = {};
+    for (const [rowIndexText, row] of Object.entries(source)) {
+      const rowIndex = Number(rowIndexText);
+      shifted[rowIndex] = {};
+      for (const [columnIndexText, value] of Object.entries(row)) {
+        shifted[rowIndex][Number(columnIndexText) + 1] = value;
+      }
+    }
+    return shifted;
+  };
+
+  const shiftedExactIntegerTexts = shiftColumns(contained.exactIntegerTexts);
+  let exactIntegerTexts: ExactIntegerTextMap | undefined;
+  for (const source of [fallbackExactIntegerTexts, shiftedExactIntegerTexts]) {
+    if (!source) continue;
+    exactIntegerTexts ??= {};
+    for (const [rowIndexText, row] of Object.entries(source)) {
+      const rowIndex = Number(rowIndexText);
+      exactIntegerTexts[rowIndex] ??= {};
+      Object.assign(exactIntegerTexts[rowIndex], row);
+    }
+  }
+
+  const oversizedCells = shiftColumns(contained.oversizedCells);
+  return {
+    rows: contained.rows.map((row, rowIndex) => [leadingValues[rowIndex], ...row]),
+    ...(oversizedCells ? { oversizedCells } : {}),
+    ...(exactIntegerTexts ? { exactIntegerTexts } : {})
   };
 }
 

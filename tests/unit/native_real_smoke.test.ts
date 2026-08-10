@@ -2211,6 +2211,45 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             );
         });
 
+        await testContext.test('loads native table pages at both maximum-width boundaries', async () => {
+            for (const declaredColumnCount of [1999, 2000]) {
+                for (const withoutRowId of [false, true]) {
+                    const columns = Array.from(
+                        { length: declaredColumnCount },
+                        (_, index) => `c${index}`
+                    );
+                    const table = `native_containment_width_${declaredColumnCount}_${withoutRowId ? 'pk' : 'rowid'}`;
+                    const definitions = columns.map((column, index) => (
+                        withoutRowId && index === 0
+                            ? `"${column}" INTEGER PRIMARY KEY`
+                            : `"${column}" TEXT`
+                    ));
+                    await engine.executeQuery(
+                        `CREATE TABLE "${table}" (${definitions.join(', ')})` +
+                        `${withoutRowId ? ' WITHOUT ROWID' : ''}; ` +
+                        `INSERT INTO "${table}" ("c0", "c${declaredColumnCount - 1}") ` +
+                        `VALUES (1, 'last')`
+                    );
+
+                    const page = await engine.fetchTableData(table, {
+                        columns: ['rowid', ...columns],
+                        globalFilterColumns: columns,
+                        limit: 1,
+                        offset: 0
+                    });
+
+                    assert.strictEqual(page.headers.length, declaredColumnCount + 1);
+                    assert.strictEqual(page.rows[0].length, declaredColumnCount + 1);
+                    assert.strictEqual(page.rows[0][1], withoutRowId ? 1 : '1');
+                    assert.strictEqual(page.rows[0][declaredColumnCount], 'last');
+                    assert.match(
+                        String(page.rows[0][0]),
+                        withoutRowId ? /^(?:pk|readonly-pk):/ : /^1$/
+                    );
+                }
+            }
+        });
+
         await testContext.test('nests native batch writes inside a host savepoint', async () => {
             await engine.executeQuery(
                 "CREATE TABLE native_nested_batch (value TEXT); " +

@@ -2536,6 +2536,47 @@ describe('web demo view worker', () => {
         assert.strictEqual(preview.exactIntegerTexts[0][1], undefined);
     });
 
+    it('loads rowid and WITHOUT ROWID demo tables at both maximum-width boundaries', async () => {
+        const worker = await createWorkerHarness();
+        for (const declaredColumnCount of [1999, 2000]) {
+            for (const withoutRowId of [false, true]) {
+                const columns = Array.from(
+                    { length: declaredColumnCount },
+                    (_, index) => `c${index}`
+                );
+                const table = `demo_containment_width_${declaredColumnCount}_${withoutRowId ? 'pk' : 'rowid'}`;
+                const definitions = columns.map((column, index) => (
+                    withoutRowId && index === 0
+                        ? `"${column}" INTEGER PRIMARY KEY`
+                        : `"${column}" TEXT`
+                ));
+                await worker.invoke(
+                    'runQuery',
+                    `CREATE TABLE "${table}" (${definitions.join(', ')})` +
+                    `${withoutRowId ? ' WITHOUT ROWID' : ''}; ` +
+                    `INSERT INTO "${table}" ("c0", "c${declaredColumnCount - 1}") ` +
+                    `VALUES (1, 'last')`
+                );
+
+                const page = await worker.invoke('fetchTableData', table, {
+                    columns: ['rowid', ...columns],
+                    globalFilterColumns: columns,
+                    limit: 1,
+                    offset: 0
+                });
+
+                assert.strictEqual(page.headers.length, declaredColumnCount + 1);
+                assert.strictEqual(page.rows[0].length, declaredColumnCount + 1);
+                assert.strictEqual(page.rows[0][1], withoutRowId ? 1 : '1');
+                assert.strictEqual(page.rows[0][declaredColumnCount], 'last');
+                assert.match(
+                    String(page.rows[0][0]),
+                    withoutRowId ? /^(?:pk|readonly-pk):/ : /^1$/
+                );
+            }
+        }
+    });
+
     it('restores divergent REAL text for a 1001-column rowid-keyed demo table', async () => {
         const worker = await createWorkerHarness();
         const columnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);

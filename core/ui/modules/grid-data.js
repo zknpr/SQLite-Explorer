@@ -146,6 +146,15 @@ function keysetResultNeedsOffsetRetry(
     return false;
 }
 
+function keysetModeCanProveInexactCount(keyset) {
+    return keyset && (
+        keyset.mode === 'first'
+        || keyset.mode === 'after'
+        || keyset.mode === 'last'
+        || keyset.mode === 'before'
+    );
+}
+
 export async function loadTableData(showSpinner = true, saveScrollPosition = true, navIntent) {
     if (!state.selectedTable) return;
 
@@ -323,8 +332,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
                 currentPageIndex = Math.max(0, totalPageCount - 1);
             }
             queryOptions = buildDataQueryOptions(currentPageIndex, countResult, totalPageCount);
-            if (!totalRecordCountIsExact
-                && (queryOptions.keyset?.mode === 'last' || queryOptions.keyset?.mode === 'before')) {
+            if (!totalRecordCountIsExact && keysetModeCanProveInexactCount(queryOptions.keyset)) {
                 exactBoundStore = prepareCountStore(countIdentity);
             }
             dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
@@ -374,6 +382,11 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
                 dataResult = dataOutcome.value;
                 queryOptions = speculativeOptions;
             }
+            if (!totalRecordCountIsExact && keysetModeCanProveInexactCount(queryOptions.keyset)) {
+                // Reuse the pre-fetch epoch guard: a mutation that raced either
+                // parallel leg must also prevent this row-proved exact store.
+                exactBoundStore = storeCount;
+            }
         }
 
         if (queryOptions.keyset && keysetResultNeedsOffsetRetry(
@@ -393,7 +406,34 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         }
 
         const returnedRows = dataResult.rows || [];
-        if (!totalRecordCountIsExact && queryOptions.keyset?.mode === 'last'
+        if (!totalRecordCountIsExact
+            && (queryOptions.keyset?.mode === 'first' || queryOptions.keyset?.mode === 'after')
+            && returnedRows.length < requestedPageSize) {
+            // A short forward seek exhausted the filtered/table identity. Every
+            // preceding page in an `after` walk was full; `first` has none.
+            totalRecordCount = currentPageIndex * requestedPageSize + returnedRows.length;
+            totalRecordCountIsExact = true;
+            totalPageCount = Math.max(1, Math.ceil(totalRecordCount / requestedPageSize));
+            exactBoundStore?.({ count: totalRecordCount, isExact: true });
+
+            if (queryOptions.keyset.mode === 'after' && returnedRows.length === 0) {
+                // The requested page lies just beyond the proven end. Retain
+                // the prior anchored page instead of committing a ghost page.
+                currentPageIndex = Math.max(0, totalPageCount - 1);
+                dataResult = {
+                    rows: state.gridData,
+                    exactIntegerTexts: state.gridExactIntegerTexts,
+                    oversizedCells: state.gridOversizedCells,
+                    readOnlyRowReasons: state.gridReadOnlyRowReasons,
+                    keysetAnchors: state.keysetAnchors
+                        ? {
+                            first: state.keysetAnchors.first ?? undefined,
+                            last: state.keysetAnchors.last ?? undefined
+                          }
+                        : undefined
+                };
+            }
+        } else if (!totalRecordCountIsExact && queryOptions.keyset?.mode === 'last'
             && returnedRows.length < requestedPageSize) {
             // A short unanchored reverse seek exhausted the table, so this is
             // both the first and last page. Replace the loose span bound with

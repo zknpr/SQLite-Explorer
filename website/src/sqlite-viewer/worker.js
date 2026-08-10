@@ -73,6 +73,8 @@ import {
   DEFAULT_MAX_PAGE_RESPONSE_BYTES,
   encodeByteFaithfulPrimaryKeyRecordId,
   findUnrepresentableTextRows,
+  mergeCellContainmentMetadataRows,
+  prependCellContainmentColumn,
   remapPrimaryKeyContainment
 } from '../../../src/core/cell-containment.ts';
 import {
@@ -1503,15 +1505,20 @@ async function fetchTableData(table, options = {}) {
   const keysetTag = keysetKey ? computeKeysetQueryTag(table, options) : undefined;
   const keysetPlan = keysetKey ? resolveKeysetPlan(table, options, keysetIdentity) : undefined;
 
+  const splitSyntheticRowId = isRowIdTable
+    && projectionColumns?.[0]?.toLowerCase() === 'rowid'
+    && projectionColumns.length > SQLITE_MAX_RESULT_COLUMNS;
+  const valueProjectionColumns = splitSyntheticRowId
+    ? projectionColumns.slice(1)
+    : projectionColumns;
+
   // Build column list - if columns specified, use them; otherwise SELECT *
   let columnList;
-  if (projectionColumns && projectionColumns.length > 0) {
-    columnList = projectionColumns.map(escapeIdentifier).join(', ');
+  if (valueProjectionColumns && valueProjectionColumns.length > 0) {
+    columnList = valueProjectionColumns.map(escapeIdentifier).join(', ');
   } else {
     columnList = '*';
   }
-
-  let sql = `SELECT ${columnList} FROM ${escapeIdentifier(table)}`;
 
   // Build WHERE clause from filters array and globalFilter
   const whereClauses = [];
@@ -1545,22 +1552,24 @@ async function fetchTableData(table, options = {}) {
     }
   }
 
-  if (keysetPlan) {
-    // Validated seek: the shared assembly owns WHERE, ORDER BY, and LIMIT so
-    // this worker cannot drift from the extension engines. Any invalid or
-    // stale request resolved to no plan and takes the unchanged path below.
-    const assembled = assembleKeysetSelect({
-      selectListSql: columnList,
-      escapedTable: escapeIdentifier(table),
-      whereClauses,
-      filterParams: params,
-      plan: keysetPlan
-    });
-    sql = assembled.sql;
-    params = assembled.params;
-  } else {
+  const filterParams = params;
+  const buildPageQuery = selectListSql => {
+    if (keysetPlan) {
+      // Validated seek: the shared assembly owns WHERE, ORDER BY, and LIMIT so
+      // this worker cannot drift from the extension engines. Any invalid or
+      // stale request resolved to no plan and takes the unchanged path below.
+      return assembleKeysetSelect({
+        selectListSql,
+        escapedTable: escapeIdentifier(table),
+        whereClauses,
+        filterParams,
+        plan: keysetPlan
+      });
+    }
+
+    let querySql = `SELECT ${selectListSql} FROM ${escapeIdentifier(table)}`;
     if (whereClauses.length > 0) {
-      sql += ` WHERE ${whereClauses.join(' AND ')}`;
+      querySql += ` WHERE ${whereClauses.join(' AND ')}`;
     }
 
     // Add ordering. One total order for both paths: an anchorable query's
@@ -1577,17 +1586,24 @@ async function fetchTableData(table, options = {}) {
       const direction = fallbackOrder
         ? fallbackOrder.orderDir
         : (orderDir === 'DESC' ? 'DESC' : 'ASC');
-      sql += ` ORDER BY ${orderedColumns
+      querySql += ` ORDER BY ${orderedColumns
         .map(column => `${escapeIdentifier(column)} ${direction}`)
         .join(', ')}`;
     }
 
     // Add pagination
-    sql += ` LIMIT ${parseInt(limit, 10)} OFFSET ${parseInt(offset, 10)}`;
-  }
+    querySql += ` LIMIT ${parseInt(limit, 10)} OFFSET ${parseInt(offset, 10)}`;
+    return { sql: querySql, params: filterParams };
+  };
+  const { sql, params: pageParams } = buildPageQuery(columnList);
+  params = pageParams;
+  const rowIdQuery = splitSyntheticRowId
+    ? buildPageQuery(escapeIdentifier('rowid'))
+    : undefined;
 
   const sourceStatement = db.prepare(sql, params);
-  const headers = sourceStatement.getColumnNames();
+  const valueHeaders = sourceStatement.getColumnNames();
+  const headers = splitSyntheticRowId ? ['rowid', ...valueHeaders] : valueHeaders;
   sourceStatement.free();
   const requestedCellLimit = Number.isSafeInteger(options.maxInlineCellBytes)
     && options.maxInlineCellBytes > 0
@@ -1619,19 +1635,45 @@ async function fetchTableData(table, options = {}) {
   const rawTextColumnIndices = [
     ...new Set([...primaryKeyColumnIndices, ...keysetColumnIndices])
   ];
+  const containmentRawTextColumnIndices = splitSyntheticRowId
+    ? rawTextColumnIndices
+        .filter(index => index > 0)
+        .map(index => index - 1)
+    : rawTextColumnIndices;
   const containmentQuery = buildCellContainmentQuery(
     sql,
-    headers.length,
+    valueHeaders.length,
     containmentOptions,
-    rawTextColumnIndices
+    containmentRawTextColumnIndices
   );
   const transportQuery = buildExactNumericTextQuery(
     containmentQuery.sql,
-    containmentQuery.transportColumnCount
+    containmentQuery.primaryTransportColumnCount
   );
   const results = db.exec(transportQuery.sql, params, { useBigInt: true });
-
-  const sourceRows = results[0]?.values ?? [];
+  const metadataResults = containmentQuery.metadataSql
+    ? db.exec(containmentQuery.metadataSql, params, { useBigInt: true })
+    : undefined;
+  const valueSourceRows = mergeCellContainmentMetadataRows(
+    results[0]?.values ?? [],
+    metadataResults?.[0]?.values,
+    containmentQuery
+  );
+  const rowIdResults = rowIdQuery
+    ? db.exec(rowIdQuery.sql, rowIdQuery.params, { useBigInt: true })
+    : undefined;
+  const rowIdRows = rowIdResults?.[0]?.values;
+  if (rowIdRows && rowIdRows.length !== valueSourceRows.length) {
+    throw new Error('Synthetic rowid companion row count does not match the value page');
+  }
+  const sourceRows = rowIdRows
+    ? rowIdRows.map((row, rowIndex) => {
+        if (row.length !== 1) {
+          throw new Error(`Synthetic rowid companion row ${rowIndex} is not one value`);
+        }
+        return [row[0], ...valueSourceRows[rowIndex]];
+      })
+    : valueSourceRows;
   const companionResults = [];
   const hasRowIdShape = headers[0]?.toLowerCase() === 'rowid';
   const needsExactRowIdIdentity = hasRowIdShape
@@ -1661,22 +1703,37 @@ async function fetchTableData(table, options = {}) {
   }
   const companionExactTexts = collectRowIdExactRealTexts(sourceRows, companionResults);
   const normalized = normalizeIntegerRowsForTransport(
-    sourceRows,
+    valueSourceRows,
     transportQuery.valueColumnCount,
-    companionExactTexts,
-    isRowIdTable && needsExactRowIdIdentity ? 0 : undefined
+    splitSyntheticRowId ? undefined : companionExactTexts,
+    !splitSyntheticRowId && isRowIdTable && needsExactRowIdIdentity ? 0 : undefined
   );
-  const contained = decodeCellContainment(
+  const valueContained = decodeCellContainment(
     normalized.rows,
-    headers.length,
+    valueHeaders.length,
     normalized.exactIntegerTexts,
     containmentOptions.maxPageResponseBytes
   );
+  const contained = rowIdRows
+    ? prependCellContainmentColumn(
+        normalizeIntegerRowsForTransport(
+          rowIdRows,
+          undefined,
+          undefined,
+          needsExactRowIdIdentity ? 0 : undefined
+        ).rows.map(row => row[0]),
+        valueContained,
+        companionExactTexts
+      )
+    : valueContained;
   const { rows, oversizedCells, exactIntegerTexts } = contained;
   const rawTextRows = decodeRawTextColumns(normalized.rows, containmentQuery);
-  const textEncoding = rawTextColumnIndices.length > 0
+  const textEncoding = containmentRawTextColumnIndices.length > 0
     ? normalizeCellTextEncoding(db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0])
     : undefined;
+  const sourceRawTextColumnIndices = splitSyntheticRowId
+    ? containmentQuery.rawTextColumnIndices.map(index => index + 1)
+    : containmentQuery.rawTextColumnIndices;
   const remapped = primaryKeyContext && textEncoding
     ? remapPrimaryKeyContainment({
         identity: primaryKeyContext.identity,
@@ -1684,7 +1741,7 @@ async function fetchTableData(table, options = {}) {
         visibleColumnCount: primaryKeyContext.visibleColumns.length,
         identityRows: sourceRows,
         rawTextBytes: rawTextRows,
-        rawTextColumnIndices: containmentQuery.rawTextColumnIndices,
+        rawTextColumnIndices: sourceRawTextColumnIndices,
         rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable,
         textEncoding,
         rows,
@@ -1699,7 +1756,7 @@ async function fetchTableData(table, options = {}) {
         sourceRows,
         sourceColumnIndices: keysetColumnIndices,
         rawTextRows,
-        rawTextColumnIndices: containmentQuery.rawTextColumnIndices,
+        rawTextColumnIndices: sourceRawTextColumnIndices,
         textEncoding,
         rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable
       })
