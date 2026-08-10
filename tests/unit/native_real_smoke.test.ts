@@ -855,7 +855,6 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                                 if (
                                     !mutationInjected
                                     && sql.includes('FROM "native_export_cell_snapshot"')
-                                    && sql.includes('__export_type_0')
                                 ) {
                                     mutationInjected = true;
                                     await writer.call('run', [

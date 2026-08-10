@@ -2,9 +2,46 @@ import './vscode_mock_setup';
 
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
+import Module from 'node:module';
+import path from 'node:path';
+import esbuild from 'esbuild';
 import * as vscode from 'vscode';
 
 import { HostBridge } from '../../src/hostBridge';
+import { mockVscode } from './mocks/vscode';
+
+const hostBridgePath = path.resolve(__dirname, '../../src/hostBridge.ts');
+
+/** Load the authored host bridge under the browser build's export-less path alias. */
+function loadBrowserHostBridge(): typeof HostBridge {
+    const source = fs.readFileSync(hostBridgePath, 'utf8');
+    const jsCode = esbuild.transformSync(source, {
+        loader: 'ts',
+        format: 'cjs',
+        define: {
+            'import.meta.env.VSCODE_BROWSER_EXT': 'true'
+        }
+    }).code;
+    const scriptModule = new Module(hostBridgePath, module as unknown as Module);
+    scriptModule.filename = hostBridgePath;
+    scriptModule.paths = (Module as unknown as { _nodeModulePaths(dirname: string): string[] })
+        ._nodeModulePaths(path.dirname(hostBridgePath));
+
+    const originalRequire = Module.prototype.require;
+    Module.prototype.require = function(request: string) {
+        if (request === 'vscode') return mockVscode;
+        if (request === 'path') return {};
+        return originalRequire.call(this, request);
+    };
+    try {
+        (scriptModule as unknown as { _compile(code: string, filename: string): void })
+            ._compile(jsCode, hostBridgePath);
+    } finally {
+        Module.prototype.require = originalRequire;
+    }
+    return (scriptModule.exports as { HostBridge: typeof HostBridge }).HostBridge;
+}
 
 interface FakeUri {
     scheme: string;
@@ -21,8 +58,8 @@ interface FakeUri {
 /**
  * The shared vscode mock's Uri.parse hardcodes a single scheme; containment logic
  * needs real scheme/authority/path decomposition, so this file installs a faithful
- * parser for its duration. fsPath is the raw path (POSIX hosts only), which matches
- * how these tests exercise path.resolve-based containment.
+ * parser for its duration. fsPath is the raw path (POSIX hosts only), matching
+ * the URI-path containment cases exercised below.
  */
 function parseUriForTest(value: string): FakeUri {
     const match = /^([A-Za-z][A-Za-z0-9+.-]*):(?:\/\/([^/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/.exec(value);
@@ -133,6 +170,32 @@ describe('HostBridge.readWorkspaceFileUri containment', () => {
         const result = await bridge.readWorkspaceFileUri('vscode-vfs://github/owner/repo/assets/logo.png');
         assert.strictEqual(result, FILE_PAYLOAD);
         assert.strictEqual(readUris.length, 1);
+    });
+
+    it('allows a virtual-workspace URI in the browser build without Node path exports', async () => {
+        installWorkspaceFolders(['vscode-vfs://github/owner/repo']);
+        const BrowserHostBridge = loadBrowserHostBridge();
+        const document = {
+            uri: parseUriForTest('vscode-vfs://github/owner/repo/main.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: {},
+            isReadOnlyMode: false
+        };
+        const provider = {
+            webviews: new Map(),
+            context: {},
+            isReadOnly: false
+        };
+        const bridge = new BrowserHostBridge(provider as never, document as never);
+
+        const result = await bridge.readWorkspaceFileUri(
+            'vscode-vfs://github/owner/repo/assets/browser-logo.png'
+        );
+
+        assert.strictEqual(result, FILE_PAYLOAD);
+        assert.deepStrictEqual(readUris, [
+            'vscode-vfs://github/owner/repo/assets/browser-logo.png'
+        ]);
     });
 
     it('rejects file: traversal that getWorkspaceFolder still prefix-matches (F1)', async () => {

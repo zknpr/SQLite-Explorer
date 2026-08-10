@@ -38,14 +38,7 @@ export const EXPORT_CELL_CHUNK_BYTES = 128 * 1024;
 const EXPORT_ROW_BATCH_SIZE = 128;
 const EXPORT_INLINE_TEXT_BYTES = 64 * 1024;
 const UNSTABLE_CELL_INLINE_BYTES = 1024 * 1024;
-
-const STORAGE_CLASSES = new Set<CellStorageClass>([
-  'null',
-  'integer',
-  'real',
-  'text',
-  'blob'
-]);
+const SQLITE_MAX_RESULT_COLUMNS = 2000;
 
 export interface AsyncExportSink {
   /** Resolves only after the sink has accepted this emission. */
@@ -136,39 +129,146 @@ function byteLength(value: unknown, context: string): number {
   return Number(normalized);
 }
 
-function parseStorageClass(value: unknown, context: string): CellStorageClass {
-  if (typeof value !== 'string' || !STORAGE_CLASSES.has(value as CellStorageClass)) {
-    throw new Error(`SQLite returned an invalid storage class for ${context}`);
-  }
-  return value as CellStorageClass;
+function buildCellProjection(
+  columns: readonly string[],
+  inlineBytes: number,
+  includeInlineBlobs: boolean,
+  sourceAlias?: string
+): string {
+  const qualifier = sourceAlias ? `${escapeIdentifier(sourceAlias)}.` : '';
+  return columns.map((column, index) => {
+    const escaped = `${qualifier}${escapeIdentifier(column)}`;
+    const storageClass = `typeof(${escaped})`;
+    const byteLength = `octet_length(${escaped})`;
+    // One ASCII envelope per source column keeps even SQLite's 2,000-column
+    // maximum exportable. Hex protects raw TEXT bytes (including malformed
+    // database encodings) without asking the JS transport to decode them.
+    return (
+      `CASE ${storageClass} ` +
+      `WHEN 'null' THEN 'n:0:' ` +
+      `WHEN 'integer' THEN 'i:0:' || CAST(${escaped} AS TEXT) ` +
+      `WHEN 'real' THEN 'r:0:' || printf('%!.17g', ${escaped}) ` +
+      `WHEN 'text' THEN 't:' || CAST(${byteLength} AS TEXT) || ':' || ` +
+      `CASE WHEN ${byteLength} <= ${inlineBytes} ` +
+      `THEN hex(CAST(${escaped} AS BLOB)) ELSE '' END ` +
+      `WHEN 'blob' THEN 'b:' || CAST(${byteLength} AS TEXT) || ':' || ` +
+      (includeInlineBlobs
+        ? `CASE WHEN ${byteLength} <= ${inlineBytes} THEN hex(${escaped}) ELSE '' END `
+        : `'' `) +
+      `END AS ${escapeIdentifier(`__export_cell_${index}`)}`
+    );
+  }).join(', ');
 }
 
-function buildCellProjection(columns: readonly string[], inlineBytes: number, includeInlineBlobs: boolean): string {
-  return columns.flatMap((column, index) => {
-    const escaped = escapeIdentifier(column);
-    const storageClass = `typeof(${escaped})`;
-    const value =
-      `CASE ` +
-      // Export INTEGERs through SQLite's canonical decimal text. Returning the
-      // raw value lets WASM round int64 and gives native callers a BigInt that
-      // JSON.stringify cannot handle.
-      `WHEN ${storageClass} = 'integer' THEN CAST(${escaped} AS TEXT) ` +
-      `WHEN ${storageClass} = 'real' THEN ${escaped} ` +
-      `WHEN ${storageClass} = 'text' AND octet_length(${escaped}) <= ${inlineBytes} ` +
-      `THEN CAST(${escaped} AS BLOB) ` +
-      (includeInlineBlobs
-        ? `WHEN ${storageClass} = 'blob' AND octet_length(${escaped}) <= ${inlineBytes} THEN ${escaped} `
-        : '') +
-      `ELSE NULL END`;
-    const length =
-      `CASE WHEN ${storageClass} IN ('text', 'blob') ` +
-      `THEN octet_length(${escaped}) ELSE 0 END`;
-    return [
-      `${storageClass} AS ${escapeIdentifier(`__export_type_${index}`)}`,
-      `${value} AS ${escapeIdentifier(`__export_value_${index}`)}`,
-      `${length} AS ${escapeIdentifier(`__export_bytes_${index}`)}`
-    ];
-  }).join(', ');
+function decodePackedHex(
+  payload: string,
+  expectedBytes: number,
+  context: string
+): Uint8Array {
+  if (payload.length !== expectedBytes * 2 || /[^0-9a-f]/i.test(payload)) {
+    throw new Error(`SQLite returned invalid packed bytes for ${context}`);
+  }
+  const bytes = new Uint8Array(expectedBytes);
+  for (let index = 0; index < expectedBytes; index++) {
+    bytes[index] = Number.parseInt(payload.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+function parsePackedCell(
+  table: string,
+  column: string,
+  packed: CellValue,
+  inlineBytes: number,
+  includeInlineBlobs: boolean,
+  textEncoding: CellTextEncoding,
+  rowId?: RecordId,
+  snapshotPosition?: ExportCell['snapshotPosition']
+): ExportCell {
+  const context = `${table}.${column}`;
+  if (typeof packed !== 'string') {
+    throw new Error(`SQLite returned an invalid packed export cell for ${context}`);
+  }
+  const firstSeparator = packed.indexOf(':');
+  const secondSeparator = packed.indexOf(':', firstSeparator + 1);
+  if (firstSeparator !== 1 || secondSeparator < 0) {
+    throw new Error(`SQLite returned malformed packed export metadata for ${context}`);
+  }
+  const storageCode = packed[0];
+  const lengthText = packed.slice(firstSeparator + 1, secondSeparator);
+  if (!/^(?:0|[1-9][0-9]*)$/.test(lengthText)) {
+    throw new Error(`SQLite returned an unsafe byte length for ${context}`);
+  }
+  const sourceBytes = byteLength(Number(lengthText), context);
+  const payload = packed.slice(secondSeparator + 1);
+  const storageClass: CellStorageClass = storageCode === 'n'
+    ? 'null'
+    : storageCode === 'i'
+      ? 'integer'
+      : storageCode === 'r'
+        ? 'real'
+        : storageCode === 't'
+          ? 'text'
+          : storageCode === 'b'
+            ? 'blob'
+            : (() => { throw new Error(`SQLite returned an invalid storage class for ${context}`); })();
+  if ((storageClass === 'null' || storageClass === 'integer' || storageClass === 'real') && sourceBytes !== 0) {
+    throw new Error(`SQLite returned invalid scalar byte metadata for ${context}`);
+  }
+
+  let value: CellValue;
+  let unrepresentableTextBytes: Uint8Array | undefined;
+  if (storageClass === 'null') {
+    if (payload !== '') throw new Error(`SQLite returned a value for NULL cell ${context}`);
+    value = null;
+  } else if (storageClass === 'integer') {
+    try {
+      if (BigInt(payload).toString() !== payload) throw new Error();
+    } catch {
+      throw new Error(`SQLite returned non-canonical INTEGER text for ${context}`);
+    }
+    value = payload;
+  } else if (storageClass === 'real') {
+    value = payload === 'Inf'
+      ? Number.POSITIVE_INFINITY
+      : payload === '-Inf'
+        ? Number.NEGATIVE_INFINITY
+        : Number(payload);
+    if (typeof value !== 'number' || Number.isNaN(value)) {
+      throw new Error(`SQLite returned invalid REAL text for ${context}`);
+    }
+  } else if (storageClass === 'text') {
+    if (sourceBytes <= inlineBytes) {
+      const bytes = decodePackedHex(payload, sourceBytes, context);
+      try {
+        value = new TextDecoder(textEncoding, { fatal: true, ignoreBOM: true }).decode(bytes);
+      } catch {
+        value = bytes;
+        unrepresentableTextBytes = bytes;
+      }
+    } else {
+      if (payload !== '') throw new Error(`SQLite returned oversized packed TEXT for ${context}`);
+      value = null;
+    }
+  } else if (includeInlineBlobs && sourceBytes <= inlineBytes) {
+    value = decodePackedHex(payload, sourceBytes, context);
+  } else {
+    if (payload !== '') throw new Error(`SQLite returned unexpected packed BLOB bytes for ${context}`);
+    value = null;
+  }
+
+  return {
+    table,
+    column,
+    rowId,
+    ...(snapshotPosition ? { snapshotPosition } : {}),
+    storageClass,
+    byteLength: sourceBytes,
+    value,
+    ...(unrepresentableTextBytes === undefined
+      ? {}
+      : { unrepresentableTextBytes, textEncoding })
+  };
 }
 
 function parseCells(
@@ -176,79 +276,29 @@ function parseCells(
   columns: readonly string[],
   row: readonly CellValue[],
   startIndex: number,
+  inlineBytes: number,
+  includeInlineBlobs: boolean,
   textEncoding: CellTextEncoding,
   rowId?: RecordId,
   snapshotPosition?: ExportCell['snapshotPosition']
 ): ExportCell[] {
-  const expectedLength = startIndex + columns.length * 3;
+  const expectedLength = startIndex + columns.length;
   if (row.length !== expectedLength) {
     throw new Error(
       `Export row has ${row.length} values; expected ${expectedLength}`
     );
   }
 
-  return columns.map((column, columnIndex) => {
-    const offset = startIndex + columnIndex * 3;
-    const storageClass = parseStorageClass(row[offset], `${table}.${column}`);
-    const sourceBytes = byteLength(row[offset + 2], `${table}.${column}`);
-    const transportedValue = row[offset + 1];
-    let value = transportedValue;
-    let unrepresentableTextBytes: Uint8Array | undefined;
-    if (storageClass === 'text' && transportedValue instanceof Uint8Array) {
-      try {
-        value = new TextDecoder(textEncoding, { fatal: true, ignoreBOM: true })
-          .decode(transportedValue);
-      } catch {
-        // SQLite permits TEXT with byte sequences that cannot be represented
-        // by JavaScript strings. Keep the projection's exact bytes for the
-        // format-specific lossless export envelope.
-        value = transportedValue;
-        unrepresentableTextBytes = transportedValue;
-      }
-    }
-
-    if (storageClass === 'integer') {
-      if (typeof transportedValue !== 'string') {
-        throw new Error(`SQLite returned invalid exact INTEGER text for ${table}.${column}`);
-      }
-      try {
-        if (BigInt(transportedValue).toString() !== transportedValue) {
-          throw new Error();
-        }
-      } catch {
-        throw new Error(`SQLite returned non-canonical INTEGER text for ${table}.${column}`);
-      }
-      value = transportedValue;
-    }
-
-    if (
-      storageClass === 'text'
-      && sourceBytes <= EXPORT_INLINE_TEXT_BYTES
-      && typeof value !== 'string'
-      && unrepresentableTextBytes === undefined
-    ) {
-      throw new Error(`SQLite omitted bounded TEXT for ${table}.${column}`);
-    }
-    if (storageClass === 'blob' && value !== null && !(value instanceof Uint8Array)) {
-      throw new Error(`SQLite returned invalid bounded BLOB data for ${table}.${column}`);
-    }
-    if (storageClass === 'null' && value !== null) {
-      throw new Error(`SQLite returned a value for NULL cell ${table}.${column}`);
-    }
-
-    return {
-      table,
-      column,
-      rowId,
-      ...(snapshotPosition ? { snapshotPosition } : {}),
-      storageClass,
-      byteLength: sourceBytes,
-      value,
-      ...(unrepresentableTextBytes === undefined
-        ? {}
-        : { unrepresentableTextBytes, textEncoding })
-    };
-  });
+  return columns.map((column, columnIndex) => parsePackedCell(
+    table,
+    column,
+    row[startIndex + columnIndex],
+    inlineBytes,
+    includeInlineBlobs,
+    textEncoding,
+    rowId,
+    snapshotPosition
+  ));
 }
 
 async function resolveColumns(
@@ -325,7 +375,11 @@ async function* readRowIdTableRows(
   textEncoding: CellTextEncoding,
   cancellation?: ExportCancellation
 ): AsyncGenerator<ExportRow> {
+  if (columns.length > SQLITE_MAX_RESULT_COLUMNS) {
+    throw new Error(`Cannot export more than ${SQLITE_MAX_RESULT_COLUMNS} columns`);
+  }
   const projection = buildCellProjection(columns, EXPORT_INLINE_TEXT_BYTES, false);
+  const includeRowIdInProjection = columns.length < SQLITE_MAX_RESULT_COLUMNS;
   const selectedPredicates = selectedRowIds.length > 0
     ? buildRecordIdentityPredicateChunks(
       sortUniqueRowIdsForExport(selectedRowIds),
@@ -349,26 +403,110 @@ async function* readRowIdTableRows(
       }
       let sql =
         `SELECT CAST(rowid AS TEXT) AS ${escapeIdentifier('__export_rowid__')}` +
-        (projection ? `, ${projection}` : '') +
+        (includeRowIdInProjection && projection ? `, ${projection}` : '') +
         ` FROM ${escapeIdentifier(table)}`;
       if (predicates.length > 0) sql += ` WHERE ${predicates.join(' AND ')}`;
       sql += ` ORDER BY rowid ASC LIMIT ${EXPORT_ROW_BATCH_SIZE}`;
 
       const result = await operations.executeQuery(sql, params);
-      const rows = result[0]?.rows ?? [];
-      if (rows.length === 0) break;
-      for (const row of rows) {
-        assertNotCancelled(cancellation);
+      const identityRows = result[0]?.rows ?? [];
+      if (identityRows.length === 0) break;
+      const rowIds = identityRows.map(row => {
         const rowId = row[0];
         if (typeof rowId !== 'string' && typeof rowId !== 'number') {
           throw new Error(`SQLite returned an invalid rowid for ${table}`);
         }
-        lastId = rowId;
-        yield { cells: parseCells(table, columns, row, 1, textEncoding, rowId) };
+        return rowId;
+      });
+      let valueRows = identityRows;
+      if (!includeRowIdInProjection) {
+        const batchPredicate = buildRecordIdentitiesPredicate(rowIds, { kind: 'rowid' });
+        const valuesResult = await operations.executeQuery(
+          `SELECT ${projection} FROM ${escapeIdentifier(table)} ` +
+          `WHERE ${batchPredicate.sql} ORDER BY rowid ASC`,
+          batchPredicate.params
+        );
+        valueRows = valuesResult[0]?.rows ?? [];
+        if (valueRows.length !== rowIds.length) {
+          throw new Error(`Table ${table} changed while export rowids were being enumerated`);
+        }
       }
-      if (rows.length < EXPORT_ROW_BATCH_SIZE) break;
+      for (let rowIndex = 0; rowIndex < rowIds.length; rowIndex++) {
+        assertNotCancelled(cancellation);
+        const rowId = rowIds[rowIndex];
+        lastId = rowId;
+        yield {
+          cells: parseCells(
+            table,
+            columns,
+            valueRows[rowIndex],
+            includeRowIdInProjection ? 1 : 0,
+            EXPORT_INLINE_TEXT_BYTES,
+            false,
+            textEncoding,
+            rowId
+          )
+        };
+      }
+      if (identityRows.length < EXPORT_ROW_BATCH_SIZE) break;
     }
   }
+}
+
+const SELECTED_PK_SOURCE_ALIAS = '__sqlite_explorer_export_source';
+const SELECTED_PK_CTE = '__sqlite_explorer_export_selected';
+const SELECTED_PK_ORDER_COLUMN = '__sqlite_explorer_export_order';
+
+function buildSelectedPrimaryKeyJoin(
+  table: string,
+  identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
+  recordIds: readonly RecordId[]
+): { cte: string; from: string; orderBy: string; params: CellValue[] } {
+  const keyAliases = identity.columns.map((_, index) => `__sqlite_explorer_export_key_${index}`);
+  const params: CellValue[] = [];
+  const valueRows = recordIds.map((rowId, order) => {
+    const predicate = buildRecordIdentityPredicate(rowId, identity);
+    if (
+      !predicate.primaryKey
+      || !predicate.primaryKeyIntegerCasts
+      || predicate.primaryKeyIntegerCasts.length !== identity.columns.length
+    ) {
+      throw new Error(`Cannot bind selected primary-key identity for ${table}`);
+    }
+    params.push(...predicate.params);
+    const placeholders = predicate.primaryKeyIntegerCasts.map(
+      integerCast => integerCast ? 'CAST(? AS INTEGER)' : '?'
+    );
+    return `(${order}, ${placeholders.join(', ')})`;
+  });
+  const escapedCte = escapeIdentifier(SELECTED_PK_CTE);
+  const escapedSource = escapeIdentifier(SELECTED_PK_SOURCE_ALIAS);
+  const cteColumns = [SELECTED_PK_ORDER_COLUMN, ...keyAliases]
+    .map(escapeIdentifier)
+    .join(', ');
+  const join = identity.columns.map((column, index) => (
+    `${escapedSource}.${escapeIdentifier(column.identifier)} = ` +
+    `${escapedCte}.${escapeIdentifier(keyAliases[index])}`
+  )).join(' AND ');
+  return {
+    cte: `WITH ${escapedCte} (${cteColumns}) AS (VALUES ${valueRows.join(', ')})`,
+    from:
+      `FROM ${escapeIdentifier(table)} AS ${escapedSource} ` +
+      `INNER JOIN ${escapedCte} ON ${join}`,
+    orderBy: `ORDER BY ${escapedCte}.${escapeIdentifier(SELECTED_PK_ORDER_COLUMN)}`,
+    params
+  };
+}
+
+function parseSelectedPrimaryKeyOrder(
+  value: CellValue,
+  rowCount: number,
+  table: string
+): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0 || Number(value) >= rowCount) {
+    throw new Error(`SQLite returned an invalid selected-row order for ${table}`);
+  }
+  return Number(value);
 }
 
 async function* readPrimaryKeyTableRows(
@@ -380,30 +518,111 @@ async function* readPrimaryKeyTableRows(
   textEncoding: CellTextEncoding,
   cancellation?: ExportCancellation
 ): AsyncGenerator<ExportRow> {
+  if (columns.length > SQLITE_MAX_RESULT_COLUMNS) {
+    throw new Error(`Cannot export more than ${SQLITE_MAX_RESULT_COLUMNS} columns`);
+  }
   const projection = buildCellProjection(columns, EXPORT_INLINE_TEXT_BYTES, false);
   if (selectedRowIds.length > 0) {
     const seen = new Set<string>();
+    const uniqueRowIds: RecordId[] = [];
     for (const rowId of selectedRowIds) {
-      assertNotCancelled(cancellation);
       const key = recordIdKey(rowId);
       if (seen.has(key)) continue;
       seen.add(key);
+      uniqueRowIds.push(rowId);
+    }
 
-      // Bind the values to the opaque identity in the same statement. The old
-      // two-query/index zip could pair a retained identity with an unrelated
-      // replacement row after a concurrent delete+insert of equal cardinality.
-      const predicate = buildRecordIdentityPredicate(rowId, identity);
-      const result = await operations.executeQuery(
-        `SELECT ${projection} FROM ${escapeIdentifier(table)} ` +
-        `WHERE ${predicate.sql} LIMIT 2`,
-        predicate.params
-      );
-      const rows = result[0]?.rows ?? [];
-      if (rows.length > 1) {
-        throw new Error(`Primary-key identity matched multiple rows in ${table}`);
+    const predicateChunks = buildRecordIdentityPredicateChunks(uniqueRowIds, identity);
+    let chunkOffset = 0;
+    for (const predicateChunk of predicateChunks) {
+      assertNotCancelled(cancellation);
+      const groupSize = predicateChunk.params.length / identity.columns.length;
+      if (!Number.isSafeInteger(groupSize) || groupSize < 1) {
+        throw new Error(`Invalid selected primary-key export chunk for ${table}`);
       }
-      if (rows.length === 1) {
-        yield { cells: parseCells(table, columns, rows[0], 0, textEncoding, rowId) };
+      const groupIds = uniqueRowIds.slice(chunkOffset, chunkOffset + groupSize);
+      chunkOffset += groupSize;
+
+      if (columns.length < SQLITE_MAX_RESULT_COLUMNS) {
+        const join = buildSelectedPrimaryKeyJoin(table, identity, groupIds);
+        const selectedProjection = buildCellProjection(
+          columns,
+          EXPORT_INLINE_TEXT_BYTES,
+          false,
+          SELECTED_PK_SOURCE_ALIAS
+        );
+        const result = await operations.executeQuery(
+          `${join.cte} SELECT ` +
+          `${escapeIdentifier(SELECTED_PK_CTE)}.${escapeIdentifier(SELECTED_PK_ORDER_COLUMN)}` +
+          (selectedProjection ? `, ${selectedProjection} ` : ' ') +
+          `${join.from} ${join.orderBy}`,
+          join.params
+        );
+        const yieldedOrders = new Set<number>();
+        for (const row of result[0]?.rows ?? []) {
+          const order = parseSelectedPrimaryKeyOrder(row[0], groupIds.length, table);
+          if (yieldedOrders.has(order)) {
+            throw new Error(`Primary-key identity matched multiple rows in ${table}`);
+          }
+          yieldedOrders.add(order);
+          yield {
+            cells: parseCells(
+              table,
+              columns,
+              row,
+              1,
+              EXPORT_INLINE_TEXT_BYTES,
+              false,
+              textEncoding,
+              groupIds[order]
+            )
+          };
+        }
+      } else {
+        // The selected ordinal would become result column 2,001. Resolve only
+        // the surviving ordinals first, then project the exact 2,000 columns in
+        // the same savepoint and CTE order.
+        const existenceJoin = buildSelectedPrimaryKeyJoin(table, identity, groupIds);
+        const existence = await operations.executeQuery(
+          `${existenceJoin.cte} SELECT ` +
+          `${escapeIdentifier(SELECTED_PK_CTE)}.${escapeIdentifier(SELECTED_PK_ORDER_COLUMN)} ` +
+          `${existenceJoin.from} ${existenceJoin.orderBy}`,
+          existenceJoin.params
+        );
+        const existingIds = (existence[0]?.rows ?? []).map(row => (
+          groupIds[parseSelectedPrimaryKeyOrder(row[0], groupIds.length, table)]
+        ));
+        if (existingIds.length === 0) continue;
+        const valuesJoin = buildSelectedPrimaryKeyJoin(table, identity, existingIds);
+        const selectedProjection = buildCellProjection(
+          columns,
+          EXPORT_INLINE_TEXT_BYTES,
+          false,
+          SELECTED_PK_SOURCE_ALIAS
+        );
+        const values = await operations.executeQuery(
+          `${valuesJoin.cte} SELECT ${selectedProjection} ` +
+          `${valuesJoin.from} ${valuesJoin.orderBy}`,
+          valuesJoin.params
+        );
+        const rows = values[0]?.rows ?? [];
+        if (rows.length !== existingIds.length) {
+          throw new Error(`Table ${table} changed while selected identities were being exported`);
+        }
+        for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+          yield {
+            cells: parseCells(
+              table,
+              columns,
+              rows[rowIndex],
+              0,
+              EXPORT_INLINE_TEXT_BYTES,
+              false,
+              textEncoding,
+              existingIds[rowIndex]
+            )
+          };
+        }
       }
     }
     return;
@@ -468,6 +687,8 @@ async function* readPrimaryKeyTableRows(
             columns,
             row,
             0,
+            EXPORT_INLINE_TEXT_BYTES,
+            false,
             textEncoding,
             rowId,
             {
@@ -511,6 +732,8 @@ async function* readPrimaryKeyTableRows(
             columns,
             rows[groupIndex],
             0,
+            EXPORT_INLINE_TEXT_BYTES,
+            false,
             textEncoding,
             groupIds[groupIndex]
           )
@@ -533,6 +756,7 @@ async function* readUnstableCursorRows(
   columns: readonly string[],
   projection: string,
   textEncoding: CellTextEncoding,
+  includeInlineBlobs: boolean,
   cancellation?: ExportCancellation
 ): AsyncGenerator<ExportRow> {
   const openQueryReadSession = operations.openQueryReadSession!;
@@ -554,7 +778,17 @@ async function* readUnstableCursorRows(
       }
       const row = chunk.rows[0];
       if (row) {
-        yield { cells: parseCells(table, columns, row, 0, textEncoding) };
+        yield {
+          cells: parseCells(
+            table,
+            columns,
+            row,
+            0,
+            UNSTABLE_CELL_INLINE_BYTES,
+            includeInlineBlobs,
+            textEncoding
+          )
+        };
       } else if (!chunk.done) {
         throw new Error(`Query read session made no progress for ${table}`);
       }
@@ -584,6 +818,7 @@ async function* readUnstableSpoolRows(
   columns: readonly string[],
   projection: string,
   textEncoding: CellTextEncoding,
+  includeInlineBlobs: boolean,
   cancellation?: ExportCancellation
 ): AsyncGenerator<ExportRow> {
   const spoolTable = `__sqlite_explorer_export_${webCrypto.randomUUID().replace(/-/g, '')}`;
@@ -609,8 +844,11 @@ async function* readUnstableSpoolRows(
     let lastSpoolRowId: RecordId = 0;
     while (true) {
       assertNotCancelled(cancellation);
+      const includeRowIdInProjection = columns.length < SQLITE_MAX_RESULT_COLUMNS;
       const result = await operations.executeQuery(
-        `SELECT CAST(rowid AS TEXT), * FROM ${escapedSpool} ` +
+        `SELECT CAST(rowid AS TEXT)` +
+        (includeRowIdInProjection ? ', * ' : ' ') +
+        `FROM ${escapedSpool} ` +
         `WHERE rowid > ? ORDER BY rowid LIMIT 1`,
         [lastSpoolRowId],
         cancellationBinding.signal
@@ -622,7 +860,29 @@ async function* readUnstableSpoolRows(
         throw new Error(`SQLite returned an invalid export spool rowid for ${table}`);
       }
       lastSpoolRowId = row[0];
-      yield { cells: parseCells(table, columns, row, 1, textEncoding) };
+      let valueRow = row;
+      if (!includeRowIdInProjection) {
+        const values = await operations.executeQuery(
+          `SELECT * FROM ${escapedSpool} WHERE rowid = ? LIMIT 1`,
+          [lastSpoolRowId],
+          cancellationBinding.signal
+        );
+        valueRow = values[0]?.rows[0];
+        if (!valueRow || (values[0]?.rows.length ?? 0) !== 1) {
+          throw new Error(`Export spool ${spoolTable} changed while reading ${table}`);
+        }
+      }
+      yield {
+        cells: parseCells(
+          table,
+          columns,
+          valueRow,
+          includeRowIdInProjection ? 1 : 0,
+          UNSTABLE_CELL_INLINE_BYTES,
+          includeInlineBlobs,
+          textEncoding
+        )
+      };
     }
   } catch (error) {
     primaryError = error;
@@ -671,6 +931,7 @@ async function* readUnstableRows(
       columns,
       projection,
       textEncoding,
+      includeInlineBlobs,
       cancellation
     );
     return;
@@ -681,6 +942,7 @@ async function* readUnstableRows(
     columns,
     projection,
     textEncoding,
+    includeInlineBlobs,
     cancellation
   );
 }

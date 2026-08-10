@@ -993,6 +993,9 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
     const value =
       `CASE WHEN ${storageClass} = 'integer' THEN CAST(${identifier} AS TEXT) ` +
       `WHEN ${storageClass} = 'text' THEN CAST(${identifier} AS BLOB) ` +
+      (format === 'csv' || format === 'excel'
+        ? `WHEN ${storageClass} = 'blob' THEN NULL `
+        : '') +
       `ELSE ${identifier} END`;
     return [
       `${storageClass} AS ${escapeIdentifier(`__export_type_${index}`)}`,
@@ -1011,7 +1014,8 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
         table,
         selectedColumns,
         whereSql,
-        predicate.params
+        predicate.params,
+        format
       );
       if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes > WEB_DEMO_EXPORT_MAX_BYTES) {
         throw webDemoExportLimitError();
@@ -1119,12 +1123,18 @@ function getExportProjectionColumns(table) {
   }
 }
 
-function estimateWebDemoExportBytes(table, columns, whereSql, params) {
+function estimateWebDemoExportBytes(table, columns, whereSql, params, format) {
   const estimateCells = columns.map(column => {
     const identifier = escapeIdentifier(column);
+    const blobBytes = `length(${identifier})`;
+    const blobEstimate = format === 'csv' || format === 'excel'
+      ? '64'
+      : format === 'json'
+        ? `((${blobBytes} + 2) / 3) * 4 + 64`
+        : `${blobBytes} * 2 + 64`;
     return `CASE typeof(${identifier}) ` +
       `WHEN 'text' THEN length(CAST(${identifier} AS BLOB)) * 6 + 64 ` +
-      `WHEN 'blob' THEN length(${identifier}) + 64 ELSE 64 END`;
+      `WHEN 'blob' THEN ${blobEstimate} ELSE 64 END`;
   }).join(' + ') || '0';
   const result = db.exec(
     `SELECT COUNT(*), COALESCE(SUM(${estimateCells}), 0) ` +

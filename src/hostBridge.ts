@@ -7,7 +7,6 @@
  */
 
 import * as vsc from 'vscode';
-import * as path from 'path';
 
 import type { DatabaseEditorProvider, DatabaseViewerProvider } from './editorController';
 import { ConfigurationSection, ExtensionId, getMaxInlineCellBytes, getMaxUndoMemoryBytes, SidebarLeft, SidebarRight, UriScheme } from './config';
@@ -121,6 +120,44 @@ export function toWebviewQueryResultSet(result: QueryResultSet): WebviewQueryRes
   return webviewResult;
 }
 
+/** Normalize a workspace URI path without importing Node's browser-incompatible path module. */
+function normalizeUriPath(value: string): string {
+  const segments: string[] = [];
+  for (const segment of value.split('/')) {
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') {
+      segments.pop();
+    } else {
+      segments.push(segment);
+    }
+  }
+  return `/${segments.join('/')}`;
+}
+
+function uriPathDirname(value: string): string {
+  const normalized = normalizeUriPath(value);
+  const separator = normalized.lastIndexOf('/');
+  return separator <= 0 ? '/' : normalized.slice(0, separator);
+}
+
+function uriDirectory(uri: vsc.Uri): vsc.Uri {
+  const directoryPath = uriPathDirname(uri.path);
+  // Uri.file derives the platform fsPath without Node's path module. Other
+  // providers must retain their scheme and authority in browser workspaces.
+  return uri.scheme === 'file'
+    ? vsc.Uri.file(directoryPath)
+    : uri.with({ path: directoryPath, query: '', fragment: '' });
+}
+
+function pathLeaf(value: string): string {
+  const withoutTrailingSeparators = value.replace(/[\\/]+$/g, '');
+  const separator = Math.max(
+    withoutTrailingSeparators.lastIndexOf('/'),
+    withoutTrailingSeparators.lastIndexOf('\\')
+  );
+  return withoutTrailingSeparators.slice(separator + 1);
+}
+
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
 
@@ -134,14 +171,12 @@ type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength:
  * `base` is either the directory itself (a workspace folder) or a file whose
  * parent directory is the boundary (the open database document).
  *
- * file: URIs compare with the platform path rules on fsPath — path.resolve
- * collapses dot segments and, on Windows, honours `\` as a separator. Every
- * other provider addresses resources by POSIX uri.path; there a candidate
- * containing `\` is rejected outright, because posix.resolve treats `\` as an
- * ordinary filename character while Windows-backed remote providers treat it
- * as a separator — normalizing instead of rejecting would misjudge either kind
- * of provider. (Module-level on purpose: webviewMessageHandler dispatches any
- * function-valued HostBridge property by name, and this must not be callable.)
+ * workspace.fs addresses every provider, including file:, by URI. Compare the
+ * normalized POSIX URI path so this guard behaves identically in desktop and
+ * browser extension hosts. A backslash is rejected rather than interpreted:
+ * URI paths use `/`, while some Windows-backed providers may treat `\` as a
+ * second separator. (Module-level on purpose: webviewMessageHandler dispatches
+ * any function-valued HostBridge property by name, and this must not be callable.)
  */
 function isUriContainedInDirectory(
   candidate: vsc.Uri,
@@ -153,22 +188,12 @@ function isUriContainedInDirectory(
   if (candidate.scheme !== base.scheme || candidate.authority !== base.authority) {
     return false;
   }
-  if (candidate.scheme === 'file') {
-    const baseDir = baseKind === 'directory' ? base.fsPath : path.dirname(base.fsPath);
-    const resolvedDir = path.resolve(baseDir);
-    const resolvedCandidate = path.resolve(candidate.fsPath);
-    // Match the directory itself or require the separator after the prefix:
-    // this prevents prefix spoofing (e.g. '/path/to/dir-fake'). If resolvedDir
-    // is root it already ends with the separator.
-    const prefix = resolvedDir.endsWith(path.sep) ? resolvedDir : resolvedDir + path.sep;
-    return resolvedCandidate === resolvedDir || resolvedCandidate.startsWith(prefix);
-  }
-  if (candidate.path.includes('\\')) {
+  if (candidate.path.includes('\\') || base.path.includes('\\')) {
     return false;
   }
-  const baseDir = baseKind === 'directory' ? base.path : path.posix.dirname(base.path);
-  const resolvedDir = path.posix.resolve('/', baseDir);
-  const resolvedCandidate = path.posix.resolve('/', candidate.path);
+  const baseDir = baseKind === 'directory' ? base.path : uriPathDirname(base.path);
+  const resolvedDir = normalizeUriPath(baseDir);
+  const resolvedCandidate = normalizeUriPath(candidate.path);
   const prefix = resolvedDir.endsWith('/') ? resolvedDir : resolvedDir + '/';
   return resolvedCandidate === resolvedDir || resolvedCandidate.startsWith(prefix);
 }
@@ -1497,7 +1522,7 @@ export class HostBridge implements ToastService {
     }
 
     const previewId = crypto.randomUUID();
-    const runDirectory = vsc.Uri.file(path.dirname(materialized.uri.fsPath));
+    const runDirectory = uriDirectory(materialized.uri);
     let resourceUri: string;
     try {
       resourceUri = panel.webview.asWebviewUri(materialized.uri).toString();
@@ -1737,12 +1762,11 @@ export class HostBridge implements ToastService {
    */
   async saveFile(filename: string, data: Uint8ArrayLike): Promise<void> {
     // Use the database file's directory as the default location
-    const dbDir = path.dirname(this.document.uri.fsPath);
-    const safeFilename = path.basename(filename);
-    const defaultPath = path.join(dbDir, safeFilename);
+    const safeFilename = pathLeaf(filename);
+    const defaultUri = vsc.Uri.joinPath(uriDirectory(this.document.uri), safeFilename);
     
     const uri = await vsc.window.showSaveDialog({
-        defaultUri: vsc.Uri.file(defaultPath),
+        defaultUri,
         saveLabel: 'Save Blob'
     });
 
@@ -1781,7 +1805,7 @@ export class HostBridge implements ToastService {
         const data = await vsc.workspace.fs.readFile(uri);
         assertCellValueWithinEditLimit(data, DEFAULT_MAX_CELL_EDIT_BYTES);
         return {
-            name: path.basename(uri.fsPath),
+            name: pathLeaf(uri.path),
             data: data
         };
     }

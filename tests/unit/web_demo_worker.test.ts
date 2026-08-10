@@ -92,6 +92,7 @@ async function createWorkerHarness(options: {
     initSqlJs?: (config: any) => Promise<any>;
     onImportScripts?: (url: string) => void;
     onSql?: (kind: 'exec' | 'prepare', sql: string) => void;
+    onSqlResult?: (kind: 'exec' | 'prepare', sql: string, result: unknown) => void;
     coerceBigIntsToNumbers?: boolean;
 } = {}): Promise<WorkerHarness> {
     const source = await readCurrentWorkerBundle();
@@ -100,7 +101,7 @@ async function createWorkerHarness(options: {
     const workerGlobal: any = {
         initSqlJs: async (config: any) => {
             const sqlJs = await initializeSqlJs(config);
-            if (!options.onSql && !options.coerceBigIntsToNumbers) return sqlJs;
+            if (!options.onSql && !options.onSqlResult && !options.coerceBigIntsToNumbers) return sqlJs;
             const ObservedDatabase = new Proxy(sqlJs.Database, {
                 construct(Target: any, args: any[]): object {
                     const database = Reflect.construct(Target, args) as Record<string, any>;
@@ -109,6 +110,7 @@ async function createWorkerHarness(options: {
                         database[kind] = (sql: string, ...methodArgs: unknown[]) => {
                             options.onSql?.(kind, sql);
                             const result = original(sql, ...methodArgs);
+                            options.onSqlResult?.(kind, sql, result);
                             if (kind !== 'exec' || !options.coerceBigIntsToNumbers) {
                                 return result;
                             }
@@ -492,6 +494,90 @@ describe('web demo view worker', () => {
             observedSql.every(sql => !/^SELECT\s+"payload"\s+FROM\s+"demo_stage_e_cap"/i.test(sql)),
             `oversized export fetched the whole cell: ${observedSql.join('\n')}`
         );
+    });
+
+    it('exports oversized CSV/Excel BLOB placeholders without transporting source bytes', async () => {
+        const projectionResults: unknown[] = [];
+        const worker = await createWorkerHarness({
+            onSqlResult: (kind, sql, result) => {
+                if (
+                    kind === 'exec'
+                    && sql.includes('FROM "demo_format_blob_placeholder"')
+                    && !/COUNT\s*\(\s*\*\s*\)/i.test(sql)
+                ) {
+                    projectionResults.push(result);
+                }
+            }
+        });
+        await worker.invoke('runQuery', 'CREATE TABLE demo_format_blob_placeholder (payload BLOB)');
+        await worker.invoke(
+            'runQuery',
+            `INSERT INTO demo_format_blob_placeholder VALUES (zeroblob(${16 * 1024 * 1024 + 1}))`
+        );
+
+        for (const format of ['csv', 'excel']) {
+            const exported = await worker.invoke(
+                'exportTable',
+                { table: 'demo_format_blob_placeholder' },
+                ['payload'],
+                {},
+                {},
+                { format }
+            );
+            assert.strictEqual(
+                Array.from(exported.contentChunks).join(''),
+                'payload\n[BLOB]'
+            );
+        }
+        assert.strictEqual(projectionResults.length, 2);
+        const containsBlobBytes = (value: unknown): boolean => {
+            if (value instanceof Uint8Array) return value.byteLength > 0;
+            if (Array.isArray(value)) return value.some(containsBlobBytes);
+            if (value && typeof value === 'object') {
+                return Object.values(value as Record<string, unknown>).some(containsBlobBytes);
+            }
+            return false;
+        };
+        assert.strictEqual(projectionResults.some(containsBlobBytes), false);
+    });
+
+    it('rejects JSON base64 and SQL hex expansion before fetching BLOB bytes', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (kind, sql) => {
+                if (kind === 'exec') observedSql.push(sql);
+            }
+        });
+        await worker.invoke('runQuery', 'CREATE TABLE demo_format_blob_expansion (payload BLOB)');
+        await worker.invoke(
+            'runQuery',
+            `INSERT INTO demo_format_blob_expansion VALUES (zeroblob(${13 * 1024 * 1024}))`
+        );
+
+        for (const format of ['json', 'sql']) {
+            const projectionCountBefore = observedSql.filter(
+                sql => /^SELECT\s+typeof\("payload"\)/i.test(sql)
+            ).length;
+            await assert.rejects(
+                worker.invoke(
+                    'exportTable',
+                    { table: 'demo_format_blob_expansion' },
+                    ['payload'],
+                    {},
+                    {},
+                    { format }
+                ),
+                /limited to 16 MiB \(16,777,216 bytes\)/i
+            );
+            const projectionCountAfter = observedSql.filter(
+                sql => /^SELECT\s+typeof\("payload"\)/i.test(sql)
+            ).length;
+            assert.strictEqual(
+                projectionCountAfter,
+                projectionCountBefore,
+                `${format} fetched BLOB bytes before enforcing encoded output size`
+            );
+        }
     });
 
     it('chunks a 5000-row seven-column selected export below the SQLite bind limit', async () => {

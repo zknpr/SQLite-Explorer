@@ -9,14 +9,44 @@ import { noteCellValuesChanged } from './count-cache.js';
 import {
     getCellValueForDisplay,
     getCellMutationBlockReason,
+    getOversizedCellMetadata,
     getRowDataOffset,
     remapDisplayedRowIdentity,
     resolveDisplayedCell
 } from './data-utils.js';
 import { validateRowId, escapeIdentifier } from './utils.js';
 
+const TRUNCATED_COPY_NOTICE =
+    'Copy blocked: selection contains truncated data. Use Open Full Content for one cell or Export for complete rows.';
+
+function refuseTruncatedCellSelection() {
+    if (state.selectedCells.some(cell => getOversizedCellMetadata(cell.rowIdx, cell.colIdx))) {
+        updateStatus(TRUNCATED_COPY_NOTICE);
+        return true;
+    }
+    return false;
+}
+
+function refuseTruncatedRowSelection() {
+    for (let rowIdx = 0; rowIdx < state.gridData.length; rowIdx++) {
+        const row = state.gridData[rowIdx];
+        const rowId = state.selectedTableType === 'table'
+            ? row[0]
+            : state.currentPageIndex * state.rowsPerPage + rowIdx;
+        if (!state.selectedRowIds.has(rowId)) continue;
+        if (state.tableColumns.some((_column, colIdx) => (
+            getOversizedCellMetadata(rowIdx, colIdx)
+        ))) {
+            updateStatus(TRUNCATED_COPY_NOTICE);
+            return true;
+        }
+    }
+    return false;
+}
+
 export async function copyCellsToClipboard() {
     if (state.selectedCells.length === 0) return;
+    if (refuseTruncatedCellSelection()) return;
 
     try {
         let clipboardText;
@@ -79,6 +109,7 @@ export async function copyCellsToClipboard() {
 
 export async function copySelectedRowsToClipboard() {
     if (state.selectedRowIds.size === 0) return;
+    if (refuseTruncatedRowSelection()) return;
 
     try {
         // Collect rows

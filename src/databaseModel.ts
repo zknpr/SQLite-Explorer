@@ -881,7 +881,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   async #autoSaveIfNeeded(): Promise<void> {
     try {
       if (this.autoCommitEnabled) {
-        if (this.#hasActiveViewer) {
+        if (this.#activeViewers.size > 0) {
           await this.triggerSave();
         } else {
           this.#savePending = true;
@@ -894,9 +894,20 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     }
   }
 
-  #hasActiveViewer = false;
-  set hasActiveViewer(value: boolean) {
-    this.#hasActiveViewer = value;
+  // A document can be shared by panels owned by different editor providers.
+  // Track every panel here so an inactive sibling cannot hide an active view.
+  readonly #activeViewers = new Set<vsc.WebviewPanel>();
+
+  setViewerActive(viewer: vsc.WebviewPanel, active: boolean): void {
+    if (active) {
+      this.#activeViewers.add(viewer);
+    } else {
+      this.#activeViewers.delete(viewer);
+    }
+  }
+
+  removeViewer(viewer: vsc.WebviewPanel): void {
+    this.#activeViewers.delete(viewer);
   }
 
   #savePending = false;

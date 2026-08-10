@@ -16,9 +16,7 @@ import {
 import { noteCellValuesChanged } from './count-cache.js';
 import { formatCellValueAsText } from './utils.js';
 import { renderDataGrid } from './grid.js';
-
-// Maximum blob size in bytes (50MB) to prevent UI freeze during Base64 encoding
-const MAX_BLOB_SIZE_BYTES = 50 * 1024 * 1024;
+import { DEFAULT_MAX_CELL_EDIT_BYTES } from '../../../src/core/cell-edit-policy.ts';
 
 // Track upload state to prevent concurrent uploads and allow proper cleanup
 let isUploading = false;
@@ -162,9 +160,9 @@ function captureUploadTarget(cell) {
 
 async function handleFileUpload(uploadTarget, fileName, fileBlob) {
     // Early size check before reading file
-    if (fileBlob.size > MAX_BLOB_SIZE_BYTES) {
+    if (fileBlob.size > DEFAULT_MAX_CELL_EDIT_BYTES) {
         const sizeMB = (fileBlob.size / (1024 * 1024)).toFixed(1);
-        const limitMB = (MAX_BLOB_SIZE_BYTES / (1024 * 1024)).toFixed(0);
+        const limitMB = (DEFAULT_MAX_CELL_EDIT_BYTES / (1024 * 1024)).toFixed(0);
         updateStatus(`File too large (${sizeMB}MB). Maximum is ${limitMB}MB.`);
         return;
     }
@@ -211,10 +209,11 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
         return;
     }
 
-    // Check file size limit to prevent UI freeze during Base64 encoding
-    if (uint8Array.byteLength > MAX_BLOB_SIZE_BYTES) {
+    // URI reads cannot preflight a browser File, so enforce the same edit
+    // ceiling again before serialization or database mutation.
+    if (uint8Array.byteLength > DEFAULT_MAX_CELL_EDIT_BYTES) {
         const sizeMB = (uint8Array.byteLength / (1024 * 1024)).toFixed(1);
-        const limitMB = (MAX_BLOB_SIZE_BYTES / (1024 * 1024)).toFixed(0);
+        const limitMB = (DEFAULT_MAX_CELL_EDIT_BYTES / (1024 * 1024)).toFixed(0);
         updateStatus(`File too large (${sizeMB}MB). Maximum is ${limitMB}MB.`);
         return;
     }

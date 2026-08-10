@@ -199,20 +199,21 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
   /**
    * Create handler for webview panel disposal.
    */
-  #createPanelDisposeHandler(webviewPanel: vsc.WebviewPanel) {
+  #createPanelDisposeHandler(webviewPanel: vsc.WebviewPanel, document: DatabaseDocument) {
     return () => {
       this.webviewBridges.delete(webviewPanel);
+      document.removeViewer(webviewPanel);
     };
   }
 
   /**
    * Create handler for webview panel view state changes.
    */
-  #createViewStateChangeHandler(_webviewPanel: vsc.WebviewPanel, document: DatabaseDocument) {
-    return (e: vsc.WebviewPanelOnDidChangeViewStateEvent) => {
+  #createViewStateChangeHandler(webviewPanel: vsc.WebviewPanel, document: DatabaseDocument) {
+    return () => {
       // If the webview panel is active and there is a pending save, save the document
-      document.hasActiveViewer = e.webviewPanel.active;
-      if (e.webviewPanel.active && document.hasPendingSave) {
+      document.setViewerActive(webviewPanel, webviewPanel.active);
+      if (webviewPanel.active && document.hasPendingSave) {
         document.triggerSave().catch(() => { });
       }
     };
@@ -279,10 +280,10 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     };
     webviewPanel.webview.html = await this.#generateWebviewHtml(webviewPanel, document, webviewId);
 
-    document.hasActiveViewer = webviewPanel.active;
+    document.setViewerActive(webviewPanel, webviewPanel.active);
 
     webviewPanel.onDidChangeViewState(this.#createViewStateChangeHandler(webviewPanel, document)),
-      webviewPanel.onDidDispose(this.#createPanelDisposeHandler(webviewPanel));
+      webviewPanel.onDidDispose(this.#createPanelDisposeHandler(webviewPanel, document));
   }
 
   /**

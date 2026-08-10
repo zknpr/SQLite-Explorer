@@ -250,7 +250,7 @@ describe('HostBridge', () => {
 
     it('saveFile should prevent path traversal by stripping directory components from filename', async () => {
         const mockDocument = {
-            uri: vscode.Uri.parse('file:///dbDir/test.db'),
+            uri: vscode.Uri.file('/dbDir/test.db'),
             documentKey: Promise.resolve('test-key'),
         };
 

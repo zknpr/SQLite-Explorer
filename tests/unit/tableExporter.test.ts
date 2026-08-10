@@ -489,6 +489,130 @@ describe('streamTableExport golden parity', () => {
     });
 });
 
+describe('streamTableExport wide and selected-row batching', () => {
+    it('exports a 2000-column table and view without exceeding SQLite result width', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        const columns = Array.from({ length: 2000 }, (_, index) => `c${index}`);
+        await operations.executeQuery(
+            `CREATE TABLE stage_e_wide_projection (` +
+            columns.map(column => `"${column}"`).join(', ') +
+            ')'
+        );
+        await operations.executeQuery(
+            'INSERT INTO stage_e_wide_projection ("c0", "c1999") VALUES (?, ?)',
+            ['first', 'last']
+        );
+        await operations.executeQuery(
+            'CREATE VIEW stage_e_wide_projection_view AS ' +
+            'SELECT * FROM stage_e_wide_projection'
+        );
+        const expectedRow = Array.from({ length: columns.length }, (_, index) => (
+            index === 0 ? 'first' : index === columns.length - 1 ? 'last' : ''
+        )).join(',');
+        const expected = `${columns.join(',')}\n${expectedRow}`;
+        const spoolOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (
+                    property === 'openQueryReadSession'
+                    || property === 'readQueryRows'
+                    || property === 'closeQueryReadSession'
+                ) {
+                    return undefined;
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+
+        try {
+            for (const [source, sourceOperations] of [
+                ['stage_e_wide_projection', operations],
+                ['stage_e_wide_projection_view', operations],
+                ['stage_e_wide_projection_view', spoolOperations]
+            ] as const) {
+                const exported = await collectStreamingExport(
+                    sourceOperations,
+                    source,
+                    columns,
+                    { format: 'csv' }
+                );
+                assert.strictEqual(exported.rowCount, 1);
+                assert.strictEqual(exported.content, expected);
+            }
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('batches 5000 selected WITHOUT ROWID identities while preserving selection order', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_selected_pk (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID; ' +
+            'WITH RECURSIVE rows(id) AS (' +
+            'VALUES(0) UNION ALL SELECT id + 1 FROM rows WHERE id < 4999' +
+            ') INSERT INTO stage_e_selected_pk ' +
+            "SELECT id, printf('value-%04d', id) FROM rows"
+        );
+        const identityPage = await operations.fetchTableData('stage_e_selected_pk', {
+            columns: ['rowid'],
+            orderBy: 'rowid',
+            orderDir: 'ASC',
+            limit: 5000,
+            offset: 0,
+            maxInlineCellBytes: 1024,
+            maxPageResponseBytes: 16 * 1024 * 1024
+        });
+        const selectedRowIds = identityPage.rows.map(row => row[0] as RecordId).reverse();
+        selectedRowIds.push(selectedRowIds[0]);
+        let selectedProjectionQueries = 0;
+        const recordingOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'executeQuery') {
+                    return async (...args: Parameters<DatabaseOperations['executeQuery']>) => {
+                        if (String(args[0]).includes('stage_e_selected_pk')) {
+                            selectedProjectionQueries++;
+                        }
+                        return target.executeQuery(...args);
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+
+        try {
+            const exported = await collectStreamingExport(
+                recordingOperations,
+                'stage_e_selected_pk',
+                ['id', 'payload'],
+                { format: 'csv', rowIds: selectedRowIds }
+            );
+            const lines = exported.content.split('\n');
+            assert.strictEqual(exported.rowCount, 5000);
+            assert.strictEqual(lines.length, 5001);
+            assert.strictEqual(lines[0], 'id,payload');
+            assert.strictEqual(lines[1], '4999,value-4999');
+            assert.strictEqual(lines.at(-1), '0,value-0000');
+            assert.ok(
+                selectedProjectionQueries <= 10,
+                `selected export used ${selectedProjectionQueries} table queries`
+            );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+});
+
 describe('streamTableExport cell boundaries', () => {
     const readonlyPrimaryKeyExportTable = 'stage_e_readonly_pk_stream';
     const oversizedReadonlyRowText =
@@ -1196,8 +1320,7 @@ describe('streamTableExport cell boundaries', () => {
                         const sql = String(args[0]);
                         if (
                             !mutationInjected &&
-                            sql.includes('FROM "stage_e_pk_race"') &&
-                            sql.includes('__export_type_0')
+                            sql.includes('FROM "stage_e_pk_race"')
                         ) {
                             mutationInjected = true;
                             await target.executeQuery(
@@ -1426,8 +1549,7 @@ describe('streamTableExport cell boundaries', () => {
                         const sql = String(args[0]);
                         if (
                             !mutationQueued &&
-                            sql.includes('FROM "stage_e_cell_snapshot"') &&
-                            sql.includes('__export_type_0')
+                            sql.includes('FROM "stage_e_cell_snapshot"')
                         ) {
                             mutationQueued = true;
                             // Queue through the public facade while the projection is

@@ -298,6 +298,111 @@ it('shares one document, engine, and edit history across both editor view types 
     }
 });
 
+it('tracks active panels on the shared document across view types and disposal', async () => {
+    activeEngineKind = 'wasm';
+    (mockVscode.workspace as any)._config.set('instantCommit', 'always');
+    const defaultProvider = createProvider('sqlite-explorer.view');
+    const optionalProvider = createProvider('sqlite-explorer.option');
+    const uri = fileUri('/workspace/shared-active.sqlite');
+    const document = await defaultProvider.openCustomDocument(uri, openContext);
+    const optionalDocument = await optionalProvider.openCustomDocument(uri, openContext);
+    const originalExecuteCommand = mockVscode.commands.executeCommand;
+    let saveCount = 0;
+    mockVscode.commands.executeCommand = async (command: string) => {
+        if (command === 'workbench.action.files.save') saveCount++;
+    };
+
+    function createTrackedPanel(initiallyActive: boolean) {
+        const viewStateListeners: Array<(event: any) => void> = [];
+        const disposeListeners: Array<() => void> = [];
+        const webview = {
+            cspSource: '',
+            options: {},
+            html: '',
+            postMessage: async () => true,
+            onDidReceiveMessage: () => noOpDisposable,
+            asWebviewUri: (value: unknown) => value
+        };
+        const panel: any = {
+            active: initiallyActive,
+            visible: true,
+            webview,
+            onDidChangeViewState(listener: (event: any) => void) {
+                viewStateListeners.push(listener);
+                return noOpDisposable;
+            },
+            onDidDispose(listener: () => void) {
+                disposeListeners.push(listener);
+                return noOpDisposable;
+            }
+        };
+        return {
+            panel,
+            setActive(active: boolean) {
+                panel.active = active;
+                for (const listener of viewStateListeners) listener({ webviewPanel: panel });
+            },
+            dispose() {
+                for (const listener of disposeListeners) listener();
+            }
+        };
+    }
+
+    const activePanel = createTrackedPanel(true);
+    const inactivePanel = createTrackedPanel(false);
+    const modification: LabeledModification = {
+        label: 'Active panel edit',
+        description: 'Exercise shared active-panel auto-save state',
+        modificationType: 'cell_update',
+        targetTable: 'items',
+        targetRowId: 1,
+        targetColumn: 'value',
+        priorValue: 'before',
+        newValue: 'after'
+    };
+    const recordAndFlush = async (label: string) => {
+        document.recordExternalModification({ ...modification, label });
+        await new Promise(resolve => setImmediate(resolve));
+    };
+
+    try {
+        assert.strictEqual(document, optionalDocument);
+        await defaultProvider.resolveCustomEditor(document, activePanel.panel, {} as any);
+        await optionalProvider.resolveCustomEditor(document, inactivePanel.panel, {} as any);
+        const bridge = {
+            updateColorScheme: async () => {},
+            updateCellEditBehavior: async () => {},
+            refreshContent: async () => {}
+        };
+        defaultProvider.webviewBridges.set(activePanel.panel, bridge);
+        optionalProvider.webviewBridges.set(inactivePanel.panel, bridge);
+
+        await recordAndFlush('active despite inactive sibling');
+        assert.strictEqual(saveCount, 1);
+
+        inactivePanel.setActive(true);
+        activePanel.setActive(false);
+        await recordAndFlush('second view remains active');
+        assert.strictEqual(saveCount, 2);
+
+        activePanel.dispose();
+        await recordAndFlush('disposing inactive sibling preserves active view');
+        assert.strictEqual(saveCount, 3);
+
+        inactivePanel.dispose();
+        await recordAndFlush('no active panels');
+        assert.strictEqual(saveCount, 3);
+        assert.strictEqual(document.hasPendingSave, true);
+    } finally {
+        mockVscode.commands.executeCommand = originalExecuteCommand;
+        (mockVscode.workspace as any)._config.set('instantCommit', 'never');
+        await document.dispose();
+        await optionalDocument.dispose();
+        defaultProvider.dispose();
+        optionalProvider.dispose();
+    }
+});
+
 it('coalesces simultaneous opens for one URI before either engine is registered', async () => {
     const defaultProvider = createProvider('sqlite-explorer.view');
     const optionalProvider = createProvider('sqlite-explorer.option');
