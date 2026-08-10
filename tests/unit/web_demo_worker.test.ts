@@ -311,6 +311,39 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('exports a 2000-column demo table within SQLite result width', async () => {
+        const worker = await createWorkerHarness();
+        const columns = Array.from({ length: 2000 }, (_, index) => `c${index}`);
+        await worker.invoke(
+            'runQuery',
+            `CREATE TABLE demo_wide_export (` +
+            columns.map(column => `"${column}"`).join(', ') +
+            ')'
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_wide_export ("c0", "c1999") VALUES (?, ?)',
+            ['first', 'last']
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_wide_export' },
+            columns,
+            {},
+            {},
+            { format: 'csv' }
+        );
+        const [header, row] = Array.from(exported.contentChunks).join('').split('\n');
+
+        assert.deepStrictEqual(header.split(','), columns);
+        const values = row.split(',');
+        assert.strictEqual(values.length, 2000);
+        assert.strictEqual(values[0], 'first');
+        assert.strictEqual(values[1999], 'last');
+        assert.strictEqual(values.slice(1, -1).every(value => value === ''), true);
+    });
+
     it('exports malformed TEXT bytes faithfully in all four demo formats', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
@@ -556,7 +589,7 @@ describe('web demo view worker', () => {
 
         for (const format of ['json', 'sql']) {
             const projectionCountBefore = observedSql.filter(
-                sql => /^SELECT\s+typeof\("payload"\)/i.test(sql)
+                sql => /^SELECT\s+CASE\s+typeof\("payload"\)/i.test(sql)
             ).length;
             await assert.rejects(
                 worker.invoke(
@@ -570,7 +603,7 @@ describe('web demo view worker', () => {
                 /limited to 16 MiB \(16,777,216 bytes\)/i
             );
             const projectionCountAfter = observedSql.filter(
-                sql => /^SELECT\s+typeof\("payload"\)/i.test(sql)
+                sql => /^SELECT\s+CASE\s+typeof\("payload"\)/i.test(sql)
             ).length;
             assert.strictEqual(
                 projectionCountAfter,
@@ -1327,6 +1360,38 @@ describe('web demo view worker', () => {
         assert.deepStrictEqual(Array.from(small.rows[0].slice(0, 2)), [2, 'ok']);
         assert.deepStrictEqual(Array.from(small.rows[0][2]), [1, 2]);
         assert.strictEqual(small.oversizedCells, undefined);
+    });
+
+    it('clips aggregate BLOB previews before demo worker transport', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_predecode_page_bound (a BLOB, b BLOB, c BLOB, d BLOB); ' +
+            'INSERT INTO demo_predecode_page_bound VALUES ' +
+            '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300)), ' +
+            '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300)), ' +
+            '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300)), ' +
+            '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300))'
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_predecode_page_bound', {
+            columns: ['rowid', 'a', 'b', 'c', 'd'],
+            orderBy: 'rowid',
+            limit: 4,
+            offset: 0,
+            maxInlineCellBytes: 1024 * 1024,
+            maxPageResponseBytes: 80
+        });
+
+        assert.strictEqual(page.rows.length, 4);
+        for (let rowIndex = 0; rowIndex < page.rows.length; rowIndex++) {
+            for (let columnIndex = 1; columnIndex < 5; columnIndex++) {
+                assert.strictEqual(page.rows[rowIndex][columnIndex].byteLength, 4);
+                assert.deepStrictEqual(
+                    JSON.parse(JSON.stringify(page.oversizedCells[rowIndex][columnIndex])),
+                    { storageClass: 'blob', byteLength: 300 }
+                );
+            }
+        }
     });
 
     it('keeps demo cell chunks on one snapshot and preserves multibyte byte boundaries', async () => {

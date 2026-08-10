@@ -27,14 +27,71 @@ describe('grid cell containment limits', () => {
         }, 4), 1024 * 1024);
     });
 
-    it('keeps a 256-byte SQL clipping floor for a 50-column 5000-row page', async () => {
+    it('caps the SQL display floor by the aggregate raw page budget', async () => {
         const { deriveEffectiveInlineCellBytes } = await loadContainmentModule();
 
         assert.strictEqual(deriveEffectiveInlineCellBytes({
             maxInlineCellBytes: 1024 * 1024,
             maxPageResponseBytes: 16 * 1024 * 1024,
             limit: 5000
-        }, 50), 256);
+        }, 50), 67);
+        assert.strictEqual(deriveEffectiveInlineCellBytes({
+            maxInlineCellBytes: 1024 * 1024,
+            maxPageResponseBytes: 16 * 1024 * 1024,
+            limit: 5000
+        }, 51), 65);
+        assert.strictEqual(deriveEffectiveInlineCellBytes({
+            maxInlineCellBytes: 1024 * 1024,
+            maxPageResponseBytes: 16 * 1024 * 1024,
+            limit: 5000
+        }, 1000), 3);
+        assert.strictEqual(deriveEffectiveInlineCellBytes({
+            maxInlineCellBytes: 1024 * 1024,
+            maxPageResponseBytes: 16 * 1024 * 1024,
+            limit: Number.MAX_SAFE_INTEGER
+        }, 2), 0);
+    });
+
+    it('bounds BLOB bytes in SQLite before the result reaches the decoder', async () => {
+        const { buildCellContainmentQuery } = await loadContainmentModule();
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const engine = result.operations!;
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE predecode_page_bound (a BLOB, b BLOB); ' +
+                'INSERT INTO predecode_page_bound VALUES ' +
+                '(zeroblob(300), zeroblob(300)), ' +
+                '(zeroblob(300), zeroblob(300)), ' +
+                '(zeroblob(300), zeroblob(300)), ' +
+                '(zeroblob(300), zeroblob(300))'
+            );
+            const query = buildCellContainmentQuery(
+                'SELECT a, b FROM predecode_page_bound LIMIT 4',
+                2,
+                {
+                    limit: 4,
+                    maxInlineCellBytes: 1024 * 1024,
+                    maxPageResponseBytes: 16
+                }
+            );
+            const queryResult = await engine.executeQuery(query.sql);
+            const transportedBlobBytes = (queryResult[0]?.rows ?? []).reduce<number>(
+                (pageTotal, row) => pageTotal + row.slice(0, 2).reduce<number>(
+                    (rowTotal, value) => rowTotal + (
+                        value instanceof Uint8Array ? value.byteLength : 0
+                    ),
+                    0
+                ),
+                0
+            );
+
+            assert.ok(
+                transportedBlobBytes <= 16,
+                `SQLite materialized ${transportedBlobBytes} BLOB bytes for a 16-byte page`
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
     });
 
     it('downgrades the payload tail after actual UTF-8 bytes exhaust the page budget', async () => {
@@ -158,23 +215,40 @@ describe('grid cell containment limits', () => {
         ));
     });
 
-    it('returns zero oversized markers for 5000 rows of 50 ordinary UUID cells', async () => {
-        const { decodeCellContainment } = await loadContainmentModule();
+    it('keeps 5000 rows of 50 ordinary UUID cells inline through SQLite', async () => {
         const rowCount = 5000;
         const columnCount = 50;
+        const columns = Array.from({ length: columnCount }, (_, index) => `c${index}`);
         const uuid = '550e8400-e29b-41d4-a716-446655440000';
-        const packedMetadata = Array(columnCount).fill('').join('|');
-        const transportedRow = [...Array(columnCount).fill(uuid), packedMetadata];
-        const page = decodeCellContainment(
-            Array(rowCount).fill(transportedRow),
-            columnCount,
-            undefined,
-            16 * 1024 * 1024
-        );
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const engine = result.operations!;
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE ordinary_wide_page (' +
+                columns.map(column => `"${column}" TEXT`).join(', ') +
+                '); WITH RECURSIVE rows(value) AS (' +
+                `VALUES(1) UNION ALL SELECT value + 1 FROM rows WHERE value < ${rowCount}` +
+                ') INSERT INTO ordinary_wide_page SELECT ' +
+                columns.map(() => `'${uuid}'`).join(', ') +
+                ' FROM rows'
+            );
+            const page = await engine.fetchTableData('ordinary_wide_page', {
+                columns: ['rowid', ...columns],
+                orderBy: 'rowid',
+                limit: rowCount,
+                offset: 0,
+                maxInlineCellBytes: 1024 * 1024,
+                maxPageResponseBytes: 16 * 1024 * 1024
+            });
 
-        assert.strictEqual(page.rows.length, 5000);
-        assert.strictEqual(page.rows[0].length, 50);
-        assert.strictEqual(page.oversizedCells, undefined);
+            assert.strictEqual(page.rows.length, rowCount);
+            assert.strictEqual(page.rows[0].length, columnCount + 1);
+            assert.strictEqual(page.rows[0][1], uuid);
+            assert.strictEqual(page.rows.at(-1)?.at(-1), uuid);
+            assert.strictEqual(page.oversizedCells, undefined);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
     });
 
     it('fails closed instead of exceeding SQLite result width for a 1000-column key', async () => {

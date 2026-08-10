@@ -726,6 +726,38 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.strictEqual(small.oversizedCells, undefined);
         });
 
+        await testContext.test('clips aggregate BLOB previews before native worker transport', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_predecode_page_bound (a BLOB, b BLOB, c BLOB, d BLOB); ' +
+                'INSERT INTO native_predecode_page_bound VALUES ' +
+                '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300)), ' +
+                '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300)), ' +
+                '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300)), ' +
+                '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300))'
+            );
+            const page = await engine.fetchTableData('native_predecode_page_bound', {
+                columns: ['rowid', 'a', 'b', 'c', 'd'],
+                orderBy: 'rowid',
+                limit: 4,
+                offset: 0,
+                maxInlineCellBytes: 1024 * 1024,
+                maxPageResponseBytes: 80
+            });
+
+            assert.strictEqual(page.rows.length, 4);
+            for (let rowIndex = 0; rowIndex < page.rows.length; rowIndex++) {
+                for (let columnIndex = 1; columnIndex < 5; columnIndex++) {
+                    const value = page.rows[rowIndex][columnIndex];
+                    assert.ok(value instanceof Uint8Array);
+                    assert.strictEqual(value.byteLength, 4);
+                    assert.deepStrictEqual(page.oversizedCells?.[rowIndex]?.[columnIndex], {
+                        storageClass: 'blob',
+                        byteLength: 300
+                    });
+                }
+            }
+        });
+
         await testContext.test('guards and replaces an oversized native cell without a prior payload read', async () => {
             await engine.executeQuery(
                 'CREATE TABLE native_stage_d (payload BLOB); ' +

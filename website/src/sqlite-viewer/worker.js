@@ -128,6 +128,7 @@ const PROGRESS_HANDLER_INTERVAL = 1000;
 const WEB_DEMO_EXPORT_MAX_BYTES = 16 * 1024 * 1024;
 const WEB_DEMO_EXPORT_CHUNK_CHARS = 64 * 1024;
 const WEB_DEMO_EXPORT_LIMIT_DESCRIPTION = '16 MiB (16,777,216 bytes)';
+const SQLITE_MAX_RESULT_COLUMNS = 2000;
 // RPC payloads cannot forge this Symbol; only in-worker history restoration
 // may bypass the new-value policy for a value that already existed.
 const HISTORY_REPLAY_EDIT_TOKEN = Symbol('history-replay-edit');
@@ -985,22 +986,27 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
   const selectedColumns = columns && columns.length > 0
     ? columns
     : getExportProjectionColumns(table);
-  // Project exact INTEGER text and raw TEXT bytes at the SQLite boundary.
-  // Raw sql.js values can round int64 and truncate strings at the first NUL.
-  const projection = selectedColumns.flatMap((column, index) => {
+  if (selectedColumns.length > SQLITE_MAX_RESULT_COLUMNS) {
+    throw new Error(`Cannot export more than ${SQLITE_MAX_RESULT_COLUMNS} columns`);
+  }
+  const includeBlobBytes = format !== 'csv' && format !== 'excel';
+  // One ASCII envelope per source column stays within SQLite's 2,000-result-
+  // column ceiling while preserving exact INTEGER and raw TEXT/BLOB bytes.
+  const projection = selectedColumns.map((column, index) => {
     const identifier = escapeIdentifier(column);
     const storageClass = `typeof(${identifier})`;
-    const value =
-      `CASE WHEN ${storageClass} = 'integer' THEN CAST(${identifier} AS TEXT) ` +
-      `WHEN ${storageClass} = 'text' THEN CAST(${identifier} AS BLOB) ` +
-      (format === 'csv' || format === 'excel'
-        ? `WHEN ${storageClass} = 'blob' THEN NULL `
-        : '') +
-      `ELSE ${identifier} END`;
-    return [
-      `${storageClass} AS ${escapeIdentifier(`__export_type_${index}`)}`,
-      `${value} AS ${escapeIdentifier(`__export_value_${index}`)}`
-    ];
+    const byteLength = `octet_length(${identifier})`;
+    return (
+      `CASE ${storageClass} ` +
+      `WHEN 'null' THEN 'n:0:' ` +
+      `WHEN 'integer' THEN 'i:0:' || CAST(${identifier} AS TEXT) ` +
+      `WHEN 'real' THEN 'r:0:' || printf('%!.17g', ${identifier}) ` +
+      `WHEN 'text' THEN 't:' || CAST(${byteLength} AS TEXT) || ':' || ` +
+      `hex(CAST(${identifier} AS BLOB)) ` +
+      `WHEN 'blob' THEN 'b:' || CAST(${byteLength} AS TEXT) || ':' || ` +
+      (includeBlobBytes ? `hex(${identifier}) ` : `'' `) +
+      `END AS ${escapeIdentifier(`__export_cell_${index}`)}`
+    );
   }).join(', ');
   const savepointName = createViewSavepointName('sp_export_rows');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
@@ -1046,38 +1052,21 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
   const textEncoding = normalizeCellTextEncoding(
     db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]
   );
-  const storageClasses = new Set(['null', 'integer', 'real', 'text', 'blob']);
-  const rows = rawRows.map(row => selectedColumns.map((column, index) => {
-    const storageClass = row[index * 2];
-    if (typeof storageClass !== 'string' || !storageClasses.has(storageClass)) {
-      throw new Error(`SQLite returned an invalid storage class for ${table}.${column}`);
+  const rows = rawRows.map((row, rowIndex) => {
+    if (row.length !== selectedColumns.length) {
+      throw new Error(
+        `SQLite returned ${row.length} packed export cells for row ${rowIndex}; ` +
+        `expected ${selectedColumns.length}`
+      );
     }
-    const rawValue = row[index * 2 + 1];
-    let value = rawValue;
-    let unrepresentableTextBytes;
-    if (storageClass === 'text') {
-      if (!(rawValue instanceof Uint8Array)) {
-        throw new Error(`SQLite returned invalid TEXT bytes for ${table}.${column}`);
-      }
-      try {
-        value = new TextDecoder(textEncoding, { fatal: true, ignoreBOM: true })
-          .decode(rawValue);
-      } catch {
-        value = rawValue;
-        unrepresentableTextBytes = rawValue;
-      }
-    }
-    if (storageClass === 'null' && value !== null) {
-      throw new Error(`SQLite returned a value for NULL cell ${table}.${column}`);
-    }
-    return {
-      storageClass,
-      value,
-      ...(unrepresentableTextBytes === undefined
-        ? {}
-        : { unrepresentableTextBytes, textEncoding })
-    };
-  }));
+    return selectedColumns.map((column, index) => parseWebDemoExportCell(
+      table,
+      column,
+      row[index],
+      includeBlobBytes,
+      textEncoding
+    ));
+  });
 
   const output = new WebDemoExportChunkCollector();
   let mimeType = 'text/plain';
@@ -1123,8 +1112,125 @@ function getExportProjectionColumns(table) {
   }
 }
 
+function decodeWebDemoExportHex(payload, expectedBytes, context) {
+  if (payload.length !== expectedBytes * 2 || /[^0-9a-f]/i.test(payload)) {
+    throw new Error(`SQLite returned invalid packed bytes for ${context}`);
+  }
+  const bytes = new Uint8Array(expectedBytes);
+  for (let index = 0; index < expectedBytes; index++) {
+    bytes[index] = Number.parseInt(payload.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+function parseWebDemoExportCell(
+  table,
+  column,
+  packed,
+  includeBlobBytes,
+  textEncoding
+) {
+  const context = `${table}.${column}`;
+  if (typeof packed !== 'string') {
+    throw new Error(`SQLite returned an invalid packed export cell for ${context}`);
+  }
+  const firstSeparator = packed.indexOf(':');
+  const secondSeparator = packed.indexOf(':', firstSeparator + 1);
+  if (firstSeparator !== 1 || secondSeparator < 0) {
+    throw new Error(`SQLite returned malformed packed export metadata for ${context}`);
+  }
+  const storageCode = packed[0];
+  const lengthText = packed.slice(firstSeparator + 1, secondSeparator);
+  if (!/^(?:0|[1-9][0-9]*)$/.test(lengthText)) {
+    throw new Error(`SQLite returned an unsafe byte length for ${context}`);
+  }
+  const byteLength = Number(lengthText);
+  if (!Number.isSafeInteger(byteLength)) {
+    throw new Error(`SQLite returned an unsafe byte length for ${context}`);
+  }
+  const payload = packed.slice(secondSeparator + 1);
+  const storageClass = storageCode === 'n'
+    ? 'null'
+    : storageCode === 'i'
+      ? 'integer'
+      : storageCode === 'r'
+        ? 'real'
+        : storageCode === 't'
+          ? 'text'
+          : storageCode === 'b'
+            ? 'blob'
+            : null;
+  if (!storageClass) {
+    throw new Error(`SQLite returned an invalid storage class for ${context}`);
+  }
+  if (['null', 'integer', 'real'].includes(storageClass) && byteLength !== 0) {
+    throw new Error(`SQLite returned invalid scalar byte metadata for ${context}`);
+  }
+
+  if (storageClass === 'null') {
+    if (payload !== '') throw new Error(`SQLite returned a value for NULL cell ${context}`);
+    return { storageClass, value: null };
+  }
+  if (storageClass === 'integer') {
+    try {
+      if (BigInt(payload).toString() !== payload) throw new Error();
+    } catch {
+      throw new Error(`SQLite returned non-canonical INTEGER text for ${context}`);
+    }
+    return { storageClass, value: payload };
+  }
+  if (storageClass === 'real') {
+    const value = payload === 'Inf'
+      ? Number.POSITIVE_INFINITY
+      : payload === '-Inf'
+        ? Number.NEGATIVE_INFINITY
+        : Number(payload);
+    if (Number.isNaN(value)) {
+      throw new Error(`SQLite returned invalid REAL text for ${context}`);
+    }
+    return { storageClass, value };
+  }
+  if (storageClass === 'blob' && !includeBlobBytes) {
+    if (payload !== '') throw new Error(`SQLite returned unexpected BLOB bytes for ${context}`);
+    return { storageClass, value: null };
+  }
+
+  const bytes = decodeWebDemoExportHex(payload, byteLength, context);
+  if (storageClass === 'blob') return { storageClass, value: bytes };
+  try {
+    return {
+      storageClass,
+      value: new TextDecoder(textEncoding, { fatal: true, ignoreBOM: true }).decode(bytes)
+    };
+  } catch {
+    return {
+      storageClass,
+      value: bytes,
+      unrepresentableTextBytes: bytes,
+      textEncoding
+    };
+  }
+}
+
+function buildBalancedSqlSum(expressions) {
+  if (expressions.length === 0) return '0';
+  let level = expressions;
+  while (level.length > 1) {
+    const next = [];
+    for (let index = 0; index < level.length; index += 2) {
+      next.push(index + 1 < level.length
+        ? `(${level[index]} + ${level[index + 1]})`
+        : level[index]);
+    }
+    level = next;
+  }
+  return level[0];
+}
+
 function estimateWebDemoExportBytes(table, columns, whereSql, params, format) {
-  const estimateCells = columns.map(column => {
+  // A left-deep `a + b + ...` exceeds SQLite's expression-depth limit on wide
+  // tables. A balanced sum keeps the estimate in one snapshot-consistent scan.
+  const estimateCells = buildBalancedSqlSum(columns.map(column => {
     const identifier = escapeIdentifier(column);
     const blobBytes = `length(${identifier})`;
     const blobEstimate = format === 'csv' || format === 'excel'
@@ -1135,7 +1241,7 @@ function estimateWebDemoExportBytes(table, columns, whereSql, params, format) {
     return `CASE typeof(${identifier}) ` +
       `WHEN 'text' THEN length(CAST(${identifier} AS BLOB)) * 6 + 64 ` +
       `WHEN 'blob' THEN ${blobEstimate} ELSE 64 END`;
-  }).join(' + ') || '0';
+  }));
   const result = db.exec(
     `SELECT COUNT(*), COALESCE(SUM(${estimateCells}), 0) ` +
     `FROM ${escapeIdentifier(table)}${whereSql}`,

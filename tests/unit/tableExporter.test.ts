@@ -10,6 +10,7 @@ import {
     exportToSql,
     exportTableCommand,
     exportTableToLocalFileForTests,
+    CappedWorkspaceSink,
     EXPORT_CELL_CHUNK_BYTES,
     getFormatHelper,
     streamTableExport
@@ -490,6 +491,155 @@ describe('streamTableExport golden parity', () => {
 });
 
 describe('streamTableExport wide and selected-row batching', () => {
+    it('bounds packed inline bytes before a stable export query reaches the host', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        const inlineValue = 'x'.repeat(64 * 1024);
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_bounded_projection (payload TEXT)'
+        );
+        await operations.executeQuery(
+            'WITH RECURSIVE rows(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM rows WHERE value < 128' +
+            ') INSERT INTO stage_e_bounded_projection SELECT ? FROM rows',
+            [inlineValue]
+        );
+        let largestPackedResultBytes = 0;
+        const recordingOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'executeQuery') {
+                    return async (...args: Parameters<DatabaseOperations['executeQuery']>) => {
+                        const result = await target.executeQuery(...args);
+                        if (String(args[0]).includes('__export_cell_')) {
+                            const resultBytes = (result[0]?.rows ?? []).reduce<number>(
+                                (rowTotal, row) => rowTotal + row.reduce<number>(
+                                    (cellTotal, value) => cellTotal + (
+                                        typeof value === 'string'
+                                            ? Buffer.byteLength(value)
+                                            : value instanceof Uint8Array
+                                                ? value.byteLength
+                                                : 8
+                                    ),
+                                    0
+                                ),
+                                0
+                            );
+                            largestPackedResultBytes = Math.max(
+                                largestPackedResultBytes,
+                                resultBytes
+                            );
+                        }
+                        return result;
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+
+        try {
+            const rowCount = await streamTableExport(
+                recordingOperations,
+                'stage_e_bounded_projection',
+                ['payload'],
+                { format: 'csv', header: false },
+                { write: async () => {} }
+            );
+
+            assert.strictEqual(rowCount, 128);
+            assert.ok(largestPackedResultBytes > 0, 'no packed export query was observed');
+            assert.ok(
+                largestPackedResultBytes <= 16 * 1024 * 1024,
+                `one packed export result retained ${largestPackedResultBytes} inline bytes`
+            );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('bounds selected primary-key groups by packed envelope overhead', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        const columns = [
+            'id',
+            ...Array.from({ length: 1999 }, (_, index) => `c${index}`)
+        ];
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_selected_envelope_bound (' +
+            columns.map((column, index) => (
+                `"${column}"${index === 0 ? ' INTEGER PRIMARY KEY' : ''}`
+            )).join(', ') +
+            ') WITHOUT ROWID'
+        );
+        await operations.executeQuery(
+            'WITH RECURSIVE rows(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM rows WHERE value < 132' +
+            ') INSERT INTO stage_e_selected_envelope_bound (id) SELECT value FROM rows'
+        );
+        const identityPage = await operations.fetchTableData(
+            'stage_e_selected_envelope_bound',
+            {
+                columns: ['rowid'],
+                orderBy: 'rowid',
+                orderDir: 'ASC',
+                limit: 132,
+                offset: 0,
+                maxInlineCellBytes: 1024,
+                maxPageResponseBytes: 16 * 1024 * 1024
+            }
+        );
+        let largestModeledPackedResult = 0;
+        const recordingOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'executeQuery') {
+                    return async (...args: Parameters<DatabaseOperations['executeQuery']>) => {
+                        if (String(args[0]).includes('__export_cell_')) {
+                            const projectedRows = args[1]?.length ?? 0;
+                            largestModeledPackedResult = Math.max(
+                                largestModeledPackedResult,
+                                projectedRows * columns.length * 64
+                            );
+                        }
+                        return target.executeQuery(...args);
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+
+        try {
+            const rowCount = await streamTableExport(
+                recordingOperations,
+                'stage_e_selected_envelope_bound',
+                columns,
+                {
+                    format: 'csv',
+                    header: false,
+                    rowIds: identityPage.rows.map(row => row[0] as RecordId)
+                },
+                { write: async () => {} }
+            );
+
+            assert.strictEqual(rowCount, 132);
+            assert.ok(largestModeledPackedResult > 0, 'no packed export query was observed');
+            assert.ok(
+                largestModeledPackedResult <= 16 * 1024 * 1024,
+                `one selected projection modeled ${largestModeledPackedResult} packed bytes`
+            );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('exports a 2000-column table and view without exceeding SQLite result width', async () => {
         const database = await createDatabaseEngine({
             content: null,
@@ -1586,6 +1736,33 @@ describe('streamTableExport cell boundaries', () => {
 });
 
 describe('exportTableCommand atomic streaming', () => {
+    it('coalesces tiny workspace emissions before the final buffer copy', async () => {
+        const sink = new CappedWorkspaceSink();
+        for (let index = 0; index < 100_000; index++) {
+            await sink.write('x');
+        }
+
+        const originalSet = Uint8Array.prototype.set;
+        let finalCopyCount = 0;
+        let output: Uint8Array;
+        try {
+            Uint8Array.prototype.set = function (...args: Parameters<Uint8Array['set']>): void {
+                finalCopyCount++;
+                originalSet.apply(this, args);
+            };
+            output = sink.finish();
+        } finally {
+            Uint8Array.prototype.set = originalSet;
+        }
+
+        assert.strictEqual(output!.byteLength, 100_000);
+        assert.strictEqual(new TextDecoder().decode(output!), 'x'.repeat(100_000));
+        assert.ok(
+            finalCopyCount <= 2,
+            `final workspace buffer required ${finalCopyCount} retained-chunk copies`
+        );
+    });
+
     it('writes a sibling temp and renames it only after the stream has finished', async () => {
         const database = await createDatabaseEngine({
             content: null,

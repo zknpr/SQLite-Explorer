@@ -70,9 +70,10 @@ function positiveIntegerOr(value: unknown, fallback: number): number {
 }
 
 /**
- * Derive the speculative SQL-side preview window, but never let page shape
- * alone pre-clip an ordinary value below 256 bytes. The shared decoder applies
- * the actual returned-byte budget after the query, in deterministic row order.
+ * Derive the speculative SQL-side preview window. The 256-byte display floor
+ * may relax the wire estimate only while the raw page budget can afford it;
+ * the shared decoder still applies the actual returned-byte budget in
+ * deterministic row order.
  */
 export function deriveEffectiveInlineCellBytes(
   options: Pick<TableQueryOptions, 'limit' | 'maxInlineCellBytes' | 'maxPageResponseBytes'>,
@@ -95,7 +96,7 @@ export function deriveEffectiveInlineCellBytes(
     ? Math.floor(maxPageResponseBytes / pageSlots)
     : 0;
   if (!Number.isSafeInteger(pageSlots)) {
-    return Math.min(maxInlineCellBytes, MIN_SQL_INLINE_CELL_BYTES);
+    return 0;
   }
 
   // Model the worst transported slot: a clipped BLOB becomes a Base64 marker
@@ -118,10 +119,10 @@ export function deriveEffectiveInlineCellBytes(
   );
   const wirePageWindow = Math.floor(base64BytesPerSlot / 4) * 3;
 
-  const derivedPageWindow = Math.min(rawPageWindow, wirePageWindow);
   return Math.min(
     maxInlineCellBytes,
-    Math.max(MIN_SQL_INLINE_CELL_BYTES, derivedPageWindow)
+    rawPageWindow,
+    Math.max(MIN_SQL_INLINE_CELL_BYTES, wirePageWindow)
   );
 }
 

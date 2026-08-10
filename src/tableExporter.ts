@@ -40,6 +40,7 @@ export const NON_LOCAL_EXPORT_MAX_BYTES = 16 * 1024 * 1024;
 
 const NON_LOCAL_CAP_DESCRIPTION =
   '16 MiB (16,777,216 bytes)';
+const NON_LOCAL_EXPORT_PAGE_BYTES = 64 * 1024;
 
 /**
  * Minimal writable sink consumed by the streaming exporters. Satisfied by Node's
@@ -260,9 +261,10 @@ class AwaitedNodeStreamSink implements AsyncExportSink {
   }
 }
 
-class CappedWorkspaceSink implements AsyncExportSink {
+export class CappedWorkspaceSink implements AsyncExportSink {
   private readonly encoder = new TextEncoder();
-  private readonly chunks: Uint8Array[] = [];
+  private readonly pages: Uint8Array[] = [];
+  private tailBytes = 0;
   private totalBytes = 0;
 
   async write(chunk: string): Promise<void> {
@@ -275,16 +277,38 @@ class CappedWorkspaceSink implements AsyncExportSink {
         'filesystem destination for larger exports.'
       );
     }
-    this.chunks.push(bytes);
+    // Encode each formatter emission independently so lone-surrogate handling
+    // remains byte-identical, then retain only a bounded number of byte pages.
+    let sourceOffset = 0;
+    while (sourceOffset < bytes.byteLength) {
+      if (this.pages.length === 0 || this.tailBytes === NON_LOCAL_EXPORT_PAGE_BYTES) {
+        this.pages.push(new Uint8Array(NON_LOCAL_EXPORT_PAGE_BYTES));
+        this.tailBytes = 0;
+      }
+      const copyBytes = Math.min(
+        bytes.byteLength - sourceOffset,
+        NON_LOCAL_EXPORT_PAGE_BYTES - this.tailBytes
+      );
+      this.pages[this.pages.length - 1].set(
+        bytes.subarray(sourceOffset, sourceOffset + copyBytes),
+        this.tailBytes
+      );
+      sourceOffset += copyBytes;
+      this.tailBytes += copyBytes;
+    }
     this.totalBytes = nextBytes;
   }
 
   finish(): Uint8Array {
     const output = new Uint8Array(this.totalBytes);
     let offset = 0;
-    for (const chunk of this.chunks) {
-      output.set(chunk, offset);
-      offset += chunk.byteLength;
+    for (const page of this.pages) {
+      const copyBytes = Math.min(page.byteLength, this.totalBytes - offset);
+      output.set(
+        copyBytes === page.byteLength ? page : page.subarray(0, copyBytes),
+        offset
+      );
+      offset += copyBytes;
     }
     return output;
   }

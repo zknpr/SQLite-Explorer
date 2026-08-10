@@ -39,6 +39,10 @@ const EXPORT_ROW_BATCH_SIZE = 128;
 const EXPORT_INLINE_TEXT_BYTES = 64 * 1024;
 const UNSTABLE_CELL_INLINE_BYTES = 1024 * 1024;
 const SQLITE_MAX_RESULT_COLUMNS = 2000;
+const EXPORT_PACKED_INLINE_BATCH_BYTES = 16 * 1024 * 1024;
+// Covers the packed type/length prefix, scalar payloads, row identity, and
+// array/string framing which accompany each worst-case hex-encoded cell.
+const EXPORT_PACKED_CELL_OVERHEAD_BYTES = 64;
 
 export interface AsyncExportSink {
   /** Resolves only after the sink has accepted this emission. */
@@ -127,6 +131,48 @@ function byteLength(value: unknown, context: string): number {
     throw new Error(`SQLite returned an unsafe byte length for ${context}`);
   }
   return Number(normalized);
+}
+
+/** Bound one stable query by a conservative model of its packed result. */
+function deriveStableExportProjectionPlan(
+  columnCount: number,
+  requestedRowCount: number
+): { rowCount: number; inlineBytes: number } {
+  if (
+    !Number.isSafeInteger(columnCount)
+    || columnCount < 1
+    || !Number.isSafeInteger(requestedRowCount)
+    || requestedRowCount < 1
+  ) {
+    throw new Error('Stable export projection dimensions must be positive safe integers');
+  }
+  const modeledRowOverhead = columnCount * EXPORT_PACKED_CELL_OVERHEAD_BYTES;
+  if (!Number.isSafeInteger(modeledRowOverhead)) {
+    throw new Error('Stable export projection dimensions exceed the safe integer range');
+  }
+  const maxRowsByEnvelope = Math.floor(
+    EXPORT_PACKED_INLINE_BATCH_BYTES / modeledRowOverhead
+  );
+  if (maxRowsByEnvelope < 1) {
+    throw new Error('One stable export row exceeds the packed result budget');
+  }
+  const rowCount = Math.min(requestedRowCount, maxRowsByEnvelope);
+  const cellSlots = columnCount * rowCount;
+  const packedBytesPerCell = Math.floor(
+    EXPORT_PACKED_INLINE_BATCH_BYTES / cellSlots
+  );
+  return {
+    rowCount,
+    inlineBytes: Math.min(
+      EXPORT_INLINE_TEXT_BYTES,
+      Math.max(
+        0,
+        Math.floor(
+          (packedBytesPerCell - EXPORT_PACKED_CELL_OVERHEAD_BYTES) / 2
+        )
+      )
+    )
+  };
 }
 
 function buildCellProjection(
@@ -378,7 +424,12 @@ async function* readRowIdTableRows(
   if (columns.length > SQLITE_MAX_RESULT_COLUMNS) {
     throw new Error(`Cannot export more than ${SQLITE_MAX_RESULT_COLUMNS} columns`);
   }
-  const projection = buildCellProjection(columns, EXPORT_INLINE_TEXT_BYTES, false);
+  const projectionPlan = deriveStableExportProjectionPlan(
+    columns.length,
+    EXPORT_ROW_BATCH_SIZE
+  );
+  const inlineBytes = projectionPlan.inlineBytes;
+  const projection = buildCellProjection(columns, inlineBytes, false);
   const includeRowIdInProjection = columns.length < SQLITE_MAX_RESULT_COLUMNS;
   const selectedPredicates = selectedRowIds.length > 0
     ? buildRecordIdentityPredicateChunks(
@@ -406,7 +457,7 @@ async function* readRowIdTableRows(
         (includeRowIdInProjection && projection ? `, ${projection}` : '') +
         ` FROM ${escapeIdentifier(table)}`;
       if (predicates.length > 0) sql += ` WHERE ${predicates.join(' AND ')}`;
-      sql += ` ORDER BY rowid ASC LIMIT ${EXPORT_ROW_BATCH_SIZE}`;
+      sql += ` ORDER BY rowid ASC LIMIT ${projectionPlan.rowCount}`;
 
       const result = await operations.executeQuery(sql, params);
       const identityRows = result[0]?.rows ?? [];
@@ -441,14 +492,14 @@ async function* readRowIdTableRows(
             columns,
             valueRows[rowIndex],
             includeRowIdInProjection ? 1 : 0,
-            EXPORT_INLINE_TEXT_BYTES,
+            inlineBytes,
             false,
             textEncoding,
             rowId
           )
         };
       }
-      if (identityRows.length < EXPORT_ROW_BATCH_SIZE) break;
+      if (identityRows.length < projectionPlan.rowCount) break;
     }
   }
 }
@@ -521,7 +572,12 @@ async function* readPrimaryKeyTableRows(
   if (columns.length > SQLITE_MAX_RESULT_COLUMNS) {
     throw new Error(`Cannot export more than ${SQLITE_MAX_RESULT_COLUMNS} columns`);
   }
-  const projection = buildCellProjection(columns, EXPORT_INLINE_TEXT_BYTES, false);
+  const projectionPlan = deriveStableExportProjectionPlan(
+    columns.length,
+    EXPORT_ROW_BATCH_SIZE
+  );
+  const inlineBytes = projectionPlan.inlineBytes;
+  const projection = buildCellProjection(columns, inlineBytes, false);
   if (selectedRowIds.length > 0) {
     const seen = new Set<string>();
     const uniqueRowIds: RecordId[] = [];
@@ -540,88 +596,106 @@ async function* readPrimaryKeyTableRows(
       if (!Number.isSafeInteger(groupSize) || groupSize < 1) {
         throw new Error(`Invalid selected primary-key export chunk for ${table}`);
       }
-      const groupIds = uniqueRowIds.slice(chunkOffset, chunkOffset + groupSize);
+      const predicateGroupIds = uniqueRowIds.slice(chunkOffset, chunkOffset + groupSize);
       chunkOffset += groupSize;
+      const selectedProjectionPlan = deriveStableExportProjectionPlan(
+        columns.length,
+        predicateGroupIds.length
+      );
+      for (
+        let groupOffset = 0;
+        groupOffset < predicateGroupIds.length;
+        groupOffset += selectedProjectionPlan.rowCount
+      ) {
+        const groupIds = predicateGroupIds.slice(
+          groupOffset,
+          groupOffset + selectedProjectionPlan.rowCount
+        );
+        const selectedInlineBytes = deriveStableExportProjectionPlan(
+          columns.length,
+          groupIds.length
+        ).inlineBytes;
 
-      if (columns.length < SQLITE_MAX_RESULT_COLUMNS) {
-        const join = buildSelectedPrimaryKeyJoin(table, identity, groupIds);
-        const selectedProjection = buildCellProjection(
-          columns,
-          EXPORT_INLINE_TEXT_BYTES,
-          false,
-          SELECTED_PK_SOURCE_ALIAS
-        );
-        const result = await operations.executeQuery(
-          `${join.cte} SELECT ` +
-          `${escapeIdentifier(SELECTED_PK_CTE)}.${escapeIdentifier(SELECTED_PK_ORDER_COLUMN)}` +
-          (selectedProjection ? `, ${selectedProjection} ` : ' ') +
-          `${join.from} ${join.orderBy}`,
-          join.params
-        );
-        const yieldedOrders = new Set<number>();
-        for (const row of result[0]?.rows ?? []) {
-          const order = parseSelectedPrimaryKeyOrder(row[0], groupIds.length, table);
-          if (yieldedOrders.has(order)) {
-            throw new Error(`Primary-key identity matched multiple rows in ${table}`);
+        if (columns.length < SQLITE_MAX_RESULT_COLUMNS) {
+          const join = buildSelectedPrimaryKeyJoin(table, identity, groupIds);
+          const selectedProjection = buildCellProjection(
+            columns,
+            selectedInlineBytes,
+            false,
+            SELECTED_PK_SOURCE_ALIAS
+          );
+          const result = await operations.executeQuery(
+            `${join.cte} SELECT ` +
+            `${escapeIdentifier(SELECTED_PK_CTE)}.${escapeIdentifier(SELECTED_PK_ORDER_COLUMN)}` +
+            (selectedProjection ? `, ${selectedProjection} ` : ' ') +
+            `${join.from} ${join.orderBy}`,
+            join.params
+          );
+          const yieldedOrders = new Set<number>();
+          for (const row of result[0]?.rows ?? []) {
+            const order = parseSelectedPrimaryKeyOrder(row[0], groupIds.length, table);
+            if (yieldedOrders.has(order)) {
+              throw new Error(`Primary-key identity matched multiple rows in ${table}`);
+            }
+            yieldedOrders.add(order);
+            yield {
+              cells: parseCells(
+                table,
+                columns,
+                row,
+                1,
+                selectedInlineBytes,
+                false,
+                textEncoding,
+                groupIds[order]
+              )
+            };
           }
-          yieldedOrders.add(order);
-          yield {
-            cells: parseCells(
-              table,
-              columns,
-              row,
-              1,
-              EXPORT_INLINE_TEXT_BYTES,
-              false,
-              textEncoding,
-              groupIds[order]
-            )
-          };
-        }
-      } else {
-        // The selected ordinal would become result column 2,001. Resolve only
-        // the surviving ordinals first, then project the exact 2,000 columns in
-        // the same savepoint and CTE order.
-        const existenceJoin = buildSelectedPrimaryKeyJoin(table, identity, groupIds);
-        const existence = await operations.executeQuery(
-          `${existenceJoin.cte} SELECT ` +
-          `${escapeIdentifier(SELECTED_PK_CTE)}.${escapeIdentifier(SELECTED_PK_ORDER_COLUMN)} ` +
-          `${existenceJoin.from} ${existenceJoin.orderBy}`,
-          existenceJoin.params
-        );
-        const existingIds = (existence[0]?.rows ?? []).map(row => (
-          groupIds[parseSelectedPrimaryKeyOrder(row[0], groupIds.length, table)]
-        ));
-        if (existingIds.length === 0) continue;
-        const valuesJoin = buildSelectedPrimaryKeyJoin(table, identity, existingIds);
-        const selectedProjection = buildCellProjection(
-          columns,
-          EXPORT_INLINE_TEXT_BYTES,
-          false,
-          SELECTED_PK_SOURCE_ALIAS
-        );
-        const values = await operations.executeQuery(
-          `${valuesJoin.cte} SELECT ${selectedProjection} ` +
-          `${valuesJoin.from} ${valuesJoin.orderBy}`,
-          valuesJoin.params
-        );
-        const rows = values[0]?.rows ?? [];
-        if (rows.length !== existingIds.length) {
-          throw new Error(`Table ${table} changed while selected identities were being exported`);
-        }
-        for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
-          yield {
-            cells: parseCells(
-              table,
-              columns,
-              rows[rowIndex],
-              0,
-              EXPORT_INLINE_TEXT_BYTES,
-              false,
-              textEncoding,
-              existingIds[rowIndex]
-            )
-          };
+        } else {
+          // The selected ordinal would become result column 2,001. Resolve only
+          // the surviving ordinals first, then project the exact 2,000 columns in
+          // the same savepoint and CTE order.
+          const existenceJoin = buildSelectedPrimaryKeyJoin(table, identity, groupIds);
+          const existence = await operations.executeQuery(
+            `${existenceJoin.cte} SELECT ` +
+            `${escapeIdentifier(SELECTED_PK_CTE)}.${escapeIdentifier(SELECTED_PK_ORDER_COLUMN)} ` +
+            `${existenceJoin.from} ${existenceJoin.orderBy}`,
+            existenceJoin.params
+          );
+          const existingIds = (existence[0]?.rows ?? []).map(row => (
+            groupIds[parseSelectedPrimaryKeyOrder(row[0], groupIds.length, table)]
+          ));
+          if (existingIds.length === 0) continue;
+          const valuesJoin = buildSelectedPrimaryKeyJoin(table, identity, existingIds);
+          const selectedProjection = buildCellProjection(
+            columns,
+            selectedInlineBytes,
+            false,
+            SELECTED_PK_SOURCE_ALIAS
+          );
+          const values = await operations.executeQuery(
+            `${valuesJoin.cte} SELECT ${selectedProjection} ` +
+            `${valuesJoin.from} ${valuesJoin.orderBy}`,
+            valuesJoin.params
+          );
+          const rows = values[0]?.rows ?? [];
+          if (rows.length !== existingIds.length) {
+            throw new Error(`Table ${table} changed while selected identities were being exported`);
+          }
+          for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+            yield {
+              cells: parseCells(
+                table,
+                columns,
+                rows[rowIndex],
+                0,
+                selectedInlineBytes,
+                false,
+                textEncoding,
+                existingIds[rowIndex]
+              )
+            };
+          }
         }
       }
     }
@@ -642,7 +716,7 @@ async function* readPrimaryKeyTableRows(
       columns: ['rowid'],
       orderBy: 'rowid',
       orderDir: 'ASC',
-      limit: EXPORT_ROW_BATCH_SIZE,
+      limit: projectionPlan.rowCount,
       offset,
       ...(keyset ? { keyset } : {}),
       maxInlineCellBytes: UNSTABLE_CELL_INLINE_BYTES,
@@ -687,7 +761,7 @@ async function* readPrimaryKeyTableRows(
             columns,
             row,
             0,
-            EXPORT_INLINE_TEXT_BYTES,
+            inlineBytes,
             false,
             textEncoding,
             rowId,
@@ -732,7 +806,7 @@ async function* readPrimaryKeyTableRows(
             columns,
             rows[groupIndex],
             0,
-            EXPORT_INLINE_TEXT_BYTES,
+            inlineBytes,
             false,
             textEncoding,
             groupIds[groupIndex]
@@ -746,7 +820,7 @@ async function* readPrimaryKeyTableRows(
     keyset = identities.keysetAnchors?.last
       ? { mode: 'after', anchor: identities.keysetAnchors.last }
       : undefined;
-    if (identityRows.length < EXPORT_ROW_BATCH_SIZE) return;
+    if (identityRows.length < projectionPlan.rowCount) return;
   }
 }
 
