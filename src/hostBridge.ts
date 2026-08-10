@@ -26,9 +26,12 @@ import {
 } from './core/row-identity';
 import { escapeIdentifier, validateRowId } from './core/sql-utils';
 import {
+  assertColumnDropHistoryFitsUndoBudget,
+  buildColumnDropHistorySizePreflight,
   COLUMN_DROP_TABLE_STATE_SQL,
   mapColumnDropTableState
 } from './core/column-drop';
+import { runReadSnapshot } from './core/operation-serializer';
 import { isViewDefinitionConflictError } from './core/view-utils';
 import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './core/cell-containment';
 import { assertDocumentModification } from './core/modification-validation';
@@ -85,6 +88,21 @@ function estimatePrimaryKeyIdentityGrowthReserve(updates: readonly CellUpdate[])
     reserve += row.resultCount * row.replacementBytes;
   }
   return reserve;
+}
+
+/** Keep the provisional post-drop schema separately owned for history accounting. */
+function cloneColumnDropTableState(state: ColumnDropTableState): ColumnDropTableState {
+  return {
+    tableSql: state.tableSql,
+    columns: [...state.columns],
+    identity: state.identity.kind === 'rowid'
+      ? { kind: 'rowid' }
+      : {
+          kind: 'primaryKey',
+          columns: state.identity.columns.map(column => ({ ...column }))
+        },
+    schemaObjects: state.schemaObjects.map(object => ({ ...object }))
+  };
 }
 
 interface CellMediaPreviewOptions {
@@ -708,62 +726,128 @@ export class HostBridge implements ToastService {
       }
     }
 
-    // Capture the exact schema and values before deletion. If this fails, do not
-    // perform an operation whose undo record would already be incomplete.
-    const tableInfoBefore = await dbOps.getTableInfo(table);
-    const identityBefore = await this.resolveTableIdentity(dbOps, table, tableInfoBefore);
-    const stateBefore = await this.captureColumnDropTableState(
-      dbOps,
-      table,
-      tableInfoBefore,
-      identityBefore
-    );
-    const colMap = new Map(tableInfoBefore.map(column => [
-      column.identifier,
-      // An empty declared type is meaningful in SQLite: staging it as TEXT
-      // would apply affinity and could change restored INTEGER/BLOB values.
-      column.declaredType
-    ]));
-    for (const column of columns) {
-      if (!colMap.has(column)) {
-        throw new Error(`Column not found in ${table}: ${column}`);
-      }
-    }
-
-    const colsData = columns.map(() => [] as { rowId: RecordId; value: CellValue }[]);
-    if (columns.length > 0) {
-      const identityColumns = identityBefore.kind === 'primaryKey'
-        ? identityBefore.columns.map(column => column.identifier)
-        : [];
-      const identityProjection = identityBefore.kind === 'rowid'
-        ? ['CAST(rowid AS TEXT)']
-        : identityColumns.map(escapeIdentifier);
-      const valueProjection = columns.map(escapeIdentifier);
-      const result = await dbOps.executeQuery(
-        `SELECT ${[...identityProjection, ...valueProjection].join(', ')} ` +
-        `FROM ${escapeIdentifier(table)}`
+    // Keep the aggregate gate and full-value projection on one read snapshot.
+    // The engine's schema-changing savepoint starts only after this snapshot is
+    // admitted and released.
+    const captured = await runReadSnapshot(dbOps, async snapshotOps => {
+      const tableInfoBefore = await snapshotOps.getTableInfo(table);
+      const identityBefore = await this.resolveTableIdentity(
+        snapshotOps,
+        table,
+        tableInfoBefore
       );
-      const identityWidth = identityBefore.kind === 'rowid' ? 1 : identityColumns.length;
-      for (const row of result[0]?.rows ?? []) {
-        const rowId = identityBefore.kind === 'rowid'
-          ? validateRowId(row[0] as RecordId)
-          : encodePrimaryKeyRecordId(
-              identityBefore.columns,
-              row.slice(0, identityWidth)
-            );
-        for (let index = 0; index < columns.length; index++) {
-          colsData[index].push({
-            rowId,
-            value: row[identityWidth + index]
-          });
+      const stateBefore = await this.captureColumnDropTableState(
+        snapshotOps,
+        table,
+        tableInfoBefore,
+        identityBefore
+      );
+      const colMap = new Map(tableInfoBefore.map(column => [
+        column.identifier,
+        // An empty declared type is meaningful in SQLite: staging it as TEXT
+        // would apply affinity and could change restored INTEGER/BLOB values.
+        column.declaredType
+      ]));
+      for (const column of columns) {
+        if (!colMap.has(column)) {
+          throw new Error(`Column not found in ${table}: ${column}`);
         }
       }
-    }
-    const deletedColumnsData = columns.map((column, index) => ({
-      name: column,
-      type: colMap.get(column)!,
-      data: colsData[index]
-    }));
+
+      const modificationShape = {
+        label: 'Delete Columns',
+        description: `Delete columns ${columns.join(', ')} from ${table}`,
+        modificationType: 'column_drop' as const,
+        targetTable: table,
+        deletedColumns: columns.map(column => ({
+          name: column,
+          type: colMap.get(column)!,
+          data: [] as { rowId: RecordId; value: CellValue }[]
+        })),
+        // A drop removes schema text and objects. A separately owned copy of
+        // the pre-drop state is therefore a conservative post-drop reserve.
+        columnDropSnapshot: {
+          before: stateBefore,
+          after: cloneColumnDropTableState(stateBefore)
+        },
+        droppedIndexes: dependentIndexes.length > 0 ? dependentIndexes : undefined
+      };
+      const undoMemoryLimitBytes = this.document.undoMemoryLimitBytes
+        ?? getMaxUndoMemoryBytes();
+      const baseMemoryBytes = estimateUndoMemoryBytes(modificationShape);
+      if (!Number.isSafeInteger(baseMemoryBytes) || baseMemoryBytes > undoMemoryLimitBytes) {
+        throw new Error(
+          `Column-drop undo metadata exceeds the ${undoMemoryLimitBytes}-byte memory limit; ` +
+          'drop fewer columns or increase sqliteExplorer.maxUndoMemory.'
+        );
+      }
+
+      const colsData = columns.map(() => [] as { rowId: RecordId; value: CellValue }[]);
+      if (columns.length > 0) {
+        const preflight = buildColumnDropHistorySizePreflight(
+          table,
+          columns,
+          identityBefore
+        );
+        const resultRows: Array<readonly unknown[] | undefined> = [];
+        for (const query of preflight.queries) {
+          const result = await snapshotOps.executeQuery(query.sql, query.params);
+          resultRows.push(result[0]?.rows[0]);
+        }
+        assertColumnDropHistoryFitsUndoBudget({
+          table,
+          droppedColumnCount: columns.length,
+          preflight,
+          resultRows,
+          maxSnapshotBytes: undoMemoryLimitBytes - baseMemoryBytes
+        });
+
+        const identityColumns = identityBefore.kind === 'primaryKey'
+          ? identityBefore.columns.map(column => column.identifier)
+          : [];
+        const identityProjection = identityBefore.kind === 'rowid'
+          ? ['CAST(rowid AS TEXT)']
+          : identityColumns.map(escapeIdentifier);
+        const valueProjection = columns.map(escapeIdentifier);
+        const result = await snapshotOps.executeQuery(
+          `SELECT ${[...identityProjection, ...valueProjection].join(', ')} ` +
+          `FROM ${escapeIdentifier(table)}`
+        );
+        const identityWidth = identityBefore.kind === 'rowid' ? 1 : identityColumns.length;
+        for (const row of result[0]?.rows ?? []) {
+          const rowId = identityBefore.kind === 'rowid'
+            ? validateRowId(row[0] as RecordId)
+            : encodePrimaryKeyRecordId(
+                identityBefore.columns,
+                row.slice(0, identityWidth)
+              );
+          for (let index = 0; index < columns.length; index++) {
+            colsData[index].push({
+              rowId,
+              value: row[identityWidth + index]
+            });
+          }
+        }
+      }
+      const deletedColumnsData = columns.map((column, index) => ({
+        name: column,
+        type: colMap.get(column)!,
+        data: colsData[index]
+      }));
+      // Defend the DDL boundary even if a backend returns malformed aggregate
+      // metadata. This exact check still runs before deleteColumns' savepoint.
+      if (estimateUndoMemoryBytes({
+        ...modificationShape,
+        deletedColumns: deletedColumnsData
+      }) > undoMemoryLimitBytes) {
+        throw new Error(
+          `Column-drop undo snapshot exceeds the ${undoMemoryLimitBytes}-byte memory budget; ` +
+          'drop fewer columns or rows, or increase sqliteExplorer.maxUndoMemory.'
+        );
+      }
+      return { stateBefore, deletedColumnsData };
+    });
+    const { stateBefore, deletedColumnsData } = captured;
 
     this.assertConnectionGeneration(connectionGeneration);
     let stateAfter: ColumnDropTableState;

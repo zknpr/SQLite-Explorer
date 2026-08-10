@@ -1419,7 +1419,14 @@ async function resolveTableIdentity(table) {
   return identity;
 }
 
-function readPrimaryKeyRecordId(table, identity, predicate) {
+function unresolvableTriggeredPrimaryKeyUpdateError(table) {
+  return new Error(
+    `An UPDATE trigger changed or removed the primary-key identity in ${table}; ` +
+    'the edit was rolled back because SQLite Explorer cannot safely identify the resulting row.'
+  );
+}
+
+function readPrimaryKeyRecordId(table, identity, predicate, missingRowError) {
   const result = db.exec(
     `SELECT ${buildByteFaithfulPrimaryKeyProjection(identity)} ` +
     `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
@@ -1427,12 +1434,11 @@ function readPrimaryKeyRecordId(table, identity, predicate) {
     { useBigInt: true }
   );
   const rows = result[0]?.values ?? [];
+  if (rows.length === 0) {
+    throw missingRowError ?? new Error(`Updated row in ${table} no longer exists`);
+  }
   if (rows.length !== 1) {
-    throw new Error(
-      rows.length === 0
-        ? `Updated row in ${table} no longer exists`
-        : `Primary-key identity for ${table} matched more than one row`
-    );
+    throw new Error(`Primary-key identity for ${table} matched more than one row`);
   }
   return encodeByteFaithfulPrimaryKeyRecordId(
     identity,
@@ -2169,7 +2175,8 @@ async function replaceOversizedCell(
     return readPrimaryKeyRecordId(
       table,
       identity,
-      buildRecordIdentityPredicate(candidateId, identity)
+      buildRecordIdentityPredicate(candidateId, identity),
+      unresolvableTriggeredPrimaryKeyUpdateError(table)
     );
   };
 
@@ -3013,7 +3020,8 @@ async function updateCellBatch(
         const newRowId = readPrimaryKeyRecordId(
           table,
           identity,
-          buildRecordIdentityPredicate(candidateId, identity)
+          buildRecordIdentityPredicate(candidateId, identity),
+          unresolvableTriggeredPrimaryKeyUpdateError(table)
         );
         for (const preparedUpdate of preparedUpdates) {
           results.push({

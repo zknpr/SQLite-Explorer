@@ -1,8 +1,10 @@
 import type {
+  CellValue,
   ColumnDropSnapshot,
   ColumnDropTableState,
   TableIdentity
 } from './types';
+import { encodePrimaryKeyRecordId } from './row-identity';
 import { escapeIdentifier, validateSqlType } from './sql-utils';
 
 /** Read the table DDL plus every persistent index/trigger owned by it. */
@@ -19,6 +21,190 @@ ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name`;
 export const COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT = 4096;
 export const COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT = 2 * 1024 * 1024;
 export const COLUMN_DROP_FOREIGN_KEY_FIELD_BYTES_LIMIT = 64 * 1024;
+
+const COLUMN_DROP_HISTORY_COLUMN_CHUNK_SIZE = 64;
+const COLUMN_DROP_VALUE_ENTRY_STRUCTURAL_BYTES = 28;
+
+export interface ColumnDropHistorySizeQuery {
+  kind: 'values' | 'identity';
+  sql: string;
+  params: CellValue[];
+}
+
+export interface ColumnDropHistorySizePreflight {
+  queries: ColumnDropHistorySizeQuery[];
+  primaryKeyStaticIdentityBytes: number;
+}
+
+function columnDropValueBytes(column: string): string {
+  const escaped = escapeIdentifier(column);
+  return (
+    `CASE typeof(${escaped}) ` +
+    `WHEN 'text' THEN 2 * octet_length(${escaped}) ` +
+    `WHEN 'blob' THEN octet_length(${escaped}) ` +
+    `WHEN 'integer' THEN 8 WHEN 'real' THEN 8 ELSE 0 END`
+  );
+}
+
+function primaryKeyDynamicIdentityBytes(column: string): string {
+  const escaped = escapeIdentifier(column);
+  // The static identity uses an empty TEXT member. These terms conservatively
+  // reserve the extra URI-safe JS-string memory for the actual storage class.
+  // A TEXT source byte can become three UTF-8 percent triplets after invalid
+  // UTF-8 replacement, and every JS character costs two tracker bytes.
+  return (
+    `CASE typeof(${escaped}) ` +
+    `WHEN 'text' THEN 18 * octet_length(${escaped}) ` +
+    `WHEN 'blob' THEN 4 * octet_length(${escaped}) ` +
+    `WHEN 'integer' THEN 46 WHEN 'real' THEN 48 ELSE 0 END`
+  );
+}
+
+function aggregateColumnDropHistoryQuery(
+  table: string,
+  expressions: readonly string[],
+  kind: ColumnDropHistorySizeQuery['kind']
+): ColumnDropHistorySizeQuery {
+  return {
+    kind,
+    sql:
+      `SELECT COUNT(*), COALESCE(SUM(${expressions.join(' + ') || '0'}), 0) ` +
+      `FROM ${escapeIdentifier(table)}`,
+    params: []
+  };
+}
+
+/** Build bounded-width metadata aggregates; no dropped value or PK value crosses RPC. */
+export function buildColumnDropHistorySizePreflight(
+  table: string,
+  droppedColumns: readonly string[],
+  identity: TableIdentity
+): ColumnDropHistorySizePreflight {
+  const queries: ColumnDropHistorySizeQuery[] = [];
+  for (let offset = 0; offset < droppedColumns.length; offset += COLUMN_DROP_HISTORY_COLUMN_CHUNK_SIZE) {
+    queries.push(aggregateColumnDropHistoryQuery(
+      table,
+      droppedColumns
+        .slice(offset, offset + COLUMN_DROP_HISTORY_COLUMN_CHUNK_SIZE)
+        .map(columnDropValueBytes),
+      'values'
+    ));
+  }
+
+  let primaryKeyStaticIdentityBytes = 0;
+  if (identity.kind === 'rowid') {
+    queries.push(aggregateColumnDropHistoryQuery(
+      table,
+      [
+        'CASE WHEN rowid BETWEEN -9007199254740991 AND 9007199254740991 ' +
+        'THEN 8 ELSE 40 END'
+      ],
+      'identity'
+    ));
+  } else {
+    const emptyPrimaryKeyIdentity = encodePrimaryKeyRecordId(
+      identity.columns,
+      identity.columns.map(() => '')
+    );
+    if (typeof emptyPrimaryKeyIdentity !== 'string') {
+      throw new Error('Primary-key identity encoder returned a non-string record ID');
+    }
+    primaryKeyStaticIdentityBytes = emptyPrimaryKeyIdentity.length * 2;
+    for (let offset = 0; offset < identity.columns.length; offset += COLUMN_DROP_HISTORY_COLUMN_CHUNK_SIZE) {
+      queries.push(aggregateColumnDropHistoryQuery(
+        table,
+        identity.columns
+          .slice(offset, offset + COLUMN_DROP_HISTORY_COLUMN_CHUNK_SIZE)
+          .map(column => primaryKeyDynamicIdentityBytes(column.identifier)),
+        'identity'
+      ));
+    }
+  }
+  return { queries, primaryKeyStaticIdentityBytes };
+}
+
+function safeColumnDropAggregateInteger(value: unknown, label: string): number {
+  const normalized = typeof value === 'bigint' ? Number(value) : value;
+  if (!Number.isSafeInteger(normalized) || Number(normalized) < 0) {
+    throw new Error(`SQLite returned an unsafe ${label} during column-drop undo preflight`);
+  }
+  return Number(normalized);
+}
+
+function checkedColumnDropTotal(values: readonly number[]): number | undefined {
+  let total = 0;
+  for (const value of values) {
+    total += value;
+    if (!Number.isSafeInteger(total)) return undefined;
+  }
+  return total;
+}
+
+/** Refuse before the full snapshot SELECT when retained positional undo cannot fit. */
+export function assertColumnDropHistoryFitsUndoBudget(input: {
+  table: string;
+  droppedColumnCount: number;
+  preflight: ColumnDropHistorySizePreflight;
+  resultRows: readonly (readonly unknown[] | undefined)[];
+  maxSnapshotBytes: number;
+}): void {
+  if (!Number.isSafeInteger(input.maxSnapshotBytes) || input.maxSnapshotBytes < 0) {
+    throw new Error('Column-drop undo snapshot budget must be a non-negative safe integer');
+  }
+  if (input.resultRows.length !== input.preflight.queries.length) {
+    throw new Error('SQLite returned incomplete column-drop undo preflight metadata');
+  }
+
+  let rowCount: number | undefined;
+  let valueBytes = 0;
+  let dynamicIdentityBytes = 0;
+  let aggregateOverflow = false;
+  input.resultRows.forEach((row, index) => {
+    if (!row || row.length < 2) {
+      throw new Error('SQLite omitted column-drop undo preflight metadata');
+    }
+    const queryRowCount = safeColumnDropAggregateInteger(row[0], 'row count');
+    const bytes = safeColumnDropAggregateInteger(row[1], 'byte count');
+    if (rowCount === undefined) rowCount = queryRowCount;
+    else if (rowCount !== queryRowCount) {
+      throw new Error('SQLite returned inconsistent row counts during column-drop undo preflight');
+    }
+    if (input.preflight.queries[index].kind === 'values') valueBytes += bytes;
+    else dynamicIdentityBytes += bytes;
+    if (!Number.isSafeInteger(valueBytes) || !Number.isSafeInteger(dynamicIdentityBytes)) {
+      aggregateOverflow = true;
+    }
+  });
+
+  const rows = rowCount ?? 0;
+  const staticIdentityBytes = rows * input.preflight.primaryKeyStaticIdentityBytes;
+  const identityBytes = checkedColumnDropTotal([
+    staticIdentityBytes,
+    dynamicIdentityBytes
+  ]);
+  const structuralBytes = rows
+    * input.droppedColumnCount
+    * COLUMN_DROP_VALUE_ENTRY_STRUCTURAL_BYTES;
+  const repeatedIdentityBytes = identityBytes === undefined
+    ? undefined
+    : identityBytes * input.droppedColumnCount;
+  const projectedBytes = repeatedIdentityBytes === undefined
+    ? undefined
+    : checkedColumnDropTotal([valueBytes, repeatedIdentityBytes, structuralBytes]);
+  if (
+    !Number.isSafeInteger(staticIdentityBytes)
+    || !Number.isSafeInteger(structuralBytes)
+    || !Number.isSafeInteger(repeatedIdentityBytes)
+    || aggregateOverflow
+    || projectedBytes === undefined
+    || projectedBytes > input.maxSnapshotBytes
+  ) {
+    throw new Error(
+      `Column-drop undo snapshot exceeds the ${input.maxSnapshotBytes}-byte memory budget; ` +
+      'drop fewer columns or rows, or increase sqliteExplorer.maxUndoMemory.'
+    );
+  }
+}
 
 export type ColumnDropForeignKeyBaseline = ReadonlyMap<string, number>;
 

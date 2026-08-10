@@ -63,6 +63,18 @@ export interface RecordIdentityPredicate {
   primaryKeyIntegerCasts?: boolean[];
 }
 
+/**
+ * SQLite exposes no final row handle when an UPDATE trigger moves or removes a
+ * WITHOUT ROWID key. RETURNING observes pre-AFTER-trigger values, so callers
+ * must roll back instead of presenting a guessed identity as successful.
+ */
+export function unresolvableTriggeredPrimaryKeyUpdateError(table: string): Error {
+  return new Error(
+    `An UPDATE trigger changed or removed the primary-key identity in ${table}; ` +
+    'the edit was rolled back because SQLite Explorer cannot safely identify the resulting row.'
+  );
+}
+
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
 }

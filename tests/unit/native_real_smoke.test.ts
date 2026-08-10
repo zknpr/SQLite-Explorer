@@ -19,6 +19,10 @@ import {
 import { streamTableExport } from '../../src/tableExporter';
 import { ModificationTracker } from '../../src/core/undo-history';
 import {
+    assertColumnDropHistoryFitsUndoBudget,
+    buildColumnDropHistorySizePreflight
+} from '../../src/core/column-drop';
+import {
     reconcileRestoredDatabase,
     revertDatabaseToSaved
 } from '../../src/core/restore-reconciler';
@@ -416,6 +420,41 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 engine.applyModifications([]),
                 /applyModifications is not supported on the native backend; history replay uses redoModification/
             );
+        });
+
+        await testContext.test('runs column-drop metadata preflight on native SQLite', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_column_drop_preflight (' +
+                'tenant TEXT, sequence BLOB, payload TEXT, ' +
+                'PRIMARY KEY (tenant, sequence)) WITHOUT ROWID; ' +
+                "INSERT INTO native_column_drop_preflight VALUES " +
+                "('north', X'0102', char(0) || 'quoted\"'), ('south', X'0304', 'plain')"
+            );
+            const preflight = buildColumnDropHistorySizePreflight(
+                'native_column_drop_preflight',
+                ['payload'],
+                {
+                    kind: 'primaryKey',
+                    columns: [
+                        { identifier: 'tenant', declaredType: 'TEXT', position: 1 },
+                        { identifier: 'sequence', declaredType: 'BLOB', position: 2 }
+                    ]
+                }
+            );
+            const resultRows: Array<readonly unknown[] | undefined> = [];
+            for (const query of preflight.queries) {
+                const result = await engine.executeQuery(query.sql, query.params);
+                resultRows.push(result[0]?.rows[0]);
+            }
+
+            assert.ok(resultRows.every(row => row?.[0] === 2));
+            assert.doesNotThrow(() => assertColumnDropHistoryFitsUndoBudget({
+                table: 'native_column_drop_preflight',
+                droppedColumnCount: 1,
+                preflight,
+                resultRows,
+                maxSnapshotBytes: 1024 * 1024
+            }));
         });
 
         await testContext.test(
@@ -1494,6 +1533,51 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                     'SELECT tenant, sequence, value FROM native_dependent_identity ORDER BY sequence'
                 ))[0].rows,
                 [[1, 1, 'first'], [1, 2, 'second']]
+            );
+        });
+
+        await testContext.test('fails clearly when a native UPDATE trigger rewrites the primary key', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_trigger_rekey_identity (' +
+                'tenant TEXT, sequence INTEGER, value TEXT, PRIMARY KEY (tenant, sequence)' +
+                ') WITHOUT ROWID; ' +
+                "INSERT INTO native_trigger_rekey_identity VALUES ('north', 1, 'before'); " +
+                'CREATE TRIGGER native_trigger_rekey_identity_after ' +
+                'AFTER UPDATE OF value ON native_trigger_rekey_identity BEGIN ' +
+                'UPDATE native_trigger_rekey_identity SET sequence = sequence + 1 ' +
+                'WHERE tenant = NEW.tenant AND sequence = NEW.sequence; END'
+            );
+            const page = await engine.fetchTableData('native_trigger_rekey_identity', {
+                columns: ['rowid', 'tenant', 'sequence', 'value'],
+                limit: 1,
+                offset: 0
+            });
+
+            await assert.rejects(
+                engine.updateCell(
+                    'native_trigger_rekey_identity',
+                    page.rows[0][0] as string,
+                    'value',
+                    'after'
+                ),
+                /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+            );
+            await assert.rejects(
+                engine.replaceOversizedCell(
+                    'native_trigger_rekey_identity',
+                    page.rows[0][0] as string,
+                    'value',
+                    'after',
+                    { storageClass: 'text', byteLength: 6 },
+                    5
+                ),
+                /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT tenant, sequence, value FROM native_trigger_rekey_identity'
+                ))[0].rows,
+                [['north', 1, 'before']]
             );
         });
 

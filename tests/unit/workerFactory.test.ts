@@ -257,7 +257,8 @@ describe('workerFactory error path tests', () => {
     const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
     const { databaseOps } = await bundle.establishConnection(fileUri, 'test.sqlite');
 
-    const result = await databaseOps.writeToFile('/test/save-as.sqlite');
+    const signal = new AbortController().signal;
+    const result = await databaseOps.writeToFile('/test/save-as.sqlite', signal);
 
     assert.deepStrictEqual(result, { requiresReopen: true });
     assert.strictEqual(directWorkerWriteCalls, 0);
@@ -266,6 +267,48 @@ describe('workerFactory error path tests', () => {
     assert.strictEqual(pagedHostSaveCalls[0][1], '/test/db.sqlite');
     assert.strictEqual(pagedHostSaveCalls[0][2], '/test/save-as.sqlite');
     assert.strictEqual(pagedHostSaveCalls[0][3], snapshot, 'transferred buffers must be consumed directly');
+    assert.strictEqual(pagedHostSaveCalls[0][6], signal);
+  });
+
+  it('stops a paged save cancelled during overlay export before host reconstruction', async () => {
+    let releaseExport!: () => void;
+    let exportStarted!: () => void;
+    const started = new Promise<void>(resolve => { exportStarted = resolve; });
+    const release = new Promise<void>(resolve => { releaseExport = resolve; });
+    const snapshot = {
+      chunkSize: 4,
+      logicalSize: 4,
+      baseLimit: 4,
+      dirtyBytes: 0,
+      baseIdentity: { dev: 1n, ino: 2n, size: 4n, mtimeNs: 3n, mode: 0o600n },
+      runs: []
+    };
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false, storage: 'paged' }),
+      exportPagedWritableOverlay: async (...args: unknown[]) => {
+        assert.strictEqual(args.length, 0, 'AbortSignal must not cross worker RPC');
+        exportStarted();
+        await release;
+        return snapshot;
+      }
+    };
+
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+    const { databaseOps } = await bundle.establishConnection(testDbUri(), 'test.sqlite');
+    const controller = new AbortController();
+    const cancellation = new Error('cancelled during overlay export');
+    const pending = databaseOps.writeToFile('/test/cancelled.sqlite', controller.signal);
+    await started;
+    controller.abort(cancellation);
+    releaseExport();
+
+    let caught: unknown;
+    await pending.catch((error: unknown) => { caught = error; });
+    assert.strictEqual(caught, cancellation);
+    assert.deepStrictEqual(pagedHostSaveCalls, []);
   });
 
   it('keeps memory-backed saves on the worker writeToFile path', async () => {

@@ -133,6 +133,10 @@ function utf8ByteLength(value: string): number {
   return bytes;
 }
 
+function escapedJsonStringByteLength(value: string): number {
+  return utf8ByteLength(JSON.stringify(value));
+}
+
 function decodedBase64Bytes(base64: string): number {
   if (base64.length === 0) return 0;
   const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
@@ -206,7 +210,7 @@ export function assertWebviewTransportPayload(
     }
     if (typeof candidate === 'string') {
       add(
-        utf8ByteLength(candidate) + 2
+        escapedJsonStringByteLength(candidate)
         + jsonSafeNumberStringExpansionBytes(candidate)
       );
       return;
@@ -267,7 +271,7 @@ export function assertWebviewTransportPayload(
 
       add(2 + Math.max(0, keys.length - 1));
       for (const key of keys) {
-        add(utf8ByteLength(key) + 3);
+        add(escapedJsonStringByteLength(key) + 1);
         visit(candidate[key]);
       }
     } finally {

@@ -712,6 +712,85 @@ describe('DatabaseDocument save/saveAs fallback', () => {
     });
 
     for (const operation of ['save', 'saveAs'] as const) {
+        it(`${operation}: cancellation aborts a paged write and releases the mutation barrier`, async () => {
+            const writerStarted = createDeferred<void>();
+            const releaseWriter = createDeferred<void>();
+            let receivedSignal: AbortSignal | undefined;
+            let reconnectCalls = 0;
+            let cancellationListener: (() => void) | undefined;
+            let cancelled = false;
+            const token = {
+                get isCancellationRequested() { return cancelled; },
+                onCancellationRequested(listener: () => void) {
+                    cancellationListener = listener;
+                    return { dispose() { cancellationListener = undefined; } };
+                }
+            } as any;
+            const pagedOps = {
+                engineKind: Promise.resolve('wasm' as const),
+                ping: async () => true,
+                writeToFile: async (_filePath: string, signal?: AbortSignal) => {
+                    receivedSignal = signal;
+                    writerStarted.resolve();
+                    await releaseWriter.promise;
+                    signal?.throwIfAborted();
+                    return { requiresReopen: operation === 'save' };
+                },
+                serializeDatabase: async () => {
+                    throw new Error('cancelled paged save must not use a whole-image fallback');
+                }
+            };
+            const doc = createDocBypassingFactory(
+                pagedOps,
+                createFileUri('/test/paged-cancel.db'),
+                async () => {
+                    reconnectCalls++;
+                    return {
+                        databaseOps: { engineKind: Promise.resolve('wasm' as const) },
+                        isReadOnly: false,
+                        storage: 'paged'
+                    };
+                },
+                { initialStorage: 'paged' }
+            );
+            doc.recordModification({
+                label: 'Unsaved paged update',
+                description: 'Update items.value',
+                modificationType: 'cell_update',
+                targetTable: 'items',
+                targetRowId: 1,
+                targetColumn: 'value',
+                priorValue: 'before',
+                newValue: 'after'
+            });
+
+            const pending = operation === 'save'
+                ? doc.save(token)
+                : doc.saveAs(createFileUri('/test/paged-cancel-copy.db'), token);
+            await writerStarted.promise;
+            cancelled = true;
+            cancellationListener?.();
+            releaseWriter.resolve();
+
+            await assert.rejects(
+                pending,
+                (error: Error) => error.name === 'Canceled'
+            );
+            assert.strictEqual(receivedSignal?.aborted, true);
+            assert.strictEqual(reconnectCalls, 0);
+            assert.strictEqual(doc.databaseOperations, pagedOps);
+            const state = await doc.getDesktopTestState();
+            assert.strictEqual(state.storage, 'paged');
+            assert.strictEqual(state.dirty, true);
+            assert.strictEqual(state.readOnly, false);
+            assert.strictEqual(
+                await doc.runTrackedMutation(async () => 'mutation admitted'),
+                'mutation admitted'
+            );
+        });
+    }
+
+    for (const operation of ['save', 'saveAs'] as const) {
         it(`${operation}: Reload recovers a paged session after rename succeeds but reconnect fails`, async () => {
             const replacementOps = {
                 engineKind: Promise.resolve('wasm' as const),

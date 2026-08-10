@@ -94,7 +94,8 @@ import {
   isPrimaryKeyRecordId,
   primaryKeyColumnsFromTableInfo,
   replacePrimaryKeyRecordIdValues,
-  TABLE_IDENTITY_METADATA_SQL
+  TABLE_IDENTITY_METADATA_SQL,
+  unresolvableTriggeredPrimaryKeyUpdateError
 } from '../../row-identity';
 import {
   assertDeleteSnapshotFitsUndoBudget,
@@ -1848,7 +1849,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       return this.readPrimaryKeyRecordId(
         table,
         identity,
-        buildRecordIdentityPredicate(candidateId, identity)
+        buildRecordIdentityPredicate(candidateId, identity),
+        unresolvableTriggeredPrimaryKeyUpdateError(table)
       );
     };
 
@@ -2404,19 +2406,19 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private readPrimaryKeyRecordId(
     table: string,
     identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
-    predicate: { sql: string; params: CellValue[] }
+    predicate: { sql: string; params: CellValue[] },
+    missingRowError?: Error
   ): RecordId {
     const result = this.queryRaw(
       `SELECT ${buildByteFaithfulPrimaryKeyProjection(identity)} ` +
       `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
       predicate.params
     );
+    if (result.rows.length === 0) {
+      throw missingRowError ?? new Error(`Updated row in ${table} no longer exists`);
+    }
     if (result.rows.length !== 1) {
-      throw new Error(
-        result.rows.length === 0
-          ? `Updated row in ${table} no longer exists`
-          : `Primary-key identity for ${table} matched more than one row`
-      );
+      throw new Error(`Primary-key identity for ${table} matched more than one row`);
     }
     return encodeByteFaithfulPrimaryKeyRecordId(
       identity,
@@ -2527,7 +2529,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const newRowId = this.readPrimaryKeyRecordId(
           table,
           identity,
-          buildRecordIdentityPredicate(candidateId, identity)
+          buildRecordIdentityPredicate(candidateId, identity),
+          unresolvableTriggeredPrimaryKeyUpdateError(table)
         );
         for (const preparedUpdate of preparedUpdates) {
           results.push({

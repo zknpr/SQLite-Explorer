@@ -631,16 +631,20 @@ function assertReplacementReadySync(
 async function writeAll(
   handle: NodeFileHandle,
   data: Uint8Array,
-  position: number
+  position: number,
+  signal?: AbortSignal
 ): Promise<void> {
   let written = 0;
   while (written < data.byteLength) {
+    signal?.throwIfAborted();
+    const writeLength = Math.min(BASE_COPY_BUFFER_BYTES, data.byteLength - written);
     const result = await handle.write(
       data,
       written,
-      data.byteLength - written,
+      writeLength,
       position + written
     );
+    signal?.throwIfAborted();
     if (result.bytesWritten <= 0) {
       throw new Error('Temporary database write made no progress');
     }
@@ -654,20 +658,24 @@ async function copyBaseGap(
   buffer: Uint8Array,
   start: number,
   end: number,
-  baseLimit: number
+  baseLimit: number,
+  signal?: AbortSignal
 ): Promise<void> {
   const copyEnd = Math.min(end, baseLimit);
   let position = start;
   while (position < copyEnd) {
+    signal?.throwIfAborted();
     const requested = Math.min(buffer.byteLength, copyEnd - position);
     let filled = 0;
     while (filled < requested) {
+      signal?.throwIfAborted();
       const result = await source.read(
         buffer,
         filled,
         requested - filled,
         position + filled
       );
+      signal?.throwIfAborted();
       if (result.bytesRead <= 0) {
         throw new Error(
           `Short read from frozen base below baseLimit at byte ${position + filled}`
@@ -675,7 +683,7 @@ async function copyBaseGap(
       }
       filled += result.bytesRead;
     }
-    await writeAll(temporary, buffer.subarray(0, requested), position);
+    await writeAll(temporary, buffer.subarray(0, requested), position, signal);
     position += requested;
   }
   // [copyEnd, end) is outside baseLimit. Leaving it unwritten creates a
@@ -685,11 +693,13 @@ async function copyBaseGap(
 async function assembleSnapshot(
   source: NodeFileHandle,
   temporary: NodeFileHandle,
-  snapshot: PagedWritableOverlaySnapshot
+  snapshot: PagedWritableOverlaySnapshot,
+  signal?: AbortSignal
 ): Promise<void> {
   const baseBuffer = new Uint8Array(BASE_COPY_BUFFER_BYTES);
   let outputPosition = 0;
   for (const run of snapshot.runs) {
+    signal?.throwIfAborted();
     const runStart = run.startChunkIndex * snapshot.chunkSize;
     if (runStart >= snapshot.logicalSize) break;
     await copyBaseGap(
@@ -698,11 +708,12 @@ async function assembleSnapshot(
       baseBuffer,
       outputPosition,
       Math.min(runStart, snapshot.logicalSize),
-      snapshot.baseLimit
+      snapshot.baseLimit,
+      signal
     );
     const runBytes = new Uint8Array(run.data);
     const writtenLength = Math.min(runBytes.byteLength, snapshot.logicalSize - runStart);
-    await writeAll(temporary, runBytes.subarray(0, writtenLength), runStart);
+    await writeAll(temporary, runBytes.subarray(0, writtenLength), runStart, signal);
     outputPosition = runStart + writtenLength;
   }
   await copyBaseGap(
@@ -711,9 +722,12 @@ async function assembleSnapshot(
     baseBuffer,
     outputPosition,
     snapshot.logicalSize,
-    snapshot.baseLimit
+    snapshot.baseLimit,
+    signal
   );
+  signal?.throwIfAborted();
   await temporary.truncate(snapshot.logicalSize);
+  signal?.throwIfAborted();
 }
 
 function warnAfterSuccessfulRename(
@@ -741,8 +755,10 @@ export async function writePagedWritableOverlayToFile(
   targetPath: string,
   snapshot: PagedWritableOverlaySnapshot,
   logger?: PagedSaveLogger,
-  acquireWriteLock: PagedSaveWriteLockAcquirer = acquireSqliteWriteLock
+  acquireWriteLock: PagedSaveWriteLockAcquirer = acquireSqliteWriteLock,
+  signal?: AbortSignal
 ): Promise<DatabaseWriteResult> {
+  signal?.throwIfAborted();
   validateSnapshot(snapshot);
 
   let source: NodeFileHandle | undefined;
@@ -756,8 +772,11 @@ export async function writePagedWritableOverlayToFile(
   let renamed = false;
   try {
     source = await fs.promises.open(basePath, 'r');
+    signal?.throwIfAborted();
     const activeBasePath = await fs.promises.realpath(basePath);
+    signal?.throwIfAborted();
     await assertBaseGeneration(fs, source, activeBasePath, snapshot.baseIdentity);
+    signal?.throwIfAborted();
 
     const target = await resolveReplacementTarget(
       fs,
@@ -765,7 +784,9 @@ export async function writePagedWritableOverlayToFile(
       targetPath,
       snapshot.baseIdentity
     );
+    signal?.throwIfAborted();
     await assertAdjacentTemporarySpace(fs, target.replacementPath, snapshot);
+    signal?.throwIfAborted();
     try {
       // Open before assembly so the post-rename durability step needs no path
       // lookup in the commit window. Some platforms cannot open directories;
@@ -777,21 +798,28 @@ export async function writePagedWritableOverlayToFile(
     } catch (error) {
       replacementDirectoryOpenError = error;
     }
+    signal?.throwIfAborted();
     temporaryPath = path.join(
       path.dirname(target.replacementPath),
       `.${path.basename(target.replacementPath)}.sqlite-explorer-${crypto.randomUUID()}.tmp`
     );
     temporary = await fs.promises.open(temporaryPath, 'wx', 0o600);
     temporaryCreated = true;
+    signal?.throwIfAborted();
 
-    await assembleSnapshot(source, temporary, snapshot);
+    await assembleSnapshot(source, temporary, snapshot, signal);
     ownershipPreservationFailure = await restoreTemporaryMetadata(temporary, target);
+    signal?.throwIfAborted();
     await temporary.sync();
+    signal?.throwIfAborted();
     completedTemporaryFingerprint = fingerprintFromStats(
       fs.fstatSync(temporary.fd, { bigint: true })
     );
     await temporary.close();
     temporary = undefined;
+    // This is the last cooperative cancellation point. Once rename commits,
+    // durability cleanup and any required reconnect must run to completion.
+    signal?.throwIfAborted();
 
     let writeLock: PagedSaveWriteLock | undefined;
     let replacementError: unknown;
@@ -956,6 +984,7 @@ export async function writePagedWritableOverlayToFile(
         `Failed to save paged database '${targetPath}', and cleanup also failed`
       );
     }
+    if (signal?.aborted && error === signal.reason) throw error;
     throw new Error(
       `Failed to save paged database '${targetPath}': ${describeError(error)}`,
       { cause: error }

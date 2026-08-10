@@ -897,7 +897,11 @@ async function createWorkerBackedWasmDatabaseConnection(
         };
 
         const writeToFile = result.storage === 'paged' && result.isReadOnly !== true
-          ? async (targetPath: string): Promise<DatabaseWriteResult> => {
+          ? async (
+              targetPath: string,
+              signal?: AbortSignal
+            ): Promise<DatabaseWriteResult> => {
+              signal?.throwIfAborted();
               if (!filePath) {
                 throw new Error(
                   'Internal error: writable paged save has no local frozen base path.'
@@ -910,12 +914,17 @@ async function createWorkerBackedWasmDatabaseConnection(
                 );
               }
               const snapshot = await workerProxy.exportPagedWritableOverlay();
+              // AbortSignal cannot cross worker_threads. Re-check after the
+              // serialized export before starting host filesystem I/O.
+              signal?.throwIfAborted();
               return writePagedWritableOverlayToFile(
                 fs,
                 filePath,
                 targetPath,
                 snapshot,
-                (level, message, error) => forwardWorkerLog(level, [message, error])
+                (level, message, error) => forwardWorkerLog(level, [message, error]),
+                undefined,
+                signal
               );
             }
           : (targetPath: string) => workerProxy.writeToFile(targetPath);

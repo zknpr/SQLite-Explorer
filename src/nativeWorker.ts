@@ -78,7 +78,8 @@ import {
   isPrimaryKeyRecordId,
   primaryKeyColumnsFromTableInfo,
   replacePrimaryKeyRecordIdValues,
-  TABLE_IDENTITY_METADATA_SQL
+  TABLE_IDENTITY_METADATA_SQL,
+  unresolvableTriggeredPrimaryKeyUpdateError
 } from './core/row-identity';
 import {
   assertDeleteSnapshotFitsUndoBudget,
@@ -1216,19 +1217,19 @@ export async function createNativeDatabaseConnection(
       const readNativePrimaryKeyRecordId = async (
         table: string,
         identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
-        predicate: { sql: string; params: CellValue[] }
+        predicate: { sql: string; params: CellValue[] },
+        missingRowError?: Error
       ): Promise<RecordId> => {
         const result = await worker.call<NativeQueryResult>('query', [
           `SELECT ${buildByteFaithfulPrimaryKeyProjection(identity)} ` +
           `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
           predicate.params
         ]);
+        if (result.values.length === 0) {
+          throw missingRowError ?? new Error(`Updated row in ${table} no longer exists`);
+        }
         if (result.values.length !== 1) {
-          throw new Error(
-            result.values.length === 0
-              ? `Updated row in ${table} no longer exists`
-              : `Primary-key identity for ${table} matched more than one row`
-          );
+          throw new Error(`Primary-key identity for ${table} matched more than one row`);
         }
         return encodeByteFaithfulPrimaryKeyRecordId(
           identity,
@@ -1351,7 +1352,8 @@ export async function createNativeDatabaseConnection(
             const newRowId = await readNativePrimaryKeyRecordId(
               table,
               identity,
-              buildRecordIdentityPredicate(candidateId, identity)
+              buildRecordIdentityPredicate(candidateId, identity),
+              unresolvableTriggeredPrimaryKeyUpdateError(table)
             );
             for (const preparedUpdate of preparedUpdates) {
               results.push({
@@ -2100,7 +2102,8 @@ export async function createNativeDatabaseConnection(
             return readNativePrimaryKeyRecordId(
               table,
               identity,
-              buildRecordIdentityPredicate(candidateId, identity)
+              buildRecordIdentityPredicate(candidateId, identity),
+              unresolvableTriggeredPrimaryKeyUpdateError(table)
             );
           };
 

@@ -479,7 +479,16 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.ping();
     }
 
-    async writeToFile(path: string): Promise<DatabaseWriteResult | void> {
-        return this.logAndDelegate(`Writing to file: ${path}`, true, 'writeToFile', path);
+    async writeToFile(
+        path: string,
+        signal?: AbortSignal
+    ): Promise<DatabaseWriteResult | void> {
+        return this.logAndDelegate(
+            `Writing to file: ${path}`,
+            true,
+            'writeToFile',
+            path,
+            signal
+        );
     }
 }

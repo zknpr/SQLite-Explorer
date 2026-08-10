@@ -609,7 +609,7 @@ export interface DatabaseOperations {
   ping(): Promise<boolean>;
 
   /** Write database directly to file system (optimization) */
-  writeToFile(path: string): Promise<DatabaseWriteResult | void>;
+  writeToFile(path: string, signal?: AbortSignal): Promise<DatabaseWriteResult | void>;
 }
 
 /**

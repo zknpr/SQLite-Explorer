@@ -597,6 +597,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     if (cancellation?.isCancellationRequested) {
       throw new vsc.CancellationError();
     }
+    const saveSignal = cancelTokenToAbortSignal(cancellation);
     await this.ensureWritable();
 
     // Check if using native engine - changes are already on disk
@@ -637,6 +638,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
               const drain = this.#beginPagedSaveExclusive();
               pagedExclusiveOwned = true;
               await drain;
+              saveSignal?.throwIfAborted();
             }
             // Capture the tracker position that matches the database snapshot
             // exported by writeToFile(). If undo, rollback, or history eviction
@@ -646,7 +648,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             const fileCheckpoint = this.#modificationTracker.getCurrentPosition();
             const fileCheckpointInvalidationRevision =
               this.#modificationTracker.getCheckpointInvalidationRevision();
-            await this.databaseOperations.writeToFile(this.uri.fsPath);
+            await this.databaseOperations.writeToFile(
+              this.uri.fsPath,
+              pagedSave ? saveSignal : undefined
+            );
             baseReplaced = true;
             if (pagedSave) {
               // The old hostIo still owns a descriptor for the frozen pre-save
@@ -674,6 +679,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
                   this.#endPagedSaveExclusive();
                   this.connectionState.isReadOnly = priorReadOnlyState;
                 }
+                if (saveSignal?.aborted && e === saveSignal.reason) {
+                  throw new vsc.CancellationError();
+                }
                 throw e;
               }
               // Rename completed but the replacement connection failed. The
@@ -686,6 +694,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
                 + 'Reload the document before making more edits.',
                 { cause: e }
               );
+            }
+            if (saveSignal?.aborted && e === saveSignal.reason) {
+              throw new vsc.CancellationError();
             }
             // Fallback if direct write fails
             this.viewerProvider.outputChannel?.appendLine(`[Fallback] Direct write failed, falling back to buffer transfer: ${e instanceof Error ? e.message : String(e)}`);
@@ -731,6 +742,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * Save document to new location.
    */
   async saveAs(targetUri: vsc.Uri, cancellation: vsc.CancellationToken): Promise<void> {
+    if (cancellation?.isCancellationRequested) {
+      throw new vsc.CancellationError();
+    }
+    const saveSignal = cancelTokenToAbortSignal(cancellation);
     await this.ensureWritable();
 
     const pagedSaveAs = this.connectionState.storage === 'paged';
@@ -749,9 +764,13 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
               const drain = this.#beginPagedSaveExclusive();
               pagedExclusiveOwned = true;
               await drain;
+              saveSignal?.throwIfAborted();
             }
             // Use optimized write/vacuum if available
-            const result = await this.databaseOperations.writeToFile(targetUri.fsPath);
+            const result = await this.databaseOperations.writeToFile(
+              targetUri.fsPath,
+              pagedSaveAs ? saveSignal : undefined
+            );
             baseReplaced = result?.requiresReopen === true;
             if (baseReplaced) {
               await this.#reconnectFromDisk();
@@ -772,6 +791,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
                    this.#endPagedSaveExclusive();
                    this.connectionState.isReadOnly = priorReadOnlyState;
                  }
+                 if (saveSignal?.aborted && e === saveSignal.reason) {
+                   throw new vsc.CancellationError();
+                 }
                  throw e;
                }
                this.connectionState.isReadOnly = true;
@@ -781,6 +803,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
                  + 'Reload the document before making more edits.',
                  { cause: e }
                );
+             }
+             if (saveSignal?.aborted && e === saveSignal.reason) {
+               throw new vsc.CancellationError();
              }
              this.viewerProvider.outputChannel?.appendLine(`[Fallback] Direct write failed, falling back to buffer transfer: ${e instanceof Error ? e.message : String(e)}`);
         }

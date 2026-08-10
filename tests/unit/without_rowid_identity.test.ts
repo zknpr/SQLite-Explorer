@@ -344,6 +344,51 @@ describe('WITHOUT ROWID primary-key identity', () => {
         );
     });
 
+    it('fails clearly and rolls back when an UPDATE trigger rewrites the primary key', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE trigger_rekey_identity (' +
+            'tenant TEXT, sequence INTEGER, value TEXT, PRIMARY KEY (tenant, sequence)' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO trigger_rekey_identity VALUES ('north', 1, 'before'); " +
+            'CREATE TRIGGER trigger_rekey_identity_after ' +
+            'AFTER UPDATE OF value ON trigger_rekey_identity BEGIN ' +
+            'UPDATE trigger_rekey_identity SET sequence = sequence + 1 ' +
+            'WHERE tenant = NEW.tenant AND sequence = NEW.sequence; END'
+        );
+        const page = await engine.fetchTableData('trigger_rekey_identity', {
+            columns: ['rowid', 'tenant', 'sequence', 'value'],
+            limit: 1,
+            offset: 0
+        });
+
+        await assert.rejects(
+            engine.updateCell(
+                'trigger_rekey_identity',
+                page.rows[0][0] as RecordId,
+                'value',
+                'after'
+            ),
+            /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+        );
+        await assert.rejects(
+            engine.replaceOversizedCell(
+                'trigger_rekey_identity',
+                page.rows[0][0] as RecordId,
+                'value',
+                'after',
+                { storageClass: 'text', byteLength: 6 },
+                5
+            ),
+            /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT tenant, sequence, value FROM trigger_rekey_identity'
+            ))[0].rows,
+            [['north', 1, 'before']]
+        );
+    });
+
     it('keeps a changed composite primary-key identity coherent through undo and redo', async () => {
         await engine.executeQuery(
             'CREATE TABLE composite_identity (' +

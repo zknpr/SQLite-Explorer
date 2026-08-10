@@ -283,5 +283,17 @@ describe('LoggingDatabaseOperations', () => {
             const result = await logger.dropView('customers');
             assert.strictEqual(result.identifier, 'customers');
         });
+
+        it('forwards paged-save cancellation without cloning the signal', async () => {
+            const signal = new AbortController().signal;
+            let delegatedSignal: AbortSignal | undefined;
+            mockDb.writeToFile = async (_path: string, received?: AbortSignal) => {
+                delegatedSignal = received;
+            };
+
+            await logger.writeToFile('/test/paged.db', signal);
+
+            assert.strictEqual(delegatedSignal, signal);
+        });
     });
 });

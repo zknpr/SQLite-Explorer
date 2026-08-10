@@ -92,6 +92,23 @@ describe('RPC Serialization', () => {
             );
         });
 
+        it('rejects control-heavy text by its escaped JSON wire size', () => {
+            assert.throws(
+                () => serializeValue('\0'.repeat(3), {
+                    surface: 'escaped text test',
+                    maxBinaryBytes: 64,
+                    maxAggregateBytes: 19
+                }),
+                (error: unknown) => {
+                    assert.ok(error instanceof WebviewPayloadLimitError);
+                    assert.strictEqual(error.kind, 'aggregate-payload');
+                    assert.strictEqual(error.actualBytes, 20);
+                    assert.strictEqual(error.limitBytes, 19);
+                    return true;
+                }
+            );
+        });
+
         it('rejects a per-value overflow before invoking the base64 encoder', () => {
             const bytes = new Uint8Array(5);
             const bufferFrom = mock.method(Buffer, 'from', () => {

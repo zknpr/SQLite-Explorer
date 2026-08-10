@@ -2071,6 +2071,58 @@ describe('web demo view worker', () => {
         assert.strictEqual(data.exactIntegerTexts[1][0], '9007199254740993');
     });
 
+    it('fails clearly when a demo UPDATE trigger rewrites the primary key', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_trigger_rekey_identity (' +
+            'tenant TEXT, sequence INTEGER, value TEXT, PRIMARY KEY (tenant, sequence)' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_trigger_rekey_identity VALUES ('north', 1, 'before'); " +
+            'CREATE TRIGGER demo_trigger_rekey_identity_after ' +
+            'AFTER UPDATE OF value ON demo_trigger_rekey_identity BEGIN ' +
+            'UPDATE demo_trigger_rekey_identity SET sequence = sequence + 1 ' +
+            'WHERE tenant = NEW.tenant AND sequence = NEW.sequence; END'
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_trigger_rekey_identity', {
+            columns: ['rowid', 'tenant', 'sequence', 'value'],
+            limit: 1,
+            offset: 0
+        });
+
+        await assert.rejects(
+            worker.invoke(
+                'updateCell',
+                'demo_trigger_rekey_identity',
+                page.rows[0][0],
+                'value',
+                'after'
+            ),
+            /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+        );
+        await assert.rejects(
+            worker.invoke(
+                'replaceOversizedCell',
+                'demo_trigger_rekey_identity',
+                page.rows[0][0],
+                'value',
+                'after',
+                { storageClass: 'text', byteLength: 6 },
+                5
+            ),
+            /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+        );
+        assert.deepStrictEqual(
+            Array.from(
+                (await worker.invoke(
+                    'runQuery',
+                    'SELECT tenant, sequence, value FROM demo_trigger_rekey_identity'
+                ))[0].rows[0]
+            ),
+            ['north', 1, 'before']
+        );
+    });
+
     it('edits and deletes rows through WITHOUT ROWID primary-key identities', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

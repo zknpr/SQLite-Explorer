@@ -1683,6 +1683,7 @@ describe('HostBridge', () => {
                 primaryKeyPosition: 0
             }]),
             executeQuery: mock.fn(async (sql: string) => {
+                if (/^(?:SAVEPOINT|RELEASE|ROLLBACK TO)\b/i.test(sql)) return [];
                 if (sql.includes('pragma_table_list')) {
                     return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
                 }
@@ -1691,6 +1692,9 @@ describe('HostBridge', () => {
                         headers: ['type', 'name', 'sql'],
                         rows: [['table', 'items', 'CREATE TABLE items (payload BLOB)']]
                     }];
+                }
+                if (sql.includes('COUNT(*)')) {
+                    return [{ headers: ['row_count', 'history_bytes'], rows: [[1, 9]] }];
                 }
                 rowsStarted.resolve();
                 return rows.promise;
@@ -1718,6 +1722,170 @@ describe('HostBridge', () => {
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
+    it('refuses oversized column-drop history before selecting values or dropping schema', async () => {
+        let fullValueSelects = 0;
+        const beforeColumns = [
+            {
+                ordinal: 0,
+                identifier: 'tenant',
+                declaredType: 'TEXT',
+                isRequired: 1,
+                defaultExpression: null,
+                primaryKeyPosition: 1
+            },
+            {
+                ordinal: 1,
+                identifier: 'payload',
+                declaredType: 'BLOB',
+                isRequired: 0,
+                defaultExpression: null,
+                primaryKeyPosition: 0
+            }
+        ];
+        const dbOps = {
+            findDependentIndexes: mock.fn(async () => []),
+            getTableInfo: mock.fn(async () => beforeColumns),
+            executeQuery: mock.fn(async (sql: string) => {
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['type', 'wr'], rows: [['table', 1]] }];
+                }
+                if (sql.includes('sqlite_schema')) {
+                    return [{
+                        headers: ['type', 'name', 'sql'],
+                        rows: [[
+                            'table',
+                            'large_drop',
+                            'CREATE TABLE large_drop (tenant TEXT PRIMARY KEY, payload BLOB) WITHOUT ROWID'
+                        ]]
+                    }];
+                }
+                if (sql.includes('COUNT(*)')) {
+                    return [{ headers: ['row_count', 'history_bytes'], rows: [[1, 100_000]] }];
+                }
+                if (/^SELECT\s/i.test(sql)) fullValueSelects++;
+                return [{ headers: ['tenant', 'payload'], rows: [['north', new Uint8Array([1])]] }];
+            }),
+            deleteColumns: mock.fn(async () => ({
+                tableSql: 'CREATE TABLE large_drop (tenant TEXT PRIMARY KEY) WITHOUT ROWID',
+                columns: ['tenant'],
+                identity: {
+                    kind: 'primaryKey' as const,
+                    columns: [{ identifier: 'tenant', declaredType: 'TEXT', position: 1 }]
+                },
+                schemaObjects: []
+            }))
+        };
+        const recordExternalModification = mock.fn();
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            {
+                uri: vscode.Uri.parse('file:///test.db'),
+                documentKey: Promise.resolve('test-key'),
+                databaseOperations: dbOps,
+                isReadOnlyMode: false,
+                connectionGeneration: 1,
+                undoMemoryLimitBytes: 10_000,
+                recordExternalModification
+            } as any
+        );
+
+        await assert.rejects(
+            bridge.deleteColumns('large_drop', ['payload']),
+            /Column-drop undo snapshot exceeds the 8?\d{3}-byte memory budget/i
+        );
+        assert.strictEqual(fullValueSelects, 0);
+        assert.strictEqual(dbOps.deleteColumns.mock.callCount(), 0);
+        assert.strictEqual(recordExternalModification.mock.callCount(), 0);
+    });
+
+    it('accounts for composite primary-key bytes in column-drop history preflight', async () => {
+        let fullValueSelects = 0;
+        const beforeColumns = [
+            {
+                ordinal: 0,
+                identifier: 'tenant',
+                declaredType: 'TEXT',
+                isRequired: 1,
+                defaultExpression: null,
+                primaryKeyPosition: 1
+            },
+            {
+                ordinal: 1,
+                identifier: 'sequence',
+                declaredType: 'BLOB',
+                isRequired: 1,
+                defaultExpression: null,
+                primaryKeyPosition: 2
+            },
+            {
+                ordinal: 2,
+                identifier: 'payload',
+                declaredType: 'TEXT',
+                isRequired: 0,
+                defaultExpression: null,
+                primaryKeyPosition: 0
+            }
+        ];
+        const dbOps = {
+            findDependentIndexes: mock.fn(async () => []),
+            getTableInfo: mock.fn(async () => beforeColumns),
+            executeQuery: mock.fn(async (sql: string) => {
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['type', 'wr'], rows: [['table', 1]] }];
+                }
+                if (sql.includes('sqlite_schema')) {
+                    return [{
+                        headers: ['type', 'name', 'sql'],
+                        rows: [[
+                            'table',
+                            'composite_drop',
+                            'CREATE TABLE composite_drop (' +
+                            'tenant TEXT, sequence BLOB, payload TEXT, ' +
+                            'PRIMARY KEY (tenant, sequence)) WITHOUT ROWID'
+                        ]]
+                    }];
+                }
+                if (sql.includes('COUNT(*)')) {
+                    const identityAggregate = sql.includes('typeof("tenant")')
+                        || sql.includes('typeof("sequence")');
+                    return [{
+                        headers: ['row_count', 'history_bytes'],
+                        rows: [[1, identityAggregate ? 100_000 : 1]]
+                    }];
+                }
+                if (/^SELECT\s/i.test(sql)) fullValueSelects++;
+                return [{
+                    headers: ['tenant', 'sequence', 'payload'],
+                    rows: [['north', new Uint8Array([1]), 'x']]
+                }];
+            }),
+            deleteColumns: mock.fn(async () => {
+                throw new Error('drop savepoint opened');
+            })
+        };
+        const recordExternalModification = mock.fn();
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            {
+                uri: vscode.Uri.parse('file:///test.db'),
+                documentKey: Promise.resolve('test-key'),
+                databaseOperations: dbOps,
+                isReadOnlyMode: false,
+                connectionGeneration: 1,
+                undoMemoryLimitBytes: 10_000,
+                recordExternalModification
+            } as any
+        );
+
+        await assert.rejects(
+            bridge.deleteColumns('composite_drop', ['payload']),
+            /Column-drop undo snapshot exceeds/i
+        );
+        assert.strictEqual(fullValueSelects, 0);
+        assert.strictEqual(dbOps.deleteColumns.mock.callCount(), 0);
+        assert.strictEqual(recordExternalModification.mock.callCount(), 0);
+    });
+
     it('canonicalizes rowids captured for column-drop history', async () => {
         const beforeColumns = [
             {
@@ -1742,6 +1910,7 @@ describe('HostBridge', () => {
             findDependentIndexes: mock.fn(async () => []),
             getTableInfo: mock.fn(async () => dropped ? [beforeColumns[0]] : beforeColumns),
             executeQuery: mock.fn(async (sql: string) => {
+                if (/^(?:SAVEPOINT|RELEASE|ROLLBACK TO)\b/i.test(sql)) return [];
                 if (sql.includes('pragma_table_list')) {
                     return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
                 }
@@ -1756,6 +1925,9 @@ describe('HostBridge', () => {
                                 : 'CREATE TABLE items (id INTEGER PRIMARY KEY, payload)'
                         ]]
                     }];
+                }
+                if (sql.includes('COUNT(*)')) {
+                    return [{ headers: ['row_count', 'history_bytes'], rows: [[2, 20]] }];
                 }
                 return [{
                     headers: ['rowid', 'payload'],
@@ -1837,6 +2009,7 @@ describe('HostBridge', () => {
                 ? [beforeColumns[0], { ...beforeColumns[2], ordinal: 1 }]
                 : beforeColumns),
             executeQuery: mock.fn(async (sql: string) => {
+                if (/^(?:SAVEPOINT|RELEASE|ROLLBACK TO)\b/i.test(sql)) return [];
                 if (sql.includes('pragma_table_list')) {
                     return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
                 }
@@ -1845,6 +2018,9 @@ describe('HostBridge', () => {
                         headers: ['type', 'name', 'sql'],
                         rows: [['table', 'items', dropped ? afterSql : beforeSql]]
                     }];
+                }
+                if (sql.includes('COUNT(*)')) {
+                    return [{ headers: ['row_count', 'history_bytes'], rows: [[1, 16]] }];
                 }
                 return [{
                     headers: ['rowid', 'payload'],
@@ -1927,6 +2103,7 @@ describe('HostBridge', () => {
                 return beforeColumns;
             }),
             executeQuery: mock.fn(async (sql: string) => {
+                if (/^(?:SAVEPOINT|RELEASE|ROLLBACK TO)\b/i.test(sql)) return [];
                 if (sql.includes('pragma_table_list')) {
                     return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
                 }
@@ -1939,6 +2116,9 @@ describe('HostBridge', () => {
                             'CREATE TABLE items (id INTEGER PRIMARY KEY, payload TEXT)'
                         ]]
                     }];
+                }
+                if (sql.includes('COUNT(*)')) {
+                    return [{ headers: ['row_count', 'history_bytes'], rows: [[1, 16]] }];
                 }
                 return [{ headers: ['rowid', 'payload'], rows: [[1, 'kept']] }];
             }),
@@ -2021,6 +2201,7 @@ describe('HostBridge', () => {
     it('propagates a column-history capture failure without dropping the column', async () => {
         const error = new Error('Database disconnected during column info fetch');
         const dbOps = {
+            executeQuery: mock.fn(async () => []),
             getTableInfo: mock.fn(async () => { throw error; }),
             deleteColumns: mock.fn(async () => {})
         };

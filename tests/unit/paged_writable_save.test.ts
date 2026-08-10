@@ -365,6 +365,51 @@ describe('paged writable host save', () => {
     assert.ok(!fs.readdirSync(fixtureDir).some(name => name.includes('short-read-target.db.sqlite-explorer')));
   });
 
+  it('cancels after one bounded reconstruction chunk and leaves the active base untouched', async () => {
+    const basePath = path.join(fixtureDir, 'cancelled-active-base.db');
+    const original = Buffer.alloc(3 * 1024 * 1024, 0x5a);
+    fs.writeFileSync(basePath, original);
+    const beforeInode = fs.statSync(basePath, { bigint: true }).ino;
+    const controller = new AbortController();
+    const cancellation = new Error('cancelled paged reconstruction');
+    let sourceReadCalls = 0;
+    let writeLockCalls = 0;
+    const open = async (...args: Parameters<typeof fs.promises.open>) => {
+      const handle = await fs.promises.open(...args);
+      if (String(args[0]) !== basePath || args[1] !== 'r') return handle;
+      const realRead = handle.read.bind(handle);
+      return proxyHandleRead(handle, async (...readArgs: any[]) => {
+        const result = await realRead(...readArgs);
+        sourceReadCalls++;
+        if (sourceReadCalls === 1) controller.abort(cancellation);
+        return result;
+      });
+    };
+
+    let caught: unknown;
+    await writePagedWritableOverlayToFile(
+      capabilityWithOpen(open as typeof fs.promises.open),
+      basePath,
+      basePath,
+      snapshotFor(basePath, { runs: [], dirtyBytes: 0 }),
+      undefined,
+      () => {
+        writeLockCalls++;
+        return { release() {} };
+      },
+      controller.signal
+    ).catch(error => { caught = error; });
+
+    assert.strictEqual(caught, cancellation);
+    assert.strictEqual(sourceReadCalls, 1, 'cancellation must stop before a second 1 MiB read');
+    assert.strictEqual(writeLockCalls, 0, 'a cancelled reconstruction must not enter commit');
+    assert.strictEqual(fs.statSync(basePath, { bigint: true }).ino, beforeInode);
+    assert.deepStrictEqual(fs.readFileSync(basePath), original);
+    assert.ok(!fs.readdirSync(fixtureDir).some(name => (
+      name.includes('cancelled-active-base.db.sqlite-explorer')
+    )));
+  });
+
   it('replaces the active base atomically and requires reopen', async () => {
     const basePath = path.join(fixtureDir, 'active-base.db');
     fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
