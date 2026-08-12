@@ -19,6 +19,10 @@ import { CellValue, DatabaseOperations, ExportOptions, RecordId } from '../../sr
 import { mockVscode } from './mocks/vscode';
 import { DocumentRegistry } from '../../src/documentRegistry';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+import {
+    createCsvTextInspection,
+    inspectCsvTextChunk
+} from '../../src/core/export-encoding';
 import { serializeOperations } from '../../src/core/operation-serializer';
 
 async function collectStreamingExport(
@@ -100,6 +104,46 @@ function firstNonIgnorableCsvCodePoint(text: string): string | undefined {
     }
     return undefined;
 }
+
+describe('CSV text inspection', () => {
+    it('keeps an ignorable cross-chunk prefix open for every formula operator', () => {
+        const prefixChunks = [' ', '\t', '\r', '\n', '\0', '\uFEFF', '\u200B', '\u2003'];
+
+        for (const operator of ['=', '+', '-', '@', '\uFF1D', '\uFF0B', '\uFF0D', '\uFF20']) {
+            const inspection = createCsvTextInspection();
+            for (const chunk of prefixChunks) {
+                inspectCsvTextChunk(inspection, chunk);
+                assert.strictEqual(inspection.dangerousPrefix, false, operator);
+                assert.strictEqual(inspection.prefixOpen, true, operator);
+            }
+
+            inspectCsvTextChunk(inspection, `${operator}1`);
+            assert.deepStrictEqual(
+                inspection,
+                { dangerousPrefix: true, prefixOpen: false, needsQuotes: true },
+                operator
+            );
+        }
+    });
+
+    it('continues detecting RFC quote triggers after prefix inspection closes', () => {
+        for (const chunk of [',', '"', '\r', '\n']) {
+            const inspection = createCsvTextInspection();
+            inspectCsvTextChunk(inspection, 'ordinary');
+            assert.deepStrictEqual(
+                inspection,
+                { dangerousPrefix: false, prefixOpen: false, needsQuotes: false }
+            );
+
+            inspectCsvTextChunk(inspection, chunk);
+            assert.deepStrictEqual(
+                inspection,
+                { dangerousPrefix: false, prefixOpen: false, needsQuotes: true },
+                JSON.stringify(chunk)
+            );
+        }
+    });
+});
 
 describe('streamTableExport golden parity', () => {
     it('emits headers for empty CSV/Excel results and preserves JSON/SQL empty shapes', async () => {
@@ -2510,6 +2554,14 @@ describe('exportToCsv', () => {
         assert.strictEqual(exportToCsv([], [['']], false), '');
         assert.strictEqual(exportToCsv([], [['\r']], false), '"\r"');
         assert.strictEqual(exportToCsv([], [["'=1"]], false), "'=1");
+    });
+
+    it('combines formula neutralization with comma, quote, CR, and LF escaping', () => {
+        const dangerous = '\uFEFF=SUM("A1,A2")\r\n+1';
+        const csv = exportToCsv([], [[dangerous]], false);
+
+        assert.strictEqual(csv, '"\'\uFEFF=SUM(""A1,A2"")\r\n+1"');
+        assert.deepStrictEqual(parseCsvRecords(csv), [["'" + dangerous]]);
     });
 });
 
