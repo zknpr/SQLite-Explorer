@@ -29,8 +29,8 @@ const SQLJS_COMMIT = '653366ed214563ea95a57b34c92986b6ff584c23';
 const SQLJS_RUN = '31639875548';
 
 const TXIKI_BRANCH = 'agent/v8-bounded-host-views';
-const TXIKI_COMMIT = '02f5b28e142d3aaab423621f717f4a43456c3127';
-const TXIKI_RUN = '31647149226';
+const TXIKI_COMMIT = 'acef1d0de4f16321bc24b81261aebcea064f5923';
+const TXIKI_RUN = '31648639100';
 
 interface ScriptSpec {
     name: string;
