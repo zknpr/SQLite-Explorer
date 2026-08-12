@@ -1,16 +1,14 @@
 /**
- * Refresh the pinned txiki.js native runtime artifacts.
+ * Refresh the exact txiki.js security-fix workflow artifacts.
  *
- * Default usage downloads all five artifacts from the pinned GitHub Actions run:
+ * Default usage re-validates the pinned GitHub Actions run before download:
  *   node scripts/refresh-natives.mjs
  *
- * A different workflow run can be checked against the same pinned hashes:
- *   node scripts/refresh-natives.mjs 31268780165
- *
- * Maintainers can verify already-downloaded artifacts without network access.
- * The commit is explicit because an extracted artifact has no trustworthy run metadata:
- *   node scripts/refresh-natives.mjs --from /path/to/extracted/artifacts \
- *     --run 31268780165 --commit <40-character-sha>
+ * An already-downloaded artifact can be verified without network access only
+ * when its complete pinned provenance is supplied explicitly:
+ *   node scripts/refresh-natives.mjs --from /path/to/run-artifacts \
+ *     --run 31647149226 --branch agent/v8-bounded-host-views \
+ *     --commit 02f5b28e142d3aaab423621f717f4a43456c3127
  */
 
 import { execFileSync } from 'node:child_process';
@@ -30,17 +28,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPOSITORY = 'zknpr/txiki.js';
-// The fork's master IS the shipped source; the sqlite-explorer/* branches are
-// frozen history. Artifact runs are dispatched from master.
-const SOURCE_BRANCH = 'master';
-const PINNED_RUN_ID = '31278603707';
+const SOURCE_BRANCH = 'agent/v8-bounded-host-views';
+const SOURCE_COMMIT = '02f5b28e142d3aaab423621f717f4a43456c3127';
+const PINNED_RUN_ID = '31647149226';
 const PINNED_SHA256 = Object.freeze({
-  'aarch64-linux-gnu/tjs': 'e603ac1b9aa8aa9f6e8b30666062ee8c2cafff2e3099a1c760053fcc2b52c3a5',
-  'aarch64-macos/tjs': '5b3df909c99bd73fd4e1e4395253d0311e5308ae28363bd3e8099f8d0e37d044',
-  'x86_64-linux-gnu/tjs': '5fbaabbdfb9a13e6ce72ec4dedaf29c1dd9b4e8be096ae2a0cba6595d12686ad',
-  'x86_64-macos/tjs': 'cd8e22a6e7cf834d31711d56600476a83f671b2f9206280da4863ea48dc5208c',
-  'x86_64-windows/tjs.exe': '290215bb6184b811eb45606e5a36e48b0885fd0f0b8bac1a24a82cb8550bcaec'
+  'aarch64-linux-gnu/tjs': '2350c69972c9a0d3cbd5471ab338d6d1fe733432bef3fc6dc89a17df5b2ef4a7',
+  'aarch64-macos/tjs': '2da1db12dfb3f71e614737a9b36cc9d2411484527dc3af85fd8f8d532e145daf',
+  'x86_64-linux-gnu/tjs': '34a9eeb3e19935ee33a4d8e55a6579dbcc678a8ff3e0136b8970e7bff10fecef',
+  'x86_64-macos/tjs': '3bfd6d82cdd5adbfa0c795b80c919bfd301a6f7f81d25a85f7807f5e6d6bd5ab',
+  'x86_64-windows/tjs.exe': '81c63f2a4445c2aa361863f6a57422ca5612535a3fe544206d93fc98d27df316'
 });
+const PAYLOAD_FILENAMES = new Set(['tjs', 'tjs.exe']);
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, '..');
@@ -49,44 +47,55 @@ function sha256(contents) {
   return createHash('sha256').update(contents).digest('hex');
 }
 
-function findNativeCandidates(root) {
+function portableRelative(root, entryPath) {
+  return path.relative(root, entryPath).split(path.sep).join('/');
+}
+
+function listPayloadPaths(root) {
   const matches = [];
   const visit = directory => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const entryPath = path.join(directory, entry.name);
-      if (entry.isDirectory()) visit(entryPath);
-      else if (entry.isFile() && (entry.name === 'tjs' || entry.name === 'tjs.exe')) {
-        matches.push(entryPath);
+      if (entry.isDirectory()) {
+        visit(entryPath);
+      } else if (PAYLOAD_FILENAMES.has(entry.name)) {
+        if (!entry.isFile()) {
+          throw new Error(
+            `Artifact manifest contains a non-regular payload: ${portableRelative(root, entryPath)}`
+          );
+        }
+        matches.push(portableRelative(root, entryPath));
       }
     }
   };
   visit(root);
-  return matches;
+  return matches.sort();
 }
 
-function findPinnedArtifacts(root) {
-  const targetByHash = new Map(
-    Object.entries(PINNED_SHA256).map(([target, expectedHash]) => [expectedHash, target])
-  );
+function readPinnedArtifacts(root) {
+  const expectedPaths = Object.keys(PINNED_SHA256).sort();
+  const observedPaths = listPayloadPaths(root);
+  if (
+    expectedPaths.length !== observedPaths.length ||
+    expectedPaths.some((expectedPath, index) => expectedPath !== observedPaths[index])
+  ) {
+    throw new Error(
+      `Artifact manifest mismatch: expected exactly ${expectedPaths.join(', ')}; ` +
+      `received ${observedPaths.length > 0 ? observedPaths.join(', ') : '(none)'}`
+    );
+  }
+
   const artifacts = new Map();
-  const observed = [];
-
-  for (const candidate of findNativeCandidates(root)) {
-    const contents = readFileSync(candidate);
+  for (const [artifactPath, expectedHash] of Object.entries(PINNED_SHA256)) {
+    const contents = readFileSync(path.join(root, ...artifactPath.split('/')));
     const actualHash = sha256(contents);
-    observed.push(`${candidate} (${actualHash})`);
-    const target = targetByHash.get(actualHash);
-    if (target && !artifacts.has(target)) artifacts.set(target, contents);
+    if (actualHash !== expectedHash) {
+      throw new Error(
+        `SHA-256 mismatch for ${artifactPath}: expected ${expectedHash}, received ${actualHash}`
+      );
+    }
+    artifacts.set(artifactPath, contents);
   }
-
-  const missing = Object.keys(PINNED_SHA256).filter(target => !artifacts.has(target));
-  if (missing.length > 0) {
-    const detail = observed.length > 0
-      ? ` Candidates: ${observed.join('; ')}`
-      : ' No tjs or tjs.exe candidates were found.';
-    throw new Error(`Pinned txiki.js artifacts were not found for: ${missing.join(', ')}.${detail}`);
-  }
-
   return artifacts;
 }
 
@@ -98,7 +107,9 @@ function atomicWrite(destination, contents, expectedHash) {
     chmodSync(temporary, 0o755);
     const actualHash = sha256(readFileSync(temporary));
     if (actualHash !== expectedHash) {
-      throw new Error(`Refusing to install ${destination}: expected ${expectedHash}, received ${actualHash}`);
+      throw new Error(
+        `Refusing to install ${destination}: expected ${expectedHash}, received ${actualHash}`
+      );
     }
     renameSync(temporary, destination);
   } finally {
@@ -109,7 +120,7 @@ function atomicWrite(destination, contents, expectedHash) {
 function refreshCopies(artifacts) {
   for (const [target, expectedHash] of Object.entries(PINNED_SHA256)) {
     atomicWrite(
-      path.join(repositoryRoot, 'natives', target),
+      path.join(repositoryRoot, 'natives', ...target.split('/')),
       artifacts.get(target),
       expectedHash
     );
@@ -124,91 +135,105 @@ function readValue(args, index, option) {
 
 function parseArguments() {
   const args = process.argv.slice(2);
-  let runId = PINNED_RUN_ID;
-  let runIdWasSet = false;
-  let suppliedSource;
-  let suppliedCommit;
+  if (args.length === 0) return { suppliedSource: undefined };
 
+  const values = new Map();
   for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    if (argument === '--from') {
-      suppliedSource = path.resolve(readValue(args, index, '--from'));
-      index += 1;
-    } else if (argument === '--run') {
-      if (runIdWasSet) throw new Error('Specify the workflow run id only once');
-      runId = readValue(args, index, '--run');
-      runIdWasSet = true;
-      index += 1;
-    } else if (argument === '--commit') {
-      suppliedCommit = readValue(args, index, '--commit').toLowerCase();
-      index += 1;
-    } else if (/^\d+$/.test(argument) && !runIdWasSet) {
-      runId = argument;
-      runIdWasSet = true;
-    } else {
+    const option = args[index];
+    if (!['--from', '--run', '--branch', '--commit'].includes(option)) {
       throw new Error(
-        'Usage: node scripts/refresh-natives.mjs [run-id] [--run run-id] ' +
-        '[--commit 40-character-sha] [--from /path/to/extracted/artifacts]'
+        'Usage: node scripts/refresh-natives.mjs [--from path --run run-id ' +
+        '--branch branch --commit 40-character-sha]'
       );
     }
+    if (values.has(option)) throw new Error(`${option} may be specified only once`);
+    values.set(option, readValue(args, index, option));
+    index += 1;
   }
 
+  if (!values.has('--from')) {
+    throw new Error('--run, --branch, and --commit are accepted only with --from');
+  }
+  if (!values.has('--run') || !values.has('--branch') || !values.has('--commit')) {
+    throw new Error('--run, --branch, and --commit are required with --from');
+  }
+
+  const runId = values.get('--run');
+  const branch = values.get('--branch');
+  const commit = values.get('--commit');
   if (!/^\d+$/.test(runId)) throw new Error(`Invalid workflow run id: ${runId}`);
-  if (suppliedCommit && !/^[0-9a-f]{40}$/.test(suppliedCommit)) {
-    throw new Error(`Invalid fork commit: ${suppliedCommit}`);
+  if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error(`Invalid source commit: ${commit}`);
+  if (runId !== PINNED_RUN_ID) {
+    throw new Error(`Refusing local artifacts: expected run ${PINNED_RUN_ID}, received ${runId}`);
   }
-  if (suppliedSource && !suppliedCommit) {
-    throw new Error('--commit is required with --from because extracted artifacts lack run metadata');
+  if (branch !== SOURCE_BRANCH) {
+    throw new Error(`Refusing local artifacts: expected branch ${SOURCE_BRANCH}, received ${branch}`);
+  }
+  if (commit !== SOURCE_COMMIT) {
+    throw new Error(`Refusing local artifacts: expected commit ${SOURCE_COMMIT}, received ${commit}`);
   }
 
-  return { runId, suppliedSource, suppliedCommit };
+  return { suppliedSource: path.resolve(values.get('--from')) };
 }
 
-function readRunMetadata(runId, expectedCommit) {
+function readPinnedRunMetadata() {
   const output = execFileSync(
     'gh',
     [
       'run',
       'view',
-      runId,
+      PINNED_RUN_ID,
       '--repo',
       REPOSITORY,
       '--json',
-      'headBranch,headSha'
+      'headBranch,headSha,conclusion'
     ],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }
   );
-  const metadata = JSON.parse(output);
+  let metadata;
+  try {
+    metadata = JSON.parse(output);
+  } catch (error) {
+    throw new Error(`Run ${PINNED_RUN_ID} returned invalid metadata JSON`, { cause: error });
+  }
+
   const commit = String(metadata.headSha ?? '').toLowerCase();
   if (metadata.headBranch !== SOURCE_BRANCH) {
     throw new Error(
-      `Refusing run ${runId}: expected branch ${SOURCE_BRANCH}, received ${metadata.headBranch}`
+      `Refusing run ${PINNED_RUN_ID}: expected branch ${SOURCE_BRANCH}, ` +
+      `received ${metadata.headBranch ?? '(missing)'}`
     );
   }
   if (!/^[0-9a-f]{40}$/.test(commit)) {
-    throw new Error(`Run ${runId} did not report a valid headSha`);
+    throw new Error(`Run ${PINNED_RUN_ID} did not report a valid headSha`);
   }
-  if (expectedCommit && expectedCommit !== commit) {
-    throw new Error(`Refusing run ${runId}: expected commit ${expectedCommit}, received ${commit}`);
+  if (commit !== SOURCE_COMMIT) {
+    throw new Error(
+      `Refusing run ${PINNED_RUN_ID}: expected commit ${SOURCE_COMMIT}, received ${commit}`
+    );
   }
-  return commit;
+  if (metadata.conclusion !== 'success') {
+    throw new Error(
+      `Refusing run ${PINNED_RUN_ID}: expected conclusion success, ` +
+      `received ${metadata.conclusion ?? '(missing)'}`
+    );
+  }
 }
 
 function main() {
-  const { runId, suppliedSource, suppliedCommit } = parseArguments();
+  const { suppliedSource } = parseArguments();
   let temporaryDownload;
   try {
     let artifactRoot = suppliedSource;
-    let sourceCommit = suppliedCommit;
     if (!artifactRoot) {
-      sourceCommit = readRunMetadata(runId, suppliedCommit);
+      readPinnedRunMetadata();
       temporaryDownload = mkdtempSync(path.join(tmpdir(), 'sqlite-explorer-natives-'));
       execFileSync(
         'gh',
         [
           'run',
           'download',
-          runId,
+          PINNED_RUN_ID,
           '--repo',
           REPOSITORY,
           '--dir',
@@ -219,11 +244,13 @@ function main() {
       artifactRoot = temporaryDownload;
     }
 
-    const artifacts = findPinnedArtifacts(artifactRoot);
+    // Every provenance, manifest, and hash check completes before the first
+    // destination write, so malformed inputs cannot produce partial installs.
+    const artifacts = readPinnedArtifacts(artifactRoot);
     refreshCopies(artifacts);
     console.log(
-      `Refreshed five pinned txiki.js binaries from ${REPOSITORY} Actions run ${runId} ` +
-      `(${SOURCE_BRANCH}@${sourceCommit}).`
+      `Refreshed five pinned txiki.js binaries from ${REPOSITORY} Actions run ${PINNED_RUN_ID} ` +
+      `(${SOURCE_BRANCH}@${SOURCE_COMMIT}).`
     );
   } finally {
     if (temporaryDownload) {
