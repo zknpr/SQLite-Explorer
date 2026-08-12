@@ -11,6 +11,7 @@ import type { CellValue, DbParams, ExportOptions } from './core/types';
 import type { DatabaseDocument } from './databaseModel';
 import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
+import { encodeCsvExportText } from './core/export-encoding';
 import { getNodeFs } from './core/sqlite-db';
 import {
   EXPORT_CELL_CHUNK_BYTES,
@@ -758,17 +759,12 @@ export function exportToCsv(columns: string[], rows: CellValue[][], includeHeade
   const escapeCsvValue = (value: CellValue): string => {
     if (value === null || value === undefined) return '';
     if (value instanceof Uint8Array) return '[BLOB]';
-    const str = String(value);
-    // If contains comma, quote, or newline, wrap in quotes and escape internal quotes
-    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-      return `"${str.replace(/"/g, '""')}"`;
-    }
-    return str;
+    return typeof value === 'string' ? encodeCsvExportText(value) : String(value);
   };
 
   const lines = [];
   if (includeHeader) {
-    lines.push(columns.map(escapeCsvValue).join(','));
+    lines.push(columns.map(encodeCsvExportText).join(','));
   }
 
   rows.forEach(row => {

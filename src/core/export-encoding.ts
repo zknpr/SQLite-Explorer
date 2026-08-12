@@ -11,6 +11,49 @@ export interface ExportEncodingCell {
 
 export type UnrepresentableTextExportFormat = 'csv' | 'json' | 'sql';
 
+export interface CsvTextInspection {
+  dangerousPrefix: boolean;
+  prefixOpen: boolean;
+  needsQuotes: boolean;
+}
+
+const CSV_FORMULA_START = new Set(['=', '+', '-', '@', '＝', '＋', '－', '＠']);
+const CSV_IGNORABLE_PREFIX = /^(?:\p{White_Space}|\p{Cc}|\p{Cf})$/u;
+
+export function createCsvTextInspection(): CsvTextInspection {
+  return { dangerousPrefix: false, prefixOpen: true, needsQuotes: false };
+}
+
+export function inspectCsvTextChunk(state: CsvTextInspection, text: string): void {
+  if (text.includes(',') || text.includes('"') || text.includes('\n') || text.includes('\r')) {
+    state.needsQuotes = true;
+  }
+  if (!state.prefixOpen) return;
+
+  for (const codePoint of text) {
+    if (CSV_FORMULA_START.has(codePoint)) {
+      state.dangerousPrefix = true;
+      state.needsQuotes = true;
+      state.prefixOpen = false;
+      return;
+    }
+    if (!CSV_IGNORABLE_PREFIX.test(codePoint)) {
+      state.prefixOpen = false;
+      return;
+    }
+  }
+}
+
+/** Encode one Unicode string at the direct-open CSV boundary. */
+export function encodeCsvExportText(text: string): string {
+  const inspection = createCsvTextInspection();
+  inspectCsvTextChunk(inspection, text);
+  const protectedText = inspection.dangerousPrefix ? `'${text}` : text;
+  return inspection.needsQuotes
+    ? `"${protectedText.replace(/"/g, '""')}"`
+    : protectedText;
+}
+
 /**
  * Invalid TEXT cannot be emitted as a Unicode string without replacing bytes.
  * SQL uses SQLite's byte-preserving CAST(X'...' AS TEXT). JSON uses a typed
@@ -120,10 +163,8 @@ export function encodeCsvExportCell(cell: ExportEncodingCell): string {
   if (cell.storageClass === 'null') return '';
   if (cell.storageClass === 'blob') return '[BLOB]';
   if (cell.storageClass === 'integer') return canonicalIntegerText(cell.value);
-  const text = String(cell.value);
-  return text.includes(',') || text.includes('"') || text.includes('\n')
-    ? `"${text.replace(/"/g, '""')}"`
-    : text;
+  if (cell.storageClass === 'text') return encodeCsvExportText(String(cell.value));
+  return String(cell.value);
 }
 
 /** Return the complete JSON token for one bounded export cell. */
