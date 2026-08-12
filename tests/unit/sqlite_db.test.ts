@@ -3,8 +3,24 @@ import './vscode_mock_setup';
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
-import { createDatabaseEngine } from '../../src/core/sqlite-db';
+import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import type { DatabaseOperations, CellUpdate, ModificationEntry } from '../../src/core/types';
+
+async function withFreshWasmEngine(
+    run: (engine: WasmDatabaseEngine) => Promise<void>
+): Promise<void> {
+    const opened = await createDatabaseEngine({
+        content: null,
+        maxSize: 0,
+        readOnlyMode: false
+    });
+    const engine = opened.operations as WasmDatabaseEngine;
+    try {
+        await run(engine);
+    } finally {
+        engine.shutdown();
+    }
+}
 
 describe('WasmDatabaseEngine', () => {
     let engine: DatabaseOperations;
@@ -50,6 +66,187 @@ describe('WasmDatabaseEngine', () => {
             (pragmaEngine as any).shutdown?.();
         }
     });
+
+    it('preserves caller order for heterogeneous batch inserts and trigger side effects', () => (
+        withFreshWasmEngine(async batchEngine => {
+            await batchEngine.executeQuery('CREATE TABLE batch_target (a TEXT, b TEXT)');
+            await batchEngine.executeQuery(
+                'CREATE TABLE batch_audit (sequence INTEGER PRIMARY KEY, value TEXT NOT NULL)'
+            );
+            await batchEngine.executeQuery(`
+                CREATE TRIGGER audit_batch_insert AFTER INSERT ON batch_target
+                BEGIN
+                    INSERT INTO batch_audit (value) VALUES (COALESCE(NEW.a, NEW.b));
+                END
+            `);
+
+            await batchEngine.insertRowBatch('batch_target', [
+                { a: 'first' },
+                { b: 'second' },
+                { a: 'third' }
+            ]);
+
+            const target = await batchEngine.executeQuery(
+                'SELECT COALESCE(a, b) FROM batch_target ORDER BY rowid'
+            );
+            const audit = await batchEngine.executeQuery(
+                'SELECT value FROM batch_audit ORDER BY sequence'
+            );
+            assert.deepStrictEqual({
+                target: target[0].rows.map(row => row[0]),
+                audit: audit[0].rows.map(row => row[0])
+            }, {
+                target: ['first', 'second', 'third'],
+                audit: ['first', 'second', 'third']
+            });
+        })
+    ));
+
+    it('preserves value order for same-shape batch inserts', () => (
+        withFreshWasmEngine(async batchEngine => {
+            await batchEngine.executeQuery('CREATE TABLE same_shape_batch (value TEXT NOT NULL)');
+            await batchEngine.insertRowBatch('same_shape_batch', [
+                { value: 'first' },
+                { value: 'second' },
+                { value: 'third' }
+            ]);
+
+            const result = await batchEngine.executeQuery(
+                'SELECT value FROM same_shape_batch ORDER BY rowid'
+            );
+            assert.deepStrictEqual(
+                result[0].rows.map(row => row[0]),
+                ['first', 'second', 'third']
+            );
+        })
+    ));
+
+    it('supports repeated default-value rows in a batch', () => (
+        withFreshWasmEngine(async batchEngine => {
+            await batchEngine.executeQuery(`
+                CREATE TABLE default_value_batch (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT 'generated'
+                )
+            `);
+            await batchEngine.insertRowBatch('default_value_batch', [{}, {}]);
+
+            const result = await batchEngine.executeQuery(
+                'SELECT id, value FROM default_value_batch ORDER BY rowid'
+            );
+            assert.deepStrictEqual(result[0].rows, [
+                [1, 'generated'],
+                [2, 'generated']
+            ]);
+        })
+    ));
+
+    it('rolls back a failed batch and permits a subsequent successful insert', () => (
+        withFreshWasmEngine(async batchEngine => {
+            await batchEngine.executeQuery(
+                'CREATE TABLE atomic_batch (value TEXT NOT NULL UNIQUE)'
+            );
+
+            await assert.rejects(
+                batchEngine.insertRowBatch('atomic_batch', [
+                    { value: 'first' },
+                    { value: 'duplicate' },
+                    { value: 'duplicate' }
+                ]),
+                /UNIQUE constraint failed/
+            );
+            const afterFailure = await batchEngine.executeQuery(
+                'SELECT value FROM atomic_batch ORDER BY rowid'
+            );
+            assert.deepStrictEqual(afterFailure[0]?.rows ?? [], []);
+
+            await batchEngine.insertRowBatch('atomic_batch', [{ value: 'after' }]);
+            const afterSuccess = await batchEngine.executeQuery(
+                'SELECT value FROM atomic_batch ORDER BY rowid'
+            );
+            assert.deepStrictEqual(afterSuccess[0].rows, [['after']]);
+        })
+    ));
+
+    it('preserves the insert error and every statement cleanup error', () => (
+        withFreshWasmEngine(async batchEngine => {
+            const wasmEngine = batchEngine as any;
+
+            await batchEngine.executeQuery(
+                'CREATE TABLE cleanup_failure_batch (a TEXT UNIQUE, b TEXT UNIQUE)'
+            );
+            const originalPrepare = wasmEngine.instance.prepare.bind(wasmEngine.instance);
+            let preparedInsertCount = 0;
+            wasmEngine.instance.prepare = (sql: string, params?: unknown[]) => {
+                const statement = originalPrepare(sql, params);
+                if (!sql.startsWith('INSERT INTO "cleanup_failure_batch"')) return statement;
+                const cleanupIndex = ++preparedInsertCount;
+                const originalFree = statement.free.bind(statement);
+                statement.free = () => {
+                    originalFree();
+                    throw new Error(`simulated cleanup failure ${cleanupIndex}`);
+                };
+                return statement;
+            };
+
+            let rejection: unknown;
+            try {
+                await batchEngine.insertRowBatch('cleanup_failure_batch', [
+                    { a: 'duplicate' },
+                    { b: 'second' },
+                    { a: 'duplicate' }
+                ]);
+                assert.fail('Expected the duplicate batch to reject');
+            } catch (error) {
+                rejection = error;
+            } finally {
+                wasmEngine.instance.prepare = originalPrepare;
+            }
+
+            assert.ok(rejection instanceof AggregateError);
+            assert.strictEqual(rejection.errors.length, 3);
+            assert.match(String(rejection.errors[0]), /UNIQUE constraint failed/);
+            assert.match(String(rejection.errors[1]), /simulated cleanup failure 1/);
+            assert.match(String(rejection.errors[2]), /simulated cleanup failure 2/);
+            const afterFailure = await batchEngine.executeQuery(
+                'SELECT COALESCE(a, b) FROM cleanup_failure_batch ORDER BY rowid'
+            );
+            assert.deepStrictEqual(afterFailure[0]?.rows ?? [], []);
+        })
+    ));
+
+    it('rolls back when statement finalization reports failure', () => (
+        withFreshWasmEngine(async batchEngine => {
+            const wasmEngine = batchEngine as any;
+
+            await batchEngine.executeQuery('CREATE TABLE finalize_failure_batch (value TEXT)');
+            const originalPrepare = wasmEngine.instance.prepare.bind(wasmEngine.instance);
+            wasmEngine.instance.prepare = (sql: string, params?: unknown[]) => {
+                const statement = originalPrepare(sql, params);
+                if (!sql.startsWith('INSERT INTO "finalize_failure_batch"')) return statement;
+                const originalFree = statement.free.bind(statement);
+                statement.free = () => {
+                    originalFree();
+                    return false;
+                };
+                return statement;
+            };
+
+            try {
+                await assert.rejects(
+                    batchEngine.insertRowBatch('finalize_failure_batch', [{ value: 'first' }]),
+                    /failed to finalize/i
+                );
+            } finally {
+                wasmEngine.instance.prepare = originalPrepare;
+            }
+
+            const afterFailure = await batchEngine.executeQuery(
+                'SELECT value FROM finalize_failure_batch ORDER BY rowid'
+            );
+            assert.deepStrictEqual(afterFailure[0]?.rows ?? [], []);
+        })
+    ));
 
     it('should update multiple cells in a batch', async () => {
         // Setup initial data
