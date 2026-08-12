@@ -12,19 +12,11 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import {
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  rmSync,
-  writeFileSync
-} from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createPinnedArtifactPolicy } from './lib/pinned-artifacts.mjs';
 
 const REPOSITORY = 'zknpr/sql.js';
 const SOURCE_BRANCH = 'agent/paged-vfs-attach-isolation';
@@ -42,79 +34,20 @@ const PAYLOAD_FILENAMES = new Set(Object.keys(PINNED_SHA256));
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, '..');
-
-function sha256(contents) {
-  return createHash('sha256').update(contents).digest('hex');
-}
-
-function portableRelative(root, entryPath) {
-  return path.relative(root, entryPath).split(path.sep).join('/');
-}
-
-function listPayloadPaths(root) {
-  const matches = [];
-  const visit = directory => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const entryPath = path.join(directory, entry.name);
-      if (entry.isDirectory()) {
-        visit(entryPath);
-      } else if (PAYLOAD_FILENAMES.has(entry.name)) {
-        if (!entry.isFile()) {
-          throw new Error(
-            `Artifact manifest contains a non-regular payload: ${portableRelative(root, entryPath)}`
-          );
-        }
-        matches.push(portableRelative(root, entryPath));
-      }
-    }
-  };
-  visit(root);
-  return matches.sort();
-}
-
-function readPinnedArtifacts(root) {
-  const expectedPaths = Object.keys(EXPECTED_ARTIFACT_PATHS).sort();
-  const observedPaths = listPayloadPaths(root);
-  if (
-    expectedPaths.length !== observedPaths.length ||
-    expectedPaths.some((expectedPath, index) => expectedPath !== observedPaths[index])
-  ) {
-    throw new Error(
-      `Artifact manifest mismatch: expected exactly ${expectedPaths.join(', ')}; ` +
-      `received ${observedPaths.length > 0 ? observedPaths.join(', ') : '(none)'}`
-    );
-  }
-
-  const artifacts = new Map();
-  for (const [artifactPath, expectedHash] of Object.entries(EXPECTED_ARTIFACT_PATHS)) {
-    const contents = readFileSync(path.join(root, ...artifactPath.split('/')));
-    const actualHash = sha256(contents);
-    if (actualHash !== expectedHash) {
-      throw new Error(
-        `SHA-256 mismatch for ${artifactPath}: expected ${expectedHash}, received ${actualHash}`
-      );
-    }
-    artifacts.set(artifactPath, contents);
-  }
-  return artifacts;
-}
-
-function atomicWrite(destination, contents, expectedHash) {
-  mkdirSync(path.dirname(destination), { recursive: true });
-  const temporary = `${destination}.${process.pid}.tmp`;
-  try {
-    writeFileSync(temporary, contents);
-    const actualHash = sha256(readFileSync(temporary));
-    if (actualHash !== expectedHash) {
-      throw new Error(
-        `Refusing to install ${destination}: expected ${expectedHash}, received ${actualHash}`
-      );
-    }
-    renameSync(temporary, destination);
-  } finally {
-    rmSync(temporary, { force: true });
-  }
-}
+const {
+  atomicWrite,
+  parseArguments,
+  readPinnedArtifacts,
+  readPinnedRunMetadata
+} = createPinnedArtifactPolicy({
+  scriptName: 'refresh-sqljs.mjs',
+  repository: REPOSITORY,
+  sourceBranch: SOURCE_BRANCH,
+  sourceCommit: SOURCE_COMMIT,
+  pinnedRunId: PINNED_RUN_ID,
+  expectedArtifactPaths: EXPECTED_ARTIFACT_PATHS,
+  payloadFilenames: PAYLOAD_FILENAMES
+});
 
 function refreshCopies(artifacts) {
   const destinations = {
@@ -135,99 +68,6 @@ function refreshCopies(artifacts) {
     for (const destination of artifactDestinations) {
       atomicWrite(destination, contents, expectedHash);
     }
-  }
-}
-
-function readValue(args, index, option) {
-  const value = args[index + 1];
-  if (!value || value.startsWith('--')) throw new Error(`${option} requires a value`);
-  return value;
-}
-
-function parseArguments() {
-  const args = process.argv.slice(2);
-  if (args.length === 0) return { suppliedSource: undefined };
-
-  const values = new Map();
-  for (let index = 0; index < args.length; index += 1) {
-    const option = args[index];
-    if (!['--from', '--run', '--branch', '--commit'].includes(option)) {
-      throw new Error(
-        'Usage: node scripts/refresh-sqljs.mjs [--from path --run run-id ' +
-        '--branch branch --commit 40-character-sha]'
-      );
-    }
-    if (values.has(option)) throw new Error(`${option} may be specified only once`);
-    values.set(option, readValue(args, index, option));
-    index += 1;
-  }
-
-  if (!values.has('--from')) {
-    throw new Error('--run, --branch, and --commit are accepted only with --from');
-  }
-  if (!values.has('--run') || !values.has('--branch') || !values.has('--commit')) {
-    throw new Error('--run, --branch, and --commit are required with --from');
-  }
-
-  const runId = values.get('--run');
-  const branch = values.get('--branch');
-  const commit = values.get('--commit');
-  if (!/^\d+$/.test(runId)) throw new Error(`Invalid workflow run id: ${runId}`);
-  if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error(`Invalid source commit: ${commit}`);
-  if (runId !== PINNED_RUN_ID) {
-    throw new Error(`Refusing local artifacts: expected run ${PINNED_RUN_ID}, received ${runId}`);
-  }
-  if (branch !== SOURCE_BRANCH) {
-    throw new Error(`Refusing local artifacts: expected branch ${SOURCE_BRANCH}, received ${branch}`);
-  }
-  if (commit !== SOURCE_COMMIT) {
-    throw new Error(`Refusing local artifacts: expected commit ${SOURCE_COMMIT}, received ${commit}`);
-  }
-
-  return { suppliedSource: path.resolve(values.get('--from')) };
-}
-
-function readPinnedRunMetadata() {
-  const output = execFileSync(
-    'gh',
-    [
-      'run',
-      'view',
-      PINNED_RUN_ID,
-      '--repo',
-      REPOSITORY,
-      '--json',
-      'headBranch,headSha,conclusion'
-    ],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }
-  );
-  let metadata;
-  try {
-    metadata = JSON.parse(output);
-  } catch (error) {
-    throw new Error(`Run ${PINNED_RUN_ID} returned invalid metadata JSON`, { cause: error });
-  }
-
-  const commit = String(metadata.headSha ?? '').toLowerCase();
-  if (metadata.headBranch !== SOURCE_BRANCH) {
-    throw new Error(
-      `Refusing run ${PINNED_RUN_ID}: expected branch ${SOURCE_BRANCH}, ` +
-      `received ${metadata.headBranch ?? '(missing)'}`
-    );
-  }
-  if (!/^[0-9a-f]{40}$/.test(commit)) {
-    throw new Error(`Run ${PINNED_RUN_ID} did not report a valid headSha`);
-  }
-  if (commit !== SOURCE_COMMIT) {
-    throw new Error(
-      `Refusing run ${PINNED_RUN_ID}: expected commit ${SOURCE_COMMIT}, received ${commit}`
-    );
-  }
-  if (metadata.conclusion !== 'success') {
-    throw new Error(
-      `Refusing run ${PINNED_RUN_ID}: expected conclusion success, ` +
-      `received ${metadata.conclusion ?? '(missing)'}`
-    );
   }
 }
 

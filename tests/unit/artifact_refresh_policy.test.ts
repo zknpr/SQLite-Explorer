@@ -11,6 +11,7 @@ import {
     readdirSync,
     rmSync,
     statSync,
+    symlinkSync,
     writeFileSync
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -185,6 +186,12 @@ function createHarness(spec: ScriptSpec): Harness {
     );
     const scriptPath = path.join(scriptDirectory, spec.scriptName);
     writeFileSync(scriptPath, patchFixtureHashes(sourceScript, spec));
+    const helperDirectory = path.join(scriptDirectory, 'lib');
+    mkdirSync(helperDirectory, { recursive: true });
+    copyFileSync(
+        path.join(sourceRepositoryRoot, 'scripts', 'lib', 'pinned-artifacts.mjs'),
+        path.join(helperDirectory, 'pinned-artifacts.mjs')
+    );
 
     for (const [artifactPath, contents] of Object.entries(spec.artifactContents)) {
         writeFixtureFile(artifactRoot, artifactPath, contents);
@@ -279,6 +286,8 @@ function assertInstalled(harness: Harness, spec: ScriptSpec): void {
             assert.deepEqual(readFileSync(installedPath), expectedContents);
             if (spec.executable) {
                 assert.equal(statSync(installedPath).mode & 0o777, 0o755);
+            } else {
+                assert.equal(statSync(installedPath).mode & 0o111, 0);
             }
         }
     }
@@ -299,6 +308,18 @@ function assertInstalled(harness: Harness, spec: ScriptSpec): void {
     }
     assert.deepEqual(installedFiles.sort(), [...intendedDestinations].sort());
 }
+
+test('refresh scripts share one pinned-artifact policy implementation', () => {
+    for (const spec of scriptSpecs) {
+        const source = readFileSync(
+            path.join(sourceRepositoryRoot, 'scripts', spec.scriptName),
+            'utf8'
+        );
+        assert.match(source, /from ['"]\.\/lib\/pinned-artifacts\.mjs['"]/);
+        assert.doesNotMatch(source, /function readPinnedArtifacts\s*\(/);
+        assert.doesNotMatch(source, /function readPinnedRunMetadata\s*\(/);
+    }
+});
 
 for (const spec of scriptSpecs) {
     describe(`${spec.name} refresh provenance`, () => {
@@ -356,6 +377,15 @@ for (const spec of scriptSpecs) {
                 args.splice(optionIndex, 2);
                 assertRejected(harness, args, /required with --from|requires.*--run.*--branch.*--commit/i);
             }
+        });
+
+        test('rejects provenance options without --from', () => {
+            const harness = createHarness(spec);
+            assertRejected(
+                harness,
+                ['--run', spec.runId, '--branch', spec.branch, '--commit', spec.commit],
+                /accepted only with --from/i
+            );
         });
 
         for (const [label, option, wrongValue, expectedMessage] of [
@@ -420,6 +450,21 @@ for (const spec of scriptSpecs) {
                 harness,
                 localArguments(spec, harness.artifactRoot),
                 /sha-?256|hash|expected/i
+            );
+        });
+
+        test('rejects a symlinked payload before installing', () => {
+            const harness = createHarness(spec);
+            const artifactPath = Object.keys(spec.artifactContents)[0];
+            const target = path.join(harness.artifactRoot, ...artifactPath.split('/'));
+            const decoy = path.join(harness.root, 'decoy');
+            writeFileSync(decoy, readFileSync(target));
+            rmSync(target);
+            symlinkSync(decoy, target);
+            assertRejected(
+                harness,
+                localArguments(spec, harness.artifactRoot),
+                /non-regular|artifact manifest/i
             );
         });
 
