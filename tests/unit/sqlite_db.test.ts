@@ -69,6 +69,7 @@ describe('WasmDatabaseEngine', () => {
 
     it('preserves caller order for heterogeneous batch inserts and trigger side effects', () => (
         withFreshWasmEngine(async batchEngine => {
+            const wasmEngine = batchEngine as any;
             await batchEngine.executeQuery('CREATE TABLE batch_target (a TEXT, b TEXT)');
             await batchEngine.executeQuery(
                 'CREATE TABLE batch_audit (sequence INTEGER PRIMARY KEY, value TEXT NOT NULL)'
@@ -80,11 +81,21 @@ describe('WasmDatabaseEngine', () => {
                 END
             `);
 
-            await batchEngine.insertRowBatch('batch_target', [
-                { a: 'first' },
-                { b: 'second' },
-                { a: 'third' }
-            ]);
+            const originalPrepare = wasmEngine.instance.prepare.bind(wasmEngine.instance);
+            const insertPrepares: string[] = [];
+            wasmEngine.instance.prepare = (sql: string, params?: unknown[]) => {
+                if (sql.startsWith('INSERT INTO "batch_target"')) insertPrepares.push(sql);
+                return originalPrepare(sql, params);
+            };
+            try {
+                await batchEngine.insertRowBatch('batch_target', [
+                    { a: 'first' },
+                    { b: 'second' },
+                    { a: 'third' }
+                ]);
+            } finally {
+                wasmEngine.instance.prepare = originalPrepare;
+            }
 
             const target = await batchEngine.executeQuery(
                 'SELECT COALESCE(a, b) FROM batch_target ORDER BY rowid'
@@ -99,6 +110,10 @@ describe('WasmDatabaseEngine', () => {
                 target: ['first', 'second', 'third'],
                 audit: ['first', 'second', 'third']
             });
+            assert.deepStrictEqual(insertPrepares, [
+                'INSERT INTO "batch_target" ("a") VALUES (?)',
+                'INSERT INTO "batch_target" ("b") VALUES (?)'
+            ]);
         })
     ));
 
@@ -165,6 +180,116 @@ describe('WasmDatabaseEngine', () => {
                 'SELECT value FROM atomic_batch ORDER BY rowid'
             );
             assert.deepStrictEqual(afterSuccess[0].rows, [['after']]);
+        })
+    ));
+
+    it('rejects an invalid table before opening a transaction', () => (
+        withFreshWasmEngine(async batchEngine => {
+            await batchEngine.executeQuery('CREATE TABLE valid_after_invalid_table (value TEXT)');
+
+            await assert.rejects(
+                batchEngine.insertRowBatch(undefined as any, [{ value: 'invalid' }]),
+                TypeError
+            );
+            await batchEngine.insertRowBatch(
+                'valid_after_invalid_table',
+                [{ value: 'after' }]
+            );
+
+            const result = await batchEngine.executeQuery(
+                'SELECT value FROM valid_after_invalid_table ORDER BY rowid'
+            );
+            assert.deepStrictEqual(result[0].rows, [['after']]);
+        })
+    ));
+
+    it('rolls back when preparing a later row shape fails', () => (
+        withFreshWasmEngine(async batchEngine => {
+            const wasmEngine = batchEngine as any;
+            await batchEngine.executeQuery('CREATE TABLE prepare_failure_batch (a TEXT, b TEXT)');
+            const originalPrepare = wasmEngine.instance.prepare.bind(wasmEngine.instance);
+            wasmEngine.instance.prepare = (sql: string, params?: unknown[]) => {
+                if (sql === 'INSERT INTO "prepare_failure_batch" ("b") VALUES (?)') {
+                    throw new Error('simulated second-shape prepare failure');
+                }
+                return originalPrepare(sql, params);
+            };
+
+            try {
+                await assert.rejects(
+                    batchEngine.insertRowBatch('prepare_failure_batch', [
+                        { a: 'first' },
+                        { b: 'second' }
+                    ]),
+                    /simulated second-shape prepare failure/
+                );
+            } finally {
+                wasmEngine.instance.prepare = originalPrepare;
+            }
+
+            const afterFailure = await batchEngine.executeQuery(
+                'SELECT COALESCE(a, b) FROM prepare_failure_batch ORDER BY rowid'
+            );
+            assert.deepStrictEqual(afterFailure[0]?.rows ?? [], []);
+
+            await batchEngine.insertRowBatch('prepare_failure_batch', [{ a: 'after' }]);
+            const afterSuccess = await batchEngine.executeQuery(
+                'SELECT COALESCE(a, b) FROM prepare_failure_batch ORDER BY rowid'
+            );
+            assert.deepStrictEqual(afterSuccess[0].rows, [['after']]);
+        })
+    ));
+
+    it('rolls back when a deferred foreign key rejects commit', () => (
+        withFreshWasmEngine(async batchEngine => {
+            await batchEngine.executeQuery('PRAGMA foreign_keys = ON');
+            const foreignKeys = await batchEngine.executeQuery('PRAGMA foreign_keys');
+            assert.strictEqual(foreignKeys[0].rows[0][0], 1);
+            await batchEngine.executeQuery('CREATE TABLE deferred_parent (id INTEGER PRIMARY KEY)');
+            await batchEngine.executeQuery(`
+                CREATE TABLE deferred_child (
+                    parent_id INTEGER NOT NULL,
+                    value TEXT NOT NULL,
+                    FOREIGN KEY (parent_id) REFERENCES deferred_parent(id)
+                        DEFERRABLE INITIALLY DEFERRED
+                )
+            `);
+
+            const originalExecuteQuery = batchEngine.executeQuery.bind(batchEngine);
+            const transactionCommands: string[] = [];
+            batchEngine.executeQuery = async (sql, params, cancellation) => {
+                if (sql === 'BEGIN TRANSACTION' || sql === 'COMMIT' || sql === 'ROLLBACK') {
+                    transactionCommands.push(sql);
+                }
+                return originalExecuteQuery(sql, params, cancellation);
+            };
+            try {
+                await assert.rejects(
+                    batchEngine.insertRowBatch('deferred_child', [
+                        { parent_id: 404, value: 'must roll back' }
+                    ]),
+                    /FOREIGN KEY constraint failed/
+                );
+            } finally {
+                batchEngine.executeQuery = originalExecuteQuery;
+            }
+            assert.deepStrictEqual(
+                transactionCommands,
+                ['BEGIN TRANSACTION', 'COMMIT', 'ROLLBACK']
+            );
+            const afterFailure = await batchEngine.executeQuery(
+                'SELECT parent_id, value FROM deferred_child ORDER BY rowid'
+            );
+            assert.deepStrictEqual(afterFailure[0]?.rows ?? [], []);
+
+            await batchEngine.executeQuery('INSERT INTO deferred_parent (id) VALUES (1)');
+            await batchEngine.insertRowBatch('deferred_child', [
+                { parent_id: 1, value: 'after' }
+            ]);
+            const afterSuccess = await batchEngine.executeQuery(
+                'SELECT parent_id, value FROM deferred_child ORDER BY rowid'
+            );
+            assert.deepStrictEqual(afterSuccess[0].rows, [[1, 'after']]);
         })
     ));
 

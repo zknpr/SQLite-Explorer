@@ -1955,13 +1955,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       );
     }
 
-    await this.executeQuery('BEGIN TRANSACTION');
     const escapedTable = escapeIdentifier(table);
     const statements = new Map<string, WasmPreparedStatement>();
     let operationFailed = false;
     let operationError: unknown;
     let failedStatement: WasmPreparedStatement | undefined;
 
+    await this.executeQuery('BEGIN TRANSACTION');
     try {
       for (const row of rows) {
         const columns = Object.keys(row);
