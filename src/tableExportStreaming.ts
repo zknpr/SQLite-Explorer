@@ -13,10 +13,14 @@ import { crypto as webCrypto } from './platform/cryptoShim';
 import { escapeIdentifier, validateRowId } from './core/sql-utils';
 import { normalizeCellTextEncoding } from './core/cell-read';
 import {
+  createCsvTextInspection,
   encodeCsvExportCell,
+  encodeCsvExportText,
   encodeJsonExportCell,
   encodeSqlExportCell,
-  getUnrepresentableTextExportEnvelope
+  getUnrepresentableTextExportEnvelope,
+  inspectCsvTextChunk,
+  type CsvTextInspection
 } from './core/export-encoding';
 import {
   buildRecordIdentityPredicate,
@@ -1430,21 +1434,12 @@ async function inspectCsvText(
   operations: DatabaseOperations,
   input: ExportCellSession,
   cancellation?: ExportCancellation
-): Promise<{ representable: boolean; needsQuotes: boolean }> {
-  let needsQuotes = false;
+): Promise<{ representable: boolean; inspection: CsvTextInspection }> {
+  const inspection = createCsvTextInspection();
   const representable = await inspectDecodedText(operations, input, cancellation, async text => {
-    if (text.includes(',') || text.includes('"') || text.includes('\n')) needsQuotes = true;
+    inspectCsvTextChunk(inspection, text);
   });
-  return { representable, needsQuotes };
-}
-
-function escapeCsvValue(value: CellValue): string {
-  if (value === null || value === undefined) return '';
-  if (value instanceof Uint8Array) return '[BLOB]';
-  const text = String(value);
-  return text.includes(',') || text.includes('"') || text.includes('\n')
-    ? `"${text.replace(/"/g, '""')}"`
-    : text;
+  return { representable, inspection };
 }
 
 function needsCellStream(cell: ExportCell): boolean {
@@ -1471,12 +1466,14 @@ async function writeCsvCell(
     return;
   }
   await withCellSession(operations, cell, cancellation, async input => {
-    const inspection = await inspectCsvText(operations, input, cancellation);
-    if (!inspection.representable) {
+    const inspected = await inspectCsvText(operations, input, cancellation);
+    if (!inspected.representable) {
       await writeUnrepresentableText(operations, input, sink, 'csv', cancellation);
       return;
     }
+    const inspection = inspected.inspection;
     if (inspection.needsQuotes) await emit(sink, '"', cancellation);
+    if (inspection.dangerousPrefix) await emit(sink, "'", cancellation);
     await forEachDecodedText(operations, input, cancellation, async text => {
       await emit(
         sink,
@@ -1582,7 +1579,7 @@ async function writeCsvRows(
   let rowCount = 0;
   if (excel) await emit(sink, '\uFEFF', cancellation);
   if (includeHeader) {
-    await emit(sink, columns.map(escapeCsvValue).join(','), cancellation);
+    await emit(sink, columns.map(encodeCsvExportText).join(','), cancellation);
   }
   for await (const row of rows) {
     if (includeHeader || rowCount > 0) {

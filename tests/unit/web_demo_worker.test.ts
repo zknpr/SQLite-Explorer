@@ -311,6 +311,35 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('neutralizes formula-bearing TEXT values and headers in bundled CSV exports', async () => {
+        const worker = await createWorkerHarness();
+        const dangerousHeader = '=WEBSERVICE(A1)';
+        const dangerousText = '\uFEFF+SUM(A1:A2)';
+        await worker.invoke(
+            'runQuery',
+            `CREATE TABLE demo_csv_formula ("${dangerousHeader}" TEXT)`
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_csv_formula VALUES (?)',
+            [dangerousText]
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_csv_formula' },
+            [dangerousHeader],
+            {},
+            {},
+            { format: 'csv' }
+        );
+
+        assert.strictEqual(
+            Array.from(exported.contentChunks).join(''),
+            `"'${dangerousHeader}"\n"'${dangerousText}"`
+        );
+    });
+
     it('exports a 2000-column demo table within SQLite result width', async () => {
         const worker = await createWorkerHarness();
         const columns = Array.from({ length: 2000 }, (_, index) => `c${index}`);
