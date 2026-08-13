@@ -42,7 +42,7 @@ _repro_*.html
 _endpoint_bundle.mjs
 vscode-web-test-db.png
 docs/superpowers/
-docs/security/plans/
+docs/security/
 test_db/
 
 # Security scan exports. These enumerate unfixed vulnerabilities in a shipped
