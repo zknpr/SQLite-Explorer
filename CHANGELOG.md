@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.7.1
+
+### Security
+
+- **Paged databases can no longer attach another live SQLite Explorer connection.** Host-backed `sql.js` connections now reject named and non-literal `ATTACH` statements before their synthetic VFS filenames can resolve, preventing cross-database reads or writable-overlay changes. Anonymous in-memory scratch databases and normal `VACUUM` operations continue to work.
+- **CSV and Excel-compatible exports neutralize spreadsheet formulas.** Attacker-controlled TEXT cells and column headers that begin with formula operators are prefixed safely, including operators hidden behind ASCII or Unicode whitespace, control/format characters, and full-width variants. Numeric negative values keep their numeric meaning.
+- **Native IPC typed arrays expose only their own bytes.** Deserialized values now receive exact-extent backing buffers, so callers cannot widen `.buffer` to inspect or modify adjacent values from the same serialized message. The aligned path remains zero-copy and adds no IPC round trip.
+- **Runtime artifact refreshes fail closed on provenance and layout.** The sql.js and txiki.js refresh scripts now require the exact successful GitHub Actions run, branch, commit, relative payload manifest, and SHA-256 hashes before writing any destination; symlinked, duplicate, misplaced, missing, or unexpected payloads are rejected.
+
+### Fixes
+
+- **Heterogeneous batch inserts preserve caller order.** Rows with different column/default shapes now execute in the supplied sequence, so trigger side effects and generated row IDs remain correctly ordered while prepared statements are still reused. Prepare, execution, cleanup, and commit failures roll back explicitly without hiding the primary error.
+
 ## 1.7.0
 
 ### Features

@@ -1955,56 +1955,85 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       );
     }
 
+    const escapedTable = escapeIdentifier(table);
+    const statements = new Map<string, WasmPreparedStatement>();
+    let operationFailed = false;
+    let operationError: unknown;
+    let failedStatement: WasmPreparedStatement | undefined;
+
     await this.executeQuery('BEGIN TRANSACTION');
     try {
-      const escapedTable = escapeIdentifier(table);
-      const groups = new Map<
-        string,
-        { columns: string[], placeholders: string[], data: CellValue[][] }
-      >();
-
       for (const row of rows) {
         const columns = Object.keys(row);
-        const values = columns.map(col => row[col]);
+        const values = columns.map(column => row[column]);
         const placeholders = values.map(wasmBindPlaceholder);
         const key = `${columns.join('\0')}\0\0${placeholders.join('\0')}`;
-        if (!groups.has(key)) {
-          groups.set(key, { columns, placeholders, data: [] });
+        let statement = statements.get(key);
+        if (!statement) {
+          const sql = columns.length === 0
+            ? `INSERT INTO ${escapedTable} DEFAULT VALUES`
+            : `INSERT INTO ${escapedTable} (${columns.map(escapeIdentifier).join(', ')}) ` +
+              `VALUES (${placeholders.join(', ')})`;
+          statement = this.instance.prepare(sql);
+          statements.set(key, statement);
         }
-        groups.get(key)!.data.push(values);
-      }
-
-      for (const group of groups.values()) {
-        const { columns, placeholders, data } = group;
-        let sql: string;
-        if (columns.length === 0) {
-          sql = `INSERT INTO ${escapedTable} DEFAULT VALUES`;
-          const stmt = this.instance.prepare(sql);
-          try {
-            for (let i = 0; i < data.length; i++) {
-              stmt.run();
-            }
-          } finally {
-            stmt.free();
-          }
-        } else {
-          const colNames = columns.map(escapeIdentifier).join(', ');
-          sql = `INSERT INTO ${escapedTable} (${colNames}) VALUES (${placeholders.join(', ')})`;
-          const stmt = this.instance.prepare(sql);
-          try {
-            for (const params of data) {
-              stmt.run(normalizeWasmBindParams(params));
-            }
-          } finally {
-            stmt.free();
-          }
+        try {
+          if (columns.length === 0) statement.run();
+          else statement.run(normalizeWasmBindParams(values));
+        } catch (error) {
+          failedStatement = statement;
+          throw error;
         }
       }
+    } catch (error) {
+      operationFailed = true;
+      operationError = error;
+    }
 
-      await this.executeQuery('COMMIT');
-    } catch (e) {
+    const cleanupErrors: unknown[] = [];
+    for (const statement of statements.values()) {
+      try {
+        const finalized = statement.free();
+        // sqlite3_finalize repeats the last sqlite3_step error as `false`.
+        // That is the primary operation failure, not a second cleanup error.
+        if (!finalized && statement !== failedStatement) {
+          cleanupErrors.push(new Error('Failed to finalize batch insert statement'));
+        }
+      } catch (error) {
+        // Keep finalizing the remaining shapes; one broken statement must not
+        // leak every later cached statement or hide the primary insert error.
+        cleanupErrors.push(error);
+      }
+    }
+
+    if (operationFailed || cleanupErrors.length > 0) {
+      let errorToThrow: unknown;
+      if (operationFailed && cleanupErrors.length > 0) {
+        errorToThrow = new AggregateError(
+          [operationError, ...cleanupErrors],
+          'Batch insertion failed and statement cleanup also failed'
+        );
+      } else if (operationFailed) {
+        errorToThrow = operationError;
+      } else if (cleanupErrors.length === 1) {
+        errorToThrow = cleanupErrors[0];
+      } else {
+        errorToThrow = new AggregateError(
+          cleanupErrors,
+          'Multiple batch insert statements failed to finalize'
+        );
+      }
       await this.safeRollback('insertRowBatch');
-      throw e;
+      throw errorToThrow;
+    }
+
+    try {
+      // Finalize every statement before committing so cleanup failures still
+      // roll back the batch instead of surfacing after durable side effects.
+      await this.executeQuery('COMMIT');
+    } catch (error) {
+      await this.safeRollback('insertRowBatch');
+      throw error;
     }
   }
 

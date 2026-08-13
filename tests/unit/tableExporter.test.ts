@@ -19,6 +19,10 @@ import { CellValue, DatabaseOperations, ExportOptions, RecordId } from '../../sr
 import { mockVscode } from './mocks/vscode';
 import { DocumentRegistry } from '../../src/documentRegistry';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+import {
+    createCsvTextInspection,
+    inspectCsvTextChunk
+} from '../../src/core/export-encoding';
 import { serializeOperations } from '../../src/core/operation-serializer';
 
 async function collectStreamingExport(
@@ -43,6 +47,103 @@ async function collectStreamingExport(
     );
     return { content: chunks.join(''), chunks, rowCount };
 }
+
+function parseCsvRecords(csv: string): string[][] {
+    const records: string[][] = [];
+    let record: string[] = [];
+    let field = '';
+    let quoted = false;
+
+    const finishRecord = (): void => {
+        record.push(field);
+        records.push(record);
+        record = [];
+        field = '';
+    };
+
+    for (let index = 0; index < csv.length; index++) {
+        const character = csv[index];
+        if (quoted) {
+            if (character === '"') {
+                if (csv[index + 1] === '"') {
+                    field += '"';
+                    index++;
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field += character;
+            }
+            continue;
+        }
+
+        if (character === '"') {
+            assert.strictEqual(field, '', 'CSV quote started after unquoted content');
+            quoted = true;
+        } else if (character === ',') {
+            record.push(field);
+            field = '';
+        } else if (character === '\r' || character === '\n') {
+            if (character === '\r' && csv[index + 1] === '\n') index++;
+            finishRecord();
+        } else {
+            field += character;
+        }
+    }
+
+    assert.strictEqual(quoted, false, 'CSV record ended inside a quoted field');
+    if (field || record.length > 0 || csv.length === 0) finishRecord();
+    return records;
+}
+
+function firstNonIgnorableCsvCodePoint(text: string): string | undefined {
+    for (const codePoint of text) {
+        if (!/^(?:\p{White_Space}|\p{Cc}|\p{Cf})$/u.test(codePoint)) {
+            return codePoint;
+        }
+    }
+    return undefined;
+}
+
+describe('CSV text inspection', () => {
+    it('keeps an ignorable cross-chunk prefix open for every formula operator', () => {
+        const prefixChunks = [' ', '\t', '\r', '\n', '\0', '\uFEFF', '\u200B', '\u2003'];
+
+        for (const operator of ['=', '+', '-', '@', '\uFF1D', '\uFF0B', '\uFF0D', '\uFF20']) {
+            const inspection = createCsvTextInspection();
+            for (const chunk of prefixChunks) {
+                inspectCsvTextChunk(inspection, chunk);
+                assert.strictEqual(inspection.dangerousPrefix, false, operator);
+                assert.strictEqual(inspection.prefixOpen, true, operator);
+            }
+
+            inspectCsvTextChunk(inspection, `${operator}1`);
+            assert.deepStrictEqual(
+                inspection,
+                { dangerousPrefix: true, prefixOpen: false, needsQuotes: true },
+                operator
+            );
+        }
+    });
+
+    it('continues detecting RFC quote triggers after prefix inspection closes', () => {
+        for (const chunk of [',', '"', '\r', '\n']) {
+            const inspection = createCsvTextInspection();
+            inspectCsvTextChunk(inspection, 'ordinary');
+            assert.deepStrictEqual(
+                inspection,
+                { dangerousPrefix: false, prefixOpen: false, needsQuotes: false }
+            );
+
+            inspectCsvTextChunk(inspection, chunk);
+            assert.deepStrictEqual(
+                inspection,
+                { dangerousPrefix: false, prefixOpen: false, needsQuotes: true },
+                JSON.stringify(chunk)
+            );
+        }
+    });
+});
 
 describe('streamTableExport golden parity', () => {
     it('emits headers for empty CSV/Excel results and preserves JSON/SQL empty shapes', async () => {
@@ -167,6 +268,51 @@ describe('streamTableExport golden parity', () => {
                 ['integer', '9223372036854775807'],
                 ['integer', '-9223372036854775808']
             ]);
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('neutralizes bounded CSV and Excel TEXT formulas and headers without changing numeric negatives', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE stage_csv_formula (' +
+            '"=header" TEXT, integer_value INTEGER, real_value REAL' +
+            ')'
+        );
+        await operations.executeQuery(
+            'INSERT INTO stage_csv_formula VALUES (?, ?, ?)',
+            ['\uFEFF@SUM(A1:A2)', -42, -1.25]
+        );
+
+        try {
+            const csv = await collectStreamingExport(
+                operations,
+                'stage_csv_formula',
+                ['=header', 'integer_value', 'real_value'],
+                { format: 'csv' }
+            );
+            const excel = await collectStreamingExport(
+                operations,
+                'stage_csv_formula',
+                ['=header', 'integer_value', 'real_value'],
+                { format: 'excel' }
+            );
+            const expected =
+                '"\'=header",integer_value,real_value\n' +
+                '"\'\uFEFF@SUM(A1:A2)",-42,-1.25';
+
+            assert.strictEqual(csv.content, expected);
+            assert.strictEqual(excel.content, '\uFEFF' + expected);
+            const parsed = parseCsvRecords(csv.content);
+            assert.strictEqual(firstNonIgnorableCsvCodePoint(parsed[0][0]), "'");
+            assert.strictEqual(firstNonIgnorableCsvCodePoint(parsed[1][0]), "'");
+            assert.deepStrictEqual(parsed[1].slice(1), ['-42', '-1.25']);
         } finally {
             (operations as WasmDatabaseEngine).shutdown();
         }
@@ -1036,6 +1182,72 @@ describe('streamTableExport cell boundaries', () => {
             assert.ok(
                 exported.chunks.every(chunk => chunk.length <= 1024 * 1024),
                 'no individual SQL hex emission may grow to a cell-sized string'
+            );
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('neutralizes a CSV formula after a large-TEXT chunk seam without adding a read pass', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        const text = '\t'.repeat(EXPORT_CELL_CHUNK_BYTES) + '+1';
+        await operations.executeQuery(
+            'CREATE TABLE stage_csv_stream_formula ("@value" TEXT)'
+        );
+        await operations.executeQuery(
+            'INSERT INTO stage_csv_stream_formula VALUES (?)',
+            [text]
+        );
+
+        let openedSessions = 0;
+        let chunkReads = 0;
+        const observedOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'openCellReadSession') {
+                    return async (...args: Parameters<DatabaseOperations['openCellReadSession']>) => {
+                        openedSessions++;
+                        return target.openCellReadSession(...args);
+                    };
+                }
+                if (property === 'readCellChunk') {
+                    return async (...args: Parameters<DatabaseOperations['readCellChunk']>) => {
+                        chunkReads++;
+                        return target.readCellChunk(...args);
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+
+        try {
+            const exported = await collectStreamingExport(
+                observedOperations,
+                'stage_csv_stream_formula',
+                ['@value'],
+                { format: 'csv' }
+            );
+
+            const parsed = parseCsvRecords(exported.content);
+            assert.deepStrictEqual(parsed[0], ["'@value"]);
+            assert.ok(
+                parsed[1][0] === "'" + text,
+                'the streamed field must preserve every source code point after the apostrophe'
+            );
+            assert.strictEqual(openedSessions, 1);
+            assert.strictEqual(
+                chunkReads,
+                4,
+                'two source chunks must use only the existing inspection and write passes'
+            );
+            assert.ok(
+                exported.chunks.every(chunk => chunk.length <= EXPORT_CELL_CHUNK_BYTES),
+                'streamed CSV must not emit a second whole-cell buffer'
             );
         } finally {
             (operations as WasmDatabaseEngine).shutdown();
@@ -2280,6 +2492,76 @@ describe('exportToCsv', () => {
 
         const csv = exportToCsv(columns, rows);
         assert.strictEqual(csv, 'val,blob\n,[BLOB]');
+    });
+
+    it('neutralizes every supported formula operator after Unicode ignorable prefixes', () => {
+        const cases = [
+            { value: '=1+1', encoded: '"\'=1+1"' },
+            { value: '+1', encoded: '"\'+1"' },
+            { value: '-1', encoded: '"\'-1"' },
+            { value: '@SUM(A1:A2)', encoded: '"\'@SUM(A1:A2)"' },
+            { value: '\uFF1D1', encoded: '"\'\uFF1D1"' },
+            { value: '\uFF0B1', encoded: '"\'\uFF0B1"' },
+            { value: '\uFF0D1', encoded: '"\'\uFF0D1"' },
+            { value: '\uFF201', encoded: '"\'\uFF201"' },
+            { value: ' =1', encoded: '"\' =1"' },
+            { value: '\t=1', encoded: '"\'\t=1"' },
+            { value: '\r=1', encoded: '"\'\r=1"' },
+            { value: '\n=1', encoded: '"\'\n=1"' },
+            { value: '\0=1', encoded: '"\'\0=1"' },
+            { value: '\uFEFF=1', encoded: '"\'\uFEFF=1"' },
+            { value: '\u200B=1', encoded: '"\'\u200B=1"' },
+            { value: '\u2003=1', encoded: '"\'\u2003=1"' },
+            {
+                value: ' \t\r\n\0\uFEFF\u200B=1',
+                encoded: '"\' \t\r\n\0\uFEFF\u200B=1"'
+            }
+        ];
+
+        for (const testCase of cases) {
+            const encoded = exportToCsv([], [[testCase.value]], false);
+            assert.strictEqual(encoded, testCase.encoded, JSON.stringify(testCase.value));
+            const parsed = parseCsvRecords(encoded);
+            assert.deepStrictEqual(parsed, [["'" + testCase.value]]);
+            assert.strictEqual(firstNonIgnorableCsvCodePoint(parsed[0][0]), "'");
+        }
+    });
+
+    it('neutralizes headers and only JavaScript strings while retaining RFC quoting', () => {
+        const allIgnorable = ' \t\0\uFEFF\u200B';
+        const csv = exportToCsv(
+            ['\uFEFF@SUM(A1:A2)', 'ordinary'],
+            [
+                [-42, -1.25],
+                [-9223372036854775808n, '-text'],
+                ['normal,"quoted"\r\nnext', allIgnorable]
+            ]
+        );
+
+        assert.strictEqual(
+            csv,
+            '"\'\uFEFF@SUM(A1:A2)",ordinary\n' +
+            '-42,-1.25\n' +
+            '-9223372036854775808,"\'-text"\n' +
+            '"normal,""quoted""\r\nnext",' + allIgnorable
+        );
+        assert.deepStrictEqual(parseCsvRecords(csv), [
+            ["'\uFEFF@SUM(A1:A2)", 'ordinary'],
+            ['-42', '-1.25'],
+            ['-9223372036854775808', "'-text"],
+            ['normal,"quoted"\r\nnext', allIgnorable]
+        ]);
+        assert.strictEqual(exportToCsv([], [['']], false), '');
+        assert.strictEqual(exportToCsv([], [['\r']], false), '"\r"');
+        assert.strictEqual(exportToCsv([], [["'=1"]], false), "'=1");
+    });
+
+    it('combines formula neutralization with comma, quote, CR, and LF escaping', () => {
+        const dangerous = '\uFEFF=SUM("A1,A2")\r\n+1';
+        const csv = exportToCsv([], [[dangerous]], false);
+
+        assert.strictEqual(csv, '"\'\uFEFF=SUM(""A1,A2"")\r\n+1"');
+        assert.deepStrictEqual(parseCsvRecords(csv), [["'" + dangerous]]);
     });
 });
 
