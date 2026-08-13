@@ -30,12 +30,11 @@ const EXPECTED_ARTIFACT_PATHS = Object.freeze({
   'dist/sql-wasm.js': PINNED_SHA256['sql-wasm.js'],
   'dist/sql-wasm.wasm': PINNED_SHA256['sql-wasm.wasm']
 });
-const PAYLOAD_FILENAMES = new Set(Object.keys(PINNED_SHA256));
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, '..');
 const {
-  atomicWrite,
+  installArtifacts,
   parseArguments,
   readPinnedArtifacts,
   readPinnedRunMetadata
@@ -45,8 +44,7 @@ const {
   sourceBranch: SOURCE_BRANCH,
   sourceCommit: SOURCE_COMMIT,
   pinnedRunId: PINNED_RUN_ID,
-  expectedArtifactPaths: EXPECTED_ARTIFACT_PATHS,
-  payloadFilenames: PAYLOAD_FILENAMES
+  expectedArtifactPaths: EXPECTED_ARTIFACT_PATHS
 });
 
 function refreshCopies(artifacts) {
@@ -62,13 +60,15 @@ function refreshCopies(artifacts) {
     ]
   };
 
-  for (const [artifactPath, artifactDestinations] of Object.entries(destinations)) {
-    const contents = artifacts.get(artifactPath);
-    const expectedHash = EXPECTED_ARTIFACT_PATHS[artifactPath];
-    for (const destination of artifactDestinations) {
-      atomicWrite(destination, contents, expectedHash);
-    }
-  }
+  installArtifacts(
+    Object.entries(destinations).flatMap(([artifactPath, artifactDestinations]) =>
+      artifactDestinations.map(destination => ({
+        destination,
+        contents: artifacts.get(artifactPath),
+        expectedHash: EXPECTED_ARTIFACT_PATHS[artifactPath]
+      }))
+    )
+  );
 }
 
 function main() {
@@ -95,8 +95,8 @@ function main() {
       artifactRoot = temporaryDownload;
     }
 
-    // Every provenance, manifest, and hash check completes before the first
-    // destination write, so malformed inputs cannot produce partial installs.
+    // Provenance and artifact hashes are checked before the rollback-protected
+    // destination batch begins.
     const artifacts = readPinnedArtifacts(artifactRoot);
     refreshCopies(artifacts);
     console.log(

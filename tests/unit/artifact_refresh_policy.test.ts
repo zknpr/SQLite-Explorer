@@ -8,7 +8,9 @@ import {
     mkdirSync,
     mkdtempSync,
     readFileSync,
+    realpathSync,
     readdirSync,
+    renameSync,
     rmSync,
     statSync,
     symlinkSync,
@@ -137,6 +139,7 @@ if (args[0] !== 'run' || (args[1] !== 'view' && args[1] !== 'download')) {
     console.error('unexpected fake gh arguments: ' + JSON.stringify(args));
     process.exit(90);
 }
+
 if (args[2] !== expectedRun) {
     console.error('unexpected run id: ' + args[2]);
     process.exit(91);
@@ -158,6 +161,37 @@ for (const entry of fs.readdirSync(source)) {
     fs.cpSync(path.join(source, entry), path.join(destination, entry), { recursive: true });
 }
 `;
+}
+
+function renameFailureModuleSource(): string {
+    return `import { renameSync } from 'node:fs';
+
+let failureInjected = false;
+export function renameFile(source, destination) {
+    if (
+        !failureInjected &&
+        process.env.FAKE_RENAME_FAILURE_DESTINATION &&
+        String(destination) === process.env.FAKE_RENAME_FAILURE_DESTINATION
+    ) {
+        failureInjected = true;
+        throw new Error('injected artifact commit rename failure');
+    }
+    renameSync(source, destination);
+}
+`;
+}
+
+function injectRenameDependency(script: string): string {
+    const policyCall = script.indexOf('createPinnedArtifactPolicy({');
+    const policyCallEnd = script.indexOf('\n});', policyCall);
+    assert.notEqual(policyCall, -1, 'fixture script must create a pinned-artifact policy');
+    assert.notEqual(policyCallEnd, -1, 'fixture policy call must have a closing delimiter');
+    return (
+        "import { renameFile as testRenameFile } from './rename-failure-injection.mjs';\n" +
+        script.slice(0, policyCallEnd) +
+        '\n}, { renameFile: testRenameFile });' +
+        script.slice(policyCallEnd + '\n});'.length)
+    );
 }
 
 interface Harness {
@@ -185,7 +219,11 @@ function createHarness(spec: ScriptSpec): Harness {
         'utf8'
     );
     const scriptPath = path.join(scriptDirectory, spec.scriptName);
-    writeFileSync(scriptPath, patchFixtureHashes(sourceScript, spec));
+    writeFileSync(scriptPath, injectRenameDependency(patchFixtureHashes(sourceScript, spec)));
+    writeFileSync(
+        path.join(scriptDirectory, 'rename-failure-injection.mjs'),
+        renameFailureModuleSource()
+    );
     const helperDirectory = path.join(scriptDirectory, 'lib');
     mkdirSync(helperDirectory, { recursive: true });
     copyFileSync(
@@ -212,7 +250,10 @@ function createHarness(spec: ScriptSpec): Harness {
     const fakeGh = path.join(fakeBin, 'gh');
     writeFileSync(fakeGh, fakeGhSource());
     chmodSync(fakeGh, 0o755);
-
+    writeFileSync(
+        path.join(fakeBin, 'gh.cmd'),
+        `@echo off\r\n"${process.execPath}" "%~dp0gh" %*\r\n`
+    );
     return {
         root,
         repositoryRoot,
@@ -271,6 +312,8 @@ function assertRejected(
     expectedMessage: RegExp
 ): void {
     const result = runScript(harness, args);
+    assert.equal(result.signal, null, combinedOutput(result));
+    assert.equal(typeof result.status, 'number', combinedOutput(result));
     assert.notEqual(result.status, 0, combinedOutput(result));
     assert.match(combinedOutput(result), expectedMessage);
     assertDestinationsUnchanged(harness);
@@ -309,6 +352,96 @@ function assertInstalled(harness: Harness, spec: ScriptSpec): void {
     assert.deepEqual(installedFiles.sort(), [...intendedDestinations].sort());
 }
 
+test('restores every destination when a later artifact commit fails', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'artifact-install-rollback-'));
+    temporaryRoots.add(root);
+    const firstDestination = path.join(root, 'first.bin');
+    const secondDestination = path.join(root, 'second.bin');
+    const firstOriginal = Buffer.from('first original\n');
+    const secondOriginal = Buffer.from('second original\n');
+    const firstReplacement = Buffer.from('first replacement\n');
+    const secondReplacement = Buffer.from('second replacement\n');
+    writeFileSync(firstDestination, firstOriginal);
+    writeFileSync(secondDestination, secondOriginal);
+
+    const modulePath = '../../scripts/lib/pinned-artifacts.mjs';
+    const { createPinnedArtifactPolicy } = await import(modulePath);
+    const commitFailure = new Error('injected second-destination commit failure');
+    let failureInjected = false;
+    const { installArtifacts } = createPinnedArtifactPolicy(
+        {
+            scriptName: 'rollback-test.mjs',
+            repository: 'example/repository',
+            sourceBranch: 'reviewed-branch',
+            sourceCommit: 'a'.repeat(40),
+            pinnedRunId: '123',
+            expectedArtifactPaths: {
+                'first.bin': sha256(firstReplacement),
+                'second.bin': sha256(secondReplacement)
+            }
+        },
+        {
+            renameFile(source: string, destination: string): void {
+                if (!failureInjected && destination === secondDestination) {
+                    failureInjected = true;
+                    throw commitFailure;
+                }
+                renameSync(source, destination);
+            }
+        }
+    );
+
+    let thrown: unknown;
+    try {
+        installArtifacts([
+            {
+                destination: firstDestination,
+                contents: firstReplacement,
+                expectedHash: sha256(firstReplacement)
+            },
+            {
+                destination: secondDestination,
+                contents: secondReplacement,
+                expectedHash: sha256(secondReplacement)
+            }
+        ]);
+    } catch (error) {
+        thrown = error;
+    }
+
+    assert.strictEqual(thrown, commitFailure);
+    assert.equal(failureInjected, true);
+    assert.deepEqual(readFileSync(firstDestination), firstOriginal);
+    assert.deepEqual(readFileSync(secondDestination), secondOriginal);
+    assert.deepEqual(readdirSync(root).sort(), ['first.bin', 'second.bin']);
+});
+
+test('derives monitored payload names from the exact artifact manifest', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'artifact-manifest-derivation-'));
+    temporaryRoots.add(root);
+    const contents = Buffer.from('reviewed payload\n');
+    writeFixtureFile(root, 'nested/payload.bin', contents);
+    writeFixtureFile(root, 'unexpected/payload.bin', contents);
+
+    const modulePath = '../../scripts/lib/pinned-artifacts.mjs';
+    const { createPinnedArtifactPolicy } = await import(modulePath);
+    const { readPinnedArtifacts } = createPinnedArtifactPolicy({
+        scriptName: 'manifest-test.mjs',
+        repository: 'example/repository',
+        sourceBranch: 'reviewed-branch',
+        sourceCommit: 'a'.repeat(40),
+        pinnedRunId: '123',
+        expectedArtifactPaths: {
+            'nested/payload.bin': sha256(contents)
+        }
+    });
+
+    assert.throws(
+        () => readPinnedArtifacts(root),
+        /Artifact manifest mismatch: expected exactly nested\/payload\.bin; received nested\/payload\.bin, unexpected\/payload\.bin/
+    );
+});
+
 test('refresh scripts share one pinned-artifact policy implementation', () => {
     for (const spec of scriptSpecs) {
         const source = readFileSync(
@@ -344,7 +477,7 @@ for (const spec of scriptSpecs) {
             [
                 'unsuccessful conclusion',
                 { headBranch: spec.branch, headSha: spec.commit, conclusion: 'failure' },
-                /expected.*success|conclusion/i
+                /expected conclusion success/i
             ],
             [
                 'missing branch metadata',
@@ -359,7 +492,7 @@ for (const spec of scriptSpecs) {
             [
                 'missing conclusion metadata',
                 { headBranch: spec.branch, headSha: spec.commit },
-                /expected.*success|conclusion/i
+                /expected conclusion success/i
             ]
         ] as const) {
             test(`default mode rejects ${label} without partial writes`, () => {
@@ -408,7 +541,7 @@ for (const spec of scriptSpecs) {
             assertRejected(
                 harness,
                 localArguments(spec, harness.artifactRoot),
-                /artifact manifest|missing/i
+                /Artifact manifest mismatch/i
             );
         });
 
@@ -423,7 +556,7 @@ for (const spec of scriptSpecs) {
             assertRejected(
                 harness,
                 localArguments(spec, harness.artifactRoot),
-                /artifact manifest|unexpected|duplicate/i
+                /Artifact manifest mismatch/i
             );
         });
 
@@ -437,7 +570,7 @@ for (const spec of scriptSpecs) {
             assertRejected(
                 harness,
                 localArguments(spec, harness.artifactRoot),
-                /artifact manifest|unexpected|missing/i
+                /Artifact manifest mismatch/i
             );
         });
 
@@ -449,11 +582,13 @@ for (const spec of scriptSpecs) {
             assertRejected(
                 harness,
                 localArguments(spec, harness.artifactRoot),
-                /sha-?256|hash|expected/i
+                /SHA-256 mismatch/i
             );
         });
 
-        test('rejects a symlinked payload before installing', () => {
+        test('rejects a symlinked payload before installing', {
+            skip: process.platform === 'win32' ? 'symlink creation requires Windows privileges' : false
+        }, () => {
             const harness = createHarness(spec);
             const artifactPath = Object.keys(spec.artifactContents)[0];
             const target = path.join(harness.artifactRoot, ...artifactPath.split('/'));
@@ -473,6 +608,22 @@ for (const spec of scriptSpecs) {
             const result = runScript(harness, localArguments(spec, harness.artifactRoot));
             assert.equal(result.status, 0, combinedOutput(result));
             assertInstalled(harness, spec);
+        });
+
+        test('rolls back earlier destinations when a later commit rename fails', () => {
+            const harness = createHarness(spec);
+            const laterDestination = [...harness.sentinels.keys()][1];
+            assert.ok(laterDestination, 'fixture must contain at least two destinations');
+            harness.environment.FAKE_RENAME_FAILURE_DESTINATION = path.join(
+                realpathSync(harness.repositoryRoot),
+                laterDestination
+            );
+
+            assertRejected(
+                harness,
+                localArguments(spec, harness.artifactRoot),
+                /injected artifact commit rename failure/
+            );
         });
     });
 }

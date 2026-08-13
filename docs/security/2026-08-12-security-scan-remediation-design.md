@@ -24,7 +24,7 @@ The no-change findings will be documented in the pull request, not represented b
 
 All CSV-producing paths will share one formula-neutralization policy before normal RFC-style CSV quoting.
 
-A string is dangerous when the first character after zero or more Unicode White_Space, Cc, or Cf code points is equals, plus, minus, at-sign, or its full-width counterpart. A leading tab, carriage return, or line feed is also treated as dangerous. Dangerous text receives one leading apostrophe and is always enclosed in double quotes with embedded double quotes escaped. The apostrophe is therefore the first parsed cell character when a spreadsheet directly opens the export.
+A string is dangerous when the first character after zero or more Unicode White_Space, Cc, or Cf code points is equals, plus, minus, at-sign, or its full-width counterpart. A leading tab, carriage return, or line feed is scanned as part of that ignorable prefix rather than treated as dangerous on its own; carriage returns and line feeds still force normal CSV quoting. Dangerous text receives one leading apostrophe and is always enclosed in double quotes with embedded double quotes escaped. The apostrophe is therefore the first parsed cell character when a spreadsheet directly opens the export.
 
 The policy applies to:
 
@@ -77,7 +77,11 @@ txiki flow:
 4. Update scripts/refresh-natives.mjs to accept and verify that source branch and pin the run, commit, and five hashes.
 5. Install all five platform binaries under natives with executable modes preserved.
 
-The refresh scripts must fail closed on a branch, commit, run, filename, or hash mismatch. The downstream pull request will name the exact upstream pull requests, commits, CI runs, and artifact hashes.
+The refresh scripts must fail closed on a branch, commit, run, filename, or hash mismatch. Payload basenames are derived from the exact artifact manifest so adding a manifest entry cannot omit that filename from duplicate and misplaced-payload detection.
+
+Every destination replacement is staged in a same-directory workspace, assigned its final mode, and hash-verified before the commit phase changes any destination. The commit phase moves each original into its workspace before installing the staged replacement. If a later synchronous filesystem operation fails, the scripts restore earlier destinations in reverse order; rollback and cleanup failures are reported explicitly, and a backup whose restoration failed is retained for recovery.
+
+This is rollback protection for ordinary synchronous failures, not a crash-atomic multi-file filesystem transaction. A process crash or power loss during the commit window can still require rerunning the pinned refresh. The downstream pull request will name the exact upstream pull requests, commits, CI runs, and artifact hashes.
 
 ## Generated Artifacts
 

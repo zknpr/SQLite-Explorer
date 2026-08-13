@@ -29,12 +29,11 @@ const PINNED_SHA256 = Object.freeze({
   'x86_64-macos/tjs': '57645ccb7bcfec8a220a05a37b2fae204c667ac703de7a6be7ce121b5ef8883a',
   'x86_64-windows/tjs.exe': '78768640f59cd413bc0a6ed28709d9161d4d7fe3682c6d4276489f532399c5d9'
 });
-const PAYLOAD_FILENAMES = new Set(['tjs', 'tjs.exe']);
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, '..');
 const {
-  atomicWrite,
+  installArtifacts,
   parseArguments,
   readPinnedArtifacts,
   readPinnedRunMetadata
@@ -45,18 +44,17 @@ const {
   sourceCommit: SOURCE_COMMIT,
   pinnedRunId: PINNED_RUN_ID,
   expectedArtifactPaths: PINNED_SHA256,
-  payloadFilenames: PAYLOAD_FILENAMES,
   executable: true
 });
 
 function refreshCopies(artifacts) {
-  for (const [target, expectedHash] of Object.entries(PINNED_SHA256)) {
-    atomicWrite(
-      path.join(repositoryRoot, 'natives', ...target.split('/')),
-      artifacts.get(target),
+  installArtifacts(
+    Object.entries(PINNED_SHA256).map(([target, expectedHash]) => ({
+      destination: path.join(repositoryRoot, 'natives', ...target.split('/')),
+      contents: artifacts.get(target),
       expectedHash
-    );
-  }
+    }))
+  );
 }
 
 function main() {
@@ -83,8 +81,8 @@ function main() {
       artifactRoot = temporaryDownload;
     }
 
-    // Every provenance, manifest, and hash check completes before the first
-    // destination write, so malformed inputs cannot produce partial installs.
+    // Provenance and artifact hashes are checked before the rollback-protected
+    // destination batch begins.
     const artifacts = readPinnedArtifacts(artifactRoot);
     refreshCopies(artifacts);
     console.log(

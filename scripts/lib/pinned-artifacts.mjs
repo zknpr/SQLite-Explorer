@@ -2,6 +2,8 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  existsSync,
+  mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -32,9 +34,14 @@ export function createPinnedArtifactPolicy({
   sourceCommit,
   pinnedRunId,
   expectedArtifactPaths,
-  payloadFilenames,
   executable = false
-}) {
+}, {
+  renameFile = renameSync
+} = {}) {
+  const payloadFilenames = new Set(
+    Object.keys(expectedArtifactPaths).map(artifactPath => path.posix.basename(artifactPath))
+  );
+
   function listPayloadPaths(root) {
     const matches = [];
     const visit = directory => {
@@ -83,21 +90,118 @@ export function createPinnedArtifactPolicy({
     return artifacts;
   }
 
-  function atomicWrite(destination, contents, expectedHash) {
-    mkdirSync(path.dirname(destination), { recursive: true });
-    const temporary = `${destination}.${process.pid}.tmp`;
-    try {
-      writeFileSync(temporary, contents);
-      if (executable) chmodSync(temporary, 0o755);
-      const actualHash = sha256(readFileSync(temporary));
-      if (actualHash !== expectedHash) {
-        throw new Error(
-          `Refusing to install ${destination}: expected ${expectedHash}, received ${actualHash}`
-        );
+  function cleanupWorkspaces(entries) {
+    const errors = [];
+    for (const entry of entries) {
+      try {
+        rmSync(entry.workspace, { recursive: true, force: true });
+      } catch (error) {
+        errors.push(new Error(`Failed to clean artifact workspace ${entry.workspace}`, {
+          cause: error
+        }));
       }
-      renameSync(temporary, destination);
-    } finally {
-      rmSync(temporary, { force: true });
+    }
+    return errors;
+  }
+
+  function throwWithSecondaryErrors(primaryError, secondaryErrors, message) {
+    if (secondaryErrors.length === 0) throw primaryError;
+    throw new AggregateError([primaryError, ...secondaryErrors], message, {
+      cause: primaryError
+    });
+  }
+
+  function installArtifacts(replacements) {
+    const entries = [];
+    try {
+      for (const replacement of replacements) {
+        const directory = path.dirname(replacement.destination);
+        mkdirSync(directory, { recursive: true });
+        const workspace = mkdtempSync(
+          path.join(directory, `.${path.basename(replacement.destination)}.refresh-`)
+        );
+        const entry = {
+          ...replacement,
+          workspace,
+          staged: path.join(workspace, 'staged'),
+          backup: path.join(workspace, 'original'),
+          originalMoved: false,
+          installed: false
+        };
+        entries.push(entry);
+
+        writeFileSync(entry.staged, entry.contents);
+        if (executable) chmodSync(entry.staged, 0o755);
+        const actualHash = sha256(readFileSync(entry.staged));
+        if (actualHash !== entry.expectedHash) {
+          throw new Error(
+            `Refusing to install ${entry.destination}: expected ${entry.expectedHash}, ` +
+            `received ${actualHash}`
+          );
+        }
+      }
+    } catch (error) {
+      throwWithSecondaryErrors(
+        error,
+        cleanupWorkspaces(entries),
+        'Artifact staging failed and cleanup was incomplete'
+      );
+    }
+
+    try {
+      for (const entry of entries) {
+        if (existsSync(entry.destination)) {
+          renameFile(entry.destination, entry.backup);
+          entry.originalMoved = true;
+        }
+        renameFile(entry.staged, entry.destination);
+        entry.installed = true;
+      }
+    } catch (error) {
+      const rollbackErrors = [];
+      for (const entry of entries.slice().reverse()) {
+        if (entry.installed) {
+          try {
+            rmSync(entry.destination, { force: true });
+            entry.installed = false;
+          } catch (rollbackError) {
+            rollbackErrors.push(new Error(
+              `Failed to remove partially installed artifact ${entry.destination}`,
+              { cause: rollbackError }
+            ));
+          }
+        }
+        if (entry.originalMoved) {
+          try {
+            renameFile(entry.backup, entry.destination);
+            entry.originalMoved = false;
+          } catch (rollbackError) {
+            rollbackErrors.push(new Error(
+              `Failed to restore original artifact ${entry.destination}; backup remains at ${entry.backup}`,
+              { cause: rollbackError }
+            ));
+          }
+        }
+      }
+
+      // A failed restoration keeps its workspace because that directory holds
+      // the only recoverable copy of the original destination.
+      const cleanupErrors = cleanupWorkspaces(
+        entries.filter(entry => !entry.originalMoved)
+      );
+      throwWithSecondaryErrors(
+        error,
+        [...rollbackErrors, ...cleanupErrors],
+        'Artifact installation failed and rollback was incomplete'
+      );
+    }
+
+    const cleanupErrors = cleanupWorkspaces(entries);
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        cleanupErrors,
+        'Artifacts were installed, but transaction workspace cleanup failed'
+      );
     }
   }
 
@@ -187,5 +291,10 @@ export function createPinnedArtifactPolicy({
     }
   }
 
-  return { atomicWrite, parseArguments, readPinnedArtifacts, readPinnedRunMetadata };
+  return {
+    installArtifacts,
+    parseArguments,
+    readPinnedArtifacts,
+    readPinnedRunMetadata
+  };
 }

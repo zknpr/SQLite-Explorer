@@ -249,6 +249,55 @@
 
   Stage the scripts, tests, `vendor/sql.js`, `assets/sqlite3.wasm`, web-demo sql.js files, and five `natives` platform binaries. Commit with `fix(security): pin isolated runtime artifacts`.
 
+### Task 3A: Address artifact-policy review findings
+
+**Files:**
+
+- Modify: `scripts/lib/pinned-artifacts.mjs`
+- Modify: `scripts/refresh-sqljs.mjs`
+- Modify: `scripts/refresh-natives.mjs`
+- Modify: `tests/unit/artifact_refresh_policy.test.ts`
+- Modify: `docs/security/2026-08-12-security-scan-remediation-design.md`
+
+**Interfaces:**
+
+- `createPinnedArtifactPolicy(configuration, dependencies?)` derives the payload basename set from `expectedArtifactPaths` and returns `installArtifacts(replacements)` instead of a per-file writer.
+- Each replacement contains `destination`, `contents`, and `expectedHash`; the optional dependency object supplies `renameFile` only so the focused test can deterministically inject a commit-phase filesystem failure.
+
+- [ ] **Step 1: Write the rollback regression before changing production code**
+
+  Create two real destination files and two replacement buffers in a temporary directory. Inject a rename operation that throws only when the staged second replacement is first moved into its final destination. Assert that installation rejects with that primary error, both original destination bytes are restored, and no transaction workspace remains.
+
+- [ ] **Step 2: Run the focused test and record RED**
+
+  ```bash
+  node --import tsx --test --test-name-pattern='restores every destination' tests/unit/artifact_refresh_policy.test.ts
+  ```
+
+  Expected before implementation: the policy has no batch installation operation, so it cannot restore a destination already replaced before a later rename fails.
+
+- [ ] **Step 3: Implement a staged, rollback-protected batch commit**
+
+  Derive payload basenames with `path.posix.basename()` from the exact manifest. For each replacement, create a same-directory transaction workspace, write and mode the staged file, and verify its SHA-256 before changing any destination. During commit, move each original into its workspace before moving the staged file into place. If any commit rename fails, walk the replacements in reverse, remove newly installed files, restore every original, clean all workspaces, and rethrow the primary error. If rollback or cleanup also fails, throw an `AggregateError` that retains the primary failure.
+
+- [ ] **Step 4: Wire both refresh scripts to one batch call**
+
+  Build the complete replacement array in `refreshCopies()` and invoke `installArtifacts()` once. Remove the independent `PAYLOAD_FILENAMES` declarations and the comments that claim prevalidation alone prevents partial installs.
+
+- [ ] **Step 5: Harden the portable test harness and negative assertions**
+
+  On Windows create `gh.cmd` beside the POSIX `gh` shim, skip the symlink-specific case, require `signal === null` and a numeric nonzero exit status for every rejected process, and match the exact conclusion, manifest-mismatch, and SHA-256 failure families instead of alternations that overlap unrelated errors.
+
+- [ ] **Step 6: Correct the security design and verify GREEN**
+
+  Document that tabs, carriage returns, and line feeds are scanned as ignorable prefixes rather than being independently dangerous; carriage returns and line feeds still force normal CSV quoting. Document that artifact replacement is rollback-protected for synchronous filesystem failures but is not a crash-atomic multi-file filesystem transaction. Run:
+
+  ```bash
+  node --import tsx --test tests/unit/artifact_refresh_policy.test.ts
+  npx tsc --noEmit -p tsconfig.json
+  npm test
+  ```
+
 ---
 
 ### Task 4: Regenerate bundles and verify the completed downstream branch
