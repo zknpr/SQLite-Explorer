@@ -11,8 +11,9 @@
 
 import { RPC_TIMEOUT_MS, getRpcTimeoutMs } from './rpc-constants.js';
 import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from './transport.js';
-import { DEFAULT_MAX_INLINE_CELL_BYTES } from '../../../src/core/cell-containment.ts';
 import {
+    CellEditPolicyError,
+    DEFAULT_MAX_CELL_EDIT_BYTES,
     formatOversizedCellReplacementWarning,
     isOversizedCellReplacementConflictError
 } from '../../../src/core/cell-edit-policy.ts';
@@ -84,7 +85,7 @@ export const backendApi = {
             }]);
             if (
                 (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
-                && metadata.byteLength > DEFAULT_MAX_INLINE_CELL_BYTES
+                && metadata.byteLength > DEFAULT_MAX_CELL_EDIT_BYTES
             ) {
                 if (!window.confirm(formatOversizedCellReplacementWarning(
                     table,
@@ -103,7 +104,7 @@ export const backendApi = {
                             storageClass: metadata.storageClass,
                             byteLength: metadata.byteLength
                         },
-                        DEFAULT_MAX_INLINE_CELL_BYTES
+                        DEFAULT_MAX_CELL_EDIT_BYTES
                     ]);
                 } catch (error) {
                     if (isOversizedCellReplacementConflictError(error)) continue;
@@ -116,7 +117,7 @@ export const backendApi = {
                 column,
                 value,
                 originalValue,
-                DEFAULT_MAX_INLINE_CELL_BYTES
+                DEFAULT_MAX_CELL_EDIT_BYTES
             ]);
         }
     },
@@ -128,7 +129,7 @@ export const backendApi = {
         sendRpcRequest('closeCellReadSession', [sessionId]),
     insertRow: (table, data) => sendRpcRequest(
         'insertRow',
-        [table, data, DEFAULT_MAX_INLINE_CELL_BYTES]
+        [table, data, DEFAULT_MAX_CELL_EDIT_BYTES]
     ),
     deleteRows: (table, rowIds) => sendRpcRequest('deleteRows', [table, rowIds]),
     deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),
@@ -178,7 +179,7 @@ export const backendApi = {
     },
     updateCellBatch: (table, updates, label) => sendRpcRequest(
         'updateCellBatch',
-        [table, updates, label, DEFAULT_MAX_INLINE_CELL_BYTES]
+        [table, updates, label, DEFAULT_MAX_CELL_EDIT_BYTES]
     ),
     addColumn: (table, column, type, defaultValue) => sendRpcRequest('addColumn', [table, column, type, defaultValue]),
     fetchTableData: (table, options) => sendRpcRequest('fetchTableData', [table, options]),
@@ -219,25 +220,53 @@ export const backendApi = {
     // Web-compatible implementations for Blob Inspector
     saveFile: (filename, data) => sendRpcRequest('saveFile', [filename, data]),
     selectFile: () => {
-        return new Promise((resolve) => {
+        return new Promise((resolve, reject) => {
             const input = document.createElement('input');
             input.type = 'file';
             input.style.display = 'none';
+            const parent = document.body;
+            let removed = false;
+            const cleanup = () => {
+                if (removed) return;
+                removed = true;
+                parent.removeChild(input);
+            };
             input.onchange = async (e) => {
-                if (e.target.files.length > 0) {
-                    const file = e.target.files[0];
-                    const buffer = await file.arrayBuffer();
-                    resolve({
-                        name: file.name,
-                        data: new Uint8Array(buffer)
-                    });
-                } else {
-                    resolve(undefined);
+                try {
+                    if (e.target.files.length > 0) {
+                        const file = e.target.files[0];
+                        if (!Number.isSafeInteger(file.size) || file.size < 0) {
+                            throw new Error('Unable to determine the selected file size safely.');
+                        }
+                        if (file.size > DEFAULT_MAX_CELL_EDIT_BYTES) {
+                            throw new CellEditPolicyError(
+                                'blob',
+                                file.size,
+                                DEFAULT_MAX_CELL_EDIT_BYTES
+                            );
+                        }
+                        const buffer = await file.arrayBuffer();
+                        const data = new Uint8Array(buffer);
+                        if (data.byteLength > DEFAULT_MAX_CELL_EDIT_BYTES) {
+                            throw new CellEditPolicyError(
+                                'blob',
+                                data.byteLength,
+                                DEFAULT_MAX_CELL_EDIT_BYTES
+                            );
+                        }
+                        resolve({ name: file.name, data });
+                    } else {
+                        resolve(undefined);
+                    }
+                } catch (error) {
+                    reject(error);
+                } finally {
+                    cleanup();
                 }
             };
-            document.body.appendChild(input);
+            parent.appendChild(input);
             input.click();
-            setTimeout(() => document.body.removeChild(input), 1000);
+            setTimeout(cleanup, 1000);
         });
     }
 };
