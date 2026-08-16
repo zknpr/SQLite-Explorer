@@ -1,9 +1,11 @@
 /**
- * SQLite Explorer - Web Demo Entry Point
+ * SQLite Explorer - Desktop Entry Point
  *
- * Modified version of viewer.js that uses parent window communication
- * instead of VS Code API. This enables the viewer to run standalone
- * in a browser iframe.
+ * Tauri desktop build of viewer.js. The webview page IS the host process
+ * (see desktop-host.js's own header comment): there is no VS Code extension
+ * host and no parent-window/iframe boundary to bridge. `window.__SQLITE_DESKTOP__`
+ * (injected by the native shell) is what desktop-host.js uses for file I/O,
+ * settings, and native menus.
  */
 import { state, persistState } from './modules/state.js';
 import { backendApi, initDesktopApi } from './modules/desktop-api.js';
@@ -57,11 +59,12 @@ import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
 setCountCacheDemoMode(true);
 
 // ============================================================================
-// Web-specific RPC initialization
+// Webview methods the desktop host invokes directly
 // ============================================================================
 
 /**
- * Methods that can be called by the parent window.
+ * Methods the desktop host (desktop-host.js) calls directly via
+ * host.setWebviewMethods(webviewMethods) — no message channel involved.
  */
 const webviewMethods = {
     async refreshContent(filename, connectionResult) {
@@ -136,7 +139,7 @@ async function initializeApp() {
 
         updateStatus('Connecting to database...');
 
-        // Initialize connection - parent window handles this
+        // Initialize connection - the desktop host handles this
         const result = await backendApi.initialize();
         if (!applyConnectionResult(result)) {
             throw new Error('Failed to connect to database');
@@ -172,32 +175,47 @@ if (!bridge) {
     initDesktopApi(host);
     host.setWebviewMethods(webviewMethods);
 
-    bridge.onMenu(async (id) => {
-        if (id === 'open-db') await host.openDatabaseViaDialog();
-        else if (id === 'save-db') await host.saveToDisk();
-        else if (id === 'refresh-db') await host.refreshFromDisk();
-    });
-
-    // VS Code intercepts these outside the webview; the desktop wires them here.
-    document.addEventListener('keydown', async (event) => {
-        const inEditor = document.activeElement?.tagName === 'INPUT'
-            || document.activeElement?.tagName === 'TEXTAREA';
-        const primary = event.metaKey || event.ctrlKey;
-        if (!primary || inEditor) return;
-        const key = event.key.toLowerCase();
-        if (key === 'z' && !event.shiftKey) { event.preventDefault(); await backendApi.triggerUndo(); }
-        else if ((key === 'z' && event.shiftKey) || key === 'y') { event.preventDefault(); await backendApi.triggerRedo(); }
-        else if (key === 's') { event.preventDefault(); await host.saveToDisk(); }
-        else if (key === 'o') { event.preventDefault(); await host.openDatabaseViaDialog(); }
-    });
-
     // Follow the OS theme; VS Code pushes updateColorScheme, the desktop asks the OS.
+    // Safe to wire before start(): it never touches the host or worker.
     const media = window.matchMedia('(prefers-color-scheme: dark)');
     const applyScheme = () => { document.documentElement.style.colorScheme = media.matches ? 'dark' : 'light'; };
     applyScheme();
     media.addEventListener('change', applyScheme);
 
-    host.start().then(initializeApp).catch(err => {
+    host.start().then(() => {
+        // Registered only after host.start() resolves. Both handlers reach
+        // into the worker (openDatabaseViaDialog/saveToDisk/triggerUndo/...),
+        // which doesn't exist until start() has booted it — registering
+        // earlier would let an early menu click or Cmd+O land on a null
+        // worker.
+        bridge.onMenu(async (id) => {
+            if (id === 'open-db') await host.openDatabaseViaDialog();
+            else if (id === 'save-db') await host.saveToDisk();
+            else if (id === 'refresh-db') await host.refreshFromDisk();
+        });
+
+        // VS Code intercepts these outside the webview; the desktop wires them here.
+        document.addEventListener('keydown', async (event) => {
+            // Mirrors hasActiveTextEditor() in modules/global-shortcuts.js:12-21
+            // (not exported, so replicated here) — keep this the one definition
+            // of "user is typing" in this file if that function's logic changes.
+            const inEditor = state.editingCellInfo
+                || document.activeElement?.tagName === 'INPUT'
+                || document.activeElement?.tagName === 'TEXTAREA'
+                || event.target?.tagName === 'INPUT'
+                || event.target?.tagName === 'TEXTAREA'
+                || event.target?.isContentEditable === true;
+            const primary = event.metaKey || event.ctrlKey;
+            if (!primary || inEditor) return;
+            const key = event.key.toLowerCase();
+            if (key === 'z' && !event.shiftKey) { event.preventDefault(); await backendApi.triggerUndo(); }
+            else if ((key === 'z' && event.shiftKey) || key === 'y') { event.preventDefault(); await backendApi.triggerRedo(); }
+            else if (key === 's') { event.preventDefault(); await host.saveToDisk(); }
+            else if (key === 'o') { event.preventDefault(); await host.openDatabaseViaDialog(); }
+        });
+
+        return initializeApp();
+    }).catch(err => {
         console.error('Desktop init error:', err);
         showErrorState(err.message);
     });
