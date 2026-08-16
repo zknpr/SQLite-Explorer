@@ -29,10 +29,13 @@ const UNDOABLE_METHODS = new Set([
     'createView', 'editView', 'dropView'
 ]);
 const BARRIER_METHODS = new Set([
-    'addColumn', 'deleteColumns', 'createTable', 'setPragma', 'replaceOversizedCell'
+    'addColumn', 'deleteColumns', 'createTable', 'setPragma', 'replaceOversizedCell',
+    // No live webview call site invokes insertRowBatch today; barrier-by-default
+    // keeps dirty-tracking honest until someone designs its undo/redo replay.
+    'insertRowBatch'
 ]);
 
-export function createDesktopHost({ bridge, createWorker, confirmFn = (msg) => globalThis.confirm(msg) }) {
+export function createDesktopHost({ bridge, createWorker }) {
     let worker = null;
     let messageCounter = 0;
     const pendingCalls = new Map();
@@ -106,6 +109,7 @@ export function createDesktopHost({ bridge, createWorker, confirmFn = (msg) => g
                 const [table, rowId, column, value, originalValue] = args;
                 return {
                     label: `Edit ${column}`,
+                    description: `Edit ${column}`,
                     modificationType: 'cell_update',
                     targetTable: table,
                     targetRowId: rowId,
@@ -117,72 +121,108 @@ export function createDesktopHost({ bridge, createWorker, confirmFn = (msg) => g
             }
             case 'updateCellBatch': {
                 const [table, updates, label] = args;
+                const summaryLabel = label || `Edit ${updates.length} cells`;
+                // Build affectedCells from the worker's authoritative
+                // CellUpdateResult[] (result), not the caller's request array
+                // (updates/args[1]). The worker re-reads priorValue from the row
+                // at update time and computes newRowId only when a primary-key
+                // member actually changed — the caller's originalValue can be
+                // stale and args never carries a newRowId concept at all. The
+                // rowid-table path never reports newRowId (CellUpdateResult in
+                // src/core/types.ts: "Identity to use after the update when a PK
+                // member changed"); default to the unchanged rowId there,
+                // matching undoModification's own `cell.newRowId ?? cell.rowId`.
                 return {
-                    label: label || `Edit ${updates.length} cells`,
+                    label: summaryLabel,
+                    description: summaryLabel,
                     modificationType: 'cell_update',
                     targetTable: table,
-                    affectedCells: updates.map(u => ({
-                        rowId: u.rowId,
-                        newRowId: u.rowId,
-                        columnName: u.column,
-                        priorValue: u.originalValue,
-                        newValue: u.value
+                    affectedCells: result.map(r => ({
+                        rowId: r.rowId,
+                        newRowId: r.newRowId ?? r.rowId,
+                        columnName: r.columnName,
+                        priorValue: r.priorValue,
+                        newValue: r.newValue,
+                        operation: r.operation
                     }))
                 };
             }
             case 'insertRow': {
-                const [table] = args;
+                const [table, data] = args;
                 return {
                     label: 'Insert row',
+                    description: 'Insert row',
                     modificationType: 'row_insert',
                     targetTable: table,
-                    targetRowId: result
+                    targetRowId: result,
+                    // redoModification's row_insert case reads `rowData` (not
+                    // args) to reconstruct the insert; without it, redo silently
+                    // inserts an empty row.
+                    rowData: data
                 };
             }
             case 'deleteRows': {
-                const [table] = args;
+                const [table, rowIds] = args;
                 return {
                     label: 'Delete rows',
+                    description: 'Delete rows',
                     modificationType: 'row_delete',
                     targetTable: table,
-                    deletedRows: result
+                    deletedRows: result,
+                    // Self-discovered while auditing insertRow's analogous gap
+                    // above (not one of the review's 3 listed defects — flagged
+                    // separately in the report): redoModification's row_delete
+                    // case reads `affectedRowIds` (not deletedRows) to
+                    // re-delete; without it, redo silently deletes nothing.
+                    affectedRowIds: rowIds
                 };
             }
             case 'createView': {
-                const [view, selectSql] = args;
+                const [view] = args;
                 return {
                     label: `Create view ${view}`,
+                    description: `Create view ${view}`,
                     modificationType: 'view_create',
                     targetTable: view,
-                    viewDefAfter: selectSql
+                    // The worker's createView() return IS the post-create
+                    // ViewDefinition (it fetches one internally via
+                    // getViewDefinition) — required so the undo-path CAS guard
+                    // (assertViewDefinitionStateCurrent) compares real stored
+                    // sqlite_schema SQL, not the user's raw SELECT body string.
+                    viewDefAfter: result
                 };
             }
-            // editView/dropView need the prior definition; the wrapper fetches
-            // it before the mutation and threads it through `context`.
+            // editView/dropView build their modification directly in
+            // invokeMutation from the worker's own {before, after} / before
+            // result (see below) — no separate pre-fetch needed.
             default:
                 return null;
         }
     }
 
     async function invokeMutation(method, args) {
-        // Views: capture the prior definition for undo before mutating.
-        let priorViewDef = null;
-        if (method === 'editView' || method === 'dropView') {
-            priorViewDef = await callWorker('getViewDefinition', [args[0]]);
-        }
         const result = await callWorker(method, args);
         if (result && typeof result === 'object' && result.cancelled === true) return result;
 
         let modification = buildModification(method, args, result);
         if (method === 'editView') {
+            // editView's own result already carries {before, after} as real
+            // ViewDefinition objects (worker.js editView / types.ts
+            // ViewEditResult) — using args[1] (the raw SELECT body string) here
+            // would make the undo-path CAS guard
+            // (assertViewDefinitionStateCurrent) compare a bare SELECT fragment
+            // against sqlite_schema's stored CREATE VIEW text and always fail.
             modification = {
-                label: `Edit view ${args[0]}`, modificationType: 'view_edit', targetTable: args[0],
-                viewDefBefore: priorViewDef, viewDefAfter: args[1]
+                label: `Edit view ${args[0]}`, description: `Edit view ${args[0]}`,
+                modificationType: 'view_edit', targetTable: args[0],
+                viewDefBefore: result.before, viewDefAfter: result.after
             };
         } else if (method === 'dropView') {
+            // dropView's own result IS the pre-drop ViewDefinition.
             modification = {
-                label: `Drop view ${args[0]}`, modificationType: 'view_drop', targetTable: args[0],
-                viewDefBefore: priorViewDef
+                label: `Drop view ${args[0]}`, description: `Drop view ${args[0]}`,
+                modificationType: 'view_drop', targetTable: args[0],
+                viewDefBefore: result
             };
         }
         if (modification) tracker.record(modification);
@@ -304,7 +344,18 @@ export function createDesktopHost({ bridge, createWorker, confirmFn = (msg) => g
             if (local) return local(...args);
             if (BARRIER_METHODS.has(method)) {
                 const result = await callWorker(method, args);
-                tracker.record({ label: method, undoPolicy: 'barrier' });
+                // No ModificationType union member fits a generic DDL/pragma
+                // barrier (there's no "barrier"/"pragma" entry); the literal RPC
+                // method name is used for modificationType/description instead.
+                // This has no runtime effect: ModificationTracker.stepBack()
+                // refuses to pop a barrier entry, so undoModification/
+                // redoModification never destructure it.
+                tracker.record({
+                    label: method,
+                    description: method,
+                    modificationType: method,
+                    undoPolicy: 'barrier'
+                });
                 if (settings.instantCommit === 'always' && currentPath) await saveToDisk();
                 updateTitle();
                 return result;
@@ -316,6 +367,12 @@ export function createDesktopHost({ bridge, createWorker, confirmFn = (msg) => g
         async openDatabaseViaDialog() {
             const picked = await bridge.pickDatabase();
             if (!picked) return false;
+            if (settings.maxFileSize > 0 && picked.size > settings.maxFileSize * 1024 * 1024) {
+                throw new Error(
+                    `Cannot open "${picked.name}": file is ${picked.size} bytes, which exceeds ` +
+                    `the ${settings.maxFileSize} MiB cap set by the maxFileSize setting.`
+                );
+            }
             const bytes = await bridge.readDatabaseBytes(picked.path);
             return openFromBytes(picked.path, picked.name, bytes);
         },

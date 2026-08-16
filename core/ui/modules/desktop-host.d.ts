@@ -33,8 +33,6 @@ export interface CreateDesktopHostOptions {
     bridge: DesktopHostBridge;
     /** Factory so tests can inject a fake worker instead of a real `Worker`. */
     createWorker: () => Worker;
-    /** Defaults to `globalThis.confirm` when omitted. */
-    confirmFn?: (message: string) => boolean;
 }
 
 /**
