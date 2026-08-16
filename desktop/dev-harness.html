@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SQLite Explorer desktop harness</title>
+<script>
+// Mock of the Tauri-injected bridge, for browser-based development and the
+// Playwright smoke in the app repo. File picks go through a hidden input.
+(function () {
+  let menuHandler = null;
+  let settings = {};
+  const input = () => {
+    const el = document.createElement('input');
+    el.type = 'file';
+    el.style.display = 'none';
+    return el;
+  };
+  let pickedFile = null; // File object; path is synthetic in the harness
+  window.__SQLITE_DESKTOP__ = {
+    async pickDatabase() {
+      return new Promise((resolvePick) => {
+        const el = input();
+        el.accept = '.db,.sqlite,.sqlite3,.db3,.sdb,.s3db,.gpkg';
+        el.onchange = () => {
+          const file = el.files[0] ?? null;
+          pickedFile = file;
+          resolvePick(file ? { path: `harness://${file.name}`, name: file.name, size: file.size } : null);
+          el.remove();
+        };
+        document.body.appendChild(el);
+        el.click();
+        setTimeout(() => { if (!el.files?.length) { resolvePick(null); el.remove(); } }, 60000);
+      });
+    },
+    async readDatabaseBytes(path) {
+      if (!pickedFile || path !== `harness://${pickedFile.name}`) throw new Error('path not allowlisted');
+      return new Uint8Array(await pickedFile.arrayBuffer());
+    },
+    async saveDatabase(_path, bytes) {
+      console.log(`[harness] saveDatabase: ${bytes.byteLength} bytes (discarded)`);
+    },
+    async saveFileAs(defaultName, bytes) {
+      const blob = new Blob([bytes]);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = defaultName;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 100);
+      return `harness-download://${defaultName}`;
+    },
+    async loadSettings() { return settings; },
+    async saveSettings(next) { settings = next; },
+    onMenu(handler) { menuHandler = handler; },
+    async setTitle(title) { document.title = title; }
+  };
+  // Expose for the smoke driver: window.__HARNESS_MENU__('open-db') etc.
+  window.__HARNESS_MENU__ = (id) => menuHandler && menuHandler(id);
+})();
+</script>
+<script>
+// Load the real viewer document into this page after the mock exists.
+fetch('./viewer.html')
+  .then(r => r.text())
+  .then(html => {
+    document.open();
+    // Re-inject the bridge: document.open() wipes the window's inline scripts
+    // but not properties already set on window — verify and keep this comment
+    // accurate. If WKWebView/Chrome clears them, switch the harness to copying
+    // the two scripts of viewer.html into this document instead.
+    document.write(html);
+    document.close();
+  });
+</script>
+</head>
+<body><p style="font-family:sans-serif;padding:1em">Loading viewer…</p></body>
+</html>

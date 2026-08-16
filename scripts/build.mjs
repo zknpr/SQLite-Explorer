@@ -443,6 +443,77 @@ const bundleWebDemoViewer = async () => {
 };
 
 /**
+ * Bundle the desktop viewer HTML + runtime into desktop/.
+ * Consumed by the Tauri shell repo (SQLite-Explorer-App) via its sync script.
+ * Artifacts are committed and deterministic: always minified, like the
+ * website worker bundle.
+ */
+const bundleDesktopViewer = async () => {
+  const templatePath = resolve('core', 'ui', 'viewer.template.html');
+  const cssPath = resolve('core', 'ui', 'viewer.css');
+  const jsPath = resolve('core', 'ui', 'desktop-viewer.js');
+  const outputDir = resolve('desktop');
+  const outputPath = resolve(outputDir, 'viewer.html');
+
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  const template = fs.readFileSync(templatePath, 'utf-8');
+  const css = fs.readFileSync(cssPath, 'utf-8');
+
+  const desktopApiPlugin = {
+    name: 'desktop-api-plugin',
+    setup(build) {
+      build.onResolve({ filter: /\/api\.js$/ }, args => {
+        if (args.importer.includes('core/ui/modules') || args.importer.includes('core/ui/desktop-viewer')) {
+          return { path: resolve('core', 'ui', 'modules', 'desktop-api.js') };
+        }
+        return null;
+      });
+    }
+  };
+
+  const jsResult = await esbuild.build({
+    entryPoints: [jsPath],
+    bundle: true,
+    write: false,
+    minify: true,
+    format: 'iife',
+    target: 'es2020',
+    plugins: [desktopApiPlugin],
+    loader: { '.js': 'js', '.ts': 'ts' }
+  });
+  const finalJs = jsResult.outputFiles[0].text;
+
+  const cssResult = await esbuild.transform(css, { loader: 'css', minify: true });
+  const finalCss = cssResult.code;
+
+  // Local codicons (offline); the Tauri CSP forbids remote origins.
+  const codiconLink = '<link rel="stylesheet" href="./codicons/codicon.css">';
+
+  const bundled = template
+    .replace('<!--HEAD-->', () => codiconLink)
+    .replace('<!--STYLES-->', () => finalCss)
+    .replace('<!--SCRIPTS-->', () => finalJs)
+    .replace('nonce="<!--NONCE-->"', ''); // Tauri injects CSP hashes for inline scripts in bundled assets
+
+  fs.writeFileSync(outputPath, bundled, 'utf-8');
+  console.log('Bundled desktop viewer: desktop/viewer.html');
+
+  // Runtime files beside the viewer: worker + sql.js + codicons.
+  fs.copyFileSync(
+    resolve('website', 'public', 'sqlite-viewer', 'worker.js'),
+    resolve(outputDir, 'worker.js')
+  );
+  fs.copyFileSync(resolve('vendor', 'sql.js', 'sql-wasm.js'), resolve(outputDir, 'sql-wasm.js'));
+  fs.copyFileSync(resolve('vendor', 'sql.js', 'sql-wasm.wasm'), resolve(outputDir, 'sql-wasm.wasm'));
+  const codiconsOut = resolve(outputDir, 'codicons');
+  fs.mkdirSync(codiconsOut, { recursive: true });
+  for (const file of ['codicon.css', 'codicon.ttf']) {
+    fs.copyFileSync(resolve('node_modules', '@vscode', 'codicons', 'dist', file), resolve(codiconsOut, file));
+  }
+};
+
+/**
  * Validate that required output files exist after build.
  * Throws error if any required files are missing.
  */
@@ -456,7 +527,12 @@ const validateBuildOutputs = () => {
     'core/ui/viewer.html',
     'website/public/sqlite-viewer/worker.js',
     'website/public/sqlite-viewer/sql-wasm.js',
-    'website/public/sqlite-viewer/sql-wasm.wasm'
+    'website/public/sqlite-viewer/sql-wasm.wasm',
+    'desktop/viewer.html',
+    'desktop/worker.js',
+    'desktop/sql-wasm.js',
+    'desktop/sql-wasm.wasm',
+    'desktop/codicons/codicon.css'
   ];
 
   const missingFiles = requiredFiles.filter(file => !fs.existsSync(resolve(file)));
@@ -498,6 +574,13 @@ const compileExt = async (target) => {
     }
     throw new Error(`Build failed: ${failures.length} task(s) failed: ${failures.map(f => f.task.name).join(', ')}`);
   }
+
+  // Desktop viewer bundling reads website/public/sqlite-viewer/worker.js, which
+  // bundleWebDemoWorker writes above. buildTasks runs its entries concurrently
+  // (Promise.allSettled), so bundleDesktopViewer can't be one of them without
+  // racing that write — it runs here instead, after the whole parallel batch
+  // (bundleWebDemoWorker included) has settled.
+  await bundleDesktopViewer();
 
   // Validate all required outputs exist
   validateBuildOutputs();

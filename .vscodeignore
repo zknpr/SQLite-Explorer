@@ -48,6 +48,13 @@ scripts/
 tsconfig.json
 CLAUDE.md
 
+# Exclude the desktop (Tauri shell) build target. desktop/ artifacts are
+# consumed by the separate SQLite-Explorer-App repo's sync script, not by the
+# VS Code extension — already caught by the default-deny above, but called
+# out explicitly (repo convention) so the .vsix never ships it even if the
+# default-deny rules above it change.
+desktop/**
+
 # Exclude development files
 .git/
 .gitignore
