@@ -1,0 +1,60 @@
+/**
+ * Types for desktop-host.js — the Tauri desktop host that owns the sql.js
+ * worker, undo/redo history, settings, and bridge-backed file I/O.
+ */
+
+/** Result of a successful native "Open Database" file-picker round trip. */
+export interface PickedDatabase {
+    path: string;
+    name: string;
+    size: number;
+}
+
+/**
+ * Native shell services desktop-host.js depends on. Implemented by
+ * `bridge.js` (Task 8) and mocked directly in tests and the Task 5 harness.
+ */
+export interface DesktopHostBridge {
+    pickDatabase(): Promise<PickedDatabase | null>;
+    /** `path` must be session-allowlisted (previously picked/opened). */
+    readDatabaseBytes(path: string): Promise<Uint8Array>;
+    /** Writes `bytes` to `path` atomically. */
+    saveDatabase(path: string, bytes: Uint8Array): Promise<void>;
+    /** Resolves to the chosen path, or null if the user cancelled the dialog. */
+    saveFileAs(defaultName: string, bytes: Uint8Array): Promise<string | null>;
+    loadSettings(): Promise<Record<string, unknown>>;
+    saveSettings(settings: Record<string, unknown>): Promise<void>;
+    onMenu(handler: (id: string) => void): void;
+    setTitle(title: string): Promise<void>;
+}
+
+/** Options accepted by {@link createDesktopHost}. */
+export interface CreateDesktopHostOptions {
+    bridge: DesktopHostBridge;
+    /** Factory so tests can inject a fake worker instead of a real `Worker`. */
+    createWorker: () => Worker;
+    /** Defaults to `globalThis.confirm` when omitted. */
+    confirmFn?: (message: string) => boolean;
+}
+
+/**
+ * Public surface returned by {@link createDesktopHost}. `invoke` is the
+ * single entry point desktop-api.js calls for every RPC method name; the
+ * remaining methods are the host-level operations the native menu/toolbar
+ * drive directly (open/save dialogs, refresh, unsaved-changes state).
+ */
+export interface DesktopHost {
+    /** Boots the worker with an empty database. */
+    start(): Promise<void>;
+    invoke(method: string, args: unknown[]): Promise<unknown>;
+    /** Registers webview-side callbacks (e.g. `refreshContent`) the host notifies after mutations. */
+    setWebviewMethods(methods: Record<string, (...args: unknown[]) => unknown>): void;
+    openDatabaseViaDialog(): Promise<boolean>;
+    openDatabaseFromFile(file: File): Promise<boolean>;
+    saveToDisk(): Promise<boolean>;
+    refreshFromDisk(): Promise<void>;
+    hasUnsavedChanges(): boolean;
+    currentFilename(): string | null;
+}
+
+export function createDesktopHost(options: CreateDesktopHostOptions): DesktopHost;
