@@ -196,6 +196,38 @@ test('updateCellBatch defaults newRowId to the unchanged rowId when the worker r
   assert.equal(cells[0].newRowId, 3);   // defaulted to rowId, not left undefined
 });
 
+// Redo-direction coverage (fix round 3): the recorded descriptor must survive
+// undo→redo intact and reach redoModification's cell_update case (worker.js
+// ~line 2166), which maps affectedCells[].rowId/columnName/newValue/operation
+// back into updateCellBatch's update shape.
+test('updateCellBatch descriptor survives undo→redo intact: affectedCells (incl. newRowId/operation) reach redoModification', async () => {
+  const redone: unknown[][] = [];
+  const { host } = makeHost({
+    updateCellBatch: () => ([
+      { rowId: 5, newRowId: 9, columnName: 'sku', priorValue: 'A', newValue: 'B', operation: 'set' }
+    ]),
+    undoModification: () => ({ success: true }),
+    redoModification: (args) => { redone.push(args); return { success: true }; }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.invoke('updateCellBatch', ['items', [
+    { rowId: 5, column: 'sku', value: 'B', originalValue: 'STALE' }
+  ]]);
+  await host.invoke('triggerUndo', []);
+  await host.invoke('triggerRedo', []);
+
+  assert.equal(redone.length, 1);
+  const mod = (redone[0] as unknown[])[0] as Record<string, unknown>;
+  const cells = mod.affectedCells as Array<Record<string, unknown>>;
+  assert.equal(cells.length, 1);
+  assert.equal(cells[0].rowId, 5);
+  assert.equal(cells[0].newRowId, 9);
+  assert.equal(cells[0].columnName, 'sku');
+  assert.equal(cells[0].newValue, 'B');
+  assert.equal(cells[0].operation, 'set');
+});
+
 test('insertRow records rowData for redo; undo deletes via targetRowId, redo re-inserts via rowData', async () => {
   const undone: unknown[][] = [];
   const redone: unknown[][] = [];
@@ -312,6 +344,35 @@ test('createView records the worker-returned ViewDefinition object (not the raw 
   assert.equal((mod.viewDefAfter as Record<string, unknown>).sql, viewDef.sql);
 });
 
+// Redo-direction coverage (fix round 3): redoModification's view_create case
+// (worker.js ~line 2204) reads viewDefAfter to replay the create — must
+// survive undo→redo as the real object, not be dropped or stringified.
+test('createView descriptor survives undo→redo intact: ViewDefinition object (with .sql) reaches redoModification', async () => {
+  const redone: unknown[][] = [];
+  const viewDef = {
+    identifier: 'v_active',
+    sql: 'CREATE VIEW "v_active" AS SELECT * FROM users WHERE active = 1',
+    selectSql: 'SELECT * FROM users WHERE active = 1',
+    triggers: []
+  };
+  const { host } = makeHost({
+    createView: () => viewDef,
+    undoModification: () => ({ success: true }),
+    redoModification: (args) => { redone.push(args); return { success: true }; }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.invoke('createView', ['v_active', 'SELECT * FROM users WHERE active = 1']);
+  await host.invoke('triggerUndo', []);
+  await host.invoke('triggerRedo', []);
+
+  assert.equal(redone.length, 1);
+  const mod = (redone[0] as unknown[])[0] as Record<string, unknown>;
+  assert.equal(mod.modificationType, 'view_create');
+  assert.deepEqual(mod.viewDefAfter, viewDef);
+  assert.equal((mod.viewDefAfter as Record<string, unknown>).sql, viewDef.sql);
+});
+
 test('editView records the worker-returned {before, after} ViewDefinition pair for undo', async () => {
   const undone: unknown[][] = [];
   const before = {
@@ -338,6 +399,35 @@ test('editView records the worker-returned {before, after} ViewDefinition pair f
   assert.deepEqual(mod.viewDefAfter, after);
 });
 
+// Redo-direction coverage (fix round 3): redoModification's view_edit case
+// (worker.js ~line 2211) requires BOTH viewDefBefore and viewDefAfter to
+// replay the edit — must survive undo→redo as the real objects.
+test('editView descriptor survives undo→redo intact: {before, after} ViewDefinitions reach redoModification', async () => {
+  const redone: unknown[][] = [];
+  const before = {
+    identifier: 'v1', sql: 'CREATE VIEW "v1" AS SELECT a FROM t', selectSql: 'SELECT a FROM t', triggers: []
+  };
+  const after = {
+    identifier: 'v1', sql: 'CREATE VIEW "v1" AS SELECT a, b FROM t', selectSql: 'SELECT a, b FROM t', triggers: []
+  };
+  const { host } = makeHost({
+    editView: () => ({ before, after }),
+    undoModification: () => ({ success: true }),
+    redoModification: (args) => { redone.push(args); return { success: true }; }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.invoke('editView', ['v1', 'SELECT a, b FROM t']);
+  await host.invoke('triggerUndo', []);
+  await host.invoke('triggerRedo', []);
+
+  assert.equal(redone.length, 1);
+  const mod = (redone[0] as unknown[])[0] as Record<string, unknown>;
+  assert.equal(mod.modificationType, 'view_edit');
+  assert.deepEqual(mod.viewDefBefore, before);
+  assert.deepEqual(mod.viewDefAfter, after);
+});
+
 test('dropView records the worker-returned pre-drop ViewDefinition for undo', async () => {
   const undone: unknown[][] = [];
   const before = {
@@ -352,6 +442,31 @@ test('dropView records the worker-returned pre-drop ViewDefinition for undo', as
   await host.invoke('dropView', ['v2']);
   await host.invoke('triggerUndo', []);
   const mod = (undone[0] as unknown[])[0] as Record<string, unknown>;
+  assert.equal(mod.modificationType, 'view_drop');
+  assert.deepEqual(mod.viewDefBefore, before);
+});
+
+// Redo-direction coverage (fix round 3, closing the class the re-review
+// flagged as deferred): redoModification's view_drop case (worker.js ~line
+// 2218) reads viewDefBefore to replay the drop — must survive undo→redo.
+test('dropView descriptor survives undo→redo intact: pre-drop ViewDefinition reaches redoModification', async () => {
+  const redone: unknown[][] = [];
+  const before = {
+    identifier: 'v2', sql: 'CREATE VIEW "v2" AS SELECT * FROM t2', selectSql: 'SELECT * FROM t2', triggers: []
+  };
+  const { host } = makeHost({
+    dropView: () => before,
+    undoModification: () => ({ success: true }),
+    redoModification: (args) => { redone.push(args); return { success: true }; }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.invoke('dropView', ['v2']);
+  await host.invoke('triggerUndo', []);
+  await host.invoke('triggerRedo', []);
+
+  assert.equal(redone.length, 1);
+  const mod = (redone[0] as unknown[])[0] as Record<string, unknown>;
   assert.equal(mod.modificationType, 'view_drop');
   assert.deepEqual(mod.viewDefBefore, before);
 });
