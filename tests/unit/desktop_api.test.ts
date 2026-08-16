@@ -37,3 +37,40 @@ test('view state round-trips through localStorage', () => {
   saveVsCodeState({ selectedTable: 'users' });
   assert.deepEqual(getVsCodeState(), { selectedTable: 'users' });
 });
+
+test('sendRpcRequest clears its timeout timer once the host invocation settles (no leaked timer)', async () => {
+  const host = fakeHost();
+  initDesktopApi(host as never);
+
+  // Spy on the real global timer functions rather than faking time: this
+  // proves the actual fix mechanism (finally -> clearTimeout(sameId)), not
+  // just that *a* clearTimeout happened somewhere. A stale-id bug would
+  // still call clearTimeout while leaking the real timer; asserting the
+  // cleared id matches the one setTimeout handed back rules that out.
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  let capturedTimerId: unknown;
+  const clearCalls: unknown[] = [];
+
+  (globalThis as unknown as { setTimeout: (fn: (...args: unknown[]) => void, ms?: number) => unknown }).setTimeout =
+    (fn: (...args: unknown[]) => void, ms?: number) => {
+      const id = (realSetTimeout as unknown as (fn: (...args: unknown[]) => void, ms?: number) => unknown)(fn, ms);
+      capturedTimerId = id;
+      return id;
+    };
+  (globalThis as unknown as { clearTimeout: (id: unknown) => void }).clearTimeout = (id: unknown) => {
+    clearCalls.push(id);
+    (realClearTimeout as unknown as (id: unknown) => void)(id);
+  };
+
+  try {
+    const result = await backendApi.ping();
+    assert.deepEqual(result, { ok: true });
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  }
+
+  assert.equal(clearCalls.length, 1);
+  assert.equal(clearCalls[0], capturedTimerId);
+});

@@ -27,11 +27,25 @@ export async function sendRpcRequest(method, args) {
     const timeoutMs = getRpcTimeoutMs(method);
     const invocation = host.invoke(method, args);
     if (timeoutMs === undefined) return invocation;
-    return Promise.race([
-        invocation,
-        new Promise((_, reject) => setTimeout(
-            () => reject(new Error(`RPC timeout: ${method}`)), timeoutMs))
-    ]);
+    // The Promise executor below runs synchronously on construction, so
+    // timeoutId is already assigned before Promise.race is even evaluated —
+    // `finally` can always find it, whichever side of the race wins.
+    // Clearing it when `invocation` wins is the actual fix: without this,
+    // the losing timer keeps ticking for the full timeoutMs (default
+    // RPC_TIMEOUT_MS = 60s) on every single RPC call, into a promise
+    // nothing is awaiting anymore.
+    let timeoutId;
+    try {
+        return await Promise.race([
+            invocation,
+            new Promise((_, reject) => {
+                timeoutId = setTimeout(
+                    () => reject(new Error(`RPC timeout: ${method}`)), timeoutMs);
+            })
+        ]);
+    } finally {
+        clearTimeout(timeoutId);
+    }
 }
 
 // Import-parity no-ops: the desktop build has no message channel.
