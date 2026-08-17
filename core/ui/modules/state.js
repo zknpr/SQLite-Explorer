@@ -141,6 +141,7 @@ export const state = {
     // Settings
     dateFormat: 'raw', // 'raw', 'local', 'iso', 'relative'
     cellEditBehavior: 'inline', // 'inline', 'modal', 'vscode'
+    isDesktop: false,
 
     // Filter match navigation (Enter-to-jump on global/column filters)
     matchNav: {

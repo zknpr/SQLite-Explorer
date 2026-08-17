@@ -5,6 +5,11 @@ import { backendApi } from './api.js';
 import { updateStatus } from './ui.js';
 import { closeModal } from './modals.js';
 import { state } from './state.js';
+import { applyTheme, THEME_IDS } from './desktop-theme.js';
+
+export function doubleClickOptions(isDesktop) {
+    return isDesktop ? ['inline', 'modal'] : ['inline', 'modal', 'vscode'];
+}
 
 export function initSettings() {
     const container = document.getElementById('pragmaSettingsContainer');
@@ -141,8 +146,20 @@ function renderPragmaForm(pragmas, settings) {
     const doubleClickSelect = document.createElement('select');
     doubleClickSelect.className = 'setting-extension';
     doubleClickSelect.dataset.key = 'doubleClickBehavior';
-    createOptions(['inline', 'modal', 'vscode'], settings.cellEditBehavior).forEach(opt => doubleClickSelect.appendChild(opt));
+    createOptions(doubleClickOptions(state.isDesktop), settings.cellEditBehavior).forEach(opt => doubleClickSelect.appendChild(opt));
     appendField('Double Click Behavior', doubleClickSelect, 'Action when double-clicking a cell');
+
+    // Theme (desktop shell only — VS Code drives its own theme via the editor)
+    if (state.isDesktop) {
+        const themeSelect = document.createElement('select');
+        themeSelect.className = 'setting-desktop-theme';
+        createOptions(THEME_IDS, settings.theme).forEach(opt => themeSelect.appendChild(opt));
+        themeSelect.addEventListener('change', async () => {
+            const value = applyTheme(themeSelect.value);
+            await updateExtensionSetting('theme', value);
+        });
+        appendField('Theme', themeSelect, 'Color theme (System follows the OS appearance)');
+    }
 
     // Database Settings Section
     const spacer = document.createElement('div');

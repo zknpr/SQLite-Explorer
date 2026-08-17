@@ -134,10 +134,6 @@ async function initializeApp() {
         initDragAndDrop();
         initViews();
 
-        // Hide VS Code-specific buttons
-        const vscodeBtn = document.getElementById('openInVsCodeBtn');
-        if (vscodeBtn) vscodeBtn.style.display = 'none';
-
         updateStatus('Connecting to database...');
 
         // Initialize connection - the desktop host handles this
@@ -171,6 +167,9 @@ if (!bridge) {
         + 'Desktop bridge missing: this page must run inside the SQLite Explorer shell '
         + 'or the dev harness.</p>';
 } else {
+    state.isDesktop = true;
+    document.body.classList.add('desktop-app');
+
     const host = createDesktopHost({
         bridge,
         createWorker: () => new Worker('./worker.js')
@@ -184,20 +183,31 @@ if (!bridge) {
         // which doesn't exist until start() has booted it — registering
         // earlier would let an early menu click or Cmd+O land on a null
         // worker.
+        //
+        // No-silent-failures: there is no VS Code host to log a swallowed
+        // rejection to here, so menu/file-open failures must reach the user,
+        // not just the console.
+        const surface = (label) => (err) => {
+            console.error(err);
+            updateStatus(`${label}: ${err.message}`);
+        };
+
         bridge.onMenu(async (id) => {
-            if (id === 'open-db') await host.openDatabaseViaDialog();
-            else if (id === 'save-db') await host.saveToDisk();
-            else if (id === 'refresh-db') await host.refreshFromDisk();
+            if (id === 'open-db') await host.openDatabaseViaDialog().catch(surface('Open failed'));
+            else if (id === 'save-db') await host.saveToDisk().catch(surface('Save failed'));
+            else if (id === 'refresh-db') await host.refreshFromDisk().catch(surface('Refresh failed'));
             else if (id.startsWith('theme:')) {
                 const theme = applyTheme(id.slice('theme:'.length));
-                await backendApi.updateExtensionSetting('theme', theme);
+                await backendApi.updateExtensionSetting('theme', theme).catch(surface('Theme change failed'));
             }
         });
 
         // Native "Open With"/recents deliver a path directly, bypassing the
         // in-webview dialog flow above. Optional: older shells and the dev
         // harness don't implement onOpenFile.
-        bridge.onOpenFile?.(async (path) => { await host.openFromShellPath(path); });
+        bridge.onOpenFile?.(async (path) => {
+            await host.openFromShellPath(path).catch(surface('Open failed'));
+        });
 
         // VS Code intercepts these outside the webview; the desktop wires them here.
         document.addEventListener('keydown', async (event) => {

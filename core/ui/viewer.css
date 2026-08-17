@@ -1547,3 +1547,7 @@ body {
 .blob-preview-placeholder {
     color: var(--text-secondary);
 }
+
+/* Desktop shell: VS Code-only affordances do not exist here. */
+.desktop-app #openInVsCodeBtn,
+.desktop-app #btnOpenViewInVsCode { display: none !important; }
