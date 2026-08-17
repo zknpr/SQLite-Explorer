@@ -899,6 +899,125 @@ async function runQuery(sql, params = [], cancellationFlag) {
 }
 
 /**
+ * Clamp a caller-supplied console row cap into [1, 50000], defaulting to
+ * 5000 when omitted (or non-finite). Exported inline rather than as a
+ * standalone RPC method; covered indirectly by runConsole's own tests.
+ *
+ * @param {unknown} maxRows
+ * @returns {number}
+ */
+function clampConsoleMaxRows(maxRows) {
+  if (maxRows === undefined || maxRows === null) return 5000;
+  const numeric = Number(maxRows);
+  if (!Number.isFinite(numeric)) return 5000;
+  return Math.min(50000, Math.max(1, Math.trunc(numeric)));
+}
+
+/**
+ * Execute an ad hoc, possibly multi-statement SQL script typed into a
+ * console/scratchpad. Unlike runQuery (a single compiled statement plus
+ * bound params), this compiles and steps every semicolon-separated
+ * statement in `sql` in turn, returning one result set per SELECT-shaped
+ * statement -- DML/DDL statements contribute no result set -- plus
+ * aggregate mutation/timing metadata for the whole script.
+ *
+ * No transaction wrapping: statements before a failing one remain applied,
+ * matching how the same script would behave pasted into any other sqlite3
+ * client one statement at a time.
+ *
+ * @param {string} sql - One or more semicolon-separated SQL statements
+ * @param {{ maxRows?: number }} [options]
+ * @param {Int32Array} [cancellationFlag] - Shared cancellation flag; mirrors runQuery
+ * @returns {Promise<{
+ *   results: Array<{ headers: string[], rows: unknown[][], truncated: boolean }>,
+ *   mutated: boolean,
+ *   changes: number,
+ *   durationMs: number
+ * }>}
+ */
+async function runConsole(sql, options = {}, cancellationFlag) {
+  if (!db) throw new Error('No database initialized');
+  if (readOnlyMode) {
+    // Same belt-and-braces refusal as runQuery: query_only is SQL-flippable, so no
+    // statement-level capability distinction is safe to infer here.
+    throw new Error('Ad hoc SQL execution is unavailable because the database is read-only');
+  }
+
+  const maxRows = clampConsoleMaxRows(options.maxRows);
+  const startedAt = Date.now();
+  const changesBefore = db.exec('SELECT total_changes()')[0].values[0][0];
+  const schemaBefore = db.exec('PRAGMA schema_version')[0].values[0][0];
+
+  let statementIndex = 0;
+  let results;
+  try {
+    results = executeWithProgressHandler(() => {
+      const collected = [];
+      const iterator = db.iterateStatements(sql);
+      // Advance the iterator manually (rather than `for...of`) so the index
+      // reported on a prepare-time failure (e.g. "no such table") names the
+      // statement that failed to prepare. `for...of` only re-enters the loop
+      // body -- where a naive counter would live -- after next() has already
+      // returned successfully, which under-counts by one on exactly that
+      // failure class.
+      for (;;) {
+        statementIndex++;
+        const step = iterator.next();
+        if (step.done) break;
+        const statement = step.value;
+        try {
+          const headers = statement.getColumnNames();
+          if (headers.length === 0) {
+            // DML/DDL: run to completion, no result set.
+            while (statement.step()) { /* side effects only */ }
+          } else {
+            const rows = [];
+            let truncated = false;
+            while (statement.step()) {
+              // Keep stepping past the cap without collecting: a capped
+              // statement may still be mutating rows (e.g. UPDATE ...
+              // RETURNING), so total_changes must reflect the full run,
+              // not just the collected prefix.
+              if (rows.length < maxRows) rows.push(statement.get());
+              else truncated = true;
+            }
+            collected.push({ headers, rows, truncated });
+          }
+        } finally {
+          // iterateStatements()'s own next() frees the previous statement
+          // lazily, right before preparing the next one -- but only on the
+          // *next* call to next(). If statement.step() throws above (e.g. a
+          // constraint violation), nothing would ever call next() again and
+          // this statement would leak. Freeing explicitly here closes that
+          // gap. The iterator then "frees" an already-freed statement
+          // (this.stmt reset to NULL) on its own next() call; empirically
+          // (and per the vendored Statement.prototype.free source) that is
+          // a documented no-op -- sqlite3_finalize(NULL) is safe, and the
+          // wrapper's own sentinel guards the JS-level bookkeeping.
+          statement.free();
+        }
+      }
+      return collected;
+    }, cancellationFlag);
+  } catch (error) {
+    // Duck-typed rather than `instanceof Error`: sql.js errors are
+    // constructed in whatever realm initialized the WASM module, which in
+    // the unit-test harness is not this worker's own realm, so a strict
+    // instanceof check silently misses and double-wraps via String(error).
+    throw new Error(`statement ${statementIndex}: ${getErrorMessage(error)}`);
+  }
+
+  const changesAfter = db.exec('SELECT total_changes()')[0].values[0][0];
+  const schemaAfter = db.exec('PRAGMA schema_version')[0].values[0][0];
+  return {
+    results,
+    mutated: changesAfter - changesBefore > 0 || schemaAfter !== schemaBefore,
+    changes: changesAfter - changesBefore,
+    durationMs: Date.now() - startedAt
+  };
+}
+
+/**
  * Export the database to binary.
  *
  * @param {string} _name - Database name (ignored, uses 'main')
@@ -3232,6 +3351,7 @@ async function fireEditEvent(_edit) {
 const methods = {
   initializeDatabase,
   runQuery,
+  runConsole,
   getCellMetadata,
   openCellReadSession,
   readCellChunk,

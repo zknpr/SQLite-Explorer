@@ -3703,4 +3703,279 @@ describe('web demo view worker', () => {
             17
         );
     });
+
+    it('runs each console statement in order, producing a result set only for SELECT-shaped ones', async () => {
+        const worker = await createWorkerHarness();
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT 1 AS value; CREATE TABLE console_multi (id INTEGER); SELECT 2 AS value;'
+        );
+
+        assert.strictEqual(result.results.length, 2);
+        assert.deepStrictEqual(Array.from(result.results[0].headers), ['value']);
+        assert.deepStrictEqual(
+            Array.from(result.results[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1]]
+        );
+        assert.strictEqual(result.results[0].truncated, false);
+        assert.deepStrictEqual(Array.from(result.results[1].headers), ['value']);
+        assert.deepStrictEqual(
+            Array.from(result.results[1].rows, (row: unknown[]) => Array.from(row)),
+            [[2]]
+        );
+        assert.strictEqual(result.results[1].truncated, false);
+        assert.strictEqual(typeof result.durationMs, 'number');
+        assert.ok(result.durationMs >= 0);
+    });
+
+    it('caps collected console rows without cutting the script short', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE console_cap (id INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 10' +
+            ') INSERT INTO console_cap SELECT value FROM ids'
+        );
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT id FROM console_cap ORDER BY id; UPDATE console_cap SET id = id + 1000;',
+            { maxRows: 3 }
+        );
+
+        assert.strictEqual(result.results.length, 1);
+        assert.strictEqual(result.results[0].rows.length, 3);
+        assert.strictEqual(result.results[0].truncated, true);
+        // The UPDATE runs after the capped SELECT and still reports its full
+        // effect: capping collection must not stop the iterator from
+        // reaching, or finishing, later statements.
+        assert.strictEqual(result.changes, 10);
+        const updated = await worker.invoke(
+            'runQuery',
+            'SELECT count(*) FROM console_cap WHERE id >= 1000'
+        );
+        assert.deepStrictEqual(updated[0].rows, [[10]]);
+    });
+
+    it('keeps stepping a capped console statement to completion so every row is still affected', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE console_cap_returning (id INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 10' +
+            ') INSERT INTO console_cap_returning SELECT value FROM ids'
+        );
+
+        const result = await worker.invoke(
+            'runConsole',
+            'UPDATE console_cap_returning SET id = id + 100 RETURNING id;',
+            { maxRows: 3 }
+        );
+
+        assert.strictEqual(result.results[0].rows.length, 3);
+        assert.strictEqual(result.results[0].truncated, true);
+        assert.strictEqual(result.changes, 10);
+        const remaining = await worker.invoke(
+            'runQuery',
+            'SELECT count(*) FROM console_cap_returning WHERE id >= 101'
+        );
+        assert.deepStrictEqual(remaining[0].rows, [[10]]);
+    });
+
+    it('detects console mutation from total_changes and schema_version rather than result shape', async () => {
+        const worker = await createWorkerHarness();
+
+        const ddlOnly = await worker.invoke(
+            'runConsole',
+            'CREATE TABLE console_mutation (id INTEGER)'
+        );
+        assert.strictEqual(ddlOnly.mutated, true);
+        assert.strictEqual(ddlOnly.changes, 0);
+
+        const inserted = await worker.invoke('runConsole', 'INSERT INTO console_mutation VALUES (1)');
+        assert.strictEqual(inserted.mutated, true);
+        assert.strictEqual(inserted.changes, 1);
+
+        const selected = await worker.invoke('runConsole', 'SELECT * FROM console_mutation');
+        assert.strictEqual(selected.mutated, false);
+        assert.strictEqual(selected.changes, 0);
+    });
+
+    it('prefixes a mid-script console failure with its 1-based statement index and keeps earlier statements applied', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runConsole', 'CREATE TABLE console_error (id INTEGER)');
+
+        await assert.rejects(
+            worker.invoke(
+                'runConsole',
+                'INSERT INTO console_error VALUES (1); SELECT * FROM console_error_missing;'
+            ),
+            (error: Error) => {
+                assert.match(error.message, /^statement 2: /);
+                return true;
+            }
+        );
+
+        const rows = await worker.invoke('runQuery', 'SELECT id FROM console_error');
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1]]
+        );
+    });
+
+    it('finalizes a statement that throws mid-step without corrupting later use of the database', async () => {
+        // Unlike "no such table" (a prepare-time failure), a UNIQUE violation is
+        // only detected once sqlite3_step() actually attempts the write. That
+        // makes this the one path where iterateStatements()'s own lazy free
+        // (deferred until the *next* next() call) never fires, since the script
+        // is abandoned on the throw -- so this is what actually exercises the
+        // manual statement.free() in runConsole's finally block.
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE console_step_throw (id INTEGER UNIQUE); ' +
+            'INSERT INTO console_step_throw VALUES (1)'
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'runConsole',
+                'INSERT INTO console_step_throw VALUES (2); ' +
+                'INSERT INTO console_step_throw VALUES (1); ' +
+                'INSERT INTO console_step_throw VALUES (3);'
+            ),
+            (error: Error) => {
+                assert.match(error.message, /^statement 2: /);
+                assert.match(error.message, /UNIQUE constraint failed/);
+                return true;
+            }
+        );
+
+        // Statement 1 committed; statement 3 never ran. The real point of this
+        // assertion is that the connection is still fully usable afterwards --
+        // proof the throwing statement was finalized cleanly rather than
+        // leaked or left in a state that wedges the shared db handle.
+        const rows = await worker.invoke('runQuery', 'SELECT id FROM console_step_throw ORDER BY id');
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1], [2]]
+        );
+        const after = await worker.invoke('runConsole', 'SELECT count(*) AS n FROM console_step_throw');
+        assert.deepStrictEqual(Array.from(after.results[0].rows[0]), [2]);
+    });
+
+    it('treats empty console statements and trailing comments as producing no extra result sets', async () => {
+        const worker = await createWorkerHarness();
+
+        const result = await worker.invoke('runConsole', 'SELECT 1; ; -- x');
+
+        assert.strictEqual(result.results.length, 1);
+        assert.deepStrictEqual(
+            Array.from(result.results[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1]]
+        );
+    });
+
+    it('clamps console maxRows into [1, 50000]', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE console_clamp_low (id INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 3' +
+            ') INSERT INTO console_clamp_low SELECT value FROM ids'
+        );
+        const low = await worker.invoke(
+            'runConsole',
+            'SELECT id FROM console_clamp_low ORDER BY id',
+            { maxRows: 0 }
+        );
+        assert.strictEqual(low.results[0].rows.length, 1);
+        assert.strictEqual(low.results[0].truncated, true);
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE console_clamp_high (id INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 50010' +
+            ') INSERT INTO console_clamp_high SELECT value FROM ids'
+        );
+        const high = await worker.invoke(
+            'runConsole',
+            'SELECT id FROM console_clamp_high ORDER BY id',
+            { maxRows: 999999 }
+        );
+        assert.strictEqual(high.results[0].rows.length, 50000);
+        assert.strictEqual(high.results[0].truncated, true);
+    });
+
+    it('rejects runConsole with the exact read-only refusal runQuery uses', async () => {
+        const worker = await createWorkerHarness({ readOnlyMode: true });
+
+        let queryMessage = '';
+        await assert.rejects(worker.invoke('runQuery', 'SELECT 1'), (error: Error) => {
+            queryMessage = error.message;
+            return true;
+        });
+        assert.ok(queryMessage.length > 0);
+
+        await assert.rejects(worker.invoke('runConsole', 'SELECT 1'), (error: Error) => {
+            assert.strictEqual(error.message, queryMessage);
+            return true;
+        });
+    });
+
+    it('interrupts a long-running console script at the configured deadline', async () => {
+        const worker = await createWorkerHarness({ queryTimeout: 20 });
+
+        await assert.rejects(
+            worker.invoke(
+                'runConsole',
+                'WITH RECURSIVE counter(value) AS (' +
+                'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+                ') SELECT sum(value) FROM counter'
+            ),
+            (error: Error) => {
+                assert.match(error.message, /^statement 1: Query execution timed out after 20ms/);
+                return true;
+            }
+        );
+    });
+
+    it('preempts a running console script through a shared cancellation flag', async () => {
+        const worker = await createWorkerHarness({ queryTimeout: 200 });
+        const cancellationFlag = new Int32Array(
+            new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)
+        );
+        const flagSetter = new NodeWorker(
+            `const { parentPort, workerData } = require('node:worker_threads');
+             setTimeout(() => {
+               Atomics.store(workerData, 0, 1);
+               parentPort.postMessage('cancelled');
+             }, 20);`,
+            { eval: true, workerData: cancellationFlag }
+        );
+
+        try {
+            await assert.rejects(
+                worker.invoke(
+                    'runConsole',
+                    'WITH RECURSIVE counter(value) AS (' +
+                    'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+                    ') SELECT sum(value) FROM counter',
+                    {},
+                    cancellationFlag
+                ),
+                (error: Error) => {
+                    assert.match(error.message, /^statement 1: Query execution cancelled/);
+                    return true;
+                }
+            );
+        } finally {
+            await flagSetter.terminate();
+        }
+    });
 });
