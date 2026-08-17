@@ -558,6 +558,116 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('lets a raised maxExportBytes complete an export whose real output exceeds the 16 MiB demo cap', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_export_raised_cap (payload BLOB)');
+        // 13 MiB of real bytes base64-encodes to ~17.3 MiB of JSON output --
+        // over the 16 MiB demo ceiling with a comfortable margin -- while its
+        // estimate (JSON's blob estimate is the ~4/3 base64 expansion, not
+        // CSV/Excel's flat 64) stays well under the raised 64 MiB cap. Kept as
+        // small as a safe margin allows: the worker's hex transport decode is
+        // O(bytes) with real per-byte cost, so this single value already
+        // dominates this file's runtime at any larger size.
+        await worker.invoke(
+            'runQuery',
+            `INSERT INTO demo_export_raised_cap VALUES (zeroblob(${13 * 1024 * 1024}))`
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_export_raised_cap' },
+            ['payload'],
+            {},
+            {},
+            { format: 'json', maxExportBytes: 64 * 1024 * 1024 }
+        );
+
+        assert.ok(
+            Array.from(exported.contentChunks).join('').length > 16 * 1024 * 1024,
+            'raised-cap export did not actually produce more than 16 MiB of output'
+        );
+    });
+
+    it('throws the parameterized, non-demo message when maxExportBytes is set below the default cap', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_export_tiny_cap (v INTEGER); INSERT INTO demo_export_tiny_cap VALUES (1)'
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'exportTable',
+                { table: 'demo_export_tiny_cap' },
+                ['v'],
+                {},
+                {},
+                { format: 'csv', maxExportBytes: 1024 }
+            ),
+            (error: Error) => {
+                assert.match(error.message, /1024 bytes/);
+                assert.doesNotMatch(error.message, /web demo/i);
+                assert.doesNotMatch(error.message, /desktop extension/i);
+                return true;
+            }
+        );
+    });
+
+    it('falls back to the default 16 MiB demo cap for a non-positive-integer maxExportBytes', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_export_bad_cap (payload BLOB)');
+        await worker.invoke(
+            'runQuery',
+            `INSERT INTO demo_export_bad_cap VALUES (zeroblob(${16 * 1024 * 1024 + 1}))`
+        );
+
+        for (const invalid of [NaN, -5, 0, 3.5]) {
+            await assert.rejects(
+                worker.invoke(
+                    'exportTable',
+                    { table: 'demo_export_bad_cap' },
+                    ['payload'],
+                    {},
+                    {},
+                    { format: 'json', maxExportBytes: invalid }
+                ),
+                /limited to 16 MiB \(16,777,216 bytes\).*worker RPC cannot stream downloads/i,
+                `maxExportBytes: ${invalid} did not fall back to the default demo cap`
+            );
+        }
+    });
+
+    it('clamps a maxExportBytes above 1 GiB down to the 1 GiB hard ceiling', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_export_ceiling (payload TEXT)');
+        // TEXT's estimate multiplier is 6x real bytes, so ~180 MiB of real text
+        // (safely under SQLite's ~954 MiB single-value SQLITE_MAX_LENGTH ceiling)
+        // produces a ~1.08 GiB estimate -- above the 1 GiB hard sanity ceiling
+        // even though the requested cap below is 2 GiB.
+        await worker.invoke(
+            'runQuery',
+            `INSERT INTO demo_export_ceiling VALUES (CAST(zeroblob(${180 * 1024 * 1024}) AS TEXT))`
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'exportTable',
+                { table: 'demo_export_ceiling' },
+                ['payload'],
+                {},
+                {},
+                { format: 'csv', maxExportBytes: 2 * 1024 * 1024 * 1024 }
+            ),
+            (error: Error) => {
+                // 1 GiB, not the requested 2 GiB -- proves the clamp, not just a cap.
+                assert.match(error.message, /1073741824 bytes/);
+                assert.doesNotMatch(error.message, /web demo/i);
+                assert.doesNotMatch(error.message, /desktop extension/i);
+                return true;
+            }
+        );
+    });
+
     it('exports oversized CSV/Excel BLOB placeholders without transporting source bytes', async () => {
         const projectionResults: unknown[] = [];
         const worker = await createWorkerHarness({
@@ -3877,6 +3987,36 @@ describe('web demo view worker', () => {
             Array.from(result.results[0].rows, (row: unknown[]) => Array.from(row)),
             [[1]]
         );
+    });
+
+    it('never drops the tail statement across mid-script empty-statement and comment variants', async () => {
+        // Regression coverage for the fail-loud drift guard added after runConsole:
+        // sqlite3_prepare_v2 (via iterateStatements) consumes leading empty
+        // statements/whitespace/comments on its own, so none of these should ever
+        // throw the "unexecuted SQL remained" insurance error -- both statements
+        // must always come through.
+        const worker = await createWorkerHarness();
+        const scripts = [
+            'SELECT 1;; SELECT 2;',
+            'SELECT 1; ; SELECT 2;',
+            'SELECT 1; -- comment\nSELECT 2;',
+            'SELECT 1;; ; -- comment\n; SELECT 2;'
+        ];
+
+        for (const sql of scripts) {
+            const result = await worker.invoke('runConsole', sql);
+            assert.strictEqual(result.results.length, 2, `expected 2 result sets for: ${sql}`);
+            assert.deepStrictEqual(
+                Array.from(result.results[0].rows, (row: unknown[]) => Array.from(row)),
+                [[1]],
+                `first result set for: ${sql}`
+            );
+            assert.deepStrictEqual(
+                Array.from(result.results[1].rows, (row: unknown[]) => Array.from(row)),
+                [[2]],
+                `second result set for: ${sql}`
+            );
+        }
     });
 
     it('clamps console maxRows into [1, 50000]', async () => {

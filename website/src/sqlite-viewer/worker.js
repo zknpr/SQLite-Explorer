@@ -135,6 +135,12 @@ const PROGRESS_HANDLER_INTERVAL = 1000;
 const WEB_DEMO_EXPORT_MAX_BYTES = 16 * 1024 * 1024;
 const WEB_DEMO_EXPORT_CHUNK_CHARS = 64 * 1024;
 const WEB_DEMO_EXPORT_LIMIT_DESCRIPTION = '16 MiB (16,777,216 bytes)';
+// The 16 MiB cap above is policy for the web demo's non-streaming download
+// path, not a physical limit -- hosts that move whole DB images another way
+// (e.g. the desktop's saveToDisk) may raise it via exportOptions.maxExportBytes.
+// This ceiling still bounds every caller: it's a sanity backstop against a
+// pathological or malicious request, not a target for any real caller today.
+const EXPORT_MAX_BYTES_HARD_CEILING = 1024 * 1024 * 1024;
 const SQLITE_MAX_RESULT_COLUMNS = 2000;
 // RPC payloads cannot forge this Symbol; only in-worker history restoration
 // may bypass the new-value policy for a value that already existed.
@@ -997,6 +1003,21 @@ async function runConsole(sql, options = {}, cancellationFlag) {
           statement.free();
         }
       }
+      // A SQL console must never silently drop part of a script. Unreachable
+      // with the current vendored fork -- sqlite3_prepare_v2 consumes leading
+      // whitespace/comments/empty statements on its own, verified empirically
+      // against several probe scripts (see the regression test in
+      // web_demo_worker.test.ts) -- so this is insurance against a future
+      // fork's iterator behaving differently, not a path any current input
+      // reaches. No "statement N:" prefix here: the catch below adds it
+      // uniformly, reusing this same statementIndex, which already sits one
+      // past the last successfully-processed statement (it's incremented
+      // before *every* next() call, including the final done:true one) --
+      // exactly this hypothetical statement's correct 1-based ordinal.
+      const remaining = iterator.getRemainingSQL?.();
+      if (remaining && remaining.trim() !== '') {
+        throw new Error(`unexecuted SQL remained after iteration: ${remaining.trim().slice(0, 80)}`);
+      }
       return collected;
     }, cancellationFlag);
   } catch (error) {
@@ -1068,15 +1089,17 @@ async function exportDatabase(_name) {
  * Export a table to various formats (CSV, JSON, SQL).
  * The worker RPC is request/response only: it cannot progressively transfer a
  * download. Keep the honest bounded fallback explicit by refusing a worst-case
- * source/output estimate above 16 MiB, then return small assembly chunks rather
- * than one monolithic string. The desktop extension owns genuinely streamed
- * exports.
+ * source/output estimate above the effective cap, then return small assembly
+ * chunks rather than one monolithic string. 16 MiB is a browser-download-path
+ * policy default, not a physical limit -- hosts that move whole DB images
+ * another way (e.g. the desktop's saveToDisk) may raise it via
+ * exportOptions.maxExportBytes, up to a 1 GiB hard sanity ceiling.
  *
  * @param {Object} dbParams - Database parameters with 'table' property
  * @param {Array<string>} columns - Columns to export
  * @param {Object} _dbOptions - Database options (unused)
  * @param {Object} _tableStore - Table store (unused)
- * @param {Object} exportOptions - Export options including 'format'
+ * @param {Object} exportOptions - Export options including 'format', 'maxExportBytes'
  * @returns {Promise<Object>} Export result with contentChunks and filename
  */
 async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOptions = {}) {
@@ -1085,10 +1108,21 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
   const table = dbParams?.table;
   if (!table) throw new Error('No table specified');
 
-  const { format = 'csv', header = true, includeTableName = true, rowIds = null } = exportOptions;
+  const {
+    format = 'csv',
+    header = true,
+    includeTableName = true,
+    rowIds = null,
+    maxExportBytes
+  } = exportOptions;
   if (!['csv', 'json', 'sql', 'excel'].includes(format)) {
     throw new Error(`Unsupported export format: ${format}`);
   }
+  // Any positive integer cap under the hard ceiling is honored; anything else
+  // (omitted, NaN, <= 0, non-integer) falls back to the web demo's own cap.
+  const exportCapBytes = Number.isSafeInteger(maxExportBytes) && maxExportBytes > 0
+    ? Math.min(maxExportBytes, EXPORT_MAX_BYTES_HARD_CEILING)
+    : WEB_DEMO_EXPORT_MAX_BYTES;
   let predicateChunks = [{ sql: '', params: [] }];
 
   // Filter by rowIds if specified
@@ -1147,10 +1181,11 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
         selectedColumns,
         whereSql,
         predicate.params,
-        format
+        format,
+        exportCapBytes
       );
-      if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes > WEB_DEMO_EXPORT_MAX_BYTES) {
-        throw webDemoExportLimitError();
+      if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes > exportCapBytes) {
+        throw exportLimitError(exportCapBytes);
       }
     }
     for (const predicate of predicateChunks) {
@@ -1194,7 +1229,7 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
     ));
   });
 
-  const output = new WebDemoExportChunkCollector();
+  const output = new WebDemoExportChunkCollector(exportCapBytes);
   let mimeType = 'text/plain';
   let filename = `${table}.${format}`;
 
@@ -1222,10 +1257,23 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
   return { contentChunks: output.finish(), filename, mimeType };
 }
 
-function webDemoExportLimitError() {
+/**
+ * @param {number} capBytes - The effective cap in force for this export (the
+ *   web demo's own default, or a host-raised exportOptions.maxExportBytes).
+ */
+function exportLimitError(capBytes) {
+  if (capBytes === WEB_DEMO_EXPORT_MAX_BYTES) {
+    // Verbatim: this is the only wording a browser-hosted web demo caller
+    // ever sees, and "use the desktop extension" is only true for them.
+    return new Error(
+      `Web demo exports are limited to ${WEB_DEMO_EXPORT_LIMIT_DESCRIPTION} because ` +
+      'the worker RPC cannot stream downloads; use the desktop extension for larger exports.'
+    );
+  }
+  const mebibytes = capBytes / (1024 * 1024);
   return new Error(
-    `Web demo exports are limited to ${WEB_DEMO_EXPORT_LIMIT_DESCRIPTION} because ` +
-    'the worker RPC cannot stream downloads; use the desktop extension for larger exports.'
+    `Export exceeds the ${mebibytes} MiB (${capBytes} bytes) limit; the worker assembles ` +
+    'the whole file in memory, so larger exports need the native engine.'
   );
 }
 
@@ -1353,7 +1401,7 @@ function buildBalancedSqlSum(expressions) {
   return level[0];
 }
 
-function estimateWebDemoExportBytes(table, columns, whereSql, params, format) {
+function estimateWebDemoExportBytes(table, columns, whereSql, params, format, capBytes) {
   // A left-deep `a + b + ...` exceeds SQLite's expression-depth limit on wide
   // tables. A balanced sum keeps the estimate in one snapshot-consistent scan.
   const estimateCells = buildBalancedSqlSum(columns.map(column => {
@@ -1377,7 +1425,10 @@ function estimateWebDemoExportBytes(table, columns, whereSql, params, format) {
   const rowCount = Number(row[0]);
   const estimatedBytes = Number(row[1]) + rowCount * 128;
   if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes < 0) {
-    throw webDemoExportLimitError();
+    // Overflow/corruption in the SQL SUM, not a real over-cap estimate -- this
+    // refuses regardless of what cap was requested, but still needs it to
+    // report an accurate limit in the message.
+    throw exportLimitError(capBytes);
   }
   return estimatedBytes;
 }
@@ -1406,16 +1457,17 @@ function utf8ByteLength(value) {
 }
 
 class WebDemoExportChunkCollector {
-  constructor() {
+  constructor(capBytes = WEB_DEMO_EXPORT_MAX_BYTES) {
     this.chunks = [];
     this.pending = '';
     this.outputBytes = 0;
+    this.capBytes = capBytes;
   }
 
   append(value) {
     this.outputBytes += utf8ByteLength(value);
-    if (!Number.isSafeInteger(this.outputBytes) || this.outputBytes > WEB_DEMO_EXPORT_MAX_BYTES) {
-      throw webDemoExportLimitError();
+    if (!Number.isSafeInteger(this.outputBytes) || this.outputBytes > this.capBytes) {
+      throw exportLimitError(this.capBytes);
     }
 
     let offset = 0;

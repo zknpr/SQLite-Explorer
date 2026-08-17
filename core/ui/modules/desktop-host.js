@@ -36,6 +36,15 @@ const BARRIER_METHODS = new Set([
     'insertRowBatch'
 ]);
 
+// The web demo's 16 MiB export cap is a browser-download-path policy (the
+// worker RPC can't stream), not a native limit here: the desktop already
+// moves whole DB images through saveToDisk. exportTable below assembles the
+// chunked result with join('') then re-encodes it with TextEncoder, which
+// momentarily holds both the joined string and its encoded bytes at once —
+// 512 MiB keeps that worst case to ~1 GiB in-page, matching the worker's own
+// 1 GiB hard sanity ceiling on maxExportBytes.
+const DESKTOP_EXPORT_MAX_BYTES = 512 * 1024 * 1024;
+
 export function createDesktopHost({ bridge, createWorker }) {
     let worker = null;
     let messageCounter = 0;
@@ -317,6 +326,10 @@ export function createDesktopHost({ bridge, createWorker }) {
             return { success: target !== null, savedAs: target ? basename(target) : undefined };
         },
         async exportTable(...args) {
+            // Host policy overrides anything UI-passed (nothing passes one today):
+            // raise the worker's default web-demo cap to the desktop ceiling.
+            args = [...args];
+            args[4] = { ...(args[4] ?? {}), maxExportBytes: DESKTOP_EXPORT_MAX_BYTES };
             const result = await callWorker('exportTable', args);
             const text = result.contentChunks.join('');
             const target = await bridge.saveFileAs(result.filename, new TextEncoder().encode(text));

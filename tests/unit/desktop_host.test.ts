@@ -566,6 +566,29 @@ test('exportTable assembles worker chunks and saves via bridge.saveFileAs', asyn
   assert.equal(savedAs.text, 'a,b\n1,2\n');
 });
 
+test('exportTable injects the desktop export cap while preserving caller-passed options', async () => {
+  let recordedArgs: unknown[] = [];
+  const { host } = makeHost(
+    {
+      exportTable: (args: unknown[]) => {
+        recordedArgs = args;
+        return { contentChunks: [], filename: 'users.csv', mimeType: 'text/csv' };
+      }
+    },
+    { saveFileAs: async () => '/tmp/u.csv' }
+  );
+  await host.start();
+  await host.invoke(
+    'exportTable',
+    [{ table: 'users' }, ['a', 'b'], null, null, { format: 'csv', header: false }]
+  );
+  const exportOptions = recordedArgs[4] as Record<string, unknown>;
+  assert.equal(exportOptions.maxExportBytes, 536870912);
+  // Host policy must override, not replace: caller-passed keys still survive the spread.
+  assert.equal(exportOptions.format, 'csv');
+  assert.equal(exportOptions.header, false);
+});
+
 test('theme defaults to system and round-trips through the wire shape', async () => {
   const { host, saved } = makeHost({});
   await host.start();
