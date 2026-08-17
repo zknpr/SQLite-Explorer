@@ -23,6 +23,9 @@ const STATUS_SEPARATOR = ' · ';
  */
 const MULTI_STATEMENT_NOTE = 'Statements before the error were applied.';
 
+/** Shown when the payload is neither a runConsole result nor an error — a caller bug. */
+const CONTRACT_VIOLATION_MESSAGE = 'Malformed console result payload';
+
 /**
  * One-line summary of a completed console run, e.g.
  * `123 rows (truncated) · 2 changed · 45 ms`.
@@ -97,10 +100,14 @@ function buildPane(set) {
             const td = document.createElement('td');
             // Same NULL class the grid uses (grid-render.js), so console NULLs
             // pick up the one existing null-cell rule instead of a parallel
-            // style. Deliberately WITHOUT the grid's `data-cell` class:
-            // document-level grid handlers (dnd.js/grid-events.js) match
-            // `.data-cell` via closest(), and console cells must not answer
-            // to cell-edit or drop handling.
+            // style. Deliberately WITHOUT the grid's `data-cell` class: that
+            // class carries the grid's own layout rules (fixed --row-height,
+            // relative positioning) which do not belong to console output, and
+            // omitting it keeps console cells inert to the grid's cell-edit and
+            // drop handlers, which match `.data-cell` via closest(). Those
+            // handlers are bound to #gridContainer today (dnd.js:36-38,
+            // grid-events.js:53-59), so this is defense against a future
+            // re-scoping, not a live exposure.
             if (value === null || value === undefined) td.className = 'null-value';
             td.textContent = formatCellValueAsText(value);
             tr.appendChild(td);
@@ -149,38 +156,89 @@ function buildTabStrip(panes) {
 }
 
 /**
+ * Renders a failure into `container`: the message, plus the fixed
+ * multi-statement note when earlier statements may have applied.
+ *
+ * @param {HTMLElement} container
+ * @param {string} message
+ * @param {boolean} withNote
+ */
+function renderError(container, message, withNote) {
+    const error = document.createElement('div');
+    error.className = 'sql-console-results-error';
+    error.textContent = message;
+    container.appendChild(error);
+
+    if (withNote) {
+        const note = document.createElement('div');
+        note.className = 'sql-console-results-note';
+        note.textContent = MULTI_STATEMENT_NOTE;
+        container.appendChild(note);
+    }
+}
+
+/**
+ * True when `payload` is structurally renderable as a successful run: every
+ * property the success path walks is present and of the right kind. Checked
+ * rather than assumed because rendering must be total — see
+ * {@link renderConsoleResults}. One extra pass over the rows is nothing next
+ * to building a DOM row for each of them.
+ *
+ * @param {unknown} payload
+ * @returns {boolean}
+ */
+function isRenderableRun(payload) {
+    if (payload === null || typeof payload !== 'object') return false;
+    if (!Array.isArray(payload.results)) return false;
+    return payload.results.every(set =>
+        set !== null
+        && typeof set === 'object'
+        && Array.isArray(set.headers)
+        && Array.isArray(set.rows)
+        && set.rows.every(row => Array.isArray(row))
+    );
+}
+
+/**
  * Renders a console run into `container`, replacing whatever the previous
  * run left behind.
  *
- * Two payload shapes, discriminated by the presence of `error`:
+ * Two payload shapes, discriminated by a non-nullish `error`:
  * - success: runConsole's result — a status line, a tab strip when (and only
  *   when) there is more than one result set, and one table per set.
  * - failure: the error message, plus the fixed multi-statement note when the
  *   failed run had more than one statement.
  *
+ * Rendering is TOTAL: anything that is neither of those (a nullish payload, a
+ * missing/non-array `results`, a set without array `headers`/`rows`) is a
+ * caller contract violation and renders as a visible failure with the raw
+ * payload logged, instead of throwing halfway through and leaving the pane
+ * blank — the container has already been cleared by then, so a throw would
+ * lose the previous output AND show nothing in its place.
+ *
  * @param {HTMLElement} container
- * @param {{ results: Array<{ headers: string[], rows: unknown[][], truncated: boolean }>, mutated: boolean, changes: number, durationMs: number } | { error: string, multiStatement: boolean }} payload
+ * @param {{ results: Array<{ headers: string[], rows: unknown[][], truncated: boolean }>, mutated: boolean, changes: number, durationMs: number } | { error: string, multiStatement?: boolean }} payload
  * @returns {void}
  */
 export function renderConsoleResults(container, payload) {
     container.replaceChildren();
 
-    // Presence-checked, not typeof-string-checked, and coerced on the way out:
+    // Nullish-checked, not typeof-string-checked, and coerced on the way out:
     // the error branch is the worst possible place to throw a second time, so
     // a caller that hands over an Error instead of its message still gets its
-    // failure rendered instead of a TypeError from the result branch below.
-    if (payload.error !== undefined) {
-        const error = document.createElement('div');
-        error.className = 'sql-console-results-error';
-        error.textContent = String(payload.error);
-        container.appendChild(error);
+    // failure rendered. A null/undefined `error` is not a message and falls
+    // through to the contract check below rather than rendering "null".
+    if (payload !== null && payload !== undefined && payload.error !== null && payload.error !== undefined) {
+        renderError(container, String(payload.error), Boolean(payload.multiStatement));
+        return;
+    }
 
-        if (payload.multiStatement) {
-            const note = document.createElement('div');
-            note.className = 'sql-console-results-note';
-            note.textContent = MULTI_STATEMENT_NOTE;
-            container.appendChild(note);
-        }
+    if (!isRenderableRun(payload)) {
+        // Loud in devtools (raw payload, for whoever has to debug the caller)
+        // and visible on screen (the user must not be left staring at an
+        // empty pane wondering whether the query did anything).
+        console.error('[ConsoleResults] Malformed console result payload:', payload);
+        renderError(container, CONTRACT_VIOLATION_MESSAGE, false);
         return;
     }
 

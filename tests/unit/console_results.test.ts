@@ -273,13 +273,84 @@ test('an error payload carrying a non-string still renders as an error, not a cr
     // A caller that forgets `.message` must still get its failure on screen —
     // the error branch is exactly where throwing a second time is worst.
     renderConsoleResults(container as unknown as HTMLElement, {
-        error: new Error('statement 1: no such table: nope')
-    } as unknown as { error: string; multiStatement: boolean });
+        error: new Error('statement 1: no such table: nope') as unknown as string
+    });
 
     const errors = findAllByClass(container, 'sql-console-results-error');
     assert.equal(errors.length, 1);
     assert.equal(textOf(errors[0]), 'Error: statement 1: no such table: nope');
     assert.equal(findAllByClass(container, 'sql-console-results-status').length, 0);
+});
+
+test('a run with no result sets renders the status line alone', () => {
+    installDocument();
+    const container = new FakeNode('div');
+
+    renderConsoleResults(container as unknown as HTMLElement, {
+        results: [],
+        mutated: true,
+        changes: 2,
+        durationMs: 45
+    });
+
+    assert.equal(textOf(findAllByClass(container, 'sql-console-results-status')[0]), '2 changed · 45 ms');
+    assert.equal(findAllByClass(container, 'sql-console-results-pane').length, 0);
+    assert.equal(findAllByClass(container, 'sql-console-results-tabs').length, 0);
+    assert.equal(container.children.length, 1);
+});
+
+test('a single set leaves its pane visible', () => {
+    installDocument();
+    const container = new FakeNode('div');
+
+    renderConsoleResults(container as unknown as HTMLElement, {
+        results: [{ headers: ['a'], rows: [[1]], truncated: false }],
+        mutated: false,
+        changes: 0,
+        durationMs: 1
+    });
+
+    const panes = findAllByClass(container, 'sql-console-results-pane');
+    assert.equal(panes.length, 1);
+    assert.equal(panes[0].hidden, false);
+});
+
+/** Renders `payload` with console.error captured, asserting the contract-violation output. */
+function assertContractViolation(payload: unknown) {
+    installDocument();
+    const container = new FakeNode('div');
+    const logged: unknown[][] = [];
+    const realError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args); };
+    try {
+        renderConsoleResults(container as unknown as HTMLElement, payload as never);
+    } finally {
+        console.error = realError;
+    }
+
+    const errors = findAllByClass(container, 'sql-console-results-error');
+    assert.equal(errors.length, 1, 'contract violation must render through the error path');
+    assert.equal(textOf(errors[0]), 'Malformed console result payload');
+    assert.equal(findAllByClass(container, 'sql-console-results-status').length, 0);
+    assert.equal(findAllByClass(container, 'sql-console-results-note').length, 0);
+    assert.equal(findAllByTag(container, 'table').length, 0);
+    // Fail loud as well as visible: the raw payload reaches devtools.
+    assert.equal(logged.length, 1);
+    assert.equal(logged[0][1], payload);
+}
+
+test('malformed payloads render a contract violation instead of throwing', () => {
+    // Nothing at all.
+    assertContractViolation(null);
+    assertContractViolation(undefined);
+    // Right shape, wrong types.
+    assertContractViolation({ results: null, mutated: false, changes: 0, durationMs: 1 });
+    assertContractViolation({ results: [{ headers: null, rows: [] }], mutated: false, changes: 0, durationMs: 1 });
+    assertContractViolation({ results: [{ headers: ['a'], rows: null }], mutated: false, changes: 0, durationMs: 1 });
+    assertContractViolation({ results: [{ headers: ['a'], rows: [null] }], mutated: false, changes: 0, durationMs: 1 });
+    // A nulled-out error is not an error message; it must not render "null".
+    assertContractViolation({ error: null });
+    assertContractViolation('not a payload at all');
 });
 
 test('each render replaces the previous one entirely', () => {

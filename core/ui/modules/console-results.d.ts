@@ -27,8 +27,8 @@ export interface ConsoleRunResult {
 export interface ConsoleRunError {
     /** The message to show. A non-string (e.g. a raw Error) is coerced rather than throwing. */
     error: string;
-    /** True when the failed run had more than one statement, so earlier statements may have applied. */
-    multiStatement: boolean;
+    /** True when the failed run had more than one statement, so earlier statements may have applied. Absent reads as false. */
+    multiStatement?: boolean;
 }
 
 export type ConsoleRenderPayload = ConsoleRunResult | ConsoleRunError;
@@ -49,6 +49,10 @@ export function formatStatus(result: ConsoleRunResult): string;
  * more than one result set, and one table per set; error payloads render the
  * message plus, when `multiStatement`, the fixed note
  * `Statements before the error were applied.`
+ *
+ * Total: a payload matching neither shape (nullish, non-array `results`, a set
+ * without array `headers`/`rows`) renders `Malformed console result payload`
+ * through the error path and logs the raw payload, rather than throwing.
  *
  * All DOM is built with createElement + textContent — query output is
  * untrusted database content and never reaches innerHTML.
