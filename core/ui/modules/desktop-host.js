@@ -18,7 +18,8 @@ const DEFAULT_SETTINGS = Object.freeze({
     fileOperations: 'native',
     queryTimeout: 30000,
     maxInlineCellBytes: 1048576,
-    maxUndoMemory: 52428800
+    maxUndoMemory: 52428800,
+    theme: 'system'
 });
 
 // Worker methods whose successful result must be recorded for undo. DDL and
@@ -281,7 +282,8 @@ export function createDesktopHost({ bridge, createWorker }) {
             return {
                 autoCommit: settings.instantCommit === 'always',
                 cellEditBehavior: settings.doubleClickBehavior,
-                fileOperations: settings.fileOperations
+                fileOperations: settings.fileOperations,
+                theme: settings.theme
             };
         },
         async updateExtensionSetting(key, value) {

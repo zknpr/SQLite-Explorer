@@ -87,7 +87,7 @@ test('getExtensionSettings maps stored keys onto the VS Code wire shape', async 
   await host.start();
   const settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
   // hostBridge.ts parity: panel-facing keys, not the persisted config keys.
-  assert.deepEqual(settings, { autoCommit: true, cellEditBehavior: 'modal', fileOperations: 'native' });
+  assert.deepEqual(settings, { autoCommit: true, cellEditBehavior: 'modal', fileOperations: 'native', theme: 'system' });
 });
 
 test('updateExtensionSetting persists the delta through the bridge', async () => {
@@ -557,4 +557,22 @@ test('exportTable assembles worker chunks and saves via bridge.saveFileAs', asyn
   await host.invoke('exportTable', [{ table: 'users' }, ['a', 'b'], null, null, { format: 'csv' }]);
   assert.equal(savedAs.name, 'users.csv');
   assert.equal(savedAs.text, 'a,b\n1,2\n');
+});
+
+test('theme defaults to system and round-trips through the wire shape', async () => {
+  const { host, saved } = makeHost({});
+  await host.start();
+  let settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
+  assert.equal(settings.theme, 'system');
+  await host.invoke('updateExtensionSetting', ['theme', 'nord']);
+  assert.deepEqual(saved.settings, { theme: 'nord' });
+  settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
+  assert.equal(settings.theme, 'nord');
+});
+
+test('stored theme loads at start', async () => {
+  const { host } = makeHost({}, { loadSettings: async () => ({ theme: 'solarized' }) });
+  await host.start();
+  const settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
+  assert.equal(settings.theme, 'solarized');
 });
