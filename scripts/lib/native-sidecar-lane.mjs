@@ -296,6 +296,65 @@ export async function runSidecarLane({ binary, scratch, note }) {
         check(normalInsert.content?.success === true && normalInsert.content?.data?.mutated === true,
             'sidecar/normal-sql-unaffected-by-attach-block', JSON.stringify(normalInsert.content?.data));
 
+        // SECURITY: VACUUM ... INTO must not write a database copy outside the
+        // bound path. The reviewer's exact probe, replayed through the real
+        // binary via runConsole; nothing must run and the out-of-path file must
+        // not be created.
+        const vacuumTarget = path.join(scratch, 'attack-PWNED.db');
+        fs.rmSync(vacuumTarget, { force: true });
+        const vacuumInto = await rw.invoke('runConsole', [`VACUUM INTO '${vacuumTarget}'`]);
+        check(vacuumInto.content?.success === true
+            && /blocked on the native engine/i.test(vacuumInto.content?.data?.error ?? '')
+            && (vacuumInto.content?.data?.results?.length ?? 0) === 0
+            && !fs.existsSync(vacuumTarget),
+            'sidecar/VACUUM-INTO-blocked-and-no-file-created',
+            `${JSON.stringify(vacuumInto.content?.data?.error)} created=${fs.existsSync(vacuumTarget)}`);
+
+        // In-place VACUUM (no INTO) must stay legitimate.
+        const plainVacuum = await rw.invoke('runConsole', ['VACUUM']);
+        check(plainVacuum.content?.success === true && plainVacuum.content?.data?.error === undefined,
+            'sidecar/plain-VACUUM-allowed', JSON.stringify(plainVacuum.content?.data));
+
+        // NON-INTERFERENCE: exportDatabase issues the shim's OWN VACUUM INTO via
+        // backing.prepare (bypassing compileNext), so the guard must not touch
+        // it — prove the whole export path still works after the block lands.
+        const exportAfterBlock = await rw.invoke('exportDatabase', []);
+        check(exportAfterBlock.content?.success === true
+            && exportAfterBlock.content?.data instanceof Uint8Array
+            && String.fromCharCode(...exportAfterBlock.content.data.subarray(0, 15)) === 'SQLite format 3',
+            'sidecar/export-still-works-after-vacuum-block',
+            `bytes=${exportAfterBlock.content?.data?.length}`);
+
+        // Not over-broad: the phrase in a string literal is fine.
+        const vacuumLiteral = await rw.invoke('runConsole', ["SELECT 'vacuum into' AS note"]);
+        check(vacuumLiteral.content?.success === true
+            && vacuumLiteral.content?.data?.results?.[0]?.rows?.[0]?.[0] === 'vacuum into'
+            && vacuumLiteral.content?.data?.error === undefined,
+            'sidecar/vacuum-into-in-literal-not-blocked', JSON.stringify(vacuumLiteral.content?.data));
+
+        // A table whose name merely starts with "vacuum" is unaffected (leading
+        // token `vacuumlog` is not the `vacuum` keyword; no INTO involved).
+        const vacuumlog = await rw.invoke('runConsole', [
+            'CREATE TABLE vacuumlog(into_count); INSERT INTO vacuumlog VALUES (1); SELECT into_count FROM vacuumlog'
+        ]);
+        check(vacuumlog.content?.success === true
+            && vacuumlog.content?.data?.results?.[0]?.rows?.[0]?.[0] === 1
+            && vacuumlog.content?.data?.error === undefined,
+            'sidecar/vacuumlog-table-and-into-column-unaffected', JSON.stringify(vacuumlog.content?.data?.error));
+
+        // Tripwires: the other SQL→filesystem vectors are absent/disabled in the
+        // pinned fork binary. If a future binary bump enables one, THIS fails —
+        // forcing a matching block before it can ship as a hole.
+        for (const [label, sql] of [
+            ['readfile', "SELECT readfile('/etc/hosts')"],
+            ['writefile', "SELECT writefile('/tmp/sqlx-tripwire','x')"],
+            ['load_extension', "SELECT load_extension('/tmp/x')"]
+        ]) {
+            const probe = await rw.invoke('runConsole', [sql]);
+            check(probe.content?.success === true && (probe.content?.data?.error ?? '') !== '',
+                `sidecar/tripwire-${label}-unavailable`, JSON.stringify(probe.content?.data?.error));
+        }
+
         // Oversize response: the wrapped postMessage must answer IN BAND for
         // the same messageId instead of stranding the RPC (worker.js's send
         // sites are unguarded by design — byte-identity gate).

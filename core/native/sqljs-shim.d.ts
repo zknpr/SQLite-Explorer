@@ -163,6 +163,14 @@ export function createShimDatabase(config?: ShimConfig, deps?: ShimDeps): ShimDa
  */
 export const NATIVE_SQL_ATTACH_BLOCKED: 'ERR_NATIVE_SQL_ATTACH_BLOCKED';
 
+/**
+ * Error `code` stamped on the `VACUUM ... INTO` refusal (see `createShimDatabase`).
+ * VACUUM INTO writes a full copy of the bound database to an arbitrary path,
+ * the last SQL→filesystem write vector after ATTACH; it is rejected at the same
+ * compile chokepoint. In-place `VACUUM` is unaffected. No `errno` (shim policy).
+ */
+export const NATIVE_SQL_VACUUM_INTO_BLOCKED: 'ERR_NATIVE_SQL_VACUUM_INTO_BLOCKED';
+
 /** Copies a SQLite error's non-enumerable `errno` onto a replacement error. */
 export function copyErrno<T extends Error>(target: T, source: unknown): T;
 

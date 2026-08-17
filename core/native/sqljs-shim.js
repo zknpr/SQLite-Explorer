@@ -58,21 +58,36 @@ const EXPLAIN_PREFIX = /^explain\b/i;
  */
 const ATTACH_DETACH_PREFIX = /^(?:attach|detach)\b/i;
 
-/**
- * Cheap pre-filter: does the word `attach`/`detach` appear at all? Only when it
- * does is the (double-compiling) leading-token scan in `db.run(sql)`'s no-param
- * branch worth running. A false hit (the word inside a string literal or
- * comment) costs one extra parse of a script no real caller writes; a miss is
- * impossible because the token cannot be spelled any other way.
- */
-const ATTACH_DETACH_WORD = /\b(?:attach|detach)\b/i;
+/** Leading `VACUUM`, after leading trivia is stripped (in-place VACUUM or VACUUM INTO). */
+const VACUUM_PREFIX = /^vacuum\b/i;
 
 /**
- * Error code stamped on the ATTACH/DETACH refusal. Distinct from the frame
+ * A bareword `into` anywhere in a SINGLE statement's own source. On a statement
+ * whose leading token is `VACUUM`, this can only be the `INTO` clause: the
+ * legitimate forms are `VACUUM`, `VACUUM main`, `VACUUM temp` (no schema alias
+ * beyond main/temp exists, because ATTACH is blocked), none of which contain
+ * `into`. Evasion-proof: a real `VACUUM ... INTO` always carries the literal
+ * `INTO` token in its source, whatever comments surround it, so this matches it.
+ */
+const INTO_WORD = /\binto\b/i;
+
+/**
+ * Cheap pre-filter for `db.run(sql)`'s no-param branch (the one path that skips
+ * `compileNext`): only when one of these path-authority keywords appears is the
+ * double-compiling scan worth running. A false hit (the word inside a string
+ * literal or comment) costs one extra parse of a script no real caller writes;
+ * a miss is impossible because none of these tokens can be spelled another way.
+ */
+const PATH_AUTHORITY_SCAN_WORD = /\b(?:attach|detach|vacuum)\b/i;
+
+/**
+ * Error codes stamped on the path-authority refusals. Distinct from the frame
  * codec's `ERR_NATIVE_FRAME_*` family so a structured consumer can tell a SQL
- * policy refusal from a transport failure.
+ * policy refusal from a transport failure, and distinct from each other so the
+ * two SQL→filesystem vectors are separable in logs.
  */
 export const NATIVE_SQL_ATTACH_BLOCKED = 'ERR_NATIVE_SQL_ATTACH_BLOCKED';
+export const NATIVE_SQL_VACUUM_INTO_BLOCKED = 'ERR_NATIVE_SQL_VACUUM_INTO_BLOCKED';
 
 /**
  * The refusal thrown for a leading ATTACH/DETACH. A plain message (no errno:
@@ -86,6 +101,21 @@ function attachDetachBlockedError(keyword) {
         'would defeat the desktop path sandbox. Only the bound database is reachable.'
     );
     error.code = NATIVE_SQL_ATTACH_BLOCKED;
+    return error;
+}
+
+/**
+ * The refusal thrown for a `VACUUM ... INTO`. In-place `VACUUM` is untouched;
+ * only the file-writing INTO variant is blocked (it writes a full copy of the
+ * bound database to an arbitrary path).
+ */
+function vacuumIntoBlockedError() {
+    const error = new Error(
+        'VACUUM ... INTO is blocked on the native engine: it writes a full copy of ' +
+        'the database to an arbitrary path outside the one this session is bound to, ' +
+        'defeating the desktop path sandbox. Plain VACUUM (in place) is allowed.'
+    );
+    error.code = NATIVE_SQL_VACUUM_INTO_BLOCKED;
     return error;
 }
 
@@ -257,10 +287,32 @@ function compileNext(backing, sql, from) {
             'text does not align with its source'
         );
     }
+    const source = rest.slice(0, length);
+    // SECURITY: reject `VACUUM ... INTO` (an arbitrary out-of-path file write --
+    // it copies the whole bound database to any path SQL names, the last
+    // SQL->filesystem vector after ATTACH). Unlike ATTACH, VACUUM is ALSO the
+    // leading token of the legitimate in-place `VACUUM`/`VACUUM main`, so the
+    // leading token alone is not enough -- the INTO clause has to be detected.
+    // The `into` bareword is tested against THIS statement's own `source` (not
+    // the whole remaining multi-statement string), so `VACUUM; SELECT ... INTO
+    // ...temp...` in a later statement cannot false-trip it. Soundness: with
+    // ATTACH blocked there is no schema alias beyond main/temp, so on a
+    // VACUUM-led statement the only source of a bareword `into` is the INTO
+    // clause itself (the accepted narrow exception is the word `into` written
+    // inside a comment on a plain VACUUM -- pathological, and fails loud, never
+    // silent). Rejected AFTER compile / BEFORE step because VACUUM INTO's file
+    // is created at step, not prepare (verified against the shipped binary), so
+    // the compiled-but-never-stepped statement writes nothing. The shim's own
+    // export issues its VACUUM INTO through `backing.prepare` directly (see
+    // `vacuumInto`), NOT through compileNext, so it is deliberately unaffected.
+    if (VACUUM_PREFIX.test(leading) && INTO_WORD.test(source)) {
+        finalizeQuietly(compiled);
+        throw vacuumIntoBlockedError();
+    }
     // `text` is captured HERE, before any bind: it is the source with every
     // parameter rendered as NULL. Read later it would inline the bound VALUES
     // instead, which is both non-deterministic and user data in SQL text.
-    return { compiled, source: rest.slice(0, length), expanded: text, end: from + length };
+    return { compiled, source, expanded: text, end: from + length };
 }
 
 function finalizeQuietly(statement) {
@@ -274,14 +326,15 @@ function finalizeQuietly(statement) {
 
 /**
  * Walk every statement in a multi-statement script through `compileNext` purely
- * to trip its ATTACH/DETACH reject, then discard each compiled statement WITHOUT
- * stepping it -- so nothing executes. Used only to guard `db.run(sql)`'s
- * no-param `backing.exec` path, which does not itself pass through compileNext.
- * Compiling here and again in `backing.exec` is redundant but harmless (compile
- * has no side effects; ATTACH's effect is at step), and only runs at all when
- * the word `attach`/`detach` is present.
+ * to trip its path-authority rejects (ATTACH/DETACH and VACUUM ... INTO), then
+ * discard each compiled statement WITHOUT stepping it -- so nothing executes.
+ * Used only to guard `db.run(sql)`'s no-param `backing.exec` path, which does
+ * not itself pass through compileNext. Compiling here and again in
+ * `backing.exec` is redundant but harmless (compile has no side effects; both
+ * blocked vectors' effects land at step), and only runs at all when one of the
+ * scanned keywords is present.
  */
-function rejectAttachDetachInScript(backing, sql) {
+function rejectPathAuthorityViolationsInScript(backing, sql) {
     let cursor = 0;
     for (;;) {
         const next = compileNext(backing, sql, cursor);
@@ -820,11 +873,11 @@ export function createShimDatabase(config = {}, deps = {}) {
                 // no-param `run()` hands the whole string to `backing.exec`,
                 // which compiles and steps every statement natively. Worker.js
                 // only reaches this with shim-built DDL/DML (escaped
-                // identifiers, never a leading ATTACH), so it is not a reachable
-                // bypass today -- but the shim is the security boundary, not
-                // worker.js, so close it unconditionally. Fast path: skip the
-                // scan entirely unless the word even appears.
-                if (ATTACH_DETACH_WORD.test(sql)) rejectAttachDetachInScript(backing, sql);
+                // identifiers, never a leading ATTACH or VACUUM INTO), so it is
+                // not a reachable bypass today -- but the shim is the security
+                // boundary, not worker.js, so close it unconditionally. Fast
+                // path: skip the scan entirely unless a scanned keyword appears.
+                if (PATH_AUTHORITY_SCAN_WORD.test(sql)) rejectPathAuthorityViolationsInScript(backing, sql);
                 backing.exec(sql);
             }
             return database;

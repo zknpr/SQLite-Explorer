@@ -19,7 +19,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import initSqlJs from '../../vendor/sql.js/sql-wasm.js';
-import { createShimDatabase, consumedSourceLength, NATIVE_SQL_ATTACH_BLOCKED } from '../../core/native/sqljs-shim.js';
+import {
+    createShimDatabase,
+    consumedSourceLength,
+    NATIVE_SQL_ATTACH_BLOCKED,
+    NATIVE_SQL_VACUUM_INTO_BLOCKED
+} from '../../core/native/sqljs-shim.js';
 import type { ShimDatabase, ShimValueConfig, NativeBindParams } from '../../core/native/sqljs-shim.js';
 import { standInSqliteModule } from './helpers/tjs-backing-standin';
 
@@ -591,6 +596,104 @@ describe('sqljs-shim: ATTACH/DETACH is blocked at the compile chokepoint', () =>
             shim.run('CREATE TABLE "attachment"(id)');
             shim.run('INSERT INTO "attachment" VALUES (1)');
             assert.deepStrictEqual(shim.exec('SELECT id FROM "attachment"')[0].values, [[1]]);
+        } finally {
+            shim.close();
+        }
+    });
+});
+
+describe('sqljs-shim: VACUUM INTO is blocked, plain VACUUM is not', () => {
+    const isBlock = (error: unknown) => {
+        const e = error as { code?: string; errno?: number };
+        assert.strictEqual(e.code, NATIVE_SQL_VACUUM_INTO_BLOCKED);
+        assert.strictEqual(e.errno, undefined);
+        return true;
+    };
+
+    // Every INTO form, through every raw-SQL path. The INTO clause is detected
+    // in the single statement's own source, after compile / before step.
+    it('rejects every VACUUM ... INTO form across exec/prepare/iterateStatements', () => {
+        const shim = createShim();
+        try {
+            for (const sql of [
+                "VACUUM INTO '/tmp/x.db'",
+                "VACUUM main INTO '/tmp/x.db'",
+                'VACUUM INTO ?',
+                "VACUUM /* c */ INTO '/tmp/x.db'"  // comment injection cannot hide the INTO token
+            ]) {
+                assert.throws(() => shim.exec(sql), isBlock, sql);
+                assert.throws(() => shim.prepare(sql), isBlock, sql);
+                assert.throws(() => shim.iterateStatements(sql).next(), isBlock, sql);
+            }
+        } finally {
+            shim.close();
+        }
+    });
+
+    it('rejects VACUUM INTO in a no-param run() script and applies nothing', () => {
+        const shim = createShim();
+        try {
+            shim.run('CREATE TABLE g(n)');
+            assert.throws(
+                () => shim.run("INSERT INTO g VALUES(1); VACUUM INTO '/tmp/x.db'"),
+                isBlock
+            );
+            assert.deepStrictEqual(shim.exec('SELECT count(*) AS c FROM g')[0].values, [[0]]);
+        } finally {
+            shim.close();
+        }
+    });
+
+    it('allows plain VACUUM and VACUUM main (in place)', () => {
+        const shim = createShim();
+        try {
+            shim.run('CREATE TABLE t(a); INSERT INTO t VALUES(1),(2)');
+            assert.doesNotThrow(() => shim.exec('VACUUM'));
+            assert.doesNotThrow(() => shim.exec('VACUUM main'));
+            // Data survives the in-place rebuild.
+            assert.deepStrictEqual(shim.exec('SELECT count(*) AS c FROM t')[0].values, [[2]]);
+        } finally {
+            shim.close();
+        }
+    });
+
+    it('scopes the INTO check to the current statement, not a later one', () => {
+        // A plain VACUUM followed by a statement that legitimately contains
+        // `into` must not false-trip: each statement is checked on its own.
+        const shim = createShim();
+        try {
+            shim.run('CREATE TABLE t(a)');
+            assert.doesNotThrow(() => shim.exec("VACUUM; SELECT 'into' AS x"));
+        } finally {
+            shim.close();
+        }
+    });
+
+    it('is not over-broad: the phrase in a literal, and vacuum-prefixed names, are fine', () => {
+        const shim = createShim();
+        try {
+            assert.deepStrictEqual(shim.exec("SELECT 'vacuum into' AS a")[0].values, [['vacuum into']]);
+            // A table name starting with "vacuum" is not the VACUUM keyword
+            // (no word boundary), and its "into"-containing column is untouched.
+            shim.run('CREATE TABLE vacuumlog(into_count)');
+            shim.run('INSERT INTO vacuumlog VALUES (1)');
+            assert.deepStrictEqual(shim.exec('SELECT into_count FROM vacuumlog')[0].values, [[1]]);
+        } finally {
+            shim.close();
+        }
+    });
+
+    it('does not interfere with the shim export path (its own VACUUM INTO)', () => {
+        // export() issues VACUUM INTO through backing.prepare directly, NOT
+        // through compileNext, so the guard must leave it working.
+        const shim = createShim();
+        try {
+            shim.run('CREATE TABLE t(a); INSERT INTO t VALUES(1),(2),(3)');
+            const bytes = shim.export();
+            assert.strictEqual(
+                String.fromCharCode(...bytes.subarray(0, 15)),
+                'SQLite format 3'
+            );
         } finally {
             shim.close();
         }
