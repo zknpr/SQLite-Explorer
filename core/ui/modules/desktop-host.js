@@ -383,6 +383,24 @@ export function createDesktopHost({ bridge, createWorker }) {
         async invoke(method, args) {
             const local = localMethods[method];
             if (local) return local(...args);
+            if (method === 'runConsole') {
+                const result = await callWorker(method, args);
+                // Arbitrary SQL cannot be replayed by the undo engine; a mutating run
+                // barriers the history exactly like DDL does. A pure SELECT must not
+                // dirty the file or wall off the user's undo stack.
+                if (result?.mutated) {
+                    tracker.record({
+                        label: method,
+                        description: method,
+                        modificationType: method,
+                        undoPolicy: 'barrier'
+                    });
+                    if (settings.instantCommit === 'always' && currentPath) await saveToDisk();
+                    updateTitle();
+                    await refreshUi();
+                }
+                return result;
+            }
             if (BARRIER_METHODS.has(method)) {
                 const result = await callWorker(method, args);
                 // No ModificationType union member fits a generic DDL/pragma

@@ -642,3 +642,28 @@ test('openFromShellPath reads through the bridge and boots the database', async 
   const init = await host.invoke('initialize', []);
   assert.equal((init as { filename: string }).filename, 'from-finder.db');
 });
+
+test('runConsole with mutations records a barrier and refreshes', async () => {
+  const { host } = makeHost({
+    runConsole: () => ({ results: [], mutated: true, changes: 2, durationMs: 1 })
+  });
+  await host.start();
+  let refreshed = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshed++; return { success: true }; } });
+  const res = await host.invoke('runConsole', ['INSERT ...', {}]) as Record<string, unknown>;
+  assert.equal(res.mutated, true);
+  assert.equal(host.hasUnsavedChanges(), true);
+  assert.equal(refreshed, 1);
+});
+
+test('runConsole without mutations stays clean', async () => {
+  const { host } = makeHost({
+    runConsole: () => ({ results: [{ headers: ['1'], rows: [[1]], truncated: false }], mutated: false, changes: 0, durationMs: 1 })
+  });
+  await host.start();
+  let refreshed = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshed++; return { success: true }; } });
+  await host.invoke('runConsole', ['SELECT 1', {}]);
+  assert.equal(host.hasUnsavedChanges(), false);
+  assert.equal(refreshed, 0);
+});
