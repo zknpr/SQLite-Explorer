@@ -7,8 +7,11 @@
  * 1. BUNDLE ISOLATION. console.js pulls in CodeMirror 6. Only
  *    desktop-viewer.js may import it (or console-results.js): the moment a
  *    shared module does, CodeMirror lands in the VS Code webview bundle and
- *    the web-demo bundle too, shipping ~200 KB of editor into the .vsix for a
- *    feature neither target exposes.
+ *    the web-demo bundle too, shipping ~380 KB of editor into the .vsix for a
+ *    feature neither target exposes. Checked twice — once against the import
+ *    graph in source (fast, names the culprit file) and once against the
+ *    BUILT viewer.html artifacts (slow to diagnose, but it is the thing that
+ *    actually ships, and it holds no matter how the import is spelled).
  *
  * 2. TEMPLATE/CSS CONTRACT. console.js and console-results.js build their DOM
  *    into elements the shared template owns, and both toggle visibility with
@@ -38,9 +41,18 @@ function nonDesktopSources(): string[] {
     return [...entries, ...modules];
 }
 
+/**
+ * Matches all three ways a module can reach the console modules: `from '…'`,
+ * a bare side-effect `import '…'`, and a dynamic `import('…')`. Only the first
+ * makes CodeMirror unconditionally part of a bundle, but esbuild inlines the
+ * dynamic form too when the output format is iife (which every viewer target
+ * uses), so all three are disqualifying.
+ */
+const CONSOLE_IMPORT = /(?:from|import)\s*\(?\s*['"][^'"]*console(?:-results)?\.js['"]/;
+
 test('only desktop-viewer.js imports the console modules (keeps CodeMirror out of the VS Code/web bundles)', () => {
     const importers = nonDesktopSources().filter(file =>
-        /from\s+['"][^'"]*console(-results)?\.js['"]/.test(readFileSync(file, 'utf8'))
+        CONSOLE_IMPORT.test(readFileSync(file, 'utf8'))
     );
     assert.deepEqual(
         importers.map(file => path.relative(process.cwd(), file)),
@@ -53,6 +65,28 @@ test('only desktop-viewer.js imports the console modules (keeps CodeMirror out o
     const desktopEntry = readUi('desktop-viewer.js');
     assert.match(desktopEntry, /from\s+'\.\/modules\/console\.js'/);
     assert.match(desktopEntry, /from\s+'\.\/modules\/console-results\.js'/);
+});
+
+test('the built VS Code and web bundles contain no CodeMirror', () => {
+    // The committed build outputs, i.e. what actually ships. This survives any
+    // spelling of the import the source-level check above might miss, and it
+    // catches a transitive path (shared module -> new module -> console) too.
+    const occurrences = (file: string) =>
+        (readFileSync(path.resolve(process.cwd(), file), 'utf8').match(/cm-content/g) ?? []).length;
+
+    assert.equal(occurrences('core/ui/viewer.html'), 0, 'CodeMirror leaked into the VS Code webview bundle');
+    assert.equal(
+        occurrences('website/public/sqlite-viewer/viewer.html'), 0,
+        'CodeMirror leaked into the web demo bundle'
+    );
+
+    // Positive control: `cm-content` is a CodeMirror-owned class name, so if a
+    // dependency bump renamed it the two assertions above would pass while
+    // proving nothing. The desktop bundle is where CodeMirror belongs.
+    assert.ok(
+        occurrences('desktop/viewer.html') > 0,
+        'desktop bundle has no cm-content — the marker this test greps for is stale, not the isolation'
+    );
 });
 
 test('the shared template carries the console mount points, inert by default', () => {

@@ -199,6 +199,14 @@ async function openConsole() {
         saveHistory: saveConsoleHistory,
         getSchema: getConsoleSchema
     });
+    // Every open captures current state. The refreshContent hook alone is not
+    // enough: picking a table in the sidebar goes straight to selectTableItem,
+    // which reloads state.tableColumns without any host round trip — so a
+    // console reopened after a table switch would otherwise autocomplete the
+    // PREVIOUS table's columns and offer the new one none. Redundant by one
+    // compartment reconfigure on the very first open (createConsole just read
+    // the same getSchema()); that costs a single dispatch.
+    refreshConsoleSchema();
 
     container.hidden = false;
     panel.classList.add('console-mode');
@@ -207,6 +215,13 @@ async function openConsole() {
 
 function closeConsole() {
     const container = document.getElementById('consoleContainer');
+    // The module keeps its own open/closed state (isOpen() mirrors its mount's
+    // `hidden`), and applyConsoleAvailability reads it to decide whether an
+    // open is a transition worth focusing. Hiding only the container would
+    // leave the module believing it is still open, so the next open would skip
+    // show() and never focus the editor. One notion of "open", two elements
+    // kept in step.
+    sqlConsole?.hide();
     document.querySelector('.main-panel')?.classList.remove('console-mode');
     if (container) container.hidden = true;
 }
