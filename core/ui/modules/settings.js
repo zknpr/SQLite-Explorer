@@ -156,7 +156,10 @@ function renderPragmaForm(pragmas, settings) {
         createOptions(THEME_IDS, settings.theme).forEach(opt => themeSelect.appendChild(opt));
         themeSelect.addEventListener('change', async () => {
             const value = applyTheme(themeSelect.value);
-            await updateExtensionSetting('theme', value);
+            await updateExtensionSetting('theme', value).catch(err => {
+                console.error(err);
+                updateStatus(`Theme change failed: ${err.message}`);
+            });
         });
         appendField('Theme', themeSelect, 'Color theme (System follows the OS appearance)');
     }
