@@ -459,6 +459,7 @@ const bundleDesktopViewer = async () => {
 
   const template = fs.readFileSync(templatePath, 'utf-8');
   const css = fs.readFileSync(cssPath, 'utf-8');
+  const themesCss = fs.readFileSync(resolve('core', 'ui', 'desktop-themes.css'), 'utf-8');
 
   const desktopApiPlugin = {
     name: 'desktop-api-plugin',
@@ -484,7 +485,7 @@ const bundleDesktopViewer = async () => {
   });
   const finalJs = jsResult.outputFiles[0].text;
 
-  const cssResult = await esbuild.transform(css, { loader: 'css', minify: true });
+  const cssResult = await esbuild.transform(`${css}\n${themesCss}`, { loader: 'css', minify: true });
   const finalCss = cssResult.code;
 
   // Local codicons (offline); the Tauri CSP forbids remote origins.

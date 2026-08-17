@@ -1,0 +1,130 @@
+/* Desktop-only theme layer. Bundled ONLY by bundleDesktopViewer; the VS Code and web
+   builds never see this file. Overriding the --vscode-* names (not the semantic
+   tokens) lets every var(--vscode-X, fallback) in viewer.css resolve through the
+   active theme with zero shared-file changes. `system` is represented by the ABSENCE
+   of data-theme plus applyTheme() resolving to dark/light. */
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --vscode-editor-background: #1e1e1e;
+  --vscode-sideBar-background: #252526;
+  --vscode-input-background: #3c3c3c;
+  --vscode-editor-foreground: #cccccc;
+  --vscode-descriptionForeground: #888888;
+  --vscode-panel-border: #454545;
+  --vscode-focusBorder: #007acc;
+  --vscode-list-hoverBackground: #2a2d2e;
+  --vscode-list-activeSelectionBackground: #094771;
+  --vscode-list-activeSelectionForeground: #ffffff;
+  --vscode-errorForeground: #f48771;
+  --vscode-terminal-ansiGreen: #89d185;
+  --vscode-editorWarning-foreground: #cca700;
+  --vscode-button-background: #0e639c;
+  --vscode-button-foreground: #ffffff;
+  --vscode-button-hoverBackground: #1177bb;
+  --vscode-button-secondaryBackground: #3c3c3c;
+  --vscode-button-secondaryForeground: #cccccc;
+  --vscode-button-secondaryHoverBackground: #2a2d2e;
+  --vscode-editor-findMatchHighlightBackground: rgba(234, 182, 42, 0.4);
+  --bg-stripe: rgba(255, 255, 255, .02);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --vscode-editor-background: #ffffff;
+  --vscode-sideBar-background: #f3f3f3;
+  --vscode-input-background: #ffffff;
+  --vscode-editor-foreground: #3b3b3b;
+  --vscode-descriptionForeground: #717171;
+  --vscode-panel-border: #e5e5e5;
+  --vscode-focusBorder: #005fb8;
+  --vscode-list-hoverBackground: #e8e8e8;
+  --vscode-list-activeSelectionBackground: #0060c0;
+  --vscode-list-activeSelectionForeground: #ffffff;
+  --vscode-errorForeground: #b01011;
+  --vscode-terminal-ansiGreen: #107c10;
+  --vscode-editorWarning-foreground: #bf8803;
+  --vscode-button-background: #005fb8;
+  --vscode-button-foreground: #ffffff;
+  --vscode-button-hoverBackground: #0258a8;
+  --vscode-button-secondaryBackground: #e5e5e5;
+  --vscode-button-secondaryForeground: #3b3b3b;
+  --vscode-button-secondaryHoverBackground: #d8d8d8;
+  --vscode-editor-findMatchHighlightBackground: rgba(234, 92, 0, .33);
+  --bg-stripe: rgba(0, 0, 0, .03);
+}
+
+:root[data-theme="high-contrast"] {
+  color-scheme: dark;
+  --vscode-editor-background: #000000;
+  --vscode-sideBar-background: #000000;
+  --vscode-input-background: #000000;
+  --vscode-editor-foreground: #ffffff;
+  --vscode-descriptionForeground: #ffffff;
+  --vscode-panel-border: #6fc3df;
+  --vscode-focusBorder: #f38518;
+  --vscode-list-hoverBackground: rgba(255, 255, 255, .12);
+  --vscode-list-activeSelectionBackground: #0f4a85;
+  --vscode-list-activeSelectionForeground: #ffffff;
+  --vscode-errorForeground: #f48771;
+  --vscode-terminal-ansiGreen: #00ff00;
+  --vscode-editorWarning-foreground: #f38518;
+  --vscode-button-background: #0f4a85;
+  --vscode-button-foreground: #ffffff;
+  --vscode-button-hoverBackground: #17629f;
+  --vscode-button-secondaryBackground: #1a1a1a;
+  --vscode-button-secondaryForeground: #ffffff;
+  --vscode-button-secondaryHoverBackground: #333333;
+  --vscode-editor-findMatchHighlightBackground: rgba(243, 133, 24, .5);
+  --bg-stripe: rgba(255, 255, 255, .06);
+}
+
+:root[data-theme="solarized"] {
+  color-scheme: dark;
+  --vscode-editor-background: #002b36;
+  --vscode-sideBar-background: #073642;
+  --vscode-input-background: #073642;
+  --vscode-editor-foreground: #839496;
+  --vscode-descriptionForeground: #586e75;
+  --vscode-panel-border: #0d4a5a;
+  --vscode-focusBorder: #268bd2;
+  --vscode-list-hoverBackground: #08404f;
+  --vscode-list-activeSelectionBackground: #268bd2;
+  --vscode-list-activeSelectionForeground: #fdf6e3;
+  --vscode-errorForeground: #dc322f;
+  --vscode-terminal-ansiGreen: #859900;
+  --vscode-editorWarning-foreground: #b58900;
+  --vscode-button-background: #268bd2;
+  --vscode-button-foreground: #fdf6e3;
+  --vscode-button-hoverBackground: #3097dd;
+  --vscode-button-secondaryBackground: #073642;
+  --vscode-button-secondaryForeground: #93a1a1;
+  --vscode-button-secondaryHoverBackground: #0a4351;
+  --vscode-editor-findMatchHighlightBackground: rgba(181, 137, 0, .35);
+  --bg-stripe: rgba(255, 255, 255, .02);
+}
+
+:root[data-theme="nord"] {
+  color-scheme: dark;
+  --vscode-editor-background: #2e3440;
+  --vscode-sideBar-background: #3b4252;
+  --vscode-input-background: #3b4252;
+  --vscode-editor-foreground: #d8dee9;
+  --vscode-descriptionForeground: #616e88;
+  --vscode-panel-border: #434c5e;
+  --vscode-focusBorder: #88c0d0;
+  --vscode-list-hoverBackground: #434c5e;
+  --vscode-list-activeSelectionBackground: #5e81ac;
+  --vscode-list-activeSelectionForeground: #eceff4;
+  --vscode-errorForeground: #bf616a;
+  --vscode-terminal-ansiGreen: #a3be8c;
+  --vscode-editorWarning-foreground: #ebcb8b;
+  --vscode-button-background: #5e81ac;
+  --vscode-button-foreground: #eceff4;
+  --vscode-button-hoverBackground: #81a1c1;
+  --vscode-button-secondaryBackground: #434c5e;
+  --vscode-button-secondaryForeground: #d8dee9;
+  --vscode-button-secondaryHoverBackground: #4c566a;
+  --vscode-editor-findMatchHighlightBackground: rgba(136, 192, 208, .30);
+  --bg-stripe: rgba(255, 255, 255, .02);
+}
