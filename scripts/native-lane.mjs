@@ -1,16 +1,20 @@
 /**
  * Real-binary lane for the native engine: `npm run native-lane`.
  *
- * Deliberately OUTSIDE `npm test`. The unit suite exercises
- * `core/native/sqljs-shim.js` over a node:sqlite stand-in so it runs anywhere;
- * this lane spawns the ACTUAL sha-pinned fork binary from `natives/`, loads the
- * same shim over real `tjs:sqlite`, runs the same fixture matrix
- * (`scripts/lib/native-lane-fixtures.mjs`), and diffs the result against the
- * real vendored sql.js running here in node. Fork API drift therefore fails at
- * gate time rather than at runtime in the sidecar.
+ * Deliberately OUTSIDE `npm test`. It runs two phases against the ACTUAL
+ * sha-pinned fork binary from `natives/`:
  *
- * Exits non-zero on any fixture mismatch, errno mismatch, or fork-only check
- * failure.
+ *   1. ENGINE — loads `core/native/sqljs-shim.js` over real `tjs:sqlite`, runs
+ *      the shared fixture matrix (`scripts/lib/native-lane-fixtures.mjs`), and
+ *      diffs the result against the real vendored sql.js running here in node.
+ *      The unit suite runs the same shim over a node:sqlite stand-in, so fork
+ *      API drift fails at gate time rather than at runtime in the sidecar.
+ *   2. TRANSPORT — drives `core/native/stdio-transport.js` inside the binary
+ *      over real pipes (`scripts/lib/native-frame-lane.mjs`): drip-feed,
+ *      coalesced writes, split headers, 256 KiB, the 16 MiB drain, and EOF.
+ *
+ * Exits non-zero on any fixture mismatch, errno mismatch, fork-only check, or
+ * transport check failure.
  */
 
 import { spawn } from 'node:child_process';
@@ -20,6 +24,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import initSqlJs from '../vendor/sql.js/sql-wasm.js';
 import { runFixtures, normalize } from './lib/native-lane-fixtures.mjs';
+import { runFrameLane } from './lib/native-frame-lane.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -82,6 +87,7 @@ const FORK_ONLY_EXPECTATIONS = {
 
 const scratch = mkdtempSync(path.join(tmpdir(), 'native-lane-'));
 let failures = 0;
+let frameChecks = 0;
 const note = (ok, label, detail) => {
     if (!ok) failures += 1;
     console.log(`${ok ? '  ok  ' : ' FAIL '} ${label}${detail ? ` -- ${detail}` : ''}`);
@@ -134,10 +140,13 @@ try {
                 actualText === expectedText ? '' : `expected ${expectedText}, got ${JSON.stringify(outcome)}`);
         }
 
+        console.log('\n-- stdio transport through the real binary (real pipes) --');
+        frameChecks = await runFrameLane({ binary, scratch, note });
+
         console.log(
             `\n${failures === 0 ? 'native lane PASSED' : `native lane FAILED (${failures} check(s))`}` +
             ` -- ${native.fixtures.length} shared fixtures, ${native.errnoChecks.length} errno checks, ` +
-            `${native.forkOnly.length} fork-only checks`
+            `${native.forkOnly.length} fork-only checks, ${frameChecks} transport checks`
         );
         if (failures > 0) process.exitCode = 1;
     }

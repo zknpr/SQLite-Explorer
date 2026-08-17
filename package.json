@@ -202,7 +202,8 @@
     "package": "node scripts/package-vsix.mjs",
     "package-all": "node scripts/package-vsix.mjs",
     "test": "npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts",
-    "native-lane": "node scripts/native-lane.mjs",
+    "native-lane": "npx tsx scripts/native-lane.mjs",
+    "native-frame-fixture": "npx tsx scripts/generate-native-frame-fixture.ts",
     "compile:desktop-tests": "rm -rf .desktop-test-out && tsc -p tsconfig.desktop.json",
     "test:desktop": "npm run compile:desktop-tests && node scripts/run-desktop-tests.mjs",
     "test:native-smoke": "node --import tsx --test tests/unit/native_real_smoke.test.ts"
