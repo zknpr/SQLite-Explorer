@@ -21,7 +21,15 @@
 import { createStdioTransport } from '../../core/native/stdio-transport.js';
 import { frameErrorResponse } from '../../core/native/frame-codec.js';
 
+/**
+ * Mirrors what Task 4's entry does: one shutdown hook, whatever stopped the
+ * reader. `fatal` (a desync) exits too — staying alive would leave the parent
+ * writing into a process that no longer parses anything.
+ */
+let shutdownReason = { kind: 'eof' };
+
 const transport = createStdioTransport({
+    onEof: (reason) => { shutdownReason = reason; },
     onTransportError: (error) => {
         console.error(`[frame-harness] transport error: ${error?.message ?? error}`);
     }
@@ -40,7 +48,12 @@ transport.onmessage = (event) => {
     }
 };
 
-// EOF resolves start(); it is both the clean shutdown and the orphan signal.
+// start() resolves at EOF (clean shutdown / orphan signal) and also when a
+// desync stops the reader. flush() first so the in-band error frame reaches the
+// parent before the pipe closes.
 await transport.start();
 await transport.flush();
+if (shutdownReason.kind !== 'eof') {
+    console.error(`[frame-harness] shutting down: ${shutdownReason.kind} -- ${shutdownReason.error?.message ?? ''}`);
+}
 tjs.exit(0);

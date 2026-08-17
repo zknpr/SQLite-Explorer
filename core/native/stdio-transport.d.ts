@@ -18,31 +18,64 @@ export interface StdioMessageEvent {
     data: unknown;
 }
 
+/**
+ * Why reading stopped. Delivered to `onEof` exactly once, whatever the cause,
+ * so the entry has a single place to exit from.
+ *
+ * - `eof` — stdin closed. Clean shutdown, and also the primary orphan signal:
+ *   an orphaned tjs process is NOT killed by the OS.
+ * - `fatal` — the frame stream desynchronised (`NATIVE_FRAME_DESYNC`). The
+ *   in-band error frame has been queued; `flush()` before exiting so the
+ *   parent receives it. Exiting is REQUIRED, not optional: it closes the pipe
+ *   so the parent's next write sees EPIPE/EOF instead of blocking forever
+ *   against a process that is alive but no longer listening.
+ * - `stream-error` — stdin itself failed. Treated as terminal.
+ */
+export type StdioShutdownReason =
+    | { kind: 'eof' }
+    | { kind: 'fatal'; error: import('./frame-codec.js').NativeFrameError }
+    | { kind: 'stream-error'; error: unknown };
+
 export interface StdioTransportOptions {
     /** Defaults to `tjs.stdin`. */
     stdin?: StdinLike;
     /** Defaults to `tjs.stdout`. */
     stdout?: StdoutLike;
-    /**
-     * Fired exactly once when stdin reaches EOF. EOF is both the clean
-     * shutdown signal and the primary orphan signal — an orphaned tjs process
-     * is not killed by the OS.
-     */
-    onEof?: () => void;
+    /** Fired exactly once when reading stops. See `StdioShutdownReason`. */
+    onEof?: (reason: StdioShutdownReason) => void;
     /** Pipe-level failures (write errors, stream errors). Defaults to console.error. */
     onTransportError?: (error: unknown) => void;
     /** Defaults to `MAX_FRAME_BYTES`. */
     maxFrameBytes?: number;
+    /** Defaults to `MAX_DRAIN_BYTES`. Above it a declared length is a desync. */
+    maxDrainBytes?: number;
 }
 
 export interface StdioTransport {
     /** Assigned by the worker method layer, exactly as it would assign `self.onmessage`. */
     onmessage: ((event: StdioMessageEvent) => void) | null;
     /**
-     * Frame and queue one message.
-     * @throws {import('./frame-codec.js').NativeFrameError} synchronously when
-     *   the encoded payload exceeds the cap, so the caller can answer the
-     *   request with an error instead of leaving it pending forever.
+     * Frame and queue one message. The returned promise resolves once stdout
+     * has accepted the frame; it always carries its own rejection handler, so
+     * ignoring it is safe and pipe failures still reach `onTransportError`.
+     *
+     * THROWS SYNCHRONOUSLY on an oversize payload (`NATIVE_FRAME_TOO_LARGE`).
+     * That is deliberate — a dropped reply strands the parent's pending request
+     * forever, so the failure has to be visible at the call site.
+     *
+     * EMBEDDER OBLIGATION: every send site must either wrap this call or be
+     * handed a surface that self-handles the cap. The worker method layer in
+     * `website/src/sqlite-viewer/worker.js` does NOT qualify — only its success
+     * send sits inside a try/catch; the unknown-method reply (which interpolates
+     * a webview-supplied `targetMethod` and is therefore attacker-influenced)
+     * and the catch-branch reply both call `postMessage` unguarded. An oversize
+     * frame at either site becomes a stranded RPC plus an unhandled rejection.
+     * Because that file is under a byte-identical build gate, the sidecar entry
+     * must hand the worker layer a WRAPPED transport that catches the cap error
+     * and synthesises a bounded error response for the same `messageId`, rather
+     * than this object directly.
+     *
+     * @throws {import('./frame-codec.js').NativeFrameError}
      */
     postMessage(message: unknown): Promise<void>;
     /** Begin reading stdin. Resolves at EOF. */

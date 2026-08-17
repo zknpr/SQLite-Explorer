@@ -47,12 +47,31 @@ export const FRAME_HEADER_BYTES = 4;
  */
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 
+/**
+ * How far past the cap a declared length may go and still be treated as a real
+ * (if oversize) frame whose bytes will actually arrive, so the reader can drain
+ * it and resynchronise. 4x the cap — 64 MiB.
+ *
+ * The multiple is a judgement about the SOURCE of the number, not about size.
+ * Below it, the length is plausibly what a buggy-but-honest peer meant: an
+ * over-budget result page is the same order of magnitude as the budget, and
+ * those bytes are genuinely on their way, so draining them resynchronises.
+ * Above it, the value is far outside anything the format can legitimately
+ * produce, which means the header is not a header — the stream is misaligned
+ * or corrupt. Draining then consumes bytes that will never arrive as payload
+ * and silently eats every real frame behind them.
+ */
+const DRAIN_LIMIT_MULTIPLE = 4;
+export const MAX_DRAIN_BYTES = MAX_FRAME_BYTES * DRAIN_LIMIT_MULTIPLE;
+
 /** Largest value a u32 length prefix can express. */
 const MAX_HEADER_VALUE = 0xffffffff;
 
 /** Stable machine-readable identities carried on both sides of the pipe. */
 export const NATIVE_FRAME_TOO_LARGE = 'ERR_NATIVE_FRAME_TOO_LARGE';
 export const NATIVE_FRAME_MALFORMED = 'ERR_NATIVE_FRAME_MALFORMED';
+/** Unrecoverable: the stream is not framed any more. Always fatal. */
+export const NATIVE_FRAME_DESYNC = 'ERR_NATIVE_FRAME_DESYNC';
 
 const TEXT_ENCODER = new TextEncoder();
 // Fatal: a truncated or invalid UTF-8 payload must surface as an error frame.
@@ -81,6 +100,7 @@ export class NativeFrameError extends Error {
      * @param {string} options.message
      * @param {number} [options.actualBytes]
      * @param {number} [options.limitBytes]
+     * @param {boolean} [options.fatal] the reader cannot continue after this
      * @param {unknown} [options.cause]
      */
     constructor(options) {
@@ -90,8 +110,15 @@ export class NativeFrameError extends Error {
         this.direction = options.direction;
         this.actualBytes = options.actualBytes;
         this.limitBytes = options.limitBytes;
+        this.fatal = options.fatal === true;
     }
 }
+
+const NATIVE_FRAME_CODES = [
+    NATIVE_FRAME_TOO_LARGE,
+    NATIVE_FRAME_MALFORMED,
+    NATIVE_FRAME_DESYNC
+];
 
 export function isNativeFrameError(error) {
     return error instanceof NativeFrameError
@@ -99,7 +126,7 @@ export function isNativeFrameError(error) {
             !!error
             && typeof error === 'object'
             && error.name === 'NativeFrameError'
-            && (error.code === NATIVE_FRAME_TOO_LARGE || error.code === NATIVE_FRAME_MALFORMED)
+            && NATIVE_FRAME_CODES.includes(error.code)
         );
 }
 
@@ -120,6 +147,19 @@ function malformed(message, cause) {
         direction: 'incoming',
         message: `Native frame rejected: ${message}`,
         cause
+    });
+}
+
+function desync(declared, drainLimit) {
+    return new NativeFrameError({
+        code: NATIVE_FRAME_DESYNC,
+        direction: 'incoming',
+        actualBytes: declared,
+        limitBytes: drainLimit,
+        fatal: true,
+        message: `Native frame stream desynchronised: header declares ${declared} bytes, `
+            + `beyond the ${drainLimit}-byte recoverable-drain limit. The stream is no longer `
+            + 'framed; reading has stopped.'
     });
 }
 
@@ -182,6 +222,15 @@ export function encodeFrameHeader(payloadBytes) {
  * @returns {number}
  */
 export function readFrameHeader(bytes, offset = 0) {
+    // Without this, a short buffer reads `undefined` bytes as 0 and returns a
+    // plausible-looking length. Silence there means the caller framed against
+    // a number nobody wrote.
+    if (!bytes || bytes.length < offset + FRAME_HEADER_BYTES) {
+        throw new RangeError(
+            `Native frame header needs ${FRAME_HEADER_BYTES} bytes at offset ${offset}, `
+            + `got ${bytes ? bytes.length : 0}`
+        );
+    }
     return (
         (bytes[offset] << 24)
         | (bytes[offset + 1] << 16)
@@ -412,24 +461,47 @@ export function encodeFrame(message, options) {
  * chunks honour neither frame boundaries nor sizes (partial headers, coalesced
  * frames, and frame-plus-prefix-of-next all occur).
  *
- * OVERSIZE-INCOMING POLICY: an oversize declared length reports once through
- * `onError` and then DRAINS exactly that many bytes, discarding them without
- * buffering, before resuming at the next frame boundary. The alternatives are
- * both worse: stopping the read loop deadlocks the peer as soon as the pipe
- * buffer fills, and resuming at the next byte instead of the next frame
- * desynchronises framing permanently (payload bytes get read as headers, which
- * an attacker chooses). Draining costs read bandwidth — at most 4 GiB, the
- * ceiling of a u32 prefix — but O(1) memory, and it resynchronises exactly.
+ * OVERSIZE-INCOMING POLICY, in two tiers, because "too large" and "not a
+ * length at all" need different answers:
+ *
+ *  1. cap < declared <= MAX_DRAIN_BYTES — RECOVERABLE. Report once through
+ *     `onError` and then DRAIN exactly that many bytes, discarding them without
+ *     buffering, before resuming at the next frame boundary. The alternatives
+ *     are both worse: stopping the read loop deadlocks the peer as soon as the
+ *     pipe buffer fills, and resuming at the next byte instead of the next
+ *     frame desynchronises framing permanently (payload bytes get read as
+ *     headers, which an attacker chooses). Draining costs read bandwidth but
+ *     O(1) memory, and it resynchronises exactly.
+ *
+ *  2. declared > MAX_DRAIN_BYTES — UNRECOVERABLE DESYNC, and draining is the
+ *     WRONG answer. A corrupt header (`FF FF FF FF`) would otherwise make the
+ *     reader discard the next 4 GiB, silently eating every legitimate frame
+ *     behind it: one error, then permanent deafness — exactly the outcome the
+ *     drain design exists to avoid, reached by corrupt rather than oversize
+ *     input. So the reader emits ONE fatal error (`NATIVE_FRAME_DESYNC`) and
+ *     STOPS PERMANENTLY; later `push()` calls are ignored.
+ *
+ * The no-deadlock argument survives tier 2 because fatal means the embedder
+ * EXITS: `stdio-transport.js` reports the fatal error, writes it in band, and
+ * runs its shutdown path, which closes the pipe. The parent then sees EOF or
+ * EPIPE on its next write — it never blocks writing into a deaf-but-alive
+ * peer, which is the failure this whole policy is built to prevent.
  *
  * Callbacks are invoked AFTER the reader's own state has advanced, so a
  * throwing callback cannot leave the framing misaligned.
  *
  * @param {(message: unknown) => void} onMessage
- * @param {(error: NativeFrameError) => void} onError
- * @param {{maxFrameBytes?: number}} [options]
+ * @param {(error: NativeFrameError) => void} onError sole argument; `error.fatal`
+ *   marks the desync case, after which the reader is permanently stopped
+ * @param {{maxFrameBytes?: number, maxDrainBytes?: number}} [options]
  */
 export function createFrameReader(onMessage, onError, options) {
     const limit = resolveMaxFrameBytes(options?.maxFrameBytes);
+    // Scales with the cap so a test running a tiny limit exercises the same
+    // two-tier shape the 16 MiB default does.
+    const drainLimit = options?.maxDrainBytes === undefined
+        ? Math.min(limit * DRAIN_LIMIT_MULTIPLE, MAX_HEADER_VALUE)
+        : resolveMaxFrameBytes(options.maxDrainBytes);
     /** @type {Uint8Array[]} */
     const chunks = [];
     let head = 0;          // read offset into chunks[0]
@@ -437,6 +509,7 @@ export function createFrameReader(onMessage, onError, options) {
     let pendingLength = -1; // payload length of the frame being assembled
     let skipRemaining = 0;  // bytes of a doomed oversize frame still to discard
     let ended = false;
+    let fatal = false;      // desynchronised: reading has stopped for good
 
     const advance = (count) => {
         available -= count;
@@ -516,6 +589,17 @@ export function createFrameReader(onMessage, onError, options) {
             if (pendingLength < 0) {
                 if (available < FRAME_HEADER_BYTES) return;
                 const declared = readFrameHeader(takeExact(FRAME_HEADER_BYTES));
+                if (declared > drainLimit) {
+                    // Tier 2: not a length. Stop for good rather than drain
+                    // every real frame behind it into the void.
+                    fatal = true;
+                    chunks.length = 0;
+                    head = 0;
+                    available = 0;
+                    skipRemaining = 0;
+                    onError(desync(declared, drainLimit));
+                    return;
+                }
                 if (declared > limit) {
                     skipRemaining = declared;
                     onError(tooLarge('incoming', declared, limit));
@@ -534,6 +618,10 @@ export function createFrameReader(onMessage, onError, options) {
         /** @param {Uint8Array} chunk */
         push(chunk) {
             if (ended) throw new Error('Native frame reader: push() after end()');
+            // After a desync the stream carries no recoverable framing, so
+            // later bytes are ignored rather than reinterpreted. Not a throw:
+            // the embedder's read loop may already have a chunk in hand.
+            if (fatal) return;
             if (!chunk || chunk.length === 0) return;
             chunks.push(chunk);
             available += chunk.length;
@@ -543,10 +631,12 @@ export function createFrameReader(onMessage, onError, options) {
         end() {
             if (ended) return;
             ended = true;
-            // A drain still in progress is NOT reported again: the oversize
-            // frame it belongs to already produced its error, and the peer
-            // dying mid-drain adds nothing.
-            if (skipRemaining === 0 && (available > 0 || pendingLength >= 0)) {
+            // Nothing further to report once desynchronised — the fatal error
+            // already said everything true about this stream. A drain still in
+            // progress is likewise not reported again: its oversize frame
+            // already produced an error, and the peer dying mid-drain adds
+            // nothing.
+            if (!fatal && skipRemaining === 0 && (available > 0 || pendingLength >= 0)) {
                 const missing = pendingLength >= 0 ? pendingLength - available : null;
                 onError(malformed(
                     missing === null
@@ -556,7 +646,9 @@ export function createFrameReader(onMessage, onError, options) {
             }
         },
         get bufferedBytes() { return available; },
-        get skipRemainingBytes() { return skipRemaining; }
+        get skipRemainingBytes() { return skipRemaining; },
+        /** True once a desync stopped the reader permanently. */
+        get fatal() { return fatal; }
     };
 }
 

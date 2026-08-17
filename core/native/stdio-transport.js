@@ -38,9 +38,11 @@ import {
  * @param {object} [options]
  * @param {{getReader: () => {read: () => Promise<{value?: Uint8Array, done: boolean}>}}} [options.stdin]
  * @param {{getWriter: () => {write: (bytes: Uint8Array) => Promise<void>}}} [options.stdout]
- * @param {() => void} [options.onEof] fired once when stdin reaches EOF
+ * @param {(reason: {kind: 'eof'|'fatal'|'stream-error', error?: unknown}) => void} [options.onEof]
+ *   fired exactly once when reading stops, whatever stopped it
  * @param {(error: unknown) => void} [options.onTransportError] pipe-level failures
  * @param {number} [options.maxFrameBytes]
+ * @param {number} [options.maxDrainBytes]
  */
 export function createStdioTransport(options = {}) {
     const stdin = options.stdin ?? globalThis.tjs?.stdin;
@@ -51,6 +53,10 @@ export function createStdioTransport(options = {}) {
     if (!stdout || typeof stdout.getWriter !== 'function') {
         throw new TypeError('stdio transport requires a WHATWG writable stdout (getWriter)');
     }
+    const readerOptions = {};
+    if (options.maxFrameBytes !== undefined) readerOptions.maxFrameBytes = options.maxFrameBytes;
+    if (options.maxDrainBytes !== undefined) readerOptions.maxDrainBytes = options.maxDrainBytes;
+    // Encoding only ever needs the size cap, never the drain limit.
     const frameOptions = options.maxFrameBytes === undefined
         ? undefined
         : { maxFrameBytes: options.maxFrameBytes };
@@ -62,11 +68,26 @@ export function createStdioTransport(options = {}) {
     let onmessage = null;
     let started = false;
     let eofFired = false;
+    /** Set when the frame reader desynchronises; stops the read loop. */
+    let fatalError = null;
     /** Serialises writes and carries backpressure; never rejects. */
     let writeChain = Promise.resolve();
 
+    /**
+     * Never lets a user callback's own failure escape. These run from the read
+     * loop and from promise handlers, where a throw would skip the shutdown
+     * path and strand the sidecar alive with nobody listening.
+     */
+    const guarded = (label, callback, argument) => {
+        try {
+            callback(argument);
+        } catch (failure) {
+            console.error(`[stdio-transport] ${label} callback threw`, failure);
+        }
+    };
+
     const reportTransportError = (error) => {
-        if (options.onTransportError) options.onTransportError(error);
+        if (options.onTransportError) guarded('onTransportError', options.onTransportError, error);
         else console.error('[stdio-transport]', error);
     };
 
@@ -93,25 +114,38 @@ export function createStdioTransport(options = {}) {
                 reportTransportError(new Error('stdio transport received a frame before onmessage was installed'));
                 return;
             }
-            // Worker-shaped: the method layer reads `event.data`.
-            onmessage({ data: message });
+            // Worker-shaped: the method layer reads `event.data`. Guarded
+            // because this runs inside the read loop — a handler bug must not
+            // become a dead sidecar.
+            guarded('onmessage', onmessage, { data: message });
         },
         (error) => {
-            // In-band answer; the stream stays alive and resynchronises.
-            // Encoding it must never throw back into the read loop: this
-            // callback runs inside frameReader.push(), so a throw here would
-            // unwind the loop and leave the sidecar deaf. Error messages are
-            // bounded by the codec, so this is a floor, not the usual path.
+            // In-band answer. Encoding it must never throw back into the read
+            // loop: this callback runs inside frameReader.push(), so a throw
+            // here would unwind the loop and skip the shutdown path. Error
+            // messages are bounded by the codec, so this is a floor, not the
+            // usual path.
             try {
                 writeBytes(encodeFrame(frameErrorResponse(error), frameOptions));
             } catch (encodeFailure) {
                 reportTransportError(encodeFailure);
             }
+            // A desync leaves the stream unframed; the reader has already
+            // stopped for good. Record it so the read loop stops too and the
+            // embedder is told to exit, which closes the pipe.
+            if (error?.fatal === true) fatalError = error;
         },
-        frameOptions
+        readerOptions
     );
 
+    const shutdown = (reason) => {
+        if (eofFired) return;
+        eofFired = true;
+        if (options.onEof) guarded('onEof', options.onEof, reason);
+    };
+
     const readLoop = async () => {
+        let reason = { kind: 'eof' };
         try {
             for (;;) {
                 const result = await reader.read();
@@ -119,16 +153,18 @@ export function createStdioTransport(options = {}) {
                 const chunk = result.value;
                 // Zero-length chunks are legal and are not EOF.
                 if (chunk && chunk.length > 0) frameReader.push(chunk);
+                if (fatalError) { reason = { kind: 'fatal', error: fatalError }; break; }
             }
         } catch (error) {
-            // A stream-level failure is terminal: fall through to the EOF path
-            // so the entry still gets its single shutdown signal.
+            // A stream-level failure is terminal: fall through to the shutdown
+            // path so the entry still gets its single signal.
             reportTransportError(error);
-        }
-        frameReader.end();
-        if (!eofFired) {
-            eofFired = true;
-            if (options.onEof) options.onEof();
+            reason = { kind: 'stream-error', error };
+        } finally {
+            // In a `finally` so a throwing callback anywhere above cannot skip
+            // the shutdown signal and strand the sidecar alive but deaf.
+            frameReader.end();
+            shutdown(reason);
         }
     };
 

@@ -16,9 +16,12 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
     FRAME_HEADER_BYTES,
+    MAX_DRAIN_BYTES,
     MAX_FRAME_BYTES,
+    NATIVE_FRAME_DESYNC,
     NATIVE_FRAME_MALFORMED,
     NATIVE_FRAME_TOO_LARGE,
     createFrameReader,
@@ -33,6 +36,7 @@ import {
 } from '../../core/native/frame-codec.js';
 import type { NativeFrameError } from '../../core/native/frame-codec.js';
 import { createStdioTransport } from '../../core/native/stdio-transport.js';
+import type { StdioShutdownReason } from '../../core/native/stdio-transport.js';
 import { buildFrameFixture, FIXTURE_BASENAME } from '../../scripts/generate-native-frame-fixture';
 
 // --- helpers ---------------------------------------------------------------
@@ -42,7 +46,7 @@ interface Collected {
     errors: NativeFrameError[];
 }
 
-function collect(options?: { maxFrameBytes?: number }) {
+function collect(options?: { maxFrameBytes?: number; maxDrainBytes?: number }) {
     const sink: Collected = { messages: [], errors: [] };
     const reader = createFrameReader(
         (message) => sink.messages.push(message),
@@ -110,6 +114,14 @@ describe('native frame header', () => {
 
     it('reads at an offset', () => {
         assert.strictEqual(readFrameHeader(new Uint8Array([9, 9, 0, 0, 1, 2]), 2), 258);
+    });
+
+    it('refuses a short read instead of inventing a length', () => {
+        // Without the guard, the missing bytes read as `undefined` -> 0 and the
+        // caller frames against a number nobody wrote.
+        assert.throws(() => readFrameHeader(new Uint8Array([0, 0, 1])), RangeError);
+        assert.throws(() => readFrameHeader(new Uint8Array([0, 0, 1, 2]), 1), RangeError);
+        assert.throws(() => readFrameHeader(new Uint8Array(0)), RangeError);
     });
 
     it('rejects lengths that do not fit an unsigned 32-bit header', () => {
@@ -457,7 +469,10 @@ describe('native frame incoming cap', () => {
     });
 
     it('drains in O(1) memory rather than buffering the doomed bytes', () => {
-        const { reader, sink } = collect({ maxFrameBytes: 64 });
+        // Drain limit raised explicitly: this exercises the DRAIN mechanics
+        // over a large frame, not the recoverable/fatal tier boundary (which
+        // has its own tests and would otherwise make this length fatal).
+        const { reader, sink } = collect({ maxFrameBytes: 64, maxDrainBytes: 2_000_000 });
         reader.push(encodeFrameHeader(1_000_000));
         assert.strictEqual(sink.errors.length, 1);
         assert.strictEqual(reader.skipRemainingBytes, 1_000_000);
@@ -491,9 +506,98 @@ describe('native frame incoming cap', () => {
         const { reader, sink } = collect();
         reader.push(encodeFrameHeader(MAX_FRAME_BYTES + 1));
         assert.strictEqual(sink.errors.length, 1);
+        assert.strictEqual(sink.errors[0].code, NATIVE_FRAME_TOO_LARGE);
+        assert.strictEqual(sink.errors[0].fatal, false);
         assert.strictEqual(sink.errors[0].actualBytes, MAX_FRAME_BYTES + 1);
         assert.strictEqual(sink.errors[0].limitBytes, MAX_FRAME_BYTES);
         assert.strictEqual(reader.skipRemainingBytes, MAX_FRAME_BYTES + 1);
+    });
+
+    it('accepts a declared length of exactly the cap', () => {
+        const limit = 64;
+        const { reader, sink } = collect({ maxFrameBytes: limit });
+        const payload = utf8(`"${'p'.repeat(limit - 2)}"`);
+        assert.strictEqual(payload.length, limit);
+
+        reader.push(rawFrame(payload));
+        reader.end();
+
+        assert.deepStrictEqual(sink.errors, []);
+        assert.deepStrictEqual(sink.messages, ['p'.repeat(limit - 2)]);
+    });
+});
+
+// --- desync (garbage length prefix) ----------------------------------------
+
+describe('native frame desync', () => {
+    it('sets the drain limit at 4x the cap', () => {
+        assert.strictEqual(MAX_DRAIN_BYTES, MAX_FRAME_BYTES * 4);
+    });
+
+    for (const [label, declared] of [
+        ['0xffffffff', 0xffffffff],
+        // A SIGNED header read returns -2147483648 here, sails past every
+        // `> limit` check, and parks the reader on a body that never ends.
+        ['0x80000000', 0x80000000]
+    ] as const) {
+        it(`treats a ${label} garbage prefix as fatal and delivers nothing after it`, () => {
+            const { reader, sink } = collect();
+            const good = encodeFrame({ n: 'must-not-be-delivered' });
+
+            reader.push(concat(encodeFrameHeader(declared), good));
+            reader.push(good);
+            reader.end();
+
+            assert.strictEqual(sink.errors.length, 1, 'exactly one error, not one per chunk');
+            assert.strictEqual(sink.errors[0].code, NATIVE_FRAME_DESYNC);
+            assert.strictEqual(sink.errors[0].fatal, true);
+            assert.strictEqual(sink.errors[0].actualBytes, declared);
+            assert.strictEqual(sink.errors[0].limitBytes, MAX_DRAIN_BYTES);
+            // The whole point: a drain-everything reader would have eaten these.
+            assert.deepStrictEqual(sink.messages, []);
+            assert.strictEqual(reader.fatal, true);
+            assert.strictEqual(reader.skipRemainingBytes, 0, 'no doomed drain is left armed');
+            assert.strictEqual(reader.bufferedBytes, 0);
+        });
+    }
+
+    it('still drains and resynchronises an over-cap but plausible length', () => {
+        const { reader, sink } = collect();
+        reader.push(encodeFrameHeader(MAX_FRAME_BYTES + 1));
+
+        assert.strictEqual(sink.errors[0].code, NATIVE_FRAME_TOO_LARGE);
+        assert.strictEqual(reader.fatal, false);
+        assert.strictEqual(reader.skipRemainingBytes, MAX_FRAME_BYTES + 1);
+    });
+
+    it('puts the recoverable/fatal boundary exactly at the drain limit', () => {
+        const atLimit = collect();
+        atLimit.reader.push(encodeFrameHeader(MAX_DRAIN_BYTES));
+        assert.strictEqual(atLimit.sink.errors[0].code, NATIVE_FRAME_TOO_LARGE);
+        assert.strictEqual(atLimit.reader.fatal, false);
+        assert.strictEqual(atLimit.reader.skipRemainingBytes, MAX_DRAIN_BYTES);
+
+        const overLimit = collect();
+        overLimit.reader.push(encodeFrameHeader(MAX_DRAIN_BYTES + 1));
+        assert.strictEqual(overLimit.sink.errors[0].code, NATIVE_FRAME_DESYNC);
+        assert.strictEqual(overLimit.reader.fatal, true);
+    });
+
+    it('scales the drain limit with a custom cap so both tiers stay reachable', () => {
+        const { reader, sink } = collect({ maxFrameBytes: 64 });
+        reader.push(encodeFrameHeader(64 * 4));
+        assert.strictEqual(sink.errors[0].code, NATIVE_FRAME_TOO_LARGE);
+
+        const fatal = collect({ maxFrameBytes: 64 });
+        fatal.reader.push(encodeFrameHeader(64 * 4 + 1));
+        assert.strictEqual(fatal.sink.errors[0].code, NATIVE_FRAME_DESYNC);
+    });
+
+    it('reports nothing further at EOF once fatal', () => {
+        const { reader, sink } = collect();
+        reader.push(encodeFrameHeader(0xffffffff));
+        reader.end();
+        assert.strictEqual(sink.errors.length, 1);
     });
 });
 
@@ -755,18 +859,71 @@ describe('native stdio transport', () => {
 
     it('fires onEof exactly once at stdin EOF — the orphan signal', async () => {
         const io = fakeStdio();
-        let eofCount = 0;
+        const reasons: unknown[] = [];
         const transport = createStdioTransport({
             stdin: io.stdin,
             stdout: io.stdout,
-            onEof: () => { eofCount += 1; }
+            onEof: (reason) => { reasons.push(reason); }
         });
         const running = transport.start();
 
         io.eof();
         await running;
         await settle();
-        assert.strictEqual(eofCount, 1);
+        assert.deepStrictEqual(reasons, [{ kind: 'eof' }]);
+    });
+
+    it('stops reading and reports a fatal shutdown on a desync', async () => {
+        const io = fakeStdio();
+        const reasons: StdioShutdownReason[] = [];
+        const transport = createStdioTransport({
+            stdin: io.stdin,
+            stdout: io.stdout,
+            onEof: (reason) => { reasons.push(reason); }
+        });
+        const seen: unknown[] = [];
+        transport.onmessage = (event) => { seen.push(event.data); };
+        const running = transport.start();
+
+        io.push(encodeFrameHeader(0xffffffff));
+        io.push(encodeFrame({ n: 'must-not-be-delivered' }));
+        await running;
+        await settle();
+
+        // The fatal frame is written in band so the parent learns why.
+        assert.strictEqual(io.written.length, 1);
+        const reply = decodeOneFrame(io.written[0]) as { content: { error: { code: string } } };
+        assert.strictEqual(reply.content.error.code, NATIVE_FRAME_DESYNC);
+        // start() resolved without EOF: the loop stopped itself.
+        assert.strictEqual(reasons.length, 1);
+        const reason = reasons[0];
+        assert.strictEqual(reason.kind, 'fatal');
+        assert.strictEqual(reason.kind === 'fatal' && reason.error.code, NATIVE_FRAME_DESYNC);
+        assert.strictEqual(reason.kind === 'fatal' && reason.error.fatal, true);
+        assert.deepStrictEqual(seen, []);
+    });
+
+    it('still reaches the shutdown hook when a message handler throws', async () => {
+        const io = fakeStdio();
+        const reasons: unknown[] = [];
+        const transport = createStdioTransport({
+            stdin: io.stdin,
+            stdout: io.stdout,
+            onEof: (reason) => { reasons.push(reason); }
+        });
+        transport.onmessage = () => { throw new Error('handler bug'); };
+        const running = transport.start();
+
+        io.push(encodeFrame({ n: 1 }));
+        await settle();
+        io.push(encodeFrame({ n: 2 }));
+        await settle();
+        io.eof();
+        await running;
+        await settle();
+
+        // A throwing handler must neither kill the read loop nor skip onEof.
+        assert.deepStrictEqual(reasons, [{ kind: 'eof' }]);
     });
 
     it('reports write failures instead of dropping them', async () => {
@@ -811,7 +968,9 @@ describe('native stdio transport', () => {
 // --- cross-language fixture ------------------------------------------------
 
 describe('cross-language frame fixture', () => {
-    const fixtureDir = path.resolve(process.cwd(), 'tests', 'fixtures');
+    // From the test file, not the cwd — the suite must not depend on where it
+    // was invoked from.
+    const fixtureDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
     const binPath = path.join(fixtureDir, `${FIXTURE_BASENAME}.bin`);
     const manifestPath = path.join(fixtureDir, `${FIXTURE_BASENAME}.json`);
 
@@ -847,16 +1006,43 @@ describe('cross-language frame fixture', () => {
         }
     });
 
-    it('pins the 16 MiB boundary as real header bytes', () => {
-        const { manifest } = buildFrameFixture();
-        assert.strictEqual(manifest.limits.maxFrameBytes, MAX_FRAME_BYTES);
-        assert.deepStrictEqual(
-            manifest.limits.maxHeader,
-            Array.from(encodeFrameHeader(MAX_FRAME_BYTES))
-        );
-        assert.deepStrictEqual(
-            manifest.limits.overMaxHeader,
-            Array.from(encodeFrameHeader(MAX_FRAME_BYTES + 1))
+    it('pins every threshold as real header bytes', () => {
+        const { limits } = buildFrameFixture().manifest;
+        assert.strictEqual(limits.maxFrameBytes, MAX_FRAME_BYTES);
+        assert.strictEqual(limits.maxDrainBytes, MAX_DRAIN_BYTES);
+
+        const pins: Array<[number[], number]> = [
+            [limits.maxHeader, MAX_FRAME_BYTES],
+            [limits.overMaxHeader, MAX_FRAME_BYTES + 1],
+            [limits.maxDrainHeader, MAX_DRAIN_BYTES],
+            [limits.overMaxDrainHeader, MAX_DRAIN_BYTES + 1],
+            [limits.signedTrapHeader, 0x80000000],
+            [limits.maxU32Header, 0xffffffff]
+        ];
+        for (const [actual, declared] of pins) {
+            assert.deepStrictEqual(actual, Array.from(encodeFrameHeader(declared)), String(declared));
+        }
+        // The signed-read trap is only a trap if it is above the drain limit,
+        // i.e. a signed decoder would keep going where an unsigned one stops.
+        assert.ok(0x80000000 > MAX_DRAIN_BYTES);
+        assert.deepStrictEqual(limits.signedTrapHeader, [128, 0, 0, 0]);
+        assert.deepStrictEqual(limits.maxU32Header, [255, 255, 255, 255]);
+    });
+
+    it('tells Rust which marker form is decode-only', () => {
+        const { decodeOnly } = buildFrameFixture().manifest;
+        const legacy = decodeOnly.find((entry) => entry.label.includes('legacy'));
+        assert.ok(legacy, 'the legacy array-form blob marker must be documented');
+        assert.match(legacy.note, /NEVER emits|never emits/);
+
+        // The documented payload must genuinely decode to those bytes...
+        const decoded = decodeFrameValue(JSON.parse(legacy.payloadUtf8)) as { v: Uint8Array };
+        assert.ok(decoded.v instanceof Uint8Array);
+        assert.deepStrictEqual(Array.from(decoded.v), [1, 2, 255]);
+        // ...and the encoder must genuinely not produce it.
+        assert.notStrictEqual(
+            JSON.stringify(encodeFrameValue({ v: new Uint8Array([1, 2, 255]) })),
+            legacy.payloadUtf8
         );
     });
 });

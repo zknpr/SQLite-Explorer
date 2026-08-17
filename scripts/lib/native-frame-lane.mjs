@@ -22,6 +22,7 @@ import * as esbuild from 'esbuild';
 import {
     FRAME_HEADER_BYTES,
     MAX_FRAME_BYTES,
+    NATIVE_FRAME_DESYNC,
     NATIVE_FRAME_MALFORMED,
     NATIVE_FRAME_TOO_LARGE,
     createFrameReader,
@@ -84,17 +85,38 @@ function startHarness(binary, bundlePath) {
     };
 
     // A second reader over the child's stdout, used only to capture raw frame
-    // bytes for the byte-identity checks.
-    let rawBuffer = new Uint8Array(0);
+    // bytes for the byte-identity checks. Appends into a growable buffer and
+    // tracks a read offset — reconcatenating per chunk would be O(n^2) over
+    // the 16 MiB frames this lane sends.
+    let rawBuffer = new Uint8Array(64 * 1024);
+    let rawEnd = 0;    // bytes written into rawBuffer
+    let rawStart = 0;  // bytes already consumed as complete frames
     const captureRaw = (chunk) => {
-        rawBuffer = concat([rawBuffer, chunk]);
+        if (rawEnd + chunk.length > rawBuffer.length) {
+            // Reclaim consumed bytes first, then grow only if still short.
+            if (rawStart > 0) {
+                rawBuffer.copyWithin(0, rawStart, rawEnd);
+                rawEnd -= rawStart;
+                rawStart = 0;
+            }
+            if (rawEnd + chunk.length > rawBuffer.length) {
+                let capacity = rawBuffer.length * 2;
+                while (capacity < rawEnd + chunk.length) capacity *= 2;
+                const grown = new Uint8Array(capacity);
+                grown.set(rawBuffer.subarray(0, rawEnd));
+                rawBuffer = grown;
+            }
+        }
+        rawBuffer.set(chunk, rawEnd);
+        rawEnd += chunk.length;
+
         for (;;) {
-            if (rawBuffer.length < FRAME_HEADER_BYTES) return;
-            const view = new DataView(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
-            const length = view.getUint32(0, false);
-            if (rawBuffer.length < FRAME_HEADER_BYTES + length) return;
-            rawReplies.push(rawBuffer.slice(0, FRAME_HEADER_BYTES + length));
-            rawBuffer = rawBuffer.slice(FRAME_HEADER_BYTES + length);
+            if (rawEnd - rawStart < FRAME_HEADER_BYTES) return;
+            const view = new DataView(rawBuffer.buffer, rawBuffer.byteOffset + rawStart, FRAME_HEADER_BYTES);
+            const total = FRAME_HEADER_BYTES + view.getUint32(0, false);
+            if (rawEnd - rawStart < total) return;
+            rawReplies.push(rawBuffer.slice(rawStart, rawStart + total));
+            rawStart += total;
         }
     };
 
@@ -109,6 +131,11 @@ function startHarness(binary, bundlePath) {
         reader.push(bytes);
     });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
+    // The desync case deliberately writes into a sidecar that is shutting down,
+    // so EPIPE here is the EXPECTED outcome, not a lane failure — it is the
+    // proof that the peer closed rather than sat alive and deaf. Unhandled, it
+    // would throw out of the stream.
+    child.stdin.on('error', (error) => { stderr += `[stdin] ${error.code ?? error.message}\n`; });
     child.on('close', (code) => {
         exit = code;
         reader.end();
@@ -321,5 +348,53 @@ export async function runFrameLane({ binary, scratch, note }) {
         if (stderrText) console.log(`[frame harness stderr]\n${stderrText}\n`);
     }
 
+    // 11. GARBAGE HEADER -> fatal desync. Needs its own process: the fatal path
+    //     stops reading for good, so nothing after it could be checked in the
+    //     harness above. This is the corrupt-header case a drain-everything
+    //     reader would answer by silently eating the next 4 GiB.
+    checks += await runDesyncCase(binary, bundlePath, note);
+
+    return checks;
+}
+
+/**
+ * @returns {Promise<number>} checks run
+ */
+async function runDesyncCase(binary, bundlePath, note) {
+    const harness = startHarness(binary, bundlePath);
+    let checks = 0;
+    try {
+        // 0xffffffff: the largest length a u32 can express, and 256x the cap.
+        harness.write(encodeFrameHeader(0xffffffff));
+        // A well-formed frame right behind it. A drain-everything reader would
+        // swallow this; the fatal path must never deliver it.
+        harness.write(encodeFrame({ n: 'must-not-be-delivered' }));
+
+        await harness.untilReplies(1, 30000);
+        const reply = harness.replies[0]?.ok?.content;
+        note(reply?.success === false && reply?.error?.code === NATIVE_FRAME_DESYNC,
+            'frame/garbage-header-is-fatal-desync',
+            JSON.stringify(reply?.errorMessage));
+        checks += 1;
+
+        // The sidecar must shut itself down rather than sit alive and deaf --
+        // exiting closes the pipe, so the parent sees EOF instead of blocking.
+        // Nothing is written to stdin here: a hang would mean a deaf-alive peer.
+        const code = await Promise.race([
+            harness.untilExit(),
+            sleep(15000).then(() => 'TIMEOUT')
+        ]);
+        note(code !== 'TIMEOUT', 'frame/desync-shuts-down-without-hanging', `exit ${code}`);
+        checks += 1;
+
+        note(harness.replies.length === 1,
+            'frame/desync-delivers-nothing-after-the-fatal-frame',
+            `${harness.replies.length} replies: ${JSON.stringify(harness.replies.map((r) => r.ok))}`);
+        checks += 1;
+    } finally {
+        if (harness.exitCode === null) harness.child.kill('SIGKILL');
+        const stderrText = harness.stderr.trim();
+        if (stderrText) console.log(`[desync harness stderr]\n${stderrText}\n`);
+    }
     return checks;
 }
