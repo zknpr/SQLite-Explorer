@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import initSqlJs from '../../vendor/sql.js/sql-wasm.js';
-import { createShimDatabase, consumedSourceLength } from '../../core/native/sqljs-shim.js';
+import { createShimDatabase, consumedSourceLength, NATIVE_SQL_ATTACH_BLOCKED } from '../../core/native/sqljs-shim.js';
 import type { ShimDatabase, ShimValueConfig, NativeBindParams } from '../../core/native/sqljs-shim.js';
 import { standInSqliteModule } from './helpers/tjs-backing-standin';
 
@@ -518,6 +518,79 @@ describe('sqljs-shim: error surfaces', () => {
                 return true;
             });
             statement.free();
+        } finally {
+            shim.close();
+        }
+    });
+});
+
+describe('sqljs-shim: ATTACH/DETACH is blocked at the compile chokepoint', () => {
+    const isBlock = (error: unknown) => {
+        const e = error as { code?: string; errno?: number };
+        assert.strictEqual(e.code, NATIVE_SQL_ATTACH_BLOCKED);
+        // A shim policy, not a SQLite result code: no errno.
+        assert.strictEqual(e.errno, undefined);
+        return true;
+    };
+
+    // Every path into raw SQL must reject, since compileNext is shared by all.
+    it('rejects a leading ATTACH through exec/prepare/iterateStatements', () => {
+        const shim = createShim();
+        try {
+            const attach = "ATTACH DATABASE '/tmp/x.sqlite' AS steal";
+            assert.throws(() => shim.exec(attach), isBlock);
+            assert.throws(() => shim.prepare(attach), isBlock);
+            assert.throws(() => shim.iterateStatements(attach).next(), isBlock);
+        } finally {
+            shim.close();
+        }
+    });
+
+    it('rejects DETACH', () => {
+        const shim = createShim();
+        try {
+            assert.throws(() => shim.exec('DETACH DATABASE steal'), isBlock);
+        } finally {
+            shim.close();
+        }
+    });
+
+    // The no-param run() path hands the whole string to backing.exec, bypassing
+    // compileNext — the shim scans it separately. A leading ATTACH in the SECOND
+    // statement must still be caught, and nothing before it must persist.
+    it('rejects ATTACH in a no-param run() script and applies nothing', () => {
+        const shim = createShim();
+        try {
+            shim.run('CREATE TABLE g(n)');
+            assert.throws(
+                () => shim.run("INSERT INTO g VALUES(1); ATTACH DATABASE '/tmp/x.sqlite' AS steal"),
+                isBlock
+            );
+            // backing.exec never ran because the scan threw first: the INSERT did
+            // not persist.
+            assert.deepStrictEqual(shim.exec('SELECT count(*) AS c FROM g')[0].values, [[0]]);
+        } finally {
+            shim.close();
+        }
+    });
+
+    it('sees through leading trivia and mixed case', () => {
+        const shim = createShim();
+        try {
+            assert.throws(() => shim.exec("/* c */ AtTaCh DATABASE '/tmp/x.sqlite' AS s"), isBlock);
+            assert.throws(() => shim.exec("  \n-- note\n  detach database s"), isBlock);
+        } finally {
+            shim.close();
+        }
+    });
+
+    it('does not block the word attach inside a string literal or identifier', () => {
+        const shim = createShim();
+        try {
+            assert.deepStrictEqual(shim.exec("SELECT 'attach me' AS a")[0].values, [['attach me']]);
+            shim.run('CREATE TABLE "attachment"(id)');
+            shim.run('INSERT INTO "attachment" VALUES (1)');
+            assert.deepStrictEqual(shim.exec('SELECT id FROM "attachment"')[0].values, [[1]]);
         } finally {
             shim.close();
         }

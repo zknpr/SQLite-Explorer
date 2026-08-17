@@ -51,6 +51,45 @@ const PARAMETER_TOKEN = /^(?:\?\d*|[:@$][A-Za-z0-9_$\u0080-\uffff]+(?:\([^()]*\)
 const EXPLAIN_PREFIX = /^explain\b/i;
 
 /**
+ * Leading `ATTACH` / `DETACH`, after any leading trivia is stripped. Both are
+ * always the FIRST token of a standalone statement and cannot nest anywhere
+ * else in the grammar (see the reject site in `compileNext`), so matching the
+ * leading token is a complete test.
+ */
+const ATTACH_DETACH_PREFIX = /^(?:attach|detach)\b/i;
+
+/**
+ * Cheap pre-filter: does the word `attach`/`detach` appear at all? Only when it
+ * does is the (double-compiling) leading-token scan in `db.run(sql)`'s no-param
+ * branch worth running. A false hit (the word inside a string literal or
+ * comment) costs one extra parse of a script no real caller writes; a miss is
+ * impossible because the token cannot be spelled any other way.
+ */
+const ATTACH_DETACH_WORD = /\b(?:attach|detach)\b/i;
+
+/**
+ * Error code stamped on the ATTACH/DETACH refusal. Distinct from the frame
+ * codec's `ERR_NATIVE_FRAME_*` family so a structured consumer can tell a SQL
+ * policy refusal from a transport failure.
+ */
+export const NATIVE_SQL_ATTACH_BLOCKED = 'ERR_NATIVE_SQL_ATTACH_BLOCKED';
+
+/**
+ * The refusal thrown for a leading ATTACH/DETACH. A plain message (no errno:
+ * this is a shim policy, not a SQLite result code) naming the reason, plus the
+ * distinct `code`.
+ */
+function attachDetachBlockedError(keyword) {
+    const error = new Error(
+        `${keyword.toUpperCase()} is blocked on the native engine: it can open or ` +
+        'create a database file outside the path this session is bound to, which ' +
+        'would defeat the desktop path sandbox. Only the bound database is reachable.'
+    );
+    error.code = NATIVE_SQL_ATTACH_BLOCKED;
+    return error;
+}
+
+/**
  * Drop leading whitespace, empty statements and comments.
  *
  * `sqlite3_sql` keeps whatever trivia the parser consumed on its way into the
@@ -177,6 +216,27 @@ function toSqlJsValue(value, useBigInt) {
 function compileNext(backing, sql, from) {
     if (from >= sql.length) return null;
     const rest = sql.slice(from);
+    // SECURITY: reject ATTACH/DETACH before it is ever compiled. `compileNext`
+    // is the chokepoint for exec/prepare/iterateStatements, so blocking here
+    // holds for every RPC that reaches raw SQL (runQuery, runConsole) on every
+    // session, engine-level -- NOT relying on the read-only wholesale block,
+    // which does not stop ATTACH reads (query_only blocks only attached-DB
+    // writes). ATTACH would otherwise open/create a file outside the bound
+    // path from inside SQL, defeating the desktop's path authority.
+    //
+    // Matching only the LEADING token is complete because ATTACH/DETACH is
+    // always the first token of a standalone statement and CANNOT nest: verified
+    // against the shipped fork binary that SQLite rejects `WITH x AS (ATTACH..)`,
+    // `SELECT (ATTACH..)`, `SELECT * FROM (ATTACH..)`, `ATTACH` in a CREATE
+    // TRIGGER body, a compound `... UNION ATTACH..`, and `VALUES (ATTACH..)` all
+    // at COMPILE. The `rest`'s leading token (after trivia) is this statement's
+    // leading token, so a later ATTACH in a multi-statement script is caught on
+    // the compileNext call that reaches it. Checked pre-compile because ATTACH's
+    // side effect lands at step, not prepare (also verified) -- but not compiling
+    // it at all is the cleaner guarantee.
+    const leading = stripLeadingTrivia(rest);
+    const attachDetach = ATTACH_DETACH_PREFIX.exec(leading);
+    if (attachDetach) throw attachDetachBlockedError(attachDetach[0]);
     const compiled = backing.prepare(rest);
     let text;
     try {
@@ -209,6 +269,25 @@ function finalizeQuietly(statement) {
     } catch {
         // A statement that cannot be finalized is already gone; the caller is
         // on an error path and has a more informative failure to report.
+    }
+}
+
+/**
+ * Walk every statement in a multi-statement script through `compileNext` purely
+ * to trip its ATTACH/DETACH reject, then discard each compiled statement WITHOUT
+ * stepping it -- so nothing executes. Used only to guard `db.run(sql)`'s
+ * no-param `backing.exec` path, which does not itself pass through compileNext.
+ * Compiling here and again in `backing.exec` is redundant but harmless (compile
+ * has no side effects; ATTACH's effect is at step), and only runs at all when
+ * the word `attach`/`detach` is present.
+ */
+function rejectAttachDetachInScript(backing, sql) {
+    let cursor = 0;
+    for (;;) {
+        const next = compileNext(backing, sql, cursor);
+        if (next === null) return;
+        cursor = next.end;
+        finalizeQuietly(next.compiled);
     }
 }
 
@@ -737,6 +816,15 @@ export function createShimDatabase(config = {}, deps = {}) {
                     statement.free();
                 }
             } else {
+                // The one path that does NOT flow through compileNext: a
+                // no-param `run()` hands the whole string to `backing.exec`,
+                // which compiles and steps every statement natively. Worker.js
+                // only reaches this with shim-built DDL/DML (escaped
+                // identifiers, never a leading ATTACH), so it is not a reachable
+                // bypass today -- but the shim is the security boundary, not
+                // worker.js, so close it unconditionally. Fast path: skip the
+                // scan entirely unless the word even appears.
+                if (ATTACH_DETACH_WORD.test(sql)) rejectAttachDetachInScript(backing, sql);
                 backing.exec(sql);
             }
             return database;

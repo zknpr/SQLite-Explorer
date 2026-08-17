@@ -154,6 +154,15 @@ export interface ShimDatabase {
 
 export function createShimDatabase(config?: ShimConfig, deps?: ShimDeps): ShimDatabase;
 
+/**
+ * Error `code` stamped on the ATTACH/DETACH refusal (see `createShimDatabase`).
+ * ATTACH/DETACH is rejected engine-level, at the compile chokepoint, because it
+ * can reach a database file outside the session's bound path — defeating the
+ * desktop path sandbox. The refusal carries no `errno` (it is a shim policy,
+ * not a SQLite result code).
+ */
+export const NATIVE_SQL_ATTACH_BLOCKED: 'ERR_NATIVE_SQL_ATTACH_BLOCKED';
+
 /** Copies a SQLite error's non-enumerable `errno` onto a replacement error. */
 export function copyErrno<T extends Error>(target: T, source: unknown): T;
 

@@ -258,9 +258,13 @@ transport.onmessage = async (event) => {
 const bootPpid = tjs.ppid;
 setInterval(() => {
   if (tjs.ppid !== bootPpid) {
+    // The code is named in the breadcrumb because an orphaned process reparents
+    // to the OS reaper (launchd/init), so its real wait-status is not reap-able
+    // by any surviving relative — the log line is the only channel that carries
+    // the numeric exit code out.
     console.error(
       `[native-worker] parent process ${bootPpid} vanished without closing ` +
-      `stdin (ppid now ${tjs.ppid}); exiting`
+      `stdin (ppid now ${tjs.ppid}); exiting (code ${EXIT_ORPHANED})`
     );
     tjs.exit(EXIT_ORPHANED);
   }

@@ -236,6 +236,66 @@ export async function runSidecarLane({ binary, scratch, note }) {
             && reopenedCount === 4,
             'sidecar/exportDatabase-roundtrips', `bytes=${bytes?.length}, rows=${reopenedCount}`);
 
+        // SECURITY: ATTACH/DETACH must not reach files outside the bound path.
+        // The reviewer's exact READ and WRITE bypasses, replayed through the
+        // real binary via runConsole (an intended webview feature). runConsole
+        // resolves failures (failure-is-a-resolution), so the block surfaces in
+        // data.error; nothing must run, and the out-of-path files must be
+        // untouched. `secret` proves a READ can't reach it; `planted` proves a
+        // WRITE can't create it.
+        const secretPath = path.join(scratch, 'attack-secret.sqlite');
+        const plantedPath = path.join(scratch, 'attack-planted.sqlite');
+        fs.rmSync(plantedPath, { force: true });
+        {
+            const secret = new DatabaseSync(secretPath);
+            secret.exec("CREATE TABLE secrets(v); INSERT INTO secrets VALUES('TOPSECRET')");
+            secret.close();
+        }
+        const attachBlocked = (data) => /blocked on the native engine/i.test(data?.error ?? '')
+            && (data?.results?.length ?? 0) === 0
+            && data?.mutated === false;
+
+        const attachRead = await rw.invoke('runConsole', [
+            `ATTACH DATABASE '${secretPath}' AS steal; SELECT v FROM steal.secrets`
+        ]);
+        check(attachRead.content?.success === true && attachBlocked(attachRead.content?.data),
+            'sidecar/ATTACH-read-blocked', JSON.stringify(attachRead.content?.data));
+
+        const attachWrite = await rw.invoke('runConsole', [
+            `ATTACH DATABASE '${plantedPath}' AS evil; CREATE TABLE evil.pwn(x); INSERT INTO evil.pwn VALUES(1)`
+        ]);
+        check(attachWrite.content?.success === true
+            && attachBlocked(attachWrite.content?.data)
+            && !fs.existsSync(plantedPath),
+            'sidecar/ATTACH-write-blocked-and-no-file-created',
+            `${JSON.stringify(attachWrite.content?.data)} planted=${fs.existsSync(plantedPath)}`);
+
+        const detach = await rw.invoke('runConsole', ['DETACH DATABASE steal']);
+        check(detach.content?.success === true
+            && /blocked on the native engine/i.test(detach.content?.data?.error ?? ''),
+            'sidecar/DETACH-blocked', JSON.stringify(detach.content?.data?.error));
+
+        // Smuggling: a leading block comment and mixed case must not slip past
+        // the leading-token reject.
+        const smuggle = await rw.invoke('runConsole', [
+            `/*x*/ AtTaCh DATABASE '${secretPath}' AS s3`
+        ]);
+        check(smuggle.content?.success === true
+            && /blocked on the native engine/i.test(smuggle.content?.data?.error ?? ''),
+            'sidecar/ATTACH-smuggle-comment-and-case-blocked', JSON.stringify(smuggle.content?.data?.error));
+
+        // Not over-broad: the word `attach` inside a string literal is fine, and
+        // normal single-DB SELECT/INSERT keep working right after the blocks.
+        const benign = await rw.invoke('runConsole', ["SELECT 'attach me' AS note"]);
+        check(benign.content?.success === true
+            && benign.content?.data?.results?.[0]?.rows?.[0]?.[0] === 'attach me'
+            && benign.content?.data?.error === undefined,
+            'sidecar/word-attach-in-literal-not-blocked', JSON.stringify(benign.content?.data));
+
+        const normalInsert = await rw.invoke('runConsole', ["INSERT INTO t VALUES (5, 'epsilon', NULL, 5, 5.0)"]);
+        check(normalInsert.content?.success === true && normalInsert.content?.data?.mutated === true,
+            'sidecar/normal-sql-unaffected-by-attach-block', JSON.stringify(normalInsert.content?.data));
+
         // Oversize response: the wrapped postMessage must answer IN BAND for
         // the same messageId instead of stranding the RPC (worker.js's send
         // sites are unguarded by design — byte-identity gate).
@@ -376,6 +436,25 @@ export async function runSidecarLane({ binary, scratch, note }) {
         if (stderrText) console.log(`[sidecar desync stderr]\n${stderrText}\n`);
     }
 
+    // ---- usage exit (malformed argv) --------------------------------------
+    // A direct child (no reparenting), so its real wait-status IS reap-able.
+    // Bad flag + a path that must never be opened: assert exit 2 and that the
+    // named file was not created (the entry exits at argv parse, before any
+    // open).
+    {
+        const neverOpened = path.join(scratch, 'must-not-open.sqlite');
+        fs.rmSync(neverOpened, { force: true });
+        const usage = spawn(binary, ['run', BUNDLE_PATH, neverOpened, 'bogus'], {
+            stdio: ['ignore', 'ignore', 'pipe']
+        });
+        let usageStderr = '';
+        usage.stderr.on('data', (chunk) => { usageStderr += chunk; });
+        const code = await new Promise((resolve) => usage.on('close', resolve));
+        check(code === 2 && !fs.existsSync(neverOpened),
+            'sidecar/malformed-argv-exits-2-without-opening',
+            `exit ${code}, opened=${fs.existsSync(neverOpened)}, stderr=${JSON.stringify(usageStderr.trim().slice(0, 120))}`);
+    }
+
     // ---- ppid watchdog ----------------------------------------------------
     checks += await runWatchdogCase(binary, dbPath, note);
 
@@ -444,9 +523,12 @@ async function runWatchdogCase(binary, dbPath, note) {
         check(died, 'sidecar/watchdog-exits-orphan-with-open-stdin', `pid ${sidecarPid}`);
 
         // The abnormal-death breadcrumb reached us over the inherited stderr.
+        // The orphan reparents to the OS reaper (launchd/init), so its real
+        // wait-status is unreachable here — the watchdog names its numeric exit
+        // code in the breadcrumb (EXIT_ORPHANED = 3), and that is what we assert.
         await sleep(200);
-        check(/vanished without closing stdin/.test(stderr),
-            'sidecar/watchdog-logs-abnormal-death', JSON.stringify(stderr.trim().slice(0, 200)));
+        check(/vanished without closing stdin/.test(stderr) && /exiting \(code 3\)/.test(stderr),
+            'sidecar/watchdog-logs-abnormal-death-with-code-3', JSON.stringify(stderr.trim().slice(0, 220)));
     } finally {
         if (alive(sidecarPid)) process.kill(sidecarPid, 'SIGKILL');
         if (intermediary.exitCode === null) intermediary.kill('SIGKILL');
