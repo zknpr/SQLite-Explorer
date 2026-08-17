@@ -970,7 +970,12 @@ function clampConsoleMaxStatements(maxStatements) {
  *   statementsSkipped?: boolean,
  *   error?: string,
  *   multiStatement?: boolean
- * }>}
+ * }>} `statementsSkipped` means the statement cap left part of the script
+ *   unexecuted. It is exact when the tail was drained, and conservatively
+ *   `true` when the tail contained a pragma and so was left untouched -- in
+ *   that case statements really were skipped, they just were not counted, so
+ *   a tail of `-- pragma note` reports `true` while any other comment-only
+ *   tail reports `false`.
  */
 async function runConsole(sql, options = {}, cancellationFlag) {
   if (!db) throw new Error('No database initialized');
@@ -1055,14 +1060,33 @@ async function runConsole(sql, options = {}, cancellationFlag) {
         }
       }
       if (capped) {
-        // Drain the tail WITHOUT executing it. sqlite3_prepare_v2 compiles a
-        // statement, it never steps one, so nothing here runs -- but draining
-        // is what releases the iterator's heap copy of the SQL. The vendored
-        // StatementIterator only frees that buffer when it reaches `done` or a
-        // prepare throws, and it exposes no return()/close(), so simply
-        // abandoning it would leak the script's bytes on every capped run
-        // (i.e. on every EXPLAIN click).
+        // Release the tail without RUNNING it. Draining (rather than just
+        // abandoning the iterator) is what frees its heap copy of the SQL: the
+        // vendored StatementIterator releases that buffer only when it reaches
+        // `done` or a prepare throws, and exposes no return()/close(), so
+        // walking away would leak the script's bytes on every capped run --
+        // i.e. on every EXPLAIN click.
         //
+        // "Preparing does not execute" is ALMOST true, and the exception is
+        // the whole reason for the guard below: some flag-setting pragmas take
+        // effect at PREPARE time. Verified empirically against this vendored
+        // wasm build -- draining `PRAGMA foreign_keys=ON` and `PRAGMA
+        // query_only=ON` flipped both. `query_only` is the one that matters:
+        // an EXPLAIN over `SELECT ...; PRAGMA query_only=ON;` would render its
+        // plan, honestly report the tail as not executed, and leave the
+        // connection silently write-locked.
+        //
+        // So: if anything in the tail even LOOKS like a pragma, do not drain
+        // it. The trade is deliberate and one-directional -- a false positive
+        // (the word "pragma" inside a string literal or a comment) costs one
+        // leaked SQL buffer for that run and nothing else, while a false
+        // negative would silently reconfigure the connection.
+        const tail = iterator.getRemainingSQL?.() ?? '';
+        if (/\bpragma\b/i.test(tail)) {
+          statementsSkipped = true;
+          return collected;
+        }
+
         // A prepare error in the tail is swallowed deliberately: those
         // statements were not run, so their compile errors are not this run's
         // failure -- an EXPLAIN must still show its plan when a later
@@ -1107,19 +1131,35 @@ async function runConsole(sql, options = {}, cancellationFlag) {
   } catch (error) {
     // Resolve, don't reject: see the header. The caller gets the failure AND
     // the mutation metadata for whatever ran before it.
+    //
+    // Duck-typed rather than `instanceof Error`: sql.js errors are constructed
+    // in whatever realm initialized the WASM module, which in the unit-test
+    // harness is not this worker's own realm, so a strict instanceof check
+    // silently misses and double-wraps via String(error). Built BEFORE the
+    // metadata read so a second failure there cannot lose the real one.
+    const message = `statement ${statementIndex}: ${getErrorMessage(error)}`;
+    let metadata;
+    try {
+      metadata = mutationMetadata();
+    } catch {
+      // Unreachable today: total_changes()/schema_version cannot fail on a
+      // handle that just executed SQL. But if the handle ever IS wedged badly
+      // enough to refuse them, guess DIRTY. That direction is the safe one --
+      // a false "mutated" costs a redundant undo barrier and a Save prompt,
+      // while a false "clean" silently discards real writes, which is the
+      // exact bug this whole resolve-on-failure path exists to prevent.
+      metadata = { mutated: true, changes: 0, durationMs: Date.now() - startedAt };
+    }
     return {
       results: [],
-      // Duck-typed rather than `instanceof Error`: sql.js errors are
-      // constructed in whatever realm initialized the WASM module, which in
-      // the unit-test harness is not this worker's own realm, so a strict
-      // instanceof check silently misses and double-wraps via String(error).
-      error: `statement ${statementIndex}: ${getErrorMessage(error)}`,
+      error: message,
       // Computed here rather than guessed by the caller from a `;` scan: the
       // worker knows how far it actually got, so the renderer's "statements
       // before the error were applied" note is only shown when statements
       // really did precede the failure.
       multiStatement: statementIndex > 1,
-      ...mutationMetadata()
+      statementsSkipped,
+      ...metadata
     };
   }
 

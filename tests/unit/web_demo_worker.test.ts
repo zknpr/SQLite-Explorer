@@ -4207,6 +4207,40 @@ describe('web demo view worker', () => {
         assert.strictEqual(after.statementsSkipped, false);
     });
 
+    it('never lets a capped tail PRAGMA take effect, since pragmas apply at prepare time', async () => {
+        // Draining the tail compiles it, and SOME pragmas act during
+        // compilation -- so a plain drain would run `PRAGMA query_only=ON`
+        // behind an EXPLAIN and silently write-lock the connection while the
+        // status line honestly reported the tail as not executed. The tail is
+        // left undrained (one leaked buffer) whenever it mentions a pragma.
+        const worker = await createWorkerHarness();
+        const before = await worker.invoke('runConsole', 'PRAGMA foreign_keys');
+        const beforeValue = before.results[0].rows[0][0];
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT 1 AS plan; PRAGMA foreign_keys=ON;',
+            { maxStatements: 1 }
+        );
+
+        assert.strictEqual(result.error, undefined);
+        assert.strictEqual(result.results.length, 1);
+        // Conservative rather than counted: the tail was never walked, but it
+        // did hold a statement that was skipped.
+        assert.strictEqual(result.statementsSkipped, true);
+
+        const after = await worker.invoke('runConsole', 'PRAGMA foreign_keys');
+        assert.strictEqual(
+            after.results[0].rows[0][0],
+            beforeValue,
+            'a capped tail pragma changed the connection state'
+        );
+
+        // The connection is still fully usable after the undrained tail.
+        const usable = await worker.invoke('runConsole', 'SELECT 7 AS ok');
+        assert.deepStrictEqual(Array.from(usable.results[0].rows[0]), [7]);
+    });
+
     it('does not report skipped statements when the capped tail is only comments or whitespace', async () => {
         const worker = await createWorkerHarness();
 

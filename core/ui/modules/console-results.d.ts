@@ -21,7 +21,12 @@ export interface ConsoleRunResult {
     /** total_changes() delta across the whole script. */
     changes: number;
     durationMs: number;
-    /** True when a statement cap (EXPLAIN's `maxStatements: 1`) left part of the script unexecuted. Absent reads as false. */
+    /**
+     * True when a statement cap (EXPLAIN's `maxStatements: 1`) left part of the
+     * script unexecuted. Absent reads as false. Exact when the worker drained
+     * the tail; conservatively true when the tail held a pragma and was left
+     * untouched instead (see the worker's runConsole).
+     */
     statementsSkipped?: boolean;
 }
 
