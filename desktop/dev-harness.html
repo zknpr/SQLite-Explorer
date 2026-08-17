@@ -51,7 +51,9 @@
     async loadSettings() { return settings; },
     async saveSettings(next) { settings = next; },
     onMenu(handler) { menuHandler = handler; },
-    async setTitle(title) { document.title = title; }
+    async setTitle(title) { document.title = title; },
+    onOpenFile: () => {},
+    viewerReady: async () => {},
   };
   // Expose for the smoke driver: window.__HARNESS_MENU__('open-db') etc.
   window.__HARNESS_MENU__ = (id) => menuHandler && menuHandler(id);

@@ -576,3 +576,17 @@ test('stored theme loads at start', async () => {
   const settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
   assert.equal(settings.theme, 'solarized');
 });
+
+test('openFromShellPath reads through the bridge and boots the database', async () => {
+  const reads: string[] = [];
+  const { host, posted } = makeHost({}, {
+    readDatabaseBytes: async (p: string) => { reads.push(p); return new Uint8Array([1]); }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/from-finder.db');
+  assert.deepEqual(reads, ['/tmp/from-finder.db']);
+  assert.equal(posted.at(-1)!.content.targetMethod !== undefined, true);
+  const init = await host.invoke('initialize', []);
+  assert.equal((init as { filename: string }).filename, 'from-finder.db');
+});

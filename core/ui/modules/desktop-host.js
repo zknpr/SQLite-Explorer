@@ -399,6 +399,11 @@ export function createDesktopHost({ bridge, createWorker }) {
             const bytes = await bridge.readDatabaseBytes(picked.path);
             return openFromBytes(picked.path, picked.name, bytes);
         },
+        async openFromShellPath(path) {
+            const name = String(path).split('/').pop() || 'database.db';
+            const bytes = await bridge.readDatabaseBytes(path);
+            return openFromBytes(path, name, bytes);
+        },
         async openDatabaseFromFile(file) {
             // Drag-and-dropped File objects keep the demo's paged-open path for
             // very large databases (the worker reads the handle on demand).

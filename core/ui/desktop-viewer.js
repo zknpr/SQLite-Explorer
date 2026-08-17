@@ -10,6 +10,7 @@
 import { state, persistState } from './modules/state.js';
 import { backendApi, initDesktopApi } from './modules/desktop-api.js';
 import { createDesktopHost } from './modules/desktop-host.js';
+import { applyTheme } from './modules/desktop-theme.js';
 import {
     initSidebar,
     refreshSchema
@@ -156,6 +157,8 @@ async function initializeApp() {
 
         setupGlobalShortcuts();
 
+        window.__SQLITE_DESKTOP__?.viewerReady?.();
+
     } catch (err) {
         console.error('Init error:', err);
         showErrorState(err.message);
@@ -175,13 +178,6 @@ if (!bridge) {
     initDesktopApi(host);
     host.setWebviewMethods(webviewMethods);
 
-    // Follow the OS theme; VS Code pushes updateColorScheme, the desktop asks the OS.
-    // Safe to wire before start(): it never touches the host or worker.
-    const media = window.matchMedia('(prefers-color-scheme: dark)');
-    const applyScheme = () => { document.documentElement.style.colorScheme = media.matches ? 'dark' : 'light'; };
-    applyScheme();
-    media.addEventListener('change', applyScheme);
-
     host.start().then(() => {
         // Registered only after host.start() resolves. Both handlers reach
         // into the worker (openDatabaseViaDialog/saveToDisk/triggerUndo/...),
@@ -192,7 +188,16 @@ if (!bridge) {
             if (id === 'open-db') await host.openDatabaseViaDialog();
             else if (id === 'save-db') await host.saveToDisk();
             else if (id === 'refresh-db') await host.refreshFromDisk();
+            else if (id.startsWith('theme:')) {
+                const theme = applyTheme(id.slice('theme:'.length));
+                await backendApi.updateExtensionSetting('theme', theme);
+            }
         });
+
+        // Native "Open With"/recents deliver a path directly, bypassing the
+        // in-webview dialog flow above. Optional: older shells and the dev
+        // harness don't implement onOpenFile.
+        bridge.onOpenFile?.(async (path) => { await host.openFromShellPath(path); });
 
         // VS Code intercepts these outside the webview; the desktop wires them here.
         document.addEventListener('keydown', async (event) => {
@@ -213,6 +218,10 @@ if (!bridge) {
             else if (key === 's') { event.preventDefault(); await host.saveToDisk(); }
             else if (key === 'o') { event.preventDefault(); await host.openDatabaseViaDialog(); }
         });
+
+        // Independent of worker boot: never blocks initializeApp() on the
+        // settings round trip.
+        backendApi.getExtensionSettings().then(s => applyTheme(s.theme)).catch(console.error);
 
         return initializeApp();
     }).catch(err => {

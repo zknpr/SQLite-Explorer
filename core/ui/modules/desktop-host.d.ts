@@ -26,6 +26,18 @@ export interface DesktopHostBridge {
     saveSettings(settings: Record<string, unknown>): Promise<void>;
     onMenu(handler: (id: string) => void): void;
     setTitle(title: string): Promise<void>;
+    /**
+     * Fires when the shell delivers a path via native "Open With"/recents,
+     * outside the in-webview open-dialog flow. Optional: implemented by
+     * Task 8's bridge.js; older shells and the dev harness omit it, so
+     * callers must use `?.`.
+     */
+    onOpenFile?(handler: (path: string) => void): void;
+    /**
+     * Signals the webview has finished booting. Optional for the same reason
+     * as {@link onOpenFile}.
+     */
+    viewerReady?(): Promise<void>;
 }
 
 /** Options accepted by {@link createDesktopHost}. */
@@ -48,6 +60,8 @@ export interface DesktopHost {
     /** Registers webview-side callbacks (e.g. `refreshContent`) the host notifies after mutations. */
     setWebviewMethods(methods: Record<string, (...args: unknown[]) => unknown>): void;
     openDatabaseViaDialog(): Promise<boolean>;
+    /** Reads and boots a database at a shell-provided path (native "Open With"/recents). */
+    openFromShellPath(path: string): Promise<boolean>;
     openDatabaseFromFile(file: File): Promise<boolean>;
     saveToDisk(): Promise<boolean>;
     refreshFromDisk(): Promise<void>;
