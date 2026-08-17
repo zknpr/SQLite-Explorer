@@ -700,3 +700,46 @@ test('stored console history loads at start', async () => {
   const settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
   assert.deepEqual(settings.consoleHistory, ['SELECT 1']);
 });
+
+test('a console script that failed after mutating still records a barrier and refreshes', async () => {
+  // runConsole RESOLVES with {error, mutated} once execution has begun (see the
+  // worker). The host must key off the resolved `mutated`, not off whether the
+  // call threw — otherwise the writes a half-applied script made are never
+  // recorded, never mark the file dirty, and are never auto-committed.
+  const { host } = makeHost({
+    runConsole: () => ({
+      results: [],
+      error: 'statement 2: no such table: nope',
+      multiStatement: true,
+      mutated: true,
+      changes: 1,
+      durationMs: 3
+    })
+  });
+  await host.start();
+  let refreshed = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshed++; return { success: true }; } });
+
+  const res = await host.invoke('runConsole', ['INSERT ...; SELECT * FROM nope;', {}]) as Record<string, unknown>;
+
+  assert.equal(res.error, 'statement 2: no such table: nope');
+  assert.equal(host.hasUnsavedChanges(), true);
+  assert.equal(refreshed, 1);
+});
+
+test('a console script that failed without mutating leaves the document clean', async () => {
+  const { host } = makeHost({
+    runConsole: () => ({
+      results: [], error: 'statement 1: no such table: nope',
+      multiStatement: false, mutated: false, changes: 0, durationMs: 1
+    })
+  });
+  await host.start();
+  let refreshed = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshed++; return { success: true }; } });
+
+  await host.invoke('runConsole', ['SELECT * FROM nope', {}]);
+
+  assert.equal(host.hasUnsavedChanges(), false);
+  assert.equal(refreshed, 0);
+});

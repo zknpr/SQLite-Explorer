@@ -83,10 +83,15 @@ export interface DesktopBackendApi {
     /**
      * Desktop-only: runs an ad hoc, possibly multi-statement script for the
      * SQL console. Resolves with the worker's runConsole payload (typed as
-     * ConsoleRunResult by the console results module) and rejects with the
-     * first failing statement's error.
+     * ConsoleRunResult by the console results module) — including for a SQL
+     * failure once execution has begun, where the payload carries `error`
+     * alongside the mutation metadata a half-applied script produced. It
+     * rejects only for the pre-execution refusals (no database, read-only).
+     *
+     * `maxStatements` caps how many statements run; EXPLAIN passes 1, because
+     * the EXPLAIN prefix only ever applies to the first one.
      */
-    runConsole(sql: string, options?: { maxRows?: number }): Promise<unknown>;
+    runConsole(sql: string, options?: { maxRows?: number; maxStatements?: number }): Promise<unknown>;
     getTableInfo(table: string): Promise<unknown>;
     getPragmas(): Promise<unknown>;
     setPragma(pragma: string, value: unknown): Promise<unknown>;

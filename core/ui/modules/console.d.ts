@@ -21,9 +21,26 @@ export function pushHistory(list: readonly string[], sqlText: string): string[];
 
 /**
  * Prefixes `sqlText` with `EXPLAIN QUERY PLAN ` unless it already starts
- * (after leading whitespace) with `explain`, case-insensitively.
+ * (after leading whitespace) with `explain`, case-insensitively. Only the
+ * first statement of a script is prefixed, which is why the EXPLAIN action
+ * also passes `maxStatements: 1`.
  */
 export function explainWrap(sqlText: string): string;
+
+/**
+ * Filters a persisted history list to usable entries (strings within
+ * HISTORY_ENTRY_MAX, at most HISTORY_CAP of them). A trust boundary:
+ * settings.json is hand-editable, and one non-string entry used to throw
+ * inside createConsole and leave the console unopenable. Returns the SAME
+ * reference when nothing needed removing.
+ */
+export function sanitizeHistory(list: unknown): string[];
+
+/**
+ * `'not recorded (too long)'` when `sqlText` exceeds HISTORY_ENTRY_MAX after
+ * trimming (so the run happened but pushHistory dropped it), otherwise `''`.
+ */
+export function historySkipNotice(sqlText: string): string;
 
 /** Schema shape consumed by @codemirror/lang-sql's `sql({ schema })` option: table/view name → column names. */
 export type ConsoleSchema = Record<string, string[]>;
@@ -34,13 +51,14 @@ export interface CreateConsoleOptions {
     container: HTMLElement;
     /**
      * Executes `sqlText`. Invoked with the editor's full current text on
-     * Mod-Enter and on the Run button, and with {@link explainWrap}'s result
-     * on the EXPLAIN button (which records no history). May return a value or
-     * a Promise; createConsole awaits it but does not otherwise interpret the
-     * result — rendering results is the injected implementation's own
-     * responsibility.
+     * Mod-Enter and on the Run button (no `options`), and with
+     * {@link explainWrap}'s result plus `{ maxStatements: 1 }` on the EXPLAIN
+     * button (which records no history). Implementations must forward
+     * `options` to the backend verbatim. May return a value or a Promise;
+     * createConsole awaits it but does not otherwise interpret the result —
+     * rendering results is the injected implementation's own responsibility.
      */
-    runSql(sqlText: string): unknown;
+    runSql(sqlText: string, options?: { maxRows?: number; maxStatements?: number }): unknown;
     /** Returns the persisted history, newest first. */
     loadHistory(): string[];
     /** Persists a full replacement history list (as produced by {@link pushHistory}). */

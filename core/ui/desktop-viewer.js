@@ -58,7 +58,7 @@ import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
 // console.js bundles CodeMirror 6, and an import from any shared module would
 // drag it into the VS Code webview and web-demo bundles too. Pinned by
 // tests/unit/console_desktop_wiring.test.ts.
-import { createConsole } from './modules/console.js';
+import { createConsole, sanitizeHistory } from './modules/console.js';
 import { renderConsoleResults } from './modules/console-results.js';
 
 // Like the demo, ordinary edits get no host-echoed refreshContent, so
@@ -120,7 +120,7 @@ function getConsoleSchema() {
  * rejection) belong in the results area the user is already looking at, which
  * is also what keeps console.js's own fallback notice empty.
  */
-async function runConsoleSql(sqlText) {
+async function runConsoleSql(sqlText, options) {
     const results = document.getElementById('consoleResults');
     if (!results) return;
     if (state.isReadOnly) {
@@ -130,20 +130,30 @@ async function runConsoleSql(sqlText) {
         return;
     }
     try {
-        renderConsoleResults(results, await backendApi.runConsole(sqlText));
+        // Passed through untouched. A SQL failure is not a rejection: runConsole
+        // resolves with `{ error, multiStatement, mutated, changes }` once
+        // execution has begun, so the renderer picks the error branch while the
+        // host has already recorded the mutations a half-applied script made.
+        renderConsoleResults(results, await backendApi.runConsole(sqlText, options));
     } catch (err) {
+        // Only failures that never reached (or never left) the worker land here:
+        // transport, RPC timeout, an unbooted database.
         renderConsoleResults(results, {
             error: err instanceof Error ? err.message : String(err),
-            // Rough on purpose: a trailing semicolon over-reports, which only
-            // adds the "statements before the error were applied" note to a
-            // single-statement failure where nothing was applied.
+            // Rough on purpose, and only used on this path: the worker computes
+            // an exact `multiStatement` for the failures it can see.
             multiStatement: sqlText.includes(';')
         });
     }
 }
 
 function loadConsoleHistory() {
-    return consoleHistory;
+    // Choke point for a hand-edited settings.json: a non-string entry would
+    // otherwise reach the module's dropdown builder and throw mid-construction,
+    // leaving the console unopenable for the session. Reference-preserving when
+    // the list is already clean, so saveConsoleHistory's "nothing recorded"
+    // check below still works.
+    return sanitizeHistory(consoleHistory);
 }
 
 function saveConsoleHistory(list) {
@@ -463,7 +473,7 @@ if (!bridge) {
         // console that refuses to open.
         consoleHistoryReady = backendApi.getExtensionSettings().then(s => {
             applyTheme(s.theme);
-            consoleHistory = Array.isArray(s.consoleHistory) ? s.consoleHistory : [];
+            consoleHistory = sanitizeHistory(s.consoleHistory);
         }).catch(console.error);
 
         initSqlConsole(surface);

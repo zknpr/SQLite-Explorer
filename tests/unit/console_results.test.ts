@@ -430,3 +430,35 @@ test('hostile headers, values, and error text land as text only', () => {
     });
     assert.equal(textOf(findAllByClass(container, 'sql-console-results-error')[0]), hostileValue);
 });
+
+test('formatStatus flags a capped run so a one-statement plan is not read as covering the script', () => {
+    assert.equal(
+        formatStatus({
+            results: [rowSet(2)], mutated: false, changes: 0, durationMs: 3, statementsSkipped: true
+        }),
+        '2 rows · 3 ms · remaining statements not executed'
+    );
+    // Absent and false both read as "the whole script ran".
+    assert.equal(
+        formatStatus({
+            results: [rowSet(2)], mutated: false, changes: 0, durationMs: 3, statementsSkipped: false
+        }),
+        '2 rows · 3 ms'
+    );
+    assert.equal(
+        formatStatus({ results: [rowSet(2)], mutated: false, changes: 0, durationMs: 3 }),
+        '2 rows · 3 ms'
+    );
+});
+
+test('renderConsoleResults surfaces the skipped-statements flag in the rendered status line', () => {
+    installDocument();
+    const container = new FakeNode('div');
+    renderConsoleResults(container as unknown as HTMLElement, {
+        results: [{ headers: ['id'], rows: [[1]], truncated: false }],
+        mutated: false, changes: 0, durationMs: 1, statementsSkipped: true
+    });
+    const [status] = findAllByClass(container, 'sql-console-results-status');
+    assert.ok(status);
+    assert.match(status.textContent, /remaining statements not executed$/);
+});

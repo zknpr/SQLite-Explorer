@@ -3937,26 +3937,44 @@ describe('web demo view worker', () => {
         assert.strictEqual(selected.changes, 0);
     });
 
-    it('prefixes a mid-script console failure with its 1-based statement index and keeps earlier statements applied', async () => {
+    it('RESOLVES a mid-script console failure with its mutation metadata so half-applied writes stay tracked', async () => {
+        // The whole point: the INSERT really happened. Rejecting would strand
+        // it — the desktop host reads `mutated` off the RESOLVED value to
+        // record an undo barrier, mark the file dirty and honour instantCommit,
+        // and a rejection never reaches that code at all.
         const worker = await createWorkerHarness();
         await worker.invoke('runConsole', 'CREATE TABLE console_error (id INTEGER)');
 
-        await assert.rejects(
-            worker.invoke(
-                'runConsole',
-                'INSERT INTO console_error VALUES (1); SELECT * FROM console_error_missing;'
-            ),
-            (error: Error) => {
-                assert.match(error.message, /^statement 2: /);
-                return true;
-            }
+        const result = await worker.invoke(
+            'runConsole',
+            'INSERT INTO console_error VALUES (1); SELECT * FROM console_error_missing;'
         );
+
+        assert.match(result.error, /^statement 2: /);
+        assert.strictEqual(result.multiStatement, true);
+        assert.strictEqual(result.mutated, true);
+        assert.strictEqual(result.changes, 1);
+        assert.deepStrictEqual(Array.from(result.results), []);
+        assert.strictEqual(typeof result.durationMs, 'number');
 
         const rows = await worker.invoke('runQuery', 'SELECT id FROM console_error');
         assert.deepStrictEqual(
             Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
             [[1]]
         );
+    });
+
+    it('reports a failed read-only script as unmutated so it never dirties the file', async () => {
+        const worker = await createWorkerHarness();
+
+        const result = await worker.invoke('runConsole', 'SELECT * FROM console_nothing_here;');
+
+        assert.match(result.error, /^statement 1: /);
+        // Single statement: nothing preceded the failure, so the renderer must
+        // not claim earlier statements were applied.
+        assert.strictEqual(result.multiStatement, false);
+        assert.strictEqual(result.mutated, false);
+        assert.strictEqual(result.changes, 0);
     });
 
     it('finalizes a statement that throws mid-step without corrupting later use of the database', async () => {
@@ -3973,19 +3991,16 @@ describe('web demo view worker', () => {
             'INSERT INTO console_step_throw VALUES (1)'
         );
 
-        await assert.rejects(
-            worker.invoke(
-                'runConsole',
-                'INSERT INTO console_step_throw VALUES (2); ' +
-                'INSERT INTO console_step_throw VALUES (1); ' +
-                'INSERT INTO console_step_throw VALUES (3);'
-            ),
-            (error: Error) => {
-                assert.match(error.message, /^statement 2: /);
-                assert.match(error.message, /UNIQUE constraint failed/);
-                return true;
-            }
+        const result = await worker.invoke(
+            'runConsole',
+            'INSERT INTO console_step_throw VALUES (2); ' +
+            'INSERT INTO console_step_throw VALUES (1); ' +
+            'INSERT INTO console_step_throw VALUES (3);'
         );
+        assert.match(result.error, /^statement 2: /);
+        assert.match(result.error, /UNIQUE constraint failed/);
+        assert.strictEqual(result.mutated, true);
+        assert.strictEqual(result.changes, 1);
 
         // Statement 1 committed; statement 3 never ran. The real point of this
         // assertion is that the connection is still fully usable afterwards --
@@ -4098,18 +4113,38 @@ describe('web demo view worker', () => {
     it('interrupts a long-running console script at the configured deadline', async () => {
         const worker = await createWorkerHarness({ queryTimeout: 20 });
 
-        await assert.rejects(
-            worker.invoke(
-                'runConsole',
-                'WITH RECURSIVE counter(value) AS (' +
-                'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
-                ') SELECT sum(value) FROM counter'
-            ),
-            (error: Error) => {
-                assert.match(error.message, /^statement 1: Query execution timed out after 20ms/);
-                return true;
-            }
+        // Timeout is an error raised after execution began, so it takes the
+        // same resolve-with-metadata path as a statement error.
+        const result = await worker.invoke(
+            'runConsole',
+            'WITH RECURSIVE counter(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+            ') SELECT sum(value) FROM counter'
         );
+        assert.match(result.error, /^statement 1: Query execution timed out after 20ms/);
+        assert.strictEqual(result.mutated, false);
+        assert.strictEqual(result.changes, 0);
+    });
+
+    it('reports mutations made before a timeout cut the script short', async () => {
+        const worker = await createWorkerHarness({ queryTimeout: 60 });
+        await worker.invoke('runConsole', 'CREATE TABLE console_timeout_writes (id INTEGER)');
+
+        const result = await worker.invoke(
+            'runConsole',
+            'INSERT INTO console_timeout_writes VALUES (1); ' +
+            'WITH RECURSIVE counter(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+            ') SELECT sum(value) FROM counter'
+        );
+
+        assert.match(result.error, /^statement 2: Query execution timed out/);
+        // The interrupted script still wrote a row; losing that would leave an
+        // untracked mutation on disk.
+        assert.strictEqual(result.mutated, true);
+        assert.strictEqual(result.changes, 1);
+        const rows = await worker.invoke('runQuery', 'SELECT count(*) FROM console_timeout_writes');
+        assert.deepStrictEqual(rows[0].rows, [[1]]);
     });
 
     it('preempts a running console script through a shared cancellation flag', async () => {
@@ -4127,22 +4162,92 @@ describe('web demo view worker', () => {
         );
 
         try {
-            await assert.rejects(
-                worker.invoke(
-                    'runConsole',
-                    'WITH RECURSIVE counter(value) AS (' +
-                    'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
-                    ') SELECT sum(value) FROM counter',
-                    {},
-                    cancellationFlag
-                ),
-                (error: Error) => {
-                    assert.match(error.message, /^statement 1: Query execution cancelled/);
-                    return true;
-                }
+            const result = await worker.invoke(
+                'runConsole',
+                'WITH RECURSIVE counter(value) AS (' +
+                'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+                ') SELECT sum(value) FROM counter',
+                {},
+                cancellationFlag
             );
+            assert.match(result.error, /^statement 1: Query execution cancelled/);
+            assert.strictEqual(result.mutated, false);
         } finally {
             await flagSetter.terminate();
+        }
+    });
+
+    it('runs only the first statement under maxStatements and reports the rest as skipped', async () => {
+        // What EXPLAIN does: explainWrap only prefixes statement 1, so without
+        // this cap the tail of a script would execute for real behind a button
+        // the user reads as read-only diagnostics.
+        const worker = await createWorkerHarness();
+        await worker.invoke('runConsole', 'CREATE TABLE console_cap_stmt (id INTEGER)');
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT 1 AS plan; INSERT INTO console_cap_stmt VALUES (99);',
+            { maxStatements: 1 }
+        );
+
+        assert.strictEqual(result.results.length, 1);
+        assert.deepStrictEqual(Array.from(result.results[0].rows[0]), [1]);
+        assert.strictEqual(result.statementsSkipped, true);
+        assert.strictEqual(result.mutated, false);
+        assert.strictEqual(result.changes, 0);
+        assert.strictEqual(result.error, undefined);
+
+        // The INSERT must not have run.
+        const rows = await worker.invoke('runQuery', 'SELECT count(*) FROM console_cap_stmt');
+        assert.deepStrictEqual(rows[0].rows, [[0]]);
+
+        // Still usable afterwards: the abandoned tail is drained, not leaked.
+        const after = await worker.invoke('runConsole', 'SELECT 2 AS ok');
+        assert.deepStrictEqual(Array.from(after.results[0].rows[0]), [2]);
+        assert.strictEqual(after.statementsSkipped, false);
+    });
+
+    it('does not report skipped statements when the capped tail is only comments or whitespace', async () => {
+        const worker = await createWorkerHarness();
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT 1 AS plan; -- nothing executable here\n  ',
+            { maxStatements: 1 }
+        );
+
+        assert.strictEqual(result.results.length, 1);
+        assert.strictEqual(result.statementsSkipped, false);
+    });
+
+    it('shows a capped EXPLAIN its plan even when a later statement would fail to compile', async () => {
+        // The drain that frees the iterator must swallow prepare errors from
+        // statements it deliberately did not run, or EXPLAIN would report a
+        // failure instead of the plan the user asked for.
+        const worker = await createWorkerHarness();
+
+        const result = await worker.invoke(
+            'runConsole',
+            'EXPLAIN QUERY PLAN SELECT 1; SELECT * FROM console_no_such_table_at_all;',
+            { maxStatements: 1 }
+        );
+
+        assert.strictEqual(result.error, undefined);
+        assert.strictEqual(result.results.length, 1);
+        assert.strictEqual(result.statementsSkipped, true);
+    });
+
+    it('runs the whole script when maxStatements is absent or non-numeric', async () => {
+        const worker = await createWorkerHarness();
+
+        for (const options of [{}, { maxStatements: undefined }, { maxStatements: 'lots' }]) {
+            const result = await worker.invoke(
+                'runConsole',
+                'SELECT 1 AS a; SELECT 2 AS b; SELECT 3 AS c;',
+                options
+            );
+            assert.strictEqual(result.results.length, 3, `all sets for ${JSON.stringify(options)}`);
+            assert.strictEqual(result.statementsSkipped, false);
         }
     });
 });

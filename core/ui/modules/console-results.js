@@ -27,6 +27,14 @@ const MULTI_STATEMENT_NOTE = 'Statements before the error were applied.';
 const CONTRACT_VIOLATION_MESSAGE = 'Malformed console result payload';
 
 /**
+ * Trailing status segment for a run that stopped at its statement cap. EXPLAIN
+ * only ever prefixes the first statement, so a plan for a multi-statement
+ * script covers just that one — saying so is what stops the user reading it as
+ * a plan for everything they typed.
+ */
+const SKIPPED_STATEMENTS_NOTE = 'remaining statements not executed';
+
+/**
  * One-line summary of a completed console run, e.g.
  * `123 rows (truncated) · 2 changed · 45 ms`.
  *
@@ -43,7 +51,12 @@ const CONTRACT_VIOLATION_MESSAGE = 'Malformed console result payload';
  * A run with neither rows nor mutations (`BEGIN;`, comments only) still gets
  * a leading `no results` so the status is never a bare duration.
  *
- * @param {{ results: Array<{ rows: unknown[][], truncated: boolean }>, mutated: boolean, changes: number, durationMs: number }} result
+ * `statementsSkipped` (a capped run, i.e. EXPLAIN on a multi-statement
+ * script) adds a trailing segment. It goes last, after the duration, because
+ * it describes what the run declined to do rather than what it did — and the
+ * user must not read a one-statement plan as covering their whole script.
+ *
+ * @param {{ results: Array<{ rows: unknown[][], truncated: boolean }>, mutated: boolean, changes: number, durationMs: number, statementsSkipped?: boolean }} result
  * @returns {string}
  */
 export function formatStatus(result) {
@@ -66,6 +79,8 @@ export function formatStatus(result) {
 
     const durationMs = Number.isFinite(result.durationMs) ? Math.round(result.durationMs) : 0;
     segments.push(`${durationMs} ms`);
+
+    if (result.statementsSkipped) segments.push(SKIPPED_STATEMENTS_NOTE);
 
     return segments.join(STATUS_SEPARATOR);
 }

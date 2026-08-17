@@ -920,6 +920,23 @@ function clampConsoleMaxRows(maxRows) {
 }
 
 /**
+ * Clamp a caller-supplied statement cap to a positive integer, defaulting to
+ * Infinity (run the whole script). The console's EXPLAIN button passes 1:
+ * `EXPLAIN QUERY PLAN <editor text>` only ever prefixes the FIRST statement,
+ * so without a cap a diagnostics button would run the rest of the script for
+ * real.
+ *
+ * @param {unknown} maxStatements
+ * @returns {number}
+ */
+function clampConsoleMaxStatements(maxStatements) {
+  if (maxStatements === undefined || maxStatements === null) return Infinity;
+  const numeric = Number(maxStatements);
+  if (!Number.isFinite(numeric)) return Infinity;
+  return Math.max(1, Math.trunc(numeric));
+}
+
+/**
  * Execute an ad hoc, possibly multi-statement SQL script typed into a
  * console/scratchpad. Unlike runQuery (a single compiled statement plus
  * bound params), this compiles and steps every semicolon-separated
@@ -931,14 +948,28 @@ function clampConsoleMaxRows(maxRows) {
  * matching how the same script would behave pasted into any other sqlite3
  * client one statement at a time.
  *
+ * FAILURE IS A RESOLUTION, NOT A REJECTION -- but only once execution has
+ * begun. The pre-execution guards below (no database, read-only) still throw:
+ * nothing was applied, so there is no mutation state for a caller to lose. Any
+ * error after that point (a statement error, a timeout, a cancellation)
+ * resolves with the same mutation/timing metadata the success path reports,
+ * plus `error`. That is load-bearing, not cosmetic: `INSERT ...; SELECT * FROM
+ * nope;` really does leave the INSERT applied, and a rejection would hide the
+ * `mutated: true` that the desktop host needs to record an undo barrier, mark
+ * the file dirty, and honour instantCommit. A rejected mutation is an untracked
+ * mutation.
+ *
  * @param {string} sql - One or more semicolon-separated SQL statements
- * @param {{ maxRows?: number }} [options]
+ * @param {{ maxRows?: number, maxStatements?: number }} [options]
  * @param {Int32Array} [cancellationFlag] - Shared cancellation flag; mirrors runQuery
  * @returns {Promise<{
  *   results: Array<{ headers: string[], rows: unknown[][], truncated: boolean }>,
  *   mutated: boolean,
  *   changes: number,
- *   durationMs: number
+ *   durationMs: number,
+ *   statementsSkipped?: boolean,
+ *   error?: string,
+ *   multiStatement?: boolean
  * }>}
  */
 async function runConsole(sql, options = {}, cancellationFlag) {
@@ -950,16 +981,32 @@ async function runConsole(sql, options = {}, cancellationFlag) {
   }
 
   const maxRows = clampConsoleMaxRows(options.maxRows);
+  const maxStatements = clampConsoleMaxStatements(options.maxStatements);
   const startedAt = Date.now();
   const changesBefore = db.exec('SELECT total_changes()')[0].values[0][0];
   const schemaBefore = db.exec('PRAGMA schema_version')[0].values[0][0];
 
+  // Read AFTER execution on both the success and the failure path, from the
+  // before-values captured above: a script that failed halfway still changed
+  // whatever its earlier statements changed.
+  const mutationMetadata = () => {
+    const changesAfter = db.exec('SELECT total_changes()')[0].values[0][0];
+    const schemaAfter = db.exec('PRAGMA schema_version')[0].values[0][0];
+    return {
+      mutated: changesAfter - changesBefore > 0 || schemaAfter !== schemaBefore,
+      changes: changesAfter - changesBefore,
+      durationMs: Date.now() - startedAt
+    };
+  };
+
   let statementIndex = 0;
+  let statementsSkipped = false;
   let results;
   try {
     results = executeWithProgressHandler(() => {
       const collected = [];
       const iterator = db.iterateStatements(sql);
+      let capped = false;
       // Advance the iterator manually (rather than `for...of`) so the index
       // reported on a prepare-time failure (e.g. "no such table") names the
       // statement that failed to prepare. `for...of` only re-enters the loop
@@ -967,6 +1014,10 @@ async function runConsole(sql, options = {}, cancellationFlag) {
       // returned successfully, which under-counts by one on exactly that
       // failure class.
       for (;;) {
+        // statementIndex is incremented immediately before every next(), so at
+        // the top of an iteration it is exactly the number of statements
+        // already executed -- no second counter needed.
+        if (statementIndex >= maxStatements) { capped = true; break; }
         statementIndex++;
         const step = iterator.next();
         if (step.done) break;
@@ -1003,17 +1054,50 @@ async function runConsole(sql, options = {}, cancellationFlag) {
           statement.free();
         }
       }
+      if (capped) {
+        // Drain the tail WITHOUT executing it. sqlite3_prepare_v2 compiles a
+        // statement, it never steps one, so nothing here runs -- but draining
+        // is what releases the iterator's heap copy of the SQL. The vendored
+        // StatementIterator only frees that buffer when it reaches `done` or a
+        // prepare throws, and it exposes no return()/close(), so simply
+        // abandoning it would leak the script's bytes on every capped run
+        // (i.e. on every EXPLAIN click).
+        //
+        // A prepare error in the tail is swallowed deliberately: those
+        // statements were not run, so their compile errors are not this run's
+        // failure -- an EXPLAIN must still show its plan when a later
+        // statement references a missing table. The iterator frees itself on
+        // that path too (its own catch), so the buffer is released either way.
+        //
+        // Counting statements the drain actually yields is a stricter test
+        // than inspecting leftover SQL text: a tail of nothing but whitespace
+        // or comments yields none, and correctly reports nothing skipped.
+        try {
+          for (;;) {
+            const step = iterator.next();
+            if (step.done) break;
+            statementsSkipped = true;
+            step.value.free();
+          }
+        } catch {
+          statementsSkipped = true;
+        }
+        return collected;
+      }
+
       // A SQL console must never silently drop part of a script. Unreachable
       // with the current vendored fork -- sqlite3_prepare_v2 consumes leading
       // whitespace/comments/empty statements on its own, verified empirically
       // against several probe scripts (see the regression test in
       // web_demo_worker.test.ts) -- so this is insurance against a future
       // fork's iterator behaving differently, not a path any current input
-      // reaches. No "statement N:" prefix here: the catch below adds it
-      // uniformly, reusing this same statementIndex, which already sits one
-      // past the last successfully-processed statement (it's incremented
-      // before *every* next() call, including the final done:true one) --
-      // exactly this hypothetical statement's correct 1-based ordinal.
+      // reaches. This guards NATURAL COMPLETION only -- the capped path above
+      // returns before it, because leftover SQL is that path's whole point.
+      // No "statement N:" prefix here: the handler below adds it uniformly,
+      // reusing this same statementIndex, which already sits one past the last
+      // successfully-processed statement (it's incremented before *every*
+      // next() call, including the final done:true one) -- exactly this
+      // hypothetical statement's correct 1-based ordinal.
       const remaining = iterator.getRemainingSQL?.();
       if (remaining && remaining.trim() !== '') {
         throw new Error(`unexecuted SQL remained after iteration: ${remaining.trim().slice(0, 80)}`);
@@ -1021,21 +1105,25 @@ async function runConsole(sql, options = {}, cancellationFlag) {
       return collected;
     }, cancellationFlag);
   } catch (error) {
-    // Duck-typed rather than `instanceof Error`: sql.js errors are
-    // constructed in whatever realm initialized the WASM module, which in
-    // the unit-test harness is not this worker's own realm, so a strict
-    // instanceof check silently misses and double-wraps via String(error).
-    throw new Error(`statement ${statementIndex}: ${getErrorMessage(error)}`);
+    // Resolve, don't reject: see the header. The caller gets the failure AND
+    // the mutation metadata for whatever ran before it.
+    return {
+      results: [],
+      // Duck-typed rather than `instanceof Error`: sql.js errors are
+      // constructed in whatever realm initialized the WASM module, which in
+      // the unit-test harness is not this worker's own realm, so a strict
+      // instanceof check silently misses and double-wraps via String(error).
+      error: `statement ${statementIndex}: ${getErrorMessage(error)}`,
+      // Computed here rather than guessed by the caller from a `;` scan: the
+      // worker knows how far it actually got, so the renderer's "statements
+      // before the error were applied" note is only shown when statements
+      // really did precede the failure.
+      multiStatement: statementIndex > 1,
+      ...mutationMetadata()
+    };
   }
 
-  const changesAfter = db.exec('SELECT total_changes()')[0].values[0][0];
-  const schemaAfter = db.exec('PRAGMA schema_version')[0].values[0][0];
-  return {
-    results,
-    mutated: changesAfter - changesBefore > 0 || schemaAfter !== schemaBefore,
-    changes: changesAfter - changesBefore,
-    durationMs: Date.now() - startedAt
-  };
+  return { results, statementsSkipped, ...mutationMetadata() };
 }
 
 /**

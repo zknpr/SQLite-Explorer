@@ -45,9 +45,45 @@ export function pushHistory(list, sqlText) {
  * (after leading whitespace) with `explain`, case-insensitively — so
  * re-running EXPLAIN on text loaded back from history doesn't stack a
  * second prefix.
+ *
+ * Note that this only ever prefixes the FIRST statement of a script. The
+ * EXPLAIN action therefore also caps execution at one statement
+ * (`maxStatements: 1`); without that, a diagnostics button would run the rest
+ * of the script for real.
  */
 export function explainWrap(sqlText) {
     return /^\s*explain\b/i.test(sqlText) ? sqlText : `EXPLAIN QUERY PLAN ${sqlText}`;
+}
+
+/**
+ * Filters a persisted history list down to what the console can actually use:
+ * strings, no longer than an entry this module would itself have recorded, and
+ * no more of them than it would itself have kept.
+ *
+ * This is a trust boundary, not tidiness. The list arrives from settings.json,
+ * which a user (or anything else on the machine) can edit by hand: a single
+ * `null` in there used to reach `entry.length` inside the dropdown builder and
+ * throw during construction, which left `createConsole` half-finished and the
+ * console unopenable for the rest of the session.
+ *
+ * Returns the SAME `list` reference when every entry already passes and the
+ * length is within cap, mirroring {@link pushHistory}'s convention so callers
+ * can keep reference-comparing to detect "nothing changed".
+ */
+export function sanitizeHistory(list) {
+    if (!Array.isArray(list)) return [];
+    const usable = list.filter(entry => typeof entry === 'string' && entry.length <= HISTORY_ENTRY_MAX);
+    if (usable.length === list.length && list.length <= HISTORY_CAP) return list;
+    return usable.slice(0, HISTORY_CAP);
+}
+
+/**
+ * The notice shown for a run that was executed but deliberately not recorded
+ * in history, or `''` when there is nothing to say. Split out from the run
+ * action so the rule is testable without a live editor.
+ */
+export function historySkipNotice(sqlText) {
+    return String(sqlText).trim().length > HISTORY_ENTRY_MAX ? 'not recorded (too long)' : '';
 }
 
 // ---- CodeMirror 6 console --------------------------------------------------
@@ -207,10 +243,10 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
         loadIntoEditor(list[index]);
     });
 
-    async function execute(sqlText) {
+    async function execute(sqlText, options) {
         setNotice('');
         try {
-            await runSql(sqlText);
+            await runSql(sqlText, options);
         } catch (err) {
             // The injected runSql is expected to render its own errors
             // (desktop-viewer.js renders via console-results.js); this is
@@ -229,17 +265,25 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
         saveHistory(pushHistory(loadHistory(), text));
         historyIndex = -1;
         populateHistorySelect();
+        // pushHistory silently drops an over-long entry; say so, but never at
+        // the cost of an error the run itself produced (execute() owns the
+        // notice, and only cleared it if nothing went wrong).
+        const skipped = historySkipNotice(text);
+        if (skipped && !notice.textContent) setNotice(skipped);
     }
 
     /**
-     * Runs the editor's text wrapped in EXPLAIN QUERY PLAN. No history write:
-     * the recorded entry should be the query the user is working on, not the
-     * plan lookup, and the next Run records it anyway.
+     * Runs the editor's text wrapped in EXPLAIN QUERY PLAN, capped at ONE
+     * statement: the wrap only prefixes the first, so without the cap the
+     * tail of a multi-statement script would execute for real — a diagnostics
+     * button that mutates. No history write either: the recorded entry should
+     * be the query the user is working on, not the plan lookup, and the next
+     * Run records it anyway.
      */
     async function runExplain() {
         const text = view.state.doc.toString();
         if (!text.trim()) return;
-        await execute(explainWrap(text));
+        await execute(explainWrap(text), { maxStatements: 1 });
     }
 
     const runKeymap = keymap.of([

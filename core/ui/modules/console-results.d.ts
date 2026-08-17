@@ -21,9 +21,16 @@ export interface ConsoleRunResult {
     /** total_changes() delta across the whole script. */
     changes: number;
     durationMs: number;
+    /** True when a statement cap (EXPLAIN's `maxStatements: 1`) left part of the script unexecuted. Absent reads as false. */
+    statementsSkipped?: boolean;
 }
 
-/** The failure payload the caller synthesizes from a rejected runConsole. */
+/**
+ * The failure payload. Normally runConsole's own resolution once execution has
+ * begun — it carries the mutation metadata too, so the host can still record
+ * what a half-applied script changed. The viewer synthesizes this shape only
+ * for failures that never reached the worker (transport, read-only refusal).
+ */
 export interface ConsoleRunError {
     /** The message to show. A non-string (e.g. a raw Error) is coerced rather than throwing. */
     error: string;
@@ -40,6 +47,7 @@ export type ConsoleRenderPayload = ConsoleRunResult | ConsoleRunError;
  * the set count), changes only when the run mutated (`schema changed` when it
  * mutated with zero row changes), duration always, rounded to whole
  * milliseconds. A run with neither rows nor mutations reads `no results · N ms`.
+ * A capped run appends ` · remaining statements not executed`.
  */
 export function formatStatus(result: ConsoleRunResult): string;
 

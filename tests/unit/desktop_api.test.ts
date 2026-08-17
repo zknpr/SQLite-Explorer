@@ -84,4 +84,12 @@ test('runConsole passes the script and an options object through to the host', a
 
   await backendApi.runConsole('SELECT 1', { maxRows: 10 });
   assert.deepEqual(host.calls.at(-1), { method: 'runConsole', args: ['SELECT 1', { maxRows: 10 }] });
+
+  // EXPLAIN's contract: the console module injects this and the passthrough
+  // must not drop it, or a diagnostics click runs the whole script for real.
+  await backendApi.runConsole('EXPLAIN QUERY PLAN SELECT 1; DROP TABLE t;', { maxStatements: 1 });
+  assert.deepEqual(host.calls.at(-1), {
+    method: 'runConsole',
+    args: ['EXPLAIN QUERY PLAN SELECT 1; DROP TABLE t;', { maxStatements: 1 }]
+  });
 });
