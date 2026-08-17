@@ -537,6 +537,13 @@ test('exportDb routes exported bytes through bridge.saveFileAs', async () => {
   assert.equal(savedAs.len, 1);
 });
 
+test('saveFile reports the picked filename', async () => {
+  const { host } = makeHost({}, { saveFileAs: async () => '/tmp/picked-name.bin' });
+  await host.start();
+  const res = await host.invoke('saveFile', ['default.bin', new Uint8Array([1])]) as Record<string, unknown>;
+  assert.deepEqual(res, { success: true, savedAs: 'picked-name.bin' });
+});
+
 test('refreshFile re-reads the current file from disk and reinitializes the worker', async () => {
   const { host, posted } = makeHost({});
   await host.start();

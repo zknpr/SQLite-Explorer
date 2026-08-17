@@ -412,8 +412,8 @@ export class BlobInspector {
                 updateStatus(`Downloaded ${filename}`);
             } else {
                 // Native mode: Use VS Code API to save file via backendApi
-                await backendApi.saveFile(filename, this.currentData);
-                updateStatus(`Saved ${filename}`);
+                const result = await backendApi.saveFile(filename, this.currentData);
+                updateStatus(`Saved ${result?.savedAs ?? filename}`);
             }
         } catch (err) {
             console.error('Download failed:', err);

@@ -270,6 +270,11 @@ export function createDesktopHost({ bridge, createWorker }) {
         return true;
     }
 
+    // Save-dialog results report the full picked path; only the filename is
+    // status-bar-worthy (and the only part VS Code's webContents.postMessage
+    // equivalent would ever have had access to).
+    const basename = (p) => String(p).split('/').pop();
+
     const localMethods = {
         async initialize() {
             return { connected: true, isReadOnly: connectionInfo.isReadOnly === true, filename: currentName };
@@ -309,13 +314,13 @@ export function createDesktopHost({ bridge, createWorker }) {
         async exportDb(filename) {
             const bytes = await callWorker('exportDatabase', [currentName]);
             const target = await bridge.saveFileAs(filename || currentName, bytes);
-            return { success: target !== null };
+            return { success: target !== null, savedAs: target ? basename(target) : undefined };
         },
         async exportTable(...args) {
             const result = await callWorker('exportTable', args);
             const text = result.contentChunks.join('');
             const target = await bridge.saveFileAs(result.filename, new TextEncoder().encode(text));
-            return { success: target !== null };
+            return { success: target !== null, savedAs: target ? basename(target) : undefined };
         },
         async refreshFile() {
             if (!currentPath) return { success: true };
@@ -326,7 +331,7 @@ export function createDesktopHost({ bridge, createWorker }) {
         },
         async saveFile(filename, data) {
             const target = await bridge.saveFileAs(filename, data);
-            return { success: target !== null };
+            return { success: target !== null, savedAs: target ? basename(target) : undefined };
         },
         async triggerUndo() {
             const entry = tracker.stepBack();

@@ -10,6 +10,7 @@ import { refreshSchema } from './sidebar.js';
 import { parseGridInputValue } from './utils.js';
 import { noteRowCountChanged, noteCellValuesChanged } from './count-cache.js';
 import { getSelectedRowActionEligibility } from './data-utils.js';
+import { saveHint } from './platform.js';
 
 let isSubmittingAddRow = false;
 let isSubmittingDelete = false;
@@ -170,7 +171,7 @@ async function submitAddRowOnce() {
 
         closeModal('addRowModal');
         await loadTableData();
-        updateStatus('Row inserted - Ctrl+S to save');
+        updateStatus(`Row inserted - ${saveHint()}`);
 
     } catch (err) {
         console.error('Insert failed:', err);
@@ -253,7 +254,7 @@ async function submitDeleteRows() {
         const skipped = eligibility.readOnlyCount > 0
             ? `; skipped ${eligibility.readOnlyCount} read-only selection${eligibility.readOnlyCount === 1 ? '' : 's'}`
             : '';
-        updateStatus(`Deleted ${rowIds.length} row${rowIds.length > 1 ? 's' : ''}${skipped} - Ctrl+S to save`);
+        updateStatus(`Deleted ${rowIds.length} row${rowIds.length > 1 ? 's' : ''}${skipped} - ${saveHint()}`);
 
     } catch (err) {
         console.error('Delete rows failed:', err);
@@ -295,7 +296,7 @@ async function submitDeleteColumns() {
         await loadTableColumns();
         await loadTableData();
         updateToolbarButtons();
-        updateStatus(`Deleted ${columnNames.length} column${columnNames.length > 1 ? 's' : ''} - Ctrl+S to save`);
+        updateStatus(`Deleted ${columnNames.length} column${columnNames.length > 1 ? 's' : ''} - ${saveHint()}`);
 
     } catch (err) {
         console.error('Delete columns failed:', err);
@@ -462,7 +463,7 @@ async function submitCreateTableOnce() {
 
         closeModal('createTableModal');
         await refreshSchema();
-        updateStatus(`Table "${tableName}" created - Ctrl+S to save`);
+        updateStatus(`Table "${tableName}" created - ${saveHint()}`);
 
     } catch (err) {
         console.error('Create table failed:', err);
@@ -523,7 +524,7 @@ async function submitAddColumnOnce() {
         closeModal('addColumnModal');
         await loadTableColumns();
         await loadTableData();
-        updateStatus(`Column "${columnName}" added - Ctrl+S to save`);
+        updateStatus(`Column "${columnName}" added - ${saveHint()}`);
 
     } catch (err) {
         console.error('Add column failed:', err);

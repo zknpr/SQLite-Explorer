@@ -6,6 +6,7 @@ import { updateStatus } from './ui.js';
 import { closeModal } from './modals.js';
 import { state } from './state.js';
 import { applyTheme, THEME_IDS } from './desktop-theme.js';
+import { modLabel } from './platform.js';
 
 export function doubleClickOptions(isDesktop) {
     return isDesktop ? ['inline', 'modal'] : ['inline', 'modal', 'vscode'];
@@ -140,7 +141,7 @@ function renderPragmaForm(pragmas, settings) {
     autoCommitInput.className = 'setting-extension';
     autoCommitInput.dataset.key = 'autoCommit';
     autoCommitInput.checked = !!settings.autoCommit;
-    appendField('Auto-Commit Changes', autoCommitInput, 'Automatically save changes to disk immediately. If disabled, you must save manually (Ctrl+S).');
+    appendField('Auto-Commit Changes', autoCommitInput, `Automatically save changes to disk immediately. If disabled, you must save manually (${modLabel('S')}).`);
 
     // Double Click Behavior
     const doubleClickSelect = document.createElement('select');

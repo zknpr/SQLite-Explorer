@@ -10,6 +10,7 @@ import { showEmptyState, updateStatus, updateToolbarButtons } from './ui.js';
 import { formatCellValueAsText } from './utils.js';
 import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
 import { invalidateAllCounts } from './count-cache.js';
+import { saveHint } from './platform.js';
 import {
     isViewDefinitionConflictError,
     isViewDefinitionSnapshotCurrent,
@@ -345,7 +346,7 @@ async function saveDraft() {
             await loadTableData(true, false);
         }
         if (modalSession === activeViewModalSession) {
-            updateStatus(`View "${changedView}" ${targetView ? 'updated' : 'created'} - Ctrl+S to save`);
+            updateStatus(`View "${changedView}" ${targetView ? 'updated' : 'created'} - ${saveHint()}`);
         }
     } catch (err) {
         if (isCurrentModalSession(modalSession)) {
@@ -447,7 +448,7 @@ export async function dropViewFromSidebar(view) {
             persistState();
         }
         await refreshSchema();
-        updateStatus(`View "${view}" dropped - Ctrl+S to save`);
+        updateStatus(`View "${view}" dropped - ${saveHint()}`);
     } catch (err) {
         updateStatus(`Error: ${err.message}`);
     }

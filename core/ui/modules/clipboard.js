@@ -15,6 +15,7 @@ import {
     resolveDisplayedCell
 } from './data-utils.js';
 import { validateRowId, escapeIdentifier } from './utils.js';
+import { saveHint } from './platform.js';
 
 const TRUNCATED_COPY_NOTICE =
     'Copy blocked: selection contains truncated data. Use Open Full Content for one cell or Export for complete rows.';
@@ -224,7 +225,7 @@ export async function clearSelectedCellValues() {
 
         await loadTableData();
         updateToolbarButtons();
-        updateStatus(`${label} - Ctrl+S to save`);
+        updateStatus(`${label} - ${saveHint()}`);
 
     } catch (err) {
         console.error('Clear cells failed:', err);
