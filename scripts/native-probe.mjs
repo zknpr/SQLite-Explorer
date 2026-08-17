@@ -14,7 +14,7 @@
  *   node scripts/native-probe.mjs            # all sections
  *   node scripts/native-probe.mjs sqlite     # one or more section ids
  *
- * Sections: invocation, sqlite, async, stdio, orphan, spawnenv
+ * Sections: invocation, sqlite, multistmt, async, stdio, orphan, spawnenv
  *
  * Exits non-zero if a HARD invariant fails (binary missing/not executable, or
  * the framed stdin/stdout transport does not round-trip). Everything else is
@@ -168,6 +168,16 @@ await T('{readOnly:true} (camelCase) then INSERT', () => {
 });
 await T('PRAGMA query_only under {readonly:true}', () => { const d = new Database(${JSON.stringify(roDb)}, { readonly: true }); const r = d.prepare('PRAGMA query_only').all(); d.close(); return r; });
 
+// Any options object at all disables create-on-open -- even an empty one. The
+// shim therefore has to ask for \`create\` explicitly on read-write opens, and
+// must never combine it with readOnly.
+const fresh = (n) => ${JSON.stringify(SCRATCH)} + '/create-probe-' + n + '.db';
+await T('new Database(missing) with NO options', () => { const d = new Database(fresh(1)); d.exec('CREATE TABLE t(a)'); d.close(); return 'created'; });
+await T('new Database(missing, {}) -- empty options', () => { const d = new Database(fresh(2), {}); d.close(); return 'created'; });
+await T('new Database(missing, {create:true})', () => { const d = new Database(fresh(3), { create: true }); d.exec('CREATE TABLE t(a)'); d.close(); return 'created'; });
+await T('new Database(missing, {create:false})', () => { const d = new Database(fresh(4), { create: false }); d.close(); return 'created'; });
+await T('{create:true, readOnly:true} together', () => { const d = new Database(${JSON.stringify(roDb)}, { create: true, readOnly: true }); d.close(); return 'accepted'; });
+
 const db = new Database(':memory:');
 db.exec('CREATE TABLE t(a INTEGER, b TEXT)');
 
@@ -285,6 +295,170 @@ await T('vacuumed copy readable', () => { const d = new Database(${JSON.stringif
 await T('VACUUM INTO existing path', () => { const d = new Database(${JSON.stringify(vacSrc)}); try { d.exec("VACUUM INTO '" + ${JSON.stringify(vacOut)} + "'"); return 'OVERWROTE'; } catch (e) { return 'blocked: ' + e.message; } finally { d.close(); } });
 await T('VACUUM INTO with a bound parameter', () => { const d = new Database(${JSON.stringify(vacSrc)}); try { const s = d.prepare('VACUUM INTO ?'); s.run([${JSON.stringify(path.join(SCRATCH, 'vac-param.db'))}]); s.finalize(); return 'ok'; } catch (e) { return 'failed: ' + e.message; } finally { d.close(); } });
 await T('VACUUM INTO from a {readOnly:true} connection', () => { const d = new Database(${JSON.stringify(vacSrc)}, { readOnly: true }); try { d.exec("VACUUM INTO '" + ${JSON.stringify(path.join(SCRATCH, 'vac-ro.db'))} + "'"); return 'ok'; } catch (e) { return 'blocked: ' + e.message; } finally { d.close(); } });
+`);
+
+  const r = await runTjs(script);
+  console.log(r.stdout.trimEnd());
+  if (r.stderr.trim()) console.log('[stderr]', r.stderr.trim());
+}
+
+// ---------------------------------------------------------------------------
+// 2b. Multi-statement compilation — the `iterateStatements` question
+//
+// sql.js's StatementIterator is a thin wrapper over sqlite3_prepare_v2's pzTail
+// out-parameter: each next() prepares one statement and keeps the pointer to
+// the unconsumed remainder, which getRemainingSQL() exposes. The fork's binding
+// hides pzTail entirely, so the shim needs to know EXACTLY what prepare() does
+// with trailing statements before it can reproduce that iterator.
+//
+// Load-bearing distinctions probed here:
+//   - does prepare() itself EXECUTE (if so, prepare-then-all double-runs DML);
+//   - is the unconsumed tail reachable from the Statement or the Database;
+//   - is toString() the ORIGINAL statement text (sqlite3_sql, what sql.js's
+//     getSQL returns and what worker.js's boundary-comment single-statement
+//     guard depends on) or the EXPANDED text (sqlite3_expanded_sql);
+//   - how trivia-only and incomplete (trigger body) input fail, since a
+//     split-then-prepare shim has to classify both.
+// ---------------------------------------------------------------------------
+async function sectionMultiStatement() {
+  heading('2b. tjs:sqlite — MULTI-STATEMENT PREPARE / TAIL');
+
+  const script = tjsScript('multistmt.js', `
+import * as sqlite from "tjs:sqlite";
+const { Database } = sqlite;
+${PREAMBLE}
+const db = new Database(':memory:');
+db.exec('CREATE TABLE t(a INTEGER)');
+
+console.log('-- does prepare() execute? (nothing else is called on the stmt) --');
+await T('prepare INSERT, never run it', () => {
+  db.exec('DELETE FROM t');
+  const s = db.prepare("INSERT INTO t VALUES(1)");
+  const mid = db.prepare('SELECT count(*) AS c FROM t').all()[0].c;
+  s.finalize();
+  const after = db.prepare('SELECT count(*) AS c FROM t').all()[0].c;
+  return { rowsAfterPrepare: mid, rowsAfterFinalize: after };
+});
+await T('prepare INSERT then all() ONCE', () => {
+  db.exec('DELETE FROM t');
+  const s = db.prepare("INSERT INTO t VALUES(1)");
+  s.all();
+  const after = db.prepare('SELECT count(*) AS c FROM t').all()[0].c;
+  s.finalize();
+  return { rowsAfterAll: after };
+});
+await T('prepare INSERT then run() ONCE', () => {
+  db.exec('DELETE FROM t');
+  const s = db.prepare("INSERT INTO t VALUES(1)");
+  s.run();
+  const after = db.prepare('SELECT count(*) AS c FROM t').all()[0].c;
+  s.finalize();
+  return { rowsAfterRun: after };
+});
+await T('prepare MULTI-statement DML, never run it', () => {
+  db.exec('DELETE FROM t');
+  const s = db.prepare("INSERT INTO t VALUES(1); INSERT INTO t VALUES(2)");
+  const mid = db.prepare('SELECT group_concat(a) AS g FROM t').all()[0].g;
+  s.run();
+  const after = db.prepare('SELECT group_concat(a) AS g FROM t').all()[0].g;
+  s.finalize();
+  return { afterPrepare: String(mid), afterRun: String(after) };
+});
+
+console.log('\\n-- is the unconsumed tail reachable anywhere? --');
+await T('Statement own+proto property names', () => {
+  const s = db.prepare('SELECT 1 AS one; SELECT 2 AS two');
+  const own = Object.getOwnPropertyNames(s);
+  const proto = Object.getOwnPropertyNames(Object.getPrototypeOf(s));
+  s.finalize();
+  return { own, proto };
+});
+await T('Database own+proto property names', () => ({
+  own: Object.getOwnPropertyNames(db),
+  proto: Object.getOwnPropertyNames(Object.getPrototypeOf(db))
+}));
+await T('db.iterateStatements / db.prepareAll / db.tail exist?', () => ({
+  iterateStatements: typeof db.iterateStatements,
+  prepareAll: typeof db.prepareAll,
+  tail: typeof db.tail,
+  remainingSql: typeof db.remainingSql
+}));
+
+console.log('\\n-- toString(): original (sqlite3_sql) or expanded? --');
+await T('toString of a multi-statement prepare', () => String(db.prepare('SELECT 1 AS one; SELECT 2 AS two')));
+await T('toString preserves a trailing comment (boundary trick)', () => {
+  const s = db.prepare('SELECT 1 AS one\\n/*BOUNDARY_MARKER*/');
+  const text = String(s);
+  s.finalize();
+  return { text, endsWithMarker: text.trimEnd().endsWith('/*BOUNDARY_MARKER*/') };
+});
+await T('boundary marker survives a MULTI-statement prepare', () => {
+  const s = db.prepare('SELECT 1; SELECT 2\\n/*BOUNDARY_MARKER*/');
+  const text = String(s);
+  s.finalize();
+  return { text, endsWithMarker: text.trimEnd().endsWith('/*BOUNDARY_MARKER*/') };
+});
+await T('unbound placeholder in toString', () => {
+  const s = db.prepare('SELECT ? AS v, :name AS n');
+  const text = String(s);
+  s.finalize();
+  return text;
+});
+await T('leading trivia retained in toString?', () => {
+  const s = db.prepare('  -- lead\\n  SELECT 1 AS one');
+  const text = String(s);
+  s.finalize();
+  return J(text);
+});
+
+console.log('\\n-- trivia-only and incomplete input --');
+const errShape = (fn) => {
+  try { const v = fn(); return { threw: false, value: String(v) }; }
+  catch (e) { return { threw: true, ctor: e.constructor.name, message: e.message, errno: String(e.errno) }; }
+};
+await T('prepare("") empty string', () => errShape(() => { const s = db.prepare(''); const r = String(s); s.finalize(); return r; }));
+await T('prepare("   ") whitespace only', () => errShape(() => { const s = db.prepare('   '); const r = String(s); s.finalize(); return r; }));
+await T('prepare("-- c") comment only', () => errShape(() => { const s = db.prepare('-- c'); const r = String(s); s.finalize(); return r; }));
+await T('prepare(";") bare semicolon', () => errShape(() => { const s = db.prepare(';'); const r = String(s); s.finalize(); return r; }));
+await T('prepare(incomplete trigger body)', () => errShape(() =>
+  db.prepare('CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET a=1;')));
+await T('prepare(complete trigger, internal semicolons)', () => errShape(() => {
+  const s = db.prepare('CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET a=1; END;');
+  s.run(); s.finalize();
+  return db.prepare("SELECT count(*) AS c FROM sqlite_master WHERE type='trigger'").all()[0].c;
+}));
+await T('prepare(trailing text after a complete trigger)', () => errShape(() => {
+  const s = db.prepare('CREATE TRIGGER tr2 AFTER INSERT ON t BEGIN UPDATE t SET a=2; END; SELECT 1');
+  const text = String(s);
+  s.finalize();
+  return text;
+}));
+
+console.log('\\n-- exec() over multi-statement scripts (native-worker.js precedent) --');
+await T('exec runs every statement', () => {
+  db.exec('DROP TABLE IF EXISTS m; CREATE TABLE m(a); INSERT INTO m VALUES(1); INSERT INTO m VALUES(2)');
+  return db.prepare('SELECT count(*) AS c FROM m').all();
+});
+await T('exec with a failing 2nd statement: does the 1st stick?', () => {
+  db.exec('DELETE FROM m');
+  const r = errShape(() => db.exec('INSERT INTO m VALUES(9); SELEC bad'));
+  return { error: r, rows: db.prepare('SELECT group_concat(a) AS g FROM m').all()[0].g };
+});
+await T('exec returns nothing for SELECT', () => String(db.exec('SELECT 1')));
+
+console.log('\\n-- read-only assertion strategies (shim constructor gate) --');
+await T('PRAGMA query_only on a {readOnly:true} connection', () => {
+  const d = new Database(':memory:', { readOnly: true });
+  try { return d.prepare('PRAGMA query_only').all(); } finally { d.close(); }
+});
+await T('in-memory {readOnly:true} accepts DDL?', () => {
+  const d = new Database(':memory:', { readOnly: true });
+  const r = errShape(() => d.exec('CREATE TABLE probe(a)'));
+  d.close();
+  return r;
+});
+
+db.close();
 `);
 
   const r = await runTjs(script);
@@ -584,6 +758,7 @@ async function sectionSpawnEnv() {
 const SECTIONS = {
   invocation: sectionInvocation,
   sqlite: sectionSqlite,
+  multistmt: sectionMultiStatement,
   async: sectionAsync,
   stdio: sectionStdio,
   orphan: sectionOrphan,
