@@ -141,11 +141,20 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
         view.focus();
     }
 
+    // Keeps the dropdown's displayed selection tracking historyIndex when
+    // prev/next move it without going through the select's own change event.
+    // Re-populating isn't needed for this: the option list itself doesn't
+    // change between runs, only which option should read as selected does.
+    function syncHistorySelect() {
+        historySelect.value = historyIndex === -1 ? '' : String(historyIndex);
+    }
+
     function goOlder() {
         const list = loadHistory();
         if (historyIndex + 1 >= list.length) return; // already at the oldest entry (or no history)
         historyIndex += 1;
         loadIntoEditor(list[historyIndex]);
+        syncHistorySelect();
     }
 
     function goNewer() {
@@ -153,6 +162,7 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
         historyIndex -= 1;
         const list = loadHistory();
         loadIntoEditor(historyIndex === -1 ? '' : list[historyIndex]);
+        syncHistorySelect();
     }
 
     prevButton.addEventListener('click', goOlder);
@@ -233,6 +243,11 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
     function refreshSchema() {
         view.dispatch({ effects: schemaCompartment.reconfigure(sqlExtension()) });
     }
+
+    // Force container.hidden/open into agreement as the last construction
+    // step, regardless of whatever hidden/visible markup the caller handed
+    // in — isOpen() must never disagree with container.hidden's real value.
+    hide();
 
     return { show, hide, toggle, isOpen, refreshSchema };
 }
