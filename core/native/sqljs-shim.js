@@ -241,6 +241,10 @@ function createShimStatement(context, compiled, source, expanded) {
     const probeText = source === expanded ? source : expanded;
 
     const assertLive = () => {
+        // Connection-level quarantine outranks statement-level liveness: if
+        // read-only enforcement was lost, "this statement is closed" is the
+        // wrong (and reassuring) thing to say.
+        context.assertUsable();
         if (backingStatement === null) throw new Error('Statement closed');
     };
 
@@ -522,6 +526,13 @@ export function createShimDatabase(config = {}, deps = {}) {
      */
     const withInternalWrites = (operation) => {
         if (!readOnly) return operation();
+        // A poisoned connection is one whose query_only state is unknown, so
+        // lifting it again is precisely the thing not to do. Unreachable today
+        // -- every caller passes assertOpen/assertUsable first, and the probe
+        // re-throws before its DROP cleanup -- but this is THE choke point for
+        // "permit writes on a read-only connection", so it checks for itself
+        // rather than trusting each future caller to have checked.
+        if (poisoned !== null) throw poisoned;
         if (writesLifted) {
             throw new Error('Internal error: read-only write lift is not re-entrant');
         }
@@ -565,14 +576,24 @@ export function createShimDatabase(config = {}, deps = {}) {
     };
 
     /**
-     * Wrap `sql` in a TEMP VIEW and read the view's columns.
+     * Wrap `sql` in a TEMP VIEW and hand the view to `reader`.
      *
      * This is the only way to get column names for a zero-row result out of
      * this binding, and it is simultaneously the only way to see columns that
-     * `all()`'s row objects collapse. Returns null whenever the statement
-     * cannot be viewed at all (DML/DDL/PRAGMA, or a parameterised query --
-     * views may not contain parameters), which is the caller's signal to fall
-     * back to the materialised row keys.
+     * `all()`'s row objects collapse. Callers pass the statement's PARAMETER-FREE
+     * text -- its compile-time expansion, where every parameter reads as NULL --
+     * because a view body may not contain parameters; that is what lets a
+     * parameterised query be probed at all.
+     *
+     * Returns null when the statement cannot be expressed as a view (DML, DDL,
+     * PRAGMA, EXPLAIN). That is not a fallback to executing the statement: it is
+     * the signal for the caller's ladder to move to its next rung, which reports
+     * `[]` rather than run anything. See `ensureColumns`.
+     *
+     * The two `catch { return null }` arms below are deliberately blanket --
+     * "this statement is not viewable" is exactly what a failure here means --
+     * EXCEPT for a poisoned connection, which is re-thrown: degrading a lost
+     * read-only guarantee into "no columns" would hide it.
      */
     const withColumnProbeView = (sql, reader) => {
         const body = stripLeadingTrivia(sql);
@@ -599,7 +620,8 @@ export function createShimDatabase(config = {}, deps = {}) {
                     finalizeQuietly(creation);
                 }
             });
-        } catch {
+        } catch (error) {
+            if (poisoned !== null) throw poisoned;
             return null;
         }
         try {
@@ -607,7 +629,8 @@ export function createShimDatabase(config = {}, deps = {}) {
             // write permission, so nothing that touches user SQL runs while
             // query_only is down.
             return reader({ quoted, literal });
-        } catch {
+        } catch (error) {
+            if (poisoned !== null) throw poisoned;
             return null;
         } finally {
             try {
@@ -621,6 +644,10 @@ export function createShimDatabase(config = {}, deps = {}) {
     };
 
     const statementContext = {
+        /** Statements share the connection's quarantine, not just its handle. */
+        assertUsable: () => {
+            if (poisoned !== null) throw poisoned;
+        },
         register: (statement) => liveStatements.add(statement),
         forget: (statement) => liveStatements.delete(statement),
         probeColumnNames: (sql) => withColumnProbeView(sql, ({ literal }) => {

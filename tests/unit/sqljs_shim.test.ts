@@ -754,6 +754,95 @@ describe('sqljs-shim: native-only behaviour', () => {
         }
     });
 
+    it('a lost read-only guarantee quarantines the whole connection', () => {
+        // Poison is set when `PRAGMA query_only = 1` cannot be restored after an
+        // internal lift. Every route back into the connection must then fail
+        // with THAT error -- in particular the column probe, whose blanket catch
+        // would otherwise report a lost read-only guarantee as "no columns".
+        let armed = false;
+        const execLog: string[] = [];
+        interface BackingDatabase {
+            exec(sql: string): void;
+            prepare(sql: string): unknown;
+            close(): void;
+        }
+        const BackingDatabaseCtor = standInSqliteModule.Database as unknown as new (
+            path?: string,
+            options?: Record<string, unknown>
+        ) => BackingDatabase;
+        const brittleSqlite = {
+            Database: class {
+                #inner: BackingDatabase;
+                constructor(path?: string, options?: Record<string, unknown>) {
+                    this.#inner = new BackingDatabaseCtor(path, options);
+                }
+                exec(sql: string) {
+                    execLog.push(sql);
+                    if (armed && sql === 'PRAGMA query_only = 1') {
+                        throw new Error('simulated restore failure');
+                    }
+                    this.#inner.exec(sql);
+                }
+                prepare(sql: string) {
+                    return this.#inner.prepare(sql);
+                }
+                close() {
+                    this.#inner.close();
+                }
+            }
+        };
+
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sqljs-shim-poison-'));
+        try {
+            const file = path.join(dir, 'fixture.sqlite');
+            const seeded = createShim({ path: file });
+            seeded.run(SEED_SQL);
+            seeded.close();
+
+            const db = createShimDatabase(
+                { path: file, readOnly: true },
+                { sqlite: brittleSqlite as never, fs: nodeFileSystem }
+            );
+            try {
+                const statement = db.prepare('SELECT id AS alpha FROM t WHERE 0');
+                // Arm the failure only now: the constructor's own arming call
+                // must succeed, or there would be no read-only connection to lose.
+                armed = true;
+
+                // The probe lifts query_only, fails to restore it, and must
+                // surface that rather than degrade to "not viewable".
+                const execCountAtPoison = execLog.length;
+                assert.throws(() => statement.getColumnNames(), /no longer trustworthy/);
+
+                // Writes are never re-enabled on a connection whose query_only
+                // state is already unknown: the failed lift is the last one.
+                assert.deepStrictEqual(
+                    execLog.slice(execCountAtPoison).filter(sql => sql === 'PRAGMA query_only = 0'),
+                    ['PRAGMA query_only = 0'],
+                    'exactly the one lift that poisoned the connection, and no re-lift after it'
+                );
+
+                // Every other route in is closed too: statement methods...
+                assert.throws(() => statement.step(), /no longer trustworthy/);
+                assert.throws(() => statement.get(), /no longer trustworthy/);
+                statement.free();
+                // ...database methods...
+                assert.throws(() => db.exec('SELECT 1'), /no longer trustworthy/);
+                assert.throws(() => db.prepare('SELECT 1'), /no longer trustworthy/);
+                assert.throws(() => db.getRowsModified(), /no longer trustworthy/);
+                // ...and a fresh probe cannot re-lift the connection.
+                assert.throws(() => db.export(), /no longer trustworthy/);
+            } finally {
+                armed = false;
+                // close() stays available: a quarantined connection must still
+                // be releasable.
+                db.close();
+            }
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     it('progress_handler is recorded but inert (the fork has no per-row callback)', () => {
         const db = createShim();
         try {

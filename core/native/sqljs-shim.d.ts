@@ -102,7 +102,11 @@ export interface ShimExecResult {
 export interface ShimStatement {
     bind(values?: NativeBindParams | null): boolean;
     step(): boolean;
-    /** Empty until `step()` has produced a row; never executes the statement itself. */
+    /**
+     * The current row, or `[]` until `step()` has produced one. Reading the
+     * current row executes nothing; passing `params` is sql.js's bind-and-step
+     * overload, which does execute the statement.
+     */
     get(params?: NativeBindParams | null, config?: ShimValueConfig): NativeValue[];
     /**
      * Column names, resolved without executing the statement wherever possible
