@@ -589,6 +589,28 @@ test('exportTable injects the desktop export cap while preserving caller-passed 
   assert.equal(exportOptions.header, false);
 });
 
+test('exportTable host cap wins over a conflicting caller-passed maxExportBytes', async () => {
+  let recordedArgs: unknown[] = [];
+  const { host } = makeHost(
+    {
+      exportTable: (args: unknown[]) => {
+        recordedArgs = args;
+        return { contentChunks: [], filename: 'users.csv', mimeType: 'text/csv' };
+      }
+    },
+    { saveFileAs: async () => '/tmp/u.csv' }
+  );
+  await host.start();
+  // No live caller passes maxExportBytes today, but if one ever did, host
+  // policy must still win rather than merge under a smaller caller value.
+  await host.invoke(
+    'exportTable',
+    [{ table: 'users' }, ['a', 'b'], null, null, { format: 'csv', maxExportBytes: 1 }]
+  );
+  const exportOptions = recordedArgs[4] as Record<string, unknown>;
+  assert.equal(exportOptions.maxExportBytes, 536870912);
+});
+
 test('theme defaults to system and round-trips through the wire shape', async () => {
   const { host, saved } = makeHost({});
   await host.start();

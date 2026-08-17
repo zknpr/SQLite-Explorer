@@ -621,7 +621,30 @@ describe('web demo view worker', () => {
             `INSERT INTO demo_export_bad_cap VALUES (zeroblob(${16 * 1024 * 1024 + 1}))`
         );
 
-        for (const invalid of [NaN, -5, 0, 3.5]) {
+        // Pin the legacy demo wording byte-exact once: the regex loop below only
+        // checks that the disqualifying substrings are present, not that nothing
+        // in the sentence has drifted (e.g. the trailing "use the desktop
+        // extension" clause, which neither regex anchors on).
+        await assert.rejects(
+            worker.invoke(
+                'exportTable',
+                { table: 'demo_export_bad_cap' },
+                ['payload'],
+                {},
+                {},
+                { format: 'json', maxExportBytes: NaN }
+            ),
+            (error: Error) => {
+                assert.strictEqual(
+                    error.message,
+                    'Web demo exports are limited to 16 MiB (16,777,216 bytes) because the ' +
+                    'worker RPC cannot stream downloads; use the desktop extension for larger exports.'
+                );
+                return true;
+            }
+        );
+
+        for (const invalid of [-5, 0, 3.5]) {
             await assert.rejects(
                 worker.invoke(
                     'exportTable',
@@ -3997,8 +4020,12 @@ describe('web demo view worker', () => {
         // must always come through.
         const worker = await createWorkerHarness();
         const scripts = [
+            // The four binding probe scripts, verbatim.
             'SELECT 1;; SELECT 2;',
             'SELECT 1; ; SELECT 2;',
+            'SELECT 1; -- c\nSELECT 2;',
+            'SELECT 1;\n;\n-- x\nSELECT 2;',
+            // Supplementary variants beyond the binding list.
             'SELECT 1; -- comment\nSELECT 2;',
             'SELECT 1;; ; -- comment\n; SELECT 2;'
         ];
