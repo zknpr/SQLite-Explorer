@@ -261,6 +261,53 @@ describe('sqljs-shim: prepare and statement', () => {
         statement.free();
         return columns;
     });
+    // The regression that motivated the expanded-text probe: worker.js's table
+    // fetch is prepare(sql, params) -> getColumnNames() -> headers, and a zero-
+    // match filter left headers empty, which surfaces as "Primary-key column
+    // missing from table fetch". A view body cannot contain a parameter, so the
+    // probe has to run over the statement's parameter-free expansion.
+    differential('getColumnNames answers for a parameterised zero-row table query', db => {
+        const statement = db.prepare(
+            'SELECT id AS alpha, name AS beta FROM t WHERE name LIKE ?',
+            ['no-such-name-%']
+        );
+        const columns = statement.getColumnNames();
+        statement.free();
+        return columns;
+    });
+    differential('getColumnNames answers for a parameterised table query with rows', db => {
+        const statement = db.prepare(
+            'SELECT id AS alpha, name AS beta FROM t WHERE name LIKE ?',
+            ['alpha']
+        );
+        const columns = statement.getColumnNames();
+        const rows = [];
+        while (statement.step()) rows.push(statement.get());
+        statement.free();
+        return { columns, rows };
+    });
+    differential('getColumnNames answers for a parameterised LIMIT/OFFSET page query', db => {
+        const statement = db.prepare(
+            'SELECT rowid, id AS alpha, name AS beta FROM t WHERE id > ? ORDER BY id LIMIT ? OFFSET ?',
+            [0, 2, 0]
+        );
+        const columns = statement.getColumnNames();
+        statement.free();
+        return columns;
+    });
+    differential('getColumnNames answers for a named-parameter table query', db => {
+        const statement = db.prepare(
+            'SELECT id AS alpha FROM t WHERE name = :wanted AND id > @floor',
+            { ':wanted': 'nothing', '@floor': 0 } as unknown as NativeBindParams
+        );
+        const columns = statement.getColumnNames();
+        statement.free();
+        return columns;
+    });
+    differential('exec over a parameterised zero-row table query', db =>
+        db.exec('SELECT id AS alpha, name AS beta FROM t WHERE name LIKE ?', ['no-match-%']));
+    differential('exec over a parameterised table query with rows', db =>
+        db.exec('SELECT id AS alpha, name AS beta FROM t WHERE name LIKE ?', ['alpha']));
     differential('getColumnNames answers before the first step', db => {
         const statement = db.prepare('SELECT id, name FROM t');
         const columns = statement.getColumnNames();
@@ -313,6 +360,82 @@ describe('sqljs-shim: prepare and statement', () => {
     differential('use after close throws', db => {
         db.close();
         return db.exec('SELECT 1');
+    });
+});
+
+describe('sqljs-shim: metadata never causes side effects', () => {
+    /**
+     * These assert the SIDE EFFECT, not the return value. An earlier revision
+     * passed every return-value assertion while silently executing a prepared
+     * INSERT the moment its column names were asked for — sql.js reads
+     * sqlite3_column_count off the compiled statement and runs nothing.
+     */
+    const countRows = (db: SqlJsLike, id: number) =>
+        normalize(db.exec('SELECT count(*) AS c FROM t WHERE id = ?', [id]));
+
+    differential('getColumnNames on a prepared INSERT does not run it', db => {
+        const statement = db.prepare("INSERT INTO t VALUES(60,'sixty',NULL,0)");
+        const columns = statement.getColumnNames();
+        statement.free();
+        return { columns, rowsAfter: countRows(db, 60) };
+    });
+    differential('getColumnNames on a prepared UPDATE does not run it', db => {
+        const statement = db.prepare("UPDATE t SET name = 'clobbered'");
+        const columns = statement.getColumnNames();
+        statement.free();
+        return { columns, names: normalize(db.exec('SELECT name FROM t ORDER BY id')) };
+    });
+    differential('getColumnNames on a prepared DELETE does not run it', db => {
+        const statement = db.prepare('DELETE FROM t');
+        const columns = statement.getColumnNames();
+        statement.free();
+        return { columns, remaining: normalize(db.exec('SELECT count(*) AS c FROM t')) };
+    });
+    differential('getColumnNames on a prepared DDL statement does not run it', db => {
+        const statement = db.prepare('CREATE TABLE created_by_metadata(a)');
+        const columns = statement.getColumnNames();
+        statement.free();
+        return {
+            columns,
+            exists: normalize(db.exec(
+                "SELECT count(*) AS c FROM sqlite_master WHERE name = 'created_by_metadata'"
+            ))
+        };
+    });
+    differential('get() before any step does not run the statement', db => {
+        const statement = db.prepare("INSERT INTO t VALUES(61,'sixty-one',NULL,0)");
+        const row = statement.get();
+        statement.free();
+        return { row, rowsAfter: countRows(db, 61) };
+    });
+    differential('the column probe does not disturb the change counter', db => {
+        db.run("INSERT INTO t VALUES(62,'sixty-two',NULL,0)");
+        const statement = db.prepare('SELECT id FROM t WHERE 0');
+        statement.getColumnNames();
+        statement.free();
+        return db.getRowsModified();
+    });
+    differential('the column probe does not disturb schema_version', db => {
+        const before = normalize(db.exec('PRAGMA schema_version'));
+        const statement = db.prepare('SELECT id AS alpha FROM t WHERE name LIKE ?', ['x%']);
+        statement.getColumnNames();
+        statement.free();
+        return { before, after: normalize(db.exec('PRAGMA schema_version')) };
+    });
+    differential('a parameterised page query executes exactly once', db => {
+        // The names pass used to materialise, so every filtered page ran twice.
+        // total_changes is engine-visible proof for the write case; for reads,
+        // a one-shot side effect is easier: count executions of a statement that
+        // mutates on every run.
+        db.run('CREATE TABLE exec_probe(n INTEGER)');
+        const statement = db.prepare(
+            'INSERT INTO exec_probe VALUES(?) RETURNING n',
+            [1]
+        );
+        statement.getColumnNames();
+        while (statement.step()) { /* drain */ }
+        statement.free();
+        return normalize(db.exec('SELECT count(*) AS runs FROM exec_probe'));
     });
 });
 
@@ -374,7 +497,9 @@ describe('sqljs-shim: iterateStatements', () => {
     differential('named placeholders do not shift the statement boundary',
         walk('SELECT :name AS p, @other AS o, $third AS t; SELECT 2 AS q'));
     differential('a placeholder in the final statement',
-        walk('SELECT 1 AS a; SELECT ?, ?2 AS p'));
+        walk('SELECT 1 AS a; SELECT ?1 AS first, ?2 AS p'));
+    differential('placeholders in a statement that reads a table',
+        walk('SELECT id AS a FROM t WHERE name LIKE ?; SELECT 2 AS q'));
 });
 
 describe('sqljs-shim: error surfaces', () => {
@@ -586,6 +711,49 @@ describe('sqljs-shim: native-only behaviour', () => {
         assert.throws(() => statement.step(), /Statement closed/);
     });
 
+    it('the column probe leaves no temp view behind', () => {
+        const db = createShim();
+        try {
+            db.run(SEED_SQL);
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+                const statement = db.prepare('SELECT id AS alpha FROM t WHERE id > ?', [0]);
+                statement.getColumnNames();
+                statement.free();
+            }
+            assert.deepStrictEqual(
+                normalize(db.exec(
+                    "SELECT count(*) AS c FROM temp.sqlite_master WHERE name LIKE '_sqlx_shim_cols_%'"
+                )),
+                [{ columns: ['c'], values: [[0]] }]
+            );
+        } finally {
+            db.close();
+        }
+    });
+
+    it('a cleanup failure is reported, not swallowed, and does not fail the caller', () => {
+        const failures: string[] = [];
+        const db = createShimDatabase({}, {
+            sqlite: standInSqliteModule,
+            fs: {
+                makeTempDir: nodeFileSystem.makeTempDir,
+                readFile: nodeFileSystem.readFile,
+                remove: () => {
+                    throw new Error('remove refused');
+                }
+            },
+            onCleanupFailure: (_error, context) => failures.push(context)
+        });
+        try {
+            db.run(SEED_SQL);
+            const bytes = db.export();
+            assert.ok(bytes.length > 0, 'the export itself still succeeds');
+            assert.deepStrictEqual(failures, ['remove export temp directory']);
+        } finally {
+            db.close();
+        }
+    });
+
     it('progress_handler is recorded but inert (the fork has no per-row callback)', () => {
         const db = createShim();
         try {
@@ -623,6 +791,112 @@ describe('sqljs-shim: documented divergences from sql.js', () => {
             assert.deepStrictEqual(normalize(rows), [[1, 2]]);
         } finally {
             reference.close();
+            shim.close();
+        }
+    });
+
+    it('an UNALIASED placeholder column is named after its expansion', () => {
+        // A view body may not contain parameters, so the probe runs over the
+        // statement's parameter-free expansion — where `?` has become NULL, and
+        // SQLite names an unaliased result column after its source expression.
+        // sql.js reports '?'. Both are junk labels for an unnamed column, no
+        // generated query in the worker layer produces one, and the alternative
+        // (probing the source first) costs a guaranteed-failing full parse on
+        // every filtered page.
+        const reference = new SQL.Database();
+        const shim = createShim();
+        try {
+            const referenceStatement = reference.prepare('SELECT ? AS named, ?');
+            assert.deepStrictEqual(referenceStatement.getColumnNames(), ['named', '?']);
+            referenceStatement.free();
+            const statement = shim.prepare('SELECT ? AS named, ?');
+            assert.deepStrictEqual(statement.getColumnNames(), ['named', 'NULL']);
+            statement.free();
+        } finally {
+            reference.close();
+            shim.close();
+        }
+    });
+
+    it('DML with RETURNING reports no columns until it has been stepped', () => {
+        // The probe cannot express DML as a view, and the shim will not run a
+        // mutation to answer a metadata question, so getColumnNames() is empty
+        // where sql.js names the RETURNING columns. The console therefore treats
+        // such a statement as side-effect-only. Documented gap, not an accident:
+        // executing the INSERT early is the strictly worse trade.
+        const reference = new SQL.Database();
+        const shim = createShim();
+        try {
+            reference.run(SEED_SQL);
+            shim.run(SEED_SQL);
+            const referenceStatement = reference.prepare(
+                "INSERT INTO t VALUES(70,'seventy',NULL,0) RETURNING id, name"
+            );
+            assert.deepStrictEqual(referenceStatement.getColumnNames(), ['id', 'name']);
+            referenceStatement.free();
+
+            const statement = shim.prepare(
+                "INSERT INTO t VALUES(70,'seventy',NULL,0) RETURNING id, name"
+            );
+            assert.deepStrictEqual(statement.getColumnNames(), []);
+            // ...and asking did not run it.
+            assert.deepStrictEqual(
+                normalize(shim.exec('SELECT count(*) AS c FROM t WHERE id = 70')),
+                [{ columns: ['c'], values: [[0]] }]
+            );
+            // Once stepped, the columns are available and the row is there.
+            assert.strictEqual(statement.step(), true);
+            assert.deepStrictEqual(statement.getColumnNames(), ['id', 'name']);
+            statement.free();
+            assert.deepStrictEqual(
+                normalize(shim.exec('SELECT count(*) AS c FROM t WHERE id = 70')),
+                [{ columns: ['c'], values: [[1]] }]
+            );
+        } finally {
+            reference.close();
+            shim.close();
+        }
+    });
+
+    it('EXPLAIN keeps its columns: it cannot be a view, but it cannot mutate either', () => {
+        // The one rung where the shim does materialise to answer getColumnNames.
+        // Without it the console's EXPLAIN button would see zero headers and
+        // discard the plan as side-effect-only output.
+        const reference = new SQL.Database();
+        const shim = createShim();
+        try {
+            const referenceStatement = reference.prepare('EXPLAIN QUERY PLAN SELECT 1');
+            const expected = referenceStatement.getColumnNames();
+            referenceStatement.free();
+            const statement = shim.prepare('EXPLAIN QUERY PLAN SELECT 1');
+            assert.deepStrictEqual(statement.getColumnNames(), expected);
+            statement.free();
+        } finally {
+            reference.close();
+            shim.close();
+        }
+    });
+
+    it('a parameterised duplicate-name query reports BOUND values, never the probe expansion', () => {
+        // The duplicate repair re-reads rows through the probe view. For a
+        // parameterised statement that view is built from the params-as-NULL
+        // expansion, so re-reading it would return NULLs instead of the bound
+        // values. The shim declines the repair there: a collapsed column is a
+        // known, arity-safe loss; wrong data is not.
+        const shim = createShim();
+        try {
+            const statement = shim.prepare('SELECT ? AS x, ? AS x', [1, 2]);
+            // Before stepping the shim declines to answer rather than promise
+            // two names it will only be able to fill with one value.
+            assert.deepStrictEqual(statement.getColumnNames(), []);
+            const rows = [];
+            while (statement.step()) rows.push(statement.get());
+            const columns = statement.getColumnNames();
+            statement.free();
+            assert.deepStrictEqual(columns, ['x']);
+            assert.strictEqual(columns.length, rows[0].length, 'names and values must agree');
+            assert.deepStrictEqual(normalize(rows), [[2]], 'the BOUND value, not NULL');
+        } finally {
             shim.close();
         }
     });

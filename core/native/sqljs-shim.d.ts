@@ -48,7 +48,16 @@ export interface NativeDatabaseConstructor {
  * synchronous flavour, `exportAsync()` accepts either.
  */
 export interface ShimFileSystem {
-    /** Create a fresh private directory and return its path. */
+    /**
+     * Create a fresh directory and return its path.
+     *
+     * CONTRACT: the directory MUST be newly created, uniquely named, and
+     * owner-only (mode 0700). `export()` writes a complete copy of the database
+     * into it, so a shared or predictable directory would expose the user's data
+     * to any other local process — and a pre-existing path would let a planted
+     * symlink redirect the copy. `fs.mkdtempSync` and `tjs.makeTempDir` both
+     * satisfy this; do not substitute a fixed path.
+     */
     makeTempDir(): string | Promise<string>;
     readFile(path: string): Uint8Array | Promise<Uint8Array>;
     /** Remove a path recursively. */
@@ -58,6 +67,13 @@ export interface ShimFileSystem {
 export interface ShimDeps {
     sqlite: { Database: NativeDatabaseConstructor };
     fs?: ShimFileSystem;
+    /**
+     * Called when a best-effort cleanup fails (dropping a column-probe view,
+     * removing an export temp directory). These never become the caller's error
+     * — the hook exists so the sidecar can log them instead of losing them.
+     * Throwing from the hook is swallowed.
+     */
+    onCleanupFailure?(error: unknown, context: string): void;
 }
 
 /**
@@ -86,7 +102,14 @@ export interface ShimExecResult {
 export interface ShimStatement {
     bind(values?: NativeBindParams | null): boolean;
     step(): boolean;
+    /** Empty until `step()` has produced a row; never executes the statement itself. */
     get(params?: NativeBindParams | null, config?: ShimValueConfig): NativeValue[];
+    /**
+     * Column names, resolved without executing the statement wherever possible
+     * (TEMP VIEW probe over the statement's parameter-free expansion). Returns
+     * `[]` for statements that can be neither viewed nor safely run — notably
+     * DML with a RETURNING clause, which sql.js would name.
+     */
     getColumnNames(): string[];
     run(values?: NativeBindParams | null): boolean;
     reset(): boolean;

@@ -53,7 +53,24 @@ const FORK_ONLY_EXPECTATIONS = {
     'native/readonly-query-only-armed': [{ columns: ['query_only'], values: [[1]] }],
     'native/readonly-zero-row-columns': { columns: ['alpha', 'beta'], queryOnly: 1 },
     'native/readonly-columns-inside-transaction': { columns: ['alpha'], queryOnly: 1 },
+    'native/readonly-parameterised-zero-row-columns': {
+        columns: ['alpha', 'beta'],
+        queryOnly: 1
+    },
+    'native/probe-leaves-no-temp-view': [{ columns: ['c'], values: [[0]] }],
+    'native/metadata-never-mutates': {
+        insertColumns: [],
+        insertRow: [],
+        ddlColumns: [],
+        inserted: [{ columns: ['c'], values: [[0]] }],
+        created: [{ columns: ['c'], values: [[0]] }]
+    },
     'native/duplicate-columns-repaired': { columns: ['x', 'x:1'], rows: [[1, 2]] },
+    'native/parameterised-duplicate-names-keep-bound-values': {
+        before: [],
+        after: ['x'],
+        rows: [[2]]
+    },
     'native/export-sync-refused': { refused: true, mentionsExportAsync: true },
     'native/export-async-roundtrip': {
         header: 'SQLite format 3',

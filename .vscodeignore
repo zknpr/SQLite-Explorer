@@ -5,9 +5,15 @@
 !out/
 !out/**
 
-# Include core UI and utilities
-!core/
-!core/**
+# Include core UI and utilities.
+#
+# Scoped to core/ui/ rather than core/**: vsce applies every `!` negation AFTER
+# all ignore patterns, so a broad `!core/**` re-includes any subtree a later
+# rule tries to drop (the same engine quirk documented for codicons below). The
+# only other subtree is core/native/, which belongs to the desktop sidecar and
+# must not ship — see the exclusion further down.
+!core/ui/
+!core/ui/**
 
 # Include WASM binary
 !assets/
@@ -54,6 +60,12 @@ CLAUDE.md
 # out explicitly (repo convention) so the .vsix never ships it even if the
 # default-deny rules above it change.
 desktop/**
+
+# Exclude the desktop native-sidecar modules. core/native/ is bundled into the
+# tjs sidecar for the SQLite-Explorer-App repo; the extension has its own native
+# path (src/nativeWorker.ts + natives/native-worker.js) and never loads these.
+# The `!core/**` negation above would otherwise re-include them.
+core/native/**
 
 # Exclude development files
 .git/

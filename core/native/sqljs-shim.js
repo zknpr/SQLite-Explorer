@@ -37,8 +37,41 @@
 /** Reserved-prefix-free name for the throwaway column-probe views. */
 let columnProbeCounter = 0;
 
-/** Matches an SQLite bound-parameter token: `?`, `?NNN`, `:name`, `@name`, `$name`. */
-const PARAMETER_TOKEN = /^(?:\?\d*|[:@$][A-Za-z0-9_$]+(?:\([^()]*\))?)/;
+/**
+ * Matches an SQLite bound-parameter token: `?`, `?NNN`, `:name`, `@name`, `$name`.
+ *
+ * The name class mirrors SQLite's own IdChar: alphanumerics, `_`, `$`, and ANY
+ * byte at or above 0x80 — so `:café` is one token, not `:caf` followed by a
+ * misalignment. (Astral characters arrive as surrogate pairs, each of which
+ * falls inside \u0080-\uffff.)
+ */
+const PARAMETER_TOKEN = /^(?:\?\d*|[:@$][A-Za-z0-9_$\u0080-\uffff]+(?:\([^()]*\))?)/;
+
+/** Leading `EXPLAIN` / `EXPLAIN QUERY PLAN`, after any leading trivia is stripped. */
+const EXPLAIN_PREFIX = /^explain\b/i;
+
+/**
+ * Drop leading whitespace, empty statements and comments.
+ *
+ * `sqlite3_sql` keeps whatever trivia the parser consumed on its way into the
+ * statement, so the shim has to skip past it before it can either recognise a
+ * leading keyword or splice the text into a `CREATE VIEW ... AS` body.
+ */
+function stripLeadingTrivia(text) {
+    let index = 0;
+    for (;;) {
+        const before = index;
+        while (index < text.length && (/\s/.test(text[index]) || text[index] === ';')) index += 1;
+        if (text.startsWith('--', index)) {
+            const lineEnd = text.indexOf('\n', index);
+            index = lineEnd < 0 ? text.length : lineEnd + 1;
+        } else if (text.startsWith('/*', index)) {
+            const blockEnd = text.indexOf('*/', index + 2);
+            index = blockEnd < 0 ? text.length : blockEnd + 2;
+        }
+        if (index === before) return text.slice(index);
+    }
+}
 
 /** What `sqlite3_expanded_sql` renders for a parameter that was never bound. */
 const UNBOUND_PARAMETER_TEXT = 'NULL';
@@ -106,6 +139,23 @@ export function consumedSourceLength(source, compiled) {
     return sourceIndex;
 }
 
+/**
+ * Does this column list carry SQLite's own duplicate disambiguation?
+ *
+ * A view over `SELECT 1 AS x, 2 AS x` reports its columns as `x`, `x:1`, while
+ * the binding's row objects collapse both into a single `x` key. Spotting the
+ * `name`/`name:N` pair is how the shim knows, before executing anything, that
+ * the two would disagree on arity. A column genuinely named `q:1` with no `q`
+ * beside it is not a match.
+ */
+function hasDisambiguatedDuplicates(names) {
+    const present = new Set(names);
+    return names.some(name => {
+        const match = /^(.*):\d+$/.exec(name);
+        return match !== null && present.has(match[1]);
+    });
+}
+
 /** Normalise the fork's row values to sql.js's `get()` contract. */
 function toSqlJsValue(value, useBigInt) {
     // sql.js reads INTEGER columns through sqlite3_column_double unless
@@ -147,7 +197,10 @@ function compileNext(backing, sql, from) {
             'text does not align with its source'
         );
     }
-    return { compiled, source: rest.slice(0, length), end: from + length };
+    // `text` is captured HERE, before any bind: it is the source with every
+    // parameter rendered as NULL. Read later it would inline the bound VALUES
+    // instead, which is both non-deterministic and user data in SQL text.
+    return { compiled, source: rest.slice(0, length), expanded: text, end: from + length };
 }
 
 function finalizeQuietly(statement) {
@@ -166,7 +219,7 @@ function finalizeQuietly(statement) {
  * live-statement registry, and the read-only escape hatch the column probe
  * needs.
  */
-function createShimStatement(context, compiled, source) {
+function createShimStatement(context, compiled, source, expanded) {
     let backingStatement = compiled;
     let boundParameters;
     /** Materialised result: `{ columns, values }`, or null before first use. */
@@ -177,6 +230,16 @@ function createShimStatement(context, compiled, source) {
     /** Index of the row `get()` returns; -1 means "no current row". */
     let position = -1;
 
+    // A view body may not contain bound parameters, so a parameterised
+    // statement has to be probed through its EXPANDED text (parameters rendered
+    // as NULL at compile time), which compiles as a view and reports the same
+    // column names. Without this, every parameterised query fell through to the
+    // materialise fallback -- returning [] for a zero-row result, which the grid
+    // reports as "Primary-key column missing", and executing each filtered page
+    // twice. Probing the source when there are no parameters keeps sql.js's
+    // exact names for the unaliased-placeholder case.
+    const probeText = source === expanded ? source : expanded;
+
     const assertLive = () => {
         if (backingStatement === null) throw new Error('Statement closed');
     };
@@ -184,7 +247,17 @@ function createShimStatement(context, compiled, source) {
     /** Column names from a TEMP VIEW over this statement's own SQL, or null. */
     const probeColumns = () => {
         if (probedColumns !== undefined) return probedColumns;
-        probedColumns = context.probeColumnNames(source);
+        const probed = context.probeColumnNames(probeText);
+        // The probe reports the view's disambiguated columns (`x`, `x:1`) while
+        // `all()` collapses the duplicates into one key. ensureRows() repairs
+        // that by re-reading through the same view -- but only for a
+        // parameter-free statement, because a parameterised statement's view
+        // holds NULLs where the bound values belong. Without a repair available,
+        // handing back the disambiguated list would promise more names than
+        // there will ever be values, so decline and let the caller fall through.
+        probedColumns = probed && source !== expanded && hasDisambiguatedDuplicates(probed)
+            ? null
+            : probed;
         return probedColumns;
     };
 
@@ -203,7 +276,12 @@ function createShimStatement(context, compiled, source) {
         // repair is unavailable, keep the collapsed shape: names and values
         // MUST come from the same materialisation or the grid mis-renders.
         if (probedColumns && objectRows.length > 0 && probedColumns.length !== keys.length) {
-            const repaired = context.readRowsThroughView(source);
+            // Only when the probe text IS the source. A parameterised statement
+            // is probed through its params-as-NULL expansion, and re-reading
+            // rows from THAT view would return values computed with NULL
+            // parameters rather than the bound ones -- wrong data is worse than
+            // a collapsed column. Fall through to the keys instead.
+            const repaired = source === expanded ? context.readRowsThroughView(probeText) : null;
             if (repaired) {
                 rows = repaired;
                 return rows;
@@ -215,14 +293,45 @@ function createShimStatement(context, compiled, source) {
         return rows;
     };
 
+    /**
+     * Column names, WITHOUT executing the statement wherever that is possible.
+     *
+     * sql.js reads `sqlite3_column_count`/`_name` off the compiled statement and
+     * never runs anything; the fork exposes neither, so the shim works down a
+     * ladder and stops at the first rung that can answer without a side effect:
+     *
+     *   1. already materialised -> those columns (the only arity-safe answer,
+     *      whatever the probe would say);
+     *   2. the TEMP VIEW probe (CREATE VIEW compiles the body, never runs it);
+     *   3. EXPLAIN, which cannot be a view body but is by definition
+     *      side-effect-free -- it lists the bytecode of the statement it
+     *      describes and never executes it;
+     *   4. `[]`.
+     *
+     * Rung 4 is the deliberate stop: answering a metadata question by running a
+     * mutation is not a trade the shim makes. The visible cost is that a
+     * `DELETE ... RETURNING` in the console reports no result columns until it
+     * has been stepped, so its rows are treated as side-effect-only.
+     */
     const ensureColumns = () => {
         if (resolvedColumns !== null) return resolvedColumns;
-        // Already executed: the materialised columns are the only arity-safe
-        // answer, whatever the probe would say.
-        resolvedColumns = rows !== null
-            ? rows.columns
-            : (probeColumns() ?? ensureRows().columns);
-        return resolvedColumns;
+        if (rows !== null) {
+            resolvedColumns = rows.columns;
+            return resolvedColumns;
+        }
+        const probed = probeColumns();
+        if (probed) {
+            resolvedColumns = probed;
+            return resolvedColumns;
+        }
+        if (EXPLAIN_PREFIX.test(stripLeadingTrivia(probeText))) {
+            resolvedColumns = ensureRows().columns;
+            return resolvedColumns;
+        }
+        // Rung 4 is NOT memoised: it is an admission of ignorance, not an
+        // answer. Once the caller steps the statement the real columns become
+        // available, and asking again should get them.
+        return [];
     };
 
     const statement = {
@@ -254,8 +363,10 @@ function createShimStatement(context, compiled, source) {
                 statement.bind(params);
                 statement.step();
             }
-            ensureRows();
-            if (position < 0 || position >= rows.values.length) return [];
+            // sql.js reads sqlite3_data_count, which is 0 until step() has
+            // produced a row -- so an un-stepped get() is empty and, crucially,
+            // executes NOTHING. Materialisation stays deferred to step().
+            if (rows === null || position < 0 || position >= rows.values.length) return [];
             const useBigInt = config?.useBigInt === true;
             return rows.values[position].map(value => toSqlJsValue(value, useBigInt));
         },
@@ -336,9 +447,26 @@ export function createShimDatabase(config = {}, deps = {}) {
     /** Live shim statements, freed together on close() (sql.js does the same). */
     const liveStatements = new Set();
     let changesStatement = null;
+    /**
+     * Set when read-only enforcement could not be restored after an internal
+     * lift. The connection is then in an unknown write state, so every
+     * subsequent operation fails rather than proceeding on a broken guarantee.
+     */
+    let poisoned = null;
 
     const assertOpen = () => {
+        if (poisoned !== null) throw poisoned;
         if (closed) throw new Error('Database closed');
+    };
+
+    /** Report a swallowed cleanup failure without turning it into the caller's error. */
+    const reportCleanupFailure = (error, context) => {
+        try {
+            deps.onCleanupFailure?.(error, context);
+        } catch {
+            // A reporting hook must never escalate a cleanup failure into a
+            // primary one.
+        }
     };
 
     const readScalar = (sql) => {
@@ -374,20 +502,66 @@ export function createShimDatabase(config = {}, deps = {}) {
         }
     }
 
+    /** True while `query_only` is lifted; see the re-entrancy note below. */
+    let writesLifted = false;
+
     /**
-     * Run shim-authored SQL that must write (the column probe's TEMP VIEW, and
-     * `VACUUM INTO`, which writes only its own output file) on a connection
-     * pinned read-only. The lift is scoped to shim-generated statements -- user
-     * SQL never runs inside it -- and always restored.
+     * Run shim-authored DDL that must write on a connection pinned read-only.
+     *
+     * Exactly two operations need this and both are shim-authored: creating and
+     * dropping the column-probe TEMP VIEW, and `VACUUM INTO`, which writes only
+     * its own output file. Reading FROM the probe view does NOT need it
+     * (verified against the real binary: a SELECT from a temp view succeeds with
+     * `query_only = 1`), so the window is DDL-only -- no user SQL is ever
+     * executed inside it. `CREATE VIEW` compiles its body without running it, so
+     * even the view's own SELECT does not execute while writes are permitted.
+     *
+     * NOT re-entrant, and asserted so: a nested call would restore `query_only`
+     * at the inner exit and leave the outer body running unprotected. Callers
+     * keep the lifts sequential rather than nested.
      */
     const withInternalWrites = (operation) => {
         if (!readOnly) return operation();
-        backing.exec('PRAGMA query_only = 0');
-        try {
-            return operation();
-        } finally {
-            backing.exec('PRAGMA query_only = 1');
+        if (writesLifted) {
+            throw new Error('Internal error: read-only write lift is not re-entrant');
         }
+        backing.exec('PRAGMA query_only = 0');
+        writesLifted = true;
+
+        let failure = null;
+        let value;
+        try {
+            value = operation();
+        } catch (error) {
+            failure = error;
+        }
+
+        try {
+            backing.exec('PRAGMA query_only = 1');
+        } catch (restoreError) {
+            // Losing the restore means the connection may now accept writes.
+            // Poison it so nothing else runs, and ATTACH rather than mask: an
+            // error thrown from a finally would hide whatever the caller was
+            // actually trying to do.
+            poisoned = copyErrno(
+                new Error(
+                    'Read-only enforcement could not be restored (PRAGMA query_only); ' +
+                    'this connection is no longer trustworthy and has been disabled'
+                ),
+                restoreError
+            );
+            poisoned.cause = restoreError;
+            if (failure) {
+                if (failure.cause === undefined) failure.cause = restoreError;
+            } else {
+                failure = poisoned;
+            }
+        } finally {
+            writesLifted = false;
+        }
+
+        if (failure) throw failure;
+        return value;
     };
 
     /**
@@ -401,7 +575,7 @@ export function createShimDatabase(config = {}, deps = {}) {
      * back to the materialised row keys.
      */
     const withColumnProbeView = (sql, reader) => {
-        const body = sql.replace(/^[\s;]+/, '');
+        const body = stripLeadingTrivia(sql);
         if (body === '') return null;
         // Shim-generated, [A-Za-z0-9_] only: safe to embed as both an identifier
         // and a string literal without escaping. `pragma_table_info` takes its
@@ -411,8 +585,8 @@ export function createShimDatabase(config = {}, deps = {}) {
         const name = `_sqlx_shim_cols_${++columnProbeCounter}`;
         const quoted = `"${name}"`;
         const literal = `'${name}'`;
-        return withInternalWrites(() => {
-            try {
+        try {
+            withInternalWrites(() => {
                 // prepare+run rather than exec: `exec` would run EVERY statement
                 // in the string, so a mis-split (which `consumedSourceLength`
                 // reports rather than guesses at, but still) could not turn this
@@ -424,22 +598,26 @@ export function createShimDatabase(config = {}, deps = {}) {
                 } finally {
                     finalizeQuietly(creation);
                 }
-            } catch {
-                return null;
-            }
+            });
+        } catch {
+            return null;
+        }
+        try {
+            // Deliberately OUTSIDE the write lift: reading a temp view needs no
+            // write permission, so nothing that touches user SQL runs while
+            // query_only is down.
+            return reader({ quoted, literal });
+        } catch {
+            return null;
+        } finally {
             try {
-                return reader({ quoted, literal });
-            } catch {
-                return null;
-            } finally {
-                try {
-                    backing.exec(`DROP VIEW IF EXISTS temp.${quoted}`);
-                } catch {
-                    // Leaving a temp view behind is harmless (it dies with the
-                    // connection) and must not mask the caller's result.
-                }
+                withInternalWrites(() => backing.exec(`DROP VIEW IF EXISTS temp.${quoted}`));
+            } catch (error) {
+                // Leaving a temp view behind is harmless (it dies with the
+                // connection) and must not mask the caller's result.
+                reportCleanupFailure(error, 'drop column-probe view');
             }
-        });
+        }
     };
 
     const statementContext = {
@@ -470,7 +648,7 @@ export function createShimDatabase(config = {}, deps = {}) {
     const prepareInternal = (sql) => {
         const next = compileNext(backing, sql, 0);
         if (next === null) throw new Error('Nothing to prepare');
-        return createShimStatement(statementContext, next.compiled, next.source);
+        return createShimStatement(statementContext, next.compiled, next.source, next.expanded);
     };
 
     const requireFs = () => {
@@ -503,7 +681,7 @@ export function createShimDatabase(config = {}, deps = {}) {
                 const next = compileNext(backing, sql, cursor);
                 if (next === null) break;
                 cursor = next.end;
-                const statement = createShimStatement(statementContext, next.compiled, next.source);
+                const statement = createShimStatement(statementContext, next.compiled, next.source, next.expanded);
                 try {
                     if (params != null) statement.bind(params);
                     let columns = null;
@@ -573,7 +751,7 @@ export function createShimDatabase(config = {}, deps = {}) {
                         return { done: true };
                     }
                     cursor = next.end;
-                    active = createShimStatement(statementContext, next.compiled, next.source);
+                    active = createShimStatement(statementContext, next.compiled, next.source, next.expanded);
                     return { value: active, done: false };
                 },
                 getRemainingSQL() {
@@ -622,8 +800,11 @@ export function createShimDatabase(config = {}, deps = {}) {
             } finally {
                 try {
                     fs.remove(directory);
-                } catch {
-                    // A leaked temp directory must not fail an otherwise good export.
+                } catch (error) {
+                    // A leaked temp directory must not fail an otherwise good
+                    // export -- but it holds a full copy of the database, so it
+                    // is reported rather than silently dropped.
+                    reportCleanupFailure(error, 'remove export temp directory');
                 }
             }
         },
@@ -640,8 +821,10 @@ export function createShimDatabase(config = {}, deps = {}) {
             } finally {
                 try {
                     await fs.remove(directory);
-                } catch {
-                    // As above: cleanup failure is not an export failure.
+                } catch (error) {
+                    // As above: cleanup failure is not an export failure, but a
+                    // leaked directory holding a database copy is worth hearing about.
+                    reportCleanupFailure(error, 'remove export temp directory');
                 }
             }
         },

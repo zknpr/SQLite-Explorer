@@ -87,6 +87,13 @@ export const FIXTURES = [
     ['exec/pragma', db => db.exec('PRAGMA schema_version')],
     ['exec/positional-params', db => db.exec('SELECT ? AS p, ? AS q', [7, 'seven'])],
     ['exec/named-params', db => db.exec('SELECT :x AS p', { ':x': 5 })],
+    // Parameterised queries that read a REAL TABLE. The original matrix was all
+    // FROM-less SELECTs, which is exactly why a zero-row parameterised table
+    // query returning no column names went unnoticed.
+    ['exec/params-table-zero-rows',
+        db => db.exec('SELECT id AS alpha, name AS beta FROM t WHERE name LIKE ?', ['no-match-%'])],
+    ['exec/params-table-with-rows',
+        db => db.exec('SELECT id AS alpha, name AS beta FROM t WHERE name LIKE ?', ['alpha'])],
     ['exec/values', db => db.exec('SELECT id, name, data, amount FROM t ORDER BY id')],
     ['exec/int64-useBigInt', db => db.exec('SELECT id FROM t ORDER BY id', null, { useBigInt: true })],
     ['exec/int64-lossy', db => db.exec('SELECT id FROM t ORDER BY id')],
@@ -180,6 +187,107 @@ export const FIXTURES = [
         s.free();
         return columns;
     }],
+    // The regression that motivated the expanded-text column probe: worker.js's
+    // table fetch is prepare(sql, params) -> getColumnNames() -> headers, and an
+    // empty header list surfaces as "Primary-key column missing from table
+    // fetch" on any zero-match filter.
+    ['statement/columns-params-table-zero-rows', db => {
+        const s = db.prepare('SELECT id AS alpha, name AS beta FROM t WHERE name LIKE ?', ['none-%']);
+        const columns = s.getColumnNames();
+        s.free();
+        return columns;
+    }],
+    ['statement/columns-params-table-with-rows', db => {
+        const s = db.prepare('SELECT id AS alpha, name AS beta FROM t WHERE name LIKE ?', ['alpha']);
+        const columns = s.getColumnNames();
+        const rows = [];
+        while (s.step()) rows.push(s.get());
+        s.free();
+        return { columns, rows };
+    }],
+    ['statement/columns-params-page-query', db => {
+        const s = db.prepare(
+            'SELECT rowid, id AS alpha, name AS beta FROM t WHERE id > ? ORDER BY id LIMIT ? OFFSET ?',
+            [0, 2, 0]
+        );
+        const columns = s.getColumnNames();
+        s.free();
+        return columns;
+    }],
+    ['statement/columns-named-params-table', db => {
+        const s = db.prepare('SELECT id AS alpha FROM t WHERE name = :wanted AND id > @floor', {
+            ':wanted': 'nothing',
+            '@floor': 0
+        });
+        const columns = s.getColumnNames();
+        s.free();
+        return columns;
+    }],
+
+    // Metadata must never mutate. These compare the SIDE EFFECT, not the
+    // return value: an earlier revision passed every value assertion while
+    // silently running a prepared INSERT as soon as its columns were asked for.
+    ['side-effects/columns-on-insert', db => {
+        const s = db.prepare("INSERT INTO t VALUES(60,'sixty',NULL,0)");
+        const columns = s.getColumnNames();
+        s.free();
+        return { columns, rows: db.exec('SELECT count(*) AS c FROM t WHERE id = 60') };
+    }],
+    ['side-effects/columns-on-update', db => {
+        const s = db.prepare("UPDATE t SET name = 'clobbered'");
+        const columns = s.getColumnNames();
+        s.free();
+        return { columns, names: db.exec('SELECT name FROM t ORDER BY id') };
+    }],
+    ['side-effects/columns-on-delete', db => {
+        const s = db.prepare('DELETE FROM t');
+        const columns = s.getColumnNames();
+        s.free();
+        return { columns, remaining: db.exec('SELECT count(*) AS c FROM t') };
+    }],
+    ['side-effects/columns-on-ddl', db => {
+        const s = db.prepare('CREATE TABLE created_by_metadata(a)');
+        const columns = s.getColumnNames();
+        s.free();
+        return {
+            columns,
+            exists: db.exec("SELECT count(*) AS c FROM sqlite_master WHERE name = 'created_by_metadata'")
+        };
+    }],
+    ['side-effects/get-before-step', db => {
+        const s = db.prepare("INSERT INTO t VALUES(61,'sixty-one',NULL,0)");
+        const row = s.get();
+        s.free();
+        return { row, rows: db.exec('SELECT count(*) AS c FROM t WHERE id = 61') };
+    }],
+    ['side-effects/probe-leaves-change-counter-alone', db => {
+        db.run("INSERT INTO t VALUES(62,'sixty-two',NULL,0)");
+        const s = db.prepare('SELECT id FROM t WHERE 0');
+        s.getColumnNames();
+        s.free();
+        return db.getRowsModified();
+    }],
+    ['side-effects/probe-leaves-schema-version-alone', db => {
+        const before = db.exec('PRAGMA schema_version');
+        const s = db.prepare('SELECT id AS alpha FROM t WHERE name LIKE ?', ['x%']);
+        s.getColumnNames();
+        s.free();
+        return { before, after: db.exec('PRAGMA schema_version') };
+    }],
+    ['side-effects/parameterised-page-runs-once', db => {
+        db.run('CREATE TABLE exec_probe(n INTEGER)');
+        const s = db.prepare('INSERT INTO exec_probe VALUES(?) RETURNING n', [1]);
+        s.getColumnNames();
+        while (s.step()) { /* drain */ }
+        s.free();
+        return db.exec('SELECT count(*) AS runs FROM exec_probe');
+    }],
+    ['statement/columns-for-explain', db => {
+        const s = db.prepare('EXPLAIN QUERY PLAN SELECT 1');
+        const columns = s.getColumnNames();
+        s.free();
+        return columns;
+    }],
     ['statement/step-past-end-restarts', db => {
         const s = db.prepare('SELECT 1 AS a');
         const steps = [s.step(), s.step(), s.step()];
@@ -238,7 +346,10 @@ export const FIXTURES = [
     ['iterate/positional-placeholder', walkStatements('SELECT ? AS p; SELECT 2 AS q')],
     ['iterate/named-placeholders',
         walkStatements('SELECT :name AS p, @other AS o, $third AS t; SELECT 2 AS q')],
-    ['iterate/placeholder-in-final-statement', walkStatements('SELECT 1 AS a; SELECT ?, ?2 AS p')],
+    ['iterate/placeholder-in-final-statement',
+        walkStatements('SELECT 1 AS a; SELECT ?1 AS first, ?2 AS p')],
+    ['iterate/placeholder-over-a-real-table',
+        walkStatements('SELECT id AS a FROM t WHERE name LIKE ?; SELECT 2 AS q')],
 
     ['error/syntax', db => db.exec('SELEC 1')],
     ['error/no-such-table', db => db.exec('SELECT * FROM nope')],

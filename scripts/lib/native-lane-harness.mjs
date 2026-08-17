@@ -113,6 +113,64 @@ await record('native/readonly-columns-inside-transaction', () => {
     }
 });
 
+await record('native/readonly-parameterised-zero-row-columns', () => {
+    // The Critical from review: a parameterised zero-match filter used to yield
+    // no column names, which the grid reports as "Primary-key column missing".
+    const db = createDatabase({ path: filePath, readOnly: true });
+    try {
+        const statement = db.prepare(
+            'SELECT id AS alpha, name AS beta FROM t WHERE name LIKE ?',
+            ['no-match-%']
+        );
+        const columns = statement.getColumnNames();
+        statement.free();
+        return { columns, queryOnly: db.exec('PRAGMA query_only')[0].values[0][0] };
+    } finally {
+        db.close();
+    }
+});
+
+await record('native/probe-leaves-no-temp-view', () => {
+    const db = createDatabase({ path: filePath, readOnly: true });
+    try {
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const statement = db.prepare('SELECT id AS alpha FROM t WHERE id > ?', [0]);
+            statement.getColumnNames();
+            statement.free();
+        }
+        return db.exec(
+            "SELECT count(*) AS c FROM temp.sqlite_master WHERE name LIKE '_sqlx_shim_cols_%'"
+        );
+    } finally {
+        db.close();
+    }
+});
+
+await record('native/metadata-never-mutates', () => {
+    const db = createDatabase();
+    try {
+        db.run(SEED_SQL);
+        const insert = db.prepare("INSERT INTO t VALUES(60,'sixty',NULL,0)");
+        const insertColumns = insert.getColumnNames();
+        const insertRow = insert.get();
+        insert.free();
+        const ddl = db.prepare('CREATE TABLE created_by_metadata(a)');
+        const ddlColumns = ddl.getColumnNames();
+        ddl.free();
+        return {
+            insertColumns,
+            insertRow,
+            ddlColumns,
+            inserted: db.exec('SELECT count(*) AS c FROM t WHERE id = 60'),
+            created: db.exec(
+                "SELECT count(*) AS c FROM sqlite_master WHERE name = 'created_by_metadata'"
+            )
+        };
+    } finally {
+        db.close();
+    }
+});
+
 await record('native/duplicate-columns-repaired', () => {
     const db = createDatabase();
     try {
@@ -122,6 +180,23 @@ await record('native/duplicate-columns-repaired', () => {
         while (statement.step()) rows.push(statement.get());
         statement.free();
         return { columns, rows };
+    } finally {
+        db.close();
+    }
+});
+
+await record('native/parameterised-duplicate-names-keep-bound-values', () => {
+    // The probe view for a parameterised statement holds NULLs where the bound
+    // values belong, so the duplicate repair must NOT re-read through it.
+    const db = createDatabase();
+    try {
+        const statement = db.prepare('SELECT ? AS x, ? AS x', [1, 2]);
+        const before = statement.getColumnNames();
+        const rows = [];
+        while (statement.step()) rows.push(statement.get());
+        const after = statement.getColumnNames();
+        statement.free();
+        return { before, after, rows };
     } finally {
         db.close();
     }
