@@ -172,9 +172,16 @@ function applyConsoleAvailability() {
         notice.textContent = READ_ONLY_CONSOLE_NOTICE;
         notice.hidden = false;
         sqlConsole.hide();
+        // Nothing here can have come from THIS database — the console cannot
+        // run against a read-only one — so leaving it would show another
+        // file's output under the disabled notice.
+        document.getElementById('consoleResults')?.replaceChildren();
     } else {
         notice.hidden = true;
-        sqlConsole.show();
+        // Only on the transition: show() focuses the editor, and this also
+        // runs on every refreshContent, which must not yank focus out of
+        // whatever the user is doing.
+        if (!sqlConsole.isOpen()) sqlConsole.show();
     }
 }
 
