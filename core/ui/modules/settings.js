@@ -152,9 +152,27 @@ function renderPragmaForm(pragmas, settings) {
 
     // Theme (desktop shell only — VS Code drives its own theme via the editor)
     if (state.isDesktop) {
+        // createOptions renders raw ids as labels, which is fine for pragma
+        // values but not presentable here — the native menu (THEME_MENU in
+        // src-tauri/src/lib.rs) shows human labels for the same ids, so this
+        // hand-builds the options instead of reusing createOptions.
+        const THEME_LABELS = {
+            system: 'System',
+            dark: 'Dark',
+            light: 'Light',
+            'high-contrast': 'High Contrast',
+            solarized: 'Solarized',
+            nord: 'Nord'
+        };
         const themeSelect = document.createElement('select');
         themeSelect.className = 'setting-desktop-theme';
-        createOptions(THEME_IDS, settings.theme).forEach(opt => themeSelect.appendChild(opt));
+        THEME_IDS.forEach(id => {
+            const option = document.createElement('option');
+            option.value = id;
+            option.textContent = THEME_LABELS[id] ?? id;
+            option.selected = id === settings.theme;
+            themeSelect.appendChild(option);
+        });
         themeSelect.addEventListener('change', async () => {
             const value = applyTheme(themeSelect.value);
             await updateExtensionSetting('theme', value).catch(err => {

@@ -29,7 +29,7 @@ export interface DesktopHostBridge {
     /**
      * Fires when the shell delivers a path via native "Open With"/recents,
      * outside the in-webview open-dialog flow. Optional: implemented by
-     * Task 8's bridge.js; older shells and the dev harness omit it, so
+     * Task 8's bridge.js and the dev harness; older shells may omit it, so
      * callers must use `?.`.
      */
     onOpenFile?(handler: (path: string) => void): void;

@@ -8,6 +8,7 @@
 // Playwright smoke in the app repo. File picks go through a hidden input.
 (function () {
   let menuHandler = null;
+  let openFileHandler = null;
   let settings = {};
   const input = () => {
     const el = document.createElement('input');
@@ -52,11 +53,13 @@
     async saveSettings(next) { settings = next; },
     onMenu(handler) { menuHandler = handler; },
     async setTitle(title) { document.title = title; },
-    onOpenFile: () => {},
+    onOpenFile(handler) { openFileHandler = handler; },
     viewerReady: async () => {},
   };
   // Expose for the smoke driver: window.__HARNESS_MENU__('open-db') etc.
   window.__HARNESS_MENU__ = (id) => menuHandler && menuHandler(id);
+  // Same convention, for native "Open With"/recents: window.__HARNESS_OPEN_FILE__('/path/to.db').
+  window.__HARNESS_OPEN_FILE__ = (path) => openFileHandler && openFileHandler(path);
 })();
 </script>
 <script>

@@ -153,7 +153,18 @@ async function initializeApp() {
 
         setupGlobalShortcuts();
 
-        window.__SQLITE_DESKTOP__?.viewerReady?.();
+        // `surface` (used by the handlers below) is a local of the
+        // host.start().then() closure and isn't in scope here — initializeApp
+        // is a top-level function only *called* from inside that closure, so
+        // this inlines the same no-silent-failures handling. Plain .catch
+        // (no `?.`) is safe: the optional chain above already short-circuits
+        // the whole expression, including this .catch, when viewerReady is
+        // absent (older shells); when present, both the dev harness mock and
+        // bridge.js's real invoke() always return a genuine Promise.
+        window.__SQLITE_DESKTOP__?.viewerReady?.().catch((err) => {
+            console.error(err);
+            updateStatus(`Ready signal failed: ${err.message}`);
+        });
 
     } catch (err) {
         console.error('Init error:', err);
