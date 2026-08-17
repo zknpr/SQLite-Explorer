@@ -33,10 +33,12 @@ export interface CreateConsoleOptions {
     /** Empty mount element; the console clears it and builds all of its own DOM inside. */
     container: HTMLElement;
     /**
-     * Executes `sqlText`. Invoked on Mod-Enter with the editor's full
-     * current text. May return a value or a Promise; createConsole awaits
-     * it but does not otherwise interpret the result — rendering results is
-     * the injected implementation's own responsibility.
+     * Executes `sqlText`. Invoked with the editor's full current text on
+     * Mod-Enter and on the Run button, and with {@link explainWrap}'s result
+     * on the EXPLAIN button (which records no history). May return a value or
+     * a Promise; createConsole awaits it but does not otherwise interpret the
+     * result — rendering results is the injected implementation's own
+     * responsibility.
      */
     runSql(sqlText: string): unknown;
     /** Returns the persisted history, newest first. */

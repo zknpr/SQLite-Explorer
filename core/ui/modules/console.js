@@ -12,9 +12,18 @@ import { EditorView, keymap, lineNumbers } from '@codemirror/view';
 import { defaultKeymap, history as cmHistory, historyKeymap } from '@codemirror/commands';
 import { sql, SQLite } from '@codemirror/lang-sql';
 import { autocompletion } from '@codemirror/autocomplete';
+import { modLabel } from './platform.js';
 
 export const HISTORY_CAP = 50;
 export const HISTORY_ENTRY_MAX = 4096;
+
+/**
+ * Row cap the worker's runConsole applies per result set when the caller
+ * passes no `maxRows` (clampConsoleMaxRows in the worker). Shown in the
+ * controls hint so a truncated set is never a surprise; cosmetic only, so a
+ * drift from the worker's default costs nothing but an inaccurate label.
+ */
+const DEFAULT_ROW_CAP = 5000;
 
 /**
  * Returns a new history list with `sqlText` (trimmed) pushed to the front,
@@ -56,10 +65,10 @@ const consoleTheme = EditorView.theme({
 
 /**
  * Builds a CodeMirror 6 SQL console inside `container`. The module owns and
- * builds all of its own DOM under `container` (editor, history prev/next +
- * dropdown, a status line) — it makes no assumptions about `container`'s
- * existing children (it clears them first) and never reaches outside
- * `container` into the rest of the page. show()/hide()/toggle() therefore
+ * builds all of its own DOM under `container` (Run + EXPLAIN buttons, history
+ * prev/next + dropdown, the editor, a notice line) — it makes no assumptions
+ * about `container`'s existing children (it clears them first) and never
+ * reaches outside `container` into the rest of the page. show()/hide()/toggle() therefore
  * only ever touch `container`'s own `hidden` attribute; any page-level
  * layout class (e.g. a `.console-mode` toggle on an ancestor panel) is the
  * caller's responsibility, layered on top of this return value.
@@ -81,6 +90,22 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
     const controls = document.createElement('div');
     controls.className = 'sql-console-controls';
 
+    const runButton = document.createElement('button');
+    runButton.type = 'button';
+    runButton.className = 'sql-console-run';
+    runButton.title = `Run (${modLabel('↩')})`;
+    runButton.textContent = 'Run';
+
+    // EXPLAIN lives here rather than in the caller: it is the module's own
+    // explainWrap() applied to the module's own editor text, and it must NOT
+    // go through runCurrent() — a query plan is a diagnostic detour, not a
+    // query the user asked to remember, so it records no history.
+    const explainButton = document.createElement('button');
+    explainButton.type = 'button';
+    explainButton.className = 'sql-console-explain';
+    explainButton.title = 'Run EXPLAIN QUERY PLAN for the current statement (not recorded in history)';
+    explainButton.textContent = 'EXPLAIN';
+
     const prevButton = document.createElement('button');
     prevButton.type = 'button';
     prevButton.className = 'sql-console-history-prev';
@@ -96,7 +121,11 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
     nextButton.title = 'Newer query';
     nextButton.textContent = '›'; // ›
 
-    controls.append(prevButton, historySelect, nextButton);
+    const hint = document.createElement('span');
+    hint.className = 'sql-console-hint';
+    hint.textContent = `${modLabel('↩')} to run · first ${DEFAULT_ROW_CAP.toLocaleString()} rows per result set`;
+
+    controls.append(runButton, explainButton, prevButton, historySelect, nextButton, hint);
 
     const editorRoot = document.createElement('div');
     editorRoot.className = 'sql-console-editor';
@@ -165,6 +194,8 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
         syncHistorySelect();
     }
 
+    runButton.addEventListener('click', () => { void runCurrent(); });
+    explainButton.addEventListener('click', () => { void runExplain(); });
     prevButton.addEventListener('click', goOlder);
     nextButton.addEventListener('click', goNewer);
     historySelect.addEventListener('change', () => {
@@ -176,12 +207,10 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
         loadIntoEditor(list[index]);
     });
 
-    async function runCurrent() {
-        const text = view.state.doc.toString();
-        if (!text.trim()) return;
+    async function execute(sqlText) {
         setNotice('');
         try {
-            await runSql(text);
+            await runSql(sqlText);
         } catch (err) {
             // The injected runSql is expected to render its own errors
             // (desktop-viewer.js renders via console-results.js); this is
@@ -189,11 +218,28 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
             // surfaces somewhere instead of failing silently.
             setNotice(err instanceof Error ? err.message : String(err));
         }
+    }
+
+    async function runCurrent() {
+        const text = view.state.doc.toString();
+        if (!text.trim()) return;
+        await execute(text);
         // History records the attempt regardless of outcome — a failed
         // query is exactly the kind of thing a user wants to recall and fix.
         saveHistory(pushHistory(loadHistory(), text));
         historyIndex = -1;
         populateHistorySelect();
+    }
+
+    /**
+     * Runs the editor's text wrapped in EXPLAIN QUERY PLAN. No history write:
+     * the recorded entry should be the query the user is working on, not the
+     * plan lookup, and the next Run records it anyway.
+     */
+    async function runExplain() {
+        const text = view.state.doc.toString();
+        if (!text.trim()) return;
+        await execute(explainWrap(text));
     }
 
     const runKeymap = keymap.of([

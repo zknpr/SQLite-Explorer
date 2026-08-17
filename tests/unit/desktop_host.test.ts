@@ -87,7 +87,14 @@ test('getExtensionSettings maps stored keys onto the VS Code wire shape', async 
   await host.start();
   const settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
   // hostBridge.ts parity: panel-facing keys, not the persisted config keys.
-  assert.deepEqual(settings, { autoCommit: true, cellEditBehavior: 'modal', fileOperations: 'native', theme: 'system' });
+  // consoleHistory has no VS Code twin — the SQL console is desktop-only.
+  assert.deepEqual(settings, {
+    autoCommit: true,
+    cellEditBehavior: 'modal',
+    fileOperations: 'native',
+    theme: 'system',
+    consoleHistory: []
+  });
 });
 
 test('updateExtensionSetting persists the delta through the bridge', async () => {
@@ -666,4 +673,30 @@ test('runConsole without mutations stays clean', async () => {
   await host.invoke('runConsole', ['SELECT 1', {}]);
   assert.equal(host.hasUnsavedChanges(), false);
   assert.equal(refreshed, 0);
+});
+
+test('console history round-trips through the settings wire shape', async () => {
+  const { host, saved } = makeHost({});
+  await host.start();
+
+  // Default: the console asks for its history before anything has been saved.
+  const initial = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
+  assert.deepEqual(initial.consoleHistory, []);
+
+  await host.invoke('updateExtensionSetting', ['consoleHistory', ['SELECT 2', 'SELECT 1']]);
+  const after = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
+  assert.deepEqual(after.consoleHistory, ['SELECT 2', 'SELECT 1']);
+
+  // The delta-persist compares against DEFAULT_SETTINGS by reference, so any
+  // saved array always lands in the file — including an empty one.
+  assert.deepEqual(saved.settings, { consoleHistory: ['SELECT 2', 'SELECT 1'] });
+  await host.invoke('updateExtensionSetting', ['consoleHistory', []]);
+  assert.deepEqual(saved.settings, { consoleHistory: [] });
+});
+
+test('stored console history loads at start', async () => {
+  const { host } = makeHost({}, { loadSettings: async () => ({ consoleHistory: ['SELECT 1'] }) });
+  await host.start();
+  const settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
+  assert.deepEqual(settings.consoleHistory, ['SELECT 1']);
 });

@@ -57,6 +57,16 @@
     viewerReady: async () => {},
   };
   // Expose for the smoke driver: window.__HARNESS_MENU__('open-db') etc.
+  //
+  // SQL CONSOLE: no mock exists, and none is wanted. runConsole is not a
+  // bridge method — it goes desktop-api -> desktop-host -> the REAL
+  // desktop/worker.js this page already boots — so the console round trip
+  // drives end to end here against real sql.js, including multi-set scripts,
+  // truncation, and error payloads. A harness echo would only be a
+  // lower-fidelity stand-in that could mask a genuine worker regression.
+  // To drive it: __HARNESS_MENU__('sql-console') toggles the panel (the shell
+  // sends the same id), then type in `.cm-content` and click `.sql-console-run`
+  // (or `.sql-console-explain`); results land under #consoleResults.
   window.__HARNESS_MENU__ = (id) => menuHandler && menuHandler(id);
   // Same convention, for native "Open With"/recents: window.__HARNESS_OPEN_FILE__('/path/to.db').
   window.__HARNESS_OPEN_FILE__ = (path) => openFileHandler && openFileHandler(path);

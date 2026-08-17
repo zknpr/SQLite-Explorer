@@ -80,6 +80,13 @@ export interface DesktopBackendApi {
     fetchTableData(table: string, options: unknown): Promise<unknown>;
     fetchTableCount(table: string, options: unknown): Promise<unknown>;
     fetchSchema(): Promise<unknown>;
+    /**
+     * Desktop-only: runs an ad hoc, possibly multi-statement script for the
+     * SQL console. Resolves with the worker's runConsole payload (typed as
+     * ConsoleRunResult by the console results module) and rejects with the
+     * first failing statement's error.
+     */
+    runConsole(sql: string, options?: { maxRows?: number }): Promise<unknown>;
     getTableInfo(table: string): Promise<unknown>;
     getPragmas(): Promise<unknown>;
     setPragma(pragma: string, value: unknown): Promise<unknown>;

@@ -54,10 +54,192 @@ import {
 import { initViews } from './modules/views.js';
 import { applyConnectionResult } from './modules/connection-state.js';
 import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
+// Desktop-only. This is the ONLY file allowed to import the console modules:
+// console.js bundles CodeMirror 6, and an import from any shared module would
+// drag it into the VS Code webview and web-demo bundles too. Pinned by
+// tests/unit/console_desktop_wiring.test.ts.
+import { createConsole } from './modules/console.js';
+import { renderConsoleResults } from './modules/console-results.js';
 
 // Like the demo, ordinary edits get no host-echoed refreshContent, so
 // optimistic count reuse stays off.
 setCountCacheDemoMode(true);
+
+// ============================================================================
+// SQL console (desktop only)
+// ============================================================================
+
+const READ_ONLY_CONSOLE_NOTICE =
+    'This database is opened read-only; the SQL console is disabled.';
+
+/**
+ * The host closure's `surface` error helper, installed by initSqlConsole.
+ * The fallback only ever runs if a console callback fires before init, which
+ * nothing can do — it exists so this is never a silent failure.
+ */
+let consoleSurface = (label) => (err) => console.error(label, err);
+
+/** Built on first open: CodeMirror is not worth constructing for a session that never uses it. */
+let sqlConsole = null;
+
+/** In-memory mirror of the persisted `consoleHistory` setting, newest first. */
+let consoleHistory = [];
+
+/**
+ * Settles once the persisted settings (history included) have been read, or
+ * failed to read. openConsole() waits on it so createConsole's first
+ * loadHistory() sees the stored list — otherwise the first run would persist
+ * a one-entry history over it.
+ */
+let consoleHistoryReady = Promise.resolve();
+
+/**
+ * Autocompletion schema for @codemirror/lang-sql: every table and view name,
+ * plus real column names for the table currently loaded in the grid. That is
+ * the only object whose columns are in memory — loadTableColumns fills
+ * state.tableColumns for the selection alone, and fetching columns for every
+ * object would cost one getTableInfo round trip each, per schema refresh.
+ *
+ * Null-prototype: table names are untrusted database content, and a table
+ * literally named `__proto__` would otherwise reassign the object's prototype
+ * instead of adding a key.
+ */
+function getConsoleSchema() {
+    const schema = Object.create(null);
+    for (const table of state.schemaCache.tables) schema[table.name] = [];
+    for (const view of state.schemaCache.views) schema[view.name] = [];
+    if (state.selectedTable && state.selectedTable in schema) {
+        schema[state.selectedTable] = state.tableColumns.map(column => column.name);
+    }
+    return schema;
+}
+
+/**
+ * Runs `sqlText` and renders the outcome into the results pane. Deliberately
+ * never rejects: both failure modes (the read-only refusal and a worker
+ * rejection) belong in the results area the user is already looking at, which
+ * is also what keeps console.js's own fallback notice empty.
+ */
+async function runConsoleSql(sqlText) {
+    const results = document.getElementById('consoleResults');
+    if (!results) return;
+    if (state.isReadOnly) {
+        // The worker refuses runConsole outright on a read-only database; this
+        // just says so without a round trip.
+        renderConsoleResults(results, { error: READ_ONLY_CONSOLE_NOTICE });
+        return;
+    }
+    try {
+        renderConsoleResults(results, await backendApi.runConsole(sqlText));
+    } catch (err) {
+        renderConsoleResults(results, {
+            error: err instanceof Error ? err.message : String(err),
+            // Rough on purpose: a trailing semicolon over-reports, which only
+            // adds the "statements before the error were applied" note to a
+            // single-statement failure where nothing was applied.
+            multiStatement: sqlText.includes(';')
+        });
+    }
+}
+
+function loadConsoleHistory() {
+    return consoleHistory;
+}
+
+function saveConsoleHistory(list) {
+    // pushHistory returns the SAME reference when there was nothing to record,
+    // so this skips a settings write (and a disk write) for every such run.
+    if (list === consoleHistory) return;
+    consoleHistory = list;
+    backendApi.updateExtensionSetting('consoleHistory', list)
+        .catch(consoleSurface('History save failed'));
+}
+
+/** Console mode lives in one place: the class on .main-panel. */
+function isConsoleOpen() {
+    return document.querySelector('.main-panel')?.classList.contains('console-mode') === true;
+}
+
+/**
+ * Read-only databases get the notice instead of the editor. Re-applied on
+ * every refreshContent so opening a read-only file while the console is up
+ * swaps it out immediately.
+ */
+function applyConsoleAvailability() {
+    const notice = document.getElementById('consoleNotice');
+    if (!sqlConsole || !notice) return;
+    if (state.isReadOnly) {
+        notice.textContent = READ_ONLY_CONSOLE_NOTICE;
+        notice.hidden = false;
+        sqlConsole.hide();
+    } else {
+        notice.hidden = true;
+        sqlConsole.show();
+    }
+}
+
+async function openConsole() {
+    const panel = document.querySelector('.main-panel');
+    const container = document.getElementById('consoleContainer');
+    const host = document.getElementById('consoleHost');
+    if (!panel || !container || !host) return;
+
+    await consoleHistoryReady;
+    sqlConsole ??= createConsole({
+        container: host,
+        runSql: runConsoleSql,
+        loadHistory: loadConsoleHistory,
+        saveHistory: saveConsoleHistory,
+        getSchema: getConsoleSchema
+    });
+
+    container.hidden = false;
+    panel.classList.add('console-mode');
+    applyConsoleAvailability();
+}
+
+function closeConsole() {
+    const container = document.getElementById('consoleContainer');
+    document.querySelector('.main-panel')?.classList.remove('console-mode');
+    if (container) container.hidden = true;
+}
+
+function toggleConsole() {
+    if (!isConsoleOpen()) return openConsole();
+    closeConsole();
+    return Promise.resolve();
+}
+
+/** No-op until the console has been opened, since createConsole is lazy. */
+function refreshConsoleSchema() {
+    sqlConsole?.refreshSchema();
+}
+
+/**
+ * Desktop-only console wiring. `surface` is the host closure's error helper.
+ */
+function initSqlConsole(surface) {
+    consoleSurface = surface;
+
+    const button = document.getElementById('btnSqlConsole');
+    if (button) {
+        // Ships hidden in the shared template: VS Code and the web demo have
+        // no console, and neither runs this init.
+        button.hidden = false;
+        button.addEventListener('click', () => {
+            toggleConsole().catch(surface('SQL console failed'));
+        });
+    }
+
+    // Picking a table or view means "show me that data", so it leaves console
+    // mode. Delegated on the same element and matched with the same selector
+    // sidebar.js uses for selection (a `.list-item` carrying both data-name and
+    // data-type), registered separately so neither module knows about the other.
+    document.getElementById('sidebarPanel')?.addEventListener('click', (event) => {
+        const item = event.target?.closest?.('.list-item');
+        if (item?.dataset.name && item.dataset.type) closeConsole();
+    });
+}
 
 // ============================================================================
 // Webview methods the desktop host invokes directly
@@ -101,6 +283,13 @@ const webviewMethods = {
                 await loadTableData(false);
             }
         }
+        // Closes the console-DDL loop: a mutating console run makes the host
+        // call back here, and the autocompletion schema rebuilds from the
+        // freshly loaded schemaCache. Placed after loadTableColumns rather
+        // than immediately after refreshSchema() so the selected table's
+        // columns are the new ones too.
+        refreshConsoleSchema();
+        if (isConsoleOpen()) applyConsoleAvailability();
         return { success: true };
     },
 
@@ -147,6 +336,10 @@ async function initializeApp() {
 
         // Load schema
         await refreshSchema();
+        // A no-op on a cold boot (the console is built lazily on first open,
+        // from this same cache); it matters on a re-init, and keeps the schema
+        // feed in one place with the refreshContent hook above.
+        refreshConsoleSchema();
 
         updateStatus('Ready');
         showEmptyState();
@@ -207,6 +400,7 @@ if (!bridge) {
             if (id === 'open-db') await host.openDatabaseViaDialog().catch(surface('Open failed'));
             else if (id === 'save-db') await host.saveToDisk().catch(surface('Save failed'));
             else if (id === 'refresh-db') await host.refreshFromDisk().catch(surface('Refresh failed'));
+            else if (id === 'sql-console') await toggleConsole().catch(surface('SQL console failed'));
             else if (id.startsWith('theme:')) {
                 const theme = applyTheme(id.slice('theme:'.length));
                 await backendApi.updateExtensionSetting('theme', theme).catch(surface('Theme change failed'));
@@ -241,8 +435,16 @@ if (!bridge) {
         });
 
         // Independent of worker boot: never blocks initializeApp() on the
-        // settings round trip.
-        backendApi.getExtensionSettings().then(s => applyTheme(s.theme)).catch(console.error);
+        // settings round trip. openConsole() does wait on it (the console's
+        // history lives in the same payload); `.catch` makes that wait
+        // unrejectable, so a settings failure costs an empty history, not a
+        // console that refuses to open.
+        consoleHistoryReady = backendApi.getExtensionSettings().then(s => {
+            applyTheme(s.theme);
+            consoleHistory = Array.isArray(s.consoleHistory) ? s.consoleHistory : [];
+        }).catch(console.error);
+
+        initSqlConsole(surface);
 
         return initializeApp();
     }).catch(err => {

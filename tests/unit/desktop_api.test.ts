@@ -74,3 +74,14 @@ test('sendRpcRequest clears its timeout timer once the host invocation settles (
   assert.equal(clearCalls.length, 1);
   assert.equal(clearCalls[0], capturedTimerId);
 });
+
+test('runConsole passes the script and an options object through to the host', async () => {
+  const host = fakeHost();
+  initDesktopApi(host as never);
+
+  await backendApi.runConsole('SELECT 1');
+  assert.deepEqual(host.calls.at(-1), { method: 'runConsole', args: ['SELECT 1', {}] });
+
+  await backendApi.runConsole('SELECT 1', { maxRows: 10 });
+  assert.deepEqual(host.calls.at(-1), { method: 'runConsole', args: ['SELECT 1', { maxRows: 10 }] });
+});

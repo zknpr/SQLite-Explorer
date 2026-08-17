@@ -1551,3 +1551,230 @@ body {
 /* Desktop shell: VS Code-only affordances do not exist here. */
 .desktop-app #openInVsCodeBtn,
 .desktop-app #btnOpenViewInVsCode { display: none !important; }
+
+/* ================================================================
+   SQL CONSOLE (desktop only)
+
+   Inert everywhere else: the container ships `hidden` in the template
+   and only desktop-viewer.js ever adds `.console-mode`.
+
+   The `[hidden]` companions below are load-bearing, not defensive noise.
+   console.js (its mount + its own notice) and console-results.js (the tab
+   strip's panes) both toggle the `hidden` ATTRIBUTE, and an author rule
+   setting `display` outranks the UA `[hidden] { display: none }` — without
+   the companion rule a "hidden" element stays on screen.
+   tests/unit/console_desktop_wiring.test.ts pins this.
+   ================================================================ */
+.main-panel.console-mode .grid-container {
+    display: none;
+}
+
+.console-container {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.console-container[hidden] {
+    display: none;
+}
+
+/* console.js's mount: history/run controls, the CodeMirror editor, its notice.
+   Sized as a top pane so the results below always keep room. */
+.sql-console-host {
+    display: flex;
+    flex-direction: column;
+    height: 40%;
+    min-height: 150px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+/* Read-only databases hide the whole editor pane and show the page notice. */
+.sql-console-host[hidden] {
+    display: none;
+}
+
+.sql-console-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 8px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+}
+
+/* Same visual contract as .toolbar-button. Restated rather than sharing the
+   class: console.js builds these elements itself and must stay free of any
+   dependency on the shared toolbar markup. */
+.sql-console-controls button,
+.sql-console-controls select,
+.sql-console-results-tab {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 3px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 12px;
+    font-family: inherit;
+}
+
+.sql-console-controls button:hover,
+.sql-console-controls select:hover,
+.sql-console-results-tab:hover {
+    background: var(--hover-bg);
+}
+
+.sql-console-controls button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.sql-console-history-select {
+    max-width: 320px;
+}
+
+.sql-console-hint {
+    margin-left: auto;
+    color: var(--text-secondary);
+    font-size: 11px;
+}
+
+/* CodeMirror needs a bounded height to scroll instead of growing the pane. */
+.sql-console-editor {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.sql-console-editor .cm-editor {
+    height: 100%;
+}
+
+.sql-console-editor .cm-editor.cm-focused {
+    outline: none;
+}
+
+.sql-console-editor .cm-scroller {
+    overflow: auto;
+    font-family: monospace;
+    font-size: 12px;
+}
+
+/* console.js's in-pane notice: a run that rejected past the results renderer. */
+.sql-console-notice {
+    padding: 4px 8px;
+    color: var(--error-color);
+    font-size: 12px;
+    white-space: pre-wrap;
+}
+
+/* Container-level notice (read-only database); a sibling of the editor pane.
+   `order` puts it above the (empty) results area instead of at the bottom of
+   the panel, without reordering the template's children. */
+.sql-console-page-notice {
+    order: -1;
+    padding: 16px;
+    color: var(--text-secondary);
+}
+
+.sql-console-page-notice[hidden] {
+    display: none;
+}
+
+/* ---- results (console-results.js) ---- */
+.sql-console-results {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.sql-console-results-status {
+    padding: 5px 8px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.sql-console-results-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.sql-console-results-tab.active {
+    background: var(--active-bg);
+    color: var(--active-text);
+    border-color: var(--accent-color);
+}
+
+/* The scroll container for the sticky <thead> below. */
+.sql-console-results-pane {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+}
+
+.sql-console-results-pane[hidden] {
+    display: none;
+}
+
+.sql-console-results-table {
+    /* `separate` (not `collapse`) for the same reason the grid uses it: a
+       collapsed border belongs to the table, not the cell, so it does not
+       travel with a position:sticky <th> and the header loses its underline
+       as soon as the pane scrolls. The box-shadow below draws it instead. */
+    border-collapse: separate;
+    border-spacing: 0;
+    /* Wider than the pane when the columns need it; the pane scrolls. */
+    width: max-content;
+    min-width: 100%;
+    font-family: monospace;
+    font-size: 12px;
+}
+
+.sql-console-results-table th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    text-align: left;
+    font-weight: 600;
+    white-space: nowrap;
+    padding: 4px 8px;
+    box-shadow: 0 1px 0 0 var(--border-color);
+}
+
+.sql-console-results-table td {
+    padding: 3px 8px;
+    border-bottom: 1px solid var(--border-color);
+    white-space: pre;
+    vertical-align: top;
+}
+
+/* Mirrors .data-cell.null-value: console cells carry `null-value` WITHOUT
+   `data-cell` (console-results.js explains why), so that rule cannot reach them. */
+.sql-console-results-table .null-value {
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+.sql-console-results-error {
+    padding: 8px;
+    color: var(--error-color);
+    font-family: monospace;
+    font-size: 12px;
+    white-space: pre-wrap;
+}
+
+.sql-console-results-note {
+    padding: 0 8px 8px;
+    color: var(--text-secondary);
+    font-size: 12px;
+}

@@ -19,7 +19,12 @@ const DEFAULT_SETTINGS = Object.freeze({
     queryTimeout: 30000,
     maxInlineCellBytes: 1048576,
     maxUndoMemory: 52428800,
-    theme: 'system'
+    theme: 'system',
+    // SQL console history, newest first (see `pushHistory` in the console
+    // module: capped at 50 entries of <=4096 chars). Frozen because
+    // Object.freeze is shallow — without it a caller mutating the array in
+    // place would corrupt the default for the whole session.
+    consoleHistory: Object.freeze([])
 });
 
 // Worker methods whose successful result must be recorded for undo. DDL and
@@ -297,7 +302,10 @@ export function createDesktopHost({ bridge, createWorker }) {
                 autoCommit: settings.instantCommit === 'always',
                 cellEditBehavior: settings.doubleClickBehavior,
                 fileOperations: settings.fileOperations,
-                theme: settings.theme
+                theme: settings.theme,
+                // Desktop-only; the VS Code host has no console. `?? []` covers
+                // a settings file written before this key existed.
+                consoleHistory: settings.consoleHistory ?? []
             };
         },
         async updateExtensionSetting(key, value) {
@@ -313,6 +321,10 @@ export function createDesktopHost({ bridge, createWorker }) {
                 await notifyWebview('updateCellEditBehavior', [value]);
             }
             // Persist only deviations from defaults to keep the file readable.
+            // The comparison is by reference, so an object-valued setting
+            // (consoleHistory) always persists once written — including an
+            // empty array, which is not the frozen default array. Harmless:
+            // `"consoleHistory": []` in the file round-trips identically.
             const delta = {};
             for (const [k, v] of Object.entries(settings)) {
                 if (DEFAULT_SETTINGS[k] !== v) delta[k] = v;

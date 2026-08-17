@@ -185,6 +185,10 @@ export const backendApi = {
     fetchTableData: (table, options) => sendRpcRequest('fetchTableData', [table, options]),
     fetchTableCount: (table, options) => sendRpcRequest('fetchTableCount', [table, options]),
     fetchSchema: () => sendRpcRequest('fetchSchema', []),
+    // Desktop-only (the SQL console). The host special-cases this method for
+    // the undo barrier before forwarding it to the worker; the default
+    // `{}` keeps the worker's own maxRows clamp in charge of the row cap.
+    runConsole: (sql, options) => sendRpcRequest('runConsole', [sql, options ?? {}]),
     getTableInfo: (table) => sendRpcRequest('getTableInfo', [table]),
     getPragmas: () => sendRpcRequest('getPragmas', []),
     setPragma: (pragma, value) => sendRpcRequest('setPragma', [pragma, value]),

@@ -91,6 +91,9 @@
                     </div>
                 </div>
                 <div class="toolbar-right">
+                    <button type="button" class="toolbar-button" id="btnSqlConsole" hidden>
+                        <span class="codicon codicon-terminal"></span> SQL
+                    </button>
                     <button type="button" class="toolbar-button" id="btnAddRow" disabled>
                         <span class="codicon codicon-add"></span> Add Row
                     </button>
@@ -120,6 +123,19 @@
                     <div class="loading-spinner"></div>
                     <span>Connecting to database...</span>
                 </div>
+            </div>
+
+            <!-- SQL Console (desktop only). Ships hidden and inert: VS Code and
+                 the web demo never run the desktop init that unhides it, and
+                 console.js owns everything inside #consoleHost (it clears the
+                 element before mounting, so nothing may be authored in there).
+                 data-preserve-grid-selection keeps grid-events.js's
+                 handleDocumentClick from reading a click in here as an
+                 outside-click and dropping the grid's live selection. -->
+            <div class="console-container" id="consoleContainer" hidden data-preserve-grid-selection>
+                <div class="sql-console-host" id="consoleHost"></div>
+                <div class="sql-console-results" id="consoleResults"></div>
+                <div class="sql-console-page-notice" id="consoleNotice" hidden></div>
             </div>
 
             <!-- Footer -->
