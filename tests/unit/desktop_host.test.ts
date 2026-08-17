@@ -82,22 +82,46 @@ test('unknown methods forward to the worker verbatim', async () => {
   assert.equal(posted.at(-1)!.content.targetMethod, 'fetchSchema');
 });
 
-test('getExtensionSettings merges defaults with bridge-stored settings', async () => {
-  const { host } = makeHost({}, { loadSettings: async () => ({ defaultPageSize: 100 }) });
+test('getExtensionSettings maps stored keys onto the VS Code wire shape', async () => {
+  const { host } = makeHost({}, { loadSettings: async () => ({ doubleClickBehavior: 'modal', instantCommit: 'always' }) });
   await host.start();
   const settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
-  assert.equal(settings.defaultPageSize, 100);       // stored wins
-  assert.equal(settings.instantCommit, 'never');     // default fills the rest
-  assert.equal(settings.doubleClickBehavior, 'inline');
+  // hostBridge.ts parity: panel-facing keys, not the persisted config keys.
+  assert.deepEqual(settings, { autoCommit: true, cellEditBehavior: 'modal', fileOperations: 'native' });
 });
 
-test('updateExtensionSetting persists through the bridge', async () => {
+test('updateExtensionSetting persists the delta through the bridge', async () => {
   const { host, saved } = makeHost({});
   await host.start();
-  await host.invoke('updateExtensionSetting', ['defaultPageSize', 250]);
-  assert.deepEqual(saved.settings, { defaultPageSize: 250 });
+  await host.invoke('updateExtensionSetting', ['doubleClickBehavior', 'modal']);
+  assert.deepEqual(saved.settings, { doubleClickBehavior: 'modal' });
   const settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
-  assert.equal(settings.defaultPageSize, 250);
+  assert.equal(settings.cellEditBehavior, 'modal');
+});
+
+test('updateExtensionSetting translates autoCommit onto instantCommit', async () => {
+  const { host, saved } = makeHost({});
+  await host.start();
+  await host.invoke('updateExtensionSetting', ['autoCommit', true]);
+  assert.deepEqual(saved.settings, { instantCommit: 'always' });
+  let settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
+  assert.equal(settings.autoCommit, true);
+  await host.invoke('updateExtensionSetting', ['autoCommit', false]);
+  assert.deepEqual(saved.settings, {});   // back to default → empty delta
+  settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
+  assert.equal(settings.autoCommit, false);
+});
+
+test('cell-edit behavior is pushed to the webview at start and on change', async () => {
+  const pushed: unknown[] = [];
+  const { host } = makeHost({}, { loadSettings: async () => ({ doubleClickBehavior: 'modal' }) });
+  host.setWebviewMethods({
+    updateCellEditBehavior: async (value: unknown) => { pushed.push(value); return { success: true }; }
+  });
+  await host.start();
+  assert.deepEqual(pushed, ['modal']);
+  await host.invoke('updateExtensionSetting', ['doubleClickBehavior', 'vscode']);
+  assert.deepEqual(pushed, ['modal', 'vscode']);
 });
 
 test('updateCell records an undoable modification; triggerUndo replays it and refreshes the UI', async () => {

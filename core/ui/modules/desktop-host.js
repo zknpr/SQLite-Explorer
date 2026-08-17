@@ -274,14 +274,31 @@ export function createDesktopHost({ bridge, createWorker }) {
             return { connected: true, isReadOnly: connectionInfo.isReadOnly === true, filename: currentName };
         },
         async getExtensionSettings() {
-            return { ...settings };
+            // Wire-shape parity with the VS Code host (hostBridge.ts
+            // getExtensionSettings): the settings panel reads `autoCommit` and
+            // `cellEditBehavior`; the persisted store keeps the config keys
+            // `instantCommit` and `doubleClickBehavior`.
+            return {
+                autoCommit: settings.instantCommit === 'always',
+                cellEditBehavior: settings.doubleClickBehavior,
+                fileOperations: settings.fileOperations
+            };
         },
         async updateExtensionSetting(key, value) {
-            settings = { ...settings, [key]: value };
-            const { ...persisted } = settings;
+            // Same key translation the VS Code host performs, and the same push:
+            // there, a doubleClickBehavior config change fans out
+            // updateCellEditBehavior to every webview (editorController.ts).
+            if (key === 'autoCommit') {
+                settings = { ...settings, instantCommit: value ? 'always' : 'never' };
+            } else {
+                settings = { ...settings, [key]: value };
+            }
+            if (key === 'doubleClickBehavior') {
+                await notifyWebview('updateCellEditBehavior', [value]);
+            }
             // Persist only deviations from defaults to keep the file readable.
             const delta = {};
-            for (const [k, v] of Object.entries(persisted)) {
+            for (const [k, v] of Object.entries(settings)) {
                 if (DEFAULT_SETTINGS[k] !== v) delta[k] = v;
             }
             await bridge.saveSettings(delta);
@@ -335,6 +352,10 @@ export function createDesktopHost({ bridge, createWorker }) {
         async start() {
             settings = { ...DEFAULT_SETTINGS, ...(await bridge.loadSettings()) };
             tracker = new ModificationTracker(100, settings.maxUndoMemory);
+            // VS Code seeds the webview's initial cell-edit behavior through the
+            // HTML template env (editorController.ts VSCODE_ENV); the desktop has
+            // no template pass, so push it the way config changes arrive.
+            await notifyWebview('updateCellEditBehavior', [settings.doubleClickBehavior]);
             bootWorkerObject();
             await initializeWorkerDatabase(currentName, {});
             updateTitle();
