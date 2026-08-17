@@ -178,11 +178,34 @@ function renderError(container, message, withNote) {
 }
 
 /**
+ * True when `payload` carries a renderable failure message. A nullish `error`
+ * is not a message, and neither is an empty/whitespace-only string — both
+ * would produce a visually blank error pane, so they fall through to the
+ * contract check instead. Any other present value (a raw Error, a number) is
+ * a message and renders coerced.
+ *
+ * @param {unknown} payload
+ * @returns {boolean}
+ */
+function isErrorPayload(payload) {
+    if (payload === null || typeof payload !== 'object') return false;
+    const error = payload.error;
+    if (error === null || error === undefined) return false;
+    return typeof error !== 'string' || error.trim() !== '';
+}
+
+/**
  * True when `payload` is structurally renderable as a successful run: every
  * property the success path walks is present and of the right kind. Checked
  * rather than assumed because rendering must be total — see
  * {@link renderConsoleResults}. One extra pass over the rows is nothing next
  * to building a DOM row for each of them.
+ *
+ * The `Array.from` calls are load-bearing, not decoration: `every()` SKIPS
+ * array holes while the render path's `for...of` does not, so a sparse
+ * `results`/`rows` would sail past a bare `every()` and then throw on an
+ * `undefined` set/row. Copying materializes the holes so the predicate sees
+ * (and rejects) them.
  *
  * @param {unknown} payload
  * @returns {boolean}
@@ -190,12 +213,12 @@ function renderError(container, message, withNote) {
 function isRenderableRun(payload) {
     if (payload === null || typeof payload !== 'object') return false;
     if (!Array.isArray(payload.results)) return false;
-    return payload.results.every(set =>
+    return Array.from(payload.results).every(set =>
         set !== null
         && typeof set === 'object'
         && Array.isArray(set.headers)
         && Array.isArray(set.rows)
-        && set.rows.every(row => Array.isArray(row))
+        && Array.from(set.rows).every(row => Array.isArray(row))
     );
 }
 
@@ -203,18 +226,19 @@ function isRenderableRun(payload) {
  * Renders a console run into `container`, replacing whatever the previous
  * run left behind.
  *
- * Two payload shapes, discriminated by a non-nullish `error`:
+ * Two payload shapes, discriminated by a non-blank `error`:
  * - success: runConsole's result — a status line, a tab strip when (and only
  *   when) there is more than one result set, and one table per set.
  * - failure: the error message, plus the fixed multi-statement note when the
  *   failed run had more than one statement.
  *
  * Rendering is TOTAL: anything that is neither of those (a nullish payload, a
- * missing/non-array `results`, a set without array `headers`/`rows`) is a
- * caller contract violation and renders as a visible failure with the raw
- * payload logged, instead of throwing halfway through and leaving the pane
- * blank — the container has already been cleared by then, so a throw would
- * lose the previous output AND show nothing in its place.
+ * blank error message, a missing/non-array/sparse `results`, a set without
+ * array `headers`/`rows`) is a caller contract violation and renders as a
+ * visible failure with the raw payload logged, instead of throwing halfway
+ * through and leaving the pane blank — the container has already been cleared
+ * by then, so a throw would lose the previous output AND show nothing in its
+ * place.
  *
  * @param {HTMLElement} container
  * @param {{ results: Array<{ headers: string[], rows: unknown[][], truncated: boolean }>, mutated: boolean, changes: number, durationMs: number } | { error: string, multiStatement?: boolean }} payload
@@ -223,12 +247,11 @@ function isRenderableRun(payload) {
 export function renderConsoleResults(container, payload) {
     container.replaceChildren();
 
-    // Nullish-checked, not typeof-string-checked, and coerced on the way out:
-    // the error branch is the worst possible place to throw a second time, so
-    // a caller that hands over an Error instead of its message still gets its
-    // failure rendered. A null/undefined `error` is not a message and falls
-    // through to the contract check below rather than rendering "null".
-    if (payload !== null && payload !== undefined && payload.error !== null && payload.error !== undefined) {
+    // Presence-checked and coerced on the way out (see isErrorPayload): the
+    // error branch is the worst possible place to throw a second time, so a
+    // caller that hands over an Error instead of its message still gets its
+    // failure rendered.
+    if (isErrorPayload(payload)) {
         renderError(container, String(payload.error), Boolean(payload.multiStatement));
         return;
     }

@@ -28,6 +28,11 @@ class FakeNode {
     }
 
     appendChild(node: FakeNode) {
+        // The real DOM throws on a non-node (which is how an array hole
+        // reaches this method); a lenient fake would hide that crash.
+        if (!(node instanceof FakeNode)) {
+            throw new TypeError(`appendChild requires a node, got ${String(node)}`);
+        }
         this.children.push(node);
         return node;
     }
@@ -351,6 +356,32 @@ test('malformed payloads render a contract violation instead of throwing', () =>
     // A nulled-out error is not an error message; it must not render "null".
     assertContractViolation({ error: null });
     assertContractViolation('not a payload at all');
+});
+
+test('array holes are rejected by the gate rather than crashed on', () => {
+    // `.every()` SKIPS holes; the render path (for...of / map + for...of) does
+    // not — so a sparse array walks straight past a naive gate into a
+    // TypeError. Pinned as genuine holes: if the toolchain ever materializes
+    // `[,]` into `[undefined]`, these assertions fail rather than quietly
+    // reducing the regression to a weaker one.
+    const sparseSets: unknown[] = [, ];
+    const sparseRows: unknown[] = [, ];
+    assert.equal(sparseSets.length, 1);
+    assert.equal(0 in sparseSets, false);
+    assert.equal(0 in sparseRows, false);
+
+    assertContractViolation({ results: sparseSets, mutated: false, changes: 0, durationMs: 1 });
+    assertContractViolation({
+        results: [{ headers: ['a'], rows: sparseRows, truncated: false }],
+        mutated: false,
+        changes: 0,
+        durationMs: 1
+    });
+});
+
+test('a blank error message is a contract violation, not a blank pane', () => {
+    assertContractViolation({ error: '' });
+    assertContractViolation({ error: '   ' });
 });
 
 test('each render replaces the previous one entirely', () => {

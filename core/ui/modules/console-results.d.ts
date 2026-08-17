@@ -50,9 +50,10 @@ export function formatStatus(result: ConsoleRunResult): string;
  * message plus, when `multiStatement`, the fixed note
  * `Statements before the error were applied.`
  *
- * Total: a payload matching neither shape (nullish, non-array `results`, a set
- * without array `headers`/`rows`) renders `Malformed console result payload`
- * through the error path and logs the raw payload, rather than throwing.
+ * Total: a payload matching neither shape (nullish, a blank/whitespace-only
+ * `error`, a non-array or sparse `results`, a set without array
+ * `headers`/`rows`) renders `Malformed console result payload` through the
+ * error path and logs the raw payload, rather than throwing.
  *
  * All DOM is built with createElement + textContent — query output is
  * untrusted database content and never reaches innerHTML.
