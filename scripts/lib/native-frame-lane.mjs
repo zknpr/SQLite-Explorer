@@ -380,11 +380,14 @@ async function runDesyncCase(binary, bundlePath, note) {
         // The sidecar must shut itself down rather than sit alive and deaf --
         // exiting closes the pipe, so the parent sees EOF instead of blocking.
         // Nothing is written to stdin here: a hang would mean a deaf-alive peer.
+        // The code must be NONZERO: both deaths close the pipe identically, so
+        // it is the only thing that tells the parent which one happened.
         const code = await Promise.race([
             harness.untilExit(),
             sleep(15000).then(() => 'TIMEOUT')
         ]);
-        note(code !== 'TIMEOUT', 'frame/desync-shuts-down-without-hanging', `exit ${code}`);
+        note(code !== 'TIMEOUT' && code !== 0,
+            'frame/desync-exits-nonzero-without-hanging', `exit ${code}`);
         checks += 1;
 
         note(harness.replies.length === 1,

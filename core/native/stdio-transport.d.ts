@@ -30,6 +30,11 @@ export interface StdioMessageEvent {
  *   so the parent's next write sees EPIPE/EOF instead of blocking forever
  *   against a process that is alive but no longer listening.
  * - `stream-error` — stdin itself failed. Treated as terminal.
+ *
+ * EMBEDDER OBLIGATION: map these to the process exit code — 0 for `eof` only,
+ * NONZERO (1) for `fatal` and `stream-error`. The parent has to be able to tell
+ * a desync death from a clean shutdown; both close the pipe identically, so the
+ * exit code is the only signal that survives.
  */
 export type StdioShutdownReason =
     | { kind: 'eof' }
@@ -47,7 +52,11 @@ export interface StdioTransportOptions {
     onTransportError?: (error: unknown) => void;
     /** Defaults to `MAX_FRAME_BYTES`. */
     maxFrameBytes?: number;
-    /** Defaults to `MAX_DRAIN_BYTES`. Above it a declared length is a desync. */
+    /**
+     * Declared lengths above this are a desync rather than a drain. Defaults to
+     * 4x the EFFECTIVE cap — i.e. `MAX_DRAIN_BYTES` only when `maxFrameBytes`
+     * is left at its default. Must be >= the effective cap.
+     */
     maxDrainBytes?: number;
 }
 

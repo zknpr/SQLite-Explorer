@@ -64,6 +64,20 @@ export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 const DRAIN_LIMIT_MULTIPLE = 4;
 export const MAX_DRAIN_BYTES = MAX_FRAME_BYTES * DRAIN_LIMIT_MULTIPLE;
 
+/**
+ * Ceiling on a CONFIGURED frame cap — 256 MiB, 16x the protocol default.
+ *
+ * Bounding the option here is what keeps the fatal tier reachable. The drain
+ * limit derives as 4x the cap, so an unbounded cap could push it to or past
+ * the u32 ceiling, at which point NO declared length is above it and a corrupt
+ * `FF FF FF FF` header would be drained again — the regression the two-tier
+ * policy exists to close, reappearing at exotic caps. With this bound the
+ * derived limit is at most 1 GiB, comfortably under the u32 ceiling, so a
+ * garbage header is always fatal. Nothing legitimate needs more: the protocol
+ * caps payloads at 16 MiB and anything bigger is out of band by construction.
+ */
+const MAX_CONFIGURABLE_FRAME_BYTES = 0x10000000;
+
 /** Largest value a u32 length prefix can express. */
 const MAX_HEADER_VALUE = 0xffffffff;
 
@@ -165,8 +179,26 @@ function desync(declared, drainLimit) {
 
 function resolveMaxFrameBytes(value) {
     if (value === undefined) return MAX_FRAME_BYTES;
-    if (!Number.isSafeInteger(value) || value < 1 || value > MAX_HEADER_VALUE) {
-        throw new RangeError('Native frame limit must be an integer in [1, 4294967295]');
+    if (!Number.isSafeInteger(value) || value < 1 || value > MAX_CONFIGURABLE_FRAME_BYTES) {
+        throw new RangeError(
+            `Native frame limit must be an integer in [1, ${MAX_CONFIGURABLE_FRAME_BYTES}], got ${value}`
+        );
+    }
+    return value;
+}
+
+/**
+ * The drain limit must sit at or above the frame cap. Below it, a length the
+ * codec would happily ENCODE would be read back as an unrecoverable desync, so
+ * legitimate in-cap frames would kill the stream. Validated rather than
+ * silently repaired: a caller who asked for that meant something impossible.
+ */
+function resolveDrainLimit(value, limit) {
+    if (value === undefined) return limit * DRAIN_LIMIT_MULTIPLE;
+    if (!Number.isSafeInteger(value) || value < limit || value > MAX_HEADER_VALUE) {
+        throw new RangeError(
+            `Native frame drain limit must be an integer in [${limit}, ${MAX_HEADER_VALUE}], got ${value}`
+        );
     }
     return value;
 }
@@ -498,10 +530,10 @@ export function encodeFrame(message, options) {
 export function createFrameReader(onMessage, onError, options) {
     const limit = resolveMaxFrameBytes(options?.maxFrameBytes);
     // Scales with the cap so a test running a tiny limit exercises the same
-    // two-tier shape the 16 MiB default does.
-    const drainLimit = options?.maxDrainBytes === undefined
-        ? Math.min(limit * DRAIN_LIMIT_MULTIPLE, MAX_HEADER_VALUE)
-        : resolveMaxFrameBytes(options.maxDrainBytes);
+    // two-tier shape the 16 MiB default does. `limit` is bounded at 256 MiB, so
+    // the derived value is at most 1 GiB and the fatal tier stays reachable
+    // without a clamp — a clamp at the u32 ceiling would make it UNREACHABLE.
+    const drainLimit = resolveDrainLimit(options?.maxDrainBytes, limit);
     /** @type {Uint8Array[]} */
     const chunks = [];
     let head = 0;          // read offset into chunks[0]

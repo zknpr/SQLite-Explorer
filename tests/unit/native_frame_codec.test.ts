@@ -593,6 +593,35 @@ describe('native frame desync', () => {
         assert.strictEqual(fatal.sink.errors[0].code, NATIVE_FRAME_DESYNC);
     });
 
+    it('bounds the configurable cap so the fatal tier is always reachable', () => {
+        // The bound is the whole mechanism: an unbounded cap would push the
+        // derived 4x drain limit to or past the u32 ceiling, at which point NO
+        // declared length is above it and 0xffffffff gets drained again.
+        const MAX_CONFIGURABLE = 0x10000000;
+        assert.doesNotThrow(() => collect({ maxFrameBytes: MAX_CONFIGURABLE }));
+        for (const bad of [0, -1, 1.5, MAX_CONFIGURABLE + 1, 0xffffffff]) {
+            assert.throws(() => collect({ maxFrameBytes: bad }), RangeError, `cap ${bad}`);
+            assert.throws(() => encodeFrame({}, { maxFrameBytes: bad }), RangeError, `cap ${bad}`);
+        }
+
+        // At the largest legal cap a garbage header is still fatal, not drained.
+        const { reader, sink } = collect({ maxFrameBytes: MAX_CONFIGURABLE });
+        reader.push(encodeFrameHeader(0xffffffff));
+        assert.strictEqual(sink.errors[0].code, NATIVE_FRAME_DESYNC);
+        assert.strictEqual(reader.fatal, true);
+    });
+
+    it('refuses a drain limit below the frame cap', () => {
+        // Otherwise a frame the codec would happily ENCODE reads back as an
+        // unrecoverable desync, killing the stream on legitimate traffic.
+        assert.throws(() => collect({ maxFrameBytes: 1024, maxDrainBytes: 1023 }), RangeError);
+        assert.doesNotThrow(() => collect({ maxFrameBytes: 1024, maxDrainBytes: 1024 }));
+        assert.throws(
+            () => collect({ maxFrameBytes: 1024, maxDrainBytes: 0x100000000 }),
+            RangeError
+        );
+    });
+
     it('reports nothing further at EOF once fatal', () => {
         const { reader, sink } = collect();
         reader.push(encodeFrameHeader(0xffffffff));

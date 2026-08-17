@@ -1,0 +1,11 @@
+# Source is always diffable. A fixture generator legitimately embeds control
+# characters as test payload, and a single stray NUL byte in the first 8 KiB is
+# enough for git's heuristic to classify the whole file binary — which silently
+# hides its diffs from review. Source files declare themselves text so that
+# cannot happen; the escapes in the generator keep them out of the bytes anyway.
+*.ts text diff
+*.js text diff
+*.mjs text diff
+
+# Committed cross-language wire fixture: real frame bytes, never a text diff.
+tests/fixtures/*.bin binary

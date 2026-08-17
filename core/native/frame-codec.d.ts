@@ -60,15 +60,22 @@ export function encodeFrameValue(value: unknown): unknown;
 export function decodeFrameValue(value: unknown): unknown;
 
 export interface FrameLimitOptions {
-    /** Defaults to `MAX_FRAME_BYTES`. Lower values exist for tests. */
+    /**
+     * Defaults to `MAX_FRAME_BYTES`. Lower values exist for tests.
+     * @throws {RangeError} outside [1, 256 MiB]. The upper bound is what keeps
+     *   the derived drain limit under the u32 ceiling, and so keeps the fatal
+     *   desync tier reachable at every configuration.
+     */
     maxFrameBytes?: number;
 }
 
 export interface FrameReaderOptions extends FrameLimitOptions {
     /**
      * Declared lengths above this are treated as a desync rather than drained.
-     * Defaults to 4 x the frame cap, so a test running a small `maxFrameBytes`
-     * still exercises both tiers.
+     * Defaults to 4 x the EFFECTIVE frame cap, so a reader running a small
+     * `maxFrameBytes` still exercises both tiers.
+     * @throws {RangeError} at construction when below the effective cap, which
+     *   would turn frames the codec can legally encode into fatal desyncs.
      */
     maxDrainBytes?: number;
 }

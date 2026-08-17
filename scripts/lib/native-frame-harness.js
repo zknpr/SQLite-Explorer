@@ -53,7 +53,8 @@ transport.onmessage = (event) => {
 // parent before the pipe closes.
 await transport.start();
 await transport.flush();
-if (shutdownReason.kind !== 'eof') {
-    console.error(`[frame-harness] shutting down: ${shutdownReason.kind} -- ${shutdownReason.error?.message ?? ''}`);
-}
-tjs.exit(0);
+// Exit code is the ONLY signal that distinguishes a desync death from a clean
+// shutdown — both close the pipe identically. 0 for EOF, nonzero otherwise.
+if (shutdownReason.kind === 'eof') tjs.exit(0);
+console.error(`[frame-harness] shutting down: ${shutdownReason.kind} -- ${shutdownReason.error?.message ?? ''}`);
+tjs.exit(1);
