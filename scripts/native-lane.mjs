@@ -12,9 +12,14 @@
  *   2. TRANSPORT — drives `core/native/stdio-transport.js` inside the binary
  *      over real pipes (`scripts/lib/native-frame-lane.mjs`): drip-feed,
  *      coalesced writes, split headers, 256 KiB, the 16 MiB drain, and EOF.
+ *   3. SIDECAR — drives the committed `desktop/native-worker-desktop.js`
+ *      end-to-end (`scripts/lib/native-sidecar-lane.mjs`): freshness, real
+ *      initializeDatabase/fetchSchema/runConsole envelopes, path binding,
+ *      int64/blob tags through real RPCs, oversize in-band answers, the
+ *      query deadline, and the ppid watchdog.
  *
  * Exits non-zero on any fixture mismatch, errno mismatch, fork-only check, or
- * transport check failure.
+ * transport/sidecar check failure.
  */
 
 import { spawn } from 'node:child_process';
@@ -25,6 +30,7 @@ import { fileURLToPath } from 'node:url';
 import initSqlJs from '../vendor/sql.js/sql-wasm.js';
 import { runFixtures, normalize } from './lib/native-lane-fixtures.mjs';
 import { runFrameLane } from './lib/native-frame-lane.mjs';
+import { runSidecarLane } from './lib/native-sidecar-lane.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -88,6 +94,7 @@ const FORK_ONLY_EXPECTATIONS = {
 const scratch = mkdtempSync(path.join(tmpdir(), 'native-lane-'));
 let failures = 0;
 let frameChecks = 0;
+let sidecarChecks = 0;
 const note = (ok, label, detail) => {
     if (!ok) failures += 1;
     console.log(`${ok ? '  ok  ' : ' FAIL '} ${label}${detail ? ` -- ${detail}` : ''}`);
@@ -143,10 +150,14 @@ try {
         console.log('\n-- stdio transport through the real binary (real pipes) --');
         frameChecks = await runFrameLane({ binary, scratch, note });
 
+        console.log('\n-- sidecar end-to-end (committed bundle, real binary, real pipes) --');
+        sidecarChecks = await runSidecarLane({ binary, scratch, note });
+
         console.log(
             `\n${failures === 0 ? 'native lane PASSED' : `native lane FAILED (${failures} check(s))`}` +
             ` -- ${native.fixtures.length} shared fixtures, ${native.errnoChecks.length} errno checks, ` +
-            `${native.forkOnly.length} fork-only checks, ${frameChecks} transport checks`
+            `${native.forkOnly.length} fork-only checks, ${frameChecks} transport checks, ` +
+            `${sidecarChecks} sidecar checks`
         );
         if (failures > 0) process.exitCode = 1;
     }

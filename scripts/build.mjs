@@ -227,6 +227,13 @@ const bundleWebDemoWorker = async () => {
     // development build mode.
     minify: true,
     write: false,
+    define: {
+      // The worker's engine seam: false folds the desktop-native branch away
+      // completely, keeping this bundle byte-identical to the pre-seam output
+      // (the desktop-native bundle below defines it true instead). The worker
+      // unit tests rebuild with this exact define — keep them in lockstep.
+      'import.meta.env.DESKTOP_NATIVE_ENGINE': 'false',
+    },
   });
   if (result.outputFiles.length !== 1) {
     throw new Error(`Expected one standalone website worker output, received ${result.outputFiles.length}`);
@@ -515,6 +522,58 @@ const bundleDesktopViewer = async () => {
 };
 
 /**
+ * Bundle the desktop native sidecar (the worker method layer over the
+ * tjs:sqlite shim) from core/native/native-entry.js, returning the marked
+ * source text rather than writing it.
+ *
+ * Exported so the native lane (scripts/lib/native-sidecar-lane.mjs) can
+ * verify the committed desktop/native-worker-desktop.js is fresh against this
+ * exact configuration — one config, no drift.
+ *
+ * The config matters:
+ * - esm/neutral/es2022 with `tjs:*` external is the lane-proven shape `tjs
+ *   run` accepts (the entry graph imports TypeScript, so it is not
+ *   raw-loadable without bundling);
+ * - the define flips worker.js's engine seam to the native branch (and
+ *   dead-code-eliminates the WASM one);
+ * - the inject binds the seam's `__desktopNativeCreateEngine` identifier to
+ *   the sidecar's engine factory.
+ * Deterministic committed artifact: always minified, like desktop/worker.js.
+ */
+export const buildDesktopNativeWorkerSource = async () => {
+  const result = await esbuild.build({
+    entryPoints: [resolve('core', 'native', 'native-entry.js')],
+    bundle: true,
+    format: 'esm',
+    platform: 'neutral',
+    target: 'es2022',
+    external: ['tjs:*'],
+    minify: true,
+    write: false,
+    define: {
+      'import.meta.env.DESKTOP_NATIVE_ENGINE': 'true',
+    },
+    inject: [resolve('core', 'native', 'native-engine-inject.js')],
+    loader: { '.js': 'js', '.ts': 'ts' },
+  });
+  if (result.outputFiles.length !== 1) {
+    throw new Error(`Expected one desktop native worker output, received ${result.outputFiles.length}`);
+  }
+  const bundledSource = result.outputFiles[0].text;
+  // Same freshness-marker convention as the website worker bundle: hash the
+  // complete generated bundle so any imported helper change changes the marker.
+  const digest = createHash('sha256').update(bundledSource).digest('hex');
+  return `/*! sqlite-explorer-native-worker-sha256:${digest} */\n${bundledSource}`;
+};
+
+const bundleDesktopNativeWorker = async () => {
+  const outputDir = resolve('desktop');
+  fs.mkdirSync(outputDir, { recursive: true });
+  fs.writeFileSync(resolve(outputDir, 'native-worker-desktop.js'), await buildDesktopNativeWorkerSource());
+  console.log('Bundled desktop native worker: desktop/native-worker-desktop.js');
+};
+
+/**
  * Validate that required output files exist after build.
  * Throws error if any required files are missing.
  */
@@ -531,6 +590,7 @@ const validateBuildOutputs = () => {
     'website/public/sqlite-viewer/sql-wasm.wasm',
     'desktop/viewer.html',
     'desktop/worker.js',
+    'desktop/native-worker-desktop.js',
     'desktop/sql-wasm.js',
     'desktop/sql-wasm.wasm',
     'desktop/codicons/codicon.css'
@@ -582,6 +642,10 @@ const compileExt = async (target) => {
   // racing that write — it runs here instead, after the whole parallel batch
   // (bundleWebDemoWorker included) has settled.
   await bundleDesktopViewer();
+
+  // Independent of the parallel outputs, but kept sequential alongside the
+  // other desktop bundling for the same post-batch determinism.
+  await bundleDesktopNativeWorker();
 
   // Validate all required outputs exist
   validateBuildOutputs();

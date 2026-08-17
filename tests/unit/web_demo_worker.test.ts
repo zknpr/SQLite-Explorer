@@ -49,7 +49,13 @@ function readCurrentWorkerBundle(): Promise<string> {
         format: 'iife',
         target: 'es2020',
         minify: true,
-        write: false
+        write: false,
+        define: {
+            // Mirrors bundleWebDemoWorker in scripts/build.mjs (this rebuild is
+            // byte-compared against its committed output): false folds the
+            // worker's desktop-native engine branch away.
+            'import.meta.env.DESKTOP_NATIVE_ENGINE': 'false'
+        }
     });
     assert.strictEqual(rendered.outputFiles.length, 1);
     const renderedSource = rendered.outputFiles[0].text;

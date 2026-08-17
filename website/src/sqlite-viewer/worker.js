@@ -738,32 +738,49 @@ async function initializeDatabase(filename, config) {
   );
   closedCellReadSessionIds.clear();
 
-  // Initialize sql.js with WASM
-  if (!SQL) {
-    // Load sql.js script
-    importScripts(SQL_JS_GLUE_URL);
+  // ENGINE SEAM. Exactly one of the two branches below survives into any
+  // given bundle; esbuild's define-driven dead-code elimination removes the
+  // other. Every WASM build (bundleWebDemoWorker in scripts/build.mjs and the
+  // worker unit tests' mirrored esbuild configs) defines
+  // `import.meta.env.DESKTOP_NATIVE_ENGINE` as false, which folds this whole
+  // `if` away and keeps those bundles BYTE-IDENTICAL to the pre-seam output —
+  // a build gate, enforced by web_demo_worker.test.ts's freshness hash. The
+  // desktop-native sidecar bundle (bundleDesktopNativeWorker) defines it true
+  // and `inject`s core/native/native-engine-inject.js, which binds the free
+  // identifier `__desktopNativeCreateEngine` to the sidecar's engine factory
+  // (a tjs:sqlite-backed sql.js shim bound to the argv-designated file). The
+  // rest of this file runs unchanged against whichever engine the branch
+  // produced.
+  if (import.meta.env.DESKTOP_NATIVE_ENGINE) {
+    ({ SQL, db } = await __desktopNativeCreateEngine(config));
+  } else {
+    // Initialize sql.js with WASM
+    if (!SQL) {
+      // Load sql.js script
+      importScripts(SQL_JS_GLUE_URL);
 
-    // Initialize with WASM binary if provided
-    const sqlConfig = {};
-    if (config.wasmBinary) {
-      sqlConfig.wasmBinary = config.wasmBinary;
-    } else {
-      sqlConfig.locateFile = () => SQL_JS_WASM_URL;
+      // Initialize with WASM binary if provided
+      const sqlConfig = {};
+      if (config.wasmBinary) {
+        sqlConfig.wasmBinary = config.wasmBinary;
+      } else {
+        sqlConfig.locateFile = () => SQL_JS_WASM_URL;
+      }
+
+      SQL = await self.initSqlJs(sqlConfig);
     }
 
-    SQL = await self.initSqlJs(sqlConfig);
-  }
-
-  // Create the database. A File handle runs the open ladder (WAL sniff,
-  // then paged-vs-buffer by size — see src/core/paged-open.ts); inline
-  // bytes keep today's buffer path unchanged.
-  if (isFileLike(config.file)) {
-    storageMode = openDatabaseFromFile(config.file, resolveOpenLimits(config));
-  } else if (config.content && config.content.length > 0) {
-    db = new SQL.Database(config.content);
-  } else {
-    // Create empty database
-    db = new SQL.Database();
+    // Create the database. A File handle runs the open ladder (WAL sniff,
+    // then paged-vs-buffer by size — see src/core/paged-open.ts); inline
+    // bytes keep today's buffer path unchanged.
+    if (isFileLike(config.file)) {
+      storageMode = openDatabaseFromFile(config.file, resolveOpenLimits(config));
+    } else if (config.content && config.content.length > 0) {
+      db = new SQL.Database(config.content);
+    } else {
+      // Create empty database
+      db = new SQL.Database();
+    }
   }
   if (readOnlyMode) {
     // Defense in depth for every current and future RPC path. Public mutators
