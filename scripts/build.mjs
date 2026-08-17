@@ -494,7 +494,7 @@ const bundleDesktopViewer = async () => {
     .replace('<!--HEAD-->', () => codiconLink)
     .replace('<!--STYLES-->', () => finalCss)
     .replace('<!--SCRIPTS-->', () => finalJs)
-    .replace('nonce="<!--NONCE-->"', ''); // Tauri injects CSP hashes for inline scripts in bundled assets
+    .replaceAll('nonce="<!--NONCE-->"', ''); // Tauri injects CSP hashes for inline scripts in bundled assets
 
   fs.writeFileSync(outputPath, bundled, 'utf-8');
   console.log('Bundled desktop viewer: desktop/viewer.html');
