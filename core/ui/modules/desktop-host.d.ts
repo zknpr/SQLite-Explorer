@@ -62,6 +62,23 @@ export interface DesktopHostBridge {
     nativeRpc?(envelopeJson: string): Promise<string>;
     /** Shuts the sidecar down; idempotent. */
     nativeClose?(): Promise<void>;
+
+    // ---- native out-of-band export (tjs sidecar) — the whole-DB image / the
+    // ---- table bytes would exceed the 16 MiB stdio frame cap if framed back,
+    // ---- so the shell shows the save dialog, drives the sidecar to write the
+    // ---- export to a shell-owned temp, and atomically moves it to the picked
+    // ---- dest; only a small result crosses the pipe. Optional like the other
+    // ---- native members. `savedAs` is the picked file's basename;
+    // ---- { success:false } means the user cancelled the dialog.
+
+    /** Whole-DB export (native): dialog → sidecar VACUUM INTO temp → atomic move to dest. */
+    nativeExportDatabase?(): Promise<{ success: boolean; savedAs?: string }>;
+    /**
+     * Table export (native): `argsJson` is `JSON.stringify` of the exportTable
+     * args array (with the host-injected `maxExportBytes` ceiling). The sidecar
+     * runs exportTable in-process and streams its chunks to the shell temp.
+     */
+    nativeExportTable?(argsJson: string): Promise<{ success: boolean; savedAs?: string }>;
 }
 
 /** Options accepted by {@link createDesktopHost}. */

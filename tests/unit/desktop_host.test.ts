@@ -763,13 +763,18 @@ type NativeLog = {
   opens: Array<{ path: string; readOnly: boolean }>;
   closes: number;
   envelopes: Envelope[];
+  // Out-of-band export route (Task 3): the whole-DB call takes no args; the
+  // table call carries the JSON.stringify'd exportTable args so tests can
+  // assert the host-injected maxExportBytes crossed WITHOUT any byte frame.
+  exportDbCalls: number;
+  exportTableArgs: string[];
 };
 
 function makeNativeBridgeMembers(
   handlers: Record<string, (args: unknown[]) => unknown>,
   opts: { available?: boolean; openError?: string } = {}
 ) {
-  const log: NativeLog = { opens: [], closes: 0, envelopes: [] };
+  const log: NativeLog = { opens: [], closes: 0, envelopes: [], exportDbCalls: 0, exportTableArgs: [] };
   const members = {
     nativeAvailable: async () => opts.available ?? true,
     nativeOpen: async (path: string, readOnly: boolean) => {
@@ -791,7 +796,15 @@ function makeNativeBridgeMembers(
         return respond(false, undefined, error instanceof Error ? error.message : String(error));
       }
     },
-    nativeClose: async () => { log.closes += 1; }
+    nativeClose: async () => { log.closes += 1; },
+    // Shell-owned out-of-band export: the sidecar writes to a shell temp and
+    // the shell moves it to the dialog-picked dest, returning the dest's
+    // basename as savedAs. The default is a clean success; tests override for
+    // cancel/empty scenarios. Deliberately NOT reachable by the framed
+    // saveFileAs path — asserting exportDbCalls/exportTableArgs proves the host
+    // took this route instead of framing bytes.
+    nativeExportDatabase: async () => { log.exportDbCalls += 1; return { success: true, savedAs: 'export.db' }; },
+    nativeExportTable: async (argsJson: string) => { log.exportTableArgs.push(argsJson); return { success: true, savedAs: 'export.csv' }; }
   };
   return { members, log };
 }
@@ -1206,36 +1219,106 @@ test('a genuine BEGIN failure fails the mutation before it executes', async () =
   assert.equal(host.hasUnsavedChanges(), false);
 });
 
-test('native exportDb with an open transaction prompts to save first; cancel aborts, accept commits then exports', async () => {
-  const exportCalls: unknown[] = [];
+// ---------------------------------------------------------------------------
+// Native out-of-band export route (Task 3): native exportDatabase/exportTable
+// would return the whole result as ONE stdio frame, capped at 16 MiB, so a
+// large export fails on native where WASM does 512 MiB. The host instead routes
+// native exports through bridge.nativeExportDatabase()/nativeExportTable(json)
+// — the shell drives the sidecar to write to a shell-owned temp and moves it to
+// the dialog-picked dest; only a {success, savedAs} result crosses the pipe.
+// The WASM path (existing tests above) is UNCHANGED: callWorker + saveFileAs.
+// ---------------------------------------------------------------------------
+
+test('native whole-DB export routes through bridge.nativeExportDatabase, never framing bytes via saveFileAs', async () => {
+  let saveFileAsCalls = 0;
   const { host, nativeLog } = makeNativeHost(
-    {
-      updateCell: () => 1,
-      exportDatabase: () => { exportCalls.push(1); return { __type: 'Uint8Array', base64: 'AQ==' }; }
-    },
+    // A framed exportDatabase must never run on native — throw if the host
+    // wrongly reaches for it.
+    { exportDatabase: () => { throw new Error('framed exportDatabase must not run on native'); } },
     {},
-    { saveFileAs: async () => '/tmp/out.db' }
+    { saveFileAs: async () => { saveFileAsCalls += 1; return '/tmp/out'; } }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');            // clean native session, no open txn
+
+  const res = await host.invoke('exportDb', ['y.db']) as Record<string, unknown>;
+  assert.equal(res.success, true);
+  assert.equal(res.savedAs, 'export.db');               // shell-provided basename, surfaced verbatim
+  assert.equal(nativeLog.exportDbCalls, 1);             // the out-of-band bridge call
+  assert.equal(saveFileAsCalls, 0);                     // no framed byte save
+  assert.equal(nativeMethods(nativeLog).includes('exportDatabase'), false);  // no worker frame crossed
+});
+
+test('native table export routes through bridge.nativeExportTable with maxExportBytes in the serialized args, never framing bytes via saveFileAs', async () => {
+  let saveFileAsCalls = 0;
+  const { host, nativeLog } = makeNativeHost(
+    { exportTable: () => { throw new Error('framed exportTable must not run on native'); } },
+    {},
+    { saveFileAs: async () => { saveFileAsCalls += 1; return '/tmp/u.csv'; } }
   );
   await host.start();
   host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
   await host.openFromShellPath('/tmp/y.db');
-  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  const res = await host.invoke(
+    'exportTable',
+    [{ table: 'users' }, ['a', 'b'], null, null, { format: 'csv', header: false }]
+  ) as Record<string, unknown>;
+  assert.equal(res.success, true);
+  assert.equal(res.savedAs, 'export.csv');
+  assert.equal(saveFileAsCalls, 0);                     // no framed byte save
+  assert.equal(nativeMethods(nativeLog).includes('exportTable'), false);   // no worker frame crossed
+
+  // The serialized args carry the desktop 512 MiB ceiling (so the sidecar's
+  // in-process exportTable isn't clipped by the worker's 16 MiB web-demo cap)
+  // AND preserve the caller-passed options.
+  assert.equal(nativeLog.exportTableArgs.length, 1);
+  const serialized = JSON.parse(nativeLog.exportTableArgs[0]) as unknown[];
+  const exportOptions = serialized[4] as Record<string, unknown>;
+  assert.equal(exportOptions.maxExportBytes, 536870912);
+  assert.equal(exportOptions.format, 'csv');
+  assert.equal(exportOptions.header, false);
+});
+
+test('native exportDb save-first-if-dirty: cancel aborts before the export; accept COMMITs, THEN routes through nativeExportDatabase', async () => {
+  const order: string[] = [];
+  const { host, nativeLog, execTxnSql } = makeNativeHost(
+    {
+      updateCell: () => 1,
+      // Record the moment the session COMMIT reaches the engine, then defer to
+      // the shared txn fake (execTxnSql is only referenced at run time — after
+      // makeNativeHost has assigned it).
+      runQuery: (args) => {
+        if (String(args[0]).trim().toUpperCase() === 'COMMIT') order.push('commit');
+        return execTxnSql(args[0]);
+      }
+    },
+    {},
+    { nativeExportDatabase: async () => { order.push('export'); return { success: true, savedAs: 'y.db' }; } }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);   // dirty: session txn open
 
   const originalConfirm = (globalThis as { confirm?: unknown }).confirm;
   try {
     (globalThis as { confirm?: unknown }).confirm = () => false;
     const refused = await host.invoke('exportDb', ['y.db']) as Record<string, unknown>;
     assert.equal(refused.success, false);
-    assert.equal(exportCalls.length, 0);                // nothing exported on cancel
+    assert.deepEqual(order, []);                         // nothing committed, nothing exported
+    assert.equal(host.hasUnsavedChanges(), true);        // still dirty — the snapshot was never taken
 
     (globalThis as { confirm?: unknown }).confirm = () => true;
     const okResult = await host.invoke('exportDb', ['y.db']) as Record<string, unknown>;
     assert.equal(okResult.success, true);
-    assert.equal(exportCalls.length, 1);
-    // The COMMIT (the save) must precede the export envelope.
-    const methods = nativeMethods(nativeLog);
+    assert.equal(okResult.savedAs, 'y.db');
+    // The save (COMMIT) must precede the out-of-band export — never export an
+    // uncommitted, snapshot-inconsistent session.
+    assert.deepEqual(order, ['commit', 'export']);
     assert.equal(nativeSql(nativeLog).includes('COMMIT'), true);
-    assert.equal(methods.lastIndexOf('runQuery') < methods.lastIndexOf('exportDatabase'), true);
+    assert.equal(nativeMethods(nativeLog).includes('exportDatabase'), false);   // still no framed bytes
     assert.equal(host.hasUnsavedChanges(), false);
   } finally {
     if (originalConfirm === undefined) delete (globalThis as { confirm?: unknown }).confirm;
@@ -1243,38 +1326,56 @@ test('native exportDb with an open transaction prompts to save first; cancel abo
   }
 });
 
-test('native exportDb decodes the sidecar Uint8Array marker back into real bytes', async () => {
-  let savedBytes: Uint8Array | null = null;
+test('native export dialog cancel ({success:false}) is a clean no-op — no error, no savedAs — for both DB and table exports', async () => {
   const { host } = makeNativeHost(
-    { exportDatabase: () => ({ __type: 'Uint8Array', base64: 'AQID' }) },   // [1,2,3]
     {},
-    { saveFileAs: async (_n: string, b: Uint8Array) => { savedBytes = b; return '/tmp/out.db'; } }
+    {},
+    {
+      nativeExportDatabase: async () => ({ success: false }),
+      nativeExportTable: async () => ({ success: false })
+    }
   );
   await host.start();
   host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
   await host.openFromShellPath('/tmp/y.db');
-  await host.invoke('exportDb', ['y.db']);
-  assert.deepEqual(savedBytes, new Uint8Array([1, 2, 3]));
+  const db = await host.invoke('exportDb', ['y.db']) as Record<string, unknown>;
+  assert.deepEqual(db, { success: false, savedAs: undefined });
+  const table = await host.invoke('exportTable', [{ table: 't' }, ['a'], null, null, { format: 'csv' }]) as Record<string, unknown>;
+  assert.deepEqual(table, { success: false, savedAs: undefined });
 });
 
-test('native exportDb is refused while a cell read session is open (dispatch-guard parity)', async () => {
+test('native empty-table export surfaces as a successful (0-byte) export, not an error', async () => {
+  // Parity with the WASM route's empty Blob: the sidecar writes a 0-byte file
+  // and the shell replies {success:true} — the host must NOT treat empty as
+  // failure.
   const { host } = makeNativeHost(
-    {
-      openCellReadSession: () => ({ sessionId: 's1', byteLength: 10, storageClass: 'blob' }),
-      closeCellReadSession: () => ({ success: true }),
-      exportDatabase: () => ({ __type: 'Uint8Array', base64: 'AQ==' })
-    },
     {},
-    { saveFileAs: async () => '/tmp/out.db' }
+    {},
+    { nativeExportTable: async () => ({ success: true, savedAs: 'empty.csv' }) }
   );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  const res = await host.invoke('exportTable', [{ table: 'empty' }, ['a'], null, null, { format: 'csv' }]) as Record<string, unknown>;
+  assert.deepEqual(res, { success: true, savedAs: 'empty.csv' });
+});
+
+test('native exportDb is refused while a cell read session is open (dispatch-guard parity), then routes out-of-band once closed', async () => {
+  const { host, nativeLog } = makeNativeHost({
+    openCellReadSession: () => ({ sessionId: 's1', byteLength: 10, storageClass: 'blob' }),
+    closeCellReadSession: () => ({ success: true })
+  });
   await host.start();
   host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
   await host.openFromShellPath('/tmp/y.db');
   await host.invoke('openCellReadSession', [{ table: 't', rowId: 1, column: 'c' }]);
+  // Refused BEFORE any export is attempted — the out-of-band bridge is never hit.
   await assert.rejects(() => host.invoke('exportDb', ['y.db']), /cell read snapshot is active/);
+  assert.equal(nativeLog.exportDbCalls, 0);
   await host.invoke('closeCellReadSession', ['s1']);
   const ok = await host.invoke('exportDb', ['y.db']) as Record<string, unknown>;
   assert.equal(ok.success, true);
+  assert.equal(nativeLog.exportDbCalls, 1);             // now the out-of-band route runs
 });
 
 test('initialize and refreshContent surface the active engine for the badge', async () => {

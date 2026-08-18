@@ -802,6 +802,16 @@ export function createDesktopHost({ bridge, createWorker }) {
                     if (saveFirst !== true) return { success: false };
                     await saveToDisk();
                 }
+                // Out-of-band file route: the sidecar VACUUM INTOs the whole-DB
+                // image to a shell-owned temp and the shell atomically moves it
+                // to the dialog-picked dest — the bytes NEVER cross the 16 MiB
+                // stdio frame cap a framed exportDatabase would hit (a framed
+                // export > 16 MiB fails on native where WASM's structured-clone
+                // path does 512 MiB; this gives native the same reach). The
+                // shell owns the dialog and returns savedAs already basenamed;
+                // { success:false } is a clean dialog-cancel no-op.
+                const result = await bridge.nativeExportDatabase();
+                return { success: result?.success === true, savedAs: result?.savedAs };
             }
             const bytes = await callWorker('exportDatabase', [currentName]);
             const target = await bridge.saveFileAs(filename || currentName, bytes);
@@ -810,8 +820,23 @@ export function createDesktopHost({ bridge, createWorker }) {
         async exportTable(...args) {
             // Host policy overrides anything UI-passed (nothing passes one today):
             // raise the worker's default web-demo cap to the desktop ceiling.
+            // Injected BEFORE the native route serializes the args: the sidecar
+            // runs exportTable IN-PROCESS, so the worker's 16 MiB web-demo cap
+            // bites without it (the whole-DB VACUUM INTO export has no such arg
+            // and is uncapped).
             args = [...args];
             args[4] = { ...(args[4] ?? {}), maxExportBytes: DESKTOP_EXPORT_MAX_BYTES };
+            if (engine === 'native') {
+                // Out-of-band file route: the sidecar runs the (byte-frozen)
+                // exportTable in-process and writes the chunks to a shell-owned
+                // temp; only a path crosses the pipe, beating the 16 MiB frame
+                // cap the assembled bytes would hit. An empty table is a 0-byte
+                // file with success:true — a successful (empty) export, not an
+                // error; { success:false } is a clean dialog-cancel no-op. The
+                // shell owns the dialog and returns savedAs already basenamed.
+                const result = await bridge.nativeExportTable(JSON.stringify(args));
+                return { success: result?.success === true, savedAs: result?.savedAs };
+            }
             const result = await callWorker('exportTable', args);
             const text = result.contentChunks.join('');
             const target = await bridge.saveFileAs(result.filename, new TextEncoder().encode(text));
