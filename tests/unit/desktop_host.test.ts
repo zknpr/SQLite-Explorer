@@ -3325,6 +3325,69 @@ test('the unsaved summary is pushed to the shell on every dirty-state and regist
   assert.equal(host.hasUnsavedChanges(), true);
 });
 
+test('the same push reports which files this window has open', async () => {
+  // The shell refuses a second window opening a file this one already has —
+  // two editable copies of one database silently overwrite each other — and
+  // for the WASM engine this push is the ONLY thing it can see. It has to
+  // report opens AND closes, or a legitimate close-then-reopen-elsewhere
+  // stays refused forever.
+  const paths: Array<string[]> = [];
+  const { host } = makeHost({ updateCell: () => 7 }, {
+    setUnsavedState: async (_hasUnsaved: boolean, _count: number, openPaths?: string[]) => {
+      paths.push(openPaths ?? ['<absent>']);
+    }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  // The boot placeholder has no file, so there is nothing to collide over.
+  assert.deepEqual(paths.at(-1), [], 'a path-less database must not be reported');
+
+  await host.openFromShellPath('/tmp/first.db');
+  assert.deepEqual(paths.at(-1), ['/tmp/first.db']);
+  const first = host.activeDatabaseId();
+  assert.ok(first, 'the open must have produced an active database');
+  await host.openFromShellPath('/tmp/second.db');
+  assert.deepEqual(paths.at(-1)?.slice().sort(), ['/tmp/first.db', '/tmp/second.db']);
+
+  // A close drops out of the list — that is the release.
+  await host.closeDatabase(first);
+  assert.deepEqual(paths.at(-1), ['/tmp/second.db']);
+
+  // …and it is an ARRAY on every push, never undefined, so the shell can tell
+  // "nothing open" apart from "this host does not report".
+  assert.ok(paths.every(entry => Array.isArray(entry) && entry[0] !== '<absent>'));
+});
+
+test('a failed open reports the registry it did NOT gain', async () => {
+  // The shell holds the file from the moment it hands over the bytes (its
+  // cross-window guard cannot wait for a push that has not happened yet). If
+  // the open then throws, only a push says so — otherwise the file stays
+  // unopenable anywhere until that hold times out.
+  const paths: Array<string[]> = [];
+  let failNext = false;
+  const { host } = makeHost({
+    initializeDatabase: () => {
+      if (failNext) throw new Error('corrupt image');
+      return { isReadOnly: false, storage: 'memory' };
+    }
+  }, {
+    setUnsavedState: async (_h: boolean, _c: number, openPaths?: string[]) => {
+      paths.push(openPaths ?? []);
+    }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+
+  failNext = true;
+  const before = paths.length;
+  await assert.rejects(host.openFromShellPath('/tmp/broken.db'), /corrupt image/);
+  assert.ok(paths.length > before, 'the failure has to push, not stay silent');
+  assert.ok(
+    !paths.at(-1)?.includes('/tmp/broken.db'),
+    'a database that failed to open must not be reported as open'
+  );
+});
+
 test('a shell without setUnsavedState still works — the push is optional', async () => {
   // Older shells (and the dev harness) omit it; an unconditional call would
   // throw inside updateTitle and take every edit down with it.

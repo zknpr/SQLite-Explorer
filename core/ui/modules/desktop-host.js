@@ -676,17 +676,30 @@ export function createDesktopHost({ bridge, createWorker }) {
      */
     function notifyDatabasesChanged() {
         const list = listDatabases();
-        // Push the unsaved summary to the shell on the same signal. The shell
-        // needs it SYNCHRONOUSLY when the OS asks whether a window may close —
-        // it cannot await the page at that moment — so the answer has to already
-        // be there. This is the one place that sees every transition:
+        // Push the window's whole registry summary to the shell on this one
+        // signal. It is the only place that sees every transition:
         // `updateTitle` calls it on every dirty-state change (it renders the
         // " — Edited" suffix from the same flag), and the registry lifecycle
-        // calls it on open/close/switch. Counting `isDirty` over the whole list
-        // matches `hasUnsavedChanges` exactly — both walk every entry, including
-        // the retained scratch placeholder that no tab can reach.
+        // calls it on open/close/switch.
+        //
+        // unsaved — the shell needs it SYNCHRONOUSLY when the OS asks whether
+        // a window may close (it cannot await the page at that moment), so the
+        // answer has to already be there. Counting `isDirty` over the whole
+        // list matches `hasUnsavedChanges` exactly — both walk every entry,
+        // including the retained scratch placeholder that no tab can reach.
+        //
+        // paths — which files this window has open, whichever engine serves
+        // them. The shell has no visible open/close pair for the WASM engine,
+        // so THIS is how it learns; it replaces this window's set wholesale
+        // and refuses a second window opening any of them, because two
+        // editable copies of one database silently overwrite each other. A
+        // path-less database (the boot placeholder, a dropped file) reports
+        // null and is dropped here — it has no file to collide over.
         const unsaved = list.filter(database => database.isDirty).length;
-        bridge.setUnsavedState?.(unsaved > 0, unsaved)
+        const paths = list
+            .map(database => database.path)
+            .filter(path => typeof path === 'string' && path.length > 0);
+        bridge.setUnsavedState?.(unsaved > 0, unsaved, paths)
             ?.catch(error => console.warn('setUnsavedState failed:', error));
         notifyWebview('databasesChanged', [list])
             .catch(error => console.warn('databasesChanged notification failed:', error));
@@ -1155,6 +1168,12 @@ export function createDesktopHost({ bridge, createWorker }) {
             await initializeWorkerDatabase(entry, name, { content: bytes });
         } catch (error) {
             await disposeEntryTransport(entry);
+            // The read above made the shell hold this file for this window
+            // (its cross-window guard cannot wait for a push that has not
+            // happened yet). The open failed, so say so: the registry never
+            // gained the entry, and pushing the unchanged list is what
+            // releases the hold instead of leaving it to time out.
+            notifyDatabasesChanged();
             throw error;
         }
         await commitEntry(entry);

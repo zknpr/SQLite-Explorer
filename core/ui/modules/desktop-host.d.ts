@@ -64,12 +64,22 @@ export interface DesktopHostBridge {
      */
     viewerReady?(): Promise<void>;
     /**
-     * Reports how many open databases have unsaved changes, so the shell can
-     * answer the OS synchronously when the window is asked to close (it cannot
-     * await the page at that point). Pushed on every dirty-state and registry
+     * The window's registry summary, pushed on every dirty-state and registry
      * change. Optional for the same reason as {@link onOpenFile}.
+     *
+     * `hasUnsaved`/`count` — how many open databases have unsaved changes, so
+     * the shell can answer the OS synchronously when the window is asked to
+     * close (it cannot await the page at that point).
+     *
+     * `openPaths` — the files this window currently has open, any engine,
+     * path-less databases omitted. The shell replaces THIS window's set with
+     * it wholesale and refuses another window opening any of them: two
+     * editable copies of one database silently overwrite each other, and the
+     * shell has no other way to see a WASM close. Sending a shorter list is
+     * how a close is reported; sending none at all (an older host) leaves the
+     * shell's previous set standing.
      */
-    setUnsavedState?(hasUnsaved: boolean, count: number): Promise<void>;
+    setUnsavedState?(hasUnsaved: boolean, count: number, openPaths?: string[]): Promise<void>;
 
     // ---- native engine (tjs sidecar) — all four present or the host stays
     // ---- on WASM. Implemented by the shell's bridge.js over the Rust
