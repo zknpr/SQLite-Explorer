@@ -4698,6 +4698,45 @@ describe('web demo worker engine defects', () => {
         );
     });
 
+    it('distinguishes an ABSENT dropDependentIndexes from an explicit null', async () => {
+        // The desktop half of this is in desktop_api.test.ts. The two halves
+        // meet on the wire: the native engine carries the argument list as
+        // JSON, `JSON.stringify` turns a trailing `undefined` into `null`, and
+        // the guard below is keyed on `undefined`. That mismatch broke column
+        // drops for the COMMON case — a column no index depends on — because
+        // the caller sent `[table, columns, undefined]` meaning "absent".
+        // Neither side is wrong on its own, which is why this needs pinning on
+        // both: the guard must keep rejecting `null` (it is not a list), and
+        // omitting the argument must keep working.
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, note TEXT)');
+        await worker.invoke('runQuery', "INSERT INTO people VALUES (1, 'n', 'keep me')");
+
+        await assert.rejects(
+            worker.invoke('deleteColumns', 'people', ['note'], null),
+            /dropDependentIndexes must be an array of index names/,
+            'null is not a list of index names and must stay refused'
+        );
+        // Refused, not half-applied.
+        assert.deepStrictEqual(
+            Array.from(
+                (await worker.invoke('runQuery', "SELECT name FROM pragma_table_info('people')"))[0].rows,
+                (row: unknown[]) => row[0]
+            ),
+            ['id', 'name', 'note']
+        );
+
+        // Absent: the early-out fires and the drop goes through.
+        await worker.invoke('deleteColumns', 'people', ['note']);
+        assert.deepStrictEqual(
+            Array.from(
+                (await worker.invoke('runQuery', "SELECT name FROM pragma_table_info('people')"))[0].rows,
+                (row: unknown[]) => row[0]
+            ),
+            ['id', 'name']
+        );
+    });
+
     it('says a column drop cannot be replayed, without calling itself a demo', async () => {
         // The desktop records DDL as a history BARRIER and never asks the worker
         // to replay it, so reaching this is a contract breach — but the message

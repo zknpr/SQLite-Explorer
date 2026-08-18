@@ -246,6 +246,31 @@ body {
     flex: 1;
 }
 
+/*
+ * Index rows pair two identifiers — the index name and the table it is on
+ * (`renderIndexesList` in modules/sidebar.js). Both were unstyled inline
+ * spans, so they rendered flush against each other and the sidebar showed
+ * `idx_people_agepeople`: a name that does not exist, in the one section with
+ * no other place to read the index's name. `min-width: 0` on both is what lets
+ * the ellipsis actually engage inside a flex row.
+ */
+.list-item .item-content {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.list-item .item-detail {
+    color: var(--text-secondary);
+    font-size: 11px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 .view-item-actions {
     display: flex;
     align-items: center;
@@ -1000,6 +1025,18 @@ body {
 
 .modal-overlay.hidden {
     display: none;
+}
+
+/*
+ * The destructive-operation confirmation (modules/modals.js) is always opened
+ * from INSIDE an operation another modal already started — a column drop runs
+ * while "Confirm Delete" is up, an oversized-cell replacement while the blob
+ * inspector's .cell-preview-modal (z-index 1100) is up — so it has to sit above
+ * EVERY other layer, not just the 1000 the plain overlays share. A confirmation
+ * the user cannot see is the bug this whole dialog exists to fix.
+ */
+.confirm-modal-overlay {
+    z-index: 1200;
 }
 
 .modal-dialog {

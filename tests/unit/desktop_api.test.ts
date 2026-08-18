@@ -1,6 +1,43 @@
-import { test } from 'node:test';
+import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { initDesktopApi, backendApi, getVsCodeState, saveVsCodeState } from '../../core/ui/modules/desktop-api.js';
+import { encodeFrameValue, decodeFrameValue } from '../../core/native/frame-codec.js';
+import { FakeElement, installFakeDom } from './helpers/fake-dom';
+
+// The destructive-operation prompts render into the page (see
+// destructive_confirm_dialog.test.ts for why `window.confirm` cannot be used
+// on the desktop), so these tests need a document to render into.
+const dom = installFakeDom();
+const modalsModulePath = '../../core/ui/modules/modals.js';
+
+before(async () => {
+  const modals = await import(modalsModulePath);
+  modals.initModals();
+});
+
+/** Settle every pending microtask so an in-flight RPC chain reaches its prompt. */
+const flush = () => new Promise(resolve => setImmediate(resolve));
+
+async function presentedConfirmation(): Promise<string> {
+  await flush();
+  const overlay = dom.getElementById('destructiveConfirmModal');
+  assert.ok(
+    overlay && !overlay.classList.contains('hidden'),
+    'the operation ran without ever presenting its confirmation'
+  );
+  const body = [...overlay.walk()].find(node => node.className.includes('modal-body'));
+  assert.ok(body, 'the confirmation has no body');
+  return body.children.map(line => line.textContent).join('\n');
+}
+
+function answerConfirmation(approve: boolean): void {
+  const overlay = dom.getElementById('destructiveConfirmModal');
+  assert.ok(overlay, 'no confirmation is open');
+  const wanted = approve ? 'btn-danger' : 'modal-cancel';
+  const target = [...overlay.walk()].find(node => node.className.includes(wanted));
+  assert.ok(target, `the confirmation has no ${wanted} control`);
+  dom.dispatchClick(target as FakeElement);
+}
 
 function fakeHost() {
   const calls: Array<{ method: string; args: unknown[] }> = [];
@@ -125,18 +162,18 @@ test('deleteColumns names the indexes it would drop and passes them to the engin
     dependentObjects: [{ type: 'view', identifier: 'active_users' }]
   });
   initDesktopApi(host as never);
-  const prompts: string[] = [];
-  (globalThis as Record<string, unknown>).window = {
-    confirm: (message: string) => { prompts.push(message); return true; }
-  };
 
-  await backendApi.deleteColumns('users', ['email']);
+  const pending = backendApi.deleteColumns('users', ['email']);
+  const prompt = await presentedConfirmation();
 
-  assert.equal(prompts.length, 1);
-  assert.match(prompts[0], /idx_users_email/);
-  assert.match(prompts[0], /view active_users/);
+  assert.match(prompt, /idx_users_email/);
+  assert.match(prompt, /view active_users/);
   // The undo cost, stated BEFORE the drop rather than discovered after ⌘Z.
-  assert.match(prompts[0], /cannot be undone/);
+  assert.match(prompt, /cannot be undone/);
+
+  answerConfirmation(true);
+  await pending;
+
   // …and the confirmed list is what actually reaches the engine. Without it
   // SQLite refuses the drop outright ("error in index ... no such column").
   assert.deepEqual(host.calls.at(-1), {
@@ -148,32 +185,116 @@ test('deleteColumns names the indexes it would drop and passes them to the engin
 test('declining the prompt cancels honestly and touches nothing', async () => {
   const host = confirmingHost({ indexes: [], dependentObjects: [] });
   initDesktopApi(host as never);
-  (globalThis as Record<string, unknown>).window = { confirm: () => false };
+
+  const pending = backendApi.deleteColumns('users', ['email']);
+  await presentedConfirmation();
+  answerConfirmation(false);
 
   // `{cancelled: true}` is the shape crud.js already understands (the VS Code
   // host has always answered it that way), so the grid reports "Delete
   // cancelled" and does not reload.
-  assert.deepEqual(await backendApi.deleteColumns('users', ['email']), { cancelled: true });
+  assert.deepEqual(await pending, { cancelled: true });
   assert.deepEqual(host.calls.map(call => call.method), ['findColumnDependencies']);
 });
 
-test('a column with no dependencies still gets the undo warning, and no index list', async () => {
+test('a column with no dependencies OMITS the third argument entirely', async () => {
   const host = confirmingHost({ indexes: [], dependentObjects: [] });
   initDesktopApi(host as never);
-  const prompts: string[] = [];
-  (globalThis as Record<string, unknown>).window = {
-    confirm: (message: string) => { prompts.push(message); return true; }
-  };
 
-  await backendApi.deleteColumns('users', ['email', 'phone']);
-  assert.match(prompts[0], /cannot be undone/);
-  assert.doesNotMatch(prompts[0], /will be dropped first/);
-  // undefined, not [] — the worker's third parameter is optional and an empty
-  // list would still be a list.
+  const pending = backendApi.deleteColumns('users', ['email', 'phone']);
+  const prompt = await presentedConfirmation();
+  assert.match(prompt, /cannot be undone/);
+  assert.doesNotMatch(prompt, /will be dropped first/);
+  answerConfirmation(true);
+  await pending;
+
+  // TWO arguments, not three-with-a-hole. This lane used to send
+  // `[table, columns, undefined]`, reasoning that the worker's third parameter
+  // is optional — true in JavaScript, false on the wire. See the round-trip
+  // test below: JSON has no `undefined`, so the hole arrived as an explicit
+  // `null` and tripped the worker's `dropDependentIndexes !== undefined`
+  // guard. Every desktop user dropping a column with no dependent index — the
+  // common case — got "dropDependentIndexes must be an array of index names".
   assert.deepEqual(host.calls.at(-1), {
     method: 'deleteColumns',
-    args: ['users', ['email', 'phone'], undefined]
+    args: ['users', ['email', 'phone']]
   });
+});
+
+/** Exactly what desktop-host.js's `callWorker` does for a native engine. */
+function acrossTheNativeWire(method: string, args: unknown[]): unknown[] {
+  const message = {
+    channel: 'rpc',
+    content: { kind: 'invoke', messageId: 'rpc_1', targetMethod: method, payload: args }
+  };
+  const wire = JSON.stringify(encodeFrameValue(message));
+  const decoded = decodeFrameValue(JSON.parse(wire)) as {
+    content: { payload: unknown[] };
+  };
+  return decoded.content.payload;
+}
+
+test('the deleteColumns argument list survives the native JSON transport intact', async () => {
+  // The bug was a TRANSPORT bug, so assert against the transport rather than
+  // against the argument array the caller happened to build.
+  const host = confirmingHost({ indexes: [], dependentObjects: [] });
+  initDesktopApi(host as never);
+  const pending = backendApi.deleteColumns('people', ['note']);
+  await presentedConfirmation();
+  answerConfirmation(true);
+  await pending;
+
+  const sent = host.calls.at(-1)!;
+  const received = acrossTheNativeWire(sent.method, sent.args);
+
+  // Absent on arrival — which is what makes the worker's
+  // `if (dropDependentIndexes !== undefined)` early-out fire.
+  assert.deepEqual(received, ['people', ['note']]);
+  assert.equal(received.length, 2);
+
+  // The shape this used to send, proven to mangle. `JSON.stringify` has no
+  // representation for `undefined` in an array, so it substitutes `null` —
+  // a value the caller never wrote and the worker rightly rejects.
+  assert.deepEqual(
+    acrossTheNativeWire('deleteColumns', ['people', ['note'], undefined]),
+    ['people', ['note'], null]
+  );
+
+  // And with a real dependency list nothing is lost either.
+  assert.deepEqual(
+    acrossTheNativeWire('deleteColumns', ['people', ['note'], ['idx_people_note']]),
+    ['people', ['note'], ['idx_people_note']]
+  );
+});
+
+test('sendRpcRequest never hands the JSON lane a trailing hole', async () => {
+  // The class fix behind the specific one above: `undefined` is not
+  // expressible in JSON, but "argument absent" is — by making the list
+  // shorter. Truncation is lossless because the worker dispatches with
+  // `handler(...(payload || []))` and never reads `arguments.length`.
+  const host = fakeHost();
+  initDesktopApi(host as never);
+
+  await backendApi.addColumn('users', 'nickname', 'TEXT', undefined);
+  assert.deepEqual(host.calls.at(-1), {
+    method: 'addColumn',
+    args: ['users', 'nickname', 'TEXT']
+  });
+  assert.deepEqual(
+    acrossTheNativeWire('addColumn', host.calls.at(-1)!.args),
+    ['users', 'nickname', 'TEXT']
+  );
+
+  // An INTERIOR hole is NOT truncated — it cannot be, positionally — so the
+  // rule the call sites have to follow is narrower than "never pass
+  // undefined": never place one where the receiving method can tell `null`
+  // from absent. `updateCellBatch`'s optional `label` sits before the byte cap
+  // this lane appends, and the worker's `_label` parameter is unread, so it is
+  // the one interior hole that is safe. Pinned so it stays deliberate.
+  await backendApi.updateCellBatch('users', [], undefined);
+  const batch = host.calls.at(-1)!;
+  assert.equal(batch.args.length, 4);
+  assert.equal(acrossTheNativeWire('updateCellBatch', batch.args)[2], null);
 });
 
 test('the oversized-cell refusals name THIS app and the route that works', async () => {

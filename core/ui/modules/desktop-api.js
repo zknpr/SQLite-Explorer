@@ -12,6 +12,7 @@
 import { RPC_TIMEOUT_MS, getRpcTimeoutMs } from './rpc-constants.js';
 import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from './transport.js';
 import { modLabel } from './platform.js';
+import { confirmDestructiveAction } from './modals.js';
 import {
     CellEditPolicyError,
     DEFAULT_MAX_CELL_EDIT_BYTES,
@@ -24,10 +25,38 @@ export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
 let host = null;
 export function initDesktopApi(hostInstance) { host = hostInstance; }
 
+/**
+ * Drop trailing `undefined`s from an RPC argument list.
+ *
+ * The native engine's transport is JSON (`desktop-host.js` →
+ * `JSON.stringify(encodeFrameValue(message))`), and JSON has no `undefined`:
+ * `JSON.stringify(['t', ['c'], undefined])` is `["t",["c"],null]`. A worker
+ * method that early-outs on `param !== undefined` — or that declares a default
+ * value, which `null` does NOT trigger — then receives an argument the caller
+ * never wrote. That is exactly how `deleteColumns` broke: the worker's
+ * `dropDependentIndexes` guard saw `null`, failed `Array.isArray`, and threw.
+ *
+ * Truncating is lossless rather than a papering-over: in JavaScript `f(a, b,
+ * undefined)` and `f(a, b)` are indistinguishable to the callee — the worker's
+ * dispatch is `handler(...(payload || []))` and nothing in it reads
+ * `arguments.length` — so the shorter list means precisely what the caller
+ * meant, "this argument is absent", which JSON *can* represent.
+ *
+ * Only the TAIL is safe to remove. An interior `undefined` still crosses as
+ * `null`; the call sites below therefore never place one where the receiving
+ * method would tell the two apart.
+ */
+function withoutTrailingUndefined(args) {
+    if (!Array.isArray(args)) return args;
+    let end = args.length;
+    while (end > 0 && args[end - 1] === undefined) end -= 1;
+    return end === args.length ? args : args.slice(0, end);
+}
+
 export async function sendRpcRequest(method, args) {
     if (!host) throw new Error('Desktop host not initialized');
     const timeoutMs = getRpcTimeoutMs(method);
-    const invocation = host.invoke(method, args);
+    const invocation = host.invoke(method, withoutTrailingUndefined(args));
     if (timeoutMs === undefined) return invocation;
     // The Promise executor below runs synchronously on construction, so
     // timeoutId is already assigned before Promise.race is even evaluated —
@@ -102,11 +131,12 @@ export const backendApi = {
                 (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
                 && metadata.byteLength > DEFAULT_MAX_CELL_EDIT_BYTES
             ) {
-                if (!window.confirm(formatOversizedCellReplacementWarning(
-                    table,
-                    column,
-                    metadata
-                ))) {
+                const approved = await confirmDestructiveAction({
+                    title: 'Replace oversized value',
+                    message: formatOversizedCellReplacementWarning(table, column, metadata),
+                    confirmLabel: 'Replace'
+                });
+                if (!approved) {
                     throw new Error('Oversized cell replacement cancelled');
                 }
                 try {
@@ -187,10 +217,23 @@ export const backendApi = {
             );
         }
         lines.push('This cannot be undone with ' + modLabel('Z') + ' — it ends the undo history for this database.');
-        if (!window.confirm(lines.join('\n'))) return { cancelled: true };
+        const approved = await confirmDestructiveAction({
+            title: columns.length === 1 ? 'Drop column' : 'Drop columns',
+            message: lines.join('\n'),
+            confirmLabel: columns.length === 1 ? 'Drop column' : 'Drop columns'
+        });
+        if (!approved) return { cancelled: true };
+        // OMIT the third argument rather than pass `undefined` for it: on the
+        // native lane the argument list is serialised as JSON, which has no
+        // `undefined`, so a trailing hole would arrive at the worker as an
+        // explicit `null` and trip its `dropDependentIndexes !== undefined`
+        // guard — the common case (a column with no dependent index) failed
+        // for every desktop user. `sendRpcRequest` also truncates trailing
+        // holes, but building the list correctly is what makes the intent
+        // legible here.
         return sendRpcRequest(
             'deleteColumns',
-            [table, columns, indexes.length > 0 ? indexes : undefined]
+            indexes.length > 0 ? [table, columns, indexes] : [table, columns]
         );
     },
     createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
@@ -209,10 +252,14 @@ export const backendApi = {
             triggerSnapshot ??= current.triggers ?? [];
             if (current.triggers?.length > 0) {
                 const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
-                if (!window.confirm(
-                    `Editing view "${view}" without preserving triggers will permanently drop ` +
-                    `these INSTEAD OF triggers: ${triggerNames}. Continue?`
-                )) {
+                const approved = await confirmDestructiveAction({
+                    title: 'Drop INSTEAD OF triggers',
+                    message:
+                        `Editing view "${view}" without preserving triggers will permanently drop `
+                        + `these INSTEAD OF triggers: ${triggerNames}. Continue?`,
+                    confirmLabel: 'Edit view'
+                });
+                if (!approved) {
                     return { cancelled: true };
                 }
             }
@@ -232,7 +279,12 @@ export const backendApi = {
         const message = triggerNames
             ? `Drop view "${view}"? This will permanently drop its INSTEAD OF triggers: ${triggerNames}.`
             : `Drop view "${view}"?`;
-        if (!window.confirm(message)) {
+        const approved = await confirmDestructiveAction({
+            title: 'Drop view',
+            message,
+            confirmLabel: 'Drop view'
+        });
+        if (!approved) {
             return { cancelled: true };
         }
         return sendRpcRequest('dropView', [view, current.sql, triggerSnapshot]);
