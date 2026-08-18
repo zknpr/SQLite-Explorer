@@ -41,6 +41,10 @@ export function resolveStartupPageSize(configuredValue, persistedValue) {
 export const state = {
     isDbConnected: false,
     isReadOnly: false,
+    // Which engine serves the current open: 'native' (tjs sidecar) or 'wasm'.
+    // Desktop-only — set by desktop-viewer.js from the host's connection
+    // results; stays null in the VS Code webview and the web demo.
+    engine: null,
     selectedTable: null,
     selectedTableType: 'table',
     selectedTableIdentity: null,

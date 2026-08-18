@@ -902,6 +902,27 @@ body {
     gap: 12px;
 }
 
+/* Engine badge (desktop only; ships hidden in the shared template).
+   data-engine tints native vs wasm so QA can tell the engines apart at a
+   glance without reading the label. */
+.engine-badge {
+    padding: 1px 8px;
+    border: 1px solid var(--border-color);
+    border-radius: 9px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    user-select: none;
+}
+
+.engine-badge[data-engine="native"] {
+    color: var(--success-color);
+    border-color: var(--success-color);
+}
+
 .footer-right {
     margin-left: auto;
     display: flex;

@@ -38,6 +38,30 @@ export interface DesktopHostBridge {
      * as {@link onOpenFile}.
      */
     viewerReady?(): Promise<void>;
+
+    // ---- native engine (tjs sidecar) — all four present or the host stays
+    // ---- on WASM. Implemented by the shell's bridge.js over the Rust
+    // ---- native_* commands; older shells and the dev harness omit them.
+
+    /** True when both the sidecar binary and its bundle are shipped. */
+    nativeAvailable?(): Promise<boolean>;
+    /**
+     * Spawns (or replaces) the sidecar bound to `path`. The path must already
+     * be session-allowlisted (dialog-picked or OS-delivered). Resolves to the
+     * CANONICAL bound path — the exact string the sidecar's argv binding and
+     * the shell's per-envelope gate compare against, so `initializeDatabase`'s
+     * `config.path` must carry this return value, never the input spelling.
+     */
+    nativeOpen?(path: string, readOnly: boolean): Promise<string>;
+    /**
+     * Frames one request envelope (the worker protocol, JSON-encoded with the
+     * frame-codec value markers) to the sidecar and resolves the response
+     * envelope JSON verbatim. Rejects with structured `ERR_NATIVE_*` reasons
+     * on transport-level failures (sidecar exit, refused envelope, caps).
+     */
+    nativeRpc?(envelopeJson: string): Promise<string>;
+    /** Shuts the sidecar down; idempotent. */
+    nativeClose?(): Promise<void>;
 }
 
 /** Options accepted by {@link createDesktopHost}. */

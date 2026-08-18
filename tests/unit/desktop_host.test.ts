@@ -71,7 +71,8 @@ test('start boots an empty database and initialize reports connected', async () 
   await host.start();
   assert.equal(posted[0].content.targetMethod, 'initializeDatabase');
   const init = await host.invoke('initialize', []);
-  assert.deepEqual(init, { connected: true, isReadOnly: false, filename: 'untitled.db' });
+  // `engine` drives the desktop status-bar badge; the empty startup DB is WASM.
+  assert.deepEqual(init, { connected: true, isReadOnly: false, filename: 'untitled.db', engine: 'wasm' });
 });
 
 test('unknown methods forward to the worker verbatim', async () => {
@@ -742,4 +743,526 @@ test('a console script that failed without mutating leaves the document clean', 
 
   assert.equal(host.hasUnsavedChanges(), false);
   assert.equal(refreshed, 0);
+});
+
+// ============================================================================
+// Native engine — selection, transport seam, session-transaction save model
+// ============================================================================
+//
+// The fakes below stand in for Task 5's bridge surface: nativeOpen returns a
+// CANONICALIZED path (deliberately different from the input spelling — the
+// shell canonicalises; layer 3 and the sidecar compare exact strings, so the
+// host must carry the RETURNED value into initializeDatabase), and nativeRpc
+// is a scripted transport that records every decoded envelope it was sent and
+// answers with canned response envelopes, exactly the JSON the Rust proxy
+// hands back verbatim.
+
+const CANONICAL_PREFIX = '/private';
+
+type NativeLog = {
+  opens: Array<{ path: string; readOnly: boolean }>;
+  closes: number;
+  envelopes: Envelope[];
+};
+
+function makeNativeBridgeMembers(
+  handlers: Record<string, (args: unknown[]) => unknown>,
+  opts: { available?: boolean; openError?: string } = {}
+) {
+  const log: NativeLog = { opens: [], closes: 0, envelopes: [] };
+  const members = {
+    nativeAvailable: async () => opts.available ?? true,
+    nativeOpen: async (path: string, readOnly: boolean) => {
+      log.opens.push({ path, readOnly });
+      if (opts.openError) throw new Error(opts.openError);
+      return CANONICAL_PREFIX + path;
+    },
+    nativeRpc: async (envelopeJson: string) => {
+      const envelope = JSON.parse(envelopeJson) as Envelope;
+      log.envelopes.push(envelope);
+      const { messageId, targetMethod, payload } = envelope.content;
+      const handler = handlers[targetMethod];
+      const respond = (success: boolean, data: unknown, errorMessage?: string) =>
+        JSON.stringify({ channel: 'rpc', content: { kind: 'response', messageId, success, data, errorMessage } });
+      if (!handler) return respond(false, undefined, `no native fake for ${targetMethod}`);
+      try {
+        return respond(true, handler(payload));
+      } catch (error) {
+        return respond(false, undefined, error instanceof Error ? error.message : String(error));
+      }
+    },
+    nativeClose: async () => { log.closes += 1; }
+  };
+  return { members, log };
+}
+
+function makeNativeHost(
+  nativeHandlers: Record<string, (args: unknown[]) => unknown> = {},
+  workerHandlers: Record<string, (args: unknown[]) => unknown> = {},
+  bridgeOverrides: Record<string, unknown> = {},
+  nativeOpts: { available?: boolean; openError?: string } = {}
+) {
+  const { members, log } = makeNativeBridgeMembers({
+    initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
+    runQuery: () => [],
+    ping: () => true,
+    ...nativeHandlers
+  }, nativeOpts);
+  const made = makeHost(workerHandlers, { ...members, ...bridgeOverrides });
+  return { ...made, nativeLog: log };
+}
+
+/** targetMethods of everything sent over the native transport, in order. */
+const nativeMethods = (log: NativeLog) => log.envelopes.map(e => e.content.targetMethod);
+/** First-arg SQL of every runQuery envelope, in order (the txn-control trace). */
+const nativeSql = (log: NativeLog) =>
+  log.envelopes.filter(e => e.content.targetMethod === 'runQuery').map(e => e.content.payload[0]);
+
+test('native selection: open routes through nativeOpen and initializeDatabase carries the RETURNED canonical path', async () => {
+  const initConfigs: unknown[] = [];
+  const { host, nativeLog, posted } = makeNativeHost({
+    initializeDatabase: (args) => { initConfigs.push(args); return { isReadOnly: false, storage: 'memory' }; },
+    fetchSchema: () => ({ tables: [], views: [], indexes: [] })
+  });
+  await host.start();
+  const postedAfterStart = posted.length;
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+
+  const opened = await host.openFromShellPath('/tmp/from-finder.db');
+  assert.equal(opened, true);
+  assert.deepEqual(nativeLog.opens, [{ path: '/tmp/from-finder.db', readOnly: false }]);
+  // The canonical returned string, not the input spelling.
+  const [name, config] = initConfigs[0] as [string, Record<string, unknown>];
+  assert.equal(name, 'from-finder.db');
+  assert.equal(config.path, '/private/tmp/from-finder.db');
+  assert.equal(config.readOnlyMode, false);
+  assert.equal(config.content, undefined);
+
+  // Subsequent RPCs ride the native transport, not the WASM worker.
+  await host.invoke('fetchSchema', []);
+  assert.equal(nativeMethods(nativeLog).includes('fetchSchema'), true);
+  assert.equal(posted.length, postedAfterStart);   // nothing further to the worker
+
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.engine, 'native');
+});
+
+test('nativeOpen failure falls back to the WASM bytes path with engine wasm', async () => {
+  const reads: string[] = [];
+  const { host, nativeLog, posted } = makeNativeHost({}, {}, {
+    readDatabaseBytes: async (p: string) => { reads.push(p); return new Uint8Array([1, 2, 3]); }
+  }, { openError: 'ERR_NATIVE_PATH_NOT_ALLOWED: nope' });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+
+  const opened = await host.openFromShellPath('/tmp/x.db');
+  assert.equal(opened, true);
+  assert.deepEqual(reads, ['/tmp/x.db']);
+  assert.equal(nativeLog.envelopes.length, 0);          // nothing spoke native
+  assert.equal(nativeLog.closes, 0);                    // no sidecar existed to close
+  const lastInit = posted.filter(p => p.content.targetMethod === 'initializeDatabase').at(-1)!;
+  assert.deepEqual((lastInit.content.payload[1] as Record<string, unknown>).content, new Uint8Array([1, 2, 3]));
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.engine, 'wasm');
+});
+
+test('native initializeDatabase refusal closes the sidecar and falls back to WASM', async () => {
+  const { host, nativeLog } = makeNativeHost({
+    initializeDatabase: () => { throw new Error('ERR_NATIVE_PATH_MISMATCH: refused'); }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  const opened = await host.openFromShellPath('/tmp/x.db');
+  assert.equal(opened, true);
+  assert.equal(nativeLog.closes, 1);                    // never leave a half-open sidecar
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.engine, 'wasm');
+});
+
+test('nativeAvailable=false goes straight to WASM without attempting nativeOpen', async () => {
+  const { host, nativeLog } = makeNativeHost({}, {}, {}, { available: false });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/x.db');
+  assert.equal(nativeLog.opens.length, 0);
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.engine, 'wasm');
+});
+
+test('opening a database over the WASM path closes a live native session first', async () => {
+  let failNextOpen = false;
+  const { members, log } = makeNativeBridgeMembers({
+    initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
+    runQuery: () => [],
+    ping: () => true
+  });
+  const realOpen = members.nativeOpen;
+  members.nativeOpen = async (path: string, readOnly: boolean) => {
+    if (failNextOpen) { log.opens.push({ path, readOnly }); throw new Error('spawn failed'); }
+    return realOpen(path, readOnly);
+  };
+  const { host } = makeHost({}, { ...members });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+
+  await host.openFromShellPath('/tmp/first.db');        // native session live
+  failNextOpen = true;
+  await host.openFromShellPath('/tmp/second.db');       // falls back to WASM
+  assert.equal(log.closes, 1);                          // first sidecar shut down on the switch
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.engine, 'wasm');
+});
+
+test('dialog opens skip the maxFileSize cap on the native engine but enforce it on the WASM fallback', async () => {
+  let readCalled = false;
+  const { host } = makeNativeHost({}, {}, {
+    pickDatabase: async () => ({ path: '/tmp/huge.db', name: 'huge.db', size: 5 * 1024 * 1024 }),
+    readDatabaseBytes: async () => { readCalled = true; return new Uint8Array([1]); },
+    loadSettings: async () => ({ maxFileSize: 1 })
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  const opened = await host.openDatabaseViaDialog();    // native: no byte inhaling, no cap
+  assert.equal(opened, true);
+  assert.equal(readCalled, false);
+
+  const { host: wasmHost } = makeNativeHost({}, {}, {
+    pickDatabase: async () => ({ path: '/tmp/huge.db', name: 'huge.db', size: 5 * 1024 * 1024 }),
+    readDatabaseBytes: async () => { readCalled = true; return new Uint8Array([1]); },
+    loadSettings: async () => ({ maxFileSize: 1 })
+  }, { available: false });
+  await wasmHost.start();
+  await assert.rejects(() => wasmHost.openDatabaseViaDialog(), /maxFileSize/);
+  assert.equal(readCalled, false);                      // guard fires before the read
+});
+
+test('native txn model: first mutation BEGINs once, save COMMITs without exporting, next mutation BEGINs afresh', async () => {
+  const { host, nativeLog, saved } = makeNativeHost({ updateCell: () => 1 });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v1', 'o1', 1048576]);
+  await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v1', 1048576]);
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN']);    // exactly one BEGIN for two mutations
+  assert.equal(host.hasUnsavedChanges(), true);
+
+  const ok = await host.saveToDisk();
+  assert.equal(ok, true);
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT']);
+  assert.equal(nativeMethods(nativeLog).includes('exportDatabase'), false);  // no byte export
+  assert.equal(saved.path, undefined);                  // and no bridge.saveDatabase file rewrite
+  assert.equal(host.hasUnsavedChanges(), false);
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v3', 'v2', 1048576]);
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT', 'BEGIN']);
+});
+
+test('native refresh with an open transaction ROLLBACKs then reopens the bound path in place', async () => {
+  const initConfigs: unknown[] = [];
+  let reads = 0;
+  const { host, nativeLog } = makeNativeHost({
+    updateCell: () => 1,
+    initializeDatabase: (args) => { initConfigs.push(args); return { isReadOnly: false, storage: 'memory' }; }
+  }, {}, { readDatabaseBytes: async () => { reads += 1; return new Uint8Array([1]); } });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  await host.refreshFromDisk();
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'ROLLBACK']);
+  assert.equal(initConfigs.length, 2);                  // open + refresh reopen
+  const [, refreshConfig] = initConfigs[1] as [string, Record<string, unknown>];
+  assert.equal(refreshConfig.path, '/private/tmp/y.db');
+  assert.equal(reads, 0);                               // refresh never rides the bytes path
+  assert.equal(host.hasUnsavedChanges(), false);
+});
+
+test("instantCommit='always' on native commits each mutation immediately", async () => {
+  const { host, nativeLog } = makeNativeHost(
+    { updateCell: () => 1 },
+    {},
+    { loadSettings: async () => ({ instantCommit: 'always' }) }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v1', 'o1', 1048576]);
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT']);
+  await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v1', 1048576]);
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT', 'BEGIN', 'COMMIT']);
+  assert.equal(host.hasUnsavedChanges(), false);
+});
+
+test('undo/redo replay through the native engine inside the open session transaction', async () => {
+  const { host, nativeLog } = makeNativeHost({
+    updateCell: () => 1,
+    undoModification: () => ({ success: true }),
+    redoModification: () => ({ success: true })
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  await host.invoke('triggerUndo', []);
+  await host.invoke('triggerRedo', []);
+  // Replay rides the SAME transaction: no extra BEGIN, and both replay
+  // envelopes went over the native transport.
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN']);
+  assert.equal(nativeMethods(nativeLog).includes('undoModification'), true);
+  assert.equal(nativeMethods(nativeLog).includes('redoModification'), true);
+});
+
+test('undo after a save opens a fresh transaction before replaying', async () => {
+  const { host, nativeLog } = makeNativeHost({
+    updateCell: () => 1,
+    undoModification: () => ({ success: true })
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+  await host.saveToDisk();
+  await host.invoke('triggerUndo', []);
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT', 'BEGIN']);
+  const undoIndex = nativeMethods(nativeLog).lastIndexOf('undoModification');
+  const beginIndex = nativeMethods(nativeLog).lastIndexOf('runQuery');
+  assert.equal(beginIndex < undoIndex, true);           // BEGIN precedes the replay
+});
+
+test('a read-only console run closes the transaction it opened; a mutating run leaves it pending', async () => {
+  const { host, nativeLog } = makeNativeHost({
+    runConsole: (args) => (String(args[0]).startsWith('SELECT')
+      ? { results: [{ headers: ['1'], rows: [[1]], truncated: false }], mutated: false, changes: 0, durationMs: 1 }
+      : { results: [], mutated: true, changes: 1, durationMs: 1 }),
+    updateCell: () => 1
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+
+  await host.invoke('runConsole', ['SELECT 1', {}]);
+  // BEGIN then COMMIT: a pure read must not leave a transaction (and its
+  // SHARED lock on the real file) dangling until save.
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT']);
+  assert.equal(host.hasUnsavedChanges(), false);
+
+  await host.invoke('runConsole', ['INSERT INTO t DEFAULT VALUES', {}]);
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT', 'BEGIN']);
+  assert.equal(host.hasUnsavedChanges(), true);
+
+  await host.invoke('runConsole', ['SELECT 2', {}]);    // txn was already open: not this run's to close
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT', 'BEGIN']);
+});
+
+test('BEGIN tolerance: a console-opened transaction is adopted instead of failing the mutation', async () => {
+  const { host, nativeLog } = makeNativeHost({
+    runQuery: (args) => {
+      if (args[0] === 'BEGIN') throw new Error('cannot start a transaction within a transaction');
+      return [];
+    },
+    updateCell: () => 1
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);   // must not reject
+  await host.saveToDisk();
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT']);         // adopted, then committed
+});
+
+test('COMMIT tolerance: a console-committed transaction still saves cleanly', async () => {
+  const { host } = makeNativeHost({
+    runQuery: (args) => {
+      if (args[0] === 'COMMIT') throw new Error('cannot commit - no transaction is active');
+      return [];
+    },
+    updateCell: () => 1
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+  const ok = await host.saveToDisk();
+  assert.equal(ok, true);
+  assert.equal(host.hasUnsavedChanges(), false);
+});
+
+test('a genuine BEGIN failure fails the mutation before it executes', async () => {
+  const { host, nativeLog } = makeNativeHost({
+    runQuery: (args) => {
+      if (args[0] === 'BEGIN') throw new Error('database is locked');
+      return [];
+    },
+    updateCell: () => 1
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await assert.rejects(() => host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]), /database is locked/);
+  assert.equal(nativeMethods(nativeLog).includes('updateCell'), false);
+  assert.equal(host.hasUnsavedChanges(), false);
+});
+
+test('native exportDb with an open transaction prompts to save first; cancel aborts, accept commits then exports', async () => {
+  const exportCalls: unknown[] = [];
+  const { host, nativeLog } = makeNativeHost(
+    {
+      updateCell: () => 1,
+      exportDatabase: () => { exportCalls.push(1); return { __type: 'Uint8Array', base64: 'AQ==' }; }
+    },
+    {},
+    { saveFileAs: async () => '/tmp/out.db' }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  const originalConfirm = (globalThis as { confirm?: unknown }).confirm;
+  try {
+    (globalThis as { confirm?: unknown }).confirm = () => false;
+    const refused = await host.invoke('exportDb', ['y.db']) as Record<string, unknown>;
+    assert.equal(refused.success, false);
+    assert.equal(exportCalls.length, 0);                // nothing exported on cancel
+
+    (globalThis as { confirm?: unknown }).confirm = () => true;
+    const okResult = await host.invoke('exportDb', ['y.db']) as Record<string, unknown>;
+    assert.equal(okResult.success, true);
+    assert.equal(exportCalls.length, 1);
+    // The COMMIT (the save) must precede the export envelope.
+    const methods = nativeMethods(nativeLog);
+    assert.equal(nativeSql(nativeLog).includes('COMMIT'), true);
+    assert.equal(methods.lastIndexOf('runQuery') < methods.lastIndexOf('exportDatabase'), true);
+    assert.equal(host.hasUnsavedChanges(), false);
+  } finally {
+    if (originalConfirm === undefined) delete (globalThis as { confirm?: unknown }).confirm;
+    else (globalThis as { confirm?: unknown }).confirm = originalConfirm;
+  }
+});
+
+test('native exportDb decodes the sidecar Uint8Array marker back into real bytes', async () => {
+  let savedBytes: Uint8Array | null = null;
+  const { host } = makeNativeHost(
+    { exportDatabase: () => ({ __type: 'Uint8Array', base64: 'AQID' }) },   // [1,2,3]
+    {},
+    { saveFileAs: async (_n: string, b: Uint8Array) => { savedBytes = b; return '/tmp/out.db'; } }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('exportDb', ['y.db']);
+  assert.deepEqual(savedBytes, new Uint8Array([1, 2, 3]));
+});
+
+test('native exportDb is refused while a cell read session is open (dispatch-guard parity)', async () => {
+  const { host } = makeNativeHost(
+    {
+      openCellReadSession: () => ({ sessionId: 's1', byteLength: 10, storageClass: 'blob' }),
+      closeCellReadSession: () => ({ success: true }),
+      exportDatabase: () => ({ __type: 'Uint8Array', base64: 'AQ==' })
+    },
+    {},
+    { saveFileAs: async () => '/tmp/out.db' }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('openCellReadSession', [{ table: 't', rowId: 1, column: 'c' }]);
+  await assert.rejects(() => host.invoke('exportDb', ['y.db']), /cell read snapshot is active/);
+  await host.invoke('closeCellReadSession', ['s1']);
+  const ok = await host.invoke('exportDb', ['y.db']) as Record<string, unknown>;
+  assert.equal(ok.success, true);
+});
+
+test('initialize and refreshContent surface the active engine for the badge', async () => {
+  const engines: unknown[] = [];
+  const { host } = makeNativeHost({});
+  host.setWebviewMethods({
+    refreshContent: async (_f: unknown, result: unknown) => {
+      engines.push((result as Record<string, unknown>).engine);
+      return { success: true };
+    }
+  });
+  await host.start();
+  const boot = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(boot.engine, 'wasm');                    // the empty startup DB is WASM
+  await host.openFromShellPath('/tmp/y.db');
+  assert.deepEqual(engines, ['native']);
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.engine, 'native');
+});
+
+test('a WASM-only bridge (no native members) reports engine wasm end to end', async () => {
+  const { host } = makeHost({});
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/x.db');
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.engine, 'wasm');
+});
+
+test('setPragma on native does not open the session transaction (pragmas are untransactable)', async () => {
+  const { host, nativeLog } = makeNativeHost({ setPragma: () => undefined });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('setPragma', ['journal_mode', 'wal']);
+  assert.deepEqual(nativeSql(nativeLog), []);           // no BEGIN wrapped around it
+  assert.equal(host.hasUnsavedChanges(), true);         // still a history barrier
+});
+
+test('native transport errors reject the pending call with the structured reason', async () => {
+  const { members } = makeNativeBridgeMembers({
+    initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
+    ping: () => true
+  });
+  const { host } = makeHost({}, {
+    ...members,
+    nativeRpc: async (json: string) => {
+      const envelope = JSON.parse(json) as Envelope;
+      if (envelope.content.targetMethod === 'fetchSchema') {
+        throw new Error('ERR_NATIVE_SIDECAR_EXITED: exited with code 1');
+      }
+      return JSON.stringify({ channel: 'rpc', content: {
+        kind: 'response', messageId: envelope.content.messageId, success: true,
+        data: { isReadOnly: false, storage: 'memory' }
+      } });
+    }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await assert.rejects(() => host.invoke('fetchSchema', []), /ERR_NATIVE_SIDECAR_EXITED/);
+});
+
+test('outbound native envelopes are frame-codec encoded: Uint8Array args become base64 markers', async () => {
+  let rawJson = '';
+  const { members } = makeNativeBridgeMembers({
+    initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
+    runQuery: () => [],
+    ping: () => true
+  });
+  const innerRpc = members.nativeRpc;
+  members.nativeRpc = async (json: string) => {
+    const envelope = JSON.parse(json) as Envelope;
+    if (envelope.content.targetMethod === 'updateCell') rawJson = json;
+    return innerRpc(json);
+  };
+  const { host } = makeHost({}, {
+    ...members,
+    nativeRpc: members.nativeRpc
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+
+  // A blob write: the bytes must cross as the codec's exact-two-key marker,
+  // which is what the sidecar's reader decodes back into a Uint8Array.
+  await host.invoke('updateCell', ['t', 1, 'c', new Uint8Array([7, 8]), null, 1048576])
+    .catch(() => { /* no updateCell fake — the send is what matters */ });
+  const parsed = JSON.parse(rawJson) as { content: { payload: unknown[] } };
+  assert.deepEqual(parsed.content.payload[3], { __type: 'Uint8Array', base64: 'Bwg=' });
 });

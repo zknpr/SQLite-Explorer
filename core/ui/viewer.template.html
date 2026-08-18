@@ -142,6 +142,11 @@
             <div class="footer-panel">
                 <div class="footer-left">
                     <span id="statusText">Ready</span>
+                    <!-- Engine badge (desktop only): which engine serves the
+                         current open, 'native' or 'wasm'. Ships hidden in the
+                         shared template like #btnSqlConsole; only
+                         desktop-viewer.js unhides and fills it. -->
+                    <span id="engineBadge" class="engine-badge" hidden></span>
                 </div>
                 <div class="footer-right">
                     <div class="page-selector">

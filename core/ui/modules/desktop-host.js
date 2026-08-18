@@ -8,6 +8,11 @@ import {
     WEBVIEW_TRANSPORT_SURFACES,
     assertWebviewTransportPayload
 } from './transport.js';
+// The native transport's value codec. The sidecar's stdio transport encodes
+// response envelopes with exactly this codec (BigInt/Uint8Array/Error markers,
+// ~-escaped scalar sentinels), and the Rust proxy forwards the payload JSON
+// verbatim — importing the same module keeps the two ends incapable of drift.
+import { decodeFrameValue, encodeFrameValue } from '../../native/frame-codec.js';
 import { ModificationTracker } from '../../../src/core/undo-history.ts';
 
 const DEFAULT_SETTINGS = Object.freeze({
@@ -63,20 +68,57 @@ export function createDesktopHost({ bridge, createWorker }) {
     let connectionInfo = { isReadOnly: false };
     let webviewMethods = {};
 
+    // ---- engine state -------------------------------------------------------
+    // One envelope protocol, two transports. 'wasm' routes callWorker through
+    // worker.postMessage; 'native' routes the SAME envelope as JSON through
+    // bridge.nativeRpc to the tjs sidecar. Selection happens per open in
+    // openFromPath; everything above callWorker is engine-agnostic.
+    let engine = 'wasm';
+    // Canonical path the live sidecar is bound to (nativeOpen's RETURN value —
+    // layer 3 and the sidecar compare exact strings, so reopen/refresh must
+    // reuse this spelling, never the user-supplied one). null = no sidecar.
+    let nativeBoundPath = null;
+    // The session transaction: the native engine executes against the REAL
+    // file, so "edits are pending until Save" is SQLite's own transaction —
+    // first mutation BEGINs, Save COMMITs, refresh/close ROLLBACK. WASM mode
+    // gets the same contract for free from its in-memory image.
+    let nativeTxnOpen = false;
+    // Replica of the worker dispatch's cell-read-session guard, tracked here
+    // because the sidecar serves exportDatabase ABOVE that guard (Task 4's
+    // accepted parity gap): the host refuses native exports while a session is
+    // open, with the worker's own message, so both engines answer identically.
+    let cellReadSessionOpen = false;
+
+    const hasNativeBridge = () =>
+        typeof bridge.nativeAvailable === 'function'
+        && typeof bridge.nativeOpen === 'function'
+        && typeof bridge.nativeRpc === 'function'
+        && typeof bridge.nativeClose === 'function';
+
     // ---- worker RPC ---------------------------------------------------------
+
+    // Shared response routing for BOTH transports — one pending map, one
+    // settle path, whichever side produced the envelope.
+    function settleFromEnvelope(envelope) {
+        if (envelope?.channel !== 'rpc' || envelope.content?.kind !== 'response') return;
+        const { messageId, success, data, errorMessage } = envelope.content;
+        const pending = pendingCalls.get(messageId);
+        if (!pending) return;
+        pendingCalls.delete(messageId);
+        if (success) pending.resolve(data);
+        else pending.reject(new Error(errorMessage || `Worker call failed: ${pending.method}`));
+    }
+
+    function rejectPending(messageId, error) {
+        const pending = pendingCalls.get(messageId);
+        if (!pending) return;
+        pendingCalls.delete(messageId);
+        pending.reject(error);
+    }
 
     function bootWorkerObject() {
         worker = createWorker();
-        worker.onmessage = (event) => {
-            const envelope = event.data;
-            if (envelope?.channel !== 'rpc' || envelope.content?.kind !== 'response') return;
-            const { messageId, success, data, errorMessage } = envelope.content;
-            const pending = pendingCalls.get(messageId);
-            if (!pending) return;
-            pendingCalls.delete(messageId);
-            if (success) pending.resolve(data);
-            else pending.reject(new Error(errorMessage || `Worker call failed: ${pending.method}`));
-        };
+        worker.onmessage = (event) => settleFromEnvelope(event.data);
         worker.onerror = (error) => {
             const failure = new Error(`Worker crashed: ${error?.message ?? error}`);
             for (const pending of pendingCalls.values()) pending.reject(failure);
@@ -94,10 +136,45 @@ export function createDesktopHost({ bridge, createWorker }) {
             surface: WEBVIEW_TRANSPORT_SURFACES.demoWorkerRequest,
             ...(maxBinaryBytes ? { maxBinaryBytes } : {})
         });
+        // Encode before registering the pending entry so a codec failure (like
+        // the assertion above) throws to the caller instead of stranding an
+        // entry in the map. Transfer lists don't apply to JSON — the only
+        // transfer-bearing call is the WASM bytes open, which never runs native.
+        const nativeJson = engine === 'native'
+            ? JSON.stringify(encodeFrameValue(message))
+            : null;
         return new Promise((resolve, reject) => {
             pendingCalls.set(messageId, { method, resolve, reject });
-            if (transfer?.length) worker.postMessage(message, transfer);
-            else worker.postMessage(message);
+            if (nativeJson !== null) {
+                bridge.nativeRpc(nativeJson).then(
+                    (responseJson) => {
+                        let envelope;
+                        try {
+                            envelope = decodeFrameValue(JSON.parse(responseJson));
+                        } catch (error) {
+                            rejectPending(messageId, new Error(
+                                `Native RPC response for ${method} is undecodable: ${error?.message ?? error}`
+                            ));
+                            return;
+                        }
+                        settleFromEnvelope(envelope);
+                        // The Rust proxy routes by messageId, so the response is
+                        // ours; if it somehow wasn't, fail this call loudly
+                        // rather than hanging it (no-op after a normal settle).
+                        rejectPending(messageId, new Error(
+                            `Native RPC response for ${method} settled a different messageId`
+                        ));
+                    },
+                    (error) => rejectPending(
+                        messageId,
+                        error instanceof Error ? error : new Error(String(error))
+                    )
+                );
+            } else if (transfer?.length) {
+                worker.postMessage(message, transfer);
+            } else {
+                worker.postMessage(message);
+            }
         });
     }
 
@@ -113,7 +190,45 @@ export function createDesktopHost({ bridge, createWorker }) {
         });
         connectionInfo = { isReadOnly: result?.isReadOnly === true, readOnlyReason: result?.readOnlyReason };
         tracker = new ModificationTracker(100, settings.maxUndoMemory);
+        // initializeDatabase closes any open cell read session worker-side and
+        // opens a fresh engine session with no transaction.
+        cellReadSessionOpen = false;
+        nativeTxnOpen = false;
         return result;
+    }
+
+    // ---- native session transaction -----------------------------------------
+    // BEGIN/COMMIT/ROLLBACK travel as ordinary runQuery envelopes: the worker's
+    // method layer has no transaction method, the shim blocks only
+    // ATTACH/DETACH/VACUUM INTO, and worker.js's own mutations use SAVEPOINTs
+    // exclusively, which nest cleanly inside the session transaction.
+    //
+    // The console can run raw transaction SQL underneath the host (a script
+    // containing BEGIN or COMMIT), so both helpers tolerate exactly the two
+    // "already in that state" engine answers and adopt reality instead of
+    // failing the user's action; every other failure propagates.
+
+    async function ensureSessionTxn() {
+        if (engine !== 'native' || nativeTxnOpen) return;
+        try {
+            await callWorker('runQuery', ['BEGIN']);
+        } catch (error) {
+            if (!/within a transaction/i.test(error?.message ?? '')) throw error;
+        }
+        nativeTxnOpen = true;
+    }
+
+    /** @param {'COMMIT' | 'ROLLBACK'} statement */
+    async function endSessionTxn(statement) {
+        if (engine !== 'native' || !nativeTxnOpen) return;
+        try {
+            await callWorker('runQuery', [statement]);
+        } catch (error) {
+            // A failed genuine COMMIT (disk full, deferred FK violation) leaves
+            // the transaction open engine-side, so the flag must stay true too.
+            if (!/no transaction is active/i.test(error?.message ?? '')) throw error;
+        }
+        nativeTxnOpen = false;
     }
 
     // ---- modification recording --------------------------------------------
@@ -216,6 +331,7 @@ export function createDesktopHost({ bridge, createWorker }) {
     }
 
     async function invokeMutation(method, args) {
+        await ensureSessionTxn();
         const result = await callWorker(method, args);
         if (result && typeof result === 'object' && result.cancelled === true) return result;
 
@@ -258,7 +374,7 @@ export function createDesktopHost({ bridge, createWorker }) {
     }
 
     async function refreshUi() {
-        await notifyWebview('refreshContent', [currentName, { connected: true, ...connectionInfo }]);
+        await notifyWebview('refreshContent', [currentName, { connected: true, engine, ...connectionInfo }]);
     }
 
     function updateTitle() {
@@ -268,6 +384,15 @@ export function createDesktopHost({ bridge, createWorker }) {
 
     async function saveToDisk() {
         if (!currentPath) return false;
+        if (engine === 'native') {
+            // Native edits already live in the real file inside the session
+            // transaction — Save IS the COMMIT. No byte export, no file
+            // rewrite; SQLite's journal makes the commit atomic.
+            await endSessionTxn('COMMIT');
+            await tracker.createCheckpoint();
+            updateTitle();
+            return true;
+        }
         const bytes = await callWorker('exportDatabase', [currentName]);
         await bridge.saveDatabase(currentPath, bytes);
         await tracker.createCheckpoint();
@@ -284,6 +409,96 @@ export function createDesktopHost({ bridge, createWorker }) {
         return true;
     }
 
+    // ---- engine selection ---------------------------------------------------
+
+    /** Shuts the live sidecar down and puts the transport back on WASM. */
+    async function closeNativeSidecar() {
+        engine = 'wasm';
+        nativeTxnOpen = false;
+        nativeBoundPath = null;
+        try {
+            await bridge.nativeClose();
+        } catch (error) {
+            // The sidecar may already be gone (crash fanout); the shell also
+            // force-kills survivors on close/replace/app-exit. Not fatal, not
+            // silent.
+            console.warn('nativeClose failed:', error);
+        }
+    }
+
+    /**
+     * Tries to serve `path` with the native engine. On success the transport
+     * is switched and the sidecar session is live; on any failure the caller
+     * proceeds down the WASM lane (with no half-open sidecar left behind).
+     */
+    async function tryOpenNative(path, name) {
+        let available = false;
+        try {
+            available = await bridge.nativeAvailable() === true;
+        } catch (error) {
+            console.warn('nativeAvailable failed; using the WASM engine:', error);
+            return false;
+        }
+        if (!available) return false;
+
+        let boundPath;
+        try {
+            // The host always requests a writable session, matching the WASM
+            // desktop (which never opens read-only; read-only-ness is reported
+            // by the engine, not requested by the user).
+            boundPath = await bridge.nativeOpen(path, false);
+        } catch (error) {
+            // Allowlist refusal, symlinked final component, spawn/handshake
+            // failure — all fall back to bytes. (nativeOpen's replace semantics
+            // may or may not have shut a previous sidecar; the WASM lane closes
+            // any survivor.)
+            console.warn(`Native open failed for ${path}; falling back to the WASM engine:`, error);
+            return false;
+        }
+
+        engine = 'native';
+        nativeBoundPath = boundPath;
+        try {
+            await initializeWorkerDatabase(name, { path: boundPath, readOnlyMode: false });
+            return true;
+        } catch (error) {
+            console.warn(`Native initializeDatabase failed for ${path}; falling back to the WASM engine:`, error);
+            // Never leave a half-open sidecar behind the fallback.
+            await closeNativeSidecar();
+            return false;
+        }
+    }
+
+    /**
+     * Engine-selecting open shared by the dialog and shell-path entries.
+     * Native first when the bridge offers it; otherwise (or on any native
+     * failure) the existing WASM bytes path, unchanged — including the
+     * worker-reported read-only notice (WAL et al.) and the dialog's
+     * maxFileSize cap, which only ever applied to byte inhaling.
+     */
+    async function openFromPath(path, name, { size } = {}) {
+        if (hasNativeBridge() && await tryOpenNative(path, name)) {
+            currentPath = path;
+            currentName = name;
+            updateTitle();
+            await refreshUi();
+            return true;
+        }
+        // A native session from a previous open must not outlive the switch:
+        // its sidecar still holds the old file (open transaction included —
+        // shutdown rolls it back by SQLite journal semantics).
+        if (nativeBoundPath !== null) await closeNativeSidecar();
+        engine = 'wasm';
+        if (size !== undefined && settings.maxFileSize > 0 && size > settings.maxFileSize * 1024 * 1024) {
+            throw new Error(
+                `Cannot open "${name}": file is ${size} bytes, which exceeds ` +
+                `the ${settings.maxFileSize} MiB cap set by the maxFileSize setting.`
+            );
+        }
+        const bytes = await bridge.readDatabaseBytes(path);
+        return openFromBytes(path, name, bytes);
+    }
+
     // Save-dialog results report the full picked path; only the filename is
     // status-bar-worthy (and the only part VS Code's webContents.postMessage
     // equivalent would ever have had access to).
@@ -291,7 +506,7 @@ export function createDesktopHost({ bridge, createWorker }) {
 
     const localMethods = {
         async initialize() {
-            return { connected: true, isReadOnly: connectionInfo.isReadOnly === true, filename: currentName };
+            return { connected: true, isReadOnly: connectionInfo.isReadOnly === true, filename: currentName, engine };
         },
         async getExtensionSettings() {
             // Wire-shape parity with the VS Code host (hostBridge.ts
@@ -333,6 +548,26 @@ export function createDesktopHost({ bridge, createWorker }) {
             return { success: true };
         },
         async exportDb(filename) {
+            if (engine === 'native') {
+                // The sidecar answers exportDatabase at its dispatch layer,
+                // above the worker's cell-read-session guard — replicate the
+                // refusal here so both engines answer identically.
+                if (cellReadSessionOpen) {
+                    throw new Error('A cell read snapshot is active; close it before another database operation');
+                }
+                if (nativeTxnOpen) {
+                    // The export is VACUUM INTO on the sidecar's connection,
+                    // which cannot run inside the open session transaction —
+                    // and silently committing (or exporting a state the user
+                    // hasn't saved) would both lie. One modal, honest.
+                    const saveFirst = globalThis.confirm?.(
+                        'This database has unsaved changes. Exporting requires saving them first.\n\n'
+                        + 'Save the pending changes and continue the export?'
+                    );
+                    if (saveFirst !== true) return { success: false };
+                    await saveToDisk();
+                }
+            }
             const bytes = await callWorker('exportDatabase', [currentName]);
             const target = await bridge.saveFileAs(filename || currentName, bytes);
             return { success: target !== null, savedAs: target ? basename(target) : undefined };
@@ -349,6 +584,16 @@ export function createDesktopHost({ bridge, createWorker }) {
         },
         async refreshFile() {
             if (!currentPath) return { success: true };
+            if (engine === 'native') {
+                // Refresh discards pending edits (WASM parity: the re-read
+                // replaces the in-memory image): roll the session transaction
+                // back, then reopen the SAME bound path on the live sidecar —
+                // the file is live, so no bytes ride the bridge.
+                await endSessionTxn('ROLLBACK');
+                await initializeWorkerDatabase(currentName, { path: nativeBoundPath, readOnlyMode: false });
+                updateTitle();
+                return { success: true };
+            }
             const bytes = await bridge.readDatabaseBytes(currentPath);
             await initializeWorkerDatabase(currentName, { content: bytes });
             updateTitle();
@@ -361,6 +606,16 @@ export function createDesktopHost({ bridge, createWorker }) {
         async triggerUndo() {
             const entry = tracker.stepBack();
             if (!entry) return { performed: false };
+            // Replay is a mutation like any other: it runs inside the open
+            // session transaction, or opens a fresh one after a save. A BEGIN
+            // failure means the replay never executed — put the history entry
+            // back so tracker and database stay in step.
+            try {
+                await ensureSessionTxn();
+            } catch (error) {
+                tracker.stepForward();
+                throw error;
+            }
             await callWorker('undoModification', [entry]);
             updateTitle();
             await refreshUi();
@@ -369,6 +624,12 @@ export function createDesktopHost({ bridge, createWorker }) {
         async triggerRedo() {
             const entry = tracker.stepForward();
             if (!entry) return { performed: false };
+            try {
+                await ensureSessionTxn();
+            } catch (error) {
+                tracker.stepBack();
+                throw error;
+            }
             await callWorker('redoModification', [entry]);
             updateTitle();
             await refreshUi();
@@ -395,7 +656,22 @@ export function createDesktopHost({ bridge, createWorker }) {
         async invoke(method, args) {
             const local = localMethods[method];
             if (local) return local(...args);
+            if (method === 'openCellReadSession' || method === 'closeCellReadSession') {
+                // Mirror of the worker's activeCellReadSession flag, consumed by
+                // the native exportDb guard above. Worker-side idle expiry can
+                // leave this stale-open; the inspector's eventual close (which
+                // the worker tolerates for expired sessions) re-syncs it.
+                const result = await callWorker(method, args);
+                cellReadSessionOpen = method === 'openCellReadSession';
+                return result;
+            }
             if (method === 'runConsole') {
+                // The script may mutate, and pending-ness must be in place
+                // BEFORE its first statement executes — so the session
+                // transaction opens up front. Whether it stays open depends on
+                // what the run reports below.
+                const beganForThisRun = engine === 'native' && !nativeTxnOpen;
+                await ensureSessionTxn();
                 const result = await callWorker(method, args);
                 // Arbitrary SQL cannot be replayed by the undo engine; a mutating run
                 // barriers the history exactly like DDL does. A pure SELECT must not
@@ -410,10 +686,22 @@ export function createDesktopHost({ bridge, createWorker }) {
                     if (settings.instantCommit === 'always' && currentPath) await saveToDisk();
                     updateTitle();
                     await refreshUi();
+                } else if (beganForThisRun) {
+                    // Nothing mutated: close the transaction this run opened so
+                    // a pure read never leaves a SHARED lock (or a phantom
+                    // "unsaved" session) dangling on the real file. Commits
+                    // nothing — the run made no changes.
+                    await endSessionTxn('COMMIT');
                 }
                 return result;
             }
             if (BARRIER_METHODS.has(method)) {
+                // setPragma stays outside the session transaction: journal_mode
+                // cannot change inside one and foreign_keys is a silent no-op
+                // there — pragmas are connection/file-level engine actions, not
+                // row edits. With a dirty session the engine's own "cannot ...
+                // within a transaction" answer surfaces to the user unchanged.
+                if (method !== 'setPragma') await ensureSessionTxn();
                 const result = await callWorker(method, args);
                 // No ModificationType union member fits a generic DDL/pragma
                 // barrier (there's no "barrier"/"pragma" entry); the literal RPC
@@ -438,23 +726,21 @@ export function createDesktopHost({ bridge, createWorker }) {
         async openDatabaseViaDialog() {
             const picked = await bridge.pickDatabase();
             if (!picked) return false;
-            if (settings.maxFileSize > 0 && picked.size > settings.maxFileSize * 1024 * 1024) {
-                throw new Error(
-                    `Cannot open "${picked.name}": file is ${picked.size} bytes, which exceeds ` +
-                    `the ${settings.maxFileSize} MiB cap set by the maxFileSize setting.`
-                );
-            }
-            const bytes = await bridge.readDatabaseBytes(picked.path);
-            return openFromBytes(picked.path, picked.name, bytes);
+            // The maxFileSize cap belongs to the WASM lane inside openFromPath:
+            // it bounds byte inhaling, which the native engine never does.
+            return openFromPath(picked.path, picked.name, { size: picked.size });
         },
         async openFromShellPath(path) {
             const name = String(path).split('/').pop() || 'database.db';
-            const bytes = await bridge.readDatabaseBytes(path);
-            return openFromBytes(path, name, bytes);
+            return openFromPath(path, name);
         },
         async openDatabaseFromFile(file) {
             // Drag-and-dropped File objects keep the demo's paged-open path for
             // very large databases (the worker reads the handle on demand).
+            // Always WASM — there is no OS path to bind a sidecar to. A native
+            // session from a previous open must not survive the switch.
+            if (nativeBoundPath !== null) await closeNativeSidecar();
+            engine = 'wasm';
             await initializeWorkerDatabase(file.name, { file });
             currentPath = null; // no on-disk write-back target for DnD opens
             currentName = file.name;

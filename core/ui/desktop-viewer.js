@@ -66,6 +66,28 @@ import { renderConsoleResults } from './modules/console-results.js';
 setCountCacheDemoMode(true);
 
 // ============================================================================
+// Engine badge (desktop only)
+// ============================================================================
+
+/**
+ * Status-bar badge naming the engine that serves the current open ('native'
+ * tjs sidecar vs 'wasm' sql.js worker). The host reports it in every
+ * connection result (initialize + refreshContent), so the badge tracks
+ * fallbacks live — QA reads it to know which engine a step actually ran on.
+ * The element ships hidden in the shared template; only this desktop entry
+ * unhides it.
+ */
+function updateEngineBadge(engine) {
+    if (engine !== 'native' && engine !== 'wasm') return;   // absent on non-desktop results
+    state.engine = engine;
+    const badge = document.getElementById('engineBadge');
+    if (!badge) return;
+    badge.textContent = engine;
+    badge.dataset.engine = engine;
+    badge.hidden = false;
+}
+
+// ============================================================================
 // SQL console (desktop only)
 // ============================================================================
 
@@ -290,6 +312,7 @@ const webviewMethods = {
         invalidateAllCounts();
         if (connectionResult) {
             applyConnectionResult(connectionResult);
+            updateEngineBadge(connectionResult.engine);
         }
         if (state.isDbConnected) {
             // A broadcast view refresh may change projection and row order.
@@ -362,6 +385,7 @@ async function initializeApp() {
         if (!applyConnectionResult(result)) {
             throw new Error('Failed to connect to database');
         }
+        updateEngineBadge(result.engine);
 
         // Test connection
         await backendApi.ping();
