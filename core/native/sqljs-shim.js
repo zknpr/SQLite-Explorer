@@ -998,6 +998,31 @@ export function createShimDatabase(config = {}, deps = {}) {
         },
 
         /**
+         * Write a vacuumed image of the database directly to `target` -- the
+         * out-of-band export route. Unlike `export()`/`exportAsync()` there is
+         * NO read-back and NO image in memory: `VACUUM INTO` streams the copy
+         * to disk and this resolves once it commits. `target` must not exist
+         * (SQLite refuses an existing target, so a planted file fails closed)
+         * and must live somewhere only the caller can write -- the desktop
+         * shell hands in a path inside its own 0700 temp directory. No
+         * `deps.fs` needed: nothing is read back.
+         *
+         * SECURITY: this is the shim's own privileged `VACUUM INTO` (the same
+         * `vacuumInto` behind `export()`), deliberately bypassing the
+         * compileNext path-authority guard. It is reachable ONLY from the
+         * sidecar's shell-originated export handler in native-host.js -- it is
+         * never exposed as a worker method, so the webview can neither invoke
+         * it nor choose `target`.
+         */
+        async exportToPath(target) {
+            assertOpen();
+            if (typeof target !== 'string' || target.length === 0) {
+                throw new Error('exportToPath requires a non-empty target path');
+            }
+            vacuumInto(target);
+        },
+
+        /**
          * sql.js's row-callback cancellation hook. The fork's binding has no
          * per-row callback, so this records the handler and does nothing else;
          * cancellation on the native engine runs through `setQueryDeadline` /

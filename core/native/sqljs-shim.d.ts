@@ -140,6 +140,13 @@ export interface ShimDatabase {
     /** Requires a synchronous `deps.fs`; throws otherwise (see `exportAsync`). */
     export(): Uint8Array;
     exportAsync(): Promise<Uint8Array>;
+    /**
+     * `VACUUM INTO target` directly — no read-back, no image in memory, no
+     * `deps.fs` needed. `target` must not exist (a planted file fails closed).
+     * Desktop sidecar only: reachable solely from the shell-originated export
+     * handler in native-host.js, never as a worker method.
+     */
+    exportToPath(target: string): Promise<void>;
     /** Recorded for the sidecar; the fork has no per-row callback. */
     progress_handler(interval: number | null, callback?: (() => boolean) | null): undefined;
     readonly progressHandler: { interval: number; callback: () => boolean } | null;

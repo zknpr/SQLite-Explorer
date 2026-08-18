@@ -842,6 +842,99 @@ describe('sqljs-shim: native-only behaviour', () => {
         });
     });
 
+    it('exportToPath() lands a valid reopenable image reflecting live mutations', async () => {
+        const db = createShim();
+        try {
+            db.run(SEED_SQL);
+            // Mutation AFTER the seed: the exported image must carry it, proving
+            // exportToPath snapshots the live database, not stale state.
+            db.run("INSERT INTO t VALUES (42, 'mutation-check', NULL, 9.75)");
+            const target = path.join(nodeFileSystem.makeTempDir(), 'export-to-path.sqlite');
+            await db.exportToPath(target);
+            const bytes = new Uint8Array(fs.readFileSync(target));
+            assert.strictEqual(
+                Buffer.from(bytes.subarray(0, 15)).toString('latin1'),
+                'SQLite format 3'
+            );
+            const reference = new SQL.Database(bytes);
+            try {
+                assert.deepStrictEqual(
+                    normalize(reference.exec('SELECT name FROM t WHERE id = 42')),
+                    [{ columns: ['name'], values: [['mutation-check']] }]
+                );
+                assert.deepStrictEqual(
+                    normalize(reference.exec('SELECT count(*) AS c FROM t')),
+                    [{ columns: ['c'], values: [[4]] }]
+                );
+            } finally {
+                reference.close();
+            }
+        } finally {
+            db.close();
+        }
+    });
+
+    it('exportToPath() refuses an existing target (VACUUM INTO fails closed)', async () => {
+        const db = createShim();
+        try {
+            db.run(SEED_SQL);
+            const target = path.join(nodeFileSystem.makeTempDir(), 'planted');
+            fs.writeFileSync(target, 'planted');
+            // The exact message depends on the target's content and the SQLite
+            // build ("output file already exists" vs "file is not a database");
+            // the invariant is: it throws and the planted file is untouched.
+            await assert.rejects(db.exportToPath(target), /already exists|not a database/);
+            assert.strictEqual(fs.readFileSync(target, 'utf8'), 'planted', 'planted file untouched');
+        } finally {
+            db.close();
+        }
+    });
+
+    it('exportToPath() rejects a non-string target structurally', async () => {
+        const db = createShim();
+        try {
+            db.run(SEED_SQL);
+            await assert.rejects(
+                db.exportToPath(undefined as unknown as string),
+                /non-empty target path/
+            );
+            await assert.rejects(db.exportToPath(''), /non-empty target path/);
+        } finally {
+            db.close();
+        }
+    });
+
+    it('exportToPath() from a readOnly connection works (writes only its output)', async () => {
+        // Not withFileDatabase: its callback is synchronous and this body awaits.
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sqljs-shim-db-'));
+        try {
+            const file = path.join(dir, 'fixture.sqlite');
+            const seeded = createShim({ path: file });
+            seeded.run(SEED_SQL);
+            seeded.close();
+            const db = createShim({ path: file, readOnly: true });
+            try {
+                const target = path.join(dir, 'ro-export.sqlite');
+                await db.exportToPath(target);
+                assert.ok(fs.statSync(target).size > 0);
+            } finally {
+                db.close();
+            }
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it('exportToPath() after close rejects', async () => {
+        const db = createShim();
+        db.run(SEED_SQL);
+        db.close();
+        await assert.rejects(
+            db.exportToPath(path.join(os.tmpdir(), 'never-written.sqlite')),
+            /Database closed/
+        );
+    });
+
     it('rejects opening from bytes', () => {
         assert.throws(
             () => createShim({ content: new Uint8Array([1, 2, 3]) }),

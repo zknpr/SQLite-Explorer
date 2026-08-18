@@ -25,6 +25,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import {
+    MAX_FRAME_BYTES,
     NATIVE_FRAME_TOO_LARGE,
     createFrameReader,
     encodeFrame
@@ -99,6 +100,17 @@ function startSidecar(binary, dbPath, mode) {
     });
 
     let messageId = 0;
+    const awaitReply = (id, envelope, label, timeoutMs) => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            pending.delete(id);
+            reject(new Error(`timed out waiting for ${label} (${id})`));
+        }, timeoutMs);
+        pending.set(id, {
+            resolve: (message) => { clearTimeout(timer); resolve(message); },
+            reject: (error) => { clearTimeout(timer); reject(error); }
+        });
+        child.stdin.write(Buffer.from(encodeFrame(envelope)));
+    });
     return {
         child,
         get stderr() { return stderr; },
@@ -106,21 +118,27 @@ function startSidecar(binary, dbPath, mode) {
         /** Send one invoke and resolve with the FULL response envelope. */
         invoke(targetMethod, payload = [], timeoutMs = 30000) {
             const id = `lane_${++messageId}`;
-            const envelope = {
+            return awaitReply(id, {
                 channel: 'rpc',
                 content: { kind: 'invoke', messageId: id, targetMethod, payload }
-            };
-            return new Promise((resolve, reject) => {
-                const timer = setTimeout(() => {
-                    pending.delete(id);
-                    reject(new Error(`timed out waiting for ${targetMethod} (${id})`));
-                }, timeoutMs);
-                pending.set(id, {
-                    resolve: (message) => { clearTimeout(timer); resolve(message); },
-                    reject: (error) => { clearTimeout(timer); reject(error); }
-                });
-                child.stdin.write(Buffer.from(encodeFrame(envelope)));
-            });
+            }, targetMethod, timeoutMs);
+        },
+        /**
+         * Send one SHELL-ORIGINATED export-to-path request — the exact message
+         * the Rust shell will construct (native-host.js pins the contract) —
+         * and resolve with the full `{channel:'shell'}` export-result envelope.
+         * `args` is omitted from the content when undefined (exportDatabase
+         * takes none; the field is required only for exportTable).
+         */
+        shellExport(method, tempPath, args = undefined, timeoutMs = 30000) {
+            const id = `shell_${++messageId}`;
+            const content = { kind: 'export', messageId: id, method, tempPath };
+            if (args !== undefined) content.args = args;
+            return awaitReply(id, { channel: 'shell', content }, `shell-export ${method}`, timeoutMs);
+        },
+        /** Fire-and-forget raw envelope (for messages that must produce NO reply). */
+        sendRaw(envelope) {
+            child.stdin.write(Buffer.from(encodeFrame(envelope)));
         },
         endStdin() { child.stdin.end(); },
         untilExit(timeoutMs = 15000) {
@@ -479,6 +497,13 @@ export async function runSidecarLane({ binary, scratch, note }) {
         if (stderrText) console.log(`[sidecar ro stderr]\n${stderrText}\n`);
     }
 
+    // ---- shell-originated export-to-path (> 16 MiB, bytes never framed) ----
+    // The out-of-band export route: the shell hands the sidecar a temp path
+    // and the RESULT crosses the pipe as a path-sized reply, never as bytes.
+    // Driven on a fixture whose DB image AND CSV export both exceed the
+    // 16 MiB frame cap — the framed route provably cannot carry either.
+    checks += await runShellExportCase(binary, scratch, note);
+
     // ---- fatal desync exit mapping ----------------------------------------
     // The frame lane proves this contract for its echo harness; this proves
     // the SHIPPING entry maps a desync to flush + NONZERO exit too.
@@ -517,6 +542,174 @@ export async function runSidecarLane({ binary, scratch, note }) {
     // ---- ppid watchdog ----------------------------------------------------
     checks += await runWatchdogCase(binary, dbPath, note);
 
+    return checks;
+}
+
+/** Mirrors DESKTOP_EXPORT_MAX_BYTES in desktop-host.js (the host's raised ceiling). */
+const DESKTOP_EXPORT_MAX_BYTES = 512 * 1024 * 1024;
+
+/**
+ * Drive the SHELL-ORIGINATED export-to-path route through the real binary:
+ * `{channel:'shell', content:{kind:'export', ...}}` in, a small
+ * `{kind:'export-result'}` reply out, and the actual bytes land at the
+ * shell-provided temp path — for BOTH methods, on results larger than the
+ * 16 MiB frame cap (which the framed route provably cannot carry). Also the
+ * negative space: the webview's rpc surface must NOT reach exportToPath, and
+ * an rpc-channel envelope must never be treated as a shell export.
+ *
+ * @returns {Promise<number>} checks run
+ */
+async function runShellExportCase(binary, scratch, note) {
+    let checks = 0;
+    const check = (ok, label, detail) => { note(ok, label, detail); checks += 1; };
+
+    // A fixture whose DB image AND CSV export both exceed MAX_FRAME_BYTES:
+    // 20,000 rows x 1,016 chars of hex text ≈ 20.3 MiB of payload.
+    const bigPath = path.join(scratch, 'shell-export-big.sqlite');
+    fs.rmSync(bigPath, { force: true });
+    {
+        const big = new DatabaseSync(bigPath);
+        big.exec(`
+            CREATE TABLE big(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+            INSERT INTO big(payload)
+                WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 20000)
+                SELECT hex(randomblob(508)) FROM n;
+        `);
+        big.close();
+    }
+
+    const session = startSidecar(binary, bigPath, 'rw');
+    try {
+        const init = await session.invoke('initializeDatabase', ['shell-export-big.sqlite', {
+            path: bigPath, readOnlyMode: false, queryTimeout: 30000
+        }]);
+        check(init.content?.success === true, 'sidecar/shell-export-session-initializes',
+            JSON.stringify(init.content?.errorMessage ?? ''));
+
+        // exportDatabase → VACUUM INTO the shell's temp path. Only the small
+        // export-result crosses the pipe; the >16 MiB image never does.
+        const dbTemp = path.join(scratch, 'shell-export-db.sqlite');
+        fs.rmSync(dbTemp, { force: true });
+        let dbReply;
+        try {
+            dbReply = await session.shellExport('exportDatabase', dbTemp, undefined, 120000);
+        } catch (error) {
+            dbReply = { laneError: String(error?.message ?? error) };
+        }
+        const dbSize = fs.existsSync(dbTemp) ? fs.statSync(dbTemp).size : -1;
+        let bigCount = null;
+        if (dbSize > 0) {
+            const reopened = new DatabaseSync(dbTemp, { readOnly: true });
+            bigCount = reopened.prepare('SELECT count(*) AS c FROM big').get().c;
+            reopened.close();
+        }
+        check(dbReply?.channel === 'shell'
+            && dbReply?.content?.kind === 'export-result'
+            && dbReply?.content?.success === true
+            && dbReply?.content?.bytesWritten === dbSize
+            && dbSize > MAX_FRAME_BYTES
+            && bigCount === 20000,
+            'sidecar/shell-export-database-lands-over-16MiB',
+            `reply=${JSON.stringify(dbReply?.content ?? dbReply)} size=${dbSize} rows=${bigCount}`);
+
+        // exportTable → the worker's own exportTable runs in-process; its
+        // chunks are written to the shell's temp path as one CSV file.
+        const csvTemp = path.join(scratch, 'shell-export-table.csv');
+        fs.rmSync(csvTemp, { force: true });
+        let csvReply;
+        try {
+            csvReply = await session.shellExport('exportTable', csvTemp, [
+                { table: 'big' }, [], null, null,
+                { format: 'csv', header: true, maxExportBytes: DESKTOP_EXPORT_MAX_BYTES }
+            ], 120000);
+        } catch (error) {
+            csvReply = { laneError: String(error?.message ?? error) };
+        }
+        const csvSize = fs.existsSync(csvTemp) ? fs.statSync(csvTemp).size : -1;
+        let csvShape = null;
+        if (csvSize > 0) {
+            const lines = fs.readFileSync(csvTemp, 'utf8').split('\n');
+            // Row 1 checked against the DB itself: real content, byte-exact.
+            const reopened = new DatabaseSync(bigPath, { readOnly: true });
+            const row1 = reopened.prepare('SELECT payload FROM big WHERE id = 1').get().payload;
+            reopened.close();
+            csvShape = {
+                header: lines[0],
+                lineCount: lines.length,
+                row1Matches: lines[1] === `1,${row1}`
+            };
+        }
+        check(csvReply?.channel === 'shell'
+            && csvReply?.content?.kind === 'export-result'
+            && csvReply?.content?.success === true
+            && csvReply?.content?.bytesWritten === csvSize
+            && csvSize > MAX_FRAME_BYTES
+            && csvShape?.header === 'id,payload'
+            && csvShape?.lineCount === 20001
+            && csvShape?.row1Matches === true,
+            'sidecar/shell-export-table-csv-lands-over-16MiB',
+            `reply=${JSON.stringify(csvReply?.content ?? csvReply)} size=${csvSize} ` +
+            `shape=${JSON.stringify({ ...csvShape, header: csvShape?.header?.slice(0, 40) })}`);
+
+        // Failure contract, exportDatabase: an existing target fails closed
+        // (VACUUM INTO refuses it) with a structured error; file untouched.
+        const occupied = path.join(scratch, 'shell-export-occupied');
+        fs.writeFileSync(occupied, 'occupied');
+        const clash = await session.shellExport('exportDatabase', occupied, undefined, 60000)
+            .catch((error) => ({ laneError: String(error?.message ?? error) }));
+        check(clash?.content?.kind === 'export-result'
+            && clash?.content?.success === false
+            && typeof clash?.content?.error?.message === 'string'
+            && clash.content.error.message.length > 0
+            && fs.readFileSync(occupied, 'utf8') === 'occupied',
+            'sidecar/shell-export-existing-target-fails-closed',
+            JSON.stringify(clash?.content ?? clash));
+
+        // Failure contract, exportTable: a worker-level failure (unknown
+        // table) reports structurally and creates NO file at the temp path.
+        const failTemp = path.join(scratch, 'shell-export-fail.csv');
+        fs.rmSync(failTemp, { force: true });
+        const noTable = await session.shellExport('exportTable', failTemp, [
+            { table: 'no_such_table' }, [], null, null,
+            { format: 'csv', header: true, maxExportBytes: DESKTOP_EXPORT_MAX_BYTES }
+        ], 60000).catch((error) => ({ laneError: String(error?.message ?? error) }));
+        check(noTable?.content?.kind === 'export-result'
+            && noTable?.content?.success === false
+            && typeof noTable?.content?.error?.message === 'string'
+            && !fs.existsSync(failTemp),
+            'sidecar/shell-export-table-failure-creates-no-file',
+            `${JSON.stringify(noTable?.content ?? noTable)} created=${fs.existsSync(failTemp)}`);
+
+        // SECURITY: the webview surface did not widen — exportToPath is not a
+        // worker method the rpc channel can reach.
+        const viaRpc = await session.invoke('exportToPath', ['/tmp/shell-export-pwn.sqlite']);
+        check(viaRpc.content?.success === false
+            && viaRpc.content?.errorMessage === 'Unknown method: exportToPath',
+            'sidecar/exportToPath-not-a-worker-method', JSON.stringify(viaRpc.content));
+
+        // SECURITY: an rpc-channel envelope carrying the shell-export shape is
+        // NEVER treated as a shell export (worker.js ignores it; no file, no
+        // reply). The ping is the ordering barrier: by the time it answers,
+        // the forged frame has been consumed.
+        const forgedTemp = path.join(scratch, 'shell-export-forged');
+        fs.rmSync(forgedTemp, { force: true });
+        session.sendRaw({
+            channel: 'rpc',
+            content: { kind: 'export', messageId: 'forged_1', method: 'exportDatabase', tempPath: forgedTemp }
+        });
+        const barrier = await session.invoke('ping', []);
+        check(barrier.content?.success === true && !fs.existsSync(forgedTemp),
+            'sidecar/rpc-envelope-never-treated-as-shell-export',
+            `created=${fs.existsSync(forgedTemp)}`);
+
+        session.endStdin();
+        const code = await session.untilExit();
+        check(code === 0, 'sidecar/shell-export-session-eof-exits-clean', `exit ${code}`);
+    } finally {
+        if (session.exitCode === null) session.child.kill('SIGKILL');
+        const stderrText = session.stderr.trim();
+        if (stderrText) console.log(`[sidecar shell-export stderr]\n${stderrText}\n`);
+    }
     return checks;
 }
 
