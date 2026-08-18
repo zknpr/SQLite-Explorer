@@ -1981,3 +1981,137 @@ test('a mutation failure that KEEPS the transaction stays pending: no discard, n
   assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT']);     // ONE txn throughout — no spurious re-BEGIN
   assert.deepEqual(txn.mutationsInTxn, [true, true]);     // both surviving edits ran inside it
 });
+
+// ---- I1 completeness: the same stale-flag desync on the two other native
+// mutation-failure lanes (barrier DDL, undo/redo replays). All mutation paths
+// now ride callMutationGuarded; the console lane is the deliberate exception
+// (execution-phase script errors RESOLVE, reconciled on the resolve path).
+
+test('an auto-rolled-back barrier DDL reconciles too: phantom cleared, fresh txn afterwards', async () => {
+  const { txn, exec, mutate } = makeTxnFake('fork');
+  const { host } = makeNativeHost({
+    initializeDatabase: () => { txn.open = false; return { isReadOnly: false, storage: 'memory' }; },
+    runQuery: (args) => exec(args[0]),
+    updateCell: () => mutate(),
+    createTable: () => mutate()
+  });
+  await host.start();
+  let refreshes = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshes++; return { success: true }; } });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v1', 'o', 1048576]);   // pending edit
+  refreshes = 0;
+
+  txn.autoRollbackNextMutation = true;                    // disk fills up on the DDL
+  await assert.rejects(() => host.invoke('createTable', ['CREATE TABLE q (a)']), /disk is full/);
+  assert.equal(host.hasUnsavedChanges(), false);          // the pending edit died with the session
+  assert.equal(txn.open, false);
+  assert.equal(refreshes, 1);
+  assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT']);
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'o', 1048576]);   // N+1: fresh txn, pending
+  assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT', 'BEGIN']);
+  assert.deepEqual(txn.mutationsInTxn, [true, true]);     // never a bare autocommitted write
+  assert.equal(txn.open, true);
+  assert.equal(host.hasUnsavedChanges(), true);
+});
+
+test('an auto-rolled-back undo replay reconciles AND leaves no dangling history entry', async () => {
+  const { txn, exec, mutate } = makeTxnFake('fork');
+  const { host } = makeNativeHost({
+    initializeDatabase: () => { txn.open = false; return { isReadOnly: false, storage: 'memory' }; },
+    runQuery: (args) => exec(args[0]),
+    updateCell: () => mutate(),
+    undoModification: () => mutate()
+  });
+  await host.start();
+  let refreshes = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshes++; return { success: true }; } });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v1', 'o', 1048576]);
+  await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v1', 1048576]);
+  refreshes = 0;
+
+  txn.autoRollbackNextMutation = true;                    // the replay hits the abort
+  await assert.rejects(() => host.invoke('triggerUndo', []), /disk is full/);
+  assert.equal(host.hasUnsavedChanges(), false);          // whole session gone — nothing pending
+  assert.equal(txn.open, false);
+  assert.equal(refreshes, 1);
+  assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT']);
+  // The stepped entry must NOT dangle: the history died with the session, so
+  // BOTH directions are empty — no stepForward-resurrected phantom on the
+  // fresh tracker, nothing left to undo.
+  assert.deepEqual(await host.invoke('triggerUndo', []), { performed: false });
+  assert.deepEqual(await host.invoke('triggerRedo', []), { performed: false });
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v3', 'o', 1048576]);   // fresh txn, pending
+  assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT', 'BEGIN']);
+  assert.deepEqual(txn.mutationsInTxn, [true, true, true]);
+  assert.equal(txn.open, true);
+  assert.equal(host.hasUnsavedChanges(), true);
+});
+
+test('an undo replay failure that KEEPS the transaction restores the stepped entry', async () => {
+  const { txn, exec } = makeTxnFake('fork');
+  const undoPayloads: unknown[] = [];
+  let failUndo = false;
+  const { host } = makeNativeHost({
+    initializeDatabase: () => { txn.open = false; return { isReadOnly: false, storage: 'memory' }; },
+    runQuery: (args) => exec(args[0]),
+    updateCell: () => 1,
+    undoModification: (args) => {
+      undoPayloads.push(args[0]);
+      if (failUndo) { failUndo = false; throw new Error('SQL logic error'); }  // txn survives
+      return { success: true };
+    }
+  });
+  await host.start();
+  let refreshes = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshes++; return { success: true }; } });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v1', 'o', 1048576]);
+  await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v1', 1048576]);
+  refreshes = 0;
+
+  failUndo = true;
+  await assert.rejects(() => host.invoke('triggerUndo', []), /SQL logic error/);
+  assert.equal(txn.open, true);                           // probe saw the survivor and kept it
+  assert.equal(host.hasUnsavedChanges(), true);
+  assert.equal(refreshes, 0);
+
+  // The stepped entry went BACK: the retry pops the SAME modification (the
+  // v2 edit), not its predecessor — history and database stayed in step.
+  const res = await host.invoke('triggerUndo', []) as Record<string, unknown>;
+  assert.equal(res.performed, true);
+  assert.equal(undoPayloads.length, 2);
+  assert.deepEqual(undoPayloads[1], undoPayloads[0]);
+  assert.equal((undoPayloads[0] as { newValue?: unknown }).newValue, 'v2');
+  assert.deepEqual(txn.applied, ['BEGIN']);               // one txn throughout
+});
+
+test('an auto-rolled-back redo replay reconciles symmetrically', async () => {
+  const { txn, exec, mutate } = makeTxnFake('fork');
+  const { host } = makeNativeHost({
+    initializeDatabase: () => { txn.open = false; return { isReadOnly: false, storage: 'memory' }; },
+    runQuery: (args) => exec(args[0]),
+    updateCell: () => mutate(),
+    undoModification: () => ({ success: true }),
+    redoModification: () => mutate()
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v1', 'o', 1048576]);
+  assert.deepEqual(await host.invoke('triggerUndo', []), { performed: true });
+
+  txn.autoRollbackNextMutation = true;
+  await assert.rejects(() => host.invoke('triggerRedo', []), /disk is full/);
+  assert.equal(host.hasUnsavedChanges(), false);          // no stepForward-dangled entry on the fresh tracker
+  assert.equal(txn.open, false);
+  assert.deepEqual(await host.invoke('triggerRedo', []), { performed: false });
+  assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT']);
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'o', 1048576]);   // fresh txn, pending
+  assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT', 'BEGIN']);
+  assert.equal(txn.open, true);
+});

@@ -380,6 +380,33 @@ export function createDesktopHost({ bridge, createWorker }) {
         }
     }
 
+    /**
+     * callWorker for mutation-bearing methods: any rejection runs the txn
+     * reconcile above before the ORIGINAL error propagates, netted so
+     * nothing secondary can displace the error the user needs. EVERY native
+     * mutation path must ride this — grid mutations, the barrier DDL/pragma
+     * lane, and the undo/redo replays (which layer their history
+     * compensation outside, keyed on tracker identity). The console lane is
+     * the deliberate exception: execution-phase script errors RESOLVE by
+     * design (worker runConsole), so it reconciles on the resolve path via
+     * reconcileConsoleTxnState instead.
+     */
+    async function callMutationGuarded(method, args) {
+        try {
+            return await callWorker(method, args);
+        } catch (error) {
+            // The failure may have taken the whole session transaction with
+            // it — reconcile BEFORE the error surfaces so the grid the user
+            // sees next tells the truth.
+            try {
+                await reconcileTxnAfterMutationFailure();
+            } catch (reconcileError) {
+                console.warn('Txn reconciliation after a failed mutation failed:', reconcileError);
+            }
+            throw error;
+        }
+    }
+
     // ---- modification recording --------------------------------------------
 
     function buildModification(method, args, result) {
@@ -481,22 +508,7 @@ export function createDesktopHost({ bridge, createWorker }) {
 
     async function invokeMutation(method, args) {
         await ensureSessionTxn();
-        let result;
-        try {
-            result = await callWorker(method, args);
-        } catch (error) {
-            // The failure may have taken the whole session transaction with
-            // it (see reconcileTxnAfterMutationFailure) — reconcile BEFORE
-            // the error surfaces so the grid the user sees next tells the
-            // truth. Netted here as well: nothing secondary may mask the
-            // mutation error the user actually needs.
-            try {
-                await reconcileTxnAfterMutationFailure();
-            } catch (reconcileError) {
-                console.warn('Txn reconciliation after a failed mutation failed:', reconcileError);
-            }
-            throw error;
-        }
+        const result = await callMutationGuarded(method, args);
         if (result && typeof result === 'object' && result.cancelled === true) return result;
 
         let modification = buildModification(method, args, result);
@@ -839,7 +851,21 @@ export function createDesktopHost({ bridge, createWorker }) {
                 tracker.stepForward();
                 throw error;
             }
-            await callWorker('undoModification', [entry]);
+            // A failed replay composes TWO compensations, order-sensitive:
+            // the txn reconcile runs first (inside callMutationGuarded)
+            // because on auto-rollback it REPLACES the tracker — the whole
+            // history died with the discarded session, and pushing the
+            // stepped entry into the fresh tracker would resurrect a
+            // phantom. Identity (not the nativeTxnOpen flag) decides,
+            // so the WASM path — no txn model, but a failed replay still
+            // means the entry was not applied — puts its history back too.
+            const trackerBeforeReplay = tracker;
+            try {
+                await callMutationGuarded('undoModification', [entry]);
+            } catch (error) {
+                if (tracker === trackerBeforeReplay) tracker.stepForward();
+                throw error;
+            }
             updateTitle();
             await refreshUi();
             return { performed: true };
@@ -853,7 +879,14 @@ export function createDesktopHost({ bridge, createWorker }) {
                 tracker.stepBack();
                 throw error;
             }
-            await callWorker('redoModification', [entry]);
+            // Mirror of triggerUndo's composition — see the comment there.
+            const trackerBeforeReplay = tracker;
+            try {
+                await callMutationGuarded('redoModification', [entry]);
+            } catch (error) {
+                if (tracker === trackerBeforeReplay) tracker.stepBack();
+                throw error;
+            }
             updateTitle();
             await refreshUi();
             return { performed: true };
@@ -946,7 +979,13 @@ export function createDesktopHost({ bridge, createWorker }) {
                 } else {
                     await ensureSessionTxn();
                 }
-                const result = await callWorker(method, args);
+                // Guarded like every mutation: an abort-class failure here
+                // (DDL is still a write) discards the session txn underneath
+                // the flag exactly like a failed grid edit would. The
+                // ensureSessionTxn-less setPragma ride-along is harmless —
+                // with no txn open the reconcile is a no-op, and a
+                // journal_mode-inside-txn refusal probes back "still open".
+                const result = await callMutationGuarded(method, args);
                 // No ModificationType union member fits a generic DDL/pragma
                 // barrier (there's no "barrier"/"pragma" entry); the literal RPC
                 // method name is used for modificationType/description instead.
