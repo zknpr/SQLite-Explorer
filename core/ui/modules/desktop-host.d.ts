@@ -47,6 +47,13 @@ export interface DesktopHostBridge {
      * as {@link onOpenFile}.
      */
     viewerReady?(): Promise<void>;
+    /**
+     * Reports how many open databases have unsaved changes, so the shell can
+     * answer the OS synchronously when the window is asked to close (it cannot
+     * await the page at that point). Pushed on every dirty-state and registry
+     * change. Optional for the same reason as {@link onOpenFile}.
+     */
+    setUnsavedState?(hasUnsaved: boolean, count: number): Promise<void>;
 
     // ---- native engine (tjs sidecar) — all four present or the host stays
     // ---- on WASM. Implemented by the shell's bridge.js over the Rust

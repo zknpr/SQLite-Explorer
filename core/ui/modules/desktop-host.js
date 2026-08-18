@@ -675,7 +675,20 @@ export function createDesktopHost({ bridge, createWorker }) {
      * Never propagates — a broken renderer must not fail a save.
      */
     function notifyDatabasesChanged() {
-        notifyWebview('databasesChanged', [listDatabases()])
+        const list = listDatabases();
+        // Push the unsaved summary to the shell on the same signal. The shell
+        // needs it SYNCHRONOUSLY when the OS asks whether a window may close —
+        // it cannot await the page at that moment — so the answer has to already
+        // be there. This is the one place that sees every transition:
+        // `updateTitle` calls it on every dirty-state change (it renders the
+        // " — Edited" suffix from the same flag), and the registry lifecycle
+        // calls it on open/close/switch. Counting `isDirty` over the whole list
+        // matches `hasUnsavedChanges` exactly — both walk every entry, including
+        // the retained scratch placeholder that no tab can reach.
+        const unsaved = list.filter(database => database.isDirty).length;
+        bridge.setUnsavedState?.(unsaved > 0, unsaved)
+            ?.catch(error => console.warn('setUnsavedState failed:', error));
+        notifyWebview('databasesChanged', [list])
             .catch(error => console.warn('databasesChanged notification failed:', error));
     }
 

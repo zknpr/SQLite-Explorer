@@ -3272,3 +3272,51 @@ test('state.dbId always names the active database, from boot through every switc
   assert.equal(state.dbId, host.activeDatabaseId());
   assert.notEqual(state.dbId, dbB);
 });
+
+test('the unsaved summary is pushed to the shell on every dirty-state and registry change', async () => {
+  // The shell has to answer the OS synchronously when a window is asked to
+  // close, so it cannot ask the page then — the page pushes instead, and this
+  // is what proves the push tracks every transition rather than only boot.
+  const pushes: Array<[boolean, number]> = [];
+  const { host } = makeHost({
+    updateCell: () => 7,
+    exportDatabase: () => new Uint8Array([1, 2, 3])
+  }, {
+    setUnsavedState: async (hasUnsaved: boolean, count: number) => {
+      pushes.push([hasUnsaved, count]);
+    }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  assert.deepEqual(pushes.at(-1), [false, 0], 'a clean boot reports nothing unsaved');
+
+  await host.invoke('updateCell', ['t', 7, 'c', 'v', 'o', 1048576]);
+  assert.deepEqual(pushes.at(-1), [true, 1]);
+  assert.equal(host.hasUnsavedChanges(), true);
+
+  // A SECOND dirty database must be counted, not collapsed to "some" — the
+  // shell names the number in its confirm.
+  await host.openFromShellPath('/tmp/second.db');
+  await host.invoke('updateCell', ['t', 7, 'c', 'v', 'o', 1048576]);
+  assert.deepEqual(pushes.at(-1), [true, 2]);
+
+  // The count is exactly `hasUnsavedChanges`' own population: both walk every
+  // entry, so a background or UI-unreachable dirty database is included.
+  const dirty = host.listDatabases().filter(database => database.isDirty).length;
+  assert.equal(pushes.at(-1)?.[1], dirty);
+
+  // Saving clears it again.
+  await host.saveToDisk();
+  assert.deepEqual(pushes.at(-1), [true, 1]);
+  assert.equal(host.hasUnsavedChanges(), true);
+});
+
+test('a shell without setUnsavedState still works — the push is optional', async () => {
+  // Older shells (and the dev harness) omit it; an unconditional call would
+  // throw inside updateTitle and take every edit down with it.
+  const { host } = makeHost({ updateCell: () => 7 });   // fake bridge has no setUnsavedState
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.invoke('updateCell', ['t', 7, 'c', 'v', 'o', 1048576]);
+  assert.equal(host.hasUnsavedChanges(), true);
+});
