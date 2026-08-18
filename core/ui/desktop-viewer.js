@@ -484,10 +484,17 @@ if (!bridge) {
             const primary = event.metaKey || event.ctrlKey;
             if (!primary || inEditor) return;
             const key = event.key.toLowerCase();
-            if (key === 'z' && !event.shiftKey) { event.preventDefault(); await backendApi.triggerUndo(); }
-            else if ((key === 'z' && event.shiftKey) || key === 'y') { event.preventDefault(); await backendApi.triggerRedo(); }
-            else if (key === 's') { event.preventDefault(); await host.saveToDisk(); }
-            else if (key === 'o') { event.preventDefault(); await host.openDatabaseViaDialog(); }
+            // WKWebView hands key equivalents to the page BEFORE menu
+            // dispatch and these preventDefault, so on macOS THIS path — not
+            // the menu handler — is what actually runs on ⌘S/⌘O/⌘Z. It needs
+            // the same failure surfacing the menu path has: a genuine COMMIT
+            // failure (disk full, dead sidecar) or open failure must reach
+            // the user, not die as an unhandled rejection behind a
+            // still-dirty title.
+            if (key === 'z' && !event.shiftKey) { event.preventDefault(); await backendApi.triggerUndo().catch(surface('Undo failed')); }
+            else if ((key === 'z' && event.shiftKey) || key === 'y') { event.preventDefault(); await backendApi.triggerRedo().catch(surface('Redo failed')); }
+            else if (key === 's') { event.preventDefault(); await host.saveToDisk().catch(surface('Save failed')); }
+            else if (key === 'o') { event.preventDefault(); await host.openDatabaseViaDialog().catch(surface('Open failed')); }
         });
 
         // Independent of worker boot: never blocks initializeApp() on the

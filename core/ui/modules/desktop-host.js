@@ -121,8 +121,15 @@ export function createDesktopHost({ bridge, createWorker }) {
         worker.onmessage = (event) => settleFromEnvelope(event.data);
         worker.onerror = (error) => {
             const failure = new Error(`Worker crashed: ${error?.message ?? error}`);
-            for (const pending of pendingCalls.values()) pending.reject(failure);
-            pendingCalls.clear();
+            // Only this transport's calls die with the worker: the pending map
+            // is shared, and an in-flight native RPC is alive on
+            // bridge.nativeRpc — it must settle from its own response, not be
+            // spuriously failed by a WASM-side crash.
+            for (const [messageId, pending] of [...pendingCalls]) {
+                if (pending.transport !== 'wasm') continue;
+                pendingCalls.delete(messageId);
+                pending.reject(failure);
+            }
         };
     }
 
@@ -144,7 +151,14 @@ export function createDesktopHost({ bridge, createWorker }) {
             ? JSON.stringify(encodeFrameValue(message))
             : null;
         return new Promise((resolve, reject) => {
-            pendingCalls.set(messageId, { method, resolve, reject });
+            pendingCalls.set(messageId, {
+                method,
+                // Tags which transport owns this entry, so a WASM worker error
+                // (onerror above) cannot reject in-flight native calls.
+                transport: nativeJson !== null ? 'native' : 'wasm',
+                resolve,
+                reject
+            });
             if (nativeJson !== null) {
                 bridge.nativeRpc(nativeJson).then(
                     (responseJson) => {
@@ -208,12 +222,54 @@ export function createDesktopHost({ bridge, createWorker }) {
     // "already in that state" engine answers and adopt reality instead of
     // failing the user's action; every other failure propagates.
 
+    // Engine answers meaning "a transaction is already open" for a bare
+    // BEGIN. Classic engines answer contextually ("cannot start a transaction
+    // within a transaction"); the fork's messages are per-errno generic
+    // strings (sqlite3_errstr) and errno never crosses the RPC wire — probed
+    // ground truth from the bundled binary: nested BEGIN, txn-less
+    // COMMIT/ROLLBACK and even missing tables ALL answer "SQL logic error"
+    // (errno 1). Matching that generic string is sound ONLY because the SQL
+    // tested here is the fixed literal 'BEGIN', whose sole errno-1 failure
+    // mode is the transaction-nesting refusal. Never reuse this pattern for
+    // any other statement's errors.
+    const BEGIN_ALREADY_IN_TXN = /within a transaction|SQL logic error/i;
+
+    /**
+     * Asks the engine whether a transaction is open, via a bare deferred
+     * BEGIN (SQLite has no SQL-level autocommit introspection). BEGIN success
+     * means autocommit was active; the empty probe transaction is closed
+     * straight back out (a deferred BEGIN acquires no locks and wrote
+     * nothing, so that COMMIT cannot fail for busy/IO reasons). The nesting
+     * refusal means a transaction is open — and the failed BEGIN changed no
+     * state. Anything else (transport, sidecar death) propagates.
+     */
+    async function probeTxnOpen() {
+        try {
+            await callWorker('runQuery', ['BEGIN']);
+        } catch (error) {
+            if (!BEGIN_ALREADY_IN_TXN.test(error?.message ?? '')) throw error;
+            return true;
+        }
+        try {
+            await callWorker('runQuery', ['COMMIT']);
+        } catch (error) {
+            // Unreachable for an empty deferred transaction short of a dying
+            // engine — but if it happens, a transaction IS now open: record
+            // that truthfully before propagating.
+            nativeTxnOpen = true;
+            throw error;
+        }
+        return false;
+    }
+
     async function ensureSessionTxn() {
         if (engine !== 'native' || nativeTxnOpen) return;
         try {
             await callWorker('runQuery', ['BEGIN']);
         } catch (error) {
-            if (!/within a transaction/i.test(error?.message ?? '')) throw error;
+            // A console script may have left a transaction open — adopt it.
+            // Any other failure propagates and the mutation never executes.
+            if (!BEGIN_ALREADY_IN_TXN.test(error?.message ?? '')) throw error;
         }
         nativeTxnOpen = true;
     }
@@ -224,11 +280,38 @@ export function createDesktopHost({ bridge, createWorker }) {
         try {
             await callWorker('runQuery', [statement]);
         } catch (error) {
-            // A failed genuine COMMIT (disk full, deferred FK violation) leaves
-            // the transaction open engine-side, so the flag must stay true too.
-            if (!/no transaction is active/i.test(error?.message ?? '')) throw error;
+            // Two failure families share this catch and MUST diverge: "no
+            // transaction is active" (a console script already closed the
+            // session underneath — tolerate, nothing left to end) versus a
+            // genuine COMMIT failure (disk full, deferred FK violation),
+            // where SQLite keeps the transaction open and the flag must stay
+            // true so the user can retry. Classic engines are separable by
+            // message; the fork answers the generic "SQL logic error" for the
+            // no-txn state, which missing tables etc. share — so when the
+            // message is not the classic no-txn answer, ask the ENGINE which
+            // family this was: transaction still open ⇒ genuine failure.
+            if (!/no transaction is active/i.test(error?.message ?? '')) {
+                if (await probeTxnOpen()) throw error;
+            }
         }
         nativeTxnOpen = false;
+    }
+
+    /**
+     * Post-console flag reconciliation. The console is the ONE path raw SQL
+     * reaches the engine (no UI module issues runQuery; the sidecar's own
+     * methods are SAVEPOINT-only), and a script's bare COMMIT/ROLLBACK/END
+     * changes the engine's autocommit state while reporting mutated:false —
+     * so nothing above would notice. A stale-true flag is the dangerous
+     * direction: ensureSessionTxn would early-return and every later grid
+     * mutation would autocommit straight into the user's real file
+     * (persist-without-Save), while a later Save would "succeed" through the
+     * COMMIT tolerance path writing nothing. After every console run the flag
+     * is therefore re-derived from the engine's actual state.
+     */
+    async function reconcileConsoleTxnState() {
+        if (engine !== 'native') return;
+        nativeTxnOpen = await probeTxnOpen();
     }
 
     // ---- modification recording --------------------------------------------
@@ -487,16 +570,68 @@ export function createDesktopHost({ bridge, createWorker }) {
         // A native session from a previous open must not outlive the switch:
         // its sidecar still holds the old file (open transaction included —
         // shutdown rolls it back by SQLite journal semantics).
-        if (nativeBoundPath !== null) await closeNativeSidecar();
+        const hadNativeSession = nativeBoundPath !== null;
+        if (hadNativeSession) await closeNativeSidecar();
         engine = 'wasm';
-        if (size !== undefined && settings.maxFileSize > 0 && size > settings.maxFileSize * 1024 * 1024) {
-            throw new Error(
-                `Cannot open "${name}": file is ${size} bytes, which exceeds ` +
-                `the ${settings.maxFileSize} MiB cap set by the maxFileSize setting.`
-            );
+        // Once the sidecar is gone — or the worker re-init below has begun —
+        // the WASM worker does NOT hold the document currentPath names: its
+        // last successful init is the empty startup DB or an older file. If
+        // the lane then fails, title/tracker/grid still describe the OLD
+        // document while Save would export whatever the worker actually holds
+        // and bridge.saveDatabase it over the old (still-allowlisted) path,
+        // destroying the user's real file. Any failure past that point must
+        // invalidate the document identity before the error propagates. A
+        // failure BEFORE that point (the cap check / a failed read with no
+        // native teardown) leaves the previous document fully intact in the
+        // worker, and destroying that session would be its own regression.
+        let workerHoldsStaleDoc = hadNativeSession;
+        try {
+            if (size !== undefined && settings.maxFileSize > 0 && size > settings.maxFileSize * 1024 * 1024) {
+                throw new Error(
+                    `Cannot open "${name}": file is ${size} bytes, which exceeds ` +
+                    `the ${settings.maxFileSize} MiB cap set by the maxFileSize setting.`
+                );
+            }
+            const bytes = await bridge.readDatabaseBytes(path);
+            workerHoldsStaleDoc = true;   // initializeDatabase may tear the old image down
+            return await openFromBytes(path, name, bytes);
+        } catch (error) {
+            if (workerHoldsStaleDoc) await invalidateDocument();
+            throw error;
         }
-        const bytes = await bridge.readDatabaseBytes(path);
-        return openFromBytes(path, name, bytes);
+    }
+
+    /**
+     * Fail-closed reset after an open left the transport without a known-good
+     * document. Nulling the identity FIRST is the primary guard: saveToDisk
+     * refuses on a null currentPath, so nothing can be written anywhere even
+     * if the recovery below fails. The re-init to the empty startup DB is
+     * hardening — it puts the worker, tracker, and page into the same
+     * coherent no-document state the app boots with.
+     */
+    async function invalidateDocument() {
+        currentPath = null;
+        currentName = 'untitled.db';
+        try {
+            // Also resets the tracker and the session/txn flags.
+            await initializeWorkerDatabase(currentName, {});
+        } catch (initError) {
+            // The null path above already made saves impossible; still reset
+            // the host-side trackers so the title stops claiming edits exist.
+            console.warn('Post-failure worker re-init failed:', initError);
+            connectionInfo = { isReadOnly: false };
+            tracker = new ModificationTracker(100, settings.maxUndoMemory);
+            cellReadSessionOpen = false;
+            nativeTxnOpen = false;
+        }
+        updateTitle();
+        try {
+            await refreshUi();
+        } catch (uiError) {
+            // Best-effort during error recovery: the ORIGINAL open failure is
+            // what must reach the user, not a secondary refresh problem.
+            console.warn('Post-failure UI refresh failed:', uiError);
+        }
     }
 
     // Save-dialog results report the full picked path; only the filename is
@@ -673,6 +808,12 @@ export function createDesktopHost({ bridge, createWorker }) {
                 const beganForThisRun = engine === 'native' && !nativeTxnOpen;
                 await ensureSessionTxn();
                 const result = await callWorker(method, args);
+                // Runs only when runConsole RESOLVED: execution-phase script
+                // errors resolve (with {error, mutated}), so a rejection here
+                // means the script never ran (pre-execution refusal — txn
+                // state unchanged) or the transport died (everything after
+                // this rejects anyway; recovery is reopening the database).
+                await reconcileConsoleTxnState();
                 // Arbitrary SQL cannot be replayed by the undo engine; a mutating run
                 // barriers the history exactly like DDL does. A pure SELECT must not
                 // dirty the file or wall off the user's undo stack.
@@ -700,8 +841,23 @@ export function createDesktopHost({ bridge, createWorker }) {
                 // cannot change inside one and foreign_keys is a silent no-op
                 // there — pragmas are connection/file-level engine actions, not
                 // row edits. With a dirty session the engine's own "cannot ...
-                // within a transaction" answer surfaces to the user unchanged.
-                if (method !== 'setPragma') await ensureSessionTxn();
+                // within a transaction" answer surfaces to the user unchanged —
+                // EXCEPT foreign_keys, which SQLite silently ignores inside any
+                // open transaction (no error, no effect). A data-integrity
+                // control must not silently no-op, so the host refuses it while
+                // the native session transaction is open. journal_mode needs no
+                // guard: the engine itself errors loudly there.
+                if (method === 'setPragma') {
+                    if (engine === 'native' && nativeTxnOpen && args[0] === 'foreign_keys') {
+                        throw new Error(
+                            'Save or discard the pending changes before changing foreign-key '
+                            + 'enforcement: PRAGMA foreign_keys is silently ignored by SQLite '
+                            + 'while a transaction is open.'
+                        );
+                    }
+                } else {
+                    await ensureSessionTxn();
+                }
                 const result = await callWorker(method, args);
                 // No ModificationType union member fits a generic DDL/pragma
                 // barrier (there's no "barrier"/"pragma" entry); the literal RPC
@@ -741,7 +897,15 @@ export function createDesktopHost({ bridge, createWorker }) {
             // session from a previous open must not survive the switch.
             if (nativeBoundPath !== null) await closeNativeSidecar();
             engine = 'wasm';
-            await initializeWorkerDatabase(file.name, { file });
+            try {
+                await initializeWorkerDatabase(file.name, { file });
+            } catch (error) {
+                // Same failure class as openFromPath's WASM lane: the previous
+                // document (native session or torn WASM image) is gone but
+                // currentPath still names it — Save must find no target.
+                await invalidateDocument();
+                throw error;
+            }
             currentPath = null; // no on-disk write-back target for DnD opens
             currentName = file.name;
             updateTitle();

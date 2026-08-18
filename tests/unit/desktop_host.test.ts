@@ -63,7 +63,7 @@ function makeHost(handlers: Record<string, (args: unknown[]) => unknown>, bridge
     bridge,
     createWorker: () => worker as unknown as Worker
   });
-  return { host, posted, saved, bridge };
+  return { host, posted, saved, bridge, worker };
 }
 
 test('start boots an empty database and initialize reports connected', async () => {
@@ -796,20 +796,65 @@ function makeNativeBridgeMembers(
   return { members, log };
 }
 
+/**
+ * Stateful transaction fake mirroring SQLite's real autocommit answers: nested
+ * BEGIN and txn-less COMMIT/ROLLBACK throw. The host's post-console
+ * reconciliation probe (a bare BEGIN) is only meaningful against a fake that
+ * answers it the way an engine would — the old stateless `runQuery: () => []`
+ * would make every probe "discover" autocommit.
+ *
+ * Two message flavors, both real: 'classic' throws sql.js/sqlite3's
+ * contextual messages ("cannot start a transaction within a transaction");
+ * 'fork' throws the bundled tjs binary's per-errno generic strings — probed
+ * ground truth: nested BEGIN, txn-less COMMIT/ROLLBACK and missing tables ALL
+ * answer exactly "SQL logic error" (errno 1, which never crosses the wire).
+ * The fork flavor exists because message-based tolerance that only knows the
+ * classic strings is dead code on the real sidecar — the live smoke caught
+ * exactly that.
+ *
+ * `applied` records the successful state TRANSITIONS only (failed probes and
+ * tolerated no-ops never appear), so tests can assert the engine-side truth
+ * (what actually opened/committed/rolled back) instead of wire noise.
+ */
+function makeTxnFake(flavor: 'classic' | 'fork' = 'classic') {
+  const txn = { open: false, applied: [] as string[] };
+  const msg = (classic: string) => (flavor === 'fork' ? 'SQL logic error' : classic);
+  const exec = (sql: unknown) => {
+    const s = String(sql).trim().toUpperCase();
+    if (s === 'BEGIN') {
+      if (txn.open) throw new Error(msg('cannot start a transaction within a transaction'));
+      txn.open = true;
+      txn.applied.push('BEGIN');
+    } else if (s === 'COMMIT' || s === 'END') {
+      if (!txn.open) throw new Error(msg('cannot commit - no transaction is active'));
+      txn.open = false;
+      txn.applied.push('COMMIT');
+    } else if (s === 'ROLLBACK') {
+      if (!txn.open) throw new Error(msg('cannot rollback - no transaction is active'));
+      txn.open = false;
+      txn.applied.push('ROLLBACK');
+    }
+    return [];
+  };
+  return { txn, exec };
+}
+
 function makeNativeHost(
   nativeHandlers: Record<string, (args: unknown[]) => unknown> = {},
   workerHandlers: Record<string, (args: unknown[]) => unknown> = {},
   bridgeOverrides: Record<string, unknown> = {},
-  nativeOpts: { available?: boolean; openError?: string } = {}
+  nativeOpts: { available?: boolean; openError?: string; txnFlavor?: 'classic' | 'fork' } = {}
 ) {
+  const { txn, exec } = makeTxnFake(nativeOpts.txnFlavor);
   const { members, log } = makeNativeBridgeMembers({
-    initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
-    runQuery: () => [],
+    // Re-init opens a fresh engine session: any transaction is implicitly gone.
+    initializeDatabase: () => { txn.open = false; return { isReadOnly: false, storage: 'memory' }; },
+    runQuery: (args) => exec(args[0]),
     ping: () => true,
     ...nativeHandlers
   }, nativeOpts);
   const made = makeHost(workerHandlers, { ...members, ...bridgeOverrides });
-  return { ...made, nativeLog: log };
+  return { ...made, nativeLog: log, txn, execTxnSql: exec };
 }
 
 /** targetMethods of everything sent over the native transport, in order. */
@@ -1033,7 +1078,12 @@ test('undo after a save opens a fresh transaction before replaying', async () =>
 });
 
 test('a read-only console run closes the transaction it opened; a mutating run leaves it pending', async () => {
-  const { host, nativeLog } = makeNativeHost({
+  // Asserted on the txn fake's ENGINE state, not the wire trace: the
+  // post-console reconciliation probe (fix round 1) adds a failing BEGIN after
+  // every native console run, so raw trace shapes now carry probe noise. The
+  // contract under test is unchanged — what matters is whether a transaction
+  // (and its SHARED lock on the real file) is left open on the engine.
+  const { host, txn } = makeNativeHost({
     runConsole: (args) => (String(args[0]).startsWith('SELECT')
       ? { results: [{ headers: ['1'], rows: [[1]], truncated: false }], mutated: false, changes: 0, durationMs: 1 }
       : { results: [], mutated: true, changes: 1, durationMs: 1 }),
@@ -1044,17 +1094,18 @@ test('a read-only console run closes the transaction it opened; a mutating run l
   await host.openFromShellPath('/tmp/y.db');
 
   await host.invoke('runConsole', ['SELECT 1', {}]);
-  // BEGIN then COMMIT: a pure read must not leave a transaction (and its
-  // SHARED lock on the real file) dangling until save.
-  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT']);
+  // A pure read must not leave a transaction dangling until save.
+  assert.equal(txn.open, false);
+  assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT']);
   assert.equal(host.hasUnsavedChanges(), false);
 
   await host.invoke('runConsole', ['INSERT INTO t DEFAULT VALUES', {}]);
-  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT', 'BEGIN']);
+  assert.equal(txn.open, true);                         // mutations stay pending until ⌘S
   assert.equal(host.hasUnsavedChanges(), true);
 
   await host.invoke('runConsole', ['SELECT 2', {}]);    // txn was already open: not this run's to close
-  assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT', 'BEGIN']);
+  assert.equal(txn.open, true);
+  assert.equal(host.hasUnsavedChanges(), true);
 });
 
 test('BEGIN tolerance: a console-opened transaction is adopted instead of failing the mutation', async () => {
@@ -1265,4 +1316,380 @@ test('outbound native envelopes are frame-codec encoded: Uint8Array args become 
     .catch(() => { /* no updateCell fake — the send is what matters */ });
   const parsed = JSON.parse(rawJson) as { content: { payload: unknown[] } };
   assert.deepEqual(parsed.content.payload[3], { __type: 'Uint8Array', base64: 'Bwg=' });
+});
+
+// ============================================================================
+// Fix round 1 — review defects
+// ============================================================================
+
+// CRITICAL 1: after a native session is torn down for a fallback open, the
+// WASM worker does NOT hold the document currentPath names (its last good init
+// is the empty startup DB). If the fallback then fails, ⌘S used to export that
+// stale/empty image and bridge.saveDatabase it over the user's REAL file (the
+// old path was still allowlisted from the original pick). The failure must
+// invalidate the document identity so nothing can be written anywhere.
+test('a failed WASM fallback after native teardown invalidates the document: saveToDisk cannot overwrite the old file', async () => {
+  let declineNative = false;
+  let failRead = false;
+  const { txn, exec } = makeTxnFake();
+  const { members, log } = makeNativeBridgeMembers({
+    initializeDatabase: () => { txn.open = false; return { isReadOnly: false, storage: 'memory' }; },
+    runQuery: (args) => exec(args[0]),
+    updateCell: () => 1,
+    ping: () => true
+  });
+  const realOpen = members.nativeOpen;
+  members.nativeOpen = async (path: string, readOnly: boolean) => {
+    if (declineNative) throw new Error('ERR_NATIVE_OPEN_FAILED: symlinked final component');
+    return realOpen(path, readOnly);
+  };
+  const { host, posted, saved } = makeHost(
+    { exportDatabase: () => new Uint8Array([9, 9, 9]) },   // what a rogue ⌘S would write
+    {
+      ...members,
+      readDatabaseBytes: async () => {
+        if (failRead) throw new Error('EACCES: read refused');
+        return new Uint8Array([1, 2, 3]);
+      }
+    }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+
+  await host.openFromShellPath('/tmp/precious.db');              // native session
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+  assert.equal(host.hasUnsavedChanges(), true);                  // dirty, txn open
+
+  declineNative = true;
+  failRead = true;
+  await assert.rejects(() => host.openFromShellPath('/tmp/second.db'), /EACCES/);
+  assert.equal(log.closes, 1);                                   // old sidecar torn down
+
+  // The dangerous ⌘S: must be a no-op, not an overwrite of /tmp/precious.db.
+  const wrote = await host.saveToDisk();
+  assert.equal(wrote, false);
+  assert.equal(saved.path, undefined);                           // bridge.saveDatabase never ran
+  assert.equal(posted.filter(p => p.content.targetMethod === 'exportDatabase').length, 0);
+
+  // Identity reset to the no-document state; title cannot claim edits exist.
+  assert.equal(host.hasUnsavedChanges(), false);
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.filename, 'untitled.db');
+  assert.equal(init.engine, 'wasm');
+  // Hardening: the WASM worker was re-initialized to the empty startup DB.
+  const lastInit = posted.filter(p => p.content.targetMethod === 'initializeDatabase').at(-1)!;
+  assert.equal(lastInit.content.payload[0], 'untitled.db');
+  assert.equal((lastInit.content.payload[1] as Record<string, unknown>).content, undefined);
+});
+
+// Companion boundary: when NO native teardown happened and the failure fired
+// before the worker was touched (the maxFileSize cap), the previous document
+// is still fully intact in the worker — a failed open must not destroy it.
+test('a failed pure-WASM second open before the worker is touched preserves the current document', async () => {
+  const { host, saved } = makeHost(
+    { exportDatabase: () => new Uint8Array([7]), updateCell: () => 1 },
+    {
+      pickDatabase: async () => ({ path: '/tmp/huge.db', name: 'huge.db', size: 5 * 1024 * 1024 }),
+      loadSettings: async () => ({ maxFileSize: 1 })
+    }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/keep.db');                  // WASM open (no native bridge)
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  await assert.rejects(() => host.openDatabaseViaDialog(), /maxFileSize/);
+
+  // The old document survived: still saveable to its own path.
+  assert.equal(host.hasUnsavedChanges(), true);
+  const ok = await host.saveToDisk();
+  assert.equal(ok, true);
+  assert.equal(saved.path, '/tmp/keep.db');
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.filename, 'keep.db');
+});
+
+// IMPORTANT 2: a bare COMMIT in the console reports mutated:false, so nothing
+// used to reconcile nativeTxnOpen — the stale-true flag made ensureSessionTxn
+// early-return and every later grid mutation autocommitted straight into the
+// user's file (persist-without-⌘S), while ⌘S "succeeded" via the tolerance
+// path writing nothing. The post-console probe must resynchronize the flag.
+test('console COMMIT divergence: the next grid edit still runs inside a fresh transaction and ⌘S is a real COMMIT', async () => {
+  const editsUnderTxn: boolean[] = [];
+  const { host, txn, execTxnSql } = makeNativeHost({
+    updateCell: () => { editsUnderTxn.push(txn.open); return 1; },
+    runConsole: (args) => {
+      execTxnSql(String(args[0]));   // the script's raw COMMIT reaches the engine
+      return { results: [], mutated: false, changes: 0, durationMs: 1 };
+    }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v1', 'o', 1048576]);   // BEGIN + pending edit
+  await host.invoke('runConsole', ['COMMIT', {}]);                       // script commits underneath
+  assert.equal(txn.open, false);                                         // engine is in autocommit
+
+  // The divergence victim: without reconciliation this edit ran OUTSIDE any
+  // transaction (txn.open false ⇒ instantly persisted to the real file).
+  await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v1', 1048576]);
+  assert.deepEqual(editsUnderTxn, [true, true]);                         // both edits were pending
+  assert.equal(txn.open, true);
+
+  // ⌘S must be an honest COMMIT that actually closes the transaction.
+  const ok = await host.saveToDisk();
+  assert.equal(ok, true);
+  assert.equal(txn.open, false);
+  assert.equal(host.hasUnsavedChanges(), false);
+  // Engine-side truth, in order: edit#1's BEGIN, the script's COMMIT, the
+  // reconciliation probe pair (BEGIN + immediate COMMIT of the empty probe
+  // txn), edit#2's fresh BEGIN, then the real ⌘S COMMIT.
+  assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT', 'BEGIN', 'COMMIT', 'BEGIN', 'COMMIT']);
+});
+
+test('console ROLLBACK divergence reconciles the same way: later edits are pending again, not autocommitted', async () => {
+  const editsUnderTxn: boolean[] = [];
+  const { host, txn, execTxnSql } = makeNativeHost({
+    updateCell: () => { editsUnderTxn.push(txn.open); return 1; },
+    runConsole: (args) => {
+      execTxnSql(String(args[0]));
+      return { results: [], mutated: false, changes: 0, durationMs: 1 };
+    }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v1', 'o', 1048576]);
+  await host.invoke('runConsole', ['ROLLBACK', {}]);
+  assert.equal(txn.open, false);
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v1', 1048576]);
+  assert.deepEqual(editsUnderTxn, [true, true]);
+  assert.equal(txn.open, true);                                  // pending until ⌘S
+});
+
+test('a mutating console script with a COMMIT tail reconciles too: the next mutation BEGINs afresh', async () => {
+  const editsUnderTxn: boolean[] = [];
+  const { host, txn, execTxnSql } = makeNativeHost({
+    updateCell: () => { editsUnderTxn.push(txn.open); return 1; },
+    runConsole: () => {
+      // Simulates `INSERT ...; COMMIT` while the session txn was open: the
+      // worker reports mutated:true (the INSERT) but the tail COMMIT already
+      // closed the transaction under the host.
+      execTxnSql('COMMIT');
+      return { results: [], mutated: true, changes: 1, durationMs: 1 };
+    }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v1', 'o', 1048576]);   // txn open
+  await host.invoke('runConsole', ['INSERT INTO t DEFAULT VALUES; COMMIT', {}]);
+  assert.equal(txn.open, false);                                 // reconciled to autocommit truth
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v1', 1048576]);
+  assert.deepEqual(editsUnderTxn, [true, true]);                 // never autocommitted
+  assert.equal(txn.open, true);
+});
+
+// IMPORTANT 4: the most dangerous transition — a genuine COMMIT failure must
+// keep the transaction open and the session dirty so the user can retry.
+test('a genuine COMMIT failure keeps the session dirty and open; a second save retries the COMMIT without re-BEGIN', async () => {
+  let failCommitOnce = true;
+  const { host, txn, execTxnSql } = makeNativeHost({
+    updateCell: () => 1,
+    runQuery: (args) => {
+      const sql = String(args[0]).trim().toUpperCase();
+      if (sql === 'COMMIT' && failCommitOnce) {
+        failCommitOnce = false;
+        throw new Error('disk I/O error');   // SQLite keeps the txn open on failed COMMIT
+      }
+      return execTxnSql(args[0]);
+    }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  await assert.rejects(() => host.saveToDisk(), /disk I\/O error/);
+  assert.equal(host.hasUnsavedChanges(), true);                  // still dirty — retry possible
+  assert.equal(txn.open, true);                                  // engine still holds the txn
+
+  const ok = await host.saveToDisk();                            // retry
+  assert.equal(ok, true);
+  assert.equal(host.hasUnsavedChanges(), false);
+  assert.equal(txn.open, false);
+  assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT']);            // one txn: no re-BEGIN between saves
+});
+
+// CONCERN 5: PRAGMA foreign_keys is a SILENT SQLite no-op inside an open
+// transaction — the engine neither applies nor reports it. The host must
+// refuse loudly instead of letting a data-integrity control silently no-op.
+test('setPragma foreign_keys is refused while a native transaction is open, and allowed once the session is clean', async () => {
+  const pragmas: unknown[][] = [];
+  const { host, nativeLog } = makeNativeHost({
+    updateCell: () => 1,
+    setPragma: (args) => { pragmas.push(args); return undefined; }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);   // txn open
+
+  await assert.rejects(
+    () => host.invoke('setPragma', ['foreign_keys', true]),
+    /Save or discard/
+  );
+  // Refused host-side: the envelope never reached the engine, and no barrier
+  // was recorded for an action that did not happen.
+  assert.equal(nativeMethods(nativeLog).includes('setPragma'), false);
+
+  // journal_mode is NOT gated: inside a txn the engine itself errors loudly,
+  // and that answer must keep flowing through unchanged.
+  await host.invoke('setPragma', ['journal_mode', 'wal']);
+  assert.deepEqual(pragmas.at(-1), ['journal_mode', 'wal']);
+
+  await host.saveToDisk();                                       // txn closed
+  await host.invoke('setPragma', ['foreign_keys', true]);        // now allowed
+  assert.deepEqual(pragmas.at(-1), ['foreign_keys', true]);
+});
+
+test('setPragma foreign_keys passes through on WASM regardless of dirty state (in-memory image, no session txn)', async () => {
+  const pragmas: unknown[][] = [];
+  const { host } = makeHost({
+    updateCell: () => 1,
+    setPragma: (args) => { pragmas.push(args); return undefined; }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/x.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+  await host.invoke('setPragma', ['foreign_keys', true]);
+  assert.deepEqual(pragmas.at(-1), ['foreign_keys', true]);
+});
+
+// MINOR: the pending map is shared by both transports. A WASM worker error
+// while the native engine is active must fail only its own (WASM) calls —
+// in-flight native RPCs are alive on bridge.nativeRpc and must settle.
+test('worker.onerror rejects only WASM-transport pendings; in-flight native calls still settle', async () => {
+  let releaseNative!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseNative = resolve; });
+  const schema = { tables: [{ name: 't' }], views: [], indexes: [] };
+  const { members } = makeNativeBridgeMembers({
+    initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
+    runQuery: () => [],
+    ping: () => true,
+    fetchSchema: () => schema
+  });
+  const innerRpc = members.nativeRpc;
+  members.nativeRpc = async (json: string) => {
+    const envelope = JSON.parse(json) as Envelope;
+    if (envelope.content.targetMethod === 'fetchSchema') await gate;   // hold the call in flight
+    return innerRpc(json);
+  };
+  const { host, worker } = makeHost({}, { ...members, nativeRpc: members.nativeRpc });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+
+  const inFlight = host.invoke('fetchSchema', []);
+  worker.onerror?.(new Error('wasm worker crashed'));   // must not touch the native pending
+  releaseNative();
+  // Settled by the NATIVE response, not spuriously rejected by the WASM crash.
+  assert.deepEqual(await inFlight, schema);
+});
+
+// ---------------------------------------------------------------------------
+// Fork-message engine (live-smoke regression): the real sidecar's tjs fork
+// answers "SQL logic error" for EVERY errno-1 condition, so any transaction
+// tolerance keyed on the classic contextual strings is dead code natively.
+// The live drive caught this: the reconciliation probe's nested BEGIN came
+// back generic, was treated as a genuine failure, and every mutating console
+// run on native errored out. These tests run the key transitions against the
+// fork's actual message behavior.
+// ---------------------------------------------------------------------------
+
+test('fork messages: a mutating console run still lands — the probe adopts the generic nesting answer', async () => {
+  const { host, txn } = makeNativeHost({
+    runConsole: () => ({ results: [], mutated: true, changes: 1, durationMs: 1 })
+  }, {}, {}, { txnFlavor: 'fork' });
+  await host.start();
+  let refreshed = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshed++; return { success: true }; } });
+  await host.openFromShellPath('/tmp/y.db');
+  refreshed = 0;   // the open itself refreshes once; count only the console's
+
+  // Must resolve (the live symptom was a rejection rendered as a console
+  // error), record the barrier, and leave the mutation pending.
+  const res = await host.invoke('runConsole', ['INSERT INTO t DEFAULT VALUES', {}]) as Record<string, unknown>;
+  assert.equal(res.mutated, true);
+  assert.equal(host.hasUnsavedChanges(), true);
+  assert.equal(refreshed, 1);
+  assert.equal(txn.open, true);
+
+  const ok = await host.saveToDisk();
+  assert.equal(ok, true);
+  assert.equal(txn.open, false);
+  assert.equal(host.hasUnsavedChanges(), false);
+});
+
+test('fork messages: console COMMIT divergence reconciles through the state probe', async () => {
+  const editsUnderTxn: boolean[] = [];
+  const { host, txn, execTxnSql } = makeNativeHost({
+    updateCell: () => { editsUnderTxn.push(txn.open); return 1; },
+    runConsole: (args) => {
+      execTxnSql(String(args[0]));
+      return { results: [], mutated: false, changes: 0, durationMs: 1 };
+    }
+  }, {}, {}, { txnFlavor: 'fork' });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v1', 'o', 1048576]);
+  await host.invoke('runConsole', ['COMMIT', {}]);
+  assert.equal(txn.open, false);
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v1', 1048576]);
+  assert.deepEqual(editsUnderTxn, [true, true]);         // never autocommitted
+  const ok = await host.saveToDisk();
+  assert.equal(ok, true);
+  assert.equal(txn.open, false);
+  assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT', 'BEGIN', 'COMMIT', 'BEGIN', 'COMMIT']);
+});
+
+test('fork messages: a genuine COMMIT failure is still separated from the generic no-txn answer by probing the engine', async () => {
+  let failCommitOnce = true;
+  const { host, txn, execTxnSql } = makeNativeHost({
+    updateCell: () => 1,
+    runQuery: (args) => {
+      const sql = String(args[0]).trim().toUpperCase();
+      if (sql === 'COMMIT' && failCommitOnce) {
+        failCommitOnce = false;
+        // Fork errstr for SQLITE_IOERR — a REAL failure; the txn stays open.
+        throw new Error('disk I/O error');
+      }
+      return execTxnSql(args[0]);
+    }
+  }, {}, {}, { txnFlavor: 'fork' });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  // The COMMIT failure is not the classic no-txn message, so the host probes:
+  // the transaction is still open (probe BEGIN answers the generic nesting
+  // refusal) ⇒ genuine failure ⇒ reject, stay dirty, keep the txn.
+  await assert.rejects(() => host.saveToDisk(), /disk I\/O error/);
+  assert.equal(host.hasUnsavedChanges(), true);
+  assert.equal(txn.open, true);
+
+  const ok = await host.saveToDisk();
+  assert.equal(ok, true);
+  assert.equal(txn.open, false);
+  assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT']);    // one txn; retry did not re-BEGIN
 });
