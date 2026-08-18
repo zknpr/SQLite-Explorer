@@ -142,9 +142,12 @@ export interface ShimDatabase {
     exportAsync(): Promise<Uint8Array>;
     /**
      * `VACUUM INTO target` directly — no read-back, no image in memory, no
-     * `deps.fs` needed. `target` must not exist (a planted file fails closed).
-     * Desktop sidecar only: reachable solely from the shell-originated export
-     * handler in native-host.js, never as a worker method.
+     * `deps.fs` needed. Do NOT rely on VACUUM INTO to refuse a planted target:
+     * SQLite refuses only a NON-EMPTY existing file; a zero-byte file is
+     * written into and a symlink is followed. The caller's own 0700 temp
+     * directory is the boundary that makes planting impossible. Desktop sidecar
+     * only: reachable solely from the shell-originated export handler in
+     * native-host.js, never as a worker method.
      */
     exportToPath(target: string): Promise<void>;
     /** Recorded for the sidecar; the fork has no per-row callback. */

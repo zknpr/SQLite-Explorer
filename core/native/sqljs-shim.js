@@ -1001,11 +1001,13 @@ export function createShimDatabase(config = {}, deps = {}) {
          * Write a vacuumed image of the database directly to `target` -- the
          * out-of-band export route. Unlike `export()`/`exportAsync()` there is
          * NO read-back and NO image in memory: `VACUUM INTO` streams the copy
-         * to disk and this resolves once it commits. `target` must not exist
-         * (SQLite refuses an existing target, so a planted file fails closed)
-         * and must live somewhere only the caller can write -- the desktop
-         * shell hands in a path inside its own 0700 temp directory. No
-         * `deps.fs` needed: nothing is read back.
+         * to disk and this resolves once it commits. `target` must live
+         * somewhere only the caller can write -- the desktop shell hands in a
+         * path inside its own 0700 temp directory, and THAT is the boundary
+         * that makes planting impossible. Do NOT rely on VACUUM INTO to refuse
+         * a planted target: SQLite refuses only a NON-EMPTY existing file; a
+         * zero-byte file is written into, and (no `O_NOFOLLOW`) a symlink is
+         * followed. No `deps.fs` needed: nothing is read back.
          *
          * SECURITY: this is the shim's own privileged `VACUUM INTO` (the same
          * `vacuumInto` behind `export()`), deliberately bypassing the
