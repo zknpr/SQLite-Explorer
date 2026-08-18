@@ -140,10 +140,12 @@ export interface DesktopHost {
      * - `databasesChanged(list: OpenDatabase[])` — the registry, the active
      *   pointer, or a dirty flag changed; the tab strip renders from it.
      * - `databaseSwitched(dbId: string)` — fired inside `setActiveDb` AFTER the
-     *   UI state swap and BEFORE the reload, so the page can re-sync the static
-     *   controls that mirror per-database state (the global filter input, the
-     *   sidebar filter input) and clear a grid the incoming database has no
-     *   selection for.
+     *   UI state swap and BEFORE the reload, so the page can re-sync the DOM
+     *   that mirrors per-database state and is not re-rendered by the reload
+     *   (the toolbar's table label, the global and sidebar filter inputs, the
+     *   status line and pager when the incoming database has no selection) and
+     *   dismiss modals showing the outgoing database's content. A rejection
+     *   from it is logged, never allowed to abort the switch.
      */
     setWebviewMethods(methods: Record<string, (...args: unknown[]) => unknown>): void;
     /** Opens (or, if already open, switches to) a dialog-picked database. */
@@ -175,7 +177,10 @@ export interface DesktopHost {
     saveToDisk(): Promise<boolean>;
     /** Re-reads the ACTIVE database from disk, discarding pending edits. */
     refreshFromDisk(): Promise<void>;
-    /** Unsaved changes in the ACTIVE database. */
+    /**
+     * Unsaved changes in ANY open database — the app-level question a quit
+     * prompt asks. Per-tab dirty marks come from `listDatabases()[].isDirty`.
+     */
     hasUnsavedChanges(): boolean;
     currentFilename(): string | null;
 }

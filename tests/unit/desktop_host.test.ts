@@ -2408,8 +2408,10 @@ test('two open databases keep independent undo history, dirty state and session 
   const dbB = host.activeDatabaseId()!;
   assert.notEqual(dbA, dbB);
 
-  // B is clean and has no transaction; A still holds both.
-  assert.equal(host.hasUnsavedChanges(), false);
+  // B is clean and has no transaction; A still holds both. Per-database dirt
+  // is read from listDatabases — hasUnsavedChanges() is the app-wide question.
+  const dirtyOf = (name: string) => host.listDatabases().find(d => d.name === name)!.isDirty;
+  assert.deepEqual([dirtyOf('a.db'), dirtyOf('b.db')], [true, false]);
   assert.equal(txnFor(idA).txn.open, true);
   assert.equal(txnFor(idB).txn.open, false);
   assert.deepEqual(
@@ -2427,14 +2429,14 @@ test('two open databases keep independent undo history, dirty state and session 
   assert.equal(await host.saveToDisk(), true);
   assert.deepEqual(txnFor(idB).txn.applied, ['BEGIN', 'COMMIT']);
   assert.deepEqual(txnFor(idA).txn.applied, ['BEGIN']);
-  assert.equal(host.hasUnsavedChanges(), false);
+  assert.deepEqual([dirtyOf('a.db'), dirtyOf('b.db')], [true, false]);
 
   // Switching back finds A exactly as it was left: dirty, with its own undo
   // entry still on the stack.
   assert.equal(await host.setActiveDb(dbA), true);
-  assert.equal(host.hasUnsavedChanges(), true);
+  assert.equal(dirtyOf('a.db'), true);
   assert.deepEqual(await host.invoke('triggerUndo', []), { performed: true });
-  assert.equal(host.hasUnsavedChanges(), false);
+  assert.deepEqual([dirtyOf('a.db'), dirtyOf('b.db')], [false, false]);
   // …and B's history was never consumed by A's undo.
   await host.setActiveDb(dbB);
   assert.deepEqual(await host.invoke('triggerUndo', []), { performed: true });
@@ -2924,4 +2926,295 @@ test('two concurrent opens of one path resolve to a single database, not two sid
 
   assert.equal(log.opens.length, 1);                     // one sidecar, not two
   assert.deepEqual(host.listDatabases().map(d => d.name), ['twice.db']);
+});
+
+// ============================================================================
+// Fix round 1 — review defects
+// ============================================================================
+
+// An inline edit is a <textarea> the incoming database's render destroys, and
+// `editingCellInfo`/`activeCellInput` are set and cleared together. If the
+// descriptor were per-database while its input is transient, switching BACK to
+// a database left mid-edit would restore a non-null editingCellInfo with a null
+// activeCellInput — a state the codebase reads as "an editor is live":
+// loadTableData skips renderDataGrid (leaving the OUTGOING database's rows on
+// screen over the incoming one's gridData), editorHoldsWindow() returns true so
+// the virtual window freezes, and grid clicks/Enter/shortcuts are swallowed.
+// Reachable with no tab strip at all — Open Recent and the open-dedupe switch
+// both call setActiveDb.
+test('an inline edit does not survive a database switch in either direction', async () => {
+  assert.equal(TRANSIENT_STATE_FIELDS.includes('editingCellInfo'), true,
+    'editingCellInfo must be transient: its <textarea> cannot survive the switch');
+  assert.equal(PER_DB_STATE_FIELDS.includes('editingCellInfo'), false);
+  // The pair must stay in the SAME class — that is the invariant, not the class.
+  assert.equal(TRANSIENT_STATE_FIELDS.includes('activeCellInput'), true);
+
+  const { host } = makeHost({});
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  await host.openFromShellPath('/tmp/b.db');
+  const dbB = host.activeDatabaseId()!;
+
+  // The user is mid-edit in A when a Finder open / recent switches away.
+  await host.setActiveDb(dbA);
+  state.selectedTable = 'users';
+  state.editingCellInfo = { table: 'users', rowId: 1, column: 'name' };
+  state.activeCellInput = { fake: 'textarea' } as unknown as null;
+
+  await host.setActiveDb(dbB);
+  assert.equal(state.editingCellInfo, null);
+  assert.equal(state.activeCellInput, null);
+
+  // …and coming back does not resurrect it.
+  await host.setActiveDb(dbA);
+  assert.equal(state.selectedTable, 'users');       // the selection DID survive
+  assert.equal(state.editingCellInfo, null);        // the editor did not
+  assert.equal(state.activeCellInput, null);
+});
+
+test('a throwing databaseSwitched handler cannot leave the switch half-applied', async () => {
+  const { host } = makeHost({});
+  let refreshed = 0;
+  host.setWebviewMethods({
+    refreshContent: async () => { refreshed++; return { success: true }; },
+    databaseSwitched: async () => { throw new Error('page handler blew up'); }
+  });
+  await host.start();
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  await host.openFromShellPath('/tmp/b.db');
+  refreshed = 0;
+
+  // activeId and `state` have already moved by the time the handler runs, so a
+  // rejection must not abort the reload — that would strand the incoming
+  // database behind the outgoing one's grid.
+  assert.equal(await host.setActiveDb(dbA), true);
+  assert.equal(host.activeDatabaseId(), dbA);
+  assert.equal(refreshed, 1);
+});
+
+test('hasUnsavedChanges covers every open database, including the unreachable edited placeholder', async () => {
+  const { host } = makeHost({ updateCell: () => 1 });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+
+  // Edit the boot placeholder, then open a file: the placeholder is retained
+  // (it has no path, so dropping it would destroy the work) but nothing in the
+  // UI can reach it until the tab strip exists.
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+  await host.openFromShellPath('/tmp/a.db');
+  assert.deepEqual(
+    host.listDatabases().map(d => [d.name, d.isDirty, d.isActive]),
+    [['untitled.db', true, false], ['a.db', false, true]]
+  );
+
+  // Active-only would answer false here and a quit prompt would never fire.
+  assert.equal(host.hasUnsavedChanges(), true);
+
+  // …and it goes quiet only when nothing anywhere is dirty.
+  await host.closeDatabase(host.listDatabases()[0].dbId);
+  assert.equal(host.hasUnsavedChanges(), false);
+});
+
+test('a background database going dirty is visible to the app-level unsaved check', async () => {
+  const { host } = makeHost({ updateCell: () => 1, exportDatabase: () => new Uint8Array([1]) });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+  await host.openFromShellPath('/tmp/b.db');
+
+  assert.equal(host.hasUnsavedChanges(), true);                 // A is dirty in the background
+  assert.equal(host.listDatabases().find(d => d.isActive)!.isDirty, false);
+  await host.setActiveDb(dbA);
+  await host.saveToDisk();
+  assert.equal(host.hasUnsavedChanges(), false);
+});
+
+// Refresh is the ONE lane that re-initializes an entry's engine in place.
+// initializeDatabase tears the previous image down before it can refuse, so a
+// failure leaves the engine not holding the document the entry's path, name and
+// tracker still describe — a later Save would COMMIT an empty native session
+// ("saved" having written nothing) or export whatever the worker now holds over
+// the real file. It must fail CLOSED.
+test('a failed native refresh closes that database instead of leaving it describing a document its engine no longer holds', async () => {
+  let failReinit = false;
+  const { txn, exec } = makeTxnFake();
+  const { members, log } = makeNativeBridgeMembers({
+    initializeDatabase: () => {
+      if (failReinit) throw new Error('file is not a database');
+      txn.open = false;
+      return { isReadOnly: false, storage: 'memory' };
+    },
+    runQuery: (args) => exec(args[0]),
+    updateCell: () => 1,
+    ping: () => true
+  });
+  const { host, saved } = makeHost({ exportDatabase: () => new Uint8Array([9, 9, 9]) }, members);
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  failReinit = true;
+  await assert.rejects(() => host.refreshFromDisk(), /Refreshing "a\.db" failed .* it was closed/s);
+
+  // The database is gone — sidecar reaped, entry removed — and the host fell
+  // back to a fresh empty database rather than a lying one.
+  assert.deepEqual(log.closedIds, log.openedIds);
+  assert.deepEqual(host.listDatabases().map(d => [d.name, d.path]), [['untitled.db', null]]);
+  assert.equal(host.hasUnsavedChanges(), false);
+  // The dangerous ⌘S is a no-op: nothing claims a path any more.
+  assert.equal(await host.saveToDisk(), false);
+  assert.equal(saved.path, undefined);
+});
+
+test('a failed WASM refresh fails closed the same way, and a failed READ leaves the database untouched', async () => {
+  let failReinit = false;
+  let failRead = false;
+  const { host, saved } = makeHost(
+    {
+      initializeDatabase: () => {
+        // One-shot: the FILE is corrupt, not the WASM runtime — so the empty
+        // replacement database the host falls back to still boots.
+        if (failReinit) { failReinit = false; throw new Error('file is not a database'); }
+        return { isReadOnly: false, storage: 'memory' };
+      },
+      updateCell: () => 1,
+      exportDatabase: () => new Uint8Array([9, 9, 9])
+    },
+    {
+      readDatabaseBytes: async () => {
+        if (failRead) throw new Error('EACCES: read refused');
+        return new Uint8Array([1, 2, 3]);
+      }
+    }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  // A failed READ happens before the engine is touched: the document survives
+  // intact, still dirty, still saveable to its own path.
+  failRead = true;
+  await assert.rejects(() => host.refreshFromDisk(), /EACCES/);
+  assert.deepEqual(host.listDatabases().map(d => d.name), ['a.db']);
+  assert.equal(host.hasUnsavedChanges(), true);
+
+  // A failed RE-INIT is past that point: fail closed.
+  failRead = false;
+  failReinit = true;
+  await assert.rejects(() => host.refreshFromDisk(), /Refreshing "a\.db" failed .* it was closed/s);
+  assert.deepEqual(host.listDatabases().map(d => [d.name, d.path]), [['untitled.db', null]]);
+  assert.equal(await host.saveToDisk(), false);
+  assert.equal(saved.path, undefined);
+});
+
+// The pending map is shared by every database. A call issued against an entry
+// whose transport is already gone used to register a pending entry and only
+// then throw inside the Promise executor — the caller rejected, but the entry
+// stayed in the map forever. Reachable when a close lands during a refresh's
+// readDatabaseBytes await.
+test('a call issued against a closed database is refused without stranding a pending entry', async () => {
+  let releaseRead!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseRead = resolve; });
+  let closeDuringRead: (() => Promise<unknown>) | null = null;
+  const { host, workers } = makeHost({}, {
+    readDatabaseBytes: async () => {
+      // Only the refresh read is held: the opens above run through this same
+      // fake and must not block on a gate released after them.
+      if (closeDuringRead) {
+        const run = closeDuringRead;
+        closeDuringRead = null;
+        await run();          // the user closes the tab mid-read
+        await gate;
+      }
+      return new Uint8Array([1, 2, 3]);
+    }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  const workerA = workers.at(-1)!;
+  await host.openFromShellPath('/tmp/b.db');
+  await host.setActiveDb(dbA);
+
+  closeDuringRead = () => host.closeDatabase(dbA);
+  const refresh = host.refreshFromDisk();
+  releaseRead();
+  // Loud and specific, not a hang and not a confusing transport error.
+  await assert.rejects(() => refresh, /database "a\.db" is closed/);
+  assert.equal(workerA.terminated, true);
+  assert.deepEqual(host.listDatabases().map(d => d.name), ['b.db']);
+  // The surviving database still serves — the shared pending map was not left
+  // holding a corpse that a later fanout would trip over.
+  assert.equal(await host.invoke('ping', []), true);
+});
+
+test('when even the replacement empty database cannot boot, the host is empty and quiet rather than lying', async () => {
+  // A dead WASM runtime: every initializeDatabase after the first refuses, so
+  // the fail-closed refresh has nothing to fall back to.
+  let bootsLeft = 2;                                   // start() + the open
+  const { host, saved } = makeHost(
+    {
+      initializeDatabase: () => {
+        if (bootsLeft-- <= 0) throw new Error('worker is gone');
+        return { isReadOnly: false, storage: 'memory' };
+      },
+      updateCell: () => 1,
+      exportDatabase: () => new Uint8Array([9, 9, 9])
+    }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  await assert.rejects(() => host.refreshFromDisk(), /Refreshing "a\.db" failed/);
+
+  assert.deepEqual(host.listDatabases(), []);
+  assert.equal(host.activeDatabaseId(), null);
+  assert.equal(host.currentFilename(), null);
+  assert.equal(host.hasUnsavedChanges(), false);
+  // ⌘S and ⌘R are quiet no-ops, and nothing was written anywhere.
+  assert.equal(await host.saveToDisk(), false);
+  assert.equal(await host.refreshFromDisk(), undefined);
+  assert.equal(saved.path, undefined);
+  // A page RPC still fails loudly: it is asking an engine that does not exist.
+  await assert.rejects(() => host.invoke('fetchSchema', []), /No database is open/);
+});
+
+test('state.dbId always names the active database, from boot through every switch', async () => {
+  // The term grid-data.js's superseded-load gate compares against: if it ever
+  // lagged the active pointer, a load fetched for one database could commit
+  // into another's state.
+  const { host } = makeHost({});
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  assert.equal(state.dbId, host.activeDatabaseId());
+
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  assert.equal(state.dbId, dbA);
+
+  await host.openFromShellPath('/tmp/b.db');
+  const dbB = host.activeDatabaseId()!;
+  assert.equal(state.dbId, dbB);
+  assert.notEqual(dbA, dbB);
+
+  await host.setActiveDb(dbA);
+  assert.equal(state.dbId, dbA);
+
+  await host.closeDatabase(dbA);
+  assert.equal(state.dbId, host.activeDatabaseId());
+  assert.equal(state.dbId, dbB);
+
+  await host.closeDatabase(dbB);            // last one out: a fresh placeholder
+  assert.equal(state.dbId, host.activeDatabaseId());
+  assert.notEqual(state.dbId, dbB);
 });

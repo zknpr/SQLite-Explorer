@@ -3,7 +3,7 @@
  */
 import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
-import { openModal, closeModal } from './modals.js';
+import { openModal, closeModal, registerModalCloseHandler } from './modals.js';
 import { refreshSchema } from './sidebar.js';
 import { clearSelection, loadTableColumns, loadTableData } from './grid.js';
 import { showEmptyState, updateStatus, updateToolbarButtons } from './ui.js';
@@ -138,6 +138,15 @@ function showDefinitionConflict() {
 }
 
 export function initViews() {
+    // Dismissing the modal ends its editing session, whichever way it was
+    // dismissed (X, Cancel, overlay click, Escape, or the desktop closing every
+    // modal on a database switch). Most guards below key on
+    // isCurrentModalSession, which already requires a VISIBLE modal; bumping the
+    // counter also retires the two that compare the session number alone, so a
+    // pending operation from the dismissed session cannot write status text or
+    // re-enable buttons for a draft — or a database — that is no longer on
+    // screen.
+    registerModalCloseHandler('viewModal', () => { activeViewModalSession++; });
     const sqlEditor = document.getElementById('viewSelectSql');
     sqlEditor?.addEventListener('keydown', handleTextareaTab);
     sqlEditor?.addEventListener('blur', () => resetTextareaTabFocusEscape(sqlEditor));

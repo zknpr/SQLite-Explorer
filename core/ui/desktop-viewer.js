@@ -33,6 +33,7 @@ import {
     initSidebarResize
 } from './modules/ui.js';
 import {
+    closeAllModals,
     initModals
 } from './modules/modals.js';
 import {
@@ -40,7 +41,8 @@ import {
     loadTableColumns,
     loadTableData,
     initGridInteraction,
-    initGridControls
+    initGridControls,
+    updatePagination
 } from './modules/grid.js';
 import {
     initEdit
@@ -350,19 +352,23 @@ const webviewMethods = {
 
     /**
      * A database switch replaced every per-database field of `state` (the host
-     * swaps them wholesale — desktop-host.js `setActiveDb`). Two things the
-     * swap cannot reach have to follow it here, before refreshContent repaints:
+     * swaps them wholesale — desktop-host.js `setActiveDb`). Everything the
+     * swap cannot reach has to follow it here, before refreshContent repaints.
      *
-     * - the two STATIC filter inputs. They are the only DOM mirrors of
-     *   per-database state that nothing re-renders (per-column filter inputs
-     *   are rebuilt with the grid header, from `state.columnFilters`), so
-     *   without this the incoming database would show the outgoing one's
-     *   filter text over unfiltered rows.
-     * - the grid, when the incoming database has no table selected:
-     *   refreshContent's reload then has nothing to draw and the outgoing
-     *   database's rows would simply stay on screen.
+     * The rule for what belongs in this handler: any DOM that mirrors
+     * per-database state and is NOT re-rendered by the reload. Per-column
+     * filter inputs and the sidebar tree are rebuilt from state, so they are
+     * absent; the toolbar label, the two static filter inputs, the status line
+     * and the pager are not, and each one left alone would describe the
+     * OUTGOING database over the incoming one's content.
      */
     async databaseSwitched() {
+        // The toolbar's table name. Written only by the sidebar/rpc/views
+        // selection paths, so a switch never touches it — it would keep naming
+        // the outgoing database's table above the incoming one's rows.
+        const label = document.getElementById('tableNameLabel');
+        if (label) label.textContent = state.selectedTable ?? 'No table selected';
+
         const globalFilter = document.getElementById('filterInput');
         // Assigning an unchanged value moves the caret in some engines; only
         // write on a real divergence.
@@ -375,10 +381,22 @@ const webviewMethods = {
         if (sidebarFilter && sidebarFilter.value !== state.sidebarFilter) {
             sidebarFilter.value = state.sidebarFilter;
         }
+
+        // A cell preview, a view editor or a BLOB inspector is showing content
+        // from the database the user just left, and its Save would now target a
+        // different file. Dismiss them all, running each one's cleanup.
+        closeAllModals();
+
         if (!state.selectedTable) {
-            const label = document.getElementById('tableNameLabel');
-            if (label) label.textContent = 'No table selected';
+            // The reload has nothing to draw for this database, so nothing
+            // would replace what is on screen: the grid keeps the outgoing
+            // database's rows, and the status line and pager keep its record
+            // count and page numbers. updatePagination reads the freshly
+            // restored (zeroed) counters, so it resets the pager to 1 / 1 with
+            // the arrows disabled.
             showEmptyState();
+            updateStatus('Ready');
+            updatePagination();
         }
         return { success: true };
     },

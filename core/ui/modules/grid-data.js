@@ -167,6 +167,14 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     const requestedTableType = state.selectedTableType;
     const requestedFilterQuery = state.filterQuery;
     const requestedColumnFilters = { ...state.columnFilters };
+    // Which database this load is for. The desktop can hold several open and
+    // swaps `state` wholesale when the user switches (desktop-host.js
+    // setActiveDb): an in-flight load whose database is no longer the active one
+    // must not commit its rows, counts or keyset anchors into the state that now
+    // belongs to a different file — and the table check below cannot see it when
+    // both databases happen to have the same table name selected. Always null
+    // (and so always equal) in the VS Code webview and the web demo.
+    const requestedDbId = state.dbId;
     let keepExistingGridOnError = false;
     state.lastGridLoadError = null;
     // This load is superseded if a newer load has started (token bumped) OR the
@@ -175,7 +183,9 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     // own load (bumping the token) after awaiting loadTableColumns(); during that
     // gap the old load still owns the token, so a token-only check would let it
     // render the old table's rows under the new selection and clear the flag.
-    const isSuperseded = () => loadToken !== activeLoadToken || requestedTable !== state.selectedTable;
+    const isSuperseded = () => loadToken !== activeLoadToken
+        || requestedTable !== state.selectedTable
+        || requestedDbId !== state.dbId;
 
     try {
         // The guard and every synchronous setup step it protects belong inside

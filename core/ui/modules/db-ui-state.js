@@ -28,6 +28,7 @@ import { state } from './state.js';
  */
 const perDbStateDefaults = () => ({
     // Connection identity of the database being rendered.
+    dbId: null,
     isDbConnected: false,
     isReadOnly: false,
     engine: null,
@@ -50,8 +51,8 @@ const perDbStateDefaults = () => ({
     gridOversizedCells: {},
     gridReadOnlyRowReasons: {},
     keysetAnchors: null,
-    // Which cell is being edited, and the cell/column/row selection around it.
-    editingCellInfo: null,
+    // The cell/column/row selection. (`editingCellInfo` is NOT here — see the
+    // transient class below.)
     selectedCells: [],
     lastSelectedCell: null,
     lastSelectedColumnIndex: null,
@@ -80,6 +81,18 @@ const perDbStateDefaults = () => ({
  * stale `isGridReloading` guard, would wedge the incoming database's grid).
  */
 const transientStateDefaults = () => ({
+    // An inline edit is a <textarea> the incoming database's render destroys,
+    // and `editingCellInfo`/`activeCellInput` are set and cleared TOGETHER
+    // (edit.js startCellEdit). Carrying the descriptor per database while its
+    // input is transient would restore a non-null editingCellInfo with a null
+    // activeCellInput on the way back, and the codebase reads that pair as "an
+    // editor is live": loadTableData would skip renderDataGrid (leaving the
+    // OUTGOING database's rows on screen over the incoming one's gridData),
+    // grid-render's editorHoldsWindow() would return true forever so the
+    // virtual window stops updating, and clicks/Enter/shortcuts would be
+    // swallowed. So the descriptor is transient too — an inline edit simply
+    // cannot survive a switch, because its DOM cannot.
+    editingCellInfo: null,
     activeCellInput: null,
     isSavingCell: false,
     isLoadingData: false,

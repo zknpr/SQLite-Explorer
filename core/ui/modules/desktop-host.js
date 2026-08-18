@@ -107,8 +107,9 @@ export function createDesktopHost({ bridge, createWorker }) {
      * @returns {object} a DbEntry — the complete per-database state.
      */
     function createEntry({ engine, nativeDbId, nativeBoundPath, currentPath, currentName, isScratch }) {
+        const dbId = nextDbId();
         return {
-            dbId: nextDbId(),
+            dbId,
             engine,
             // WASM: this database's own Worker (its own sql.js instance and its
             // own in-memory image). Native: null — the engine lives in a
@@ -140,8 +141,10 @@ export function createDesktopHost({ bridge, createWorker }) {
             // for. Replaced (not accumulated) by the first real open.
             isScratch: isScratch === true,
             // This database's slice of the viewer's `state` singleton, parked
-            // here while another database is active. See setActiveDb.
-            uiState: createPerDbStateSnapshot()
+            // here while another database is active. See setActiveDb. `dbId` is
+            // stamped into it so asynchronous UI work can tell which database
+            // the state it is about to commit into was fetched for.
+            uiState: { ...createPerDbStateSnapshot(), dbId }
         };
     }
 
@@ -215,6 +218,16 @@ export function createDesktopHost({ bridge, createWorker }) {
     }
 
     function callWorker(entry, method, args, { maxBinaryBytes, transfer } = {}) {
+        // Refuse BEFORE a pending entry is registered. A closed database's
+        // transport is gone (worker terminated / sidecar id surrendered), and
+        // discovering that inside the Promise executor below would reject the
+        // caller while leaving its entry stranded in the shared pending map
+        // forever. Reachable when work started before a close awakes after it.
+        if (entry.engine === 'native' ? entry.nativeDbId === null : entry.worker === null) {
+            throw new Error(
+                `Cannot run ${method}: the database "${entry.currentName}" is closed`
+            );
+        }
         const messageId = `rpc_${++messageCounter}_${Date.now()}`;
         const message = {
             channel: 'rpc',
@@ -783,9 +796,20 @@ export function createDesktopHost({ bridge, createWorker }) {
         restorePerDbState(entry.uiState);
         updateTitle();
         // The swap cannot reach DOM. Static controls that mirror per-database
-        // state (#filterInput, #sidebarFilterInput) and the rendered grid have
-        // to be re-synced by the page before the reload below repaints.
-        await notifyWebview('databaseSwitched', [entry.dbId]);
+        // state (#tableNameLabel, the two filter inputs), open modals and the
+        // rendered grid have to be re-synced by the page before the reload
+        // below repaints.
+        //
+        // Never allowed to abort the switch: `activeId` and `state` have
+        // already moved, so a throwing page handler would leave the host on the
+        // incoming database with the outgoing one's grid never reloaded — a
+        // half-applied switch, strictly worse than a stale control. The reload
+        // runs regardless and the failure is reported, not swallowed.
+        try {
+            await notifyWebview('databaseSwitched', [entry.dbId]);
+        } catch (error) {
+            console.warn('databaseSwitched notification failed:', error);
+        }
         await refreshUi(entry);
     }
 
@@ -801,6 +825,54 @@ export function createDesktopHost({ bridge, createWorker }) {
             throw error;
         }
         return entry;
+    }
+
+    async function closeDatabaseById(dbId) {
+        const entry = databases.get(dbId);
+        if (!entry) throw new Error(`closeDatabase: unknown database id ${String(dbId)}`);
+        const wasActive = entry.dbId === activeId;
+        await removeEntry(entry);
+        if (!wasActive) {
+            updateTitle();
+            return true;
+        }
+        // Its uiState died with it — there is nothing left to snapshot out.
+        activeId = null;
+        const next = databases.values().next().value ?? await bootScratchEntry();
+        await activateEntry(next, { snapshotOutgoing: false });
+        return true;
+    }
+
+    /**
+     * Re-initialize an entry's engine IN PLACE. Refresh is the only operation
+     * that does this — every other lane builds a fresh entry and commits it only
+     * on success.
+     *
+     * A failure here is the dangerous shape: `initializeDatabase` tears the
+     * previous image/session down BEFORE it can refuse, so the engine no longer
+     * holds the document the entry's path, name and tracker still describe. A
+     * later Save would then COMMIT an empty native session (reporting "saved"
+     * having written nothing) or export whatever the worker now holds over the
+     * real file. So a failed re-init CLOSES that database: the file on disk is
+     * untouched and the user reopens it.
+     */
+    async function reinitializeOrClose(entry, config) {
+        try {
+            await initializeWorkerDatabase(entry, entry.currentName, config);
+        } catch (error) {
+            const name = entry.currentName;
+            try {
+                await closeDatabaseById(entry.dbId);
+            } catch (closeError) {
+                console.warn(`Closing "${name}" after a failed refresh failed:`, closeError);
+            }
+            const failed = new Error(
+                `Refreshing "${name}" failed and its session could not be recovered, so it was `
+                + `closed — the file on disk is unchanged (${error?.message ?? error})`
+            );
+            failed.cause = error;
+            throw failed;
+        }
     }
 
     /** Adds a fully-initialized entry to the registry and makes it active. */
@@ -1046,14 +1118,15 @@ export function createDesktopHost({ bridge, createWorker }) {
                 // back, then reopen the SAME bound path on this database's
                 // sidecar — the file is live, so no bytes ride the bridge.
                 await endSessionTxn(entry, 'ROLLBACK');
-                await initializeWorkerDatabase(entry, entry.currentName, {
-                    path: entry.nativeBoundPath, readOnlyMode: false
-                });
+                await reinitializeOrClose(entry, { path: entry.nativeBoundPath, readOnlyMode: false });
                 updateTitle();
                 return { success: true };
             }
+            // Read BEFORE the engine is touched: a read failure must leave the
+            // document exactly as it was, which is why this is not inside
+            // reinitializeOrClose's fail-closed handling.
             const bytes = await bridge.readDatabaseBytes(entry.currentPath);
-            await initializeWorkerDatabase(entry, entry.currentName, { content: bytes });
+            await reinitializeOrClose(entry, { content: bytes });
             updateTitle();
             return { success: true };
         },
@@ -1172,9 +1245,13 @@ export function createDesktopHost({ bridge, createWorker }) {
             // no template pass, so push it the way config changes arrive.
             await notifyWebview('updateCellEditBehavior', [settings.doubleClickBehavior]);
             const entry = await bootScratchEntry();
-            // No swap on boot: `state` is already at its per-database defaults
-            // and initializeApp drives the first render.
             activeId = entry.dbId;
+            // Nothing to swap OUT at boot, but the restore still runs so the
+            // invariant "`state` always holds the ACTIVE entry's uiState" —
+            // `state.dbId` included — holds from the first moment. Everything
+            // it writes is already at its default here; initializeApp drives
+            // the first render.
+            restorePerDbState(entry.uiState);
             updateTitle();
         },
         async invoke(method, args) {
@@ -1333,29 +1410,36 @@ export function createDesktopHost({ bridge, createWorker }) {
          * was the last). Unsaved changes are DISCARDED: the caller is the UI,
          * which prompts first using the `isDirty` flag from listDatabases().
          */
-        async closeDatabase(dbId) {
-            const entry = databases.get(dbId);
-            if (!entry) throw new Error(`closeDatabase: unknown database id ${String(dbId)}`);
-            const wasActive = entry.dbId === activeId;
-            await removeEntry(entry);
-            if (!wasActive) {
-                updateTitle();
-                return true;
-            }
-            // Its uiState died with it — there is nothing left to snapshot out.
-            activeId = null;
-            const next = databases.values().next().value ?? await bootScratchEntry();
-            await activateEntry(next, { snapshotOutgoing: false });
-            return true;
-        },
+        closeDatabase: closeDatabaseById,
 
-        async saveToDisk() { return saveToDisk(requireActiveEntry()); },
+        // The menu/keyboard operations tolerate the no-database state the
+        // registry can legitimately land in: `closeDatabase` boots a
+        // replacement empty database, and if even THAT fails (a dead WASM
+        // runtime) the registry is empty rather than holding a database whose
+        // engine is gone. ⌘S and ⌘R must then be quiet no-ops — there is
+        // nothing to save or refresh — not a confusing "no database is open"
+        // error. `invoke` still throws there, which is correct: the page is
+        // asking the engine for something.
+        async saveToDisk() {
+            const entry = activeEntry();
+            return entry ? saveToDisk(entry) : false;
+        },
         async refreshFromDisk() {
-            const entry = requireActiveEntry();
+            const entry = activeEntry();
+            if (!entry) return;
             await databaseMethods.refreshFile(entry);
             await refreshUi(entry);
         },
-        hasUnsavedChanges: () => activeEntry()?.tracker.hasUncommittedChanges() === true,
+        /**
+         * ANY open database, not just the active one — this is the app-level
+         * "is there unsaved work" question (the quit prompt). A background tab
+         * can be dirty, and the edited boot placeholder is retained while being
+         * unreachable from the UI, so an active-only answer would let its edits
+         * be discarded silently. Per-tab dirty marks come from
+         * listDatabases()[].isDirty.
+         */
+        hasUnsavedChanges: () => [...databases.values()]
+            .some(entry => entry.tracker.hasUncommittedChanges()),
         currentFilename: () => activeEntry()?.currentName ?? null
     };
     return host;

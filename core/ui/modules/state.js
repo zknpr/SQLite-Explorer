@@ -46,6 +46,12 @@ export function resolveStartupPageSize(configuredValue, persistedValue) {
  * here means classifying it there — a test enforces that the two stay in step.
  */
 export const state = {
+    // Registry id of the database this state describes. Desktop-only — set by
+    // desktop-host.js when it makes a database active, and read by asynchronous
+    // work (grid-data.js's superseded-load gate) that must not commit results
+    // fetched from one database into another's state. Stays null in the VS Code
+    // webview and the web demo, where those comparisons are null === null.
+    dbId: null,
     isDbConnected: false,
     isReadOnly: false,
     // Which engine serves the current open: 'native' (tjs sidecar) or 'wasm'.

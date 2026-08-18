@@ -193,6 +193,42 @@ describe('grid keyset anchor state', () => {
         }
     });
 
+    // Desktop multi-database: the switch swaps `state` wholesale, keeping the
+    // same selected table name when both databases have one. Token and table
+    // both look unchanged to an in-flight load, so without the database term in
+    // the superseded gate database A's rows, counts and anchors land in B's
+    // state — a wrong-rows flash under B's name.
+    it('never lets a load from another database commit into the switched-in state', async () => {
+        installDocumentMock();
+        const { state, backendApi, loadTableData } = await loadHarness();
+        const originals = { count: backendApi.fetchTableCount, data: backendApi.fetchTableData };
+        const slowData = createDeferred<any>();
+        backendApi.fetchTableCount = async () => 40;
+        backendApi.fetchTableData = async () => slowData.promise;
+        primeTableState(state, 'items');
+        state.dbId = 'db#1';
+        state.gridData = [];
+        state.keysetAnchors = null;
+
+        try {
+            const loadA = loadTableData(false, false);
+            await Promise.resolve();
+
+            // The user switches to another database that also has `items`
+            // selected. No new load has started yet (the token is untouched)
+            // and the table name is identical.
+            state.dbId = 'db#2';
+
+            slowData.resolve({ rows: [[1, 'from-db-1']], keysetAnchors: { first: 'F-A', last: 'L-A' } });
+            assert.strictEqual(await loadA, undefined);
+            assert.deepStrictEqual(state.gridData, []);
+            assert.strictEqual(state.keysetAnchors, null);
+        } finally {
+            state.dbId = null;
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
     it('never lets a superseded load commit its anchors', async () => {
         installDocumentMock();
         const { state, backendApi, loadTableData } = await loadHarness();

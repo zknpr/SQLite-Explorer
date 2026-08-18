@@ -63,3 +63,22 @@ export function closeModal(modalId) {
     if (modalId === 'cellPreviewModal') state.cellPreviewInfo = null;
     modalCloseHandlers.get(modalId)?.();
 }
+
+/**
+ * Dismiss every open modal, running each one's registered cleanup.
+ *
+ * Used when the ground a modal stands on is replaced underneath it — the
+ * desktop's database switch, where a cell preview, a view editor or a BLOB
+ * inspector is showing content from the database the user just left, and its
+ * Save would now target a different file. Same element selector the Escape
+ * handler uses, so "what counts as an open modal" has one definition.
+ */
+export function closeAllModals() {
+    const open = document.querySelectorAll(
+        '.modal-overlay:not(.hidden), .cell-preview-modal:not(.hidden)'
+    );
+    for (const el of open) {
+        if (el.id) closeModal(el.id);
+        else el.classList.add('hidden');
+    }
+}
