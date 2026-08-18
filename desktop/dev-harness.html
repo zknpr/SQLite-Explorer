@@ -49,6 +49,14 @@
       setTimeout(() => URL.revokeObjectURL(url), 100);
       return `harness-download://${defaultName}`;
     },
+    // Save As. In the shell this is saveFileAs PLUS the session-allowlist grant
+    // that makes the picked file writable in place afterwards; the harness has
+    // no allowlist, and its saveDatabase discards bytes anyway, so the download
+    // is the whole behaviour. Present so the Save-As lane is exercisable here
+    // at all — the host refuses Save As outright when the bridge lacks it.
+    async saveDatabaseAs(defaultName, bytes) {
+      return this.saveFileAs(defaultName, bytes);
+    },
     async loadSettings() { return settings; },
     async saveSettings(next) { settings = next; },
     onMenu(handler) { menuHandler = handler; },

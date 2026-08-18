@@ -8,7 +8,7 @@ import {
     remapDisplayedRowIdentity,
     resolveDisplayedCell
 } from './data-utils.js';
-import { updateStatus } from './ui.js';
+import { updateStatus, wasSaveCancelled } from './ui.js';
 import { noteCellValuesChanged } from './count-cache.js';
 import { registerModalCloseHandler } from './modals.js';
 import {
@@ -413,6 +413,15 @@ export class BlobInspector {
             } else {
                 // Native mode: Use VS Code API to save file via backendApi
                 const result = await backendApi.saveFile(filename, this.currentData);
+                // The `?? filename` fallback below fires exactly when savedAs
+                // is absent — which on the desktop is the CANCELLED dialog, so
+                // it used to name a file that was never written. Check the flag
+                // first; the fallback then only covers the lanes that resolve
+                // without one (VS Code, web), where the proposed name is right.
+                if (wasSaveCancelled(result)) {
+                    updateStatus('Save cancelled');
+                    return;
+                }
                 updateStatus(`Saved ${result?.savedAs ?? filename}`);
             }
         } catch (err) {

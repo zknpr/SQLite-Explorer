@@ -531,9 +531,38 @@ if (!bridge) {
             updateStatus(`${label}: ${err.message}`);
         };
 
+        // The status line is the app's only feedback channel, and every file
+        // the app writes for the user answers the same { success, savedAs }
+        // contract — where `success:false` means "the save dialog was
+        // cancelled", NOT "it failed" (failures reject). Reporting it is what
+        // stops a cancelled operation from reading as a completed one.
+        const reportSave = (result) => {
+            if (result?.success === true) updateStatus(`Saved ${result.savedAs}`);
+            else if (result?.reason === 'cancelled') updateStatus('Save cancelled');
+            // 'no-database': nothing to save and nothing to tell the user —
+            // the registry is only ever empty when the engine itself died, and
+            // initializeApp has already put that on screen.
+        };
+        // ⌘S / File > Save. A database with no file yet routes to Save As
+        // inside the host, so this one call covers both.
+        const saveActiveDatabase = () => host.saveToDisk().then(reportSave, surface('Save failed'));
+
+        // File > Export Database — the whole-database "save a copy" route. The
+        // host picks the lane (native: sidecar VACUUM INTO → shell atomic move,
+        // out of band so it is not bound by the 16 MiB stdio frame cap; WASM:
+        // exported bytes → save dialog), and both answer the same contract.
+        const exportDatabaseCopy = async () => {
+            updateStatus('Exporting database…');
+            const result = await backendApi.exportDb();
+            updateStatus(result?.success === true
+                ? `Exported to ${result.savedAs}`
+                : 'Database export cancelled');
+        };
+
         bridge.onMenu(async (id) => {
             if (id === 'open-db') await host.openDatabaseViaDialog().catch(surface('Open failed'));
-            else if (id === 'save-db') await host.saveToDisk().catch(surface('Save failed'));
+            else if (id === 'save-db') await saveActiveDatabase();
+            else if (id === 'export-db') await exportDatabaseCopy().catch(surface('Database export failed'));
             else if (id === 'refresh-db') await host.refreshFromDisk().catch(surface('Refresh failed'));
             else if (id === 'sql-console') await toggleConsole().catch(surface('SQL console failed'));
             else if (id.startsWith('theme:')) {
@@ -598,7 +627,7 @@ if (!bridge) {
             // still-dirty title.
             if (key === 'z' && !event.shiftKey) { event.preventDefault(); await backendApi.triggerUndo().catch(surface('Undo failed')); }
             else if ((key === 'z' && event.shiftKey) || key === 'y') { event.preventDefault(); await backendApi.triggerRedo().catch(surface('Redo failed')); }
-            else if (key === 's') { event.preventDefault(); await host.saveToDisk().catch(surface('Save failed')); }
+            else if (key === 's') { event.preventDefault(); await saveActiveDatabase(); }
             else if (key === 'o') { event.preventDefault(); await host.openDatabaseViaDialog().catch(surface('Open failed')); }
         });
 

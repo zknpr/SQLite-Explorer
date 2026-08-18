@@ -714,8 +714,21 @@ export function createDesktopHost({ bridge, createWorker }) {
         notifyDatabasesChanged();
     }
 
+    /**
+     * Writes `entry` back to ITS OWN file. Requires a path: a path-less
+     * database is the Save As lane ({@link saveEntryAs}), and returning a quiet
+     * `false` here is what made ⌘S a silent no-op on the boot placeholder.
+     * Every internal caller (instant-commit, the barrier methods, the native
+     * export's save-first) already guards on `entry.currentPath`; the public
+     * `host.saveToDisk` routes the path-less case to Save As instead.
+     */
     async function saveToDisk(entry) {
-        if (!entry.currentPath) return false;
+        if (!entry.currentPath) {
+            throw new Error(
+                `"${entry.currentName}" has no file on disk yet — use Save As (host.saveToDisk `
+                + 'routes a path-less database there).'
+            );
+        }
         if (entry.engine === 'native') {
             // Native edits already live in the real file inside the session
             // transaction — Save IS the COMMIT. No byte export, no file
@@ -730,6 +743,70 @@ export function createDesktopHost({ bridge, createWorker }) {
         await entry.tracker.createCheckpoint();
         updateTitle();
         return true;
+    }
+
+    /**
+     * Save As: writes a path-less database to a dialog-picked file and makes
+     * that file the database's home, so every later ⌘S is an ordinary in-place
+     * save.
+     *
+     * Why a dedicated bridge call and not `saveFileAs`: the shell only lets the
+     * webview write paths on the session allowlist, and `saveFileAs` (the
+     * EXPORT route) deliberately does not add its destination to it — an
+     * exported CSV must not become silently overwritable for the rest of the
+     * session. `saveDatabaseAs` is the same dialog plus that grant, which is
+     * exactly what "this file is now my database" means and exactly the grant
+     * `pickDatabase` already makes. Without it the adopted path would be
+     * refused by the very next save.
+     *
+     * Only WASM databases can reach this: a native entry exists only for a path
+     * the shell already bound a sidecar to.
+     */
+    async function saveEntryAs(entry) {
+        if (entry.engine === 'native') {
+            throw new Error(
+                `"${entry.currentName}" is served by the native engine, which is always bound to a `
+                + 'file — Save As is only for databases that have none.'
+            );
+        }
+        if (typeof bridge.saveDatabaseAs !== 'function') {
+            // Fail loudly rather than fall back to `saveFileAs`: that would
+            // write the bytes and then leave the database unable to save to the
+            // file the user just chose, which is the silent-ish half-success
+            // this whole lane exists to remove.
+            throw new Error(
+                'This app build cannot Save As: the shell bridge has no saveDatabaseAs. '
+                + 'Update SQLite Explorer, or use File > Export Database to write a copy.'
+            );
+        }
+        const bytes = await callWorker(entry, 'exportDatabase', [entry.currentName]);
+        const target = await bridge.saveDatabaseAs(entry.currentName, bytes);
+        if (target === null || target === undefined) return { success: false, reason: 'cancelled' };
+
+        const name = basename(target);
+        // One file, one entry — the same invariant the open lanes' dedupe
+        // keeps. Adopting a path another database already owns would give one
+        // file two writable engines with independent session transactions,
+        // which is precisely the lost-update hazard `findEntryByPath` exists to
+        // prevent. The bytes ARE on disk (the user picked that file in a save
+        // dialog and confirmed the overwrite); what is refused is the LINK.
+        const conflict = findEntryByPath(target);
+        if (conflict && conflict !== entry) {
+            throw new Error(
+                `Wrote ${name}, but that file is already open in another tab, so `
+                + `"${entry.currentName}" was not linked to it — one file must not have two `
+                + `writable engines. Close the other tab, then reopen ${name}.`
+            );
+        }
+        entry.currentPath = target;
+        entry.currentName = name;
+        // It has a file now, so it is a document like any other. Left set, the
+        // next open would see a clean `isScratch` entry and `commitEntry` would
+        // delete the database the user just saved.
+        entry.isScratch = false;
+        await entry.tracker.createCheckpoint();
+        updateTitle();
+        return { success: true, savedAs: name };
     }
 
     // ---- registry lifecycle -------------------------------------------------
@@ -1159,8 +1236,30 @@ export function createDesktopHost({ bridge, createWorker }) {
             const target = await bridge.saveFileAs(result.filename, new TextEncoder().encode(text));
             return { success: target !== null, savedAs: target ? basename(target) : undefined };
         },
+        /**
+         * Answers the VS Code host's contract (hostBridge.ts refreshFile):
+         * "refreshed connection capabilities for immediate webview gating" —
+         * { connected, filename, readOnly }. The sidebar's Reload button gates
+         * on `connected === true` before calling applyConnectionResult
+         * (sidebar.js reloadFromDisk), so a bare { success:true } made that
+         * button the one refresh entry point that never re-applied read-only
+         * state: a file that came back read-only kept offering edits. The ⌘R /
+         * File > Refresh path goes through host.refreshFromDisk → refreshUi and
+         * always carried the real flags.
+         *
+         * A failed re-init CLOSES the database and throws (reinitializeOrClose),
+         * so reaching a return here always means a live connection.
+         */
         async refreshFile(entry) {
-            if (!entry.currentPath) return { success: true };
+            const connectionResult = () => ({
+                connected: true,
+                filename: entry.currentName,
+                readOnly: entry.connectionInfo.isReadOnly === true
+            });
+            // Nothing on disk to re-read (the boot placeholder, a dropped
+            // file): report the capabilities it still has rather than pretend
+            // a reload happened.
+            if (!entry.currentPath) return connectionResult();
             if (entry.engine === 'native') {
                 // Refresh discards pending edits (WASM parity: the re-read
                 // replaces the in-memory image): roll the session transaction
@@ -1169,7 +1268,7 @@ export function createDesktopHost({ bridge, createWorker }) {
                 await endSessionTxn(entry, 'ROLLBACK');
                 await reinitializeOrClose(entry, { path: entry.nativeBoundPath, readOnlyMode: false });
                 updateTitle();
-                return { success: true };
+                return connectionResult();
             }
             // Read BEFORE the engine is touched: a read failure must leave the
             // document exactly as it was, which is why this is not inside
@@ -1177,7 +1276,7 @@ export function createDesktopHost({ bridge, createWorker }) {
             const bytes = await bridge.readDatabaseBytes(entry.currentPath);
             await reinitializeOrClose(entry, { content: bytes });
             updateTitle();
-            return { success: true };
+            return connectionResult();
         },
         async triggerUndo(entry) {
             const entryToUndo = entry.tracker.stepBack();
@@ -1253,6 +1352,10 @@ export function createDesktopHost({ bridge, createWorker }) {
             };
         },
         async updateExtensionSetting(key, value) {
+            // Snapshot BEFORE the change: every write below replaces `settings`
+            // with a fresh object rather than mutating it, so holding the old
+            // reference is a complete rollback point.
+            const previous = settings;
             // Same key translation the VS Code host performs, and the same push:
             // there, a doubleClickBehavior config change fans out
             // updateCellEditBehavior to every webview (editorController.ts).
@@ -1273,7 +1376,27 @@ export function createDesktopHost({ bridge, createWorker }) {
             for (const [k, v] of Object.entries(settings)) {
                 if (DEFAULT_SETTINGS[k] !== v) delta[k] = v;
             }
-            await bridge.saveSettings(delta);
+            try {
+                await bridge.saveSettings(delta);
+            } catch (error) {
+                // Fail CLOSED: a setting the shell refused to persist must not
+                // stay live. Left applied, `autoCommit` is the dangerous one —
+                // the user sees the error, yet every later edit really would
+                // commit straight into their file with no ⌘S, and the next
+                // launch would silently revert to manual.
+                settings = previous;
+                if (key === 'doubleClickBehavior') {
+                    // Undo the push too, or the page keeps the rejected
+                    // behaviour while the host has the old one. Secondary
+                    // failure only: never allowed to mask the write error the
+                    // caller is about to receive.
+                    await notifyWebview('updateCellEditBehavior', [previous.doubleClickBehavior])
+                        .catch(pushError => console.warn(
+                            'Restoring the previous cell-edit behaviour failed:', pushError
+                        ));
+                }
+                throw error;
+            }
             return { success: true };
         },
         async saveFile(filename, data) {
@@ -1470,9 +1593,21 @@ export function createDesktopHost({ bridge, createWorker }) {
         // nothing to save or refresh — not a confusing "no database is open"
         // error. `invoke` still throws there, which is correct: the page is
         // asking the engine for something.
+        //
+        // Answers the same { success, savedAs } contract as exportDb /
+        // exportTable / saveFile so the page has one shape to report, plus a
+        // `reason` for the two ways nothing gets written. `success:false` is
+        // never a failure — a genuine failure REJECTS.
         async saveToDisk() {
             const entry = activeEntry();
-            return entry ? saveToDisk(entry) : false;
+            if (!entry) return { success: false, reason: 'no-database' };
+            // A database with no file on disk yet (the boot placeholder, a
+            // dropped file) goes to the save dialog instead of quietly doing
+            // nothing — it is editable, it reports dirty, and the close prompt
+            // asks about it, so it must have a way to reach disk.
+            if (!entry.currentPath) return saveEntryAs(entry);
+            await saveToDisk(entry);
+            return { success: true, savedAs: entry.currentName };
         },
         async refreshFromDisk() {
             const entry = activeEntry();

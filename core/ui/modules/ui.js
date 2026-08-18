@@ -11,6 +11,26 @@ export function updateStatus(message) {
     if (el) el.textContent = message;
 }
 
+/**
+ * Did the backend report that the user dismissed a save dialog?
+ *
+ * Every desktop path that writes a file for the user (table export, blob
+ * download, whole-database export, Save As) answers one contract:
+ * `{ success, savedAs }`, where a genuine failure REJECTS and `success:false`
+ * means exactly "the save dialog was cancelled". This is the single definition
+ * of that reading, for the call sites that see only the flag — each of them
+ * previously invented its own, and both reported a cancelled dialog as a
+ * completed save. (`host.saveToDisk` adds a `reason` on top of the same
+ * contract, so desktop-viewer.js discriminates on that instead.)
+ *
+ * Strictly `=== false`: the VS Code host resolves these to `undefined` and the
+ * web demo resolves them to the worker's `{contentChunks, filename}`, so
+ * "no flag" must never be read as a cancellation on those lanes.
+ */
+export function wasSaveCancelled(result) {
+    return result?.success === false;
+}
+
 export function showLoading() {
     const container = document.getElementById('gridContainer');
     if (container) {

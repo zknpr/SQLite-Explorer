@@ -73,7 +73,11 @@ function makeFakeWorker(handlers: Record<string, (args: unknown[]) => unknown>, 
 type FakeWorker = ReturnType<typeof makeFakeWorker>;
 
 function makeFakeBridge(overrides: Record<string, unknown> = {}) {
-  const saved: { path?: string; bytes?: Uint8Array; settings?: unknown } = {};
+  const saved: {
+    path?: string; bytes?: Uint8Array; settings?: unknown;
+    /** Save As destination, recorded separately from the in-place `path`. */
+    savedAsPath?: string;
+  } = {};
   return {
     saved,
     bridge: {
@@ -81,6 +85,10 @@ function makeFakeBridge(overrides: Record<string, unknown> = {}) {
       readDatabaseBytes: async (_p: string) => new Uint8Array([1, 2, 3]),
       saveDatabase: async (path: string, bytes: Uint8Array) => { saved.path = path; saved.bytes = bytes; },
       saveFileAs: async (_n: string, _b: Uint8Array) => '/tmp/out',
+      // Save As: the shell's dialog + allowlist grant. Separate recorder from
+      // `saveDatabase` so a test can tell an in-place save over the database's
+      // own file from a save to a newly picked one.
+      saveDatabaseAs: async (_n: string, _b: Uint8Array) => { saved.savedAsPath = '/tmp/as.db'; return '/tmp/as.db'; },
       loadSettings: async () => ({}),
       saveSettings: async (s: unknown) => { saved.settings = s; },
       onMenu: (_h: (id: string) => void) => {},
@@ -558,7 +566,7 @@ test('open → edit → saveToDisk writes exported bytes to the opened path and 
   assert.equal(opened, true);
   await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
   const ok = await host.saveToDisk();
-  assert.equal(ok, true);
+  assert.equal(ok.success, true);
   assert.equal(saved.path, '/tmp/x.db');
   assert.deepEqual(saved.bytes, bytes);
   assert.equal(host.hasUnsavedChanges(), false);
@@ -1157,7 +1165,7 @@ test('native txn model: first mutation BEGINs once, save COMMITs without exporti
   assert.equal(host.hasUnsavedChanges(), true);
 
   const ok = await host.saveToDisk();
-  assert.equal(ok, true);
+  assert.equal(ok.success, true);
   assert.deepEqual(nativeSql(nativeLog), ['BEGIN', 'COMMIT']);
   assert.equal(nativeMethods(nativeLog).includes('exportDatabase'), false);  // no byte export
   assert.equal(saved.path, undefined);                  // and no bridge.saveDatabase file rewrite
@@ -1301,7 +1309,7 @@ test('COMMIT tolerance: a console-committed transaction still saves cleanly', as
   await host.openFromShellPath('/tmp/y.db');
   await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
   const ok = await host.saveToDisk();
-  assert.equal(ok, true);
+  assert.equal(ok.success, true);
   assert.equal(host.hasUnsavedChanges(), false);
 });
 
@@ -1625,7 +1633,7 @@ test('a failed open leaves the live native database completely intact: no teardo
   // The pending edit survived, and ⌘S is a real COMMIT on precious.db's own
   // sidecar — never a byte export of some other image over the file.
   assert.equal(host.hasUnsavedChanges(), true);
-  assert.equal(await host.saveToDisk(), true);
+  assert.equal((await host.saveToDisk()).success, true);
   assert.equal(saved.path, undefined);                           // bridge.saveDatabase never ran
   assert.equal(posted.filter(p => p.content.targetMethod === 'exportDatabase').length, 0);
   assert.equal(host.hasUnsavedChanges(), false);
@@ -1657,7 +1665,7 @@ test('a failed pure-WASM second open before the worker is touched preserves the 
   // The old document survived: still saveable to its own path.
   assert.equal(host.hasUnsavedChanges(), true);
   const ok = await host.saveToDisk();
-  assert.equal(ok, true);
+  assert.equal(ok.success, true);
   assert.equal(saved.path, '/tmp/keep.db');
   const init = await host.invoke('initialize', []) as Record<string, unknown>;
   assert.equal(init.filename, 'keep.db');
@@ -1693,7 +1701,7 @@ test('console COMMIT divergence: the next grid edit still runs inside a fresh tr
 
   // ⌘S must be an honest COMMIT that actually closes the transaction.
   const ok = await host.saveToDisk();
-  assert.equal(ok, true);
+  assert.equal(ok.success, true);
   assert.equal(txn.open, false);
   assert.equal(host.hasUnsavedChanges(), false);
   // Engine-side truth, in order: edit#1's BEGIN, the script's COMMIT, the
@@ -1774,7 +1782,7 @@ test('a genuine COMMIT failure keeps the session dirty and open; a second save r
   assert.equal(txn.open, true);                                  // engine still holds the txn
 
   const ok = await host.saveToDisk();                            // retry
-  assert.equal(ok, true);
+  assert.equal(ok.success, true);
   assert.equal(host.hasUnsavedChanges(), false);
   assert.equal(txn.open, false);
   assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT']);            // one txn: no re-BEGIN between saves
@@ -1898,7 +1906,7 @@ test('fork messages: a mutating console run still lands — the probe adopts the
   assert.equal(txn.open, true);
 
   const ok = await host.saveToDisk();
-  assert.equal(ok, true);
+  assert.equal(ok.success, true);
   assert.equal(txn.open, false);
   assert.equal(host.hasUnsavedChanges(), false);
 });
@@ -1923,7 +1931,7 @@ test('fork messages: console COMMIT divergence reconciles through the state prob
   await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v1', 1048576]);
   assert.deepEqual(editsUnderTxn, [true, true]);         // never autocommitted
   const ok = await host.saveToDisk();
-  assert.equal(ok, true);
+  assert.equal(ok.success, true);
   assert.equal(txn.open, false);
   assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT', 'BEGIN', 'COMMIT', 'BEGIN', 'COMMIT']);
 });
@@ -1955,7 +1963,7 @@ test('fork messages: a genuine COMMIT failure is still separated from the generi
   assert.equal(txn.open, true);
 
   const ok = await host.saveToDisk();
-  assert.equal(ok, true);
+  assert.equal(ok.success, true);
   assert.equal(txn.open, false);
   assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT']);    // one txn; retry did not re-BEGIN
 });
@@ -2007,7 +2015,7 @@ test('init-refusal slice: native open ok, native init refuses, cap fails the WAS
   // The first database is fully intact: its pending edit, and a ⌘S that is a
   // COMMIT on its own sidecar rather than a byte export over the file.
   assert.equal(host.hasUnsavedChanges(), true);
-  assert.equal(await host.saveToDisk(), true);
+  assert.equal((await host.saveToDisk()).success, true);
   assert.equal(saved.path, undefined);                           // bridge.saveDatabase never ran
   assert.equal(posted.filter(p => p.content.targetMethod === 'exportDatabase').length, 0);
   const init = await host.invoke('initialize', []) as Record<string, unknown>;
@@ -2045,7 +2053,7 @@ test('init-refusal slice, read-throw variant: a readDatabaseBytes failure after 
   assert.deepEqual(log.closedIds, [log.openedIds[1]]);           // only the refused sidecar
   assert.equal(host.listDatabases().length, 1);
   assert.equal(host.hasUnsavedChanges(), true);                  // the pending edit is still there
-  assert.equal(await host.saveToDisk(), true);
+  assert.equal((await host.saveToDisk()).success, true);
   assert.equal(saved.path, undefined);
   assert.equal(host.hasUnsavedChanges(), false);
 });
@@ -2078,7 +2086,7 @@ test('an auto-rolled-back COMMIT is a loud failure, not a fake save (fork messag
   // clean save commits it.
   await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v', 1048576]);
   const ok = await host.saveToDisk();
-  assert.equal(ok, true);
+  assert.equal(ok.success, true);
   assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT', 'BEGIN', 'COMMIT']);
 });
 
@@ -2164,7 +2172,7 @@ test('an auto-rolled-back mutation reconciles to engine truth: no phantom edits,
   assert.equal(host.hasUnsavedChanges(), true);
 
   const ok = await host.saveToDisk();                        // …until Save commits it
-  assert.equal(ok, true);
+  assert.equal(ok.success, true);
   assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT', 'BEGIN', 'COMMIT']);
   assert.equal(host.hasUnsavedChanges(), false);
 });
@@ -2201,7 +2209,7 @@ test('a mutation failure that KEEPS the transaction stays pending: no discard, n
 
   await host.invoke('updateCell', ['t', 1, 'c', 'v3', 'v1', 1048576]);
   const ok = await host.saveToDisk();
-  assert.equal(ok, true);
+  assert.equal(ok.success, true);
   assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT']);     // ONE txn throughout — no spurious re-BEGIN
   assert.deepEqual(txn.mutationsInTxn, [true, true]);     // both surviving edits ran inside it
 });
@@ -2426,7 +2434,7 @@ test('two open databases keep independent undo history, dirty state and session 
   assert.deepEqual(txnFor(idB).txn.applied, ['BEGIN']);
 
   // Saving B commits B's transaction only: A stays dirty and pending.
-  assert.equal(await host.saveToDisk(), true);
+  assert.equal((await host.saveToDisk()).success, true);
   assert.deepEqual(txnFor(idB).txn.applied, ['BEGIN', 'COMMIT']);
   assert.deepEqual(txnFor(idA).txn.applied, ['BEGIN']);
   assert.deepEqual([dirtyOf('a.db'), dirtyOf('b.db')], [true, false]);
@@ -3121,9 +3129,11 @@ test('a failed native refresh closes that database instead of leaving it describ
   assert.deepEqual(log.closedIds, log.openedIds);
   assert.deepEqual(host.listDatabases().map(d => [d.name, d.path]), [['untitled.db', null]]);
   assert.equal(host.hasUnsavedChanges(), false);
-  // The dangerous ⌘S is a no-op: nothing claims a path any more.
-  assert.equal(await host.saveToDisk(), false);
-  assert.equal(saved.path, undefined);
+  // The dangerous ⌘S cannot reach a.db any more: the replacement database has
+  // no path, so Save routes to Save As and writes only where that dialog says.
+  assert.deepEqual(await host.saveToDisk(), { success: true, savedAs: 'as.db' });
+  assert.equal(saved.path, undefined, 'nothing was written in place');
+  assert.equal(saved.savedAsPath, '/tmp/as.db');
 });
 
 test('a failed WASM refresh fails closed the same way, and a failed READ leaves the database untouched', async () => {
@@ -3164,8 +3174,10 @@ test('a failed WASM refresh fails closed the same way, and a failed READ leaves 
   failReinit = true;
   await assert.rejects(() => host.refreshFromDisk(), /Refreshing "a\.db" failed .* it was closed/s);
   assert.deepEqual(host.listDatabases().map(d => [d.name, d.path]), [['untitled.db', null]]);
-  assert.equal(await host.saveToDisk(), false);
-  assert.equal(saved.path, undefined);
+  // Same as the native variant: the path-less replacement can only be saved
+  // through Save As, never in place over the database that was closed.
+  assert.deepEqual(await host.saveToDisk(), { success: true, savedAs: 'as.db' });
+  assert.equal(saved.path, undefined, 'nothing was written in place');
 });
 
 // The pending map is shared by every database. A call issued against an entry
@@ -3235,8 +3247,10 @@ test('when even the replacement empty database cannot boot, the host is empty an
   assert.equal(host.activeDatabaseId(), null);
   assert.equal(host.currentFilename(), null);
   assert.equal(host.hasUnsavedChanges(), false);
-  // ⌘S and ⌘R are quiet no-ops, and nothing was written anywhere.
-  assert.equal(await host.saveToDisk(), false);
+  // ⌘S and ⌘R are quiet no-ops, and nothing was written anywhere. `reason`
+  // is what keeps that quiet without lying: there is no database to save, so
+  // the page says nothing rather than reporting a cancelled dialog.
+  assert.deepEqual(await host.saveToDisk(), { success: false, reason: 'no-database' });
   assert.equal(await host.refreshFromDisk(), undefined);
   assert.equal(saved.path, undefined);
   // A page RPC still fails loudly: it is asking an engine that does not exist.

@@ -3,7 +3,7 @@
  */
 import { state } from './state.js';
 import { backendApi } from './api.js';
-import { updateStatus } from './ui.js';
+import { updateStatus, wasSaveCancelled } from './ui.js';
 import { openModal, closeModal } from './modals.js';
 import { escapeHtml } from './utils.js';
 import { getSelectedRowActionEligibility } from './data-utils.js';
@@ -186,7 +186,7 @@ async function submitExportOnce() {
         updateStatus('Exporting...');
         closeModal('exportModal');
 
-        await backendApi.exportTable(
+        const result = await backendApi.exportTable(
             { table: state.selectedTable },
             columns,
             null, // dbOptions
@@ -194,9 +194,20 @@ async function submitExportOnce() {
             { format, ...options } // exportOptions
         );
 
+        // A cancelled save dialog is not an export. Reporting it as one made
+        // Cancel indistinguishable from success on the desktop, where the host
+        // does return the flag (the VS Code and web lanes resolve without one
+        // and keep the "initiated" wording, which is accurate there: the host
+        // finishes the write out of band).
+        if (wasSaveCancelled(result)) {
+            updateStatus('Export cancelled');
+            return;
+        }
+        // …and when the host DOES name the file it wrote, say which one.
+        const outcome = result?.savedAs ? `Exported to ${result.savedAs}` : 'Export initiated';
         updateStatus(skippedReadOnlyRows > 0
-            ? `Export initiated; skipped ${skippedReadOnlyRows} read-only selected row${skippedReadOnlyRows === 1 ? '' : 's'}`
-            : 'Export initiated');
+            ? `${outcome}; skipped ${skippedReadOnlyRows} read-only selected row${skippedReadOnlyRows === 1 ? '' : 's'}`
+            : outcome);
     } catch (err) {
         console.error('Export failed:', err);
         updateStatus(`Export failed: ${err.message}`);

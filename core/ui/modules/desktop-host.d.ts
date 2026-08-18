@@ -29,8 +29,24 @@ export interface DesktopHostBridge {
     readDatabaseBytes(path: string): Promise<Uint8Array>;
     /** Writes `bytes` to `path` atomically. */
     saveDatabase(path: string, bytes: Uint8Array): Promise<void>;
-    /** Resolves to the chosen path, or null if the user cancelled the dialog. */
+    /**
+     * EXPORT route: save dialog → atomic write → the chosen path (null when the
+     * user cancelled). The destination is deliberately NOT added to the session
+     * allowlist — an exported CSV must not become silently overwritable for the
+     * rest of the session.
+     */
     saveFileAs(defaultName: string, bytes: Uint8Array): Promise<string | null>;
+    /**
+     * SAVE AS route: the same dialog and atomic write, plus the session-allowlist
+     * grant that makes the chosen file writable in place afterwards — so the
+     * database can adopt it and every later save is an ordinary `saveDatabase`.
+     * Resolves to the chosen path, or null if the user cancelled.
+     *
+     * Optional like {@link onOpenFile}: shells older than this viewer have no
+     * such command, and the host refuses Save As loudly rather than writing
+     * bytes it then could not save over.
+     */
+    saveDatabaseAs?(defaultName: string, bytes: Uint8Array): Promise<string | null>;
     loadSettings(): Promise<Record<string, unknown>>;
     saveSettings(settings: Record<string, unknown>): Promise<void>;
     onMenu(handler: (id: string) => void): void;
@@ -132,6 +148,22 @@ export interface OpenDatabase {
     isActive: boolean;
 }
 
+/**
+ * Outcome of {@link DesktopHost.saveToDisk} — the same `{ success, savedAs }`
+ * contract the host's export/saveFile methods answer, so the page has one shape
+ * to surface. `success: false` is never an error (errors reject); it is one of
+ * the two ways nothing was written:
+ * - `cancelled` — the user dismissed the Save As dialog.
+ * - `no-database` — the registry is empty (only reachable when the WASM runtime
+ *   itself died), so ⌘S is a quiet no-op rather than a confusing error.
+ */
+export interface SaveResult {
+    success: boolean;
+    /** Basename of the file written. Present exactly when `success` is true. */
+    savedAs?: string;
+    reason?: 'cancelled' | 'no-database';
+}
+
 /** Options accepted by {@link createDesktopHost}. */
 export interface CreateDesktopHostOptions {
     bridge: DesktopHostBridge;
@@ -189,8 +221,13 @@ export interface DesktopHost {
      */
     closeDatabase(dbId: string): Promise<boolean>;
 
-    /** Saves the ACTIVE database. */
-    saveToDisk(): Promise<boolean>;
+    /**
+     * Saves the ACTIVE database, routing one with no file on disk yet (the boot
+     * placeholder, a dropped file) to a Save As dialog and adopting the chosen
+     * path. Never a silent no-op: a genuine failure REJECTS, and
+     * `success: false` always carries the `reason` the page reports.
+     */
+    saveToDisk(): Promise<SaveResult>;
     /** Re-reads the ACTIVE database from disk, discarding pending edits. */
     refreshFromDisk(): Promise<void>;
     /**
