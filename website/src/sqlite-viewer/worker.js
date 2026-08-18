@@ -891,7 +891,19 @@ async function initializeDatabase(filename, config) {
     // still fail early with operation-specific errors, while SQLite itself
     // refuses an accidentally unguarded write on this connection. Read-only
     // paged databases are additionally immutable at the VFS level.
-    db.run('PRAGMA query_only = ON');
+    //
+    // Through the ENGINE where the engine has read-only state of its own. The
+    // native engine's sql.js shim does: it lifts `query_only` around the
+    // shim-authored TEMP VIEW it uses to read a statement's column names
+    // without executing it, and whether it lifts is decided by its own
+    // `readOnly` flag. Arming the pragma behind its back left the two
+    // disagreeing -- the lift became a no-op, SQLite refused the probe's
+    // CREATE TEMP VIEW as a write, and the swallowed refusal came back as
+    // "no columns", so the grid rendered an internal invariant message
+    // ("positive column count, got 0") instead of rows on EVERY database this
+    // probe found unwritable. sql.js has no such state, so it keeps the pragma.
+    if (typeof db.enforceReadOnly === 'function') db.enforceReadOnly();
+    else db.run('PRAGMA query_only = ON');
   }
 
   return {

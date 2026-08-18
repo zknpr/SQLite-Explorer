@@ -106,6 +106,13 @@ export function createDesktopHost({ bridge, createWorker }) {
     const databases = new Map();
     /** @type {Map<string, Promise<boolean>>} in-flight opens, by requested path */
     const openRequests = new Map();
+    /**
+     * Opens that have passed the {@link MAX_OPEN_DATABASES} check but have not
+     * put their entry in `databases` yet. Counted by the cap so concurrent
+     * opens cannot all pass a check against a registry that is still short —
+     * see assertRoomForAnotherDatabase.
+     */
+    let openingEntries = 0;
     let activeId = null;
     let dbIdCounter = 0;
 
@@ -1121,9 +1128,21 @@ export function createDesktopHost({ bridge, createWorker }) {
      * AFTER the dedupe on every lane that creates an entry: re-opening a file
      * that is already open only switches to it, so the cap can never wall the
      * user off from a database they already have.
+     *
+     * Counts the opens that have PASSED this check but have not registered
+     * their entry yet, not just `databases.size`. Without that the cap is a
+     * check-then-act across the whole async engine boot: a Finder
+     * multi-selection, an OS file drop and a dialog open all land through
+     * different callers, and any two of them in flight together read a
+     * registry that is still short. The shell's `MAX_NATIVE_SIDECARS` is the
+     * same number enforced SYNCHRONOUSLY in Rust, so an overshoot here does
+     * not fail loudly — it silently downgrades the surplus database to the
+     * WASM engine, which is the one lane that holds the whole file in
+     * renderer memory. Two caps over the same resource must agree or one of
+     * them lies.
      */
     function assertRoomForAnotherDatabase(name) {
-        if (databases.size < MAX_OPEN_DATABASES) return;
+        if (databases.size + openingEntries < MAX_OPEN_DATABASES) return;
         throw new Error(
             `Cannot open "${name}": ${MAX_OPEN_DATABASES} databases are already open. `
             + 'Close one first.'
@@ -1139,7 +1158,25 @@ export function createDesktopHost({ bridge, createWorker }) {
         // Before the engine work, not after: refusing here spawns no sidecar,
         // boots no worker and reads no bytes.
         assertRoomForAnotherDatabase(name);
+        // Reserved in the SAME synchronous step as the check above (no await
+        // between them, so no other open can interleave) and released only
+        // once this open has either registered its entry or given up. The
+        // reservation is held ACROSS commitEntry, so the count never dips
+        // between "no longer reserved" and "in the registry".
+        openingEntries++;
+        try {
+            return await openEngineFor(path, name, size);
+        } finally {
+            openingEntries--;
+        }
+    }
 
+    /**
+     * The engine work of an open, from a cap reservation already taken to a
+     * committed entry. Split out only so the reservation has an exception-safe
+     * release around every exit of it.
+     */
+    async function openEngineFor(path, name, size) {
         if (hasNativeBridge()) {
             const nativeEntry = await tryOpenNative(path, name);
             if (nativeEntry) {
@@ -1677,6 +1714,22 @@ export function createDesktopHost({ bridge, createWorker }) {
             // nothing — it is editable, it reports dirty, and the close prompt
             // asks about it, so it must have a way to reach disk.
             if (!entry.currentPath) return saveEntryAs(entry);
+            // A read-only database has nothing to commit: every mutation was
+            // refused before it reached the engine, so the native COMMIT below
+            // would close a transaction that was never opened and report
+            // "Saved <file>" for an operation that never happened — on exactly
+            // the file where the user most needs to know it did not. Refuse by
+            // name instead, quoting the engine's own reason. Export Database
+            // still copies it somewhere writable.
+            if (entry.connectionInfo.isReadOnly === true) {
+                return {
+                    success: false,
+                    reason: 'read-only',
+                    savedAs: entry.currentName,
+                    message: entry.connectionInfo.readOnlyReason
+                        ?? `"${entry.currentName}" is open read-only, so there is nothing to save.`
+                };
+            }
             await saveToDisk(entry);
             return { success: true, savedAs: entry.currentName };
         },

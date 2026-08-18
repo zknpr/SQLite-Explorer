@@ -946,3 +946,131 @@ test('FIXED G5: sidebar width persists through the settings store, not dead loca
     // nobody reads — see tests/unit/desktop_api.test.ts for the behaviour.
     assert.match(api, /export function saveVsCodeState\(_stateObj\) \{\}/);
 });
+
+// ===========================================================================
+// K. The OS-delivered open lane is SERIALISED (BUG F-B)
+//
+// Found live against a bundled .app: "Open With" on a 14-file Finder selection
+// started 14 independent `host.openFromShellPath` calls. The shell emits one
+// `desktop-open-file` event PER PATH, so the `for … await` loop that already
+// serialises the drop lane has no batch to loop over here — the ordering has
+// to be carried ACROSS handler invocations by a chain.
+// ===========================================================================
+
+/**
+ * The `onOpenFile` registration from desktop-viewer.js as runnable source, so
+ * the assertions below execute the SHIPPED wiring rather than paraphrasing it.
+ * (Same technique as web_viewer_refresh.test.ts, which evaluates a built
+ * bundle; the entry point itself cannot be imported — it boots a whole viewer
+ * against a real DOM on import.)
+ */
+function shellOpenLaneSource(): string {
+    const source = readFileSync(
+        path.resolve(process.cwd(), 'core/ui/desktop-viewer.js'), 'utf8'
+    );
+    const start = source.indexOf('let shellOpenChain');
+    assert.notEqual(start, -1, 'desktop-viewer.js no longer serialises the onOpenFile lane');
+    const terminator = '\n        });';
+    const end = source.indexOf(terminator, start);
+    assert.notEqual(end, -1, 'could not find the end of the onOpenFile registration');
+    return source.slice(start, end + terminator.length);
+}
+
+test('FIXED F-B: OS-delivered opens run one at a time, in delivery order, and every file is attempted', async () => {
+    const running: string[] = [];
+    const overlaps: string[] = [];
+    const started: string[] = [];
+    const completed: string[] = [];
+    const reported: string[] = [];
+    let settledCount = 0;
+
+    const host = {
+        openFromShellPath: async (p: string) => {
+            // The overlap check is the whole point: with the old handler every
+            // delivery started its own open, so a second path entered here
+            // while the first was still awaiting its engine.
+            if (running.length > 0) overlaps.push(`${running.join()} || ${p}`);
+            running.push(p);
+            started.push(p);
+            await new Promise(resolve => setTimeout(resolve, 0));
+            running.pop();
+            settledCount += 1;
+            if (p.includes('bad')) throw new Error('file is not a database');
+            completed.push(p);
+            return true;
+        }
+    };
+    const surface = (label: string) => (err: Error) => { reported.push(`${label}: ${err.message}`); };
+    let deliver: ((p: string) => void) | null = null;
+    const bridge = { onOpenFile: (handler: (p: string) => void) => { deliver = handler; } };
+
+    new Function('bridge', 'host', 'surface', shellOpenLaneSource())(bridge, host, surface);
+    assert.notEqual(deliver, null, 'the registration did not install a handler');
+
+    // Five SEPARATE events in one synchronous burst — exactly how a Finder
+    // multi-selection arrives.
+    const delivered = ['/a.db', '/b.db', '/bad.db', '/c.db', '/d.db'];
+    for (const p of delivered) deliver!(p);
+
+    for (let i = 0; i < 500 && settledCount < delivered.length; i++) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    assert.equal(settledCount, delivered.length, 'the open chain never drained');
+
+    assert.deepEqual(overlaps, [], 'two OS-delivered opens were in flight at once');
+    // Delivery order is preserved, so the LAST file the user selected is the
+    // last one opened — and therefore the one left active.
+    assert.deepEqual(started, delivered);
+    // A file that fails is reported and does not break the chain: the two after
+    // it still open.
+    assert.deepEqual(completed, ['/a.db', '/b.db', '/c.db', '/d.db']);
+    assert.deepEqual(reported, ['Open failed: file is not a database']);
+});
+
+// ===========================================================================
+// L. A read-only database says SO, and cannot report a save it never made
+//     (BUG F-C)
+//
+// A database in a read-only DIRECTORY (equally: a 0444 file, a read-only
+// mount) opens read-only. That is a legitimate outcome — but the engine's
+// `readOnlyReason` reached the page in every connection result and nothing
+// read it, so the only signals were disabled buttons; and ⌘S then reported
+// "Saved <file>" for a commit that never happened.
+// ===========================================================================
+
+test('FIXED F-C: the desktop worker escalates to read-only THROUGH the engine, not behind it', () => {
+    // The root cause of the broken grid, and a static one: the worker armed
+    // `PRAGMA query_only` itself, which on the native engine left the sql.js
+    // shim's own read-only flag false — so its column probe never lifted the
+    // pragma, SQLite refused the probe's TEMP VIEW as a write, and the
+    // swallowed refusal became "no columns". Only the built artifacts show
+    // which branch each bundle actually ships.
+    const authored = readFileSync(
+        path.resolve(process.cwd(), 'website/src/sqlite-viewer/worker.js'), 'utf8'
+    );
+    assert.match(authored, /typeof db\.enforceReadOnly === 'function'/);
+
+    // The desktop native worker is the bundle that has a shim to talk to.
+    const nativeBundle = readFileSync(
+        path.resolve(process.cwd(), 'desktop/native-worker-desktop.js'), 'utf8'
+    );
+    assert.ok(nativeBundle.includes('enforceReadOnly'),
+        'the shipped native sidecar bundle never calls enforceReadOnly');
+
+    // sql.js has no read-only state of its own, so the raw pragma is still the
+    // right call there and must survive.
+    assert.match(authored, /PRAGMA query_only = ON/);
+});
+
+test('FIXED F-C: the desktop entry says WHY a database is read-only, once per change', () => {
+    const source = readFileSync(
+        path.resolve(process.cwd(), 'core/ui/desktop-viewer.js'), 'utf8'
+    );
+    // Fed from the connection result the host already carried.
+    assert.match(source, /reportReadOnlyReason\(connectionResult\.readOnlyReason\)/);
+    // Guarded against re-posting on every refreshContent, which would keep
+    // wiping the status line the user's last action wrote.
+    assert.match(source, /if \(current === reportedReadOnlyReason\) return;/);
+    // And ⌘S no longer claims a save on a database that cannot take one.
+    assert.match(source, /result\?\.reason === 'read-only'/);
+});

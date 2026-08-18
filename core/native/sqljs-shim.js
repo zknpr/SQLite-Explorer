@@ -64,6 +64,19 @@ const ATTACH_DETACH_PREFIX = /^(?:attach|detach)\b/i;
 const VACUUM_PREFIX = /^vacuum\b/i;
 
 /**
+ * Statements whose column names a caller can actually be counting on: the ones
+ * a `CREATE VIEW ... AS` body may legally be. Everything else (DML, DDL,
+ * PRAGMA, EXPLAIN) is un-viewable BY DESIGN, so a probe failure on it is not a
+ * failure at all -- it is the ladder's documented "[]" rung.
+ *
+ * Used only to decide whether a probe refusal is worth escalating (see
+ * `withColumnProbeView`). Over-matching is harmless: `WITH ... INSERT` leads
+ * with WITH and is not viewable, but it is refused for its own reasons long
+ * before column names matter.
+ */
+const VIEWABLE_PREFIX = /^(?:select|values|with)\b/i;
+
+/**
  * A bareword `into` anywhere in a SINGLE statement's own source. On a statement
  * whose leading token is `VACUUM`, this can only be the `INTO` clause: the
  * legitimate forms are `VACUUM`, `VACUUM main`, `VACUUM temp` (no schema alias
@@ -166,6 +179,20 @@ export function copyErrno(target, source) {
         });
     }
     return target;
+}
+
+/** SQLite primary result code 8, `SQLITE_READONLY`. */
+const SQLITE_READONLY = 8;
+
+/**
+ * True for "attempt to write a readonly database".
+ *
+ * `errno` only: the fork reports `sqlite3_errstr(rc)`, so a message match would
+ * be matching text the shim itself already knows how to derive from the code,
+ * and every other classifier in this file keys off `errno` for the same reason.
+ */
+function isReadOnlyRefusal(error) {
+    return error?.errno === SQLITE_READONLY;
 }
 
 /**
@@ -614,7 +641,9 @@ export function createShimDatabase(config = {}, deps = {}) {
         );
     }
 
-    const readOnly = config.readOnly === true;
+    // NOT const: `enforceReadOnly()` escalates an open writable session, and
+    // every read-only behaviour in this file keys off this flag.
+    let readOnly = config.readOnly === true;
     // Passing ANY options object suppresses file creation on the fork -- even
     // `{}` fails with errno 14 on a missing path, where a bare
     // `new Database(path)` would have created it. `create` restores sql.js's
@@ -661,25 +690,36 @@ export function createShimDatabase(config = {}, deps = {}) {
         }
     };
 
-    if (readOnly) {
-        // The fork's `readOnly` open flag is honoured, but a typo'd key is
-        // silently ignored (the shipped extension has exactly that bug), so the
-        // shim does not trust the flag at all: `query_only` blocks writes at the
-        // SQLite level regardless of how the connection was opened, and reading
-        // it back proves the guard is armed. This is a pure connection flag --
-        // nothing is written to prove it.
+    /**
+     * Arm SQLite-level read-only enforcement and PROVE it took.
+     *
+     * The fork's `readOnly` open flag is honoured, but a typo'd key is silently
+     * ignored (the shipped extension has exactly that bug), so the shim does not
+     * trust the flag at all: `query_only` blocks writes at the SQLite level
+     * regardless of how the connection was opened, and reading it back proves
+     * the guard is armed. This is a pure connection flag -- nothing is written
+     * to prove it.
+     */
+    const armReadOnly = () => {
         try {
             backing.exec('PRAGMA query_only = 1');
         } catch (error) {
-            backing.close();
             throw copyErrno(
                 new Error(`Unable to enforce read-only mode: ${error?.message ?? error}`),
                 error
             );
         }
         if (Number(readScalar('PRAGMA query_only')) !== 1) {
-            backing.close();
             throw new Error('Unable to enforce read-only mode: PRAGMA query_only did not take');
+        }
+    };
+
+    if (readOnly) {
+        try {
+            armReadOnly();
+        } catch (error) {
+            backing.close();
+            throw error;
         }
     }
 
@@ -799,6 +839,41 @@ export function createShimDatabase(config = {}, deps = {}) {
             });
         } catch (error) {
             if (poisoned !== null) throw poisoned;
+            // A READ-ONLY refusal is not "this statement is not viewable". The
+            // statement being refused is the shim's OWN temp-schema DDL, which
+            // depends on nothing in the caller's SQL; SQLite can only be
+            // blocking it because `query_only` is armed and the lift above did
+            // not run -- i.e. this connection is read-only without the shim
+            // knowing. Swallowing that returns "no columns", which the caller
+            // turns into an internal invariant message with nothing in it that
+            // names the cause; every grid on such a connection died that way.
+            // Named here instead, once, for whatever set query_only.
+            //
+            // Only for a VIEWABLE statement, and that guard is load-bearing
+            // rather than tidiness: SQLite refuses the CREATE for being a write
+            // BEFORE it looks at the body, so a PRAGMA gets errno 8 here too --
+            // and throwing on that would take `PRAGMA query_only = OFF` down
+            // with it, which is the one statement that can undo the state being
+            // complained about. A probe refusal on a statement that was never
+            // viewable costs nothing to swallow, because `[]` was always its
+            // correct answer.
+            if (isReadOnlyRefusal(error) && VIEWABLE_PREFIX.test(body)) {
+                // The recovery named here is the one that was VERIFIED to work
+                // against the shipped binary. Turning the pragma back off from
+                // SQL does NOT: getting there runs statements that are
+                // themselves probed, and they hit this same refusal first.
+                throw copyErrno(
+                    new Error(
+                        'Column names are unavailable: this connection refuses writes (PRAGMA '
+                        + 'query_only is armed) but was not opened read-only, so the probe cannot '
+                        + 'create the temporary view it reads them from. Close and reopen the '
+                        + 'database to clear it. (A session made read-only after opening must be '
+                        + 'escalated through enforceReadOnly(), which is what lets the probe lift '
+                        + `query_only. SQLite: ${error?.message ?? error})`
+                    ),
+                    error
+                );
+            }
             return null;
         }
         try {
@@ -1175,6 +1250,54 @@ export function createShimDatabase(config = {}, deps = {}) {
         get inTransaction() {
             assertOpen();
             return backing.inTransaction === true;
+        },
+
+        /**
+         * Escalate an already-open writable session to read-only.
+         *
+         * Not part of the sql.js surface: sql.js has no read-only state of its
+         * own, so a caller there arms `PRAGMA query_only` directly and that is
+         * the whole of it. Here it is NOT -- the shim's `readOnly` flag decides
+         * whether `withInternalWrites` lifts `query_only` around the TEMP VIEW
+         * that reads column names without executing anything. Arming the pragma
+         * behind the shim's back leaves the two disagreeing: the lift becomes a
+         * no-op, SQLite refuses the probe's `CREATE TEMP VIEW` as a write, and
+         * the probe's "this statement is not viewable" catch turns that into
+         * "no columns" -- which the grid reports as an internal invariant
+         * violation instead of rows. That is exactly what happened to every
+         * database the open-time write probe found unwritable (a 0444 file, a
+         * read-only mount, a read-only DIRECTORY).
+         *
+         * Idempotent, and refused mid-lift: escalating while `query_only` is
+         * lifted would be undone by that lift's own restore.
+         *
+         * On failure the connection is POISONED rather than left running: a
+         * session that believes it is read-only and is not is the one state
+         * worse than a dead one.
+         */
+        enforceReadOnly() {
+            assertOpen();
+            if (readOnly) return true;
+            if (writesLifted) {
+                throw new Error(
+                    'Internal error: cannot escalate to read-only while an internal write lift is open'
+                );
+            }
+            try {
+                armReadOnly();
+            } catch (error) {
+                poisoned = copyErrno(
+                    new Error(
+                        `Read-only enforcement could not be armed (${error?.message ?? error}); `
+                        + 'this connection is no longer trustworthy and has been disabled'
+                    ),
+                    error
+                );
+                poisoned.cause = error;
+                throw poisoned;
+            }
+            readOnly = true;
+            return true;
         },
 
         close() {

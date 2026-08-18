@@ -100,6 +100,30 @@ function updateEngineBadge(engine) {
     badge.hidden = false;
 }
 
+/** The read-only reason currently on screen; null when the database is writable. */
+let reportedReadOnlyReason = null;
+
+/**
+ * Say WHY a database opened read-only, in the engine's own words (an unwritable
+ * file, a read-only mount, a read-only directory).
+ *
+ * Without this the only signals were disabled buttons and the console notice —
+ * neither names a cause, and neither is anywhere near the grid the user is
+ * looking at. `readOnlyReason` was already computed by the engine's open-time
+ * write probe and already carried in every connection result; nothing read it.
+ *
+ * Reported on CHANGE only: refreshContent fires after every mutating operation
+ * and every refresh, and re-posting the same line would keep wiping whatever
+ * the user's last action put in the status bar. Switching databases legitimately
+ * re-reports, because it is a different file.
+ */
+function reportReadOnlyReason(reason) {
+    const current = typeof reason === 'string' && reason !== '' ? reason : null;
+    if (current === reportedReadOnlyReason) return;
+    reportedReadOnlyReason = current;
+    if (current) updateStatus(current);
+}
+
 // ============================================================================
 // SQL console (desktop only)
 // ============================================================================
@@ -326,6 +350,7 @@ const webviewMethods = {
         if (connectionResult) {
             applyConnectionResult(connectionResult);
             updateEngineBadge(connectionResult.engine);
+            reportReadOnlyReason(connectionResult.readOnlyReason);
         }
         if (state.isDbConnected) {
             // A broadcast view refresh may change projection and row order.
@@ -560,6 +585,10 @@ if (!bridge) {
         const reportSave = (result) => {
             if (result?.success === true) updateStatus(`Saved ${result.savedAs}`);
             else if (result?.reason === 'cancelled') updateStatus('Save cancelled');
+            // A read-only database cannot be saved and never had anything
+            // pending; "Saved" there reads as a completed write of data the
+            // file does not contain.
+            else if (result?.reason === 'read-only') updateStatus(result.message);
             // 'no-database': nothing to save and nothing to tell the user —
             // the registry is only ever empty when the engine itself died, and
             // initializeApp has already put that on screen.
@@ -612,8 +641,24 @@ if (!bridge) {
         // Native "Open With"/recents deliver a path directly, bypassing the
         // in-webview dialog flow above. Optional: older shells and the dev
         // harness don't implement onOpenFile.
-        bridge.onOpenFile?.(async (path) => {
-            await host.openFromShellPath(path).catch(surface('Open failed'));
+        //
+        // Sequential, for the same reasons the drop lane below is — but the
+        // shell emits ONE event PER PATH here (a Finder multi-selection is N
+        // `desktop-open-file` events, not one array), so the loop that
+        // serialises the drop batch has no batch to loop over. The chain is
+        // what carries the ordering ACROSS handler invocations: without it a
+        // 14-file "Open With" starts 14 independent opens, which race the
+        // registry's cap check and leave an arbitrary database active instead
+        // of the last one the user asked for.
+        //
+        // Every link ends in a `.catch`, so the chain can never settle
+        // rejected: a file that fails to open is reported and the next one is
+        // still attempted.
+        let shellOpenChain = Promise.resolve();
+        bridge.onOpenFile?.((path) => {
+            shellOpenChain = shellOpenChain
+                .then(() => host.openFromShellPath(path))
+                .catch(surface('Open failed'));
         });
 
         // Files dropped on the window. Tauri handles OS drag-and-drop natively,
@@ -624,8 +669,10 @@ if (!bridge) {
         // Sequential, not Promise.all: openFromPath dedupes by canonical path
         // and each open activates the database it opened, so racing a multi-file
         // drop would leave the last one to RESOLVE active rather than the last
-        // one dropped, and would blow past MAX_OPEN_DATABASES concurrently.
-        // Every file is attempted even if an earlier one fails.
+        // one dropped, and would boot every engine at once. (The cap itself no
+        // longer depends on this: the host counts in-flight opens, because two
+        // SEPARATE lanes racing each other cannot be serialised from inside
+        // either one.) Every file is attempted even if an earlier one fails.
         bridge.onDragDropPaths?.(async (paths) => {
             for (const path of paths ?? []) {
                 await host.openFromShellPath(path).catch(surface(`Could not open ${path}`));

@@ -712,6 +712,22 @@ async function runUnwritableFileCase(binary, scratch, note) {
             && (read.content?.data?.tables?.map((table) => table.identifier) ?? []).includes('t'),
             'sidecar/E11-unwritable-file-still-reads');
 
+        // …and the GRID reads, which is the half that was broken. Escalating to
+        // read-only used to arm `PRAGMA query_only` behind the shim's back, so
+        // the shim's column probe could no longer create its TEMP VIEW, the
+        // refusal was swallowed into "no columns", and fetchTableData died on
+        // "Cell containment requires a positive column count, got 0" — the
+        // schema loaded, the table was selectable, and selecting it replaced the
+        // grid with an internal invariant message. fetchSchema alone never saw
+        // it, because schema reads do not go through the probe.
+        const grid = await session.invoke('fetchTableData', ['t', { limit: 100, offset: 0 }]);
+        check(grid.content?.success === true
+            && Array.isArray(grid.content?.data?.headers)
+            && grid.content.data.headers.length > 0
+            && (grid.content?.data?.rows?.length ?? 0) > 0,
+            'sidecar/E11-unwritable-file-renders-a-grid',
+            JSON.stringify(grid.content?.errorMessage ?? grid.content?.data?.headers));
+
         session.endStdin();
         const code = await session.untilExit();
         check(code === 0, 'sidecar/E11-unwritable-session-exits-clean', `exit ${code}`);
@@ -751,7 +767,75 @@ async function runUnwritableFileCase(binary, scratch, note) {
         const stderrText = control.stderr.trim();
         if (stderrText) console.log(`[sidecar probe-control stderr]\n${stderrText}\n`);
     }
+
+    // READ-ONLY DIRECTORY: the shape this defect was actually reported in (a
+    // read-only mount, a locked-down folder). The FILE stays rw-r--r--; only
+    // the directory refuses, so SQLite opens it happily, serves every read, and
+    // fails only when it tries to create the journal. Same escalation path as
+    // the 0444 case above, different trigger — and the one a user hits without
+    // having done anything unusual.
+    checks += await runReadOnlyDirectoryCase(binary, scratch, note);
     return checks;
+}
+
+/**
+ * @returns {Promise<number>} checks run (0 when the platform cannot express it)
+ */
+async function runReadOnlyDirectoryCase(binary, scratch, note) {
+    if (process.platform === 'win32') return 0;
+    const directory = path.join(scratch, 'readonly-dir');
+    fs.mkdirSync(directory, { recursive: true });
+    const dbPath = path.join(directory, 'locked.sqlite');
+    createFixture(dbPath);
+    fs.chmodSync(directory, 0o555);
+    try {
+        // Running as root defeats the fixture entirely (root writes read-only
+        // directories), so PROVE the trigger before asserting anything about it
+        // — a silently-writable directory would turn this into a green test of
+        // nothing.
+        const witness = path.join(directory, '.write-probe');
+        let refuses = false;
+        try {
+            fs.writeFileSync(witness, 'x');
+            fs.rmSync(witness, { force: true });
+        } catch {
+            refuses = true;
+        }
+        if (!refuses) {
+            note(true, 'sidecar/E11-readonly-directory-SKIPPED', 'the directory is still writable (root?)');
+            return 1;
+        }
+
+        const session = startSidecar(binary, dbPath, 'rw');
+        try {
+            const init = await session.invoke('initializeDatabase', ['locked.sqlite', {
+                path: dbPath, readOnlyMode: false
+            }]);
+            const grid = await session.invoke('fetchTableData', ['t', { limit: 100, offset: 0 }]);
+            note(init.content?.data?.isReadOnly === true
+                && /read-only/i.test(init.content?.data?.readOnlyReason ?? '')
+                && grid.content?.success === true
+                && (grid.content?.data?.headers?.length ?? 0) > 0
+                && (grid.content?.data?.rows?.length ?? 0) > 0,
+                'sidecar/E11-readonly-directory-opens-read-only-and-renders',
+                JSON.stringify({
+                    isReadOnly: init.content?.data?.isReadOnly,
+                    grid: grid.content?.errorMessage ?? grid.content?.data?.headers
+                }));
+
+            session.endStdin();
+            const code = await session.untilExit();
+            note(code === 0, 'sidecar/E11-readonly-directory-session-exits-clean', `exit ${code}`);
+        } finally {
+            if (session.exitCode === null) session.child.kill('SIGKILL');
+            const stderrText = session.stderr.trim();
+            if (stderrText) console.log(`[sidecar readonly-dir stderr]\n${stderrText}\n`);
+        }
+        return 2;
+    } finally {
+        // Always restore, or the scratch directory cannot be removed.
+        fs.chmodSync(directory, 0o755);
+    }
 }
 
 /** Mirrors DESKTOP_EXPORT_MAX_BYTES in desktop-host.js (the host's raised ceiling). */

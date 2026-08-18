@@ -880,6 +880,117 @@ describe('sqljs-shim: native-only behaviour', () => {
         });
     });
 
+    // -----------------------------------------------------------------------
+    // Escalating an OPEN writable session to read-only.
+    //
+    // Found live: a database in a read-only DIRECTORY (and equally a 0444 file)
+    // opens writable, the worker's open-time write probe finds it unwritable,
+    // and the worker used to arm `PRAGMA query_only` itself. That left the
+    // shim's own readOnly flag false, so its column probe never lifted the
+    // pragma, SQLite refused the probe's CREATE TEMP VIEW as a write, the
+    // refusal was swallowed into "no columns" — and every grid on such a
+    // database rendered "Cell containment requires a positive column count,
+    // got 0" instead of rows.
+    // -----------------------------------------------------------------------
+
+    it('enforceReadOnly() arms query_only AND keeps the column probe working', () => {
+        withFileDatabase(file => {
+            const db = createShim({ path: file });
+            try {
+                assert.strictEqual(db.enforceReadOnly(), true);
+                assert.deepStrictEqual(
+                    normalize(db.exec('PRAGMA query_only')),
+                    [{ columns: ['query_only'], values: [[1]] }]
+                );
+                assert.throws(() => db.run("INSERT INTO t VALUES(99,'no',NULL,0)"),
+                    (error: unknown) => (error as { errno?: number }).errno === 8);
+
+                // The column probe is the half that used to break: it needs its
+                // TEMP VIEW, which query_only refuses, so the escalation has to
+                // have moved the shim's own read-only flag as well as SQLite's.
+                const statement = db.prepare('SELECT id AS alpha, name AS beta FROM t WHERE 0');
+                assert.deepStrictEqual(statement.getColumnNames(), ['alpha', 'beta']);
+                statement.free();
+                // …and the lift was put back.
+                assert.deepStrictEqual(
+                    normalize(db.exec('PRAGMA query_only')),
+                    [{ columns: ['query_only'], values: [[1]] }]
+                );
+
+                // Idempotent: a second escalation is a no-op, not an error.
+                assert.strictEqual(db.enforceReadOnly(), true);
+            } finally {
+                db.close();
+            }
+        });
+    });
+
+    it('arming query_only BEHIND the shim is reported, not swallowed into "no columns"', () => {
+        withFileDatabase(file => {
+            const db = createShim({ path: file });
+            try {
+                // Exactly what the worker used to do — and what any future
+                // caller reaching past enforceReadOnly() would do.
+                db.run('PRAGMA query_only = ON');
+                const statement = db.prepare('SELECT id AS alpha FROM t WHERE 0');
+                assert.throws(
+                    () => statement.getColumnNames(),
+                    (error: unknown) => {
+                        const message = (error as Error).message;
+                        // Names the mechanism and the fix, rather than
+                        // answering [] and letting the caller's own invariant
+                        // check fail three layers away with no cause in it.
+                        assert.match(message, /query_only/);
+                        assert.match(message, /enforceReadOnly/);
+                        assert.strictEqual((error as { errno?: number }).errno, 8);
+                        return true;
+                    }
+                );
+                statement.free();
+            } finally {
+                db.close();
+            }
+        });
+    });
+
+    it('the query_only report does not fire for statements that were never viewable', () => {
+        withFileDatabase(file => {
+            const db = createShim({ path: file });
+            try {
+                db.run('PRAGMA query_only = ON');
+                // SQLite refuses the probe's CREATE for being a WRITE before it
+                // looks at the body, so a PRAGMA takes errno 8 here exactly like
+                // a SELECT does. It must still fall through to "[]", which was
+                // always the right answer for it — the report is only for
+                // statements whose columns a caller would have relied on.
+                const pragma = db.prepare('PRAGMA user_version');
+                assert.deepStrictEqual(pragma.getColumnNames(), []);
+                pragma.free();
+
+                const dml = db.prepare("UPDATE t SET name = 'x' WHERE id = 1");
+                assert.deepStrictEqual(dml.getColumnNames(), []);
+                dml.free();
+            } finally {
+                db.close();
+            }
+        });
+    });
+
+    it('a statement that is genuinely not viewable still falls through quietly', () => {
+        // The un-swallow above must stay narrow: DML/DDL/PRAGMA cannot be a view
+        // body, and "no columns" is the correct answer for them — the ladder's
+        // documented rung 4, not a hidden failure.
+        const db = createShim();
+        try {
+            db.run(SEED_SQL);
+            const statement = db.prepare("UPDATE t SET name = 'x' WHERE id = 1");
+            assert.deepStrictEqual(statement.getColumnNames(), []);
+            statement.free();
+        } finally {
+            db.close();
+        }
+    });
+
     it('export() produces a readable image with the same contents', () => {
         const db = createShim();
         try {

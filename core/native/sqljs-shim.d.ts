@@ -157,6 +157,16 @@ export interface ShimDatabase {
     clearQueryDeadline(): void;
     interrupt(): void;
     readonly inTransaction: boolean;
+    /**
+     * Escalate an open writable session to read-only. Not part of the sql.js
+     * surface — callers duck-type it, because sql.js has no read-only state of
+     * its own and arms `PRAGMA query_only` directly. Here the flag also decides
+     * whether the column probe may lift `query_only` for its own TEMP VIEW, so
+     * arming the pragma without this leaves the shim reporting no columns at
+     * all. Idempotent; throws (and poisons the connection) if enforcement
+     * cannot be armed.
+     */
+    enforceReadOnly(): boolean;
     close(): void;
     /** Not part of the sql.js surface; for the sidecar entry only. */
     readonly backingDatabase: NativeDatabase;

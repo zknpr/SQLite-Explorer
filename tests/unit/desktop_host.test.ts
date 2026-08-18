@@ -2843,6 +2843,132 @@ test('the drag-and-drop lane is capped too', async () => {
   assert.equal(host.listDatabases().length, MAX_OPEN_DATABASES);
 });
 
+test('the cap holds when opens RACE, not only when they are awaited one at a time', async () => {
+  // Found live: 14 files "Open With"-ed at once against 3 already open left 17
+  // databases against a cap of 16, and the shell — whose MAX_NATIVE_SIDECARS is
+  // the SAME number, enforced synchronously in Rust — refused the surplus a
+  // sidecar, so it silently ran on WASM instead.
+  //
+  // This is a real race, not a simulation of one: openFromShellPath runs
+  // SYNCHRONOUSLY as far as its first await (readDatabaseBytes), which is after
+  // the cap check, so every request below passes that check in the same
+  // synchronous burst, while the registry still holds one database.
+  // Serialising a caller cannot fix this — a Finder multi-selection, an OS file
+  // drop and a dialog open are three separate callers that can race each other.
+  const { host, workers } = makeHost({});
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  // One sequential open first, so the boot placeholder is already replaced and
+  // the arithmetic below is exact: the cap counts the scratch database like any
+  // other while it is still registered.
+  await host.openFromShellPath('/tmp/first.db');
+
+  const overshoot = 4;
+  const burst = Array.from(
+    { length: MAX_OPEN_DATABASES - 1 + overshoot },
+    (_, i) => `/tmp/race${i}.db`
+  );
+  const settled = await Promise.allSettled(burst.map(p => host.openFromShellPath(p)));
+
+  const refused = settled.filter(r => r.status === 'rejected') as PromiseRejectedResult[];
+  assert.equal(settled.filter(r => r.status === 'fulfilled').length, MAX_OPEN_DATABASES - 1);
+  assert.equal(refused.length, overshoot);
+  for (const rejection of refused) {
+    assert.match(
+      String(rejection.reason?.message),
+      new RegExp(`${MAX_OPEN_DATABASES} databases are already open`)
+    );
+  }
+  // The registry itself is the invariant: at most one database per slot, no
+  // matter how the opens interleaved.
+  assert.equal(host.listDatabases().length, MAX_OPEN_DATABASES);
+
+  // …and the refusals cost nothing: one worker for the boot placeholder plus
+  // one per opened database, none for the four that were turned away.
+  assert.equal(workers.length, MAX_OPEN_DATABASES + 1);
+
+  // The cap is not merely sticky: closing one makes room for exactly one more,
+  // so the in-flight accounting released every reservation it took.
+  assert.equal(await host.closeDatabase(host.listDatabases()[0].dbId), true);
+  assert.equal(await host.openFromShellPath('/tmp/after-close.db'), true);
+  assert.equal(host.listDatabases().length, MAX_OPEN_DATABASES);
+  await assert.rejects(
+    () => host.openFromShellPath('/tmp/one-too-many.db'),
+    new RegExp(`${MAX_OPEN_DATABASES} databases are already open`)
+  );
+});
+
+test('a failed open releases its cap reservation', async () => {
+  // The reservation is taken before the engine work and released in a finally,
+  // so a burst that mostly FAILS must not leave the cap permanently consumed —
+  // otherwise a run of unreadable files would wall the user off from every
+  // database until the window was reopened.
+  const failing = new Set(['/tmp/bad0.db', '/tmp/bad1.db', '/tmp/bad2.db']);
+  const { host } = makeHost({}, {
+    readDatabaseBytes: async (p: string) => {
+      if (failing.has(p)) throw new Error(`EACCES: ${p}`);
+      return new Uint8Array([1, 2, 3]);
+    }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+
+  const settled = await Promise.allSettled([...failing].map(p => host.openFromShellPath(p)));
+  assert.equal(settled.filter(r => r.status === 'rejected').length, failing.size);
+
+  // Room for a full registry afterwards: the boot placeholder is still the only
+  // entry, so MAX_OPEN_DATABASES more opens must all succeed.
+  for (let i = 0; i < MAX_OPEN_DATABASES; i++) {
+    assert.equal(await host.openFromShellPath(`/tmp/ok${i}.db`), true);
+  }
+  assert.equal(host.listDatabases().length, MAX_OPEN_DATABASES);
+});
+
+test('saving a READ-ONLY database is refused by name instead of reported as saved', async () => {
+  // Found live on a database in a read-only directory: ⌘S put "Saved
+  // locked.db" in the status bar while the file on disk was untouched, right
+  // after the grid had failed. Nothing was pending (a read-only database
+  // refuses every mutation), so it was not a write that failed — it was a
+  // completed-sounding report of an operation that never ran, on the one file
+  // where that matters most.
+  const READ_ONLY_REASON =
+    'This database cannot be written by this process, so it is open read-only.';
+  const { host, saved } = makeHost({
+    initializeDatabase: (args: unknown[]) =>
+      // The boot placeholder is writable; only the opened file is not.
+      (args[1] as { content?: unknown })?.content === undefined
+        ? { isReadOnly: false, storage: 'memory' }
+        : { isReadOnly: true, storage: 'memory', readOnlyReason: READ_ONLY_REASON }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/locked.db');
+
+  const result = await host.saveToDisk() as {
+    success: boolean; reason?: string; message?: string; savedAs?: string;
+  };
+  assert.equal(result.success, false);
+  assert.equal(result.reason, 'read-only');
+  // The engine's own words, so the refusal says WHY rather than just "no".
+  assert.equal(result.message, READ_ONLY_REASON);
+  assert.equal(result.savedAs, 'locked.db');
+  // …and nothing was written: the refusal happens before the save path runs.
+  assert.equal(saved.path, undefined);
+  assert.equal(saved.savedAsPath, undefined);
+});
+
+test('a writable database still saves normally', async () => {
+  // The control for the refusal above: the read-only branch must not swallow
+  // the ordinary save.
+  const { host, saved } = makeHost({ exportDatabase: () => new Uint8Array([7, 8, 9]) });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/writable.db');
+  assert.deepEqual(await host.saveToDisk(), { success: true, savedAs: 'writable.db' });
+  assert.equal(saved.path, '/tmp/writable.db');
+  assert.deepEqual([...(saved.bytes ?? [])], [7, 8, 9]);
+});
+
 // ---------------------------------------------------------------------------
 // Dedupe: one file, one entry. The shell does not de-duplicate, so a second
 // open of one file would otherwise spawn a second WRITABLE sidecar on it, with
