@@ -1622,6 +1622,90 @@ describe('web demo view worker', () => {
         await worker.invoke('closeCellReadSession', textSession.sessionId);
     });
 
+    it('answers getCellMetadata exactly, and refuses a target it cannot resolve', async () => {
+        // Coverage gap closure: getCellMetadata had NO test on either engine,
+        // despite being the gate desktop-api.js consults before every single
+        // cell edit (it decides whether the edit is ordinary or needs the
+        // oversized-replacement confirmation). A wrong byteLength there is a
+        // wrong prompt; a swallowed failure is an edit that silently takes the
+        // wrong branch.
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_cell_metadata (blob_value BLOB, text_value TEXT, num INTEGER, empty TEXT); ' +
+            "INSERT INTO demo_cell_metadata VALUES (x'4141414142424242', 'A😀Bé𝄞Z', 42, NULL)"
+        );
+        const target = (column: string, rowId: number | string = 1) =>
+            ({ table: 'demo_cell_metadata', rowId, column });
+
+        assert.deepStrictEqual(
+            JSON.parse(JSON.stringify(await worker.invoke('getCellMetadata', target('blob_value')))),
+            { storageClass: 'blob', byteLength: 8 }
+        );
+        // TEXT reports its encoding as well as its BYTE length — the character
+        // count would be 6 here, and using it would truncate every multibyte
+        // cell the chunk reader then walks.
+        assert.deepStrictEqual(
+            JSON.parse(JSON.stringify(await worker.invoke('getCellMetadata', target('text_value')))),
+            {
+                storageClass: 'text',
+                byteLength: new TextEncoder().encode('A😀Bé𝄞Z').byteLength,
+                textEncoding: 'utf-8'
+            }
+        );
+        assert.deepStrictEqual(
+            JSON.parse(JSON.stringify(await worker.invoke('getCellMetadata', target('num')))),
+            { storageClass: 'integer', byteLength: 2 }
+        );
+        assert.deepStrictEqual(
+            JSON.parse(JSON.stringify(await worker.invoke('getCellMetadata', target('empty')))),
+            { storageClass: 'null', byteLength: 0 }
+        );
+
+        // The failure paths must SAY something, not answer a default.
+        await assert.rejects(
+            worker.invoke('getCellMetadata', target('blob_value', 987654)),
+            /no longer exists/
+        );
+        await assert.rejects(
+            worker.invoke('getCellMetadata', { table: 'demo_cell_metadata', rowId: 1, column: '' }),
+            /column must be a non-empty string/
+        );
+        await assert.rejects(
+            worker.invoke('getCellMetadata', { rowId: 1, column: 'blob_value' }),
+            /table must be a non-empty string/
+        );
+    });
+
+    it('keeps ping, refreshFile and fireEditEvent honest about being no-ops', async () => {
+        // The three methods the dispatch table exposes that nothing else in
+        // this suite touched. ping is a liveness probe the host uses; the other
+        // two exist so the VS Code contract has a callee on this engine and are
+        // DELIBERATELY inert (the desktop answers both in desktop-host.js).
+        // Pinned so "inert" cannot quietly become "reports success for work it
+        // did not do" — or start mutating the database.
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_inert (v TEXT); INSERT INTO demo_inert VALUES ('kept')"
+        );
+
+        assert.strictEqual(await worker.invoke('ping'), true);
+
+        assert.strictEqual(await worker.invoke('refreshFile'), undefined);
+        assert.strictEqual(await worker.invoke('fireEditEvent', { label: 'x' }), undefined);
+        // A hostile or absent argument is ignored rather than thrown: an inert
+        // method must not become a crash surface.
+        assert.strictEqual(await worker.invoke('fireEditEvent', null), undefined);
+        assert.strictEqual(await worker.invoke('fireEditEvent'), undefined);
+
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT v FROM demo_inert WHERE rowid = 1'),
+            'kept'
+        );
+        assert.strictEqual(await worker.invoke('ping'), true);
+    });
+
     it('expires demo cell read sessions and releases their savepoint', async () => {
         const worker = await createWorkerHarness({
             cellReadSessionIdleTimeoutMs: 20,

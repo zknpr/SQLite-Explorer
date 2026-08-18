@@ -5,6 +5,7 @@ import assert from 'node:assert';
 
 const stateModulePath = '../../core/ui/modules/state.js';
 const gridRenderModulePath = '../../core/ui/modules/grid-render.js';
+const gridActionsModulePath = '../../core/ui/modules/grid-actions.js';
 
 class FakeNode {
     readonly tagName: string;
@@ -283,5 +284,118 @@ describe('grid header rendering', () => {
 
         highlights = findAllByClass(elements.get('gridContainer')!, 'cell-highlight');
         assert.deepStrictEqual(highlights.map(node => node.textContent), ['BLOB']);
+    });
+    it('resizes the column under the cursor even when a column is pinned', async () => {
+        // G-2. `onColumnResize` used to select the body cells it widens with
+        // `td:nth-child(colIdx + 2)` — an ORIGINAL column index used as a DOM
+        // POSITION. `getOrderedColumnIndices()` renders pinned columns FIRST,
+        // so with anything pinned the drag preview widened the wrong column's
+        // cells; `stopColumnResize`'s re-render corrected it on mouseup, which
+        // is why it never looked like a bug worth chasing.
+        //
+        // Two halves, and the test needs both to be honest: the RENDERER must
+        // actually reorder (otherwise the fix is guarding nothing), and the
+        // RESIZER must address cells by the identity the renderer stamps.
+        const { state } = await import(stateModulePath);
+        const { renderDataGrid } = await import(gridRenderModulePath);
+        const { startColumnResize, onColumnResize } = await import(gridActionsModulePath);
+
+        const elements = new Map<string, FakeNode>([
+            ['gridContainer', new FakeNode('div')],
+            ['pageIndicator', new FakeNode('span')],
+            ['btnFirst', new FakeNode('button')],
+            ['btnPrev', new FakeNode('button')],
+            ['btnNext', new FakeNode('button')],
+            ['btnLast', new FakeNode('button')]
+        ]);
+        const selectorsAsked: string[] = [];
+        let queryAll: (selector: string) => FakeNode[] = () => [];
+        (globalThis as any).document = {
+            body: new FakeNode('body'),
+            createElement(tagName: string) { return new FakeNode(tagName); },
+            createDocumentFragment() { return new FakeNode('#fragment'); },
+            createTextNode(text: string) {
+                const node = new FakeNode('#text');
+                node.textContent = text;
+                return node;
+            },
+            getElementById(id: string) { return elements.get(id) ?? null; },
+            querySelectorAll(selector: string) {
+                selectorsAsked.push(selector);
+                return queryAll(selector);
+            },
+            querySelector(selector: string) {
+                selectorsAsked.push(selector);
+                return queryAll(selector)[0] ?? null;
+            },
+            addEventListener() {},
+            removeEventListener() {}
+        };
+
+        state.selectedTableType = 'table';
+        state.tableColumns = [
+            { name: 'a', type: 'TEXT', isPrimaryKey: false },
+            { name: 'b', type: 'TEXT', isPrimaryKey: false },
+            { name: 'c', type: 'TEXT', isPrimaryKey: false }
+        ];
+        state.gridData = [['a0', 'b0', 'c0'], ['a1', 'b1', 'c1']];
+        state.totalPageCount = 1;
+        state.currentPageIndex = 0;
+        state.pinnedColumns.add('c');
+
+        renderDataGrid();
+
+        // HALF ONE: the renderer really does put the pinned column first, so a
+        // position-derived selector really is wrong here. `c` is original
+        // index 2 and is rendered at display position 0.
+        const dataRows = findAllByClass(elements.get('gridContainer')!, 'data-row');
+        assert.ok(dataRows.length >= 1);
+        const bodyCells = dataRows[0].children.filter(child => child.tagName === 'TD');
+        assert.deepStrictEqual(
+            bodyCells.map(cell => cell.dataset.colidx),
+            [undefined, 2, 0, 1],
+            'row-number cell, then the pinned column, then the rest'
+        );
+
+        // HALF TWO: resizing `b` (original index 1, display position 2) must
+        // address the cells carrying colidx 1 — never `nth-child(3)`, which is
+        // where `b` happens to sit, nor `nth-child(1 + 2)` computed from the
+        // original index, which is where `a` sits.
+        const targets = bodyCells.filter(cell => cell.dataset.colidx === 1);
+        queryAll = (selector: string) => (
+            selector.includes('data-colidx="1"') ? targets : []
+        );
+        selectorsAsked.length = 0;
+
+        const handle = new FakeNode('div');
+        (handle as any).classList = { add() {}, remove() {} };
+        // The renderer has already measured `b`; a drag moves from THAT width.
+        const startWidth = state.columnWidths.b ?? 120;
+        startColumnResize(
+            { stopPropagation() {}, clientX: 100, target: handle } as never,
+            'b'
+        );
+        onColumnResize({ clientX: 160 } as never);
+
+        assert.strictEqual(state.columnWidths.b, startWidth + 60);
+        assert.ok(
+            selectorsAsked.some(selector => selector === '.data-row td[data-colidx="1"]'),
+            `body cells were addressed by position, not identity: ${JSON.stringify(selectorsAsked)}`
+        );
+        assert.ok(
+            !selectorsAsked.some(selector => selector.includes('nth-child')),
+            `a positional selector survived: ${JSON.stringify(selectorsAsked)}`
+        );
+        for (const cell of targets) {
+            assert.strictEqual(cell.style.width, `${startWidth + 60}px`);
+            assert.strictEqual(cell.style.minWidth, `${startWidth + 60}px`);
+            assert.strictEqual(cell.style.maxWidth, `${startWidth + 60}px`);
+        }
+
+        // The clamp is the only other rule this handler has.
+        onColumnResize({ clientX: -1000 } as never);
+        assert.strictEqual(state.columnWidths.b, 30);
+
+        state.resizingColumn = null;
     });
 });

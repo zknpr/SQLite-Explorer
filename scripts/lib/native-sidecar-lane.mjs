@@ -34,7 +34,7 @@ import {
 import { buildDesktopNativeWorkerSource } from '../build.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const BUNDLE_PATH = path.join(REPO_ROOT, 'desktop', 'native-worker-desktop.js');
+export const BUNDLE_PATH = path.join(REPO_ROOT, 'desktop', 'native-worker-desktop.js');
 
 const FIXTURE_BLOB = [0x00, 0x01, 0x7f, 0x80, 0xff];
 const INT64_MAX = 9223372036854775807n;
@@ -57,8 +57,12 @@ function createFixture(dbPath) {
 /**
  * Spawn one sidecar session and return a sequential RPC client over it.
  * Replies are matched by messageId; stderr is collected for the caller.
+ *
+ * Exported so the per-method sweep (native-method-sweep.mjs) drives the same
+ * real binary through the same real pipes rather than reimplementing — and so
+ * a change to the spawn contract cannot silently apply to only one of them.
  */
-function startSidecar(binary, dbPath, mode) {
+export function startSidecar(binary, dbPath, mode) {
     const child = spawn(binary, ['run', BUNDLE_PATH, dbPath, mode], {
         stdio: ['pipe', 'pipe', 'pipe']
     });

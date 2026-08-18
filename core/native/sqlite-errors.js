@@ -100,6 +100,36 @@ export function hasOnlyCanonicalText(message, errno) {
 /** Statement leading keywords whose table positions are safe to probe. */
 const PROBEABLE_LEADING_KEYWORDS = new Set(['SELECT', 'INSERT', 'REPLACE', 'UPDATE', 'DELETE', 'VALUES']);
 
+/**
+ * `EXPLAIN` / `EXPLAIN QUERY PLAN` is a compile-time wrapper around an ordinary
+ * statement, and it is how the view editor asks SQLite whether a definition
+ * compiles at all (`compileSingleStatement('EXPLAIN SELECT * FROM …')` in
+ * createView / editView / validateViewDefinition / previewViewDefinition).
+ *
+ * Without this skip the wrapper made the operand unreadable to the probe, so on
+ * the native engine EVERY view-editor failure — including the everyday typo —
+ * came back as the nonspecific "SQL logic error (…the native engine cannot
+ * report SQLite's detailed message)" while the identical body reported "no such
+ * table: x" through runQuery. Skipping the prefix is safe in both directions:
+ * `EXPLAIN <stmt>` fails at compile for exactly the reasons `<stmt>` does, and
+ * the guards below still see the operand (`EXPLAIN CREATE TABLE t` still
+ * returns null, because CREATE is not probeable).
+ *
+ * @param {Array<{kind: string, value: string}>} tokens
+ * @returns {number} index of the first token of the wrapped statement
+ */
+function skipExplainPrefix(tokens) {
+    const words = [];
+    for (let index = 0; index < tokens.length && words.length < 3; index += 1) {
+        if (tokens[index].kind === 'word') words.push({ index, value: tokens[index].value.toUpperCase() });
+    }
+    if (words[0]?.value !== 'EXPLAIN') return 0;
+    // Only the complete `QUERY PLAN` pair is a prefix; a lone `QUERY` after
+    // EXPLAIN is not valid grammar, so never guess past one word.
+    if (words[1]?.value === 'QUERY' && words[2]?.value === 'PLAN') return words[2].index + 1;
+    return words[0].index + 1;
+}
+
 /** Keywords after which the next bare word names a table. */
 const TABLE_POSITION_KEYWORDS = new Set(['FROM', 'JOIN', 'INTO', 'UPDATE']);
 
@@ -172,6 +202,9 @@ export function scanSqlWords(sql) {
  * Names in a table position in `sql`, or `null` when the statement is not one
  * this module is willing to reason about.
  *
+ * A leading `EXPLAIN` / `EXPLAIN QUERY PLAN` is skipped first (see
+ * `skipExplainPrefix`) and the wrapped statement is what the rules below judge.
+ *
  * Returns null — never a guess — for:
  *   - DDL (`CREATE TABLE t` names a table that SHOULD NOT exist yet, so a
  *     "no such table" claim there would be exactly backwards);
@@ -181,7 +214,9 @@ export function scanSqlWords(sql) {
  *     (`pragma_table_info(...)`, `json_each(...)`) or a keyword.
  */
 export function extractTableReferences(sql) {
-    const tokens = scanSqlWords(sql);
+    const allTokens = scanSqlWords(sql);
+    // The EXPLAIN wrapper is not part of the statement being reasoned about.
+    const tokens = allTokens.slice(skipExplainPrefix(allTokens));
     const first = tokens.find(token => token.kind === 'word');
     if (!first || !PROBEABLE_LEADING_KEYWORDS.has(first.value.toUpperCase())) return null;
     if (tokens.some(token => token.kind === 'word' && token.value.toUpperCase() === 'WITH')) return null;

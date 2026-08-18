@@ -108,6 +108,38 @@ describe('table-reference extraction', () => {
         assert.deepEqual(extractTableReferences("SELECT * FROM pragma_table_info('t')"), []);
         assert.deepEqual(extractTableReferences('SELECT * FROM json_each(?)'), []);
     });
+
+    it('reads through an EXPLAIN wrapper, because that is how views are validated', () => {
+        // G-1. createView / editView / validateViewDefinition /
+        // previewViewDefinition all compile `EXPLAIN SELECT * FROM (body)
+        // LIMIT 0` — so before this, EVERY view-editor failure on the native
+        // engine lost its message ("SQL logic error … cannot report SQLite's
+        // detailed message") while the identical body named the table through
+        // runQuery.
+        assert.deepEqual(extractTableReferences('EXPLAIN SELECT * FROM users'), ['users']);
+        assert.deepEqual(extractTableReferences('explain select * from users'), ['users']);
+        assert.deepEqual(
+            extractTableReferences('EXPLAIN QUERY PLAN SELECT * FROM users'),
+            ['users']
+        );
+        // The exact statement the view editor compiles.
+        assert.deepEqual(
+            extractTableReferences('EXPLAIN SELECT * FROM (SELECT * FROM absent\n) LIMIT 0'),
+            ['absent']
+        );
+        // Every guard still applies to the WRAPPED statement.
+        assert.equal(extractTableReferences('EXPLAIN CREATE TABLE t (a)'), null);
+        assert.equal(
+            extractTableReferences('EXPLAIN WITH t AS (SELECT 1) SELECT * FROM t'),
+            null
+        );
+        // `explain` is only a prefix as the FIRST word: a column of that name
+        // must not shift the statement's reading.
+        assert.deepEqual(extractTableReferences('SELECT explain FROM users'), ['users']);
+        // A lone `QUERY` after EXPLAIN is not the `QUERY PLAN` prefix, so only
+        // one word is skipped and the operand is judged as it stands.
+        assert.equal(extractTableReferences('EXPLAIN QUERY'), null);
+    });
 });
 
 describe('missing-table proof', () => {

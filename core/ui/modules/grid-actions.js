@@ -557,18 +557,28 @@ export function onColumnResize(event) {
         headerCell.style.maxWidth = `${newWidth}px`;
     }
 
-    // Need to account for pinned columns offsets potentially changing if we resize a pinned column
-    const dataCells = document.querySelectorAll(`.data-row td:nth-child(${colIdx + 2})`); // +2 because nth-child is 1-based and we have row number column
+    // Select the body cells by the column IDENTITY the renderer stamps on them,
+    // not by their position in the row.
+    //
+    // This used to be `td:nth-child(${colIdx + 2})` — an ORIGINAL column index
+    // used as a DOM POSITION. Those agree only while nothing is pinned:
+    // `getOrderedColumnIndices()` renders pinned columns FIRST, so with any
+    // column pinned the drag preview widened a different column's cells than
+    // the one under the cursor (the header was always right, because it is
+    // selected by name). `stopColumnResize`'s full re-render then silently
+    // corrected it on mouseup, which is exactly why it never looked like a bug
+    // worth chasing. `data-colidx` is the original index the renderer already
+    // writes on every data cell, so this is correct in both orders and is no
+    // longer coupled to how many leading columns the row has.
+    const dataCells = document.querySelectorAll(`.data-row td[data-colidx="${colIdx}"]`);
     for (const cell of dataCells) {
         cell.style.width = `${newWidth}px`;
         cell.style.minWidth = `${newWidth}px`;
         cell.style.maxWidth = `${newWidth}px`;
     }
-
-    // If we are resizing a pinned column, subsequent pinned columns' offsets might change.
-    // We defer the full re-render to stopColumnResize to avoid performance degradation during drag.
-    if (state.pinnedColumns.has(state.resizingColumn)) {
-    }
+    // Pinned-column left offsets shift when a pinned column's width changes;
+    // recomputing them mid-drag would re-render the whole grid on every
+    // mousemove, so `stopColumnResize` does one re-render on release.
 }
 
 export function stopColumnResize() {

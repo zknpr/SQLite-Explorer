@@ -31,6 +31,7 @@ import initSqlJs from '../vendor/sql.js/sql-wasm.js';
 import { runFixtures, normalize } from './lib/native-lane-fixtures.mjs';
 import { runFrameLane } from './lib/native-frame-lane.mjs';
 import { runSidecarLane } from './lib/native-sidecar-lane.mjs';
+import { runMethodSweep } from './lib/native-method-sweep.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -132,6 +133,7 @@ const scratch = mkdtempSync(path.join(tmpdir(), 'native-lane-'));
 let failures = 0;
 let frameChecks = 0;
 let sidecarChecks = 0;
+let sweepChecks = 0;
 const note = (ok, label, detail) => {
     if (!ok) failures += 1;
     console.log(`${ok ? '  ok  ' : ' FAIL '} ${label}${detail ? ` -- ${detail}` : ''}`);
@@ -190,11 +192,14 @@ try {
         console.log('\n-- sidecar end-to-end (committed bundle, real binary, real pipes) --');
         sidecarChecks = await runSidecarLane({ binary, scratch, note });
 
+        console.log('\n-- per-method sweep (every dispatch-table method, happy + failure) --');
+        sweepChecks = await runMethodSweep({ binary, scratch, note });
+
         console.log(
             `\n${failures === 0 ? 'native lane PASSED' : `native lane FAILED (${failures} check(s))`}` +
             ` -- ${native.fixtures.length} shared fixtures, ${native.errnoChecks.length} errno checks, ` +
             `${native.forkOnly.length} fork-only checks, ${frameChecks} transport checks, ` +
-            `${sidecarChecks} sidecar checks`
+            `${sidecarChecks} sidecar checks, ${sweepChecks} method-sweep checks`
         );
         if (failures > 0) process.exitCode = 1;
     }

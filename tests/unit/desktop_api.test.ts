@@ -297,6 +297,37 @@ test('sendRpcRequest never hands the JSON lane a trailing hole', async () => {
   assert.equal(acrossTheNativeWire('updateCellBatch', batch.args)[2], null);
 });
 
+test('the truncation keys on `undefined` ONLY — an explicit trailing null survives', async () => {
+  // The other half of the F-E fix, and the one that would have been a silent
+  // regression: several worker parameters mean something as `null` (a
+  // null-valued cell, an explicitly cleared filter, `exportTable`'s
+  // dbOptions/tableStore). If the truncation had matched "nullish" instead of
+  // `undefined`, it would have deleted arguments the caller meant, in the same
+  // invisible way the original bug added one.
+  const host = fakeHost();
+  initDesktopApi(host as never);
+
+  // A trailing null is a VALUE. It must reach the worker, and reach it as null.
+  await backendApi.updateCell('users', 1, 'name', null, null);
+  const update = host.calls.at(-1)!;
+  assert.equal(update.method, 'updateCell');
+  const wire = acrossTheNativeWire(update.method, update.args);
+  assert.equal(wire[3], null, 'the null cell value must survive the JSON lane');
+  assert.equal(wire[4], null, 'the null originalValue must not be truncated away');
+
+  // Mixed tail: only the `undefined`s go, and the null before them stays put —
+  // so the argument INDEXES of everything to its left are preserved.
+  await backendApi.exportTable(
+    { table: 'users' }, ['id'], null, null, { format: 'csv' }, undefined
+  );
+  const exported = host.calls.at(-1)!;
+  assert.equal(exported.args.length, 5, 'only the trailing undefined `extras` is dropped');
+  const exportedWire = acrossTheNativeWire(exported.method, exported.args);
+  assert.equal(exportedWire[2], null);
+  assert.equal(exportedWire[3], null);
+  assert.deepEqual(exportedWire[4], { format: 'csv' });
+});
+
 test('the oversized-cell refusals name THIS app and the route that works', async () => {
   const editor = await backendApi.openCellEditor({}, 1, 'blob', {}, { sourceByteLength: 5_000_000 });
   assert.equal(editor.success, false);
