@@ -303,10 +303,76 @@ function normalizeBindParams(params) {
   });
 }
 
+/**
+ * TEXT that cannot survive being bound as a string.
+ *
+ * sql.js binds every string with `sqlite3_bind_text(..., -1, ...)` -- a
+ * NUL-TERMINATED length -- so a value containing a NUL is stored truncated at
+ * the first one, with no error: `updateCell(t, 1, c, 'a\0b')` left `'a'` on
+ * disk. The native engine binds the same value faithfully, so the two engines
+ * disagreed about what the user's data even is. SQLite itself has no problem
+ * with the value (its strings carry an explicit length), only the bind path
+ * does, so the fix is to route it around that path rather than refuse it.
+ *
+ * @param {*} value
+ * @returns {boolean}
+ */
+function requiresTextBlobBinding(value) {
+  return typeof value === 'string' && value.includes('\0');
+}
+
+/**
+ * The SQL fragment for a bound VALUE. Paired with `bindableValue()`: both test
+ * the same predicates against the same value, and a value position must apply
+ * BOTH or neither. (Row-identity predicates deliberately do not: their
+ * placeholders come from `buildRecordIdentityPredicate`.)
+ */
 function bindPlaceholder(value) {
-  return typeof value === 'bigint' && !Number.isSafeInteger(Number(value))
-    ? 'CAST(? AS INTEGER)'
-    : '?';
+  if (typeof value === 'bigint' && !Number.isSafeInteger(Number(value))) {
+    return 'CAST(? AS INTEGER)';
+  }
+  // `bindableValue` hands a NUL-bearing string over as a BLOB of the database's
+  // own text encoding -- the blob bind carries an explicit byte count, so
+  // nothing is lost. This CAST is what puts the TEXT storage class back.
+  if (requiresTextBlobBinding(value)) return 'CAST(? AS TEXT)';
+  return '?';
+}
+
+/**
+ * Encode `text` into the database's own text encoding, so that
+ * `CAST(<blob> AS TEXT)` reproduces it byte for byte. `CAST` reads a blob as
+ * text in the DATABASE encoding, not UTF-8, so a UTF-16 database needs UTF-16
+ * bytes or the value comes back as mojibake.
+ *
+ * @param {string} text
+ * @returns {Uint8Array}
+ */
+function encodeTextForDatabase(text) {
+  const encoding = normalizeCellTextEncoding(
+    db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]
+  );
+  if (encoding === 'utf-8') return new TextEncoder().encode(text);
+  // JavaScript strings ARE UTF-16 code units, so this is a direct byte
+  // serialisation -- lone surrogates included, which matches what SQLite
+  // stores for them.
+  const littleEndian = encoding === 'utf-16le';
+  const bytes = new Uint8Array(text.length * 2);
+  for (let index = 0; index < text.length; index += 1) {
+    const unit = text.charCodeAt(index);
+    bytes[index * 2] = littleEndian ? unit & 0xff : unit >>> 8;
+    bytes[index * 2 + 1] = littleEndian ? unit >>> 8 : unit & 0xff;
+  }
+  return bytes;
+}
+
+/**
+ * The bound form of a VALUE. Paired with `bindPlaceholder()` -- see there.
+ *
+ * @param {*} value
+ * @returns {*}
+ */
+function bindableValue(value) {
+  return requiresTextBlobBinding(value) ? encodeTextForDatabase(value) : value;
 }
 
 function compileSingleStatement(sql) {
@@ -782,6 +848,38 @@ async function initializeDatabase(filename, config) {
       db = new SQL.Database();
     }
   }
+  // Referential integrity must not depend on which engine happened to open the
+  // file. SQLite's own default is OFF (sql.js inherits it) while the fork the
+  // native sidecar is built on defaults it ON, so the SAME parent delete was
+  // refused on native and silently orphaned children on WASM. Pinned ON here,
+  // explicitly, on both: a refused delete is visible and recoverable, orphaned
+  // rows are neither. Users who need the permissive behaviour still have
+  // setPragma('foreign_keys', false) and the Configuration modal's control.
+  //
+  // Safe to force here because worker.js only ever drops columns through
+  // `ALTER TABLE ... DROP COLUMN`; it never runs the rename-and-rebuild plan in
+  // core/column-drop.ts (undoing a column drop is unsupported here -- see
+  // undoModification), and that plan is the one that needs foreign_keys OFF to
+  // keep SQLite from rewriting other tables' REFERENCES clauses. The extension's
+  // own engines run it and already bracket it themselves.
+  //
+  // Set BEFORE query_only: this is a connection flag, not a write, but ordering
+  // it first keeps it independent of how each engine enforces read-only.
+  db.run('PRAGMA foreign_keys = ON');
+
+  if (!readOnlyMode) {
+    // A file the process cannot write (mode 0444, a read-only mount, a
+    // read-only medium) opens FINE and only refuses at the first edit -- so the
+    // capability report said `isReadOnly: false` and the UI offered edits that
+    // were guaranteed to fail. Ask SQLite directly instead of guessing; the
+    // probe is rolled back and leaves the file byte-identical.
+    const refusal = probeWriteRefusal();
+    if (refusal) {
+      readOnlyMode = true;
+      readOnlyReason = refusal;
+    }
+  }
+
   if (readOnlyMode) {
     // Defense in depth for every current and future RPC path. Public mutators
     // still fail early with operation-specific errors, while SQLite itself
@@ -796,6 +894,79 @@ async function initializeDatabase(filename, config) {
     storage: storageMode,
     ...(readOnlyReason ? { readOnlyReason } : {})
   };
+}
+
+/** SQLite primary result code for "attempt to write a readonly database". */
+const SQLITE_READONLY = 8;
+
+/**
+ * Classify a failed write attempt.
+ *
+ * Only a genuine read-only refusal counts. A busy/locked database (another
+ * writer holds the lock right now) is INCONCLUSIVE, not read-only: reporting it
+ * as read-only would strand an editable file in a read-only session for the
+ * whole run. Anything else is left alone deliberately -- the connection stays
+ * writable and the real error surfaces, unmodified, at the first real write.
+ *
+ * The fork reports `sqlite3_errstr(errno)`, which for code 8 is exactly
+ * "attempt to write a readonly database"; sql.js reports `sqlite3_errmsg`,
+ * which says the same. `errno` is checked first because it is the only
+ * classifier the fork exposes that is not prose.
+ *
+ * @param {unknown} error
+ * @returns {string|null} the reason to report, or null when inconclusive
+ */
+function classifyWriteRefusal(error) {
+  const isReadOnly = error?.errno === SQLITE_READONLY
+    || /read[\s-]?only/i.test(getErrorMessage(error));
+  if (!isReadOnly) return null;
+  return 'This database cannot be written by this process, so it is open ' +
+    'read-only (SQLite: attempt to write a readonly database).';
+}
+
+/**
+ * Ask SQLite whether this connection can actually write, without changing the
+ * database.
+ *
+ * A file the process cannot write (mode 0444, a read-only mount, a read-only
+ * medium) opens perfectly happily -- SQLite falls back to a read-only
+ * connection silently -- and only refuses at the first write, so the open used
+ * to report `isReadOnly: false` and the UI offered edits that could not land.
+ *
+ * `BEGIN IMMEDIATE` is NOT enough on its own: modern SQLite defers the RESERVED
+ * lock, so it succeeds on a read-only connection (verified against the shipped
+ * binary). The probe therefore attempts a real write -- setting `user_version`
+ * to the value it already holds -- inside a transaction that is ALWAYS rolled
+ * back. A rolled-back transaction never reaches the database file: SQLite
+ * stages the page in the rollback journal and discards it, so the only trace is
+ * a journal file that exists for the duration of the probe.
+ *
+ * @returns {string|null} the reason to report, or null when writes are possible
+ */
+function probeWriteRefusal() {
+  // Read the current value OUTSIDE the transaction: writing it back unchanged
+  // is what makes this a no-op even if a rollback were ever skipped. It is
+  // SQLite's own 32-bit signed integer, never caller input, so interpolating it
+  // is not an injection site (`| 0` pins that).
+  const currentVersion = Number(db.exec('PRAGMA user_version')[0]?.values?.[0]?.[0]) | 0;
+  try {
+    db.run('BEGIN');
+  } catch (error) {
+    // A BEGIN that fails read-only is decisive too; anything else is not, and
+    // leaves no transaction to unwind.
+    return classifyWriteRefusal(error);
+  }
+  let refusal = null;
+  try {
+    db.run(`PRAGMA user_version = ${currentVersion}`);
+  } catch (error) {
+    refusal = classifyWriteRefusal(error);
+  } finally {
+    // A statement that failed INSIDE the transaction leaves it open, so this
+    // runs on both paths.
+    db.run('ROLLBACK');
+  }
+  return refusal;
 }
 
 /**
@@ -1002,6 +1173,20 @@ async function runConsole(sql, options = {}, cancellationFlag) {
     throw new Error('Ad hoc SQL execution is unavailable because the database is read-only');
   }
 
+  // A NUL byte ends the SQL string BOTH engines hand to sqlite3_prepare_v2:
+  // sql.js copies the script onto the WASM heap as a C string, and the fork's
+  // binding does the same. Everything from the first NUL onwards is silently
+  // never compiled -- WASM ran the prefix and dropped the rest without a word,
+  // native reported a confusing leftover-SQL error. Refuse up front, on both
+  // engines, with the actual reason. This is a PRE-EXECUTION guard: nothing has
+  // been applied, so it throws rather than resolving (see the header).
+  if (typeof sql === 'string' && sql.includes('\0')) {
+    throw new Error(
+      'SQL contains a NUL byte; SQLite stops compiling at the first NUL, so the ' +
+      'rest of the script would be silently skipped'
+    );
+  }
+
   const maxRows = clampConsoleMaxRows(options.maxRows);
   const maxStatements = clampConsoleMaxStatements(options.maxStatements);
   const startedAt = Date.now();
@@ -1045,20 +1230,44 @@ async function runConsole(sql, options = {}, cancellationFlag) {
         if (step.done) break;
         const statement = step.value;
         try {
-          const headers = statement.getColumnNames();
+          // Zero columns BEFORE the first step is authoritative on sql.js --
+          // sqlite3_column_count is known at prepare time, so it really does
+          // mean DML/DDL. It is NOT authoritative on the native shim, whose
+          // binding exposes no column metadata at all: it recovers the names by
+          // compiling the statement as a TEMP VIEW, which a `PRAGMA ...` or a
+          // `... RETURNING` clause can never be, so those reported zero columns
+          // and this loop threw their rows away without a word. Stepping once
+          // and asking again is the answer that is right on both engines: a
+          // step that produced a row proves the statement HAS columns, and the
+          // DML branch below would have stepped anyway.
+          let headers = statement.getColumnNames();
+          let probed = false;
+          let hasRow = false;
           if (headers.length === 0) {
-            // DML/DDL: run to completion, no result set.
-            while (statement.step()) { /* side effects only */ }
+            hasRow = statement.step();
+            probed = true;
+            if (hasRow) headers = statement.getColumnNames();
+          }
+          if (headers.length === 0) {
+            // DML/DDL: run to completion, no result set. Guarded on the probe
+            // above: sqlite3_step on a statement that already returned
+            // SQLITE_DONE auto-resets and RE-RUNS it, so a second step here
+            // would apply the statement twice.
+            if (!probed || hasRow) {
+              while (statement.step()) { /* side effects only */ }
+            }
           } else {
             const rows = [];
             let truncated = false;
-            while (statement.step()) {
+            if (!probed) hasRow = statement.step();
+            while (hasRow) {
               // Keep stepping past the cap without collecting: a capped
               // statement may still be mutating rows (e.g. UPDATE ...
               // RETURNING), so total_changes must reflect the full run,
               // not just the collected prefix.
               if (rows.length < maxRows) rows.push(statement.get());
               else truncated = true;
+              hasRow = statement.step();
             }
             collected.push({ headers, rows, truncated });
           }
@@ -1126,23 +1335,28 @@ async function runConsole(sql, options = {}, cancellationFlag) {
         return collected;
       }
 
-      // A SQL console must never silently drop part of a script. Unreachable
-      // with the current vendored fork -- sqlite3_prepare_v2 consumes leading
-      // whitespace/comments/empty statements on its own, verified empirically
-      // against several probe scripts (see the regression test in
-      // web_demo_worker.test.ts) -- so this is insurance against a future
-      // fork's iterator behaving differently, not a path any current input
-      // reaches. This guards NATURAL COMPLETION only -- the capped path above
-      // returns before it, because leftover SQL is that path's whole point.
-      // No "statement N:" prefix here: the handler below adds it uniformly,
-      // reusing this same statementIndex, which already sits one past the last
-      // successfully-processed statement (it's incremented before *every*
-      // next() call, including the final done:true one) -- exactly this
-      // hypothetical statement's correct 1-based ordinal.
-      const remaining = iterator.getRemainingSQL?.();
-      if (remaining && remaining.trim() !== '') {
-        throw new Error(`unexecuted SQL remained after iteration: ${remaining.trim().slice(0, 80)}`);
-      }
+      // NO leftover-SQL check on natural completion. There used to be one here
+      // and it was unsound on both engines:
+      //
+      //   - sql.js's StatementIterator FREES its heap copy of the script inside
+      //     the very next() call that reports `done`, but leaves its tail
+      //     pointer dangling. getRemainingSQL() afterwards is a use-after-free:
+      //     it decoded whatever byte the allocator had just written there, and
+      //     a fresh worker running `SELECT 1` (no trailing `;`) reliably read
+      //     back a stray 0x10 -- so the guard fired, and the failure path below
+      //     discarded a correct, already-collected result set and reported a
+      //     fabricated error instead (capstone E-1).
+      //   - the native shim's tail is a plain string slice, but its cursor does
+      //     not advance past trailing trivia, so `SELECT 1; -- note` left
+      //     "-- note" behind and tripped the guard on a perfectly complete run.
+      //
+      // Nor was it ever meaningful: BOTH iterators report `done` only when
+      // sqlite3_prepare_v2 found no further statement in the tail, so by
+      // construction there is no unexecuted statement left to warn about. The
+      // one case that really did drop SQL -- an embedded NUL, which ends the
+      // string prepare() sees -- is now refused up front, before anything runs,
+      // on both engines. The CAPPED path above still inspects the tail, and is
+      // safe to: it holds a live iterator.
       return collected;
     }, cancellationFlag);
   } catch (error) {
@@ -2454,12 +2668,21 @@ async function updateCell(
         `AND length(CAST(${escapedColumn} AS BLOB)) > ?)`
       : ''),
     normalizeBindParams(
-      enforcePriorPolicy ? [value, rowId, editLimitBytes] : [value, rowId]
+      enforcePriorPolicy
+        ? [bindableValue(value), rowId, editLimitBytes]
+        : [bindableValue(value), rowId]
     )
   );
-  if (enforcePriorPolicy) {
-    const changes = db.exec('SELECT changes()')[0]?.values?.[0]?.[0];
-    if (changes !== 1) {
+  // Unconditional, not just under the oversized-cell policy: `WHERE rowid = ?`
+  // matching nothing is a NO-OP that SQLite reports as success, so an edit
+  // against a row another window (or a console script) deleted underneath
+  // used to return the rowId as if it had been applied and the grid rendered
+  // it as saved. updateCellBatch has always refused that; the single-cell
+  // path the grid actually uses did not (capstone E-3). The two now agree,
+  // message included.
+  const changes = db.exec('SELECT changes()')[0]?.values?.[0]?.[0];
+  if (changes !== 1) {
+    if (enforcePriorPolicy) {
       const metadata = await getCellMetadata({ table, rowId, column });
       if (
         (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
@@ -2473,8 +2696,8 @@ async function updateCell(
           editLimitBytes
         );
       }
-      throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
     }
+    throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
   }
   return validateRowId(rowId);
 }
@@ -2506,7 +2729,7 @@ async function replaceOversizedCell(
       `WHERE ${predicate.sql} AND typeof(${escapedColumn}) = ? ` +
       `AND length(CAST(${escapedColumn} AS BLOB)) = ?`,
       normalizeBindParams([
-        value,
+        bindableValue(value),
         ...predicate.params,
         expected.storageClass,
         expected.byteLength
@@ -2559,6 +2782,8 @@ async function insertRow(table, data, maxEditValueBytes, historyReplayToken) {
 
   const columns = Object.keys(data);
   const values = Object.values(data);
+  // Paired with the bindPlaceholder() call below; see bindPlaceholder().
+  const boundValues = values.map(bindableValue);
   const identity = await resolveTableIdentity(table);
 
   let insertSql;
@@ -2579,7 +2804,7 @@ async function insertRow(table, data, maxEditValueBytes, historyReplayToken) {
       const statement = db.prepare(
         `${insertSql} RETURNING ` +
         buildByteFaithfulPrimaryKeyProjection(identity),
-        normalizeBindParams(values)
+        normalizeBindParams(boundValues)
       );
       let row;
       try {
@@ -2612,7 +2837,7 @@ async function insertRow(table, data, maxEditValueBytes, historyReplayToken) {
     }
   }
 
-  db.run(insertSql, normalizeBindParams(values));
+  db.run(insertSql, normalizeBindParams(boundValues));
 
   // Get last inserted row ID
   const result = db.exec('SELECT last_insert_rowid()');
@@ -3345,7 +3570,7 @@ async function updateCellBatch(
         db.run(
           `UPDATE ${escapeIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
           normalizeBindParams([
-            ...preparedUpdates.map(update => update.storedValue),
+            ...preparedUpdates.map(update => bindableValue(update.storedValue)),
             ...oldPredicate.params
           ])
         );
@@ -3461,10 +3686,17 @@ async function updateCellBatch(
     });
     for (const update of processedUpdates) {
       const escapedColumn = escapeIdentifier(update.column);
-      const sql = update.operation === 'json_patch'
+      const isJsonPatch = update.operation === 'json_patch';
+      const sql = isJsonPatch
         ? `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`
         : `UPDATE ${escapedTable} SET ${escapedColumn} = ${bindPlaceholder(update.value)} WHERE rowid = ?`;
-      db.run(sql, normalizeBindParams([update.value, update.rowId]));
+      // Only the plain SET branch carries a bindPlaceholder(); the json_patch
+      // branch binds the patch as an argument to json_patch(), where a blob
+      // would be read as a blob rather than as JSON text.
+      db.run(sql, normalizeBindParams([
+        isJsonPatch ? update.value : bindableValue(update.value),
+        update.rowId
+      ]));
     }
     runSingleStatement(`RELEASE ${savepointName}`);
     return results;

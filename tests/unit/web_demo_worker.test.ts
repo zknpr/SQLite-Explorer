@@ -1002,7 +1002,15 @@ describe('web demo view worker', () => {
             onImportScripts: url => importedUrls.push(url),
             initSqlJs: async config => {
                 wasmUrl = config.locateFile('sql-wasm.wasm');
-                return { Database: class {} };
+                // initializeDatabase configures the connection as soon as it is
+                // open (PRAGMA foreign_keys, then the rolled-back write probe),
+                // so the loader stub needs a no-op run()/exec().
+                return {
+                    Database: class {
+                        run() { return this; }
+                        exec() { return []; }
+                    }
+                };
             }
         });
 
@@ -4289,5 +4297,259 @@ describe('web demo view worker', () => {
             assert.strictEqual(result.results.length, 3, `all sets for ${JSON.stringify(options)}`);
             assert.strictEqual(result.statementsSkipped, false);
         }
+    });
+});
+
+/**
+ * Regressions for the deep-QA capstone's engine findings (E-1 .. E-5, E-11,
+ * E-15). Every one of them was a SILENTLY WRONG answer -- a result set that
+ * vanished, an edit that reported success without changing a row, text that
+ * lost everything past a NUL -- so each test asserts the observable database
+ * state, not just the returned message.
+ */
+describe('web demo worker engine defects', () => {
+    it('returns the rows of a statement with no trailing semicolon (E-1)', async () => {
+        // sql.js frees the iterator's heap copy of the script inside the next()
+        // that reports `done`; the old leftover-SQL guard then read that freed
+        // pointer and threw away an already-collected result set. Which garbage
+        // byte lands there is heap-layout dependent, so each statement runs on a
+        // FRESH worker -- the shape the capstone found to fail deterministically.
+        const statements: [string, unknown[][]][] = [
+            ['SELECT 1', [[1]]],
+            ['SELECT 2 AS two', [[2]]],
+            ["SELECT 'x' AS s", [['x']]],
+            ['SELECT 1 -- trailing comment', [[1]]],
+            ['SELECT 1 /* trailing block */', [[1]]]
+        ];
+        for (const [sql, expected] of statements) {
+            const worker = await createWorkerHarness();
+            const result = await worker.invoke('runConsole', sql);
+            assert.strictEqual(result.error, undefined, `unexpected error for: ${sql}`);
+            assert.strictEqual(result.results.length, 1, `one result set for: ${sql}`);
+            assert.deepStrictEqual(
+                Array.from(result.results[0].rows, (row: unknown[]) => Array.from(row)),
+                expected,
+                `rows for: ${sql}`
+            );
+        }
+    });
+
+    it('keeps a trailing comment from tripping the leftover-SQL guard (E-1)', async () => {
+        const worker = await createWorkerHarness();
+        const result = await worker.invoke('runConsole', 'SELECT 1 AS a; -- note');
+        assert.strictEqual(result.error, undefined);
+        assert.strictEqual(result.results.length, 1);
+    });
+
+    it('refuses console SQL containing a NUL instead of running the prefix (E-23)', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runConsole', 'CREATE TABLE console_nul_guard (id INTEGER)');
+        await assert.rejects(
+            worker.invoke(
+                'runConsole',
+                'INSERT INTO console_nul_guard VALUES (1)\0; SELECT 1'
+            ),
+            (error: Error) => {
+                assert.match(error.message, /NUL/);
+                return true;
+            }
+        );
+        // Pre-execution guard: nothing ran, so nothing was applied.
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM console_nul_guard'),
+            0
+        );
+    });
+
+    it('returns the rows of a value-returning PRAGMA through the console (E-2)', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE console_pragma (id INTEGER, note TEXT)');
+
+        const info = await worker.invoke('runConsole', 'PRAGMA table_info(console_pragma)');
+        assert.strictEqual(info.error, undefined);
+        assert.strictEqual(info.results.length, 1);
+        assert.deepStrictEqual(
+            Array.from(info.results[0].rows, (row: unknown[]) => row[1]),
+            ['id', 'note']
+        );
+
+        const journal = await worker.invoke('runConsole', 'PRAGMA journal_mode');
+        assert.strictEqual(journal.results.length, 1);
+        assert.strictEqual(journal.results[0].rows.length, 1);
+    });
+
+    it('refuses a single-cell update whose row no longer exists (E-3)', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE ghost_edit (id INTEGER PRIMARY KEY, msg TEXT); " +
+            "INSERT INTO ghost_edit VALUES (1, 'here')"
+        );
+
+        // updateCellBatch has always refused this; updateCell reported success
+        // and changed nothing, and the grid's single-cell edit path is the one
+        // that calls updateCell.
+        await assert.rejects(
+            worker.invoke('updateCell', 'ghost_edit', 999999, 'msg', 'ghost'),
+            (error: Error) => {
+                assert.match(error.message, /row 999999 no longer exists/);
+                return true;
+            }
+        );
+        await assert.rejects(
+            worker.invoke(
+                'updateCellBatch',
+                'ghost_edit',
+                [{ rowId: 999999, column: 'msg', value: 'ghost' }]
+            ),
+            (error: Error) => {
+                assert.match(error.message, /row 999999 no longer exists/);
+                return true;
+            }
+        );
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM ghost_edit'), 1);
+
+        // ... and the row that DOES exist still updates, with and without the
+        // oversized-cell policy argument.
+        assert.strictEqual(
+            await worker.invoke('updateCell', 'ghost_edit', 1, 'msg', 'plain'),
+            1
+        );
+        assert.strictEqual(
+            await worker.invoke(
+                'updateCell', 'ghost_edit', 1, 'msg', 'policed', undefined, 4096
+            ),
+            1
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT msg FROM ghost_edit WHERE id = 1'),
+            'policed'
+        );
+    });
+
+    it('stores TEXT containing a NUL byte without truncating it (E-5)', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE nul_text (id INTEGER PRIMARY KEY, name TEXT); " +
+            "INSERT INTO nul_text VALUES (1, 'seed')"
+        );
+
+        await worker.invoke('updateCell', 'nul_text', 1, 'name', 'a\0b');
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT hex(CAST(name AS BLOB)) FROM nul_text WHERE id = 1'
+            ),
+            '610062'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, "SELECT typeof(name) FROM nul_text WHERE id = 1"),
+            'text'
+        );
+
+        const insertedId = await worker.invoke('insertRow', 'nul_text', { name: 'x\0y' });
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                `SELECT hex(CAST(name AS BLOB)) FROM nul_text WHERE rowid = ${Number(insertedId)}`
+            ),
+            '780079'
+        );
+
+        await worker.invoke(
+            'updateCellBatch',
+            'nul_text',
+            [{ rowId: 1, column: 'name', value: 'p\0q\0r' }]
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT hex(CAST(name AS BLOB)) FROM nul_text WHERE id = 1'
+            ),
+            '7000710072'
+        );
+    });
+
+    it('enforces foreign keys on both engines instead of orphaning children (E-15)', async () => {
+        const worker = await createWorkerHarness();
+        assert.strictEqual((await worker.invoke('getPragmas')).foreign_keys, 1);
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE fk_parent (id INTEGER PRIMARY KEY); ' +
+            'CREATE TABLE fk_child (id INTEGER PRIMARY KEY, ' +
+            'parent_id INTEGER REFERENCES fk_parent(id)); ' +
+            'INSERT INTO fk_parent VALUES (1); INSERT INTO fk_child VALUES (1, 1)'
+        );
+
+        await assert.rejects(
+            worker.invoke('deleteRows', 'fk_parent', [1]),
+            (error: Error) => {
+                assert.match(error.message, /FOREIGN KEY constraint failed/i);
+                return true;
+            }
+        );
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM fk_parent'), 1);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM fk_child WHERE parent_id = 1'),
+            1
+        );
+
+        // Still user-controllable: the permissive behaviour is one pragma away.
+        await worker.invoke('setPragma', 'foreign_keys', false);
+        assert.strictEqual((await worker.invoke('getPragmas')).foreign_keys, 0);
+    });
+
+    it('reports a database it cannot write as read-only at open (E-11)', async () => {
+        const withProbeFailure = (failure: Error) => async (config: any) => {
+            const sqlJs = await initSqlJs(config);
+            const ProbedDatabase = new Proxy(sqlJs.Database, {
+                construct(Target: any, args: any[]): object {
+                    const database = Reflect.construct(Target, args) as Record<string, any>;
+                    const originalRun = database.run.bind(database);
+                    database.run = (sql: string, ...rest: unknown[]) => {
+                        // The open-time write probe's one real write.
+                        if (typeof sql === 'string' && sql.startsWith('PRAGMA user_version =')) {
+                            throw failure;
+                        }
+                        return originalRun(sql, ...rest);
+                    };
+                    return database;
+                }
+            });
+            return { ...sqlJs, Database: ProbedDatabase };
+        };
+
+        const readOnly = await createWorkerHarness({
+            initSqlJs: withProbeFailure(Object.assign(
+                new Error('attempt to write a readonly database'),
+                { errno: 8 }
+            ))
+        });
+        const readOnlyOpen = await readOnly.invoke('initializeDatabase', 'ro.db', {});
+        assert.strictEqual(readOnlyOpen.isReadOnly, true);
+        assert.match(String(readOnlyOpen.readOnlyReason), /read-only/);
+        await assert.rejects(
+            readOnly.invoke('runQuery', 'CREATE TABLE nope (id INTEGER)'),
+            /read-only/
+        );
+
+        // A BUSY database is INCONCLUSIVE, not read-only: reporting it as
+        // read-only would strand an editable file for the whole session.
+        const busy = await createWorkerHarness({
+            initSqlJs: withProbeFailure(Object.assign(
+                new Error('database is locked'),
+                { errno: 5 }
+            ))
+        });
+        const busyOpen = await busy.invoke('initializeDatabase', 'busy.db', {});
+        assert.strictEqual(busyOpen.isReadOnly, false);
+        assert.strictEqual(busyOpen.readOnlyReason, undefined);
+
+        // And an ordinary open is unaffected.
+        const writable = await createWorkerHarness();
+        const writableOpen = await writable.invoke('initializeDatabase', 'rw.db', {});
+        assert.strictEqual(writableOpen.isReadOnly, false);
     });
 });

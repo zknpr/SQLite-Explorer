@@ -1126,6 +1126,108 @@ describe('sqljs-shim: native-only behaviour', () => {
     });
 });
 
+describe('sqljs-shim: exec preserves duplicate result columns (capstone E-4)', () => {
+    it('keeps every column of a JOIN whose result names collide', () => {
+        // `exec` used to step FIRST and ask for columns after, so the TEMP VIEW
+        // probe -- the only thing that can tell the shim a statement's TRUE
+        // arity -- never ran, and `all()`'s object rows silently collapsed the
+        // duplicate key. The result came back one column SHORT with its values
+        // shifted left: a wrong answer, with no error. Only reachable through
+        // runQuery today, which is exactly why it went unnoticed.
+        const reference = new SQL.Database();
+        const shim = createShim();
+        const setup =
+            'CREATE TABLE parent(id INTEGER PRIMARY KEY, label TEXT);' +
+            'CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER, note TEXT);' +
+            "INSERT INTO parent VALUES (1,'p1'); INSERT INTO child VALUES (7,1,'c1');";
+        const query = 'SELECT * FROM parent JOIN child ON child.parent_id = parent.id';
+        try {
+            reference.run(setup);
+            shim.run(setup);
+            const expected = reference.exec(query);
+            const actual = shim.exec(query);
+            // The disambiguation suffix is a documented divergence (sql.js reads
+            // sqlite3_column_name positionally and reports `id` twice); the
+            // ARITY and the VALUES are what has to match.
+            assert.deepStrictEqual(
+                actual[0].columns.length,
+                expected[0].columns.length
+            );
+            assert.deepStrictEqual(normalize(actual[0].values), normalize(expected[0].values));
+            assert.deepStrictEqual(actual[0].columns, ['id', 'label', 'id:1', 'parent_id', 'note']);
+        } finally {
+            reference.close();
+            shim.close();
+        }
+    });
+
+    it('keeps both values of two identically aliased expressions', () => {
+        const shim = createShim();
+        try {
+            assert.deepStrictEqual(normalize(shim.exec('SELECT 1 AS x, 2 AS x')), [
+                { columns: ['x', 'x:1'], values: [[1, 2]] }
+            ]);
+        } finally {
+            shim.close();
+        }
+    });
+
+    it('leaves the change counter, the schema version and temp objects alone', () => {
+        // The probe now runs on EVERY exec, including the ones worker.js uses to
+        // read `changes()`/`total_changes()`/`schema_version` right after a
+        // mutation. A probe that disturbed any of those would corrupt the
+        // console's mutation detection and every oversized-cell guard.
+        const shim = createShim();
+        try {
+            shim.run(SEED_SQL);
+            shim.run("UPDATE t SET name = 'renamed' WHERE id IN (1,2)");
+            assert.deepStrictEqual(
+                normalize(shim.exec('SELECT changes() AS c')),
+                [{ columns: ['c'], values: [[2]] }]
+            );
+            const before = normalize(shim.exec('PRAGMA schema_version'));
+            shim.exec('SELECT id, name FROM t');
+            shim.exec('SELECT 1 AS x, 2 AS x');
+            assert.deepStrictEqual(normalize(shim.exec('PRAGMA schema_version')), before);
+            assert.deepStrictEqual(
+                normalize(shim.exec('SELECT count(*) AS c FROM temp.sqlite_master')),
+                [{ columns: ['c'], values: [[0]] }]
+            );
+        } finally {
+            shim.close();
+        }
+    });
+
+    it('answers a value-returning PRAGMA with the same columns sql.js reports', () => {
+        // The console's fix for E-2 is "step once, then ask again"; this is the
+        // shim half of that contract -- once a row has been produced, rung 1 of
+        // the metadata ladder knows the real names.
+        const reference = new SQL.Database();
+        const shim = createShim();
+        const setup = 'CREATE TABLE pragma_probe(id INTEGER PRIMARY KEY, note TEXT)';
+        try {
+            reference.run(setup);
+            shim.run(setup);
+            const statement = shim.prepare('PRAGMA table_info(pragma_probe)');
+            // Nothing knowable before the first step: a PRAGMA is not a legal
+            // view body and is not EXPLAIN-prefixed.
+            assert.deepStrictEqual(statement.getColumnNames(), []);
+            assert.strictEqual(statement.step(), true);
+            const referenceStatement = reference.prepare('PRAGMA table_info(pragma_probe)');
+            referenceStatement.step();
+            assert.deepStrictEqual(
+                statement.getColumnNames(),
+                referenceStatement.getColumnNames()
+            );
+            referenceStatement.free();
+            statement.free();
+        } finally {
+            reference.close();
+            shim.close();
+        }
+    });
+});
+
 describe('sqljs-shim: documented divergences from sql.js', () => {
     it('duplicate result names are disambiguated, and both values survive', () => {
         // sql.js reports ['x','x'] because it reads sqlite3_column_name
@@ -1179,9 +1281,11 @@ describe('sqljs-shim: documented divergences from sql.js', () => {
     it('DML with RETURNING reports no columns until it has been stepped', () => {
         // The probe cannot express DML as a view, and the shim will not run a
         // mutation to answer a metadata question, so getColumnNames() is empty
-        // where sql.js names the RETURNING columns. The console therefore treats
-        // such a statement as side-effect-only. Documented gap, not an accident:
-        // executing the INSERT early is the strictly worse trade.
+        // where sql.js names the RETURNING columns. Documented gap, not an
+        // accident: executing the INSERT early is the strictly worse trade.
+        // runConsole no longer LOSES the rows over it -- it steps once and asks
+        // again, which is the rung-1 answer -- but the pre-step reply is still
+        // `[]` and callers must not read it as "this statement has no columns".
         const reference = new SQL.Database();
         const shim = createShim();
         try {
@@ -1276,9 +1380,14 @@ describe('sqljs-shim: documented divergences from sql.js', () => {
     });
 
     it('getRemainingSQL after natural completion reports the leftover trivia', () => {
-        // sql.js reads a freed pointer at this point and usually reports "";
-        // the shim reports the trailing trivia deterministically. worker.js only
-        // tests `remaining.trim() !== ''`, which both satisfy.
+        // sql.js reads a FREED pointer at this point (its next() releases the
+        // heap copy of the script before reporting `done`) and returns whatever
+        // byte landed there; the shim reports the trailing trivia
+        // deterministically. Neither is usable as a "was anything dropped?"
+        // test, which is why worker.js no longer consults it after natural
+        // completion -- both iterators only report `done` once prepare found no
+        // further statement. Pinned here so a future engine swap has to look at
+        // this difference on purpose.
         const shim = createShim();
         try {
             const iterator = shim.iterateStatements('SELECT 1; -- tail');

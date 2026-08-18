@@ -23,6 +23,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import {
     MAX_FRAME_BYTES,
@@ -373,6 +374,127 @@ export async function runSidecarLane({ binary, scratch, note }) {
                 `sidecar/tripwire-${label}-unavailable`, JSON.stringify(probe.content?.data?.error));
         }
 
+        // ---- deep-QA capstone engine defects, on the real binary ----------
+        // Every one of these was a SILENTLY WRONG answer through this exact
+        // path, so each asserts the value or the on-disk state, not a message.
+
+        // E-1: a statement with no trailing `;` used to lose its whole result
+        // set to a fabricated leftover-SQL error (sql.js) — the guard is gone
+        // on both engines, so this must simply answer.
+        const noSemicolon = await rw.invoke('runConsole', ['SELECT 1 AS one']);
+        check(noSemicolon.content?.success === true
+            && noSemicolon.content?.data?.error === undefined
+            && noSemicolon.content?.data?.results?.[0]?.rows?.[0]?.[0] === 1,
+            'sidecar/E1-statement-without-trailing-semicolon-returns-rows',
+            JSON.stringify(noSemicolon.content?.data));
+
+        // E-1b: NUL in console SQL is refused up front rather than running the
+        // prefix and dropping the rest.
+        const nulSql = await rw.invoke('runConsole', ['SELECT 1\u0000; SELECT 2']);
+        check(nulSql.content?.success === false
+            && /NUL/.test(nulSql.content?.errorMessage ?? ''),
+            'sidecar/E1-nul-in-console-sql-refused',
+            JSON.stringify(nulSql.content?.errorMessage));
+
+        // E-2: every value-returning PRAGMA came back as ZERO ROWS and no
+        // error, because the shim cannot name a PRAGMA's columns before it has
+        // been stepped and the console read that as "this is DML".
+        const pragmaRows = await rw.invoke('runConsole', ['PRAGMA table_info(t)']);
+        const pragmaResult = pragmaRows.content?.data?.results?.[0];
+        check(pragmaRows.content?.success === true
+            && pragmaRows.content?.data?.error === undefined
+            && JSON.stringify(pragmaResult?.headers)
+                === JSON.stringify(['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'])
+            && JSON.stringify(pragmaResult?.rows?.map((row) => row[1]))
+                === JSON.stringify(['id', 'name', 'data', 'big', 'r']),
+            'sidecar/E2-value-returning-pragma-returns-rows',
+            JSON.stringify(pragmaRows.content?.data));
+
+        const journalMode = await rw.invoke('runConsole', ['PRAGMA journal_mode']);
+        check(journalMode.content?.success === true
+            && journalMode.content?.data?.results?.[0]?.rows?.length === 1,
+            'sidecar/E2-pragma-journal_mode-returns-its-value',
+            JSON.stringify(journalMode.content?.data));
+
+        // E-2b: the same root cause as the known RETURNING gap — and the fix
+        // closes it. The row comes back AND the insert applies exactly once.
+        await rw.invoke('runConsole', ['CREATE TABLE returning_probe(n INTEGER)']);
+        const returning = await rw.invoke('runConsole', [
+            'INSERT INTO returning_probe VALUES (41) RETURNING n + 1 AS answer'
+        ]);
+        const applied = await rw.invoke('runConsole', [
+            'SELECT count(*) AS c FROM returning_probe'
+        ]);
+        check(returning.content?.success === true
+            && returning.content?.data?.results?.[0]?.rows?.[0]?.[0] === 42
+            && applied.content?.data?.results?.[0]?.rows?.[0]?.[0] === 1,
+            'sidecar/E2-dml-with-returning-yields-its-row-once',
+            JSON.stringify(returning.content?.data));
+
+        // E-4: db.exec() collapsed duplicate result column names and shifted
+        // the values left. runQuery is the only caller, and it answered wrong
+        // rather than erroring.
+        await rw.invoke('runConsole', [
+            'CREATE TABLE dup_parent(id INTEGER PRIMARY KEY, label TEXT);'
+            + 'CREATE TABLE dup_child(id INTEGER PRIMARY KEY, parent_id INTEGER, note TEXT);'
+            + "INSERT INTO dup_parent VALUES (1,'p1'); INSERT INTO dup_child VALUES (7,1,'c1')"
+        ]);
+        const joined = await rw.invoke('runQuery', [
+            'SELECT * FROM dup_parent JOIN dup_child ON dup_child.parent_id = dup_parent.id'
+        ]);
+        const joinedSet = joined.content?.data?.[0];
+        check(joined.content?.success === true
+            && joinedSet?.headers?.length === 5
+            && JSON.stringify(joinedSet?.rows?.[0]) === JSON.stringify([1, 'p1', 7, 1, 'c1']),
+            'sidecar/E4-duplicate-result-columns-keep-every-value',
+            JSON.stringify(joinedSet));
+
+        // E-3: updateCell reported success for a row that does not exist and
+        // changed nothing; updateCellBatch always refused. They must agree.
+        const ghost = await rw.invoke('updateCell', ['t', 999999, 'name', 'ghost']);
+        check(ghost.content?.success === false
+            && /row 999999 no longer exists/.test(ghost.content?.errorMessage ?? ''),
+            'sidecar/E3-updateCell-refuses-a-row-that-does-not-exist',
+            JSON.stringify(ghost.content?.errorMessage));
+
+        const liveEdit = await rw.invoke('updateCell', ['t', 1, 'name', 'alpha-edited']);
+        const liveRead = await rw.invoke('runConsole', ['SELECT name FROM t WHERE id = 1']);
+        check(liveEdit.content?.success === true
+            && liveRead.content?.data?.results?.[0]?.rows?.[0]?.[0] === 'alpha-edited',
+            'sidecar/E3-updateCell-still-applies-to-a-row-that-exists',
+            JSON.stringify(liveRead.content?.data));
+
+        // E-5: TEXT written through the WASM engine lost everything past its
+        // first NUL. Both engines now route it through a blob bind + CAST, so
+        // the bytes on disk are identical on both.
+        await rw.invoke('updateCell', ['t', 1, 'name', 'a\u0000b']);
+        const nulBytes = await rw.invoke('runConsole', [
+            'SELECT hex(CAST(name AS BLOB)) AS h, typeof(name) AS t FROM t WHERE id = 1'
+        ]);
+        check(nulBytes.content?.data?.results?.[0]?.rows?.[0]?.[0] === '610062'
+            && nulBytes.content?.data?.results?.[0]?.rows?.[0]?.[1] === 'text',
+            'sidecar/E5-text-with-an-embedded-nul-round-trips',
+            JSON.stringify(nulBytes.content?.data?.results?.[0]?.rows?.[0]));
+
+        // E-15: foreign_keys defaulted to 1 on native and 0 on WASM, so the
+        // same delete was refused on one engine and orphaned children on the
+        // other. Pinned ON at open on both.
+        const pragmas = await rw.invoke('getPragmas', []);
+        check(pragmas.content?.success === true && pragmas.content?.data?.foreign_keys === 1,
+            'sidecar/E15-foreign-keys-enforced', JSON.stringify(pragmas.content?.data?.foreign_keys));
+
+        await rw.invoke('runConsole', [
+            'CREATE TABLE fk_parent(id INTEGER PRIMARY KEY);'
+            + 'CREATE TABLE fk_child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES fk_parent(id));'
+            + 'INSERT INTO fk_parent VALUES (1); INSERT INTO fk_child VALUES (1,1)'
+        ]);
+        const orphan = await rw.invoke('deleteRows', ['fk_parent', [1]]);
+        const survivors = await rw.invoke('runConsole', ['SELECT count(*) AS c FROM fk_child']);
+        check(orphan.content?.success === false
+            && survivors.content?.data?.results?.[0]?.rows?.[0]?.[0] === 1,
+            'sidecar/E15-parent-delete-refused-instead-of-orphaning',
+            JSON.stringify(orphan.content?.errorMessage));
+
         // Oversize response: the wrapped postMessage must answer IN BAND for
         // the same messageId instead of stranding the RPC (worker.js's send
         // sites are unguarded by design — byte-identity gate).
@@ -539,9 +661,96 @@ export async function runSidecarLane({ binary, scratch, note }) {
             `exit ${code}, opened=${fs.existsSync(neverOpened)}, stderr=${JSON.stringify(usageStderr.trim().slice(0, 120))}`);
     }
 
+    // ---- a file the process cannot write (capstone E-11) ------------------
+    checks += await runUnwritableFileCase(binary, scratch, note);
+
     // ---- ppid watchdog ----------------------------------------------------
     checks += await runWatchdogCase(binary, dbPath, note);
 
+    return checks;
+}
+
+/**
+ * A 0444 database opened in a WRITABLE session (capstone E-11).
+ *
+ * SQLite opens such a file happily and only refuses at the first write, so
+ * initializeDatabase used to answer `isReadOnly: false` and the UI offered
+ * edits that could not possibly land. The open-time BEGIN IMMEDIATE probe has
+ * to catch it, report it, and leave the session honestly read-only.
+ *
+ * @returns {Promise<number>} checks run
+ */
+async function runUnwritableFileCase(binary, scratch, note) {
+    let checks = 0;
+    const check = (ok, label, detail) => { note(ok, label, detail); checks += 1; };
+
+    const dbPath = path.join(scratch, 'unwritable-fixture.sqlite');
+    createFixture(dbPath);
+    fs.chmodSync(dbPath, 0o444);
+
+    const session = startSidecar(binary, dbPath, 'rw');
+    try {
+        const init = await session.invoke('initializeDatabase', ['unwritable-fixture.sqlite', {
+            path: dbPath, readOnlyMode: false
+        }]);
+        check(init.content?.success === true
+            && init.content?.data?.isReadOnly === true
+            && /read-only/i.test(init.content?.data?.readOnlyReason ?? ''),
+            'sidecar/E11-unwritable-file-opens-read-only',
+            JSON.stringify(init.content?.data));
+
+        // ...and the refusal is the ordinary read-only one, before SQLite is
+        // ever asked to do the impossible.
+        const write = await session.invoke('insertRow', ['t', { name: 'nope' }]);
+        check(write.content?.success === false
+            && /read-only/i.test(write.content?.errorMessage ?? ''),
+            'sidecar/E11-unwritable-file-refuses-edits-up-front',
+            JSON.stringify(write.content?.errorMessage));
+
+        const read = await session.invoke('fetchSchema', []);
+        check(read.content?.success === true
+            && (read.content?.data?.tables?.map((table) => table.identifier) ?? []).includes('t'),
+            'sidecar/E11-unwritable-file-still-reads');
+
+        session.endStdin();
+        const code = await session.untilExit();
+        check(code === 0, 'sidecar/E11-unwritable-session-exits-clean', `exit ${code}`);
+    } finally {
+        if (session.exitCode === null) session.child.kill('SIGKILL');
+        const stderrText = session.stderr.trim();
+        if (stderrText) console.log(`[sidecar unwritable stderr]\n${stderrText}\n`);
+        fs.chmodSync(dbPath, 0o644);
+    }
+
+    // WRITABLE CONTROL. The probe attempts a real write, so it has to be
+    // provably invisible: open a writable database, do nothing else, and the
+    // file must be byte-identical afterwards with no journal left behind.
+    const controlPath = path.join(scratch, 'probe-control.sqlite');
+    createFixture(controlPath);
+    const before = createHash('sha256').update(fs.readFileSync(controlPath)).digest('hex');
+    const control = startSidecar(binary, controlPath, 'rw');
+    try {
+        const init = await control.invoke('initializeDatabase', ['probe-control.sqlite', {
+            path: controlPath, readOnlyMode: false
+        }]);
+        const sidecars = ['-journal', '-wal', '-shm']
+            .filter((suffix) => fs.existsSync(`${controlPath}${suffix}`));
+        const after = createHash('sha256').update(fs.readFileSync(controlPath)).digest('hex');
+        check(init.content?.data?.isReadOnly === false
+            && init.content?.data?.readOnlyReason === undefined
+            && after === before
+            && sidecars.length === 0,
+            'sidecar/E11-write-probe-leaves-a-writable-database-untouched',
+            `same=${after === before}, leftovers=${JSON.stringify(sidecars)}`);
+
+        control.endStdin();
+        const code = await control.untilExit();
+        check(code === 0, 'sidecar/E11-control-session-exits-clean', `exit ${code}`);
+    } finally {
+        if (control.exitCode === null) control.child.kill('SIGKILL');
+        const stderrText = control.stderr.trim();
+        if (stderrText) console.log(`[sidecar probe-control stderr]\n${stderrText}\n`);
+    }
     return checks;
 }
 

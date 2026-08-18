@@ -843,6 +843,17 @@ export function createShimDatabase(config = {}, deps = {}) {
                 const statement = createShimStatement(statementContext, next.compiled, next.source, next.expanded);
                 try {
                     if (params != null) statement.bind(params);
+                    // Resolve the columns BEFORE the first step, even though the
+                    // loop below asks again. The probe is what tells ensureRows()
+                    // the statement's TRUE arity, and ensureRows() can only repair
+                    // `all()`'s collapsed duplicate keys when the probe has already
+                    // run. sql.js's exec() steps first, and copying that order here
+                    // meant `SELECT * FROM a JOIN b` silently came back one column
+                    // short with its values shifted left. The probe compiles a temp
+                    // view and never executes anything, so this costs a compile on
+                    // statements that are viewable and one failed compile on the
+                    // ones that are not.
+                    statement.getColumnNames();
                     let columns = null;
                     const values = [];
                     while (statement.step()) {

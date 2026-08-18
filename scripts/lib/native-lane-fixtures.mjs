@@ -101,6 +101,34 @@ export const FIXTURES = [
     ['exec/semicolon-in-literal', db => db.exec("SELECT ';' AS semi; SELECT 2 AS after")],
     ['exec/semicolon-in-comment', db => db.exec('SELECT 1 AS a /* ; */ ; SELECT 2 AS b')],
 
+    // Duplicate result names: sql.js reads sqlite3_column_name positionally and
+    // repeats `id`, the shim recovers SQLite's own disambiguated `id:1`. The
+    // header TEXT is a documented divergence; the ARITY and the VALUES are not,
+    // and `exec` used to silently drop one of each (capstone E-4).
+    ['exec/duplicate-result-columns-keep-every-value', db => {
+        db.run(
+            'CREATE TABLE dup_parent(id INTEGER PRIMARY KEY, label TEXT);'
+            + 'CREATE TABLE dup_child(id INTEGER PRIMARY KEY, parent_id INTEGER, note TEXT);'
+            + "INSERT INTO dup_parent VALUES (1,'p1'); INSERT INTO dup_child VALUES (7,1,'c1')"
+        );
+        const [result] = db.exec(
+            'SELECT * FROM dup_parent JOIN dup_child ON dup_child.parent_id = dup_parent.id'
+        );
+        return { columnCount: result.columns.length, values: result.values };
+    }],
+    ['exec/duplicate-aliases-keep-every-value', db => {
+        const [result] = db.exec('SELECT 1 AS x, 2 AS x');
+        return { columnCount: result.columns.length, values: result.values };
+    }],
+    // The duplicate repair re-reads the rows through a TEMP VIEW. That extra
+    // read must not disturb the change counter worker.js reads right after
+    // every mutation.
+    ['changes/duplicate-column-exec-does-not-reset', db => {
+        db.run('UPDATE t SET name = name');
+        db.exec('SELECT 1 AS x, 2 AS x');
+        return db.getRowsModified();
+    }],
+
     ['changes/after-insert', db => {
         db.run("INSERT INTO t VALUES(10,'ten',NULL,0.5)");
         return db.getRowsModified();
