@@ -1,6 +1,6 @@
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createDesktopHost } from '../../core/ui/modules/desktop-host.js';
+import { createDesktopHost, MAX_OPEN_DATABASES } from '../../core/ui/modules/desktop-host.js';
 
 // Untyped UI modules: resolved through a path variable inside a hook, so tsc
 // does not demand declaration files for them — the same convention the other
@@ -2766,6 +2766,60 @@ test('setActiveDb and closeDatabase refuse an unknown id instead of picking anot
   assert.deepEqual(host.listDatabases().map(d => d.name), ['a.db']);
   // Re-selecting the active database is a no-op, not an error.
   assert.equal(await host.setActiveDb(dbA), false);
+});
+
+// ---------------------------------------------------------------------------
+// The open cap. Each WASM database is its own Worker holding its own copy of
+// the file; each native one is its own sidecar process. The shell caps
+// sidecars at 16 — nothing capped the WASM lane, and tabs make N reachable.
+// ---------------------------------------------------------------------------
+
+test('opening past the cap is refused with a message naming it, and the registry is untouched', async () => {
+  const { host, workers } = makeHost({});
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+
+  // The boot placeholder is clean, so the first open replaces it: filling the
+  // registry to the cap takes exactly MAX_OPEN_DATABASES opens.
+  for (let i = 0; i < MAX_OPEN_DATABASES; i++) {
+    assert.equal(await host.openFromShellPath(`/tmp/db${i}.db`), true);
+  }
+  assert.equal(host.listDatabases().length, MAX_OPEN_DATABASES);
+  const workersAtCap = workers.length;
+
+  await assert.rejects(
+    () => host.openFromShellPath('/tmp/one-too-many.db'),
+    new RegExp(`${MAX_OPEN_DATABASES} databases are already open`)
+  );
+  // Refused BEFORE anything was built: no worker booted, no entry added, and
+  // the database the user was looking at is still the active one.
+  assert.equal(workers.length, workersAtCap);
+  assert.equal(host.listDatabases().length, MAX_OPEN_DATABASES);
+  assert.equal(host.listDatabases().find(d => d.isActive)!.name, `db${MAX_OPEN_DATABASES - 1}.db`);
+
+  // A file that is ALREADY open still switches at the cap: the dedupe runs
+  // first, so the cap can never wall the user off from an open database.
+  const first = host.listDatabases()[0].dbId;
+  assert.equal(await host.openFromShellPath('/tmp/db0.db'), true);
+  assert.equal(host.activeDatabaseId(), first);
+
+  // Closing one makes room again.
+  assert.equal(await host.closeDatabase(first), true);
+  assert.equal(await host.openFromShellPath('/tmp/one-too-many.db'), true);
+  assert.equal(host.listDatabases().length, MAX_OPEN_DATABASES);
+});
+
+test('the drag-and-drop lane is capped too', async () => {
+  const { host } = makeHost({});
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  for (let i = 0; i < MAX_OPEN_DATABASES; i++) await host.openFromShellPath(`/tmp/db${i}.db`);
+
+  await assert.rejects(
+    () => host.openDatabaseFromFile({ name: 'dropped.db', size: 3 } as unknown as File),
+    new RegExp(`${MAX_OPEN_DATABASES} databases are already open`)
+  );
+  assert.equal(host.listDatabases().length, MAX_OPEN_DATABASES);
 });
 
 // ---------------------------------------------------------------------------

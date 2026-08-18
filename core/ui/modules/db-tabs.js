@@ -1,0 +1,312 @@
+/**
+ * Database tabs + the sidebar's "Open Databases" overview.
+ *
+ * DESKTOP ONLY — like the SQL console modules, this file may be imported by
+ * `desktop-viewer.js` and nothing else (pinned by tests/unit/db_tabs.test.ts).
+ * The markup it fills lives in the shared template and ships `hidden`, exactly
+ * as #btnSqlConsole and #engineBadge do, so the VS Code webview and the web
+ * demo carry inert elements and none of this code.
+ *
+ * Two presentations, ONE source of truth: `host.listDatabases()`. The host
+ * pushes a fresh list through its `databasesChanged` hook on every open, close,
+ * save (a dirty flag clearing) and switch, and the desktop entry re-renders
+ * both from it. Neither presentation holds any REGISTRY state — nothing here
+ * can drift from the host's answer; the one module-level variable below
+ * remembers what the last render looked like, not what is open.
+ *
+ * Both appear only from the SECOND database on. At one open database the strip
+ * and the sidebar section would carry nothing the window title and the engine
+ * badge don't already say, and hiding them keeps the single-database window
+ * pixel-identical to the one that shipped before multi-database support.
+ */
+
+/**
+ * Below this, both presentations stay hidden. One threshold for the two, so
+ * they can never disagree about whether this window is showing "a database" or
+ * "several databases".
+ */
+const MIN_DATABASES_FOR_CHROME = 2;
+
+/** @type {import('./desktop-host.js').DesktopHost | null} */
+let host = null;
+
+/**
+ * The desktop entry's error surfacer (`(label) => (err) => …`), which puts the
+ * message in the status line. The fallback only runs if a click arrives before
+ * initDatabaseTabs, which nothing can do — it exists so this is never a silent
+ * failure.
+ */
+let surface = (label) => (err) => console.error(label, err);
+
+/**
+ * @param {object} options
+ * @param {import('./desktop-host.js').DesktopHost} options.host
+ * @param {(label: string) => (err: Error) => void} [options.surface]
+ */
+export function initDatabaseTabs(options) {
+    host = options.host;
+    if (options.surface) surface = options.surface;
+    renderDatabaseTabs();
+}
+
+/**
+ * Renders both presentations from one registry snapshot.
+ *
+ * @param {import('./desktop-host.js').OpenDatabase[]} [list] the list the host
+ *   just pushed; omitted callers read it from the host.
+ */
+export function renderDatabaseTabs(list) {
+    const databases = list ?? host?.listDatabases();
+    // No host yet (and no list handed in) means there is no registry to draw:
+    // leave the template's hidden elements exactly as they ship rather than
+    // rendering an empty strip over them.
+    if (!databases) return;
+    const visible = databases.length >= MIN_DATABASES_FOR_CHROME;
+    renderStrip(databases, visible);
+    renderOverview(databases, visible);
+}
+
+/**
+ * ⌘1-9 and ⌘W, from the desktop entry's keydown handler.
+ *
+ * Page-level rather than menu accelerators on purpose: AppKit resolves menu key
+ * equivalents against the ACTIVE keyboard layout and silently drops the ones it
+ * cannot reach, and WKWebView hands key equivalents to the page before menu
+ * dispatch anyway.
+ *
+ * @param {KeyboardEvent} event
+ * @returns {Promise<unknown> | null} the action's promise when this event was
+ *   HANDLED (`preventDefault` has already been called for it), or null when it
+ *   is not ours — in which case the event is left untouched, which is what lets
+ *   ⌘W still close the window at one open database.
+ */
+export function handleDatabaseShortcut(event) {
+    if (!host) return null;
+    // A bare primary chord only: ⌘⇧W is Close All Windows and ⌘⌥1 is nothing
+    // of ours. Both would be stolen by a looser match.
+    if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) return null;
+
+    const databases = host.listDatabases();
+    if (typeof event.key === 'string' && event.key.toLowerCase() === 'w') {
+        // At one database ⌘W keeps its old meaning — close the window. Leaving
+        // the event un-prevented is what hands it back to the shell's menu.
+        if (databases.length < MIN_DATABASES_FOR_CHROME) return null;
+        const active = databases.find(database => database.isActive);
+        if (!active) return null;
+        event.preventDefault();
+        return closeFromUi(active.dbId);
+    }
+
+    const index = shortcutIndex(event);
+    if (index === null) return null;
+    const target = databases[index];
+    // Past the end: a no-op, and NOT prevented — the user pressed a chord this
+    // window has no meaning for.
+    if (!target) return null;
+    event.preventDefault();
+    return switchTo(target.dbId);
+}
+
+/**
+ * Closes `dbId`, prompting first when it has unsaved changes.
+ *
+ * `host.closeDatabase` DISCARDS them without asking — this prompt is the only
+ * thing between a stray click on a tab's × and losing the edits, which is why
+ * an unavailable `confirm` counts as a refusal rather than a pass.
+ *
+ * Not exported: every close in the UI goes through `closeFromUi`, which adds
+ * the error surfacing the click and key handlers have no caller to do for them.
+ *
+ * @returns {Promise<boolean>} whether the database was closed.
+ */
+async function requestCloseDatabase(dbId) {
+    if (!host) return false;
+    const database = host.listDatabases().find(entry => entry.dbId === dbId);
+    // Already gone (a double click on ×, a close raced with the shell's own):
+    // closeDatabase would reject on the unknown id, which is right for a
+    // programmatic caller and noise for this one.
+    if (!database) return false;
+    if (database.isDirty) {
+        const discard = globalThis.confirm?.(
+            `"${database.name}" has unsaved changes.\n\n`
+            + 'Closing it discards them. Close without saving?'
+        );
+        // Fail closed: `undefined` means the page could not ask, and silently
+        // discarding a user's edits because a dialog was unavailable is the one
+        // outcome this path may never produce.
+        if (discard !== true) return false;
+    }
+    await host.closeDatabase(dbId);
+    return true;
+}
+
+// ---- internals ------------------------------------------------------------
+
+/** 0-based position for ⌘1-9, or null. */
+function shortcutIndex(event) {
+    // `code` is the PHYSICAL key, which is what ⌘1-9 means everywhere it
+    // exists: the tab under the user's finger, whatever that key types on the
+    // active layout. `key` is the fallback for events that carry no code.
+    const physical = /^Digit([1-9])$/.exec(typeof event.code === 'string' ? event.code : '');
+    if (physical) return Number(physical[1]) - 1;
+    if (typeof event.key === 'string' && /^[1-9]$/.test(event.key)) return Number(event.key) - 1;
+    return null;
+}
+
+/**
+ * A switch is a real operation (it swaps the whole UI state and reloads the
+ * grid), so its failure belongs in the status line, not in an unhandled
+ * rejection behind chrome that now points at the wrong database.
+ */
+function switchTo(dbId) {
+    // Only reachable before initDatabaseTabs if the host pushed a
+    // `databasesChanged` during start() and the user clicked a tab in that
+    // window — which the two-database threshold already makes impossible, since
+    // start() boots exactly one. Guarded anyway: a TypeError here would be a
+    // dead tab strip for the rest of the session.
+    if (!host) return Promise.resolve(false);
+    return host.setActiveDb(dbId).catch(surface('Database switch failed'));
+}
+
+function closeFromUi(dbId) {
+    return requestCloseDatabase(dbId).catch(surface('Close failed'));
+}
+
+/**
+ * The active database as of the last render. The only state this module keeps,
+ * and it describes the RENDER, not the registry: it is what lets a switch
+ * scroll the newly active tab into view without every other re-render doing
+ * the same. Re-renders are frequent — a dirty flag flips on every edit — and
+ * scrolling on each one would fight a user who has scrolled the strip.
+ */
+let scrolledActiveDbId = null;
+
+function renderStrip(databases, visible) {
+    const strip = document.getElementById('dbTabStrip');
+    if (!strip) return;
+    strip.hidden = !visible;
+    const tabs = databases.map(buildTab);
+    strip.replaceChildren(...tabs);
+
+    const activeIndex = databases.findIndex(database => database.isActive);
+    const activeDbId = activeIndex === -1 ? null : databases[activeIndex].dbId;
+    if (visible && activeDbId !== null && activeDbId !== scrolledActiveDbId) {
+        // At the open cap the strip is wider than any window, so ⌘7 could
+        // otherwise select a tab that never comes into view. Optional-called:
+        // it is a nicety, and the unit runner's DOM stand-in has no layout.
+        tabs[activeIndex].scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+    }
+    scrolledActiveDbId = activeDbId;
+}
+
+/**
+ * One tab: a select button and a close button, siblings rather than nested
+ * (a button inside a button is invalid HTML and unfocusable in practice), so
+ * both are natively keyboard-operable without a roving-tabindex implementation.
+ */
+function buildTab(database) {
+    const tab = document.createElement('div');
+    tab.className = database.isActive ? 'db-tab active' : 'db-tab';
+    tab.dataset.dbId = database.dbId;
+
+    const select = document.createElement('button');
+    select.type = 'button';
+    select.className = 'db-tab-select';
+    select.dataset.dbId = database.dbId;
+    // Two open files can share a basename; the path is what tells them apart.
+    select.title = database.path ?? database.name;
+    // A group of toggle buttons rather than an ARIA tablist: a tablist promises
+    // arrow-key navigation between tabs and a labelled panel per tab, and a
+    // half-kept promise reads worse to a screen reader than an honest one.
+    select.setAttribute('aria-pressed', database.isActive ? 'true' : 'false');
+    select.addEventListener('click', () => { void switchTo(database.dbId); });
+
+    // textContent throughout: a database name is a filename, i.e. arbitrary
+    // user-controlled text.
+    const name = document.createElement('span');
+    name.className = 'db-tab-name';
+    name.textContent = database.name;
+    select.appendChild(name);
+
+    const engine = document.createElement('span');
+    engine.className = 'db-tab-engine';
+    engine.dataset.engine = database.engine;
+    engine.textContent = database.engine;
+    select.appendChild(engine);
+
+    if (database.isDirty) select.appendChild(dirtyMarker('db-tab-dirty'));
+    tab.appendChild(select);
+
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'db-tab-close';
+    close.dataset.dbId = database.dbId;
+    close.title = `Close ${database.name}`;
+    close.setAttribute('aria-label', `Close ${database.name}`);
+    const icon = document.createElement('span');
+    icon.className = 'codicon codicon-close';
+    close.appendChild(icon);
+    close.addEventListener('click', () => { void closeFromUi(database.dbId); });
+    tab.appendChild(close);
+
+    return tab;
+}
+
+function renderOverview(databases, visible) {
+    const title = document.getElementById('sectionOpenDatabases');
+    const badge = document.getElementById('openDatabasesBadge');
+    const list = document.getElementById('openDatabasesList');
+    if (title) title.hidden = !visible;
+    if (badge) badge.textContent = String(databases.length);
+    if (!list) return;
+    // The `hidden` ATTRIBUTE is the desktop gate; the `hidden` CLASS is the
+    // user's collapse (sidebar.js toggleSection). Two mechanisms on purpose:
+    // re-rendering must not un-collapse a section the user closed.
+    list.hidden = !visible;
+    list.replaceChildren(...databases.map(buildOverviewItem));
+}
+
+function buildOverviewItem(database) {
+    const item = document.createElement('li');
+    // `list-item` for the sidebar's shared hover/selected styling — but
+    // deliberately NO data-name/data-type. sidebar.js's delegated handler reads
+    // that pair as "a table was clicked" (and desktop-viewer.js's console
+    // wiring closes the console on it); an entry carrying them would select a
+    // table that does not exist.
+    item.className = database.isActive
+        ? 'list-item db-list-item selected'
+        : 'list-item db-list-item';
+    item.dataset.dbId = database.dbId;
+    item.title = database.path ?? database.name;
+
+    const icon = document.createElement('span');
+    icon.className = 'item-icon codicon codicon-database';
+    item.appendChild(icon);
+
+    const name = document.createElement('span');
+    name.className = 'item-name';
+    name.textContent = database.name;
+    item.appendChild(name);
+
+    const engine = document.createElement('span');
+    engine.className = 'db-item-engine';
+    engine.dataset.engine = database.engine;
+    engine.textContent = database.engine;
+    item.appendChild(engine);
+
+    if (database.isDirty) item.appendChild(dirtyMarker('db-item-dirty'));
+
+    item.addEventListener('click', () => { void switchTo(database.dbId); });
+    return item;
+}
+
+function dirtyMarker(className) {
+    const dirty = document.createElement('span');
+    dirty.className = className;
+    dirty.title = 'Unsaved changes';
+    // aria-hidden: the dot is decorative, and `title` already carries the fact
+    // for anyone who hovers.
+    dirty.setAttribute('aria-hidden', 'true');
+    dirty.textContent = '●';
+    return dirty;
+}

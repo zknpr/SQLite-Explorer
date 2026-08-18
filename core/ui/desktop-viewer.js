@@ -62,6 +62,16 @@ import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
 // tests/unit/console_desktop_wiring.test.ts.
 import { createConsole, sanitizeHistory } from './modules/console.js';
 import { renderConsoleResults } from './modules/console-results.js';
+// Desktop-only for a different reason than the console's: the tab strip and the
+// Open Databases overview render a registry no other target has (VS Code and
+// the web demo hold exactly one database). Their markup ships hidden in the
+// shared template; this module is what fills it in. Pinned by
+// tests/unit/db_tabs.test.ts.
+import {
+    handleDatabaseShortcut,
+    initDatabaseTabs,
+    renderDatabaseTabs
+} from './modules/db-tabs.js';
 
 // Like the demo, ordinary edits get no host-echoed refreshContent, so
 // optimistic count reuse stays off.
@@ -351,6 +361,16 @@ const webviewMethods = {
     },
 
     /**
+     * The registry changed: a database was opened or closed, a save cleared a
+     * dirty mark, or the active pointer moved. The tab strip and the sidebar's
+     * Open Databases overview both render from this one list.
+     */
+    async databasesChanged(list) {
+        renderDatabaseTabs(list);
+        return { success: true };
+    },
+
+    /**
      * A database switch replaced every per-database field of `state` (the host
      * swaps them wholesale — desktop-host.js `setActiveDb`). Everything the
      * swap cannot reach has to follow it here, before refreshContent repaints.
@@ -363,6 +383,12 @@ const webviewMethods = {
      * OUTGOING database over the incoming one's content.
      */
     async databaseSwitched() {
+        // The active tab and the highlighted overview row. `databasesChanged`
+        // has already fired for this switch, so this is belt-and-braces on
+        // purpose: the chrome must not depend on the host's notification ORDER
+        // to end up pointing at the database the page is now showing.
+        renderDatabaseTabs();
+
         // The toolbar's table name. Written only by the sidebar/rpc/views
         // selection paths, so a switch never touches it — it would keep naming
         // the outgoing database's table above the incoming one's rows.
@@ -535,7 +561,33 @@ if (!bridge) {
                 || event.target?.tagName === 'TEXTAREA'
                 || event.target?.isContentEditable === true;
             const primary = event.metaKey || event.ctrlKey;
-            if (!primary || inEditor) return;
+            if (!primary) return;
+            // ⌘1-9 and ⌘W over the open databases. Two placements matter here.
+            //
+            // BEFORE the "user is typing" guard, unlike every shortcut below:
+            // these are window-management chords, not text ones, and no text
+            // control claims them. Deferring to `inEditor` would make ⌘W mean
+            // "close this database" or "close the whole window" depending on
+            // whether focus happened to be in the filter box — the more
+            // destructive of the two being the accidental one. Closing a tab
+            // with unsaved changes prompts, so the aggressive reading is safe.
+            //
+            // BEFORE the ⌘S/⌘O chain because ⌘W is only ours while a second
+            // database is open: at one it returns null having touched nothing,
+            // and the event falls through un-prevented to the shell's Close
+            // Window accelerator. Page-level rather than a menu item for the
+            // same reason ⌘S and ⌘O are — AppKit resolves menu key equivalents
+            // against the active keyboard layout and silently drops the ones it
+            // cannot reach.
+            //
+            // The .catch is a backstop: db-tabs.js already surfaces its own
+            // failures (its click handlers have no caller to do it for them).
+            const databaseAction = handleDatabaseShortcut(event);
+            if (databaseAction) {
+                await databaseAction.catch(surface('Database action failed'));
+                return;
+            }
+            if (inEditor) return;
             const key = event.key.toLowerCase();
             // WKWebView hands key equivalents to the page BEFORE menu
             // dispatch and these preventDefault, so on macOS THIS path — not
@@ -561,6 +613,11 @@ if (!bridge) {
         }).catch(console.error);
 
         initSqlConsole(surface);
+        // After start(): the first render reads host.listDatabases(), which
+        // only holds the boot database once start() has booted it. Both
+        // presentations stay hidden at that one database anyway — this is what
+        // arms them for the first databasesChanged.
+        initDatabaseTabs({ host, surface });
 
         return initializeApp();
     }).catch(err => {

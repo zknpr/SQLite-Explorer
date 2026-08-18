@@ -3,6 +3,15 @@
  * worker, undo/redo history, settings, and bridge-backed file I/O.
  */
 
+/**
+ * How many databases may be open at once, across both engines. Each one costs
+ * a whole engine instance (a Worker with its own copy of the file, or a
+ * sidecar process); the number matches the shell's own native-sidecar cap.
+ * Every lane that creates an entry refuses past it, AFTER de-duplicating, so
+ * re-opening an already-open file still switches to it at the cap.
+ */
+export const MAX_OPEN_DATABASES: number;
+
 /** Result of a successful native "Open Database" file-picker round trip. */
 export interface PickedDatabase {
     path: string;

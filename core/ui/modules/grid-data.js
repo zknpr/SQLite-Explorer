@@ -18,8 +18,19 @@ import {
 export async function loadTableColumns() {
     if (!state.selectedTable) return;
 
+    // Which database this fetch is for. The host captures the target database
+    // once per RPC, not once per UI operation, so a desktop database switch
+    // landing while getTableInfo is in flight leaves the result describing the
+    // OUTGOING file while `state` has already been swapped to the incoming one
+    // (desktop-host.js setActiveDb). Committing then would give the incoming
+    // database the other file's column set — and every later grid query builds
+    // its projection from it. Always null (and so always equal) in the VS Code
+    // webview and the web demo, which have exactly one database.
+    const requestedDbId = state.dbId;
+
     try {
         const columns = await backendApi.getTableInfo(state.selectedTable);
+        if (requestedDbId !== state.dbId) return;
         state.tableColumns = columns.map(r => ({
             cid: r.ordinal,
             name: r.identifier,

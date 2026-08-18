@@ -27,6 +27,21 @@
             </div>
 
             <div class="sidebar-scroll-area">
+                <!-- Open Databases Section (desktop only). The shell holds N
+                     databases at once; this is the overview half of that, the
+                     tab strip below being the switcher. Ships hidden and empty
+                     like #btnSqlConsole and #engineBadge — only the desktop
+                     entry runs modules/db-tabs.js, which unhides both from the
+                     second open database on and owns everything inside the
+                     list. Collapsing works through the shared toggleSection
+                     path (data-section + the matching `${section}List` id). -->
+                <div class="section-title" data-section="openDatabases" id="sectionOpenDatabases" hidden>
+                    <span class="arrow">▼</span>
+                    <span>Open Databases</span>
+                    <span class="badge" id="openDatabasesBadge">0</span>
+                </div>
+                <ul class="item-list" id="openDatabasesList" hidden></ul>
+
                 <!-- Tables Section -->
                 <div class="section-title" data-section="tables" id="sectionTables">
                     <span class="arrow">▼</span>
@@ -82,6 +97,13 @@
 
         <!-- Main Panel -->
         <div class="main-panel">
+            <!-- Database tab strip (desktop only): one tab per open database,
+                 the primary in-window switcher. Ships hidden and empty like the
+                 Open Databases section above; modules/db-tabs.js fills it and
+                 unhides it from the second database on. `role="group"` rather
+                 than a tablist: there is one grid pane, not one per tab. -->
+            <div class="db-tab-strip" id="dbTabStrip" role="group" aria-label="Open databases" hidden></div>
+
             <!-- Toolbar -->
             <div class="toolbar-panel">
                 <div class="toolbar-left">

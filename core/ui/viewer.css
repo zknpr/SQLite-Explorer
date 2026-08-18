@@ -176,6 +176,15 @@ body {
     background: var(--hover-bg);
 }
 
+/* Desktop-gated sections (Open Databases) ship with the `hidden` attribute.
+   The `display: flex` above is an AUTHOR rule and outranks the UA
+   `[hidden] { display: none }`, so without this companion a "hidden" section
+   header stays on screen — the same load-bearing pairing the SQL console
+   documents. Pinned by tests/unit/db_tabs.test.ts. */
+.section-title[hidden] {
+    display: none;
+}
+
 .section-title .arrow {
     margin-right: 4px;
     transition: transform 0.15s;
@@ -198,7 +207,11 @@ body {
     /* overflow-y: auto; - Moved to parent .sidebar-scroll-area */
 }
 
-.item-list.hidden {
+/* `.hidden` is the user's collapse (toggleSection); `[hidden]` is the desktop
+   gate on the Open Databases list. Both must hide it, and neither may depend
+   on the other. */
+.item-list.hidden,
+.item-list[hidden] {
     display: none;
 }
 
@@ -1572,6 +1585,149 @@ body {
 /* Desktop shell: VS Code-only affordances do not exist here. */
 .desktop-app #openInVsCodeBtn,
 .desktop-app #btnOpenViewInVsCode { display: none !important; }
+
+/* ================================================================
+   DATABASE TABS + OPEN DATABASES OVERVIEW (desktop only)
+
+   Both ship `hidden` in the shared template and are unhidden by
+   modules/db-tabs.js from the second open database on, so a
+   single-database window looks exactly as it did before. The
+   `[hidden]` companions here and on .section-title/.item-list are
+   load-bearing for the same reason the console's are: an author
+   `display` rule outranks the UA `[hidden] { display: none }`.
+   ================================================================ */
+.db-tab-strip {
+    display: flex;
+    align-items: stretch;
+    gap: 1px;
+    padding: 0 4px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+    overflow-x: auto;
+    /* The grid must keep every pixel it can: the strip is content-sized and
+       never absorbs the main panel's spare height. */
+    flex-shrink: 0;
+}
+
+.db-tab-strip[hidden] {
+    display: none;
+}
+
+.db-tab {
+    display: flex;
+    align-items: center;
+    max-width: 240px;
+    background: var(--bg-tertiary);
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-radius: 3px 3px 0 0;
+}
+
+.db-tab:hover {
+    background: var(--hover-bg);
+}
+
+.db-tab.active {
+    background: var(--bg-primary);
+    border-color: var(--border-color);
+    /* The one high-contrast cue that survives every palette, including the
+       high-contrast theme where background differences flatten out. */
+    box-shadow: inset 0 2px 0 0 var(--accent-color);
+}
+
+.db-tab-select {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    padding: 5px 4px 5px 10px;
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.db-tab.active .db-tab-select {
+    color: var(--text-primary);
+}
+
+.db-tab-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.db-tab-engine,
+.db-item-engine {
+    flex-shrink: 0;
+    padding: 0 5px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-secondary);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+/* Same tint the footer's engine badge uses, so "which engine is this?" reads
+   identically wherever it is answered. */
+.db-tab-engine[data-engine="native"],
+.db-item-engine[data-engine="native"] {
+    color: var(--success-color);
+    border-color: var(--success-color);
+}
+
+.db-tab-dirty,
+.db-item-dirty {
+    flex-shrink: 0;
+    color: var(--accent-color);
+    font-size: 10px;
+    line-height: 1;
+}
+
+.db-tab-close {
+    display: flex;
+    align-items: center;
+    padding: 4px 6px;
+    background: none;
+    border: none;
+    border-radius: 3px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    /* Always present, never jumpy: revealing it on hover would move the tab's
+       label under the pointer mid-click. */
+    opacity: 0.55;
+}
+
+.db-tab-close:hover {
+    background: var(--hover-bg);
+    color: var(--text-primary);
+    opacity: 1;
+}
+
+.db-tab-close:focus-visible,
+.db-tab-select:focus-visible {
+    outline: 1px solid var(--accent-color);
+    outline-offset: -1px;
+}
+
+/* Sidebar overview rows: the schema tree's .list-item styling plus the same
+   engine badge and dirty dot the tabs carry. */
+.db-list-item .item-name {
+    flex: 1;
+}
+
+.db-list-item .db-item-engine,
+.db-list-item .db-item-dirty {
+    margin-left: auto;
+}
+
+.db-list-item .db-item-engine + .db-item-dirty {
+    margin-left: 4px;
+}
 
 /* ================================================================
    SQL CONSOLE (desktop only)

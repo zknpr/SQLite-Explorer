@@ -141,8 +141,15 @@ export function syncSelectedTableIdentity() {
 export async function refreshSchema() {
     if (!state.isDbConnected) return;
 
+    // See loadTableColumns (grid-data.js) for the full reasoning: a desktop
+    // database switch mid-fetch swaps `state` under this operation, so the
+    // schema fetched for the outgoing database must not become the incoming
+    // one's tree. Null (and so always equal) off-desktop.
+    const requestedDbId = state.dbId;
+
     try {
         const schema = await backendApi.fetchSchema();
+        if (requestedDbId !== state.dbId) return;
 
         state.schemaCache.tables = (schema.tables || []).map(t => ({
             name: t.identifier,
@@ -459,8 +466,11 @@ export async function applyBatchUpdate() {
     }
 
     // Snapshot the target so the count-cache note below can never be applied
-    // to a table the user switched to while the batch RPC was in flight.
+    // to a table the user switched to while the batch RPC was in flight — nor,
+    // on the desktop, to a whole different database (the host targeted the
+    // active one when the RPC was issued, and `state` is swapped on a switch).
     const targetTable = state.selectedTable;
+    const targetDbId = state.dbId;
 
     try {
         updateStatus(`Updating ${updates.length} cells...`);
@@ -476,6 +486,11 @@ export async function applyBatchUpdate() {
         }));
 
         const outcomes = await backendApi.updateCellBatch(targetTable, backendUpdates, label);
+        // The edit landed in the database it was issued against and lives in
+        // that database's undo history; only this page's bookkeeping is left,
+        // and none of it belongs to the database now on screen. Its own grid
+        // reload will show the new values when the user switches back.
+        if (targetDbId !== state.dbId) return;
         // Edited values may enter/leave an active filter's match set, so the
         // table's cached filtered counts are no longer trustworthy.
         noteCellValuesChanged(targetTable);
@@ -632,12 +647,21 @@ export async function selectTableItem(name, type) {
 export async function reloadFromDisk() {
     if (!state.isDbConnected) return;
 
+    // The multi-RPC operation with the widest blast radius: everything below
+    // the refreshFile round trip (the connection flags, the schema tree, the
+    // columns, the rows) would be committed into whichever database is active
+    // when it resolves. Abandon the whole tail if that is no longer the one
+    // the reload was asked for — the incoming database's own switch reload is
+    // already on its way and owns the status line from here.
+    const requestedDbId = state.dbId;
+
     try {
         updateStatus('Reloading...');
         // The reload exists to pick up changes this webview didn't make, so
         // no cached count survives it.
         invalidateAllCounts();
         const connectionResult = await backendApi.refreshFile();
+        if (requestedDbId !== state.dbId) return;
         if (connectionResult?.connected === true) {
             applyConnectionResult(connectionResult);
         }

@@ -65,6 +65,25 @@ const DESKTOP_EXPORT_MAX_BYTES = 512 * 1024 * 1024;
 
 const STARTUP_DB_NAME = 'untitled.db';
 
+/**
+ * How many databases may be open at once.
+ *
+ * Every open database costs a whole engine: a WASM one is its own `Worker`
+ * holding its own full copy of the file in memory, a native one is its own
+ * sidecar process. Nothing bounded the WASM lane — the shell caps native
+ * sidecars at 16 (`MAX_NATIVE_SIDECARS`, src-tauri/src/native.rs), and once
+ * tabs made opening a one-click habit an unbounded registry was one held ⌘O
+ * away from N workers and N copies of the data.
+ *
+ * The number is deliberately the SHELL's: one cap for both engines means the
+ * refusal never depends on which engine served the open, and a native open
+ * can't be silently downgraded to WASM by hitting the shell's cap first (a
+ * failed `nativeOpen` falls back to bytes on purpose — see tryOpenNative).
+ * Enforced at the two lanes that CREATE an entry, after the dedupe, so
+ * switching to an already-open file always works at the cap.
+ */
+export const MAX_OPEN_DATABASES = 16;
+
 export function createDesktopHost({ bridge, createWorker }) {
     // ---- app-global state ---------------------------------------------------
     // Everything here is app-wide by design: one settings store, one webview,
@@ -992,12 +1011,29 @@ export function createDesktopHost({ bridge, createWorker }) {
         return request;
     }
 
+    /**
+     * Refuses an open that would exceed {@link MAX_OPEN_DATABASES}. Called
+     * AFTER the dedupe on every lane that creates an entry: re-opening a file
+     * that is already open only switches to it, so the cap can never wall the
+     * user off from a database they already have.
+     */
+    function assertRoomForAnotherDatabase(name) {
+        if (databases.size < MAX_OPEN_DATABASES) return;
+        throw new Error(
+            `Cannot open "${name}": ${MAX_OPEN_DATABASES} databases are already open. `
+            + 'Close one first.'
+        );
+    }
+
     async function openPathOnce(path, name, { size } = {}) {
         const alreadyOpen = findEntryByPath(path);
         if (alreadyOpen) {
             await activateEntry(alreadyOpen, { snapshotOutgoing: true });
             return true;
         }
+        // Before the engine work, not after: refusing here spawns no sidecar,
+        // boots no worker and reads no bytes.
+        assertRoomForAnotherDatabase(name);
 
         if (hasNativeBridge()) {
             const nativeEntry = await tryOpenNative(path, name);
@@ -1372,6 +1408,7 @@ export function createDesktopHost({ bridge, createWorker }) {
             // very large databases (the worker reads the handle on demand).
             // Always WASM — there is no OS path to bind a sidecar to, and no
             // on-disk write-back target either.
+            assertRoomForAnotherDatabase(file.name);
             const entry = createEntry({ engine: 'wasm', currentPath: null, currentName: file.name });
             bootWorkerFor(entry);
             try {
