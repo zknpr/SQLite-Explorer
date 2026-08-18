@@ -280,18 +280,40 @@ export function createDesktopHost({ bridge, createWorker }) {
         try {
             await callWorker('runQuery', [statement]);
         } catch (error) {
-            // Two failure families share this catch and MUST diverge: "no
+            // Three failure families share this catch and MUST diverge: "no
             // transaction is active" (a console script already closed the
-            // session underneath — tolerate, nothing left to end) versus a
-            // genuine COMMIT failure (disk full, deferred FK violation),
-            // where SQLite keeps the transaction open and the flag must stay
-            // true so the user can retry. Classic engines are separable by
-            // message; the fork answers the generic "SQL logic error" for the
-            // no-txn state, which missing tables etc. share — so when the
-            // message is not the classic no-txn answer, ask the ENGINE which
-            // family this was: transaction still open ⇒ genuine failure.
+            // session underneath — tolerate, nothing left to end); a genuine
+            // failure with the transaction KEPT open (SQLite's default —
+            // flag stays true so the user can retry); and a genuine COMMIT
+            // failure where the engine ROLLED THE TRANSACTION BACK itself
+            // (documented for SQLITE_FULL/IOERR/NOMEM/INTERRUPT — and
+            // autocommit-after-a-failed-COMMIT is the documented way to
+            // DETECT it). Classic engines separate the first by message; for
+            // the rest the ENGINE state decides: probe says open ⇒ retryable
+            // genuine failure; probe says autocommit ⇒ depends on intent.
             if (!/no transaction is active/i.test(error?.message ?? '')) {
                 if (await probeTxnOpen()) throw error;
+                if (statement === 'COMMIT') {
+                    // Auto-rollback: the engine DISCARDED the session's
+                    // pending changes while failing the save. Reporting
+                    // success here (checkpoint, clean title) would silently
+                    // lose them — the save must fail loudly, and the grid
+                    // must stop showing values that no longer exist.
+                    nativeTxnOpen = false;   // nothing left to commit against
+                    try {
+                        await refreshUi();
+                    } catch (uiError) {
+                        console.warn('Post-auto-rollback UI refresh failed:', uiError);
+                    }
+                    const rolledBack = new Error(
+                        'COMMIT failed and SQLite rolled the transaction back — '
+                        + `the pending changes were discarded, not saved (${error?.message ?? error})`
+                    );
+                    rolledBack.cause = error;
+                    throw rolledBack;
+                }
+                // ROLLBACK: the discard intent was fulfilled by the engine's
+                // own rollback — tolerate and fall through.
             }
         }
         nativeTxnOpen = false;
@@ -560,6 +582,13 @@ export function createDesktopHost({ bridge, createWorker }) {
      * maxFileSize cap, which only ever applied to byte inhaling.
      */
     async function openFromPath(path, name, { size } = {}) {
+        // Sampled BEFORE the native attempt: tryOpenNative's init-refusal
+        // path itself calls closeNativeSidecar(), which nulls nativeBoundPath
+        // — sampling after it would read "no native session" for exactly the
+        // slice where the OLD native document was just torn down (nativeOpen
+        // replaced the sidecar, init refused), leaving the invalidation below
+        // unarmed while ⌘S was pointed at the old file with a stale worker.
+        const hadNativeSession = nativeBoundPath !== null;
         if (hasNativeBridge() && await tryOpenNative(path, name)) {
             currentPath = path;
             currentName = name;
@@ -569,9 +598,9 @@ export function createDesktopHost({ bridge, createWorker }) {
         }
         // A native session from a previous open must not outlive the switch:
         // its sidecar still holds the old file (open transaction included —
-        // shutdown rolls it back by SQLite journal semantics).
-        const hadNativeSession = nativeBoundPath !== null;
-        if (hadNativeSession) await closeNativeSidecar();
+        // shutdown rolls it back by SQLite journal semantics). Conditional on
+        // the CURRENT binding — tryOpenNative may have already closed it.
+        if (nativeBoundPath !== null) await closeNativeSidecar();
         engine = 'wasm';
         // Once the sidecar is gone — or the worker re-init below has begun —
         // the WASM worker does NOT hold the document currentPath names: its

@@ -817,7 +817,14 @@ function makeNativeBridgeMembers(
  * (what actually opened/committed/rolled back) instead of wire noise.
  */
 function makeTxnFake(flavor: 'classic' | 'fork' = 'classic') {
-  const txn = { open: false, applied: [] as string[] };
+  // `autoRollbackNextCommit` models SQLite's documented behavior on
+  // SQLITE_FULL/IOERR/NOMEM/INTERRUPT: the COMMIT fails AND the engine rolls
+  // the transaction back automatically, leaving autocommit active — which is
+  // exactly what a post-failure BEGIN probe then observes. Without this mode
+  // the fake could only express "failed COMMIT keeps the txn open", hiding
+  // the discarded-session family entirely (the same "the fakes lied" gap the
+  // fork-message flavor closed for error strings).
+  const txn = { open: false, applied: [] as string[], autoRollbackNextCommit: false };
   const msg = (classic: string) => (flavor === 'fork' ? 'SQL logic error' : classic);
   const exec = (sql: unknown) => {
     const s = String(sql).trim().toUpperCase();
@@ -827,6 +834,13 @@ function makeTxnFake(flavor: 'classic' | 'fork' = 'classic') {
       txn.applied.push('BEGIN');
     } else if (s === 'COMMIT' || s === 'END') {
       if (!txn.open) throw new Error(msg('cannot commit - no transaction is active'));
+      if (txn.autoRollbackNextCommit) {
+        txn.autoRollbackNextCommit = false;
+        txn.open = false;                       // the engine discarded the txn
+        txn.applied.push('AUTO-ROLLBACK');
+        // Same string on both flavors: sqlite3_errstr(SQLITE_FULL).
+        throw new Error('database or disk is full');
+      }
       txn.open = false;
       txn.applied.push('COMMIT');
     } else if (s === 'ROLLBACK') {
@@ -1692,4 +1706,147 @@ test('fork messages: a genuine COMMIT failure is still separated from the generi
   assert.equal(ok, true);
   assert.equal(txn.open, false);
   assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT']);    // one txn; retry did not re-BEGIN
+});
+
+// ============================================================================
+// Fix round 2 — re-review defects
+// ============================================================================
+
+// STILL-OPEN CRITICAL slice: `hadNativeSession` used to be sampled AFTER
+// tryOpenNative — whose init-refusal path calls closeNativeSidecar(), nulling
+// nativeBoundPath. So "nativeOpen succeeds, native init refuses, WASM lane
+// fails BEFORE the worker is touched" left the invalidation unarmed and ⌘S
+// re-armed to overwrite the old file with the empty startup image. The sample
+// must be taken BEFORE the native attempt.
+test('init-refusal slice: native open ok, native init refuses, cap fails the WASM lane — invalidation still arms', async () => {
+  let refuseNativeInit = false;
+  const { txn, exec } = makeTxnFake();
+  const { members, log } = makeNativeBridgeMembers({
+    initializeDatabase: () => {
+      if (refuseNativeInit) throw new Error('file is not a database');
+      txn.open = false;
+      return { isReadOnly: false, storage: 'memory' };
+    },
+    runQuery: (args) => exec(args[0]),
+    updateCell: () => 1,
+    ping: () => true
+  });
+  const { host, posted, saved } = makeHost(
+    { exportDatabase: () => new Uint8Array([9, 9, 9]) },   // what a rogue ⌘S would write
+    {
+      ...members,
+      pickDatabase: async () => ({ path: '/tmp/huge-corrupt.db', name: 'huge-corrupt.db', size: 5 * 1024 * 1024 }),
+      loadSettings: async () => ({ maxFileSize: 1 })
+    }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/precious.db');              // native (shell path: no cap)
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+  assert.equal(host.hasUnsavedChanges(), true);
+
+  refuseNativeInit = true;
+  await assert.rejects(() => host.openDatabaseViaDialog(), /maxFileSize/);
+  assert.equal(log.closes >= 1, true);                           // second sidecar torn down inside tryOpenNative
+
+  const wrote = await host.saveToDisk();
+  assert.equal(wrote, false);
+  assert.equal(saved.path, undefined);                           // bridge.saveDatabase never ran
+  assert.equal(posted.filter(p => p.content.targetMethod === 'exportDatabase').length, 0);
+  assert.equal(host.hasUnsavedChanges(), false);
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.filename, 'untitled.db');
+  assert.equal(init.engine, 'wasm');
+});
+
+test('init-refusal slice, read-throw variant: readDatabaseBytes failure after the refusal also invalidates', async () => {
+  let refuseNativeInit = false;
+  const { txn, exec } = makeTxnFake();
+  const { members } = makeNativeBridgeMembers({
+    initializeDatabase: () => {
+      if (refuseNativeInit) throw new Error('file is not a database');
+      txn.open = false;
+      return { isReadOnly: false, storage: 'memory' };
+    },
+    runQuery: (args) => exec(args[0]),
+    updateCell: () => 1,
+    ping: () => true
+  });
+  const { host, saved } = makeHost(
+    { exportDatabase: () => new Uint8Array([9, 9, 9]) },
+    {
+      ...members,
+      readDatabaseBytes: async () => { throw new Error('EACCES: read refused'); }
+    }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/precious.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  refuseNativeInit = true;
+  await assert.rejects(() => host.openFromShellPath('/tmp/corrupt.db'), /EACCES/);
+  assert.equal(await host.saveToDisk(), false);
+  assert.equal(saved.path, undefined);
+  assert.equal(host.hasUnsavedChanges(), false);
+});
+
+// NEW IMPORTANT (introduced by round 1): autocommit after a failed COMMIT is
+// SQLite's documented auto-rollback signature (SQLITE_FULL/IOERR/NOMEM/
+// INTERRUPT may roll the transaction back; checking autocommit is the
+// official detection). The probe-false branch used to read that as tolerable
+// state noise and let saveToDisk checkpoint + clean the title — a silent
+// discard of the session. It must reject loudly instead.
+test('an auto-rolled-back COMMIT is a loud failure, not a fake save (fork messages)', async () => {
+  const { host, txn } = makeNativeHost({ updateCell: () => 1 }, {}, {}, { txnFlavor: 'fork' });
+  await host.start();
+  let refreshes = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshes++; return { success: true }; } });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+  refreshes = 0;
+
+  txn.autoRollbackNextCommit = true;
+  await assert.rejects(() => host.saveToDisk(), /rolled the transaction back|discarded/);
+  assert.equal(host.hasUnsavedChanges(), true);          // checkpoint never ran — no fake "saved"
+  assert.equal(txn.open, false);                          // engine really is in autocommit
+  assert.equal(refreshes, 1);                             // grid told to reload the engine truth
+  // Edit txn, the engine's auto-rollback, then the classifying probe's own
+  // empty open/close pair (real transitions, so the fake logs them).
+  assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT']);
+
+  // The session is recoverable: a new edit opens a fresh transaction and a
+  // clean save commits it.
+  await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v', 1048576]);
+  const ok = await host.saveToDisk();
+  assert.equal(ok, true);
+  assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT', 'BEGIN', 'COMMIT']);
+});
+
+test('an auto-rolled-back ROLLBACK stays tolerated: the discard intent was fulfilled', async () => {
+  // ROLLBACK that fails non-classically while the engine lands in autocommit:
+  // the transaction is gone, which is exactly what refresh wanted — the
+  // refresh must complete, not error.
+  const { txn, exec } = makeTxnFake('fork');
+  const initConfigs: unknown[] = [];
+  const { host } = makeNativeHost({
+    updateCell: () => 1,
+    initializeDatabase: (args) => { initConfigs.push(args); txn.open = false; return { isReadOnly: false, storage: 'memory' }; },
+    runQuery: (args) => {
+      const sql = String(args[0]).trim().toUpperCase();
+      if (sql === 'ROLLBACK' && txn.open) {
+        txn.open = false;                                 // engine discarded the txn while erroring
+        throw new Error('disk I/O error');
+      }
+      return exec(args[0]);
+    }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  await host.refreshFromDisk();                           // must not reject
+  assert.equal(initConfigs.length, 2);                    // open + refresh reopen (start rides the WASM worker)
+  assert.equal(host.hasUnsavedChanges(), false);
 });
