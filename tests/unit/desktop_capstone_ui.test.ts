@@ -8,12 +8,10 @@
  *    have, named after the finding in
  *    SQLite-Explorer-App/.superpowers/sdd/2026-08-18-multi-db/capstone-ui-report.md.
  *
- * Fix wave 1b closed D1, D2, D3, U1, U2 and G1: every one of those markers is
- * now a real assertion against the fixed behaviour. The ONE marker still
- * skipped is U3/G2 (oversized cells) — it was not in that wave's scope, its
- * second half is a feature (streaming a >1 MiB cell through
- * openCellReadSession/readCellChunk) rather than a defect, and a
- * wording-only half-fix would erase the marker without closing the bug.
+ * Fix wave 1b closed D1, D2, D3, U1, U2 and G1. Wave 2 closed the last marker,
+ * U3/G2 (oversized cells), together with G3 (drag-and-drop) and G4/G5 (inert
+ * settings and unpersisted UI state): NO test in this file is skipped any more,
+ * and every former marker is a real assertion against the fixed behaviour.
  *
  * Harnesses are lifted from the files that already own these modules:
  * desktop_host.test.ts (fake worker + fake bridge) and grid_count_cache.test.ts
@@ -735,36 +733,39 @@ test('FIXED G1: the desktop entry point wires the export-db menu id to the host'
 // H. Oversized cells: the desktop tells the user about "the web demo"
 // ===========================================================================
 
-test('BUG U3: the desktop refuses oversized-cell viewing with the WEB DEMO\'s wording', async () => {
+test('FIXED U3: the desktop refusals name the DESKTOP and point at the working route', async () => {
     // desktop-api.js:200-218 was copied from web-api.js verbatim, so the two
     // refusals a desktop user can actually hit — "Download" on an oversized
-    // cell (blob-inspector openFullContent) and a large media preview — name a
-    // product they are not running. There is also no working path behind
-    // either: openCellReadSession/readCellChunk exist on backendApi and are
-    // special-cased by the host, but NO UI module calls them, so an oversized
-    // cell tops out at the 64 KiB bounded preview on the desktop.
+    // cell (blob-inspector openFullContent) and a large media preview — named a
+    // product they are not running, and named no alternative because there was
+    // none. Both are still refusals (neither capability exists on the desktop),
+    // but they now name this app and the route that does work.
     const desktopApi = await import(desktopApiModulePath);
     const editor = await desktopApi.backendApi.openCellEditor(
         {}, 1, 'blob', {}, { sourceByteLength: 5_000_000 }
     ) as { success: boolean; message: string };
     assert.equal(editor.success, false);
-    assert.match(editor.message, /web demo/);
+    assert.doesNotMatch(editor.message, /web demo/);
+    assert.match(editor.message, /Load More/);
 
     const media = await desktopApi.backendApi.prepareCellMediaPreview(
         {}, 1, 'blob', { sourceByteLength: 5_000_000 }
     ) as { success: boolean; message: string };
     assert.equal(media.success, false);
-    assert.match(media.message, /web demo/);
+    assert.doesNotMatch(media.message, /web demo/);
+    assert.match(media.message, /Load More/);
 });
 
-test.skip('BUG U3: desktop refusals should name the desktop app, and oversized cells need a real path', () => {
-    // STILL OPEN — deliberately out of fix wave 1b's scope. Desired:
-    // desktop-api.js supplies its own messages, and the blob inspector's
-    // "Download" for an oversized cell streams through openCellReadSession/
-    // readCellChunk (already implemented in the worker and guarded by the host)
-    // instead of refusing. The second half is a feature, not a defect fix, and
-    // shipping only the wording change would retire this marker without giving
-    // the desktop any way to read a >1 MiB cell in full.
+test('FIXED G2: the shipped desktop bundle actually CALLS the chunked cell-read API', () => {
+    // The other half of the finding, and a static one like G1: the worker
+    // implemented openCellReadSession/readCellChunk/closeCellReadSession, the
+    // host special-cased them to keep its native export guard honest, and NO UI
+    // module called them — so the host's cellReadSessionOpen flag could never
+    // become true and a >64 KiB cell could not be read in full at all.
+    const bundle = desktopBundle();
+    assert.ok(/\.openCellReadSession\(/.test(bundle), 'no call site for openCellReadSession');
+    assert.ok(/\.readCellChunk\(/.test(bundle), 'no call site for readCellChunk');
+    assert.ok(/\.closeCellReadSession\(/.test(bundle), 'no call site for closeCellReadSession');
 });
 
 // ===========================================================================
@@ -879,4 +880,69 @@ test('GAP: a filter that matches nothing EMPTIES the grid instead of leaving the
         backendApi.fetchTableData = originals.data;
         delete (globalThis as any).document;
     }
+});
+
+// ===========================================================================
+// J. Drag-and-drop, and settings that used to do nothing (BUGS G3, G4, G5)
+// ===========================================================================
+
+test('FIXED G3: the desktop entry wires OS file drops to the shell path lane', () => {
+    // `host.openDatabaseFromFile` had no call site in core/ — dropping a .db on
+    // the window could not open it. It is gone: Tauri handles OS drag-and-drop
+    // natively (`dragDropEnabled` defaults true), so the webview never receives
+    // an HTML5 file drop at all and a `File` handle could never have arrived.
+    // The shell forwards PATHS instead, which is also the only shape that can
+    // bind a native sidecar and stay saveable in place.
+    const source = readFileSync(
+        path.resolve(process.cwd(), 'core/ui/desktop-viewer.js'), 'utf8'
+    );
+    assert.match(source, /bridge\.onDragDropPaths\?\.\(/);
+    assert.match(source, /openFromShellPath\(path\)/);
+
+    const host = readFileSync(
+        path.resolve(process.cwd(), 'core/ui/modules/desktop-host.js'), 'utf8'
+    );
+    assert.doesNotMatch(host, /^\s*async openDatabaseFromFile\(/m);
+
+    // The optional bridge member is declared, like onOpenFile, so an older
+    // shell without it degrades to "drops do nothing" rather than throwing.
+    const types = readFileSync(
+        path.resolve(process.cwd(), 'core/ui/modules/desktop-host.d.ts'), 'utf8'
+    );
+    assert.match(types, /onDragDropPaths\?\(handler: \(paths: string\[\]\) => void\): void;/);
+});
+
+test('FIXED G4: the desktop consumes defaultPageSize and maxInlineCellBytes', () => {
+    // Both were declared in DEFAULT_SETTINGS and read by nobody:
+    // resolveStartupPageSize is called only from the VS Code entry (which gets
+    // the value off an HTML-template dataset the desktop page does not have),
+    // and maxInlineCellBytes had no reader anywhere.
+    const source = readFileSync(
+        path.resolve(process.cwd(), 'core/ui/desktop-viewer.js'), 'utf8'
+    );
+    assert.match(source, /resolveStartupPageSize\(startupSettings\.defaultPageSize/);
+    assert.match(source, /syncPageSizeSelect\(state\.rowsPerPage\)/);
+
+    const host = readFileSync(
+        path.resolve(process.cwd(), 'core/ui/modules/desktop-host.js'), 'utf8'
+    );
+    assert.match(host, /maxInlineCellBytes: settings\.maxInlineCellBytes/);
+});
+
+test('FIXED G5: sidebar width persists through the settings store, not dead localStorage', () => {
+    const source = readFileSync(
+        path.resolve(process.cwd(), 'core/ui/desktop-viewer.js'), 'utf8'
+    );
+    assert.match(source, /initSidebarResize\(\s*startupSettings\.sidebarWidth > 0/);
+
+    // The width was ALSO dropped one layer lower: ui.js calls
+    // saveSidebarState('left', width) and this lane declared one parameter.
+    const api = readFileSync(
+        path.resolve(process.cwd(), 'core/ui/modules/desktop-api.js'), 'utf8'
+    );
+    assert.match(api, /saveSidebarState: \(side, position\) =>/);
+
+    // And the viewer-state seam is now an explicit no-op rather than a write
+    // nobody reads — see tests/unit/desktop_api.test.ts for the behaviour.
+    assert.match(api, /export function saveVsCodeState\(_stateObj\) \{\}/);
 });

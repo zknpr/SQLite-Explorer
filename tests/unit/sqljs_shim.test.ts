@@ -513,6 +513,92 @@ describe('sqljs-shim: error surfaces', () => {
     differentialThrows('UNIQUE violation', db => db.run("INSERT INTO u VALUES(1, 'y')"), 19);
     differentialThrows('NOT NULL violation', db => db.run('INSERT INTO u VALUES(2, NULL)'), 19);
 
+    /**
+     * The stand-in is node:sqlite, which DOES report `sqlite3_errmsg`, so these
+     * assert the honesty gate from the side the fork cannot reach: a specific
+     * message must survive untouched. The enrichment itself is proven against
+     * the real binary (`npm run native-lane` / the probe recorded in the wave-2
+     * report) and unit-tested in tests/unit/sqlite_errors.test.ts.
+     */
+    it('leaves a binding that reports a real SQLite message alone', () => {
+        const shim = createShim();
+        try {
+            shim.run(SEED_SQL);
+            for (const [sql, pattern] of [
+                ['SELECT * FROM nope', /no such table: nope/],
+                ['SELECT nope FROM t', /no such column: nope/],
+                ["INSERT INTO u VALUES(2, NULL)", /NOT NULL constraint failed/]
+            ] as [string, RegExp][]) {
+                assert.throws(() => shim.exec(sql), (error: unknown) => {
+                    const message = (error as Error).message;
+                    assert.match(message, pattern);
+                    assert.doesNotMatch(message, /SQLITE_/, `enriched a specific message: ${message}`);
+                    return true;
+                });
+            }
+        } finally {
+            shim.close();
+        }
+    });
+
+    it('enriches a nonspecific message and keeps its errno', () => {
+        // Forces the fork's shape onto the stand-in: canonical errstr text with
+        // the primary result code, which is exactly what the real binary hands
+        // back for every SQLITE_ERROR.
+        type BackingDatabase = {
+            prepare(sql: string): unknown;
+            exec(sql: string): unknown;
+            close(): void;
+        };
+        const Backing = standInSqliteModule.Database as unknown as
+            new (...ctorArgs: unknown[]) => BackingDatabase;
+        const forkShaped = {
+            Database: class {
+                #inner: BackingDatabase;
+                constructor(...args: unknown[]) {
+                    this.#inner = new Backing(...args);
+                }
+                prepare(sql: string) {
+                    try {
+                        return this.#inner.prepare(sql);
+                    } catch (error) {
+                        const replacement = new Error('SQL logic error');
+                        Object.defineProperty(replacement, 'errno', {
+                            value: (error as { errno?: number }).errno ?? 1,
+                            enumerable: false
+                        });
+                        throw replacement;
+                    }
+                }
+                exec(sql: string) { return this.#inner.exec(sql); }
+                close() { this.#inner.close(); }
+            }
+        };
+        const shim = createShimDatabase({}, { sqlite: forkShaped as never });
+        try {
+            shim.run(SEED_SQL);
+            // Proven missing table: SQLite's own phrasing, recovered.
+            assert.throws(() => shim.exec('SELECT * FROM absent_table'), (error: unknown) => {
+                assert.equal((error as Error).message, 'no such table: absent_table');
+                assert.equal((error as { errno?: number }).errno, 1, 'errno must survive the rewrite');
+                return true;
+            });
+            // Nothing provable: the class, plus why the engine cannot say more.
+            assert.throws(() => shim.exec('SELECT nope FROM t'), (error: unknown) => {
+                assert.match((error as Error).message, /^SQL logic error \(SQLITE_ERROR: /);
+                assert.equal((error as { errno?: number }).errno, 1);
+                return true;
+            });
+            // A name that exists is never accused.
+            assert.throws(() => shim.exec('SELECT * FROM t WHERE'), (error: unknown) => {
+                assert.doesNotMatch((error as Error).message, /no such table/);
+                return true;
+            });
+        } finally {
+            shim.close();
+        }
+    });
+
     it('a statement-level failure carries errno', () => {
         const shim = createShim();
         try {

@@ -36,7 +36,13 @@ import {
   encodeJsonExportCell,
   encodeSqlExportCell
 } from '../../../src/core/export-encoding.ts';
-import { executeSchemaPreservingColumnDrop } from '../../../src/core/column-drop.ts';
+import {
+  COLUMN_DROP_DEPENDENT_OBJECT_SQL,
+  COLUMN_DROP_INDEX_SQL,
+  executeSchemaPreservingColumnDrop,
+  indexSqlReferencesAnyColumn,
+  schemaObjectSqlMentionsColumn
+} from '../../../src/core/column-drop.ts';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 import {
   applyMergePatch,
@@ -2533,9 +2539,18 @@ async function getTableInfo(table) {
 }
 
 function getInsertableColumnNames(table) {
+  // hidden: 0 ordinary, 1 virtual-table HIDDEN, 2 GENERATED VIRTUAL,
+  // 3 GENERATED STORED. Only 0 is insertable.
+  //
+  // Excluding 1 is what makes a deleted FTS5 row restorable: an fts5 table
+  // carries two hidden columns — `<table>` (its command channel: writing to it
+  // means "rebuild"/"optimize", not a value) and `rank` — and a delete snapshot
+  // that carried them produced `INSERT INTO docs (title, body, docs, rank)`,
+  // which SQLite refuses. The rowid is snapshotted separately by the caller, so
+  // dropping the hidden columns loses nothing an insert could have restored.
   const result = db.exec(
     'SELECT name FROM pragma.pragma_table_xinfo(?) ' +
-    'WHERE hidden NOT IN (2, 3) ORDER BY cid',
+    'WHERE hidden = 0 ORDER BY cid',
     [table]
   );
   return (result[0]?.values ?? []).map(row => {
@@ -2963,6 +2978,20 @@ async function deleteColumns(table, columns, dropDependentIndexes) {
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Column deletion');
   if (columns.length === 0) return;
+  // `dropDependentIndexes` is a LIST of index names, not a boolean. The
+  // parameter name invites the boolean, and passing one used to escape as
+  // `(dropDependentIndexes ?? []) is not iterable` from deep inside the drop.
+  // This argument reaches the worker from the webview, so it is validated here
+  // rather than trusted.
+  if (dropDependentIndexes !== undefined) {
+    if (!Array.isArray(dropDependentIndexes)
+        || dropDependentIndexes.some(name => typeof name !== 'string' || name.length === 0)) {
+      throw new Error(
+        'dropDependentIndexes must be an array of index names ' +
+        '(use findColumnDependencies to obtain it)'
+      );
+    }
+  }
 
   const savepointName = createViewSavepointName('sp_delete_columns');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
@@ -2976,8 +3005,79 @@ async function deleteColumns(table, columns, dropDependentIndexes) {
     runSingleStatement(`RELEASE ${savepointName}`);
   } catch (e) {
     safeRollbackSavepoint(savepointName, 'deleteColumns');
-    throw e;
+    throw describeColumnDropFailure(e, columns);
   }
+}
+
+/**
+ * Name the views/triggers that could explain a refused DROP COLUMN.
+ *
+ * SQLite rejects a drop that would break a view or trigger, and only one engine
+ * says so usefully: sql.js reports `error in view active_logs after drop
+ * column: no such column: level` while the native fork collapses the same
+ * failure to `SQL logic error`. Runs ONLY after the engine has already refused,
+ * so the over-inclusive name match can add a wrong name to a message but can
+ * never block a drop that would have worked.
+ */
+function describeColumnDropFailure(error, columns) {
+  let dependents;
+  try {
+    dependents = findDependentSchemaObjects(columns);
+  } catch {
+    // A diagnostic must never replace the failure it is describing.
+    return error;
+  }
+  if (dependents.length === 0) return error;
+  const original = error instanceof Error ? error.message : String(error);
+  const names = dependents.map(object => `${object.type} ${object.identifier}`).join(', ');
+  return new Error(
+    `${original} — these schema objects mention ${columns.join(', ')} and may be blocking ` +
+    `the drop: ${names}. Drop or edit them first.`,
+    { cause: error }
+  );
+}
+
+/** Views/triggers whose stored SQL mentions any of `columns`, by bare-word match. */
+function findDependentSchemaObjects(columns) {
+  const rows = db.exec(COLUMN_DROP_DEPENDENT_OBJECT_SQL)[0]?.values ?? [];
+  return rows
+    .filter(row => (
+      typeof row[1] === 'string'
+      && typeof row[2] === 'string'
+      && columns.some(column => schemaObjectSqlMentionsColumn(row[2], column))
+    ))
+    .map(row => ({ type: row[0], identifier: row[1] }));
+}
+
+/**
+ * What a DROP COLUMN on `table`.`columns` would take with it.
+ *
+ * `indexes` is exact and actionable: SQLite refuses the drop while any of them
+ * exist, and passing the SAME list back as `deleteColumns`' third argument is
+ * what makes the drop succeed. `dependentObjects` is advisory (see
+ * findDependentSchemaObjects) — the UI names them as a warning, never as a
+ * refusal.
+ *
+ * @param {string} table
+ * @param {Array<string>} columns
+ */
+async function findColumnDependencies(table, columns) {
+  if (!db) throw new Error('No database initialized');
+  if (!Array.isArray(columns) || columns.some(column => typeof column !== 'string')) {
+    throw new Error('findColumnDependencies requires an array of column names');
+  }
+  if (columns.length === 0) return { indexes: [], dependentObjects: [] };
+  const indexRows = db.exec(COLUMN_DROP_INDEX_SQL, [table])[0]?.values ?? [];
+  return {
+    indexes: indexRows
+      .filter(row => (
+        typeof row[0] === 'string'
+        && typeof row[1] === 'string'
+        && indexSqlReferencesAnyColumn(row[1], columns)
+      ))
+      .map(row => row[0]),
+    dependentObjects: findDependentSchemaObjects(columns)
+  };
 }
 
 /**
@@ -3381,7 +3481,15 @@ async function undoModification(modification) {
       }
       return;
     default:
-      throw new Error(`Demo history replay does not support undoing ${String(modificationType)}`);
+      // Reached only if a caller records a modification type this replay engine
+      // never claimed. The desktop host's BARRIER_METHODS set keeps the DDL
+      // operations (column_drop included) out of the replay stack entirely, so
+      // this is a contract breach, not a user-facing limit — hence "cannot",
+      // and no "Demo" branding: the desktop ships this same worker.
+      throw new Error(
+        `${String(modificationType)} cannot be undone: this operation is recorded as a ` +
+        'history barrier, not a replayable change'
+      );
   }
 }
 
@@ -3461,7 +3569,11 @@ async function redoModification(modification) {
       }
       return;
     default:
-      throw new Error(`Demo history replay does not support redoing ${String(modificationType)}`);
+      // Mirror of undoModification's default — see the note there.
+      throw new Error(
+        `${String(modificationType)} cannot be redone: this operation is recorded as a ` +
+        'history barrier, not a replayable change'
+      );
   }
 }
 
@@ -3798,6 +3910,7 @@ const methods = {
   insertRow,
   deleteRows,
   deleteColumns,
+  findColumnDependencies,
   createTable,
   getViewDefinition,
   validateViewDefinition,

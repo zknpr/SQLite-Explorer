@@ -15,6 +15,7 @@ import {
     CellEditPolicyError,
     DEFAULT_MAX_CELL_EDIT_BYTES
 } from '../../../src/core/cell-edit-policy.ts';
+import { MAX_CELL_READ_CHUNK_BYTES } from '../../../src/core/cell-read.ts';
 
 
 const FILE_SIGNATURES = {
@@ -38,6 +39,20 @@ const FILE_SIGNATURES = {
 };
 
 export const MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES = 64 * 1024;
+
+/**
+ * How much of an oversized cell one "Load More" click pulls, and how much the
+ * inspector will ever hold in the page.
+ *
+ * The chunked read (openCellReadSession/readCellChunk) is snapshot-consistent
+ * and byte-exact, so the only ceiling that matters is the DOM's: the Preview
+ * tab renders TEXT into a single <pre>, and the whole value also lives in a
+ * Uint8Array. 8 MiB keeps both survivable while covering the sizes people
+ * actually store in a cell; the step is the worker's own per-chunk maximum, so
+ * one click is one RPC in the common case.
+ */
+export const OVERSIZED_INSPECTOR_LOAD_STEP_BYTES = MAX_CELL_READ_CHUNK_BYTES;
+export const MAX_OVERSIZED_INSPECTOR_LOAD_BYTES = 8 * 1024 * 1024;
 
 function isOversizedMediaType(type) {
     return type?.type === 'image'
@@ -80,6 +95,11 @@ export class BlobInspector {
         this.currentColName = null;
         this.currentCellInfo = null;
         this.currentOversizedMetadata = null;
+        // Bytes of the oversized value pulled through the chunked read API, and
+        // therefore the prefix `currentData` currently holds. 0 means the grid's
+        // bounded preview is still what is on screen.
+        this.oversizedLoadedBytes = 0;
+        this.isLoadingOversized = false;
 
         // Track upload state to prevent multiple concurrent uploads and enable proper cleanup
         this.isUploading = false;
@@ -134,19 +154,63 @@ export class BlobInspector {
             : undefined;
 
         if (replaceBtn) {
-            replaceBtn.disabled = state.isReadOnly || uploading || !!mutationBlockReason;
+            replaceBtn.disabled = state.isReadOnly || uploading || this.isLoadingOversized || !!mutationBlockReason;
             replaceBtn.textContent = uploading ? 'Uploading...' : 'Replace';
             replaceBtn.title = mutationBlockReason || '';
         }
         if (downloadBtn) {
-            downloadBtn.disabled = uploading;
-            downloadBtn.textContent = this.currentOversizedMetadata
-                ? 'Open Full Content'
-                : 'Download';
-            downloadBtn.title = this.currentOversizedMetadata
-                ? 'Desktop opens a verified read-only temporary file; the web demo is preview-only'
-                : '';
+            const action = this.oversizedDownloadAction();
+            downloadBtn.disabled = uploading || this.isLoadingOversized;
+            downloadBtn.textContent = this.isLoadingOversized ? 'Loading...' : action.label;
+            downloadBtn.title = action.title;
         }
+    }
+
+    /** True once the chunked reader holds the whole value (never in VS Code). */
+    isOversizedFullyLoaded() {
+        const metadata = this.currentOversizedMetadata;
+        return !!metadata
+            && this.oversizedLoadedBytes > 0
+            && this.oversizedLoadedBytes >= metadata.byteLength;
+    }
+
+    /**
+     * What the Download button does right now.
+     *
+     * Three lanes, because the capability genuinely differs: VS Code can open
+     * the whole value in a real editor tab; the desktop cannot (no host-owned
+     * temp file is exposed to the page) but CAN stream the value in through the
+     * chunked read session, which is what makes a >64 KiB cell inspectable at
+     * all; the web demo has neither and stays preview-only.
+     */
+    oversizedDownloadAction() {
+        const metadata = this.currentOversizedMetadata;
+        if (!metadata || this.isOversizedFullyLoaded()) {
+            return { kind: 'save', label: 'Download', title: '' };
+        }
+        if (!state.isDesktop) {
+            return {
+                kind: 'openEditor',
+                label: 'Open Full Content',
+                title: 'VS Code opens a verified read-only temporary file; the web demo is preview-only'
+            };
+        }
+        const remaining = metadata.byteLength - this.oversizedLoadedBytes;
+        if (this.oversizedLoadedBytes >= MAX_OVERSIZED_INSPECTOR_LOAD_BYTES) {
+            return {
+                kind: 'exhausted',
+                label: 'Load More',
+                title: `The inspector holds at most ${this.formatSize(MAX_OVERSIZED_INSPECTOR_LOAD_BYTES)}; `
+                    + `${this.formatSize(remaining)} of this value cannot be shown. `
+                    + 'Export the table to get the whole value out.'
+            };
+        }
+        return {
+            kind: 'loadMore',
+            label: 'Load More',
+            title: `Read the next ${this.formatSize(Math.min(OVERSIZED_INSPECTOR_LOAD_STEP_BYTES, remaining))} `
+                + 'from a consistent snapshot of this cell'
+        };
     }
 
     async handleReplace() {
@@ -348,6 +412,7 @@ export class BlobInspector {
 
         // Reset upload state to ensure buttons are re-enabled
         this.currentOversizedMetadata = null;
+        this.oversizedLoadedBytes = 0;
         this.setUploadState(false);
 
         if (this.currentObjectUrl) {
@@ -393,10 +458,22 @@ export class BlobInspector {
 
     async download() {
         if (!this.currentData) return;
-        if (this.currentOversizedMetadata) {
+        const action = this.oversizedDownloadAction();
+        if (action.kind === 'openEditor') {
             await this.openFullContent();
             return;
         }
+        if (action.kind === 'loadMore') {
+            await this.loadMoreOversizedContent();
+            return;
+        }
+        if (action.kind === 'exhausted') {
+            updateStatus(action.title);
+            return;
+        }
+        // action.kind === 'save' — either an ordinary cell, or an oversized one
+        // the chunked reader has now loaded in full, so the bytes below ARE the
+        // whole value.
 
         let ext = this.currentType?.ext || 'bin';
         let filename = `blob_${this.currentRowId}.${ext}`;
@@ -427,6 +504,105 @@ export class BlobInspector {
         } catch (err) {
             console.error('Download failed:', err);
             updateStatus(`Download failed: ${err.message}`);
+        }
+    }
+
+    /**
+     * Pull the next window of an oversized cell through the chunked read API.
+     *
+     * The session pins a snapshot of the value for its lifetime, which is the
+     * whole point: a 300 MB BLOB is read as a sequence of bounded windows that
+     * are guaranteed to belong to the SAME value, without ever materialising it
+     * in the engine's response. Reading always restarts at offset 0 on the first
+     * click — the bounded preview on screen came from the grid page and its byte
+     * length is not necessarily a clean prefix in the database's encoding, while
+     * every byte offset here is.
+     *
+     * The worker refuses EVERY other database operation while a session is open,
+     * so the session is opened, drained and closed inside this one call.
+     */
+    async loadMoreOversizedContent() {
+        const metadata = this.currentOversizedMetadata;
+        const table = state.selectedTable;
+        const rowId = this.currentRowId;
+        const colName = this.currentColName;
+        if (!metadata || !table || rowId === null || !colName) {
+            updateStatus('Cannot read this cell: its identity changed. Reopen the inspector.');
+            return;
+        }
+        if (this.isLoadingOversized) return;
+        if (this.oversizedLoadedBytes >= MAX_OVERSIZED_INSPECTOR_LOAD_BYTES) return;
+
+        const generation = this.previewGeneration;
+        this.isLoadingOversized = true;
+        this.setUploadState(this.isUploading);
+        let session;
+        try {
+            session = await backendApi.openCellReadSession({ table, rowId, column: colName });
+            // The session's own metadata is what the chunk offsets refer to;
+            // the grid's copy can be stale after an edit elsewhere.
+            const total = session.metadata?.byteLength ?? metadata.byteLength;
+            const start = this.oversizedLoadedBytes;
+            const budget = Math.min(
+                OVERSIZED_INSPECTOR_LOAD_STEP_BYTES,
+                MAX_OVERSIZED_INSPECTOR_LOAD_BYTES - start
+            );
+            const chunks = [];
+            let offset = start;
+            let loaded = 0;
+            while (loaded < budget && offset < total) {
+                const chunk = await backendApi.readCellChunk(
+                    session.sessionId,
+                    offset,
+                    Math.min(MAX_CELL_READ_CHUNK_BYTES, budget - loaded)
+                );
+                const bytes = chunk?.bytes instanceof Uint8Array
+                    ? chunk.bytes
+                    : new Uint8Array(chunk?.bytes ?? []);
+                // A zero-length window would loop forever; treat it as the end
+                // of the value rather than spinning on the engine.
+                if (bytes.byteLength === 0) break;
+                chunks.push(bytes);
+                loaded += bytes.byteLength;
+                offset += bytes.byteLength;
+                if (chunk.done) break;
+            }
+            if (generation !== this.previewGeneration) return;
+
+            const merged = new Uint8Array(start + loaded);
+            if (start > 0) merged.set(this.currentData.subarray(0, start), 0);
+            let cursor = start;
+            for (const bytes of chunks) {
+                merged.set(bytes, cursor);
+                cursor += bytes.byteLength;
+            }
+            this.currentData = merged;
+            this.oversizedLoadedBytes = merged.byteLength;
+            this.currentType = this.detectType(merged);
+            this.infoContainer.textContent =
+                `${colName} (Row ${rowId}) | ${metadata.storageClass.toUpperCase()} | ` +
+                `Loaded ${this.formatSize(merged.byteLength)} of ${this.formatSize(total)}`;
+            this.renderHex(merged);
+            if (!isOversizedMediaType(this.currentType)) this.renderPreview(merged, this.currentType);
+            updateStatus(
+                merged.byteLength >= total
+                    ? `Loaded the full ${this.formatSize(total)} value`
+                    : `Loaded ${this.formatSize(merged.byteLength)} of ${this.formatSize(total)}`
+            );
+        } catch (error) {
+            const details = error instanceof Error ? error.message : String(error);
+            updateStatus(`Reading the full cell failed: ${details}`);
+        } finally {
+            if (session?.sessionId) {
+                // The worker blocks every other operation until the session is
+                // closed, so a failed close is reported but never swallowed.
+                await backendApi.closeCellReadSession(session.sessionId).catch(error => {
+                    console.error('Failed to close the cell read session:', error);
+                    updateStatus(`Cell read session could not be closed: ${error.message}`);
+                });
+            }
+            this.isLoadingOversized = false;
+            if (generation === this.previewGeneration) this.setUploadState(this.isUploading);
         }
     }
 
@@ -515,6 +691,7 @@ export class BlobInspector {
         this.currentColName = colName;
         this.currentCellInfo = { rowIdx, colIdx };
         this.currentOversizedMetadata = metadata;
+        this.oversizedLoadedBytes = 0;
         this.setUploadState(false);
         this.modal.classList.remove('hidden');
         this.switchTab('preview');

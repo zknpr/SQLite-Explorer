@@ -99,8 +99,40 @@ export function updateToolbarButtons() {
     if (btnExport) btnExport.disabled = !state.selectedTable;
 }
 
+/**
+ * Point the page-size selector at `size`.
+ *
+ * A configured or previously persisted size that is not one of the preset
+ * options gets its own numerically ordered option, so the visible control
+ * always reports the LIMIT queries actually use. Shared because BOTH entry
+ * points resolve a startup page size (VS Code from the vscode-env dataset, the
+ * desktop from its settings store) and a second copy would be a second chance
+ * for the control and `state.rowsPerPage` to disagree.
+ */
+export function syncPageSizeSelect(size) {
+    const pageSizeSelect = document.getElementById('pageSizeSelect');
+    if (!pageSizeSelect) return;
+    const value = String(size);
+    const options = Array.from(pageSizeSelect.options);
+    if (!options.some(option => option.value === value)) {
+        const custom = document.createElement('option');
+        custom.value = value;
+        custom.textContent = value;
+        const next = options.find(option => Number(option.value) > size);
+        pageSizeSelect.insertBefore(custom, next ?? null);
+    }
+    pageSizeSelect.value = value;
+}
+
 // Sidebar Resize Logic
-export function initSidebarResize() {
+/**
+ * @param {{initialWidth?: number}} [options] `initialWidth` is the desktop's
+ *   persisted width from its settings store. VS Code has no such store and
+ *   delivers the width through the `#vscode-env` meta dataset its HTML template
+ *   writes — an element the desktop page does not have at all, which is why the
+ *   restored width has to be able to arrive as an argument.
+ */
+export function initSidebarResize(options = {}) {
     const sidebar = document.getElementById('sidebarPanel');
     const handle = document.getElementById('resizeHandle');
 
@@ -113,7 +145,7 @@ export function initSidebarResize() {
             : undefined;
     };
     const persistedWidth = normalizeWidth(
-        document.getElementById('vscode-env')?.dataset.sidebarLeft
+        options.initialWidth ?? document.getElementById('vscode-env')?.dataset.sidebarLeft
     );
     if (persistedWidth !== undefined) {
         sidebar.style.width = persistedWidth + 'px';

@@ -144,11 +144,17 @@ test('getExtensionSettings maps stored keys onto the VS Code wire shape', async 
   const settings = await host.invoke('getExtensionSettings', []) as Record<string, unknown>;
   // hostBridge.ts parity: panel-facing keys, not the persisted config keys.
   // consoleHistory has no VS Code twin — the SQL console is desktop-only.
+  // defaultPageSize/maxInlineCellBytes/sidebarWidth were declared in
+  // DEFAULT_SETTINGS and delivered to nobody, which is exactly why all three
+  // read as inert settings; they are part of the wire shape now.
   assert.deepEqual(settings, {
     autoCommit: true,
     cellEditBehavior: 'modal',
     fileOperations: 'native',
     theme: 'system',
+    defaultPageSize: 5000,
+    maxInlineCellBytes: 1048576,
+    sidebarWidth: 0,
     consoleHistory: []
   });
 });
@@ -2273,8 +2279,10 @@ test('an auto-rolled-back undo replay reconciles AND leaves no dangling history 
   // The stepped entry must NOT dangle: the history died with the session, so
   // BOTH directions are empty — no stepForward-resurrected phantom on the
   // fresh tracker, nothing left to undo.
-  assert.deepEqual(await host.invoke('triggerUndo', []), { performed: false });
-  assert.deepEqual(await host.invoke('triggerRedo', []), { performed: false });
+  // `reason: 'empty'` — not 'barrier'. The viewer reports the two differently
+  // ("Nothing to undo" vs naming the operation that walled the history off).
+  assert.deepEqual(await host.invoke('triggerUndo', []), { performed: false, reason: 'empty' });
+  assert.deepEqual(await host.invoke('triggerRedo', []), { performed: false, reason: 'empty' });
 
   await host.invoke('updateCell', ['t', 1, 'c', 'v3', 'o', 1048576]);   // fresh txn, pending
   assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT', 'BEGIN']);
@@ -2340,7 +2348,7 @@ test('an auto-rolled-back redo replay reconciles symmetrically', async () => {
   await assert.rejects(() => host.invoke('triggerRedo', []), /disk is full/);
   assert.equal(host.hasUnsavedChanges(), false);          // no stepForward-dangled entry on the fresh tracker
   assert.equal(txn.open, false);
-  assert.deepEqual(await host.invoke('triggerRedo', []), { performed: false });
+  assert.deepEqual(await host.invoke('triggerRedo', []), { performed: false, reason: 'empty' });
   assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT']);
 
   await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'o', 1048576]);   // fresh txn, pending
@@ -2818,13 +2826,18 @@ test('opening past the cap is refused with a message naming it, and the registry
 });
 
 test('the drag-and-drop lane is capped too', async () => {
+  // Drag-and-drop no longer has a lane of its own: Tauri handles OS file drops
+  // natively, so a dropped database arrives as a PATH through the bridge's
+  // onDragDropPaths and opens through openFromShellPath — the same lane, and
+  // therefore the same cap, as Open With and Open Recent. (The removed
+  // host.openDatabaseFromFile(File) had no call site in core/ at all.)
   const { host } = makeHost({});
   await host.start();
   host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
   for (let i = 0; i < MAX_OPEN_DATABASES; i++) await host.openFromShellPath(`/tmp/db${i}.db`);
 
   await assert.rejects(
-    () => host.openDatabaseFromFile({ name: 'dropped.db', size: 3 } as unknown as File),
+    () => host.openFromShellPath('/tmp/dropped.db'),
     new RegExp(`${MAX_OPEN_DATABASES} databases are already open`)
   );
   assert.equal(host.listDatabases().length, MAX_OPEN_DATABASES);
@@ -3396,4 +3409,74 @@ test('a shell without setUnsavedState still works — the push is optional', asy
   host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
   await host.invoke('updateCell', ['t', 7, 'c', 'v', 'o', 1048576]);
   assert.equal(host.hasUnsavedChanges(), true);
+});
+
+// ---------------------------------------------------------------------------
+// Wave 2: settings that used to be declared and never consumed, and the undo
+// refusal the page could not tell apart from a dead keystroke.
+// ---------------------------------------------------------------------------
+
+test('the maxInlineCellBytes setting reaches the engine on every page fetch', async () => {
+  // Declared in DEFAULT_SETTINGS since the port and read by nobody: the grid
+  // never asks for a cell budget, so the worker always fell back to its own
+  // default and a user who set the key got silence.
+  const seen: unknown[] = [];
+  const { host } = makeHost(
+    { fetchTableData: (args) => { seen.push(args[1]); return { headers: [], rows: [] }; } },
+    { loadSettings: async () => ({ maxInlineCellBytes: 4096 }) }
+  );
+  await host.start();
+  await host.invoke('fetchTableData', ['t', { limit: 10 }]);
+  assert.deepEqual(seen[0], { limit: 10, maxInlineCellBytes: 4096 });
+
+  // Default when unset, and the caller's own options are preserved.
+  const { host: plain } = makeHost({
+    fetchTableData: (args) => { seen.push(args[1]); return { headers: [], rows: [] }; }
+  });
+  await plain.start();
+  await plain.invoke('fetchTableData', ['t', undefined]);
+  assert.deepEqual(seen[1], { maxInlineCellBytes: 1048576 });
+});
+
+test('the sidebar width persists, and a nonsense one is refused', async () => {
+  // saveSidebarState was `async () => undefined` — a no-op — so the dragged
+  // width died with the window even though the desktop has a settings store.
+  const { host, saved } = makeHost({});
+  await host.start();
+  await host.invoke('saveSidebarState', ['left', 234.6]);
+  assert.deepEqual(saved.settings, { sidebarWidth: 235 });
+  assert.equal(
+    (await host.invoke('getExtensionSettings', []) as Record<string, unknown>).sidebarWidth,
+    235
+  );
+
+  // Webview-supplied input landing in the one webview-writable file: refuse,
+  // never clamp-and-store, so nothing bogus is persisted quietly.
+  for (const bad of [['right', 200], ['left', 10], ['left', 10000], ['left', 'wide']]) {
+    await assert.rejects(() => host.invoke('saveSidebarState', bad));
+  }
+  assert.deepEqual(saved.settings, { sidebarWidth: 235 });
+});
+
+test('a refused undo says WHY: a barrier is not an empty history', async () => {
+  const { host } = makeHost({
+    updateCell: () => ({ success: true }),
+    deleteColumns: () => undefined,
+    fetchSchema: () => ({ tables: [], views: [], indexes: [] })
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+
+  assert.deepEqual(await host.invoke('triggerUndo', []), { performed: false, reason: 'empty' });
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+  await host.invoke('deleteColumns', ['t', ['c']]);          // records a BARRIER
+
+  // Undo stops at the barrier and NAMES the operation. Before this, ⌘Z after a
+  // column drop was indistinguishable from a keystroke that did nothing.
+  assert.deepEqual(await host.invoke('triggerUndo', []), {
+    performed: false,
+    reason: 'barrier',
+    barrierDescription: 'deleteColumns'
+  });
 });

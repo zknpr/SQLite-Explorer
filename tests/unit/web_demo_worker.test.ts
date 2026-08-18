@@ -4552,4 +4552,169 @@ describe('web demo worker engine defects', () => {
         const writableOpen = await writable.invoke('initializeDatabase', 'rw.db', {});
         assert.strictEqual(writableOpen.isReadOnly, false);
     });
+    // -----------------------------------------------------------------------
+    // Wave 2: undo of an FTS5 delete, and the column-drop dependency surface.
+    // -----------------------------------------------------------------------
+
+    it('restores a deleted FTS5 row, full-text index included', async () => {
+        // The delete snapshot took every column pragma_table_xinfo reported
+        // except generated ones, which for an FTS5 table includes its two
+        // HIDDEN columns — `<table>` (a command channel: writing to it means
+        // "rebuild"/"optimize", not a value) and `rank`. The replay insert
+        // therefore built `INSERT INTO docs (title, body, docs, rank)`, which
+        // SQLite refuses with "SQL logic error", and the row stayed deleted with
+        // no way back.
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE VIRTUAL TABLE docs USING fts5(title, body)');
+        await worker.invoke(
+            'runQuery',
+            "INSERT INTO docs VALUES ('a','alpha'),('b','beta'),('c','gamma')"
+        );
+
+        const deleted = await worker.invoke('deleteRows', 'docs', [2]);
+        assert.deepStrictEqual(
+            Object.keys(deleted[0].row).sort(),
+            ['body', 'rowid', 'title'],
+            'the snapshot must not carry the virtual table’s hidden columns'
+        );
+
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete',
+            targetTable: 'docs',
+            deletedRows: deleted
+        });
+
+        const rows = await worker.invoke('runQuery', 'SELECT rowid, title, body FROM docs ORDER BY rowid');
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1, 'a', 'alpha'], [2, 'b', 'beta'], [3, 'c', 'gamma']]
+        );
+        // Re-inserted at its original rowid AND re-indexed: a restore that the
+        // full-text index could not find would be a silent half-undo.
+        const matched = await worker.invoke('runQuery', "SELECT rowid FROM docs WHERE docs MATCH 'beta'");
+        assert.deepStrictEqual(
+            Array.from(matched[0].rows, (row: unknown[]) => Array.from(row)),
+            [[2]]
+        );
+    });
+
+    it('keeps generated and fts4 columns behaving as before', async () => {
+        const worker = await createWorkerHarness();
+        // Generated columns (hidden 2/3) were already excluded and must stay so:
+        // SQLite refuses an INSERT that names one.
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE gen (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED, '
+            + 'c INTEGER GENERATED ALWAYS AS (a + 1) VIRTUAL)'
+        );
+        await worker.invoke('runQuery', 'INSERT INTO gen (a) VALUES (5), (6)');
+        const generated = await worker.invoke('deleteRows', 'gen', [2]);
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete', targetTable: 'gen', deletedRows: generated
+        });
+        const genRows = await worker.invoke('runQuery', 'SELECT a, b, c FROM gen ORDER BY rowid');
+        assert.deepStrictEqual(
+            Array.from(genRows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 10, 6], [6, 12, 7]]
+        );
+
+        // fts4 carries three hidden columns (`<table>`, `docid`, `__langid`).
+        await worker.invoke('runQuery', 'CREATE VIRTUAL TABLE notes USING fts4(a, b)');
+        await worker.invoke('runQuery', "INSERT INTO notes VALUES ('p','q'), ('r','s')");
+        const notes = await worker.invoke('deleteRows', 'notes', [2]);
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete', targetTable: 'notes', deletedRows: notes
+        });
+        const noteRows = await worker.invoke('runQuery', 'SELECT rowid, a, b FROM notes ORDER BY rowid');
+        assert.deepStrictEqual(
+            Array.from(noteRows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1, 'p', 'q'], [2, 'r', 's']]
+        );
+    });
+
+    it('reports what a column drop would take with it, and refuses a non-list flag', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
+        await worker.invoke('runQuery', "INSERT INTO users VALUES (1, 'n', 'e')");
+        await worker.invoke('runQuery', 'CREATE INDEX idx_users_email ON users(email)');
+        await worker.invoke('runQuery', 'CREATE VIEW active_users AS SELECT email FROM users');
+
+        // Structural compare: the worker runs in its own vm realm, so its
+        // Array/Object prototypes are not this realm's.
+        const dependencies = await worker.invoke('findColumnDependencies', 'users', ['email']);
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(dependencies)), {
+            indexes: ['idx_users_email'],
+            dependentObjects: [{ type: 'view', identifier: 'active_users' }]
+        });
+        // An index on ANOTHER column is not swept up.
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke('findColumnDependencies', 'users', ['name'])).indexes),
+            []
+        );
+
+        // `dropDependentIndexes` is a LIST; the parameter name invites a boolean,
+        // and one used to escape as "(dropDependentIndexes ?? []) is not
+        // iterable" from deep inside the drop. This argument comes from the
+        // webview, so it is validated rather than trusted.
+        await assert.rejects(
+            worker.invoke('deleteColumns', 'users', ['email'], true),
+            /dropDependentIndexes must be an array of index names/
+        );
+        await assert.rejects(
+            worker.invoke('deleteColumns', 'users', ['email'], ['ok', 7]),
+            /dropDependentIndexes must be an array of index names/
+        );
+
+        // Blocked by the view: SQLite decides, and the diagnostic NAMES the
+        // object so the failure is actionable on the NATIVE engine too, where
+        // the engine's own message is only "SQL logic error". sql.js happens to
+        // name the view itself, so the assertion is on the appended clause —
+        // otherwise this passes with the diagnostic removed.
+        await assert.rejects(
+            worker.invoke('deleteColumns', 'users', ['email'], ['idx_users_email']),
+            (error: Error) => {
+                assert.match(error.message, /may be blocking the drop: view active_users/);
+                assert.match(error.message, /Drop or edit them first/);
+                return true;
+            }
+        );
+        // The refusal rolled everything back — the index is still there.
+        const indexes = await worker.invoke(
+            'runQuery',
+            "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'users'"
+        );
+        assert.deepStrictEqual(
+            Array.from(indexes[0].rows, (row: unknown[]) => row[0]),
+            ['idx_users_email']
+        );
+
+        // With the view gone, the confirmed index list is what makes the drop work.
+        await worker.invoke('runQuery', 'DROP VIEW active_users');
+        await worker.invoke('deleteColumns', 'users', ['email'], ['idx_users_email']);
+        const columns = await worker.invoke('runQuery', "SELECT name FROM pragma_table_info('users')");
+        assert.deepStrictEqual(
+            Array.from(columns[0].rows, (row: unknown[]) => row[0]),
+            ['id', 'name']
+        );
+    });
+
+    it('says a column drop cannot be replayed, without calling itself a demo', async () => {
+        // The desktop records DDL as a history BARRIER and never asks the worker
+        // to replay it, so reaching this is a contract breach — but the message
+        // said "Demo history replay does not support undoing column_drop" and
+        // the desktop ships this same worker.
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE t (a, b)');
+        for (const [method, verb] of [['undoModification', 'undone'], ['redoModification', 'redone']]) {
+            await assert.rejects(
+                worker.invoke(method, { modificationType: 'column_drop', targetTable: 't' }),
+                (error: Error) => {
+                    assert.match(error.message, new RegExp(`column_drop cannot be ${verb}`));
+                    assert.match(error.message, /history barrier/);
+                    assert.doesNotMatch(error.message, /Demo/);
+                    return true;
+                }
+            );
+        }
+    });
 });

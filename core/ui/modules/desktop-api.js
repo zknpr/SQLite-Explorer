@@ -11,6 +11,7 @@
 
 import { RPC_TIMEOUT_MS, getRpcTimeoutMs } from './rpc-constants.js';
 import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from './transport.js';
+import { modLabel } from './platform.js';
 import {
     CellEditPolicyError,
     DEFAULT_MAX_CELL_EDIT_BYTES,
@@ -54,21 +55,35 @@ export function handleRpcResponse(_message) {}
 export function sendRpcResult(_correlationId, _result) {}
 export function sendRpcError(_correlationId, _error) {}
 
-const VIEW_STATE_KEY = 'sqlite-explorer-view-state';
-export function getVsCodeState() {
-    try {
-        const raw = globalThis.localStorage?.getItem(VIEW_STATE_KEY);
-        return raw ? JSON.parse(raw) : undefined;
-    } catch { return undefined; }
-}
-export function saveVsCodeState(stateObj) {
-    try { globalThis.localStorage?.setItem(VIEW_STATE_KEY, JSON.stringify(stateObj)); } catch { /* non-fatal */ }
-}
+/**
+ * VS Code's `setState`/`getState` seam, deliberately INERT on the desktop.
+ *
+ * It used to write `persistState()`'s snapshot (selected table, page, sort,
+ * filters, column widths, pins, scroll) into localStorage that nothing ever
+ * read back — `getVsCodeState` has exactly one caller, core/ui/viewer.js, the
+ * VS Code entry. That is why nothing survived a relaunch despite the write
+ * happening on every interaction.
+ *
+ * Restoring it is not the fix. VS Code's state belongs to ONE webview editing
+ * ONE file, so replaying it is unambiguous. The desktop keeps N databases open
+ * behind one `state` object (see db-ui-state.js) and boots to an empty scratch
+ * database — it does not reopen anything — so a single global blob would be
+ * replayed onto whichever database happened to open first, pointing it at
+ * another file's table with another file's filters. Per-database UI state IS
+ * preserved, in memory, across switches; what genuinely belongs to the app
+ * rather than to a file (theme, zoom, sidebar width, console history) persists
+ * through the shell's settings store instead.
+ */
+export function getVsCodeState() { return undefined; }
+export function saveVsCodeState(_stateObj) {}
 
 // Backend API proxy
 export const backendApi = {
     initialize: () => sendRpcRequest('initialize', []),
-    saveSidebarState: (state) => sendRpcRequest('saveSidebarState', [state]),
+    // (side, position) — ui.js calls it that way and api.js forwards both, but
+    // this lane declared ONE parameter, so the width was dropped on the floor
+    // before it ever reached the host.
+    saveSidebarState: (side, position) => sendRpcRequest('saveSidebarState', [side, position]),
     exportDb: (filename) => sendRpcRequest('exportDb', [filename]),
     refreshFile: () => sendRpcRequest('refreshFile', []),
     fireEditEvent: (edit) => sendRpcRequest('fireEditEvent', [edit]),
@@ -132,7 +147,52 @@ export const backendApi = {
         [table, data, DEFAULT_MAX_CELL_EDIT_BYTES]
     ),
     deleteRows: (table, rowIds) => sendRpcRequest('deleteRows', [table, rowIds]),
-    deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),
+    /**
+     * Drop columns, after telling the user what it costs.
+     *
+     * TWO facts the desktop used to withhold, both discovered only afterwards:
+     *
+     * 1. SQLite REFUSES a DROP COLUMN while any index references the column, and
+     *    nothing on this lane ever passed `dropDependentIndexes`, so dropping an
+     *    indexed column simply always failed ("error in index ... no such
+     *    column"). The list is now obtained from the engine and named in the
+     *    prompt — the same shape the VS Code host has always used
+     *    (hostBridge.ts's showWarningMessage), which is why crud.js already
+     *    understands `{cancelled: true}`.
+     * 2. A column drop is a HISTORY BARRIER on the desktop (see
+     *    BARRIER_METHODS in desktop-host.js): the worker's replay engine has no
+     *    column-drop undo, so ⌘Z will not bring the column back. Saying so
+     *    before the drop is the difference between a decision and a surprise.
+     *
+     * Views and triggers that mention the column are ADVISORY: SQLite decides,
+     * and the match is a name match, so they are reported as "may" and never
+     * used to refuse.
+     */
+    deleteColumns: async (table, columns) => {
+        const dependencies = await sendRpcRequest('findColumnDependencies', [table, columns]);
+        const indexes = dependencies?.indexes ?? [];
+        const dependentObjects = dependencies?.dependentObjects ?? [];
+        const columnList = columns.join(', ');
+        const lines = [`Drop ${columns.length === 1 ? 'column' : 'columns'} ${columnList} from "${table}"?`, ''];
+        if (indexes.length > 0) {
+            lines.push(
+                `These indexes depend on ${columns.length === 1 ? 'it' : 'them'} and will be dropped `
+                + `first: ${indexes.join(', ')}.`
+            );
+        }
+        if (dependentObjects.length > 0) {
+            lines.push(
+                'These schema objects mention the name and may block the drop: '
+                + `${dependentObjects.map(object => `${object.type} ${object.identifier}`).join(', ')}.`
+            );
+        }
+        lines.push('This cannot be undone with ' + modLabel('Z') + ' — it ends the undo history for this database.');
+        if (!window.confirm(lines.join('\n'))) return { cancelled: true };
+        return sendRpcRequest(
+            'deleteColumns',
+            [table, columns, indexes.length > 0 ? indexes : undefined]
+        );
+    },
     createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
     getViewDefinition: (view) => sendRpcRequest('getViewDefinition', [view]),
     validateViewDefinition: (view, selectSql, intent) =>
@@ -196,25 +256,31 @@ export const backendApi = {
     updateExtensionSetting: (key, value) => sendRpcRequest('updateExtensionSetting', [key, value]),
     ping: () => sendRpcRequest('ping', []),
 
-    // VS Code specific - disabled in web mode
+    // VS Code-only surfaces. Both refuse here, and the wording is the DESKTOP's:
+    // this bundle is the desktop app, and the copy inherited from web-api.js
+    // told the user about "the web demo" — a product they are not running, with
+    // no route to the one the desktop does have (the blob inspector's chunked
+    // Load More, which reads any cell through openCellReadSession/readCellChunk).
     prepareCellMediaPreview: (_params, _rowId, _colName, options = {}) => {
         const sourceBytes = Number.isSafeInteger(options.sourceByteLength)
-            ? options.sourceByteLength
-            : 'unknown';
+            ? `${options.sourceByteLength} bytes`
+            : 'this value';
         return Promise.resolve({
             success: false,
             message:
-                `Oversized media preview refused in the web demo: ${sourceBytes} bytes ` +
-                `exceeds the ${MAX_WEBVIEW_BINARY_VALUE_BYTES}-byte webview binary limit. ` +
-                'Only the bounded Text/Hex preview is available; transferable streaming is not implemented.'
+                `Inline media preview is unavailable for ${sourceBytes}: it exceeds the ` +
+                `${MAX_WEBVIEW_BINARY_VALUE_BYTES}-byte webview binary limit, and the desktop ` +
+                'shell exposes no host-owned temporary file to render from. ' +
+                'Use Load More on the Hex preview to read the value in chunks.'
         });
     },
     releaseCellMediaPreview: () => Promise.resolve(),
     openCellEditor: (_params, _rowId, _colName, _colTypes, options = {}) => Promise.resolve({
         success: false,
         message:
-            `Full oversized content (${options.sourceByteLength ?? 'unknown'} bytes) is unavailable ` +
-            'in the web demo; use the bounded Text/Hex preview.'
+            `Opening ${options.sourceByteLength ?? 'this'} bytes in an external editor is a VS Code ` +
+            'feature; on the desktop use Load More in the cell inspector, which reads the value ' +
+            'through a consistent snapshot in bounded chunks.'
     }),
     openViewEditor: () => Promise.resolve({ success: false, message: 'Not available in web mode' }),
     readWorkspaceFileUri: () => Promise.resolve(null),

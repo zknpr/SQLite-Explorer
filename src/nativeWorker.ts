@@ -155,6 +155,7 @@ import {
   COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT,
   COLUMN_DROP_TABLE_STATE_SQL,
   executeSchemaPreservingColumnDrop,
+  indexSqlReferencesAnyColumn,
   mapColumnDropTableState
 } from './core/column-drop';
 
@@ -2376,21 +2377,9 @@ export async function createNativeDatabaseConnection(
               const indexName = row[0] as string;
               const indexSql = row[1] as string;
 
-              // Check if this index references any of the columns
-              const referencesColumn = columns.some(col => {
-                // Escape regex metacharacters in column name to prevent broken patterns
-                const escaped = col.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                // Match column name in index definition (quoted or unquoted)
-                const patterns = [
-                  new RegExp(`[\\(,]\\s*${escaped}\\s*[\\),]`, 'i'),
-                  new RegExp(`[\\(,]\\s*"${escaped}"\\s*[\\),]`, 'i'),
-                  new RegExp(`[\\(,]\\s*\\[${escaped}\\]\\s*[\\),]`, 'i'),
-                  new RegExp(`[\\(,]\\s*\`${escaped}\`\\s*[\\),]`, 'i')
-                ];
-                return patterns.some(p => p.test(indexSql));
-              });
-
-              if (referencesColumn) {
+              // Shared with the WASM engine and the demo/desktop worker so the
+              // confirmed list and the dropped list cannot drift.
+              if (indexSqlReferencesAnyColumn(indexSql, columns)) {
                 dependentIndexes.push(indexName);
               }
             }

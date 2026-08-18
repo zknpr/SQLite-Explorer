@@ -21,7 +21,8 @@ import {
     updateStatus,
     showEmptyState,
     showErrorState,
-    initSidebarResize
+    initSidebarResize,
+    syncPageSizeSelect
 } from './modules/ui.js';
 import {
     initModals
@@ -75,26 +76,6 @@ async function connectAndLoadSchema() {
 
     // Load schema
     await refreshSchema();
-}
-
-/**
- * Point the page-size selector at `size`. A configured or previously persisted
- * size that is not one of the preset options gets its own numerically ordered
- * option, so the visible control always reports the LIMIT queries actually use.
- */
-function syncPageSizeSelect(size) {
-    const pageSizeSelect = document.getElementById('pageSizeSelect');
-    if (!pageSizeSelect) return;
-    const value = String(size);
-    const options = Array.from(pageSizeSelect.options);
-    if (!options.some(option => option.value === value)) {
-        const custom = document.createElement('option');
-        custom.value = value;
-        custom.textContent = value;
-        const next = options.find(option => Number(option.value) > size);
-        pageSizeSelect.insertBefore(custom, next ?? null);
-    }
-    pageSizeSelect.value = value;
 }
 
 async function restoreSavedState() {

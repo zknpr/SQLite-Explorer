@@ -31,6 +31,8 @@ const DEFAULT_SETTINGS = Object.freeze({
     fileOperations: 'native',
     queryTimeout: 30000,
     maxInlineCellBytes: 1048576,
+    // 0 = "never dragged"; initSidebarResize keeps its own default then.
+    sidebarWidth: 0,
     maxUndoMemory: 52428800,
     theme: 'system',
     // SQL console history, newest first (see `pushHistory` in the console
@@ -1298,8 +1300,21 @@ export function createDesktopHost({ bridge, createWorker }) {
             return connectionResult();
         },
         async triggerUndo(entry) {
+            // A barrier and an empty stack both refuse the step, and until the
+            // page could tell them apart ⌘Z on a DDL/console change looked
+            // exactly like a keystroke that did nothing. `reason` is what lets
+            // the viewer name the operation that walled the history off.
+            const blocking = entry.tracker.undoBlockingEntry;
             const entryToUndo = entry.tracker.stepBack();
-            if (!entryToUndo) return { performed: false };
+            if (!entryToUndo) {
+                return blocking
+                    ? {
+                        performed: false,
+                        reason: 'barrier',
+                        barrierDescription: blocking.description ?? blocking.modificationType
+                    }
+                    : { performed: false, reason: 'empty' };
+            }
             // Replay is a mutation like any other: it runs inside the open
             // session transaction, or opens a fresh one after a save. A BEGIN
             // failure means the replay never executed — put the history entry
@@ -1331,7 +1346,9 @@ export function createDesktopHost({ bridge, createWorker }) {
         },
         async triggerRedo(entry) {
             const entryToRedo = entry.tracker.stepForward();
-            if (!entryToRedo) return { performed: false };
+            // No barrier case: a barrier clears the future stack when it is
+            // recorded, so "nothing to redo" is the only refusal here.
+            if (!entryToRedo) return { performed: false, reason: 'empty' };
             try {
                 await ensureSessionTxn(entry);
             } catch (error) {
@@ -1365,6 +1382,19 @@ export function createDesktopHost({ bridge, createWorker }) {
                 cellEditBehavior: settings.doubleClickBehavior,
                 fileOperations: settings.fileOperations,
                 theme: settings.theme,
+                // Declared in DEFAULT_SETTINGS since the port and never
+                // delivered to anyone, so both read as inert: the page could not
+                // see defaultPageSize (VS Code seeds it through an HTML template
+                // the desktop has no equivalent of) and nothing consumed
+                // maxInlineCellBytes at all. They are answers now — see
+                // desktop-viewer.js's startup page size and the fetchTableData
+                // injection in `invoke`.
+                defaultPageSize: settings.defaultPageSize,
+                maxInlineCellBytes: settings.maxInlineCellBytes,
+                // Restores the dragged sidebar width across a relaunch. The
+                // shell has a real settings store, so this belongs there rather
+                // than in the localStorage the desktop never read back.
+                sidebarWidth: settings.sidebarWidth,
                 // Desktop-only; the VS Code host has no console. `?? []` covers
                 // a settings file written before this key existed.
                 consoleHistory: settings.consoleHistory ?? []
@@ -1423,7 +1453,25 @@ export function createDesktopHost({ bridge, createWorker }) {
             return { success: target !== null, savedAs: target ? basename(target) : undefined };
         },
         async fireEditEvent() { return { success: true }; },
-        async saveSidebarState() { return undefined; }
+        /**
+         * Persist the dragged sidebar width. Was a no-op, which is why the
+         * sidebar snapped back to its default on every relaunch even though the
+         * desktop has a real settings store.
+         *
+         * Only the left sidebar exists in this UI; an unknown side or an
+         * out-of-range width is REFUSED rather than written, because this is
+         * webview-supplied input landing in the one file the webview can write.
+         * The bounds mirror initSidebarResize's own clamp.
+         */
+        async saveSidebarState(side, position) {
+            if (side !== 'left') throw new Error(`Unknown sidebar: ${String(side)}`);
+            const width = Number(position);
+            if (!Number.isFinite(width) || width < 150 || width > 400) {
+                throw new Error(`Sidebar width out of range: ${String(position)}`);
+            }
+            await globalMethods.updateExtensionSetting('sidebarWidth', Math.round(width));
+            return undefined;
+        }
     };
 
     // ---- public host API ----------------------------------------------------
@@ -1498,6 +1546,19 @@ export function createDesktopHost({ bridge, createWorker }) {
                 }
                 return result;
             }
+            if (method === 'fetchTableData') {
+                // The grid never asks for a cell budget; the SETTING is the one
+                // the user can express, and until now nothing read it. The
+                // worker clamps the value against its own
+                // DEFAULT_MAX_INLINE_CELL_BYTES and ignores a non-positive or
+                // unsafe one, so a hand-edited settings.json can only ever
+                // LOWER the amount of cell data a page carries.
+                const [table, options] = args;
+                return callWorker(entry, method, [table, {
+                    ...(options ?? {}),
+                    maxInlineCellBytes: settings.maxInlineCellBytes
+                }]);
+            }
             if (BARRIER_METHODS.has(method)) {
                 // setPragma stays outside the session transaction: journal_mode
                 // cannot change inside one and foreign_keys is a silent no-op
@@ -1558,23 +1619,14 @@ export function createDesktopHost({ bridge, createWorker }) {
             const name = String(path).split('/').pop() || 'database.db';
             return openFromPath(path, name);
         },
-        async openDatabaseFromFile(file) {
-            // Drag-and-dropped File objects keep the demo's paged-open path for
-            // very large databases (the worker reads the handle on demand).
-            // Always WASM — there is no OS path to bind a sidecar to, and no
-            // on-disk write-back target either.
-            assertRoomForAnotherDatabase(file.name);
-            const entry = createEntry({ engine: 'wasm', currentPath: null, currentName: file.name });
-            bootWorkerFor(entry);
-            try {
-                await initializeWorkerDatabase(entry, file.name, { file });
-            } catch (error) {
-                await disposeEntryTransport(entry);
-                throw error;
-            }
-            await commitEntry(entry);
-            return true;
-        },
+        // REMOVED: openDatabaseFromFile(file). It opened a dropped `File` handle
+        // as a path-less WASM database and had no call site anywhere in core/ —
+        // dead since it was written, because Tauri handles OS drag-and-drop
+        // natively and the page never receives an HTML5 file drop. Drag-to-open
+        // now arrives as PATHS through the bridge's onDragDropPaths and goes
+        // through openFromShellPath, which dedupes by canonical path, can bind a
+        // native sidecar, and leaves the database saveable in place. Restoring a
+        // File-handle lane would be a strict downgrade of all three.
 
         // ---- multi-database surface (consumed by the tab strip and the
         // ---- sidebar's Open Databases overview)

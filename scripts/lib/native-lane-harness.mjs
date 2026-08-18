@@ -254,6 +254,45 @@ await record('native/in-transaction', () => {
     }
 });
 
+await record('native/error-message-recovery', () => {
+    // The fork raises sqlite3_errstr(rc) and never sqlite3_errmsg(db), so a
+    // missing table, a missing column and a syntax error are all "SQL logic
+    // error". These check what core/native/sqlite-errors.js can honestly
+    // recover against the REAL binary — including the two false-positive traps
+    // that make the missing-table proof need both of its halves.
+    const db = createDatabase();
+    const probe = (sql) => {
+        try {
+            db.exec(sql);
+            return 'ok';
+        } catch (error) {
+            return { message: String(error?.message ?? error), errno: error?.errno ?? null };
+        }
+    };
+    try {
+        db.run(SEED_SQL);
+        db.run('CREATE VIEW brokenish AS SELECT id FROM t');
+        return {
+            missingTable: probe('SELECT * FROM absent_table'),
+            missingColumn: probe('SELECT absent_column FROM t'),
+            constraint: probe('INSERT INTO u VALUES(2, NULL)'),
+            // A name inside a string literal is not a table reference.
+            literalNotBlamed: probe("SELECT * FROM t WHERE name = 'from absent_table' AND nope = 1"),
+            // A CTE name is in no catalog and must never be blamed.
+            cteNotBlamed: probe('WITH cte AS (SELECT 1 AS x) SELECT * FROM cte WHERE nope'),
+            // Resolves without a catalog row: system tables and eponymous vtabs.
+            systemTableNotBlamed: probe('SELECT * FROM sqlite_schema WHERE nope'),
+            // In the catalog but does not compile once its base table is gone.
+            brokenViewNotBlamed: (() => {
+                db.run('DROP TABLE t');
+                return probe('SELECT * FROM brokenish');
+            })()
+        };
+    } finally {
+        db.close();
+    }
+});
+
 // --- shared matrix ---------------------------------------------------------
 
 const fixtures = runFixtures(() => createDatabase());

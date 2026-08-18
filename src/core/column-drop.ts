@@ -17,6 +17,68 @@ WHERE (type = 'table' AND name = ? COLLATE NOCASE)
        AND sql IS NOT NULL)
 ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name`;
 
+/** Read every persistent view/trigger whose stored SQL could name a dropped column. */
+export const COLUMN_DROP_DEPENDENT_OBJECT_SQL = `
+SELECT type, name, sql
+FROM sqlite_schema
+WHERE type IN ('view', 'trigger') AND sql IS NOT NULL
+ORDER BY type, name`;
+
+/** Read every persistent index owned by a table, for the dependent-index prompt. */
+export const COLUMN_DROP_INDEX_SQL = `
+SELECT name, sql
+FROM sqlite_schema
+WHERE type = 'index' AND tbl_name = ? COLLATE NOCASE AND sql IS NOT NULL
+ORDER BY name`;
+
+/** Escape a column name for embedding in a RegExp source. */
+function escapeColumnForPattern(column: string): string {
+  return column.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * True when an index's stored DDL names any of `columns`.
+ *
+ * Positional rather than semantic: an index body is a parenthesised, comma
+ * separated key list, so the delimiter classes below are what distinguish a key
+ * from the index's own name or its table's. Shared by all three engines (the
+ * demo/desktop worker, the WASM engine, and the native worker) so the prompt
+ * the user confirms and the list actually dropped can never disagree.
+ */
+export function indexSqlReferencesAnyColumn(
+  indexSql: string,
+  columns: readonly string[]
+): boolean {
+  return columns.some(column => {
+    const escaped = escapeColumnForPattern(column);
+    return [
+      new RegExp(`[\\(,]\\s*${escaped}\\s*[\\),]`, 'i'),
+      new RegExp(`[\\(,]\\s*"${escaped}"\\s*[\\),]`, 'i'),
+      new RegExp(`[\\(,]\\s*\\[${escaped}\\]\\s*[\\),]`, 'i'),
+      new RegExp(`[\\(,]\\s*\`${escaped}\`\\s*[\\),]`, 'i')
+    ].some(pattern => pattern.test(indexSql));
+  });
+}
+
+/**
+ * True when a view's or trigger's stored SQL contains `column` as a bare word.
+ *
+ * DELIBERATELY over-inclusive: a view body is arbitrary SQL, so proving a
+ * reference would need a resolver. Every caller uses this only to NAME
+ * candidates in a diagnostic AFTER SQLite has already refused a drop — never to
+ * refuse one itself — so a false positive costs one extra name in an error
+ * message and a false negative costs nothing beyond the engine's own wording.
+ */
+export function schemaObjectSqlMentionsColumn(
+  objectSql: string,
+  column: string
+): boolean {
+  // \b would not fire next to a quote for names that start or end with a
+  // non-word character, so the boundary classes are spelled out.
+  const escaped = escapeColumnForPattern(column);
+  return new RegExp(`(^|[^A-Za-z0-9_$])${escaped}($|[^A-Za-z0-9_$])`, 'i').test(objectSql);
+}
+
 /** Bound host memory while comparing the pre/post rebuild violation multiset. */
 export const COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT = 4096;
 export const COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT = 2 * 1024 * 1024;

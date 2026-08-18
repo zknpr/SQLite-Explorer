@@ -150,6 +150,177 @@ describe('BlobInspector oversized containment', () => {
         }
     });
 
+    // -----------------------------------------------------------------------
+    // Wave 2 (capstone G2): the chunked read API had ZERO UI call sites, so an
+    // oversized cell topped out at the 64 KiB bounded preview and there was no
+    // way to read a large TEXT/BLOB in full on the desktop at all.
+    // -----------------------------------------------------------------------
+
+    function chunkedHarness(BlobInspector: any, options: {
+        total: number;
+        loaded?: number;
+        chunkCap?: number;
+    }) {
+        const calls: Array<[number, number]> = [];
+        const closed: string[] = [];
+        const source = new Uint8Array(options.total);
+        for (let i = 0; i < source.length; i++) source[i] = i & 0xff;
+        const base = inspectorHarness(BlobInspector);
+        Object.assign(base.inspector, {
+            currentData: source.subarray(0, options.loaded ?? 0),
+            currentType: { type: 'binary', ext: 'bin' },
+            currentRowId: 7,
+            currentColName: 'payload',
+            currentOversizedMetadata: { storageClass: 'blob', byteLength: options.total },
+            oversizedLoadedBytes: options.loaded ?? 0,
+            isLoadingOversized: false,
+            isUploading: false,
+            detectType: () => ({ type: 'binary', ext: 'bin' }),
+            formatSize: (n: number) => `${n}B`,
+            isOversizedFullyLoaded: BlobInspector.prototype.isOversizedFullyLoaded,
+            oversizedDownloadAction: BlobInspector.prototype.oversizedDownloadAction
+        });
+        const api = {
+            openCellReadSession: mock.fn(async (_target: unknown) => ({
+                sessionId: 'session-1',
+                metadata: { storageClass: 'blob', byteLength: options.total }
+            })),
+            readCellChunk: mock.fn(async (_id: string, offset: number, maxBytes: number) => {
+                calls.push([offset, maxBytes]);
+                const end = Math.min(offset + Math.min(maxBytes, options.chunkCap ?? maxBytes), source.length);
+                return { byteOffset: offset, bytes: source.slice(offset, end), done: end >= source.length };
+            }),
+            closeCellReadSession: mock.fn(async (id: string) => { closed.push(id); })
+        };
+        return { ...base, api, calls, closed, source };
+    }
+
+    function installStatusDocument() {
+        (globalThis as any).document = {
+            getElementById: (id: string) => (id === 'statusText' ? { textContent: '' } : null)
+        };
+    }
+
+    it('streams an oversized cell in through openCellReadSession/readCellChunk', async () => {
+        const inspectorModule = await import(inspectorModulePath);
+        const { BlobInspector, MAX_OVERSIZED_INSPECTOR_LOAD_BYTES } = inspectorModule;
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const total = 3 * 1024 * 1024;
+        const { inspector, api, calls, closed, hexed, source } =
+            chunkedHarness(BlobInspector, { total, chunkCap: 512 * 1024 });
+        const originals = {
+            open: backendApi.openCellReadSession,
+            read: backendApi.readCellChunk,
+            close: backendApi.closeCellReadSession
+        };
+        Object.assign(backendApi, api);
+        state.selectedTable = 'large_cells';
+        state.isDesktop = true;
+        installStatusDocument();
+
+        try {
+            await inspector.loadMoreOversizedContent();
+
+            // One session, opened and CLOSED — the worker refuses every other
+            // database operation while one is open, so leaking it would wedge
+            // the app.
+            assert.strictEqual(api.openCellReadSession.mock.callCount(), 1);
+            assert.deepStrictEqual(api.openCellReadSession.mock.calls[0].arguments, [
+                { table: 'large_cells', rowId: 7, column: 'payload' }
+            ]);
+            assert.deepStrictEqual(closed, ['session-1']);
+
+            // One click reads one step's worth, in bounded windows, from 0.
+            assert.strictEqual(inspector.oversizedLoadedBytes, 1024 * 1024);
+            assert.deepStrictEqual(calls, [[0, 1048576], [524288, 524288]]);
+            assert.deepStrictEqual(
+                Array.from(inspector.currentData.subarray(0, 4)),
+                Array.from(source.subarray(0, 4))
+            );
+            assert.strictEqual(hexed.at(-1)!.byteLength, 1024 * 1024);
+            assert.ok(inspector.oversizedLoadedBytes < MAX_OVERSIZED_INSPECTOR_LOAD_BYTES);
+
+            // The next click continues where the last one stopped, and the
+            // button only becomes a real Download once the WHOLE value is in.
+            assert.strictEqual(inspector.oversizedDownloadAction().kind, 'loadMore');
+            await inspector.loadMoreOversizedContent();
+            assert.strictEqual(inspector.oversizedLoadedBytes, 2 * 1024 * 1024);
+            await inspector.loadMoreOversizedContent();
+            assert.strictEqual(inspector.oversizedLoadedBytes, total);
+            assert.strictEqual(inspector.isOversizedFullyLoaded(), true);
+            assert.strictEqual(inspector.oversizedDownloadAction().kind, 'save');
+            assert.deepStrictEqual(Array.from(inspector.currentData), Array.from(source));
+        } finally {
+            backendApi.openCellReadSession = originals.open;
+            backendApi.readCellChunk = originals.read;
+            backendApi.closeCellReadSession = originals.close;
+            state.isDesktop = false;
+        }
+    });
+
+    it('closes the session even when a chunk read fails, and reports the failure', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { inspector, api, closed } = chunkedHarness(BlobInspector, { total: 1024 });
+        api.readCellChunk = mock.fn(async () => { throw new Error('snapshot expired'); });
+        const originals = {
+            open: backendApi.openCellReadSession,
+            read: backendApi.readCellChunk,
+            close: backendApi.closeCellReadSession
+        };
+        Object.assign(backendApi, api);
+        state.selectedTable = 'large_cells';
+        state.isDesktop = true;
+        const statusElement = { textContent: '' };
+        (globalThis as any).document = {
+            getElementById: (id: string) => (id === 'statusText' ? statusElement : null)
+        };
+
+        try {
+            await inspector.loadMoreOversizedContent();
+            assert.deepStrictEqual(closed, ['session-1']);
+            assert.match(statusElement.textContent, /snapshot expired/);
+            assert.strictEqual(inspector.oversizedLoadedBytes, 0);
+            assert.strictEqual(inspector.isLoadingOversized, false);
+        } finally {
+            backendApi.openCellReadSession = originals.open;
+            backendApi.readCellChunk = originals.read;
+            backendApi.closeCellReadSession = originals.close;
+            state.isDesktop = false;
+        }
+    });
+
+    it('stops at the in-page ceiling instead of pulling a whole 300 MB value into the DOM', async () => {
+        const { BlobInspector, MAX_OVERSIZED_INSPECTOR_LOAD_BYTES } = await import(inspectorModulePath);
+        const { state } = await import(stateModulePath);
+        const { inspector } = chunkedHarness(BlobInspector, {
+            total: 300 * 1024 * 1024,
+            loaded: MAX_OVERSIZED_INSPECTOR_LOAD_BYTES
+        });
+        state.isDesktop = true;
+        try {
+            const action = inspector.oversizedDownloadAction();
+            assert.strictEqual(action.kind, 'exhausted');
+            assert.match(action.title, /cannot be shown/);
+            // …and it is HONEST about it rather than silently doing nothing.
+            assert.strictEqual(inspector.isOversizedFullyLoaded(), false);
+        } finally {
+            state.isDesktop = false;
+        }
+    });
+
+    it('keeps the VS Code lane on the external-editor route', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { state } = await import(stateModulePath);
+        const { inspector } = chunkedHarness(BlobInspector, { total: 1024 * 1024 });
+        state.isDesktop = false;
+        const action = inspector.oversizedDownloadAction();
+        assert.strictEqual(action.kind, 'openEditor');
+        assert.strictEqual(action.label, 'Open Full Content');
+    });
+
     it('routes full oversized content to the desktop temp-file host flow', async () => {
         const { BlobInspector } = await import(inspectorModulePath);
         const { backendApi } = await import(apiModulePath);

@@ -126,6 +126,7 @@ it('restores a saved table identity before loading its columns or data', async (
                             export function showEmptyState() {}
                             export function showErrorState(error) { throw error; }
                             export function initSidebarResize() {}
+                            export function syncPageSizeSelect() {}
                         `,
                         './modules/modals.js': 'export function initModals() {}',
                         './modules/grid.js': `

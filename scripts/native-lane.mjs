@@ -88,7 +88,44 @@ const FORK_ONLY_EXPECTATIONS = {
         rows: [{ columns: ['c'], values: [[3]] }]
     },
     'native/content-mode-rejected': null,
-    'native/in-transaction': { before: false, during: true, after: false }
+    'native/in-transaction': { before: false, during: true, after: false },
+    // Wave 2: what the shim can honestly recover from a nonspecific fork error.
+    // A missing table is SQLite's own phrasing, PROVEN by a compile probe plus
+    // a catalog lookup; everything else keeps the engine's text and adds only
+    // the result-code class. errno must survive every rewrite.
+    'native/error-message-recovery': {
+        missingTable: { message: 'no such table: absent_table', errno: 1 },
+        missingColumn: {
+            message: 'SQL logic error (SQLITE_ERROR: a misspelled name, a syntax error, or a '
+                + 'misused construct \u2014 the native engine cannot report SQLite\u2019s detailed message)',
+            errno: 1
+        },
+        constraint: {
+            message: 'constraint failed (SQLITE_CONSTRAINT: a NOT NULL, UNIQUE, CHECK, '
+                + 'PRIMARY KEY or FOREIGN KEY constraint rejected the row)',
+            errno: 19
+        },
+        literalNotBlamed: {
+            message: 'SQL logic error (SQLITE_ERROR: a misspelled name, a syntax error, or a '
+                + 'misused construct \u2014 the native engine cannot report SQLite\u2019s detailed message)',
+            errno: 1
+        },
+        cteNotBlamed: {
+            message: 'SQL logic error (SQLITE_ERROR: a misspelled name, a syntax error, or a '
+                + 'misused construct \u2014 the native engine cannot report SQLite\u2019s detailed message)',
+            errno: 1
+        },
+        systemTableNotBlamed: {
+            message: 'SQL logic error (SQLITE_ERROR: a misspelled name, a syntax error, or a '
+                + 'misused construct \u2014 the native engine cannot report SQLite\u2019s detailed message)',
+            errno: 1
+        },
+        brokenViewNotBlamed: {
+            message: 'SQL logic error (SQLITE_ERROR: a misspelled name, a syntax error, or a '
+                + 'misused construct \u2014 the native engine cannot report SQLite\u2019s detailed message)',
+            errno: 1
+        }
+    }
 };
 
 const scratch = mkdtempSync(path.join(tmpdir(), 'native-lane-'));

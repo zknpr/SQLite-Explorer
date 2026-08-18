@@ -59,6 +59,21 @@ export interface DesktopHostBridge {
      */
     onOpenFile?(handler: (path: string) => void): void;
     /**
+     * Fires when files are DROPPED on the window, with their OS paths.
+     *
+     * Tauri v2 handles OS drag-and-drop natively (`dragDropEnabled` defaults
+     * true), so the webview never receives an HTML5 `drop` for a file and the
+     * page cannot see one by itself — the shell has to forward it. Paths, not
+     * `File` handles, because a path opens on the native engine, binds a
+     * sidecar, and can be saved back in place; a `File` can do none of those.
+     *
+     * The delivered paths are OS-chosen, exactly like {@link onOpenFile}'s, so
+     * they carry the same trust basis: the webview never names them.
+     *
+     * Optional for the same reason as {@link onOpenFile}.
+     */
+    onDragDropPaths?(handler: (paths: string[]) => void): void;
+    /**
      * Signals the webview has finished booting. Optional for the same reason
      * as {@link onOpenFile}.
      */
@@ -208,9 +223,13 @@ export interface DesktopHost {
     setWebviewMethods(methods: Record<string, (...args: unknown[]) => unknown>): void;
     /** Opens (or, if already open, switches to) a dialog-picked database. */
     openDatabaseViaDialog(): Promise<boolean>;
-    /** Opens a database at a shell-provided path (native "Open With"/recents). */
+    /**
+     * Opens a database at a shell-provided path — native "Open With", Open
+     * Recent, and OS drag-and-drop, all of which name the file outside the
+     * webview. Resolves true when a database is open at that path afterwards
+     * (including when it already was, and was activated instead).
+     */
     openFromShellPath(path: string): Promise<boolean>;
-    openDatabaseFromFile(file: File): Promise<boolean>;
 
     /** Every open database, in open order. */
     listDatabases(): OpenDatabase[];

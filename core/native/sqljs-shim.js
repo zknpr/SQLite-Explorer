@@ -34,6 +34,8 @@
  *     shim must construct one, `copyErrno` carries the code across.
  */
 
+import { buildSqliteErrorMessage } from './sqlite-errors.js';
+
 /** Reserved-prefix-free name for the throwaway column-probe views. */
 let columnProbeCounter = 0;
 
@@ -167,6 +169,33 @@ export function copyErrno(target, source) {
 }
 
 /**
+ * Replace a nonspecific engine error with one that says what SQLite meant.
+ *
+ * The fork surfaces `sqlite3_errstr(rc)` and never `sqlite3_errmsg(db)`, so
+ * "SQL logic error" is the answer to a typo, a missing table and a missing
+ * column alike. `buildSqliteErrorMessage` only rewrites a message that is
+ * byte-identical to its own result code's canonical text, so an engine that DOES
+ * report detail (the node:sqlite stand-in the unit suite runs this shim over, or
+ * a future fork rebuild) passes through untouched.
+ *
+ * Fails open in every direction: no errno, no describer, or a throwing describer
+ * all return the original error. A diagnostic must never replace the failure it
+ * is describing.
+ */
+function describeBackingError(error, sql, describe) {
+    if (typeof describe !== 'function' || error?.errno === undefined) return error;
+    let message;
+    try {
+        message = describe(error, sql);
+    } catch {
+        return error;
+    }
+    if (message === undefined || message === error.message) return error;
+    const replacement = new Error(message, { cause: error });
+    return copyErrno(replacement, error);
+}
+
+/**
  * How many characters of `source` the binding consumed when it compiled
  * `compiled` (the statement's own SQL text, as `Statement.toString()` reports
  * it).
@@ -243,7 +272,7 @@ function toSqlJsValue(value, useBigInt) {
  * statement whose text is empty, which is exactly `sqlite3_prepare_v2`
  * yielding a NULL statement.
  */
-function compileNext(backing, sql, from) {
+function compileNext(backing, sql, from, describe) {
     if (from >= sql.length) return null;
     const rest = sql.slice(from);
     // SECURITY: reject ATTACH/DETACH before it is ever compiled. `compileNext`
@@ -267,7 +296,16 @@ function compileNext(backing, sql, from) {
     const leading = stripLeadingTrivia(rest);
     const attachDetach = ATTACH_DETACH_PREFIX.exec(leading);
     if (attachDetach) throw attachDetachBlockedError(attachDetach[0]);
-    const compiled = backing.prepare(rest);
+    let compiled;
+    try {
+        compiled = backing.prepare(rest);
+    } catch (error) {
+        // A compile failure is where the fork's message loss hurts most: this
+        // is "no such table", "no such column" and "syntax error" all arriving
+        // as one string. `rest` is the whole remaining script; the describer
+        // reads only its leading statement's structure.
+        throw describeBackingError(error, rest, describe);
+    }
     let text;
     try {
         text = String(compiled);
@@ -334,10 +372,10 @@ function finalizeQuietly(statement) {
  * blocked vectors' effects land at step), and only runs at all when one of the
  * scanned keywords is present.
  */
-function rejectPathAuthorityViolationsInScript(backing, sql) {
+function rejectPathAuthorityViolationsInScript(backing, sql, describe) {
     let cursor = 0;
     for (;;) {
-        const next = compileNext(backing, sql, cursor);
+        const next = compileNext(backing, sql, cursor, describe);
         if (next === null) return;
         cursor = next.end;
         finalizeQuietly(next.compiled);
@@ -399,9 +437,16 @@ function createShimStatement(context, compiled, source, expanded) {
 
     const ensureRows = () => {
         if (rows !== null) return rows;
-        const objectRows = boundParameters === undefined
-            ? backingStatement.all()
-            : backingStatement.all(boundParameters);
+        let objectRows;
+        try {
+            objectRows = boundParameters === undefined
+                ? backingStatement.all()
+                : backingStatement.all(boundParameters);
+        } catch (error) {
+            // Execution-phase failures (constraint violations, datatype
+            // mismatches, interrupts) reach the user through here.
+            throw describeBackingError(error, source, context.describeError);
+        }
         const keys = objectRows.length > 0 ? Object.keys(objectRows[0]) : [];
         const values = objectRows.map(row => keys.map(key => row[key]));
 
@@ -775,11 +820,65 @@ export function createShimDatabase(config = {}, deps = {}) {
         }
     };
 
+    /**
+     * Ask SQLite itself whether a name resolves as a table.
+     *
+     * COMPILE ONLY: `prepare` never steps, and `WHERE 0` means even a caller
+     * that somehow stepped it would read nothing. Deliberately NOT routed
+     * through `compileNext` — this is shim-authored SQL over one quoted
+     * identifier, so the path-authority scan has nothing to find, and going
+     * through `compileNext` would recurse straight back into this describer.
+     */
+    const resolvesAsTable = (name) => {
+        let statement;
+        try {
+            statement = backing.prepare(`SELECT 1 FROM "${String(name).replace(/"/g, '""')}" WHERE 0`);
+        } catch {
+            return false;
+        }
+        finalizeQuietly(statement);
+        return true;
+    };
+
+    /**
+     * True when a name has a row in either catalog. Errs toward TRUE on any
+     * failure, because `inCatalog` is the veto half of the missing-table proof:
+     * an unanswerable catalog is a reason to stay silent, not to accuse.
+     */
+    const nameInCatalog = (name) => {
+        let statement;
+        try {
+            statement = backing.prepare(
+                'SELECT count(*) AS c FROM ('
+                + 'SELECT name FROM sqlite_schema UNION ALL SELECT name FROM sqlite_temp_schema'
+                + ') WHERE name = ? COLLATE NOCASE'
+            );
+        } catch {
+            return true;
+        }
+        try {
+            return Number(statement.all([String(name)])[0]?.c ?? 1) > 0;
+        } catch {
+            return true;
+        } finally {
+            finalizeQuietly(statement);
+        }
+    };
+
+    /** See describeBackingError. Bound to THIS connection's catalogs. */
+    const describeError = (error, sql) => buildSqliteErrorMessage(
+        error.errno,
+        error.message,
+        sql,
+        { resolves: resolvesAsTable, inCatalog: nameInCatalog }
+    );
+
     const statementContext = {
         /** Statements share the connection's quarantine, not just its handle. */
         assertUsable: () => {
             if (poisoned !== null) throw poisoned;
         },
+        describeError,
         register: (statement) => liveStatements.add(statement),
         forget: (statement) => liveStatements.delete(statement),
         probeColumnNames: (sql) => withColumnProbeView(sql, ({ literal }) => {
@@ -805,7 +904,7 @@ export function createShimDatabase(config = {}, deps = {}) {
     };
 
     const prepareInternal = (sql) => {
-        const next = compileNext(backing, sql, 0);
+        const next = compileNext(backing, sql, 0, describeError);
         if (next === null) throw new Error('Nothing to prepare');
         return createShimStatement(statementContext, next.compiled, next.source, next.expanded);
     };
@@ -837,7 +936,7 @@ export function createShimDatabase(config = {}, deps = {}) {
             const results = [];
             let cursor = 0;
             for (;;) {
-                const next = compileNext(backing, sql, cursor);
+                const next = compileNext(backing, sql, cursor, describeError);
                 if (next === null) break;
                 cursor = next.end;
                 const statement = createShimStatement(statementContext, next.compiled, next.source, next.expanded);
@@ -888,8 +987,14 @@ export function createShimDatabase(config = {}, deps = {}) {
                 // not a reachable bypass today -- but the shim is the security
                 // boundary, not worker.js, so close it unconditionally. Fast
                 // path: skip the scan entirely unless a scanned keyword appears.
-                if (PATH_AUTHORITY_SCAN_WORD.test(sql)) rejectPathAuthorityViolationsInScript(backing, sql);
-                backing.exec(sql);
+                if (PATH_AUTHORITY_SCAN_WORD.test(sql)) {
+                    rejectPathAuthorityViolationsInScript(backing, sql, describeError);
+                }
+                try {
+                    backing.exec(sql);
+                } catch (error) {
+                    throw describeBackingError(error, sql, describeError);
+                }
             }
             return database;
         },
@@ -918,7 +1023,7 @@ export function createShimDatabase(config = {}, deps = {}) {
                     assertOpen();
                     let next;
                     try {
-                        next = compileNext(backing, sql, cursor);
+                        next = compileNext(backing, sql, cursor, describeError);
                     } catch (error) {
                         // Leave the cursor where it is so getRemainingSQL()
                         // reports the text that failed to compile, as sql.js does.

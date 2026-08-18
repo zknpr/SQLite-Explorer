@@ -7,7 +7,7 @@
  * (injected by the native shell) is what desktop-host.js uses for file I/O,
  * settings, and native menus.
  */
-import { state, persistState } from './modules/state.js';
+import { state, persistState, resolveStartupPageSize } from './modules/state.js';
 import { backendApi, initDesktopApi } from './modules/desktop-api.js';
 import { createDesktopHost } from './modules/desktop-host.js';
 import { applyTheme } from './modules/desktop-theme.js';
@@ -30,7 +30,8 @@ import {
     updateStatus,
     showEmptyState,
     showErrorState,
-    initSidebarResize
+    initSidebarResize,
+    syncPageSizeSelect
 } from './modules/ui.js';
 import {
     closeAllModals,
@@ -444,6 +445,24 @@ const webviewMethods = {
 
 async function initializeApp() {
     try {
+        // BEFORE the modules that consume them. host.start() has already loaded
+        // the settings file, so this is a resolved in-page read, not I/O — and
+        // `.catch` keeps a settings failure from costing the whole app: it falls
+        // back to built-in defaults, which is what the desktop silently did with
+        // these three keys until now.
+        const startupSettings = await backendApi.getExtensionSettings().catch(err => {
+            console.error('Settings unavailable at startup:', err);
+            updateStatus(`Settings unavailable, using defaults: ${err.message}`);
+            return {};
+        });
+        // sqliteExplorer.defaultPageSize was declared and inert on the desktop:
+        // resolveStartupPageSize is called only from the VS Code entry, which
+        // reads it off an HTML-template dataset this page does not have. There
+        // is no persisted in-grid choice to outrank it here (see
+        // desktop-api.js's getVsCodeState), so the setting IS the startup value.
+        state.rowsPerPage = resolveStartupPageSize(startupSettings.defaultPageSize, undefined);
+        syncPageSizeSelect(state.rowsPerPage);
+
         // Initialize Modules (Event Listeners)
         initSidebar();
         initCrud();
@@ -453,7 +472,9 @@ async function initializeApp() {
         initEdit();
         initGridControls();
         initGridInteraction();
-        initSidebarResize();
+        initSidebarResize(
+            startupSettings.sidebarWidth > 0 ? { initialWidth: startupSettings.sidebarWidth } : {}
+        );
         initDragAndDrop();
         initViews();
 
@@ -547,6 +568,23 @@ if (!bridge) {
         // inside the host, so this one call covers both.
         const saveActiveDatabase = () => host.saveToDisk().then(reportSave, surface('Save failed'));
 
+        // A refused undo/redo is not a failure, so it never rejects — and until
+        // this reported it, ⌘Z after a column drop or a mutating console script
+        // was indistinguishable from a dead keystroke. DDL and console runs
+        // record a BARRIER (they cannot be replayed by the history engine), and
+        // the barrier is what the user needs named.
+        const reportHistoryStep = (label) => (result) => {
+            if (result?.performed === true) return;
+            if (result?.reason === 'barrier') {
+                updateStatus(
+                    `${label} stops here: "${result.barrierDescription}" cannot be reversed by the `
+                    + 'history engine. Save, or use File > Refresh to reload the file from disk.'
+                );
+                return;
+            }
+            updateStatus(`Nothing to ${label.toLowerCase()}`);
+        };
+
         // File > Export Database — the whole-database "save a copy" route. The
         // host picks the lane (native: sidecar VACUUM INTO → shell atomic move,
         // out of band so it is not bound by the 16 MiB stdio frame cap; WASM:
@@ -576,6 +614,22 @@ if (!bridge) {
         // harness don't implement onOpenFile.
         bridge.onOpenFile?.(async (path) => {
             await host.openFromShellPath(path).catch(surface('Open failed'));
+        });
+
+        // Files dropped on the window. Tauri handles OS drag-and-drop natively,
+        // so this arrives as PATHS from the shell rather than as an HTML5 drop
+        // the page could see (dnd.js's cell-upload handlers are registered for
+        // the VS Code and web builds and never fire here for that reason).
+        //
+        // Sequential, not Promise.all: openFromPath dedupes by canonical path
+        // and each open activates the database it opened, so racing a multi-file
+        // drop would leave the last one to RESOLVE active rather than the last
+        // one dropped, and would blow past MAX_OPEN_DATABASES concurrently.
+        // Every file is attempted even if an earlier one fails.
+        bridge.onDragDropPaths?.(async (paths) => {
+            for (const path of paths ?? []) {
+                await host.openFromShellPath(path).catch(surface(`Could not open ${path}`));
+            }
         });
 
         // VS Code intercepts these outside the webview; the desktop wires them here.
@@ -625,8 +679,14 @@ if (!bridge) {
             // failure (disk full, dead sidecar) or open failure must reach
             // the user, not die as an unhandled rejection behind a
             // still-dirty title.
-            if (key === 'z' && !event.shiftKey) { event.preventDefault(); await backendApi.triggerUndo().catch(surface('Undo failed')); }
-            else if ((key === 'z' && event.shiftKey) || key === 'y') { event.preventDefault(); await backendApi.triggerRedo().catch(surface('Redo failed')); }
+            if (key === 'z' && !event.shiftKey) {
+                event.preventDefault();
+                await backendApi.triggerUndo().then(reportHistoryStep('Undo'), surface('Undo failed'));
+            }
+            else if ((key === 'z' && event.shiftKey) || key === 'y') {
+                event.preventDefault();
+                await backendApi.triggerRedo().then(reportHistoryStep('Redo'), surface('Redo failed'));
+            }
             else if (key === 's') { event.preventDefault(); await saveActiveDatabase(); }
             else if (key === 'o') { event.preventDefault(); await host.openDatabaseViaDialog().catch(surface('Open failed')); }
         });

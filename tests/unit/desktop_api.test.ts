@@ -28,14 +28,21 @@ test('backendApi methods route through host.invoke with the web-api payload shap
   assert.equal(update.args.length, 6); // table,rowId,column,value,original,DEFAULT_MAX_CELL_EDIT_BYTES
 });
 
-test('view state round-trips through localStorage', () => {
+test('the VS Code view-state seam is inert on the desktop, and writes NOTHING', () => {
+  // It used to write persistState()'s snapshot into localStorage that nothing
+  // read back (getVsCodeState has exactly one caller, the VS Code entry), so
+  // the desktop paid for the write on every interaction and restored nothing.
+  // Restoring it would be WRONG rather than merely absent: the desktop keeps N
+  // databases behind one `state` object and boots to an empty scratch database,
+  // so one global blob would be replayed onto whichever database opened first.
   const store = new Map<string, string>();
   (globalThis as Record<string, unknown>).localStorage = {
     getItem: (k: string) => store.get(k) ?? null,
     setItem: (k: string, v: string) => { store.set(k, v); }
   };
   saveVsCodeState({ selectedTable: 'users' });
-  assert.deepEqual(getVsCodeState(), { selectedTable: 'users' });
+  assert.equal(store.size, 0, 'the desktop must not write viewer state to localStorage');
+  assert.equal(getVsCodeState(), undefined);
 });
 
 test('sendRpcRequest clears its timeout timer once the host invocation settles (no leaked timer)', async () => {
@@ -92,4 +99,87 @@ test('runConsole passes the script and an options object through to the host', a
     method: 'runConsole',
     args: ['EXPLAIN QUERY PLAN SELECT 1; DROP TABLE t;', { maxStatements: 1 }]
   });
+});
+
+// ---------------------------------------------------------------------------
+// Wave 2 (capstone E-9): dropping an indexed column ALWAYS failed, because this
+// lane never passed `dropDependentIndexes` — and a column drop is a history
+// barrier, which nothing told the user before they took it.
+// ---------------------------------------------------------------------------
+
+function confirmingHost(dependencies: unknown) {
+  const calls: Array<{ method: string; args: unknown[] }> = [];
+  return {
+    calls,
+    invoke: async (method: string, args: unknown[]) => {
+      calls.push({ method, args });
+      if (method === 'findColumnDependencies') return dependencies;
+      return { ok: true };
+    }
+  };
+}
+
+test('deleteColumns names the indexes it would drop and passes them to the engine', async () => {
+  const host = confirmingHost({
+    indexes: ['idx_users_email'],
+    dependentObjects: [{ type: 'view', identifier: 'active_users' }]
+  });
+  initDesktopApi(host as never);
+  const prompts: string[] = [];
+  (globalThis as Record<string, unknown>).window = {
+    confirm: (message: string) => { prompts.push(message); return true; }
+  };
+
+  await backendApi.deleteColumns('users', ['email']);
+
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0], /idx_users_email/);
+  assert.match(prompts[0], /view active_users/);
+  // The undo cost, stated BEFORE the drop rather than discovered after ⌘Z.
+  assert.match(prompts[0], /cannot be undone/);
+  // …and the confirmed list is what actually reaches the engine. Without it
+  // SQLite refuses the drop outright ("error in index ... no such column").
+  assert.deepEqual(host.calls.at(-1), {
+    method: 'deleteColumns',
+    args: ['users', ['email'], ['idx_users_email']]
+  });
+});
+
+test('declining the prompt cancels honestly and touches nothing', async () => {
+  const host = confirmingHost({ indexes: [], dependentObjects: [] });
+  initDesktopApi(host as never);
+  (globalThis as Record<string, unknown>).window = { confirm: () => false };
+
+  // `{cancelled: true}` is the shape crud.js already understands (the VS Code
+  // host has always answered it that way), so the grid reports "Delete
+  // cancelled" and does not reload.
+  assert.deepEqual(await backendApi.deleteColumns('users', ['email']), { cancelled: true });
+  assert.deepEqual(host.calls.map(call => call.method), ['findColumnDependencies']);
+});
+
+test('a column with no dependencies still gets the undo warning, and no index list', async () => {
+  const host = confirmingHost({ indexes: [], dependentObjects: [] });
+  initDesktopApi(host as never);
+  const prompts: string[] = [];
+  (globalThis as Record<string, unknown>).window = {
+    confirm: (message: string) => { prompts.push(message); return true; }
+  };
+
+  await backendApi.deleteColumns('users', ['email', 'phone']);
+  assert.match(prompts[0], /cannot be undone/);
+  assert.doesNotMatch(prompts[0], /will be dropped first/);
+  // undefined, not [] — the worker's third parameter is optional and an empty
+  // list would still be a list.
+  assert.deepEqual(host.calls.at(-1), {
+    method: 'deleteColumns',
+    args: ['users', ['email', 'phone'], undefined]
+  });
+});
+
+test('the oversized-cell refusals name THIS app and the route that works', async () => {
+  const editor = await backendApi.openCellEditor({}, 1, 'blob', {}, { sourceByteLength: 5_000_000 });
+  assert.equal(editor.success, false);
+  const message = String(editor.message);
+  assert.doesNotMatch(message, /web demo/);
+  assert.match(message, /Load More/);
 });

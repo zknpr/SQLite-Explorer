@@ -509,7 +509,13 @@ export function normalizeViewDefinitionError(
   selectSql: string
 ): unknown {
   const message = error instanceof Error ? error.message : String(error);
-  if (!/\bSQL logic error\s*$/i.test(message)
+  // Substring, not end-anchored: the native shim appends the result code's
+  // symbolic name and class to exactly this nonspecific text
+  // (core/native/sqlite-errors.js), so anchoring would silently stop restoring
+  // the diagnostic on the engine that needs it most. Widening is safe because
+  // a real `sqlite3_errmsg` never contains this phrase, and the self-reference
+  // proof below is what actually authorises the rewrite.
+  if (!/\bSQL logic error\b/i.test(message)
       || !viewDefinitionReferencesTarget(view, selectSql)) {
     return error;
   }
