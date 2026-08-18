@@ -348,6 +348,41 @@ const webviewMethods = {
         return { success: true };
     },
 
+    /**
+     * A database switch replaced every per-database field of `state` (the host
+     * swaps them wholesale — desktop-host.js `setActiveDb`). Two things the
+     * swap cannot reach have to follow it here, before refreshContent repaints:
+     *
+     * - the two STATIC filter inputs. They are the only DOM mirrors of
+     *   per-database state that nothing re-renders (per-column filter inputs
+     *   are rebuilt with the grid header, from `state.columnFilters`), so
+     *   without this the incoming database would show the outgoing one's
+     *   filter text over unfiltered rows.
+     * - the grid, when the incoming database has no table selected:
+     *   refreshContent's reload then has nothing to draw and the outgoing
+     *   database's rows would simply stay on screen.
+     */
+    async databaseSwitched() {
+        const globalFilter = document.getElementById('filterInput');
+        // Assigning an unchanged value moves the caret in some engines; only
+        // write on a real divergence.
+        if (globalFilter && globalFilter.value !== state.filterQuery) {
+            globalFilter.value = state.filterQuery;
+        }
+        const clearFilter = document.getElementById('btnClearFilter');
+        if (clearFilter) clearFilter.hidden = state.filterQuery.length === 0;
+        const sidebarFilter = document.getElementById('sidebarFilterInput');
+        if (sidebarFilter && sidebarFilter.value !== state.sidebarFilter) {
+            sidebarFilter.value = state.sidebarFilter;
+        }
+        if (!state.selectedTable) {
+            const label = document.getElementById('tableNameLabel');
+            if (label) label.textContent = 'No table selected';
+            showEmptyState();
+        }
+        return { success: true };
+    },
+
     async updateColorScheme(scheme) {
         document.documentElement.style.colorScheme = scheme;
         return { success: true };

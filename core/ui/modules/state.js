@@ -38,6 +38,13 @@ export function resolveStartupPageSize(configuredValue, persistedValue) {
         ?? DEFAULT_ROWS_PER_PAGE;
 }
 
+/**
+ * One object, imported by every UI module. The desktop build keeps N databases
+ * open behind it by swapping this object's contents on a database switch
+ * (`db-ui-state.js` classifies every field below as per-database, transient, or
+ * app-wide, and desktop-host.js `setActiveDb` does the swap). Adding a field
+ * here means classifying it there — a test enforces that the two stay in step.
+ */
 export const state = {
     isDbConnected: false,
     isReadOnly: false,

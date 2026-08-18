@@ -1,25 +1,61 @@
-import { test } from 'node:test';
+import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createDesktopHost } from '../../core/ui/modules/desktop-host.js';
+
+// Untyped UI modules: resolved through a path variable inside a hook, so tsc
+// does not demand declaration files for them — the same convention the other
+// webview-module tests use (crud_identity, grid_render, …). These are the very
+// modules desktop-host.js already pulled in above, so the bindings below are
+// the same live instances the host mutates.
+const stateModulePath = '../../core/ui/modules/state.js';
+const dbUiStateModulePath = '../../core/ui/modules/db-ui-state.js';
+/** The live viewer state singleton the desktop host swaps per database. */
+let state: Record<string, any>;
+let PER_DB_STATE_FIELDS: readonly string[];
+let TRANSIENT_STATE_FIELDS: readonly string[];
+let GLOBAL_STATE_FIELDS: readonly string[];
+
+before(async () => {
+  ({ state } = await import(stateModulePath));
+  ({ PER_DB_STATE_FIELDS, TRANSIENT_STATE_FIELDS, GLOBAL_STATE_FIELDS } = await import(dbUiStateModulePath));
+});
+
+/**
+ * Handler sentinel: the fake worker sends NO response at all, leaving the call
+ * in flight. Needed by the cross-database settle/fanout tests, which have to
+ * hold a pending entry open while another database's transport misbehaves.
+ */
+const NO_REPLY = Symbol('no reply');
 
 type Envelope = {
   channel: string;
   content: { kind: string; messageId: string; targetMethod: string; payload: unknown[] };
 };
 
-function makeFakeWorker(handlers: Record<string, (args: unknown[]) => unknown>) {
-  const posted: Envelope[] = [];
+/**
+ * One fake sql.js worker. Each open WASM database gets its OWN instance (the
+ * registry boots a Worker per database), so `posted` is shared by the whole
+ * host: it stays the flat, ordered trace of every envelope the host sent to
+ * any of its workers, which is what the assertions below read.
+ *
+ * `terminate()` really stops it answering — a terminated worker that kept
+ * replying would hide a closed database still serving.
+ */
+function makeFakeWorker(handlers: Record<string, (args: unknown[]) => unknown>, posted: Envelope[]) {
   const worker = {
+    terminated: false,
     onmessage: null as null | ((ev: { data: unknown }) => void),
     onerror: null as null | ((err: unknown) => void),
     postMessage(msg: Envelope) {
       posted.push(msg);
       const { messageId, targetMethod, payload } = msg.content;
       queueMicrotask(() => {
+        if (worker.terminated) return;
         try {
           const handler = handlers[targetMethod];
           if (!handler) throw new Error(`no fake for ${targetMethod}`);
           const data = handler(payload);
+          if (data === NO_REPLY) return;   // stays in flight on purpose
           worker.onmessage?.({ data: { channel: 'rpc', content: { kind: 'response', messageId, success: true, data } } });
         } catch (error) {
           worker.onmessage?.({ data: { channel: 'rpc', content: {
@@ -29,10 +65,12 @@ function makeFakeWorker(handlers: Record<string, (args: unknown[]) => unknown>) 
         }
       });
     },
-    terminate() { /* no-op */ }
+    terminate() { worker.terminated = true; }
   };
-  return { worker, posted };
+  return worker;
 }
+
+type FakeWorker = ReturnType<typeof makeFakeWorker>;
 
 function makeFakeBridge(overrides: Record<string, unknown> = {}) {
   const saved: { path?: string; bytes?: Uint8Array; settings?: unknown } = {};
@@ -53,17 +91,26 @@ function makeFakeBridge(overrides: Record<string, unknown> = {}) {
 }
 
 function makeHost(handlers: Record<string, (args: unknown[]) => unknown>, bridgeOverrides = {}) {
-  const { worker, posted } = makeFakeWorker({
+  const workerHandlers = {
     initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
     ping: () => true,
     ...handlers
-  });
+  };
+  const posted: Envelope[] = [];
+  const workers: FakeWorker[] = [];
   const { bridge, saved } = makeFakeBridge(bridgeOverrides);
   const host = createDesktopHost({
     bridge,
-    createWorker: () => worker as unknown as Worker
+    createWorker: () => {
+      const worker = makeFakeWorker(workerHandlers, posted);
+      workers.push(worker);
+      return worker as unknown as Worker;
+    }
   });
-  return { host, posted, saved, bridge, worker };
+  // `workers` grows as databases are opened; the last one is the newest WASM
+  // database's. Tests that need "the worker serving the active database" take
+  // it after the open they care about.
+  return { host, posted, saved, bridge, workers };
 }
 
 test('start boots an empty database and initialize reports connected', async () => {
@@ -761,50 +808,96 @@ const CANONICAL_PREFIX = '/private';
 
 type NativeLog = {
   opens: Array<{ path: string; readOnly: boolean }>;
+  /** dbIds issued by nativeOpen, in order. */
+  openedIds: string[];
   closes: number;
+  /** dbIds passed to nativeClose, in order — a double close would show here. */
+  closedIds: string[];
   envelopes: Envelope[];
-  // Out-of-band export route (Task 3): the whole-DB call takes no args; the
-  // table call carries the JSON.stringify'd exportTable args so tests can
-  // assert the host-injected maxExportBytes crossed WITHOUT any byte frame.
+  /** dbId each envelope was addressed to, index-aligned with `envelopes`. */
+  envelopeIds: string[];
+  // Out-of-band export route: both calls carry the dbId; the table call also
+  // carries the JSON.stringify'd exportTable args so tests can assert the
+  // host-injected maxExportBytes crossed WITHOUT any byte frame.
   exportDbCalls: number;
   exportTableArgs: string[];
 };
 
+/**
+ * The shell's native surface (Task 1, verbatim): `nativeOpen` returns an opaque
+ * shell-issued `dbId` plus the CANONICALIZED `boundPath` (deliberately a
+ * different spelling from the input — the shell canonicalises, and layer 3 and
+ * the sidecar compare exact strings, so the host must carry the RETURNED value
+ * into initializeDatabase). Every other call is addressed by `dbId`; an
+ * unknown or already-closed id is refused with `ERR_NATIVE_UNKNOWN_DB` and is
+ * NEVER retargeted, exactly as the shell behaves.
+ *
+ * Handlers receive `(payload, dbId)` so a test can give two open databases
+ * different answers.
+ */
 function makeNativeBridgeMembers(
-  handlers: Record<string, (args: unknown[]) => unknown>,
+  handlers: Record<string, (args: unknown[], dbId: string) => unknown>,
   opts: { available?: boolean; openError?: string } = {}
 ) {
-  const log: NativeLog = { opens: [], closes: 0, envelopes: [], exportDbCalls: 0, exportTableArgs: [] };
+  const log: NativeLog = {
+    opens: [], openedIds: [], closes: 0, closedIds: [],
+    envelopes: [], envelopeIds: [], exportDbCalls: 0, exportTableArgs: []
+  };
+  const live = new Set<string>();
+  let idSeq = 0;
+  const requireLive = (dbId: string) => {
+    if (!live.has(dbId)) throw new Error(`ERR_NATIVE_UNKNOWN_DB: ${String(dbId)}`);
+  };
   const members = {
     nativeAvailable: async () => opts.available ?? true,
     nativeOpen: async (path: string, readOnly: boolean) => {
       log.opens.push({ path, readOnly });
       if (opts.openError) throw new Error(opts.openError);
-      return CANONICAL_PREFIX + path;
+      const dbId = `db_${idSeq++}`;
+      live.add(dbId);
+      log.openedIds.push(dbId);
+      return { dbId, boundPath: CANONICAL_PREFIX + path };
     },
-    nativeRpc: async (envelopeJson: string) => {
+    nativeRpc: async (dbId: string, envelopeJson: string) => {
+      requireLive(dbId);
       const envelope = JSON.parse(envelopeJson) as Envelope;
       log.envelopes.push(envelope);
+      log.envelopeIds.push(dbId);
       const { messageId, targetMethod, payload } = envelope.content;
       const handler = handlers[targetMethod];
       const respond = (success: boolean, data: unknown, errorMessage?: string) =>
         JSON.stringify({ channel: 'rpc', content: { kind: 'response', messageId, success, data, errorMessage } });
       if (!handler) return respond(false, undefined, `no native fake for ${targetMethod}`);
       try {
-        return respond(true, handler(payload));
+        return respond(true, handler(payload, dbId));
       } catch (error) {
         return respond(false, undefined, error instanceof Error ? error.message : String(error));
       }
     },
-    nativeClose: async () => { log.closes += 1; },
+    // Deliberately NOT idempotent, matching the shell: a second close of the
+    // same id rejects instead of silently doing nothing.
+    nativeClose: async (dbId: string) => {
+      requireLive(dbId);
+      live.delete(dbId);
+      log.closes += 1;
+      log.closedIds.push(dbId);
+    },
     // Shell-owned out-of-band export: the sidecar writes to a shell temp and
     // the shell moves it to the dialog-picked dest, returning the dest's
     // basename as savedAs. The default is a clean success; tests override for
     // cancel/empty scenarios. Deliberately NOT reachable by the framed
     // saveFileAs path — asserting exportDbCalls/exportTableArgs proves the host
     // took this route instead of framing bytes.
-    nativeExportDatabase: async () => { log.exportDbCalls += 1; return { success: true, savedAs: 'export.db' }; },
-    nativeExportTable: async (argsJson: string) => { log.exportTableArgs.push(argsJson); return { success: true, savedAs: 'export.csv' }; }
+    nativeExportDatabase: async (dbId: string) => {
+      requireLive(dbId);
+      log.exportDbCalls += 1;
+      return { success: true, savedAs: 'export.db' };
+    },
+    nativeExportTable: async (dbId: string, argsJson: string) => {
+      requireLive(dbId);
+      log.exportTableArgs.push(argsJson);
+      return { success: true, savedAs: 'export.csv' };
+    }
   };
   return { members, log };
 }
@@ -996,7 +1089,10 @@ test('nativeAvailable=false goes straight to WASM without attempting nativeOpen'
   assert.equal(init.engine, 'wasm');
 });
 
-test('opening a database over the WASM path closes a live native session first', async () => {
+// Multi-database semantics: a second open ADDS a database, it does not replace
+// the first. The old single-document host shut the live sidecar down here; now
+// both stay open and only the active pointer moves.
+test('a WASM open alongside a live native database leaves the native sidecar running', async () => {
   let failNextOpen = false;
   const { members, log } = makeNativeBridgeMembers({
     initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
@@ -1015,9 +1111,15 @@ test('opening a database over the WASM path closes a live native session first',
   await host.openFromShellPath('/tmp/first.db');        // native session live
   failNextOpen = true;
   await host.openFromShellPath('/tmp/second.db');       // falls back to WASM
-  assert.equal(log.closes, 1);                          // first sidecar shut down on the switch
+  assert.equal(log.closes, 0);                          // first sidecar untouched by the second open
   const init = await host.invoke('initialize', []) as Record<string, unknown>;
-  assert.equal(init.engine, 'wasm');
+  assert.equal(init.engine, 'wasm');                    // …but the WASM one is now active
+
+  const open = host.listDatabases();
+  assert.deepEqual(open.map(d => [d.name, d.engine, d.isActive]), [
+    ['first.db', 'native', false],
+    ['second.db', 'wasm', true]
+  ]);
 });
 
 test('dialog opens skip the maxFileSize cap on the native engine but enforce it on the WASM fallback', async () => {
@@ -1422,7 +1524,7 @@ test('native transport errors reject the pending call with the structured reason
   });
   const { host } = makeHost({}, {
     ...members,
-    nativeRpc: async (json: string) => {
+    nativeRpc: async (_dbId: string, json: string) => {
       const envelope = JSON.parse(json) as Envelope;
       if (envelope.content.targetMethod === 'fetchSchema') {
         throw new Error('ERR_NATIVE_SIDECAR_EXITED: exited with code 1');
@@ -1447,10 +1549,10 @@ test('outbound native envelopes are frame-codec encoded: Uint8Array args become 
     ping: () => true
   });
   const innerRpc = members.nativeRpc;
-  members.nativeRpc = async (json: string) => {
+  members.nativeRpc = async (dbId: string, json: string) => {
     const envelope = JSON.parse(json) as Envelope;
     if (envelope.content.targetMethod === 'updateCell') rawJson = json;
-    return innerRpc(json);
+    return innerRpc(dbId, json);
   };
   const { host } = makeHost({}, {
     ...members,
@@ -1472,13 +1574,17 @@ test('outbound native envelopes are frame-codec encoded: Uint8Array args become 
 // Fix round 1 — review defects
 // ============================================================================
 
-// CRITICAL 1: after a native session is torn down for a fallback open, the
-// WASM worker does NOT hold the document currentPath names (its last good init
-// is the empty startup DB). If the fallback then fails, ⌘S used to export that
-// stale/empty image and bridge.saveDatabase it over the user's REAL file (the
-// old path was still allowlisted from the original pick). The failure must
-// invalidate the document identity so nothing can be written anywhere.
-test('a failed WASM fallback after native teardown invalidates the document: saveToDisk cannot overwrite the old file', async () => {
+// CRITICAL 1, under the registry. The old single-document host tore the live
+// native session down to make room for the new open, which left the shared WASM
+// worker NOT holding the document currentPath named — so a failed fallback made
+// ⌘S export a stale/empty image over the user's REAL file, and the host needed
+// an invalidate-the-document recovery to stop it.
+//
+// A registry open builds a NEW entry with its OWN engine and only commits it on
+// success, so the property is now stronger and structural: a failed open cannot
+// touch — let alone damage — the database that was already open. This is the
+// same scenario, asserting that.
+test('a failed open leaves the live native database completely intact: no teardown, still dirty, still saveable to its own path', async () => {
   let declineNative = false;
   let failRead = false;
   const { txn, exec } = makeTxnFake();
@@ -1513,23 +1619,21 @@ test('a failed WASM fallback after native teardown invalidates the document: sav
   declineNative = true;
   failRead = true;
   await assert.rejects(() => host.openFromShellPath('/tmp/second.db'), /EACCES/);
-  assert.equal(log.closes, 1);                                   // old sidecar torn down
+  assert.equal(log.closes, 0);                                   // the live sidecar was never touched
+  assert.equal(host.listDatabases().length, 1);                  // and no half-built entry was kept
 
-  // The dangerous ⌘S: must be a no-op, not an overwrite of /tmp/precious.db.
-  const wrote = await host.saveToDisk();
-  assert.equal(wrote, false);
+  // The pending edit survived, and ⌘S is a real COMMIT on precious.db's own
+  // sidecar — never a byte export of some other image over the file.
+  assert.equal(host.hasUnsavedChanges(), true);
+  assert.equal(await host.saveToDisk(), true);
   assert.equal(saved.path, undefined);                           // bridge.saveDatabase never ran
   assert.equal(posted.filter(p => p.content.targetMethod === 'exportDatabase').length, 0);
-
-  // Identity reset to the no-document state; title cannot claim edits exist.
   assert.equal(host.hasUnsavedChanges(), false);
+  assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT']);
+
   const init = await host.invoke('initialize', []) as Record<string, unknown>;
-  assert.equal(init.filename, 'untitled.db');
-  assert.equal(init.engine, 'wasm');
-  // Hardening: the WASM worker was re-initialized to the empty startup DB.
-  const lastInit = posted.filter(p => p.content.targetMethod === 'initializeDatabase').at(-1)!;
-  assert.equal(lastInit.content.payload[0], 'untitled.db');
-  assert.equal((lastInit.content.payload[1] as Record<string, unknown>).content, undefined);
+  assert.equal(init.filename, 'precious.db');
+  assert.equal(init.engine, 'native');
 });
 
 // Companion boundary: when NO native teardown happened and the failure fired
@@ -1722,9 +1826,11 @@ test('setPragma foreign_keys passes through on WASM regardless of dirty state (i
   assert.deepEqual(pragmas.at(-1), ['foreign_keys', true]);
 });
 
-// MINOR: the pending map is shared by both transports. A WASM worker error
-// while the native engine is active must fail only its own (WASM) calls —
-// in-flight native RPCs are alive on bridge.nativeRpc and must settle.
+// MINOR: the pending map is shared by both transports (and, now, by every open
+// database). A WASM worker error while the native engine is active must fail
+// only its own (WASM) calls — in-flight native RPCs are alive on
+// bridge.nativeRpc and must settle. Here the WASM worker under test is the boot
+// placeholder's, still live because the native open only made it inactive.
 test('worker.onerror rejects only WASM-transport pendings; in-flight native calls still settle', async () => {
   let releaseNative!: () => void;
   const gate = new Promise<void>((resolve) => { releaseNative = resolve; });
@@ -1736,20 +1842,30 @@ test('worker.onerror rejects only WASM-transport pendings; in-flight native call
     fetchSchema: () => schema
   });
   const innerRpc = members.nativeRpc;
-  members.nativeRpc = async (json: string) => {
+  members.nativeRpc = async (dbId: string, json: string) => {
     const envelope = JSON.parse(json) as Envelope;
     if (envelope.content.targetMethod === 'fetchSchema') await gate;   // hold the call in flight
-    return innerRpc(json);
+    return innerRpc(dbId, json);
   };
-  const { host, worker } = makeHost({}, { ...members, nativeRpc: members.nativeRpc });
+  const realOpen = members.nativeOpen;
+  members.nativeOpen = async (path: string, readOnly: boolean) => {
+    if (path === '/tmp/wasm-only.db') throw new Error('ERR_NATIVE_UNAVAILABLE');   // force the WASM lane
+    return realOpen(path, readOnly);
+  };
+  const { host, workers } = makeHost({}, { ...members });
   await host.start();
   host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
-  await host.openFromShellPath('/tmp/y.db');
+  // A WASM database the user keeps open alongside the native one (the boot
+  // placeholder is dropped by the first real open, so open a real file).
+  await host.openFromShellPath('/tmp/wasm-only.db');
+  const wasmWorker = workers.at(-1)!;
+  await host.openFromShellPath('/tmp/y.db');            // native; now active
 
   const inFlight = host.invoke('fetchSchema', []);
-  worker.onerror?.(new Error('wasm worker crashed'));   // must not touch the native pending
+  wasmWorker.onerror?.(new Error('wasm worker crashed'));   // must not touch the native pending
   releaseNative();
-  // Settled by the NATIVE response, not spuriously rejected by the WASM crash.
+  // Settled by the NATIVE response, not spuriously rejected by another
+  // database's WASM crash.
   assert.deepEqual(await inFlight, schema);
 });
 
@@ -1848,13 +1964,14 @@ test('fork messages: a genuine COMMIT failure is still separated from the generi
 // Fix round 2 — re-review defects
 // ============================================================================
 
-// STILL-OPEN CRITICAL slice: `hadNativeSession` used to be sampled AFTER
-// tryOpenNative — whose init-refusal path calls closeNativeSidecar(), nulling
-// nativeBoundPath. So "nativeOpen succeeds, native init refuses, WASM lane
-// fails BEFORE the worker is touched" left the invalidation unarmed and ⌘S
-// re-armed to overwrite the old file with the empty startup image. The sample
-// must be taken BEFORE the native attempt.
-test('init-refusal slice: native open ok, native init refuses, cap fails the WASM lane — invalidation still arms', async () => {
+// STILL-OPEN CRITICAL slice, under the registry. The nastiest ordering: the new
+// open's nativeOpen SUCCEEDS (a second sidecar is live), its init refuses, and
+// the WASM lane then fails on the cap. The single-document host had to arm an
+// invalidation here or ⌘S would overwrite the old file with the empty startup
+// image; the registry instead has to (a) reap the second sidecar it spawned and
+// (b) leave the first database — its sidecar, its pending edit, its identity —
+// untouched.
+test('init-refusal slice: native open ok, native init refuses, cap fails the WASM lane — the second sidecar is reaped and the first database is untouched', async () => {
   let refuseNativeInit = false;
   const { txn, exec } = makeTxnFake();
   const { members, log } = makeNativeBridgeMembers({
@@ -1883,22 +2000,25 @@ test('init-refusal slice: native open ok, native init refuses, cap fails the WAS
 
   refuseNativeInit = true;
   await assert.rejects(() => host.openDatabaseViaDialog(), /maxFileSize/);
-  assert.equal(log.closes >= 1, true);                           // second sidecar torn down inside tryOpenNative
+  // Exactly the SECOND sidecar was reaped, by its own id — never the first.
+  assert.deepEqual(log.closedIds, [log.openedIds[1]]);
+  assert.equal(host.listDatabases().length, 1);                  // no half-built entry survived
 
-  const wrote = await host.saveToDisk();
-  assert.equal(wrote, false);
+  // The first database is fully intact: its pending edit, and a ⌘S that is a
+  // COMMIT on its own sidecar rather than a byte export over the file.
+  assert.equal(host.hasUnsavedChanges(), true);
+  assert.equal(await host.saveToDisk(), true);
   assert.equal(saved.path, undefined);                           // bridge.saveDatabase never ran
   assert.equal(posted.filter(p => p.content.targetMethod === 'exportDatabase').length, 0);
-  assert.equal(host.hasUnsavedChanges(), false);
   const init = await host.invoke('initialize', []) as Record<string, unknown>;
-  assert.equal(init.filename, 'untitled.db');
-  assert.equal(init.engine, 'wasm');
+  assert.equal(init.filename, 'precious.db');
+  assert.equal(init.engine, 'native');
 });
 
-test('init-refusal slice, read-throw variant: readDatabaseBytes failure after the refusal also invalidates', async () => {
+test('init-refusal slice, read-throw variant: a readDatabaseBytes failure after the refusal also leaves the first database intact', async () => {
   let refuseNativeInit = false;
   const { txn, exec } = makeTxnFake();
-  const { members } = makeNativeBridgeMembers({
+  const { members, log } = makeNativeBridgeMembers({
     initializeDatabase: () => {
       if (refuseNativeInit) throw new Error('file is not a database');
       txn.open = false;
@@ -1922,7 +2042,10 @@ test('init-refusal slice, read-throw variant: readDatabaseBytes failure after th
 
   refuseNativeInit = true;
   await assert.rejects(() => host.openFromShellPath('/tmp/corrupt.db'), /EACCES/);
-  assert.equal(await host.saveToDisk(), false);
+  assert.deepEqual(log.closedIds, [log.openedIds[1]]);           // only the refused sidecar
+  assert.equal(host.listDatabases().length, 1);
+  assert.equal(host.hasUnsavedChanges(), true);                  // the pending edit is still there
+  assert.equal(await host.saveToDisk(), true);
   assert.equal(saved.path, undefined);
   assert.equal(host.hasUnsavedChanges(), false);
 });
@@ -2215,4 +2338,590 @@ test('an auto-rolled-back redo replay reconciles symmetrically', async () => {
   await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'o', 1048576]);   // fresh txn, pending
   assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT', 'BEGIN']);
   assert.equal(txn.open, true);
+});
+
+// ============================================================================
+// Multi-database registry: N open databases, one active, swap-on-switch
+// ============================================================================
+
+/** Settles to 'pending' if `promise` has not settled within a macrotask hop. */
+async function stillPending(promise: Promise<unknown>): Promise<string> {
+  return Promise.race([
+    promise.then(() => 'resolved', () => 'rejected'),
+    new Promise<string>(resolve => setTimeout(() => resolve('pending'), 5))
+  ]);
+}
+
+/** A host with N independent native sidecars, each with its own txn state. */
+function makeMultiNativeHost(extraHandlers: Record<string, (args: unknown[], dbId: string) => unknown> = {}) {
+  const txns = new Map<string, ReturnType<typeof makeTxnFake>>();
+  const txnFor = (dbId: string) => {
+    if (!txns.has(dbId)) txns.set(dbId, makeTxnFake());
+    return txns.get(dbId)!;
+  };
+  const { members, log } = makeNativeBridgeMembers({
+    initializeDatabase: (_args, dbId) => { txnFor(dbId).txn.open = false; return { isReadOnly: false, storage: 'memory' }; },
+    runQuery: (args, dbId) => txnFor(dbId).exec(args[0]),
+    updateCell: () => 1,
+    undoModification: () => ({ success: true }),
+    ping: () => true,
+    ...extraHandlers
+  });
+  const made = makeHost({}, members);
+  return { ...made, nativeLog: log, txnFor };
+}
+
+// ---------------------------------------------------------------------------
+// The classification itself. A per-database field wrongly classified global (or
+// simply forgotten) leaks one database's grid, filters or selection into
+// another — the defining defect of swap-on-switch. This test makes the
+// classification exhaustive by construction, so a field added to `state` later
+// fails here instead of leaking silently.
+// ---------------------------------------------------------------------------
+
+test('state field classification covers every field of the state singleton exactly once', async () => {
+  const classified = [...PER_DB_STATE_FIELDS, ...TRANSIENT_STATE_FIELDS, ...GLOBAL_STATE_FIELDS];
+  assert.equal(new Set(classified).size, classified.length, 'a field is classified twice');
+  assert.deepEqual(
+    [...classified].sort(),
+    Object.keys(state).sort(),
+    'every state field must be per-database, transient, or explicitly global'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Two databases, independent in every dimension the host owns.
+// ---------------------------------------------------------------------------
+
+test('two open databases keep independent undo history, dirty state and session transactions', async () => {
+  const { host, nativeLog, txnFor } = makeMultiNativeHost();
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+
+  await host.openFromShellPath('/tmp/a.db');
+  const [idA] = nativeLog.openedIds;
+  await host.invoke('updateCell', ['t', 1, 'c', 'a1', 'a0', 1048576]);   // A is dirty
+  const dbA = host.activeDatabaseId()!;
+
+  await host.openFromShellPath('/tmp/b.db');
+  const idB = nativeLog.openedIds[1];
+  const dbB = host.activeDatabaseId()!;
+  assert.notEqual(dbA, dbB);
+
+  // B is clean and has no transaction; A still holds both.
+  assert.equal(host.hasUnsavedChanges(), false);
+  assert.equal(txnFor(idA).txn.open, true);
+  assert.equal(txnFor(idB).txn.open, false);
+  assert.deepEqual(
+    host.listDatabases().map(d => [d.name, d.isDirty, d.isActive]),
+    [['a.db', true, false], ['b.db', false, true]]
+  );
+
+  // B's own edit opens B's OWN transaction and does not touch A's history.
+  await host.invoke('updateCell', ['t', 2, 'c', 'b1', 'b0', 1048576]);
+  assert.equal(txnFor(idB).txn.open, true);
+  assert.deepEqual(txnFor(idA).txn.applied, ['BEGIN']);
+  assert.deepEqual(txnFor(idB).txn.applied, ['BEGIN']);
+
+  // Saving B commits B's transaction only: A stays dirty and pending.
+  assert.equal(await host.saveToDisk(), true);
+  assert.deepEqual(txnFor(idB).txn.applied, ['BEGIN', 'COMMIT']);
+  assert.deepEqual(txnFor(idA).txn.applied, ['BEGIN']);
+  assert.equal(host.hasUnsavedChanges(), false);
+
+  // Switching back finds A exactly as it was left: dirty, with its own undo
+  // entry still on the stack.
+  assert.equal(await host.setActiveDb(dbA), true);
+  assert.equal(host.hasUnsavedChanges(), true);
+  assert.deepEqual(await host.invoke('triggerUndo', []), { performed: true });
+  assert.equal(host.hasUnsavedChanges(), false);
+  // …and B's history was never consumed by A's undo.
+  await host.setActiveDb(dbB);
+  assert.deepEqual(await host.invoke('triggerUndo', []), { performed: true });
+});
+
+test('every native envelope carries its own database\'s sidecar id — never another\'s', async () => {
+  const { host, nativeLog } = makeMultiNativeHost({ fetchSchema: (_a, dbId) => ({ tables: [{ name: dbId }], views: [], indexes: [] }) });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  await host.openFromShellPath('/tmp/b.db');
+  const [idA, idB] = nativeLog.openedIds;
+
+  const fromB = await host.invoke('fetchSchema', []) as { tables: Array<{ name: string }> };
+  assert.deepEqual(fromB.tables, [{ name: idB }]);
+  await host.setActiveDb(dbA);
+  const fromA = await host.invoke('fetchSchema', []) as { tables: Array<{ name: string }> };
+  assert.deepEqual(fromA.tables, [{ name: idA }]);
+
+  // Every envelope's addressed id matches the database whose open produced it:
+  // A's initializeDatabase must never be framed at B's sidecar, and vice versa.
+  const initIds = nativeLog.envelopes
+    .map((envelope, index) => [envelope.content.targetMethod, nativeLog.envelopeIds[index]] as const)
+    .filter(([method]) => method === 'initializeDatabase')
+    .map(([, id]) => id);
+  assert.deepEqual(initIds, [idA, idB]);
+  const initPaths = nativeLog.envelopes
+    .filter(envelope => envelope.content.targetMethod === 'initializeDatabase')
+    .map(envelope => (envelope.content.payload[1] as Record<string, unknown>).path);
+  assert.deepEqual(initPaths, ['/private/tmp/a.db', '/private/tmp/b.db']);
+});
+
+// ---------------------------------------------------------------------------
+// Swap-on-switch: `state` keeps its identity, its per-database fields do not.
+// ---------------------------------------------------------------------------
+
+test('setActiveDb restores the incoming database\'s UI state and preserves the outgoing one\'s', async () => {
+  const { host } = makeHost({ fetchSchema: () => ({ tables: [], views: [], indexes: [] }) });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  const stateIdentity = state;
+
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  // What the user did in A.
+  state.selectedTable = 'users';
+  state.selectedTableType = 'table';
+  state.currentPageIndex = 3;
+  state.columnFilters = { name: 'ali' };
+  state.filterQuery = 'ali';
+  state.selectedRowIds = new Set([1, 2, 3]);
+  state.columnWidths = { name: 240 };
+  state.gridData = [['a']];
+  state.schemaCache = { tables: [{ name: 'users' }], views: [], indexes: [] };
+  state.sidebarFilter = 'us';
+  state.matchNav = { scope: 'name', term: 'ali', matches: [{ rowIdx: 0, colIdx: 0 }], currentIndex: 0 };
+  const aRowIds = state.selectedRowIds;
+
+  await host.openFromShellPath('/tmp/b.db');
+  const dbB = host.activeDatabaseId()!;
+  // B starts clean: nothing of A's survived into it.
+  assert.equal(state.selectedTable, null);
+  assert.deepEqual(state.columnFilters, {});
+  assert.equal(state.filterQuery, '');
+  assert.equal(state.selectedRowIds.size, 0);
+  assert.notEqual(state.selectedRowIds, aRowIds);          // a fresh Set, not A's
+  assert.deepEqual(state.columnWidths, {});
+  assert.deepEqual(state.gridData, []);
+  assert.deepEqual(state.schemaCache, { tables: [], views: [], indexes: [] });
+  assert.equal(state.sidebarFilter, '');
+  assert.deepEqual(state.matchNav, { scope: null, term: null, matches: [], currentIndex: -1 });
+
+  state.selectedTable = 'orders';
+  state.columnFilters = { total: '>100' };
+  state.selectedRowIds = new Set([9]);
+
+  // Back to A: its state comes back intact, including container identity.
+  assert.equal(await host.setActiveDb(dbA), true);
+  assert.equal(state, stateIdentity, 'the state object identity must survive the swap');
+  assert.equal(state.selectedTable, 'users');
+  assert.equal(state.currentPageIndex, 3);
+  assert.deepEqual(state.columnFilters, { name: 'ali' });
+  assert.equal(state.filterQuery, 'ali');
+  assert.deepEqual([...state.selectedRowIds], [1, 2, 3]);
+  assert.equal(state.selectedRowIds, aRowIds);
+  assert.deepEqual(state.columnWidths, { name: 240 });
+  assert.deepEqual(state.schemaCache, { tables: [{ name: 'users' }], views: [], indexes: [] });
+  assert.equal(state.sidebarFilter, 'us');
+  assert.equal(state.matchNav.term, 'ali');
+
+  // And B's edits since the switch were preserved on B, not lost or merged.
+  assert.equal(await host.setActiveDb(dbB), true);
+  assert.equal(state.selectedTable, 'orders');
+  assert.deepEqual(state.columnFilters, { total: '>100' });
+  assert.deepEqual([...state.selectedRowIds], [9]);
+});
+
+test('a switch resets transient interaction state and leaves global preferences alone', async () => {
+  const { host } = makeHost({});
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  await host.openFromShellPath('/tmp/b.db');
+
+  // Global preferences the user set once, for the whole app.
+  state.rowsPerPage = 250;
+  state.dateFormat = 'iso';
+  state.cellEditBehavior = 'modal';
+  state.cellPreviewWrapEnabled = false;
+  state.isDesktop = true;
+  // Mid-interaction junk that must NOT travel to another database.
+  state.isGridReloading = true;
+  state.isSavingCell = true;
+  state.resizingColumn = 'name';
+  state.resizeStartX = 42;
+  state.activeCellInput = { fake: 'dom node' } as unknown as null;
+  state.filterApplyPending = true;
+  state.filterApplyTable = 'users';
+  state.lastDoubleClickTime = 999;
+  state.filterTimer = setTimeout(() => { throw new Error('a stale debounce fired into another database'); }, 50) as unknown as null;
+
+  await host.setActiveDb(dbA);
+
+  assert.equal(state.rowsPerPage, 250);
+  assert.equal(state.dateFormat, 'iso');
+  assert.equal(state.cellEditBehavior, 'modal');
+  assert.equal(state.cellPreviewWrapEnabled, false);
+  assert.equal(state.isDesktop, true);
+
+  assert.equal(state.isGridReloading, false);
+  assert.equal(state.isSavingCell, false);
+  assert.equal(state.resizingColumn, null);
+  assert.equal(state.resizeStartX, 0);
+  assert.equal(state.activeCellInput, null);
+  assert.equal(state.filterApplyPending, false);
+  assert.equal(state.filterApplyTable, null);
+  assert.equal(state.lastDoubleClickTime, 0);
+  assert.equal(state.filterTimer, null);
+  // The armed debounce was CLEARED, not merely forgotten: give it more than its
+  // own delay to prove it never fires.
+  await new Promise(resolve => setTimeout(resolve, 60));
+});
+
+test('the switch notifies the page after the swap and before the reload, and reports the registry', async () => {
+  const order: string[] = [];
+  let switchedTable: unknown = 'unset';
+  const lists: Array<Array<Record<string, unknown>>> = [];
+  const { host } = makeHost({});
+  host.setWebviewMethods({
+    refreshContent: async () => { order.push('refreshContent'); return { success: true }; },
+    databaseSwitched: async () => {
+      order.push('databaseSwitched');
+      switchedTable = state.selectedTable;   // the swap has already happened
+      return { success: true };
+    },
+    databasesChanged: async (list: unknown) => { lists.push(list as Array<Record<string, unknown>>); return undefined; }
+  });
+  await host.start();
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  state.selectedTable = 'users';
+  await host.openFromShellPath('/tmp/b.db');
+
+  order.length = 0;
+  await host.setActiveDb(dbA);
+  assert.deepEqual(order, ['databaseSwitched', 'refreshContent']);
+  assert.equal(switchedTable, 'users');   // A's selection was already restored
+
+  const latest = lists.at(-1)!;
+  assert.deepEqual(latest.map(d => [d.name, d.isActive]), [['a.db', true], ['b.db', false]]);
+});
+
+// ---------------------------------------------------------------------------
+// Call settlement: one pending map, N databases, no cross-talk.
+// ---------------------------------------------------------------------------
+
+test('a pending call for one database is never settled by another database\'s response', async () => {
+  const foreignRows = { tables: [{ name: 'B_ROWS' }], views: [], indexes: [] };
+  const ownRows = { tables: [{ name: 'A_ROWS' }], views: [], indexes: [] };
+  const { host, posted, workers } = makeHost({ fetchSchema: () => NO_REPLY });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const workerA = workers.at(-1)!;
+  await host.openFromShellPath('/tmp/b.db');
+  const workerB = workers.at(-1)!;
+  const dbA = host.listDatabases()[0].dbId;
+
+  await host.setActiveDb(dbA);
+  const inFlight = host.invoke('fetchSchema', []);        // held open by NO_REPLY
+  const messageId = posted.at(-1)!.content.messageId;
+
+  // B's worker answers with A's messageId — the shape a mis-routed or hostile
+  // response takes. It must not settle A's caller.
+  workerB.onmessage?.({ data: { channel: 'rpc', content: { kind: 'response', messageId, success: true, data: foreignRows } } });
+  assert.equal(await stillPending(inFlight), 'pending');
+
+  // The call is still A's to settle, and A's own answer still works.
+  workerA.onmessage?.({ data: { channel: 'rpc', content: { kind: 'response', messageId, success: true, data: ownRows } } });
+  assert.deepEqual(await inFlight, ownRows);
+});
+
+test('a worker crash fans out only its own database\'s calls', async () => {
+  const { host, posted, workers } = makeHost({ fetchSchema: () => NO_REPLY });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const workerA = workers.at(-1)!;
+  await host.openFromShellPath('/tmp/b.db');
+  const workerB = workers.at(-1)!;
+  const [dbA, dbB] = host.listDatabases().map(d => d.dbId);
+
+  const inFlightB = host.invoke('fetchSchema', []);       // B is active
+  const messageIdB = posted.at(-1)!.content.messageId;
+  await host.setActiveDb(dbA);
+  const inFlightA = host.invoke('fetchSchema', []);
+  assert.equal(dbA !== dbB, true);
+
+  workerA.onerror?.(new Error('boom'));
+  await assert.rejects(() => inFlightA, /Worker crashed: boom/);
+  assert.equal(await stillPending(inFlightB), 'pending');
+
+  const rows = { tables: [], views: [], indexes: [] };
+  workerB.onmessage?.({ data: { channel: 'rpc', content: { kind: 'response', messageId: messageIdB, success: true, data: rows } } });
+  assert.deepEqual(await inFlightB, rows);
+});
+
+// ---------------------------------------------------------------------------
+// Close.
+// ---------------------------------------------------------------------------
+
+test('closing one database leaves the other serving, closes exactly its own sidecar, and fails only its own calls', async () => {
+  const { host, nativeLog } = makeMultiNativeHost({
+    fetchSchema: (_args, dbId) => ({ tables: [{ name: dbId }], views: [], indexes: [] })
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  await host.openFromShellPath('/tmp/b.db');
+  const dbB = host.activeDatabaseId()!;
+  const [idA, idB] = nativeLog.openedIds;
+
+  await host.setActiveDb(dbA);
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);   // A is dirty
+  assert.equal(host.hasUnsavedChanges(), true);
+
+  assert.equal(await host.closeDatabase(dbA), true);
+  // Exactly one close, addressed to A's own sidecar. nativeClose is NOT
+  // idempotent shell-side, so a second one would reject loudly.
+  assert.deepEqual(nativeLog.closedIds, [idA]);
+  // B became active and answers from its OWN sidecar.
+  assert.equal(host.activeDatabaseId(), dbB);
+  assert.deepEqual(host.listDatabases().map(d => d.name), ['b.db']);
+  assert.deepEqual(await host.invoke('fetchSchema', []), { tables: [{ name: idB }], views: [], indexes: [] });
+  assert.equal(host.hasUnsavedChanges(), false);          // A's dirty flag left with A
+  assert.equal((await host.invoke('initialize', []) as Record<string, unknown>).filename, 'b.db');
+});
+
+test('closing a database rejects its in-flight calls and only those', async () => {
+  const { host, workers } = makeHost({ fetchSchema: () => NO_REPLY });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  await host.openFromShellPath('/tmp/b.db');
+  const workerB = workers.at(-1)!;
+  const [dbA, dbB] = host.listDatabases().map(d => d.dbId);
+
+  const inFlightB = host.invoke('fetchSchema', []);       // B active
+  await host.setActiveDb(dbA);
+  const inFlightA = host.invoke('fetchSchema', []);
+
+  await host.closeDatabase(dbA);
+  await assert.rejects(() => inFlightA, /Database "a\.db" was closed/);
+  assert.equal(await stillPending(inFlightB), 'pending');
+  assert.equal(host.activeDatabaseId(), dbB);
+  assert.equal(workerB.terminated, false);                // B's engine untouched
+  // inFlightB is deliberately left unsettled — that IS the assertion. Attach a
+  // handler so an unhandled-rejection warning can never appear if it ever does.
+  void inFlightB.catch(() => undefined);
+});
+
+test('closing the last database leaves a fresh empty one, not a dead host', async () => {
+  const { host, nativeLog } = makeMultiNativeHost();
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+
+  assert.equal(await host.closeDatabase(dbA), true);
+  assert.deepEqual(nativeLog.closedIds, nativeLog.openedIds);
+  const open = host.listDatabases();
+  assert.equal(open.length, 1);
+  assert.deepEqual([open[0].name, open[0].path, open[0].engine, open[0].isActive], ['untitled.db', null, 'wasm', true]);
+  // Still a working host: the replacement answers RPCs.
+  assert.equal((await host.invoke('initialize', []) as Record<string, unknown>).filename, 'untitled.db');
+  assert.equal(await host.invoke('ping', []), true);
+});
+
+test('closing a background database keeps the active one active', async () => {
+  const { host } = makeHost({});
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  await host.openFromShellPath('/tmp/b.db');
+  const [dbA, dbB] = host.listDatabases().map(d => d.dbId);
+
+  state.selectedTable = 'orders';                          // B's selection
+  await host.closeDatabase(dbA);
+  assert.equal(host.activeDatabaseId(), dbB);
+  assert.equal(state.selectedTable, 'orders');             // no swap happened
+  assert.deepEqual(host.listDatabases().map(d => d.name), ['b.db']);
+});
+
+test('setActiveDb and closeDatabase refuse an unknown id instead of picking another database', async () => {
+  const { host } = makeHost({});
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+
+  await assert.rejects(() => host.setActiveDb('db#999'), /unknown database id/);
+  await assert.rejects(() => host.closeDatabase(''), /unknown database id/);
+  assert.equal(host.activeDatabaseId(), dbA);
+  assert.deepEqual(host.listDatabases().map(d => d.name), ['a.db']);
+  // Re-selecting the active database is a no-op, not an error.
+  assert.equal(await host.setActiveDb(dbA), false);
+});
+
+// ---------------------------------------------------------------------------
+// Dedupe: one file, one entry. The shell does not de-duplicate, so a second
+// open of one file would otherwise spawn a second WRITABLE sidecar on it, with
+// its own session transaction — SQLITE_BUSY and two racing saves.
+// ---------------------------------------------------------------------------
+
+test('opening an already-open file switches to it instead of opening a second instance', async () => {
+  const { host, nativeLog } = makeMultiNativeHost();
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);   // pending edit in A
+  await host.openFromShellPath('/tmp/b.db');
+  assert.equal(nativeLog.opens.length, 2);
+
+  assert.equal(await host.openFromShellPath('/tmp/a.db'), true);
+  assert.equal(host.activeDatabaseId(), dbA);              // switched, not duplicated
+  assert.equal(nativeLog.opens.length, 2);                 // no third sidecar spawned
+  assert.deepEqual(host.listDatabases().map(d => d.name), ['a.db', 'b.db']);
+  // Re-opening did NOT discard the pending edit by re-reading the file.
+  assert.equal(host.hasUnsavedChanges(), true);
+});
+
+test('a second spelling of an already-open native file resolves to the same entry and reaps the duplicate sidecar', async () => {
+  // The shell canonicalises, so one file has two spellings the host can be
+  // handed. The canonical one is caught before any spawn; a symlink (or any
+  // other alias) is only revealed by the RETURNED boundPath, and the sidecar
+  // that probe spawned must then be reaped — exactly once, by its own id.
+  const { members, log } = makeNativeBridgeMembers({
+    initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
+    runQuery: () => [],
+    ping: () => true
+  });
+  const realOpen = members.nativeOpen;
+  members.nativeOpen = async (path: string, readOnly: boolean) => {
+    const opened = await realOpen(path, readOnly);
+    // A symlink: a different spelling, the same file underneath.
+    return path === '/tmp/link-to-a.db' ? { ...opened, boundPath: '/private/tmp/a.db' } : opened;
+  };
+  const { host } = makeHost({}, members);
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  await host.openFromShellPath('/tmp/b.db');
+  assert.equal(host.listDatabases().length, 2);
+
+  // The canonical spelling: caught by the pre-open pass, nothing spawned.
+  assert.equal(await host.openFromShellPath('/private/tmp/a.db'), true);
+  assert.equal(host.activeDatabaseId(), dbA);
+  assert.equal(log.opens.length, 2);
+  assert.deepEqual(log.closedIds, []);
+
+  await host.setActiveDb(host.listDatabases()[1].dbId);    // back to b.db
+  // The symlink: only the boundPath reveals it, so a sidecar IS spawned — and
+  // immediately reaped, leaving the original entry active.
+  assert.equal(await host.openFromShellPath('/tmp/link-to-a.db'), true);
+  assert.equal(host.activeDatabaseId(), dbA);
+  assert.equal(host.listDatabases().length, 2);            // still two databases
+  assert.equal(log.opens.length, 3);
+  assert.deepEqual(log.closedIds, [log.openedIds[2]]);     // only the duplicate
+});
+
+test('WASM opens de-duplicate by path too, without re-reading the file', async () => {
+  let reads = 0;
+  const { host } = makeHost({}, {
+    readDatabaseBytes: async () => { reads += 1; return new Uint8Array([1, 2, 3]); }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  await host.openFromShellPath('/tmp/b.db');
+  assert.equal(reads, 2);
+
+  await host.openFromShellPath('/tmp/a.db');
+  assert.equal(host.activeDatabaseId(), dbA);
+  assert.equal(reads, 2);                                  // no re-read, no second worker
+  assert.equal(host.listDatabases().length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// The boot placeholder.
+// ---------------------------------------------------------------------------
+
+test('the empty boot database is replaced by the first real open, not left behind as a tab', async () => {
+  const { host, workers } = makeHost({});
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  assert.deepEqual(host.listDatabases().map(d => d.name), ['untitled.db']);
+  const scratchWorker = workers[0];
+
+  await host.openFromShellPath('/tmp/a.db');
+  assert.deepEqual(host.listDatabases().map(d => [d.name, d.isActive]), [['a.db', true]]);
+  assert.equal(scratchWorker.terminated, true);            // its engine was reclaimed
+});
+
+test('an EDITED boot database is kept: it has no path, so dropping it would destroy the work', async () => {
+  const { host } = makeHost({ updateCell: () => 1 });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+  assert.equal(host.hasUnsavedChanges(), true);
+
+  await host.openFromShellPath('/tmp/a.db');
+  assert.deepEqual(
+    host.listDatabases().map(d => [d.name, d.isDirty, d.isActive]),
+    [['untitled.db', true, false], ['a.db', false, true]]
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Single-database behavior is the status quo: one open file is one tab, and the
+// public shape Tasks 3/4 render from is exactly this.
+// ---------------------------------------------------------------------------
+
+test('listDatabases reports the documented shape for a single open database', async () => {
+  const { host } = makeMultiNativeHost();
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/only.db');
+  const [only, ...rest] = host.listDatabases();
+  assert.deepEqual(rest, []);
+  assert.deepEqual(Object.keys(only).sort(), ['dbId', 'engine', 'isActive', 'isDirty', 'name', 'path'].sort());
+  assert.deepEqual(
+    [only.name, only.path, only.engine, only.isDirty, only.isActive],
+    ['only.db', '/tmp/only.db', 'native', false, true]
+  );
+  assert.equal(only.dbId, host.activeDatabaseId());
+});
+
+test('two concurrent opens of one path resolve to a single database, not two sidecars', async () => {
+  let releaseOpen!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseOpen = resolve; });
+  const { members, log } = makeNativeBridgeMembers({
+    initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
+    runQuery: () => [],
+    ping: () => true
+  });
+  const realOpen = members.nativeOpen;
+  members.nativeOpen = async (path: string, readOnly: boolean) => {
+    await gate;                                          // hold the first open mid-spawn
+    return realOpen(path, readOnly);
+  };
+  const { host } = makeHost({}, members);
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+
+  // Back-to-back shell deliveries of the same file (a double-clicked Finder
+  // item), the second arriving before the first finished spawning.
+  const first = host.openFromShellPath('/tmp/twice.db');
+  const second = host.openFromShellPath('/tmp/twice.db');
+  releaseOpen();
+  assert.deepEqual(await Promise.all([first, second]), [true, true]);
+
+  assert.equal(log.opens.length, 1);                     // one sidecar, not two
+  assert.deepEqual(host.listDatabases().map(d => d.name), ['twice.db']);
 });
