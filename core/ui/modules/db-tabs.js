@@ -82,12 +82,14 @@ export function renderDatabaseTabs(list) {
  */
 export function handleDatabaseShortcut(event) {
     if (!host) return null;
-    // A bare primary chord only: ⌘⇧W is Close All Windows and ⌘⌥1 is nothing
-    // of ours. Both would be stolen by a looser match.
-    if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) return null;
+    // ⌥ is never ours (⌘⌥1 belongs to nobody here). ⇧ is rejected per branch
+    // rather than globally: ⌘⇧W is Close All Windows, but ⌘⇧1 is how ⌘1
+    // reaches a layout whose digits sit in the shifted position — see
+    // shortcutIndex.
+    if (!(event.metaKey || event.ctrlKey) || event.altKey) return null;
 
     const databases = host.listDatabases();
-    if (typeof event.key === 'string' && event.key.toLowerCase() === 'w') {
+    if (!event.shiftKey && typeof event.key === 'string' && event.key.toLowerCase() === 'w') {
         // At one database ⌘W keeps its old meaning — close the window. Leaving
         // the event un-prevented is what hands it back to the shell's menu.
         if (databases.length < MIN_DATABASES_FOR_CHROME) return null;
@@ -142,11 +144,26 @@ async function requestCloseDatabase(dbId) {
 
 // ---- internals ------------------------------------------------------------
 
-/** 0-based position for ⌘1-9, or null. */
+/**
+ * 0-based position for ⌘1-9, or null.
+ *
+ * `event.code` is PRIMARY and layout-independent: it names the physical key,
+ * so ⌘+the-1-key selects the first database whatever that key types. This is
+ * not a preference — it is this project's most expensive recurring lesson.
+ * AppKit resolves key equivalents against the ACTIVE keyboard layout and
+ * silently drops the unreachable ones (a menu item bound to `CmdOrCtrl+=`
+ * shipped dead on this machine's Italian-Pro layout), and matching on
+ * `event.key` here would repeat it in the page handler: on an AZERTY-shaped
+ * layout the digit row types `&é"…` unshifted, so `key` is never '1' without
+ * Shift and is '1' only WITH it. Both of those are the same physical Digit1,
+ * and both must select the first database. Shift is therefore ignored on this
+ * path entirely (the ⌘⇧3/4/5 screenshot chords never reach the page — the OS
+ * takes them first).
+ *
+ * `event.key` stays as an additional accept for events that carry no `code`
+ * (synthetic events, older engines); it can only ever match a real digit.
+ */
 function shortcutIndex(event) {
-    // `code` is the PHYSICAL key, which is what ⌘1-9 means everywhere it
-    // exists: the tab under the user's finger, whatever that key types on the
-    // active layout. `key` is the fallback for events that carry no code.
     const physical = /^Digit([1-9])$/.exec(typeof event.code === 'string' ? event.code : '');
     if (physical) return Number(physical[1]) - 1;
     if (typeof event.key === 'string' && /^[1-9]$/.test(event.key)) return Number(event.key) - 1;
@@ -181,11 +198,43 @@ function closeFromUi(dbId) {
  */
 let scrolledActiveDbId = null;
 
+/**
+ * The two focusable roles a tab is built from, used both as the class name and
+ * as the key half that survives a re-render.
+ */
+const TAB_SELECT = 'db-tab-select';
+const TAB_CLOSE = 'db-tab-close';
+
+/** Identity of one focusable button across a re-render that replaces it. */
+const focusKey = (dbId, role) => `${role} ${dbId}`;
+
+/**
+ * Which of the strip's buttons currently holds focus, as {dbId, role}, or null.
+ *
+ * Keyed off the class name rather than a DOM walk: both roles are built here
+ * and carry exactly one class, so this is precise without needing `closest`.
+ * The sidebar overview's rows also carry `data-db-id` but are `<li>`s with a
+ * different class, and are not focusable.
+ */
+function focusedStripTarget() {
+    const active = document.activeElement;
+    const role = active?.className;
+    if (role !== TAB_SELECT && role !== TAB_CLOSE) return null;
+    const dbId = active?.dataset?.dbId;
+    return dbId ? { dbId, role } : null;
+}
+
 function renderStrip(databases, visible) {
     const strip = document.getElementById('dbTabStrip');
     if (!strip) return;
     strip.hidden = !visible;
-    const tabs = databases.map(buildTab);
+    // Every render replaces the whole subtree, and renders are FREQUENT — the
+    // host notifies on every dirty-flag flip, i.e. on every edit. Without this,
+    // a user navigating the strip by keyboard would silently lose focus to the
+    // body the moment they typed into a cell.
+    const focused = focusedStripTarget();
+    const focusables = new Map();
+    const tabs = databases.map(database => buildTab(database, focusables));
     strip.replaceChildren(...tabs);
 
     const activeIndex = databases.findIndex(database => database.isActive);
@@ -197,6 +246,15 @@ function renderStrip(databases, visible) {
         tabs[activeIndex].scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
     }
     scrolledActiveDbId = activeDbId;
+
+    if (!focused) return;
+    // The database that held focus may be gone — the close button the user just
+    // pressed Enter on is the ordinary way that happens. Fall back to the now
+    // active tab so keyboard navigation survives its own close instead of
+    // dumping focus on the body.
+    const restored = focusables.get(focusKey(focused.dbId, focused.role))
+        ?? (activeDbId === null ? undefined : focusables.get(focusKey(activeDbId, TAB_SELECT)));
+    restored?.focus?.();
 }
 
 /**
@@ -204,15 +262,16 @@ function renderStrip(databases, visible) {
  * (a button inside a button is invalid HTML and unfocusable in practice), so
  * both are natively keyboard-operable without a roving-tabindex implementation.
  */
-function buildTab(database) {
+function buildTab(database, focusables) {
     const tab = document.createElement('div');
     tab.className = database.isActive ? 'db-tab active' : 'db-tab';
     tab.dataset.dbId = database.dbId;
 
     const select = document.createElement('button');
     select.type = 'button';
-    select.className = 'db-tab-select';
+    select.className = TAB_SELECT;
     select.dataset.dbId = database.dbId;
+    focusables.set(focusKey(database.dbId, TAB_SELECT), select);
     // Two open files can share a basename; the path is what tells them apart.
     select.title = database.path ?? database.name;
     // A group of toggle buttons rather than an ARIA tablist: a tablist promises
@@ -239,8 +298,9 @@ function buildTab(database) {
 
     const close = document.createElement('button');
     close.type = 'button';
-    close.className = 'db-tab-close';
+    close.className = TAB_CLOSE;
     close.dataset.dbId = database.dbId;
+    focusables.set(focusKey(database.dbId, TAB_CLOSE), close);
     close.title = `Close ${database.name}`;
     close.setAttribute('aria-label', `Close ${database.name}`);
     const icon = document.createElement('span');

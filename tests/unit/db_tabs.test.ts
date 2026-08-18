@@ -49,6 +49,10 @@ class FakeNode {
         scrolledInto.push(this);
     }
 
+    focus() {
+        (globalThis as any).document.activeElement = this;
+    }
+
     appendChild(node: FakeNode) {
         if (!(node instanceof FakeNode)) {
             throw new TypeError(`appendChild requires a node, got ${String(node)}`);
@@ -101,11 +105,15 @@ function installDocument() {
     for (const node of Object.values(elements)) node.hidden = true;   // ships hidden
     scrolledInto = [];
     (globalThis as any).document = {
+        // Written by FakeNode.focus(), read by the renderer's focus-restore.
+        activeElement: null as FakeNode | null,
         getElementById: (id: string) => elements[id] ?? null,
         createElement: (tagName: string) => new FakeNode(tagName)
     };
     return elements;
 }
+
+const activeElement = (): FakeNode | null => (globalThis as any).document.activeElement;
 
 function hasClass(node: FakeNode, className: string): boolean {
     return node.className.split(/\s+/).includes(className);
@@ -290,6 +298,53 @@ test('a switch scrolls the newly active tab into view; an ordinary re-render doe
     void elements;
 });
 
+test('keyboard focus in the strip survives a re-render, and falls back when its tab is gone', async () => {
+    const elements = installDocument();
+    const host = makeHost([db('a', { isActive: true }), db('b'), db('c')]);
+    const { initDatabaseTabs, renderDatabaseTabs } = await import(dbTabsModulePath);
+    initDatabaseTabs({ host });
+    renderDatabaseTabs(host.listDatabases());
+
+    // The user has tabbed to c.db's close button.
+    findAllByClass(elements.dbTabStrip, 'db-tab-close')[2].focus();
+    assert.equal(activeElement()?.dataset.dbId, 'c');
+
+    // A re-render replaces the whole subtree, and they are FREQUENT — the host
+    // notifies on every dirty-flag flip, i.e. on every edit. Focus must not be
+    // silently dropped on the body by an edit somewhere else.
+    host.rows[1].isDirty = true;
+    renderDatabaseTabs(host.listDatabases());
+    const refocused = activeElement();
+    assert.equal(refocused?.dataset.dbId, 'c');
+    assert.equal(refocused?.className, 'db-tab-close');
+    // Restored onto the NEW node, not a detached one.
+    assert.equal(findAllByClass(elements.dbTabStrip, 'db-tab-close')[2], refocused);
+
+    // Its database is closed (which is what pressing Enter on that button
+    // does): focus lands on the now active tab rather than the body, so
+    // keyboard navigation survives its own close.
+    host.rows.splice(2, 1);
+    renderDatabaseTabs(host.listDatabases());
+    assert.equal(activeElement()?.dataset.dbId, 'a');
+    assert.equal(activeElement()?.className, 'db-tab-select');
+});
+
+test('a re-render does not steal focus from outside the strip', async () => {
+    const elements = installDocument();
+    const host = makeHost([db('a', { isActive: true }), db('b')]);
+    const { initDatabaseTabs, renderDatabaseTabs } = await import(dbTabsModulePath);
+    initDatabaseTabs({ host });
+    renderDatabaseTabs(host.listDatabases());
+
+    // The user is typing in the filter box while an edit lands.
+    const elsewhere = new FakeNode('input');
+    elsewhere.focus();
+    host.rows[1].isDirty = true;
+    renderDatabaseTabs(host.listDatabases());
+    assert.equal(activeElement(), elsewhere);
+    void elements;
+});
+
 // ---- switching ------------------------------------------------------------
 
 test('clicking a tab switches to that database', async () => {
@@ -440,11 +495,6 @@ test('Cmd+1..9 select by position, and a digit past the end is an unhandled no-o
     assert.equal(third.defaultPrevented, true);
     assert.deepEqual(host.calls, [['setActiveDb', 'c']]);
 
-    // Physical-key spelling only (a layout where the digit row needs Shift).
-    host.calls.length = 0;
-    await handleDatabaseShortcut(keyEvent({ key: '"', code: 'Digit2' }));
-    assert.deepEqual(host.calls, [['setActiveDb', 'b']]);
-
     // Past the end: nothing happens, and the event is left alone.
     host.calls.length = 0;
     const ninth = keyEvent({ key: '9', code: 'Digit9' });
@@ -453,7 +503,36 @@ test('Cmd+1..9 select by position, and a digit past the end is an unhandled no-o
     assert.deepEqual(host.calls, []);
 });
 
-test('the database shortcuts ignore events that are not a bare primary chord', async () => {
+test('Cmd+digit selects by PHYSICAL key, so it works on a layout whose digits need Shift', async () => {
+    installDocument();
+    const host = makeHost([db('a', { isActive: true }), db('b'), db('c')]);
+    const { initDatabaseTabs, handleDatabaseShortcut } = await import(dbTabsModulePath);
+    initDatabaseTabs({ host });
+
+    // AZERTY-shaped: the digit row types &é"… unshifted, so the ONLY stable
+    // identity of "the 1 key" is event.code. This project has already shipped a
+    // dead accelerator by binding a layout-dependent spelling (CmdOrCtrl+= was
+    // unreachable on this machine's Italian-Pro layout); event.key here would
+    // be the same mistake in the page handler.
+    for (const overrides of [
+        { key: '&', code: 'Digit1', shiftKey: false },   // Cmd + the 1 key, unshifted
+        { key: '1', code: 'Digit1', shiftKey: true },    // Cmd+Shift produces the digit
+        { key: '&', code: 'Digit1', shiftKey: true }     // …reported either way
+    ]) {
+        host.calls.length = 0;
+        const event = keyEvent(overrides);
+        await handleDatabaseShortcut(event);
+        assert.deepEqual(host.calls, [['setActiveDb', 'a']], JSON.stringify(overrides));
+        assert.equal(event.defaultPrevented, true);
+    }
+
+    // The key fallback still covers events that carry no code at all.
+    host.calls.length = 0;
+    await handleDatabaseShortcut(keyEvent({ key: '2', code: undefined }));
+    assert.deepEqual(host.calls, [['setActiveDb', 'b']]);
+});
+
+test('the database shortcuts ignore events that are not theirs', async () => {
     installDocument();
     const host = makeHost([db('a', { isActive: true }), db('b')]);
     const { initDatabaseTabs, handleDatabaseShortcut } = await import(dbTabsModulePath);
@@ -461,9 +540,10 @@ test('the database shortcuts ignore events that are not a bare primary chord', a
 
     for (const overrides of [
         { key: '2', code: 'Digit2', metaKey: false, ctrlKey: false },   // no modifier
-        { key: '2', code: 'Digit2', shiftKey: true },                   // Cmd+Shift+2
         { key: '2', code: 'Digit2', altKey: true },                     // Cmd+Alt+2
-        { key: 'w', code: 'KeyW', shiftKey: true }                      // Cmd+Shift+W
+        // Shift is ignored for DIGITS (a layout may need it) but not for W:
+        // Cmd+Shift+W is Close All Windows and stays the shell's.
+        { key: 'w', code: 'KeyW', shiftKey: true }
     ]) {
         const event = keyEvent(overrides);
         assert.equal(handleDatabaseShortcut(event), null, JSON.stringify(overrides));
