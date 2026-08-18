@@ -336,6 +336,50 @@ export function createDesktopHost({ bridge, createWorker }) {
         nativeTxnOpen = await probeTxnOpen();
     }
 
+    /**
+     * Post-mutation-failure reconciliation — the grid twin of endSessionTxn's
+     * COMMIT auto-rollback branch. An abort-class failure inside the session
+     * transaction (SQLITE_FULL/IOERR/NOMEM, or SQLITE_INTERRUPT from the
+     * sidecar's query deadline) rolls the WHOLE transaction back while the
+     * mutation rejects, discarding every pending edit underneath the flag.
+     * Stale-true is the dangerous direction: the grid keeps showing the
+     * discarded (phantom) edits, and the NEXT edit's ensureSessionTxn
+     * early-returns, so its SAVEPOINT/RELEASE commits straight into the real
+     * file (persist-without-Save) — a later discard's txn-less ROLLBACK then
+     * no-ops. The fork's per-errno generic messages make string
+     * classification impossible, so the ENGINE decides via the usual probe:
+     * still open ⇒ statement-level failure, edits so far remain validly
+     * pending, flag stays true; autocommit ⇒ adopt engine truth — flag,
+     * tracker, title and grid all reset to the last-saved state. No replay
+     * of the discarded edits into a fresh transaction (and no
+     * rollbackToCheckpoint redo-stack resurrection of them): safe-and-honest
+     * over clever-and-risky — the user redoes from a known-good state.
+     * Never throws by design: the ORIGINAL mutation error is what the user
+     * needs — secondary probe/refresh failures are logged, never propagated.
+     */
+    async function reconcileTxnAfterMutationFailure() {
+        if (engine !== 'native' || !nativeTxnOpen) return;
+        try {
+            if (await probeTxnOpen()) return;
+        } catch (probeError) {
+            // Unclassifiable (transport death; or the probe's own COMMIT
+            // failed, which already re-marked the flag true). Keep the
+            // pending state — if the sidecar is gone every later call fails
+            // loudly anyway, and the next probe path re-derives the flag.
+            console.warn('Post-mutation-failure txn probe failed:', probeError);
+            return;
+        }
+        // Auto-rollback: the engine discarded the whole session transaction.
+        nativeTxnOpen = false;
+        tracker = new ModificationTracker(100, settings.maxUndoMemory);
+        updateTitle();
+        try {
+            await refreshUi();
+        } catch (uiError) {
+            console.warn('Post-auto-rollback UI refresh failed:', uiError);
+        }
+    }
+
     // ---- modification recording --------------------------------------------
 
     function buildModification(method, args, result) {
@@ -437,7 +481,22 @@ export function createDesktopHost({ bridge, createWorker }) {
 
     async function invokeMutation(method, args) {
         await ensureSessionTxn();
-        const result = await callWorker(method, args);
+        let result;
+        try {
+            result = await callWorker(method, args);
+        } catch (error) {
+            // The failure may have taken the whole session transaction with
+            // it (see reconcileTxnAfterMutationFailure) — reconcile BEFORE
+            // the error surfaces so the grid the user sees next tells the
+            // truth. Netted here as well: nothing secondary may mask the
+            // mutation error the user actually needs.
+            try {
+                await reconcileTxnAfterMutationFailure();
+            } catch (reconcileError) {
+                console.warn('Txn reconciliation after a failed mutation failed:', reconcileError);
+            }
+            throw error;
+        }
         if (result && typeof result === 'object' && result.cancelled === true) return result;
 
         let modification = buildModification(method, args, result);

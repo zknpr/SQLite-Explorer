@@ -824,7 +824,20 @@ function makeTxnFake(flavor: 'classic' | 'fork' = 'classic') {
   // the fake could only express "failed COMMIT keeps the txn open", hiding
   // the discarded-session family entirely (the same "the fakes lied" gap the
   // fork-message flavor closed for error strings).
-  const txn = { open: false, applied: [] as string[], autoRollbackNextCommit: false };
+  const txn = {
+    open: false,
+    applied: [] as string[],
+    autoRollbackNextCommit: false,
+    autoRollbackNextMutation: false,
+    /**
+     * Whether an enclosing transaction existed when each successful mutation
+     * body ran (recorded by `mutate` below). `false` is the
+     * persist-without-Save signature: the worker's SAVEPOINT/RELEASE around a
+     * mutation autocommits straight to the real file when no session
+     * transaction encloses it.
+     */
+    mutationsInTxn: [] as boolean[]
+  };
   const msg = (classic: string) => (flavor === 'fork' ? 'SQL logic error' : classic);
   const exec = (sql: unknown) => {
     const s = String(sql).trim().toUpperCase();
@@ -850,7 +863,29 @@ function makeTxnFake(flavor: 'classic' | 'fork' = 'classic') {
     }
     return [];
   };
-  return { txn, exec };
+  /**
+   * Models a worker mutation method (a SAVEPOINT-wrapped body). When
+   * `autoRollbackNextMutation` is armed the call rejects abort-class
+   * (SQLITE_FULL — same sqlite3_errstr string on both flavors, like the
+   * COMMIT hook above) AND the engine rolls the WHOLE enclosing transaction
+   * back, leaving autocommit active — exactly what a post-failure BEGIN
+   * probe then observes. Successful runs record `txn.open` into
+   * `mutationsInTxn` so tests can catch a mutation executing with no
+   * enclosing transaction (its RELEASE would autocommit to the real file).
+   */
+  const mutate = () => {
+    if (txn.autoRollbackNextMutation) {
+      txn.autoRollbackNextMutation = false;
+      if (txn.open) {
+        txn.open = false;                     // the engine discarded the txn
+        txn.applied.push('AUTO-ROLLBACK');
+      }
+      throw new Error('database or disk is full');
+    }
+    txn.mutationsInTxn.push(txn.open);
+    return 1;
+  };
+  return { txn, exec, mutate };
 }
 
 function makeNativeHost(
@@ -1849,4 +1884,100 @@ test('an auto-rolled-back ROLLBACK stays tolerated: the discard intent was fulfi
   await host.refreshFromDisk();                           // must not reject
   assert.equal(initConfigs.length, 2);                    // open + refresh reopen (start rides the WASM worker)
   assert.equal(host.hasUnsavedChanges(), false);
+});
+
+// ============================================================================
+// Final-review fix — I1: grid-mutation-failure txn reconciliation
+// ============================================================================
+
+// The grid twin of the auto-rolled-back COMMIT test above: an abort-class
+// failure (FULL/IOERR/NOMEM, or INTERRUPT from the sidecar's query deadline)
+// on mutation N rolls the WHOLE session transaction back underneath the flag.
+// Without reconciliation the grid keeps showing edits 1..N-1 (phantoms) and —
+// worse — the NEXT edit rides the stale-true flag: ensureSessionTxn
+// early-returns and the SAVEPOINT/RELEASE autocommits straight into the real
+// file (persist-without-Save), unrecoverable by Refresh's then-txn-less
+// ROLLBACK.
+test('an auto-rolled-back mutation reconciles to engine truth: no phantom edits, no persist-without-Save (fork messages)', async () => {
+  const { txn, exec, mutate } = makeTxnFake('fork');
+  const { host } = makeNativeHost({
+    initializeDatabase: () => { txn.open = false; return { isReadOnly: false, storage: 'memory' }; },
+    runQuery: (args) => exec(args[0]),
+    updateCell: () => mutate()
+  });
+  await host.start();
+  let refreshes = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshes++; return { success: true }; } });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v1', 'o', 1048576]);   // edit 1
+  await host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v1', 1048576]);  // edit 2
+  assert.equal(host.hasUnsavedChanges(), true);
+  refreshes = 0;
+
+  txn.autoRollbackNextMutation = true;                    // disk fills up on edit 3
+  await assert.rejects(
+    () => host.invoke('updateCell', ['t', 1, 'c', 'v3', 'v2', 1048576]),
+    /disk is full/                                        // the ORIGINAL mutation error, not a probe artifact
+  );
+  // Engine truth adopted: the whole session was discarded, so nothing is
+  // pending anymore (no "Edited" title over phantom values) and the grid was
+  // told to reload the engine's real state.
+  assert.equal(host.hasUnsavedChanges(), false);
+  assert.equal(txn.open, false);
+  assert.equal(refreshes, 1);
+  // Edit txn, the engine's auto-rollback, then the classifying probe's own
+  // empty BEGIN/COMMIT pair — the same signature as the COMMIT-path test.
+  assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT']);
+
+  // Edit N+1 must open a FRESH transaction (no early-return on a stale flag)
+  // and stay pending until ⌘S. mutationsInTxn records whether an enclosing
+  // txn existed when each mutation body ran — a false entry means the edit
+  // autocommitted to the real file, the exact defect this fix closes.
+  await host.invoke('updateCell', ['t', 1, 'c', 'v4', 'v2', 1048576]);
+  assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT', 'BEGIN']);
+  assert.deepEqual(txn.mutationsInTxn, [true, true, true]);  // edits 1, 2 and N+1 all inside a txn
+  assert.equal(txn.open, true);                              // still pending…
+  assert.equal(host.hasUnsavedChanges(), true);
+
+  const ok = await host.saveToDisk();                        // …until Save commits it
+  assert.equal(ok, true);
+  assert.deepEqual(txn.applied, ['BEGIN', 'AUTO-ROLLBACK', 'BEGIN', 'COMMIT', 'BEGIN', 'COMMIT']);
+  assert.equal(host.hasUnsavedChanges(), false);
+});
+
+// The probe must CLASSIFY, not blanket-discard: a statement-level failure
+// (constraint violation et al.) keeps the transaction open and edits 1..N-1
+// validly pending — discarding them here would be the opposite data-loss bug.
+// The failing mutation deliberately throws the fork's generic "SQL logic
+// error" — the same string as the probe's nesting refusal — proving the
+// classification comes from engine state, never from error-string matching.
+test('a mutation failure that KEEPS the transaction stays pending: no discard, no stale re-BEGIN', async () => {
+  const { txn, exec, mutate } = makeTxnFake('fork');
+  let failNext = false;
+  const { host } = makeNativeHost({
+    initializeDatabase: () => { txn.open = false; return { isReadOnly: false, storage: 'memory' }; },
+    runQuery: (args) => exec(args[0]),
+    updateCell: () => {
+      if (failNext) { failNext = false; throw new Error('SQL logic error'); }  // txn survives (statement-level)
+      return mutate();
+    }
+  });
+  await host.start();
+  let refreshes = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshes++; return { success: true }; } });
+  await host.openFromShellPath('/tmp/y.db');
+  await host.invoke('updateCell', ['t', 1, 'c', 'v1', 'o', 1048576]);
+  refreshes = 0;
+
+  failNext = true;
+  await assert.rejects(() => host.invoke('updateCell', ['t', 1, 'c', 'v2', 'v1', 1048576]), /SQL logic error/);
+  assert.equal(host.hasUnsavedChanges(), true);           // edit 1 is still validly pending
+  assert.equal(txn.open, true);                           // probe saw the open txn and kept it
+  assert.equal(refreshes, 0);                             // nothing was discarded, nothing to reload
+
+  await host.invoke('updateCell', ['t', 1, 'c', 'v3', 'v1', 1048576]);
+  const ok = await host.saveToDisk();
+  assert.equal(ok, true);
+  assert.deepEqual(txn.applied, ['BEGIN', 'COMMIT']);     // ONE txn throughout — no spurious re-BEGIN
+  assert.deepEqual(txn.mutationsInTxn, [true, true]);     // both surviving edits ran inside it
 });
