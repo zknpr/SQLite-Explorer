@@ -16,7 +16,7 @@
             <div class="sidebar-header">
                 <span>Explorer</span>
                 <div class="sidebar-actions">
-                    <button type="button" class="icon-button" id="btnReload" title="Reload">
+                    <button type="button" class="icon-button" id="btnReload" title="Reload" aria-label="Reload database">
                         <span class="codicon codicon-refresh"></span>
                     </button>
                 </div>
@@ -28,41 +28,52 @@
 
             <div class="sidebar-scroll-area">
                 <!-- Tables Section -->
-                <div class="section-title" data-section="tables" id="sectionTables">
-                    <span class="arrow">▼</span>
-                    <span>Tables</span>
-                    <span class="badge" id="tablesBadge">0</span>
-                    <button type="button" class="icon-button ml-auto" id="btnOpenCreateTable" title="Create Table">
+                <div class="section-title" id="sectionTables">
+                    <button type="button" class="section-toggle" data-section="tables"
+                        aria-expanded="true" aria-controls="tablesList">
+                        <span class="arrow" aria-hidden="true">▼</span>
+                        <span>Tables</span>
+                        <span class="badge" id="tablesBadge">0</span>
+                    </button>
+                    <button type="button" class="icon-button" id="btnOpenCreateTable" title="Create Table" aria-label="Create table">
                         <span class="codicon codicon-add"></span>
                     </button>
                 </div>
                 <ul class="item-list" id="tablesList"></ul>
 
                 <!-- Views Section -->
-                <div class="section-title collapsed" data-section="views" id="sectionViews">
-                    <span class="arrow">▼</span>
-                    <span>Views</span>
-                    <span class="badge" id="viewsBadge">0</span>
-                    <button type="button" class="icon-button ml-auto" id="btnOpenCreateView" title="Create View">
+                <div class="section-title collapsed" id="sectionViews">
+                    <button type="button" class="section-toggle" data-section="views"
+                        aria-expanded="false" aria-controls="viewsList">
+                        <span class="arrow" aria-hidden="true">▼</span>
+                        <span>Views</span>
+                        <span class="badge" id="viewsBadge">0</span>
+                    </button>
+                    <button type="button" class="icon-button" id="btnOpenCreateView" title="Create View" aria-label="Create view">
                         <span class="codicon codicon-add"></span>
                     </button>
                 </div>
                 <ul class="item-list hidden" id="viewsList"></ul>
 
                 <!-- Indexes Section -->
-                <div class="section-title collapsed" data-section="indexes" id="sectionIndexes">
-                    <span class="arrow">▼</span>
-                    <span>Indexes</span>
-                    <span class="badge" id="indexesBadge">0</span>
+                <div class="section-title collapsed" id="sectionIndexes">
+                    <button type="button" class="section-toggle" data-section="indexes"
+                        aria-expanded="false" aria-controls="indexesList">
+                        <span class="arrow" aria-hidden="true">▼</span>
+                        <span>Indexes</span>
+                        <span class="badge" id="indexesBadge">0</span>
+                    </button>
                 </div>
                 <ul class="item-list hidden" id="indexesList"></ul>
 
                 <!-- Batch Update Section -->
-                <div class="section-title hidden" id="batchUpdateSectionTitle" data-section="batchUpdate" data-preserve-grid-selection>
-                    <span class="arrow">▼</span>
+                <button type="button" class="section-title hidden" id="batchUpdateSectionTitle"
+                    data-section="batchUpdate" data-preserve-grid-selection aria-expanded="true"
+                    aria-controls="batchUpdateList">
+                    <span class="arrow" aria-hidden="true">▼</span>
                     <span>Batch Update</span>
                     <span class="badge" id="batchUpdateCount">0</span>
-                </div>
+                </button>
                 <div class="item-list hidden" id="batchUpdateList" data-preserve-grid-selection>
                     <div class="batch-update-container">
                         <button type="button" class="btn-primary batch-update-btn" id="btnApplyBatchUpdate">Apply Changes</button>
@@ -72,12 +83,14 @@
             </div>
 
             <!-- Configuration Section -->
-            <div class="section-title settings-section" id="btnOpenSettings">
+            <button type="button" class="section-title settings-section" id="btnOpenSettings">
                 <span class="codicon codicon-settings mr-6"></span>
                 <span>Configuration</span>
-            </div>
+            </button>
 
-            <div class="resize-handle" id="resizeHandle"></div>
+            <div class="resize-handle" id="resizeHandle" role="separator" tabindex="0"
+                aria-label="Resize sidebar" aria-orientation="vertical" aria-valuemin="150"
+                aria-valuemax="400" aria-valuenow="220"></div>
         </div>
 
         <!-- Main Panel -->
@@ -109,7 +122,8 @@
                             <button type="button" class="filter-clear-btn" id="btnClearFilter" aria-label="Clear table filter" title="Clear table filter" hidden><span class="codicon codicon-close"></span></button>
                             <span class="filter-match-counter" id="filterMatchCounter"></span>
                         </div>
-                        <button type="button" class="filter-apply-btn filter-apply-btn-toolbar" id="btnApplyFilter" title="Search — Enter: next match, Shift+Enter: previous"><span class="codicon codicon-search"></span></button>
+                        <button type="button" class="filter-apply-btn filter-apply-btn-toolbar" id="btnApplyFilter"
+                            title="Search — Enter: next match, Shift+Enter: previous" aria-label="Search table"><span class="codicon codicon-search"></span></button>
                     </div>
                 </div>
             </div>
@@ -125,11 +139,11 @@
             <!-- Footer -->
             <div class="footer-panel">
                 <div class="footer-left">
-                    <span id="statusText">Ready</span>
+                    <span id="statusText" role="status" aria-live="polite" aria-atomic="true">Ready</span>
                 </div>
                 <div class="footer-right">
                     <div class="page-selector">
-                        <span>Rows:</span>
+                        <label for="pageSizeSelect">Rows:</label>
                         <select id="pageSizeSelect">
                             <option value="100">100</option>
                             <option value="250">250</option>
@@ -141,7 +155,7 @@
                         </select>
                     </div>
                     <div class="page-selector">
-                        <span>Date Format:</span>
+                        <label for="dateFormatSelect">Date Format:</label>
                         <select id="dateFormatSelect">
                             <option value="raw">Raw</option>
                             <option value="local">Local</option>
@@ -150,11 +164,11 @@
                         </select>
                     </div>
                     <div class="pagination-controls">
-                        <button type="button" id="btnFirst" disabled>⏮</button>
-                        <button type="button" id="btnPrev" disabled>◀</button>
+                        <button type="button" id="btnFirst" aria-label="First page" disabled>⏮</button>
+                        <button type="button" id="btnPrev" aria-label="Previous page" disabled>◀</button>
                         <span id="pageIndicator">0 / 0</span>
-                        <button type="button" id="btnNext" disabled>▶</button>
-                        <button type="button" id="btnLast" disabled>⏭</button>
+                        <button type="button" id="btnNext" aria-label="Next page" disabled>▶</button>
+                        <button type="button" id="btnLast" aria-label="Last page" disabled>⏭</button>
                     </div>
                 </div>
             </div>
@@ -171,7 +185,7 @@
         <div class="modal-dialog modal-dialog-lg view-editor-dialog">
             <div class="modal-header">
                 <span class="modal-title" id="viewModalTitle">Create View</span>
-                <button type="button" class="modal-close" data-modal="viewModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="viewModal" aria-label="Close view editor">&times;</button>
             </div>
             <div class="modal-body">
                 <div class="form-field">
@@ -210,7 +224,7 @@
         <div class="modal-dialog">
             <div class="modal-header">
                 <span class="modal-title" id="addRowModalTitle">Add New Row</span>
-                <button type="button" class="modal-close" data-modal="addRowModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="addRowModal" aria-label="Close add row">&times;</button>
             </div>
             <div class="modal-body" id="addRowForm"></div>
             <div class="modal-footer">
@@ -226,7 +240,7 @@
         <div class="modal-dialog">
             <div class="modal-header">
                 <span class="modal-title" id="deleteModalTitle">Confirm Delete</span>
-                <button type="button" class="modal-close" data-modal="deleteModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="deleteModal" aria-label="Close delete confirmation">&times;</button>
             </div>
             <div class="modal-body">
                 <p id="deleteConfirmText">Are you sure you want to delete the selected rows?</p>
@@ -244,16 +258,16 @@
         <div class="modal-dialog modal-dialog-md">
             <div class="modal-header">
                 <span class="modal-title" id="createTableModalTitle">Create New Table</span>
-                <button type="button" class="modal-close" data-modal="createTableModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="createTableModal" aria-label="Close create table">&times;</button>
             </div>
             <div class="modal-body">
                 <div class="form-field">
-                    <label>Table Name</label>
+                    <label for="newTableName">Table Name</label>
                     <input type="text" id="newTableName" placeholder="my_table">
                 </div>
                 <div class="form-field">
-                    <label>Columns</label>
-                    <div id="columnDefinitions"></div>
+                    <span class="form-group-label" id="columnDefinitionsLabel">Columns</span>
+                    <div id="columnDefinitions" role="group" aria-labelledby="columnDefinitionsLabel"></div>
                     <button type="button" class="btn-secondary mt-8" id="btnAddColumnDef">+ Add Column</button>
                 </div>
             </div>
@@ -270,15 +284,15 @@
         <div class="modal-dialog">
             <div class="modal-header">
                 <span class="modal-title" id="addColumnModalTitle">Add Column</span>
-                <button type="button" class="modal-close" data-modal="addColumnModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="addColumnModal" aria-label="Close add column">&times;</button>
             </div>
             <div class="modal-body">
                 <div class="form-field">
-                    <label>Column Name</label>
+                    <label for="newColumnName">Column Name</label>
                     <input type="text" id="newColumnName" placeholder="column_name">
                 </div>
                 <div class="form-field">
-                    <label>Type</label>
+                    <label for="newColumnType">Type</label>
                     <select id="newColumnType">
                         <option value="TEXT">TEXT</option>
                         <option value="INTEGER">INTEGER</option>
@@ -288,7 +302,7 @@
                     </select>
                 </div>
                 <div class="form-field">
-                    <label>Default Value (optional)</label>
+                    <label for="newColumnDefault">Default Value (optional)</label>
                     <input type="text" id="newColumnDefault" placeholder="NULL">
                 </div>
             </div>
@@ -305,11 +319,11 @@
         <div class="modal-dialog">
             <div class="modal-header">
                 <span class="modal-title" id="exportModalTitle">Export Table</span>
-                <button type="button" class="modal-close" data-modal="exportModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="exportModal" aria-label="Close export">&times;</button>
             </div>
             <div class="modal-body">
                 <div class="form-field">
-                    <label>Format</label>
+                    <label for="exportFormat">Format</label>
                     <select id="exportFormat">
                         <option value="csv">CSV</option>
                         <option value="json">JSON</option>
@@ -318,14 +332,15 @@
                     </select>
                 </div>
                 <div class="form-field">
-                    <label>Columns</label>
-                    <div id="exportColumns" class="export-columns-list">
+                    <span class="form-group-label" id="exportColumnsLabel">Columns</span>
+                    <div id="exportColumns" class="export-columns-list" role="group"
+                        aria-labelledby="exportColumnsLabel">
                         <!-- Columns populated by JS -->
                     </div>
                 </div>
                 <div class="form-field">
-                    <label>Options</label>
-                    <div id="exportOptions">
+                    <span class="form-group-label" id="exportOptionsLabel">Options</span>
+                    <div id="exportOptions" role="group" aria-labelledby="exportOptionsLabel">
                         <!-- Options populated by JS based on format -->
                     </div>
                 </div>
@@ -343,7 +358,7 @@
         <div class="modal-dialog modal-dialog-lg">
             <div class="modal-header">
                 <span class="modal-title" id="settingsModalTitle">Configuration</span>
-                <button type="button" class="modal-close" data-modal="settingsModal">&times;</button>
+                <button type="button" class="modal-close" data-modal="settingsModal" aria-label="Close configuration">&times;</button>
             </div>
             <div class="modal-body" id="pragmaSettingsContainer">
                 <!-- Populated by JS -->
@@ -364,7 +379,8 @@
                     <span class="cell-preview-column-name" id="cellPreviewColumnName"></span>
                     <span class="cell-preview-type-badge" id="cellPreviewTypeBadge"></span>
                 </div>
-                <button type="button" class="cell-preview-close" id="btnCloseCellPreview">&times;</button>
+                <button type="button" class="cell-preview-close" id="btnCloseCellPreview"
+                    aria-label="Close cell preview">&times;</button>
             </div>
             <div class="cell-preview-toolbar">
                 <button type="button" class="cell-preview-toolbar-btn" id="formatJsonBtn" title="Format as JSON">
@@ -376,6 +392,10 @@
                 <button type="button" class="cell-preview-toolbar-btn" id="wrapTextBtn" title="Toggle word wrap">
                     <span class="codicon codicon-word-wrap"></span> Wrap
                 </button>
+                <button type="button" class="cell-preview-toolbar-btn" id="cellPreviewEmptyBtn"
+                    title="Store an empty string">Empty string</button>
+                <button type="button" class="cell-preview-toolbar-btn" id="cellPreviewNullBtn"
+                    title="Store SQL NULL explicitly">SQL NULL</button>
                 <div class="flex-spacer"></div>
                 <button type="button" class="cell-preview-toolbar-btn" id="openInVsCodeBtn" title="Edit in VS Code editor">
                     <span class="codicon codicon-code"></span> Edit in VS Code
@@ -383,7 +403,7 @@
             </div>
             <div class="cell-preview-body">
                 <textarea class="cell-preview-textarea" id="cellPreviewTextarea" spellcheck="false"
-                    aria-describedby="multilineEditorKeyboardHint"></textarea>
+                    aria-labelledby="cellPreviewTitle" aria-describedby="multilineEditorKeyboardHint"></textarea>
             </div>
             <div class="cell-preview-footer">
                 <div class="cell-preview-info">
@@ -404,7 +424,8 @@
         <div class="modal-dialog blob-inspector blob-inspector-dialog">
             <div class="modal-header">
                 <span class="modal-title" id="blobInspectorModalTitle">BLOB Inspector</span>
-                <button type="button" class="modal-close" data-modal="blob-inspector-modal">&times;</button>
+                <button type="button" class="modal-close" data-modal="blob-inspector-modal"
+                    aria-label="Close BLOB inspector">&times;</button>
             </div>
             <div class="modal-body blob-inspector-body">
                 <div class="tabs blob-inspector-tabs">
@@ -417,11 +438,13 @@
                     <span class="blob-preview-placeholder">Select a BLOB to inspect</span>
                 </div>
                 <div class="tab-content blob-hex-pane" id="tab-hex">
-                    <textarea readonly class="hex-dump hex-dump-textarea"></textarea>
+                    <textarea readonly class="hex-dump hex-dump-textarea"
+                        aria-label="BLOB hexadecimal data"></textarea>
                 </div>
             </div>
             <div class="modal-footer">
                 <button id="blob-replace-btn" class="btn-secondary">Replace...</button>
+                <button id="blob-load-more-btn" class="btn-secondary" hidden>Load more</button>
                 <button id="blob-download-btn" class="btn-primary">Download</button>
             </div>
         </div>

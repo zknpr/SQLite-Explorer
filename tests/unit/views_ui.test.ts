@@ -175,6 +175,80 @@ describe('view modal concurrency', () => {
         }
     });
 
+    it('preserves a legal create-view identifier through validation and creation', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openCreateViewModal } = await import(viewsModulePath);
+        const originals = {
+            validate: backendApi.validateViewDefinition,
+            create: backendApi.createView
+        };
+        const validatedNames: string[] = [];
+        const createdNames: string[] = [];
+        backendApi.validateViewDefinition = async (name: string) => {
+            validatedNames.push(name);
+        };
+        backendApi.createView = async (name: string) => {
+            createdNames.push(name);
+            return { cancelled: true };
+        };
+        state.isReadOnly = false;
+
+        try {
+            initViews();
+            openCreateViewModal();
+            elements.viewNameInput.value = ' ui "view" 🚀 ';
+            elements.viewSelectSql.value = 'SELECT 1 AS value';
+
+            await listener('btnSaveView', 'click')();
+
+            assert.deepStrictEqual(validatedNames, [' ui "view" 🚀 ']);
+            assert.deepStrictEqual(createdNames, [' ui "view" 🚀 ']);
+        } finally {
+            backendApi.validateViewDefinition = originals.validate;
+            backendApi.createView = originals.create;
+        }
+    });
+
+    it('rejects a NUL create-view identifier before validation', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openCreateViewModal } = await import(viewsModulePath);
+        const originals = {
+            validate: backendApi.validateViewDefinition,
+            create: backendApi.createView
+        };
+        let validationCalls = 0;
+        let createCalls = 0;
+        backendApi.validateViewDefinition = async () => { validationCalls++; };
+        backendApi.createView = async () => { createCalls++; };
+        state.isReadOnly = false;
+
+        try {
+            initViews();
+            openCreateViewModal();
+            elements.viewNameInput.value = 'bad\0view';
+            elements.viewSelectSql.value = 'SELECT 1 AS value';
+
+            await listener('btnSaveView', 'click')();
+
+            assert.strictEqual(validationCalls, 0);
+            assert.strictEqual(createCalls, 0);
+            assert.match(elements.viewValidationStatus.textContent, /View name cannot contain NUL/);
+        } finally {
+            backendApi.validateViewDefinition = originals.validate;
+            backendApi.createView = originals.create;
+        }
+    });
+
     it('keeps the external editor result when the same view modal is reopened', async () => {
         const { elements } = installViewDocument();
         const apiModulePath = '../../core/ui/modules/api.js';
@@ -365,6 +439,65 @@ describe('view modal concurrency', () => {
             backendApi.validateViewDefinition = originalValidate;
             backendApi.editView = originalEdit;
             backendApi.createView = originalCreate;
+        }
+    });
+
+    it('refreshes schema when a view modal closes after its mutation starts', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const modalsModulePath = '../../core/ui/modules/modals.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openCreateViewModal } = await import(viewsModulePath);
+        const { closeModal } = await import(modalsModulePath);
+        const mutationStarted = createDeferred<void>();
+        const created = createDeferred<any>();
+        const originals = {
+            validate: backendApi.validateViewDefinition,
+            create: backendApi.createView,
+            fetchSchema: backendApi.fetchSchema
+        };
+        const originalState = {
+            isReadOnly: state.isReadOnly,
+            isDbConnected: state.isDbConnected,
+            selectedTable: state.selectedTable,
+            selectedTableType: state.selectedTableType
+        };
+        let schemaFetches = 0;
+        backendApi.validateViewDefinition = async () => undefined;
+        backendApi.createView = async () => {
+            mutationStarted.resolve();
+            return created.promise;
+        };
+        backendApi.fetchSchema = async () => {
+            schemaFetches++;
+            return { tables: [], views: [], indexes: [] };
+        };
+        state.isReadOnly = false;
+        state.isDbConnected = true;
+        state.selectedTable = null;
+        state.selectedTableType = 'table';
+
+        try {
+            initViews();
+            openCreateViewModal();
+            elements.viewNameInput.value = 'committed_view';
+            elements.viewSelectSql.value = 'SELECT 1 AS value';
+            const pendingSave = listener('btnSaveView', 'click')();
+            await mutationStarted.promise;
+
+            closeModal('viewModal');
+            created.resolve({});
+            await pendingSave;
+
+            assert.strictEqual(schemaFetches, 1);
+        } finally {
+            backendApi.validateViewDefinition = originals.validate;
+            backendApi.createView = originals.create;
+            backendApi.fetchSchema = originals.fetchSchema;
+            Object.assign(state, originalState);
         }
     });
 
@@ -934,12 +1067,19 @@ describe('view modal concurrency', () => {
             get: backendApi.getViewDefinition,
             validate: backendApi.validateViewDefinition,
             edit: backendApi.editView,
-            info: backendApi.getTableInfo
+            info: backendApi.getTableInfo,
+            schema: backendApi.fetchSchema
         };
+        const originalIsDbConnected = state.isDbConnected;
         let selectionWasClearedAtReload = false;
         backendApi.getViewDefinition = async () => ({ selectSql: 'SELECT 1 AS a', triggers: [] });
         backendApi.validateViewDefinition = async () => undefined;
         backendApi.editView = async () => ({});
+        backendApi.fetchSchema = async () => ({
+            tables: [],
+            views: [{ identifier: 'selected_view' }],
+            indexes: []
+        });
         backendApi.getTableInfo = async () => {
             selectionWasClearedAtReload = state.selectedCells.length === 0
                 && state.selectedRowIds.size === 0
@@ -951,7 +1091,7 @@ describe('view modal concurrency', () => {
             return [];
         };
         state.isReadOnly = false;
-        state.isDbConnected = false;
+        state.isDbConnected = true;
         state.selectedTable = 'selected_view';
         state.selectedTableType = 'view';
         state.gridData = [[1]];
@@ -973,6 +1113,8 @@ describe('view modal concurrency', () => {
             backendApi.validateViewDefinition = originals.validate;
             backendApi.editView = originals.edit;
             backendApi.getTableInfo = originals.info;
+            backendApi.fetchSchema = originals.schema;
+            state.isDbConnected = originalIsDbConnected;
             state.selectedTable = null;
         }
     });

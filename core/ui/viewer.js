@@ -1,7 +1,7 @@
 /**
  * SQLite Explorer - Main Entry Point
  */
-import { state, resolveStartupPageSize } from './modules/state.js';
+import { createSafeColumnState, state, resolveStartupPageSize } from './modules/state.js';
 import { initRpc } from './modules/rpc.js';
 import { backendApi, getVsCodeState } from './modules/api.js';
 import {
@@ -111,10 +111,24 @@ async function restoreSavedState() {
     );
     syncPageSizeSelect(state.rowsPerPage);
 
-    if (savedState && savedState.selectedTable) {
+    // Sidebar filtering is independent of table selection. Restoring it only
+    // inside the selected-table branch loses the user's filter on an empty or
+    // newly opened database when the webview is reconstructed.
+    state.sidebarFilter = savedState?.sidebarFilter || '';
+    const sidebarFilterInput = document.getElementById('sidebarFilterInput');
+    if (sidebarFilterInput) sidebarFilterInput.value = state.sidebarFilter;
+
+    const savedTableType = savedState?.selectedTableType === 'view' ? 'view' : 'table';
+    const savedObjectExists = !!savedState?.selectedTable && (
+        savedTableType === 'view'
+            ? state.schemaCache.views.some(view => view.name === savedState.selectedTable)
+            : state.schemaCache.tables.some(table => table.name === savedState.selectedTable)
+    );
+
+    if (savedState && savedObjectExists) {
         // Restore scalar state fields
         state.selectedTable = savedState.selectedTable;
-        state.selectedTableType = savedState.selectedTableType || 'table';
+        state.selectedTableType = savedTableType;
         // The initial schema load ran before persisted selection restoration.
         // Rebind identity before any CRUD code can parse primary-key values.
         syncSelectedTableIdentity();
@@ -122,23 +136,20 @@ async function restoreSavedState() {
         state.sortedColumn = savedState.sortedColumn || null;
         state.sortAscending = savedState.sortAscending !== false;
         state.filterQuery = savedState.filterQuery || '';
-        state.columnWidths = savedState.columnWidths || {};
-        state.columnFilters = savedState.columnFilters || {};
-        state.sidebarFilter = savedState.sidebarFilter || '';
+        state.columnWidths = createSafeColumnState(savedState.columnWidths);
+        state.columnFilters = createSafeColumnState(savedState.columnFilters);
         state.dateFormat = savedState.dateFormat || 'raw';
 
         // Restore Set-based state (serialized as arrays)
-        state.pinnedColumns = new Set(savedState.pinnedColumns || []);
-        state.pinnedRowIds = new Set(savedState.pinnedRowIds || []);
-        state.selectedColumns = new Set(savedState.selectedColumns || []);
+        const sameConnection = Number.isSafeInteger(savedState.connectionGeneration)
+            && savedState.connectionGeneration === state.connectionGeneration;
+        state.pinnedColumns = new Set(sameConnection ? savedState.pinnedColumns || [] : []);
+        state.pinnedRowIds = new Set(sameConnection ? savedState.pinnedRowIds || [] : []);
+        state.selectedColumns = new Set(sameConnection ? savedState.selectedColumns || [] : []);
 
         // Capture scroll position before rendering (will be applied after grid render)
         const savedScroll = savedState.scrollPosition || { top: 0, left: 0 };
         state.scrollPosition = { ...savedScroll };
-
-        // Restore sidebar filter input value
-        const sidebarFilterInput = document.getElementById('sidebarFilterInput');
-        if (sidebarFilterInput) sidebarFilterInput.value = state.sidebarFilter;
 
         // Restore global filter input value
         const filterInput = document.getElementById('filterInput');
@@ -158,7 +169,7 @@ async function restoreSavedState() {
         renderSidebar();
 
         // Load column metadata and table data, then restore scroll position
-        await loadTableColumns();
+        if (!await loadTableColumns()) return;
         await loadTableData(true, false);
 
         // Restore scroll position after the grid has been rendered.
@@ -172,6 +183,7 @@ async function restoreSavedState() {
 
         updateStatus(`${state.totalRecordCountIsExact ? '' : '≤'}${state.totalRecordCount} records`);
     } else {
+        if (savedState) renderSidebar();
         updateStatus('Ready');
         showEmptyState();
     }

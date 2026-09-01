@@ -10,11 +10,14 @@ import {
 } from './data-utils.js';
 import { updateStatus } from './ui.js';
 import { noteCellValuesChanged } from './count-cache.js';
-import { registerModalCloseHandler } from './modals.js';
+import { closeModal, openModal, registerModalCloseHandler } from './modals.js';
 import {
     CellEditPolicyError,
     DEFAULT_MAX_CELL_EDIT_BYTES
 } from '../../../src/core/cell-edit-policy.ts';
+import { MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES } from '../../../src/core/cell-containment.ts';
+import { MAX_CELL_READ_CHUNK_BYTES } from '../../../src/core/cell-read.ts';
+import { getErrorMessage, normalizeBinaryData } from './utils.js';
 
 
 const FILE_SIGNATURES = {
@@ -37,7 +40,67 @@ const FILE_SIGNATURES = {
     AVI: [0x41, 0x56, 0x49, 0x20]
 };
 
-export const MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES = 64 * 1024;
+export const MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES = MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES;
+export const OVERSIZED_INSPECTOR_LOAD_STEP_BYTES = MAX_CELL_READ_CHUNK_BYTES;
+export const MAX_OVERSIZED_INSPECTOR_LOAD_BYTES = 8 * 1024 * 1024;
+
+const CELL_TEXT_ENCODINGS = new Set(['utf-8', 'utf-16le', 'utf-16be']);
+let mediaPreviewRequestCounter = 0;
+
+function createMediaPreviewRequestId() {
+    const uuid = globalThis.crypto?.randomUUID?.();
+    if (uuid) return uuid;
+    mediaPreviewRequestCounter++;
+    return `media-${Date.now().toString(36)}-${mediaPreviewRequestCounter.toString(36)}`;
+}
+
+/** Decode a database-byte prefix while withholding only an incomplete final character. */
+export function decodeCellTextPrefix(bytes, encoding, complete) {
+    if (!(bytes instanceof Uint8Array)) {
+        throw new TypeError('Cell TEXT bytes must be a Uint8Array');
+    }
+    if (!CELL_TEXT_ENCODINGS.has(encoding)) {
+        throw new Error(`Unsupported SQLite text encoding: ${String(encoding)}`);
+    }
+    try {
+        const decoder = new TextDecoder(encoding, { fatal: true, ignoreBOM: true });
+        return decoder.decode(bytes, { stream: !complete });
+    } catch (error) {
+        throw new Error(`Cell TEXT is not validly encoded as ${encoding}`, { cause: error });
+    }
+}
+
+function validateCellReadMetadata(metadata) {
+    if (!metadata || (metadata.storageClass !== 'text' && metadata.storageClass !== 'blob')) {
+        throw new Error('Cell changed to a storage class that the inspector cannot stream');
+    }
+    if (!Number.isSafeInteger(metadata.byteLength) || metadata.byteLength < 0) {
+        throw new Error('Cell read session returned an invalid byte length');
+    }
+    if (metadata.storageClass === 'text' && !CELL_TEXT_ENCODINGS.has(metadata.textEncoding)) {
+        throw new Error(`Unsupported SQLite text encoding: ${String(metadata.textEncoding)}`);
+    }
+}
+
+function validateCellReadChunk(chunk, expectedOffset, requestedBytes, totalBytes) {
+    if (!chunk || chunk.byteOffset !== expectedOffset) {
+        throw new Error(`Cell read returned offset ${String(chunk?.byteOffset)} instead of ${expectedOffset}`);
+    }
+    if (!(chunk.bytes instanceof Uint8Array)) {
+        throw new Error('Cell read returned non-binary chunk data');
+    }
+    if (chunk.bytes.byteLength > requestedBytes) {
+        throw new Error('Cell read returned more bytes than requested');
+    }
+    if (chunk.bytes.byteLength === 0 && expectedOffset < totalBytes) {
+        throw new Error('Cell read ended before the advertised byte length');
+    }
+    const nextOffset = expectedOffset + chunk.bytes.byteLength;
+    const expectedDone = nextOffset >= totalBytes;
+    if (chunk.done !== expectedDone) {
+        throw new Error('Cell read returned inconsistent completion metadata');
+    }
+}
 
 function isOversizedMediaType(type) {
     return type?.type === 'image'
@@ -49,14 +112,16 @@ function isOversizedMediaType(type) {
 /** Keep inspector DOM work bounded and preserve a valid UTF-8 prefix for TEXT. */
 export function capOversizedInspectorPreview(value, storageClass) {
     const bytes = storageClass === 'text'
-        ? new TextEncoder().encode(String(value))
+        ? value instanceof Uint8Array
+            ? value
+            : new TextEncoder().encode(String(value))
         : value instanceof Uint8Array
             ? value
             : new Uint8Array(value);
     if (bytes.byteLength <= MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES) return bytes;
 
     let end = MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES;
-    if (storageClass === 'text') {
+    if (storageClass === 'text' && !(value instanceof Uint8Array)) {
         // If the next byte is a continuation byte, the cap landed inside one
         // UTF-8 sequence. Drop that sequence instead of displaying U+FFFD.
         while (end > 0 && (bytes[end] & 0xC0) === 0x80) end--;
@@ -68,6 +133,7 @@ export class BlobInspector {
     constructor() {
         this.currentObjectUrl = null;
         this.currentMediaPreview = null;
+        this.pendingMediaRequest = null;
         this.previewGeneration = 0;
         this.modal = document.getElementById('blob-inspector-modal');
         this.previewContainer = document.getElementById('tab-preview');
@@ -80,9 +146,19 @@ export class BlobInspector {
         this.currentColName = null;
         this.currentCellInfo = null;
         this.currentOversizedMetadata = null;
+        this.currentStorageClass = null;
+        this.currentInlineRawTextBytes = false;
+        this.currentRawTextCanStream = false;
+        this.currentTable = null;
+        this.oversizedLoadedBytes = 0;
+        this.isLoadingOversized = false;
+        this.oversizedLoadOperation = null;
 
         // Track upload state to prevent multiple concurrent uploads and enable proper cleanup
         this.isUploading = false;
+        this.activeReplacement = null;
+        this.activeFullContent = null;
+        this.activeDownload = null;
 
         this.setupEventListeners();
         registerModalCloseHandler('blob-inspector-modal', () => this.cleanup());
@@ -113,6 +189,30 @@ export class BlobInspector {
         if (replaceBtn) {
             replaceBtn.addEventListener('click', () => this.handleReplace());
         }
+
+        const loadMoreBtn = document.getElementById('blob-load-more-btn');
+        if (loadMoreBtn) {
+            loadMoreBtn.addEventListener('click', () => {
+                void this.loadMoreOversizedContent();
+            });
+        }
+    }
+
+    setInspectorTitle(label) {
+        const title = this.modal?.querySelector?.('#blobInspectorModalTitle')
+            ?? globalThis.document?.getElementById?.('blobInspectorModalTitle');
+        if (title) title.textContent = label;
+        const closeButton = this.modal?.querySelector?.('.modal-close');
+        if (closeButton) {
+            closeButton.setAttribute(
+                'aria-label',
+                `Close ${label.replace(/ Inspector$/, ' inspector')}`
+            );
+        }
+        this.hexContainer?.setAttribute?.(
+            'aria-label',
+            `${label.replace(/ Inspector$/, '')} hexadecimal data`
+        );
     }
 
     /**
@@ -125,6 +225,7 @@ export class BlobInspector {
         this.isUploading = uploading;
         const replaceBtn = document.getElementById('blob-replace-btn');
         const downloadBtn = document.getElementById('blob-download-btn');
+        const loadMoreBtn = document.getElementById('blob-load-more-btn');
         const mutationBlockReason = this.currentCellInfo
             ? getCellMutationBlockReason(
                 this.currentCellInfo.rowIdx,
@@ -134,24 +235,108 @@ export class BlobInspector {
             : undefined;
 
         if (replaceBtn) {
-            replaceBtn.disabled = state.isReadOnly || uploading || !!mutationBlockReason;
-            replaceBtn.textContent = uploading ? 'Uploading...' : 'Replace';
+            replaceBtn.disabled = state.isReadOnly
+                || uploading
+                || !!this.activeReplacement
+                || !!mutationBlockReason;
+            replaceBtn.textContent = uploading
+                ? 'Uploading...'
+                : this.activeReplacement
+                    ? 'Selecting...'
+                    : 'Replace';
             replaceBtn.title = mutationBlockReason || '';
         }
         if (downloadBtn) {
-            downloadBtn.disabled = uploading;
-            downloadBtn.textContent = this.currentOversizedMetadata
-                ? 'Open Full Content'
-                : 'Download';
-            downloadBtn.title = this.currentOversizedMetadata
-                ? 'Desktop opens a verified read-only temporary file; the web demo is preview-only'
+            const inlineRawTextOnly = this.currentInlineRawTextBytes
+                && !this.currentRawTextCanStream;
+            const rawTextBytesComplete = inlineRawTextOnly
+                && this.currentData?.byteLength === this.currentOversizedMetadata?.byteLength;
+            downloadBtn.disabled = uploading || !!this.activeFullContent;
+            if (this.activeFullContent) {
+                downloadBtn.textContent = 'Opening...';
+                downloadBtn.title = '';
+            } else if (inlineRawTextOnly) {
+                downloadBtn.textContent = rawTextBytesComplete
+                    ? 'Download Raw Bytes'
+                    : 'Download Raw Prefix';
+                downloadBtn.title = 'Download the byte-exact data retained from this result row';
+            } else if (this.currentOversizedMetadata) {
+                downloadBtn.textContent = 'Open Full Content';
+                downloadBtn.title =
+                    'Desktop opens the complete value in VS Code; the web demo is preview-only';
+            } else {
+                downloadBtn.textContent = 'Download';
+                downloadBtn.title = '';
+            }
+        }
+        if (loadMoreBtn) {
+            const totalBytes = this.currentOversizedMetadata?.byteLength ?? 0;
+            const loadLimit = Math.min(totalBytes, MAX_OVERSIZED_INSPECTOR_LOAD_BYTES);
+            const canLoadMore = (!this.currentInlineRawTextBytes || this.currentRawTextCanStream)
+                && this.currentOversizedMetadata?.storageClass === 'text'
+                && this.oversizedLoadedBytes < loadLimit;
+            const nextBytes = Math.min(
+                OVERSIZED_INSPECTOR_LOAD_STEP_BYTES,
+                Math.max(0, loadLimit - this.oversizedLoadedBytes)
+            );
+            loadMoreBtn.hidden = !canLoadMore;
+            loadMoreBtn.disabled = uploading || this.isLoadingOversized || !canLoadMore;
+            loadMoreBtn.textContent = this.isLoadingOversized ? 'Loading...' : 'Load more';
+            loadMoreBtn.title = canLoadMore
+                ? `Load the next ${this.formatSize(nextBytes)} from one fresh cell snapshot`
                 : '';
         }
     }
 
+    beginReplacementOperation() {
+        if (
+            this.activeReplacement
+            || this.currentRowId === null
+            || this.currentRowId === undefined
+            || this.currentColName === null
+            || this.currentColName === undefined
+        ) return null;
+        const targetTable = this.currentTable ?? state.selectedTable;
+        if (!targetTable || !this.currentCellInfo) return null;
+        const operation = {
+            generation: this.previewGeneration,
+            connectionGeneration: state.connectionGeneration,
+            contentGeneration: state.contentGeneration,
+            targetTable,
+            targetRowId: this.currentRowId,
+            targetColumn: this.currentColName,
+            targetCell: { ...this.currentCellInfo },
+            originalValue: this.currentData,
+            targetStorageClass:
+                this.currentOversizedMetadata?.storageClass
+                ?? this.currentStorageClass
+                ?? (this.currentType?.type === 'text' ? 'text' : undefined)
+        };
+        this.activeReplacement = operation;
+        this.setUploadState(false);
+        return operation;
+    }
+
+    isReplacementOperationCurrent(operation) {
+        return this.activeReplacement === operation
+            && this.previewGeneration === operation.generation
+            && state.connectionGeneration === operation.connectionGeneration
+            && state.contentGeneration === operation.contentGeneration
+            && state.selectedTable === operation.targetTable
+            && this.currentRowId === operation.targetRowId
+            && this.currentColName === operation.targetColumn;
+    }
+
+    finishReplacementOperation(operation) {
+        if (this.activeReplacement !== operation) return;
+        this.activeReplacement = null;
+        this.isUploading = false;
+        this.setUploadState(false);
+    }
+
     async handleReplace() {
-        // Prevent concurrent uploads
-        if (state.isReadOnly || this.isUploading) return;
+        // Prevent concurrent file pickers and uploads.
+        if (state.isReadOnly || this.isUploading || this.activeReplacement) return;
         const mutationBlockReason = this.currentCellInfo
             ? getCellMutationBlockReason(
                 this.currentCellInfo.rowIdx,
@@ -164,77 +349,100 @@ export class BlobInspector {
             return;
         }
 
+        const operation = this.beginReplacementOperation();
+        if (!operation) return;
+        let fileInputOwnsOperation = false;
+
         try {
             // Check fileOperations setting to determine behavior
             const settings = await backendApi.getExtensionSettings();
             const fileOperations = settings?.fileOperations || 'native';
+            if (!this.isReplacementOperationCurrent(operation)) return;
 
             if (fileOperations === 'web') {
                 // Web mode: Use file input
-                this.showFileInput();
+                this.showFileInput(operation);
+                fileInputOwnsOperation = true;
             } else {
                 // Native mode: Use VS Code API to select file
                 // NOTE: Use backendApi directly because it has the proper serialize/deserialize
                 // layer for Uint8Array data, ensuring consistent handling across all callers.
                 const result = await backendApi.selectFile();
+                if (!this.isReplacementOperationCurrent(operation)) return;
                 if (result) {
-                    // Data should already be a Uint8Array after deserialization
-                    let data = result.data;
-                    if (!(data instanceof Uint8Array)) {
-                        // Fallback: Convert array-like object or array to Uint8Array
-                        if (Array.isArray(data)) {
-                            data = new Uint8Array(data);
-                        } else if (data && typeof data === 'object') {
-                            // Object with numeric keys like {0: 255, 1: 128, ...}
-                            const values = Object.keys(data)
-                                .filter(k => !isNaN(parseInt(k, 10)))
-                                .sort((a, b) => parseInt(a, 10) - parseInt(b, 10))
-                                .map(k => data[k]);
-                            data = new Uint8Array(values);
-                        }
-                    }
+                    const data = normalizeBinaryData(result.data);
 
                     // Mock a File object for uploadFile
                     const file = {
                         name: result.name,
                         size: data.byteLength,
-                        arrayBuffer: async () => data.buffer
+                        arrayBuffer: async () => data.buffer.slice(
+                            data.byteOffset,
+                            data.byteOffset + data.byteLength
+                        )
                     };
-                    await this.uploadFile(file);
+                    await this.uploadFile(file, operation);
                 }
             }
         } catch (err) {
             console.error('Replace failed:', err);
-            updateStatus(`Replace failed: ${err.message}`);
+            if (this.isReplacementOperationCurrent(operation)) {
+                updateStatus(`Replace failed: ${getErrorMessage(err)}`);
+            }
+        } finally {
+            if (!fileInputOwnsOperation && !this.isUploading) {
+                this.finishReplacementOperation(operation);
+            }
         }
     }
 
     /**
      * Show file input for web mode
      */
-    showFileInput() {
+    showFileInput(operation = this.beginReplacementOperation()) {
+        if (!operation || !this.isReplacementOperationCurrent(operation)) return;
         const input = document.createElement('input');
         input.type = 'file';
+        const parent = document.body;
+        let removed = false;
+        const cleanup = () => {
+            if (removed) return;
+            removed = true;
+            parent.removeChild(input);
+        };
         input.onchange = async (e) => {
-            const file = e.target.files[0];
+            const file = e?.target?.files?.[0];
+            cleanup();
             if (file) {
-                await this.uploadFile(file);
+                await this.uploadFile(file, operation);
+            } else {
+                this.finishReplacementOperation(operation);
             }
         };
-        input.click();
+        input.oncancel = () => {
+            cleanup();
+            this.finishReplacementOperation(operation);
+        };
+        parent.appendChild(input);
+        try {
+            input.click();
+        } catch (error) {
+            cleanup();
+            throw error;
+        }
     }
 
-    async uploadFile(file) {
-        if (!this.currentRowId || !this.currentColName) return;
-        if (state.isReadOnly || this.isUploading) return;
-
-        const targetTable = state.selectedTable;
-        const targetRowId = this.currentRowId;
-        const targetColumn = this.currentColName;
-        const targetCell = this.currentCellInfo;
-        const originalValue = this.currentData;
-        if (!targetTable || !targetCell) return;
-
+    async uploadFile(file, operation = this.beginReplacementOperation()) {
+        if (!operation || state.isReadOnly || this.isUploading) return;
+        if (!this.isReplacementOperationCurrent(operation)) return;
+        const {
+            targetTable,
+            targetRowId,
+            targetColumn,
+            targetCell,
+            originalValue
+        } = operation;
+        this.isUploading = true;
         this.setUploadState(true);
 
         try {
@@ -249,9 +457,13 @@ export class BlobInspector {
                 );
             }
 
-            updateStatus(`Reading ${file.name}...`);
+            if (this.isReplacementOperationCurrent(operation)) {
+                updateStatus(`Reading ${file.name}...`);
+            }
             const buffer = await file.arrayBuffer();
             const uint8Array = new Uint8Array(buffer);
+
+            if (!this.isReplacementOperationCurrent(operation)) return;
 
             // Recheck the bytes actually read to close size/read races and to
             // distrust file-like providers whose metadata understates data.
@@ -262,6 +474,17 @@ export class BlobInspector {
                     DEFAULT_MAX_CELL_EDIT_BYTES
                 );
             }
+            let replacementValue = uint8Array;
+            if (operation.targetStorageClass === 'text') {
+                try {
+                    replacementValue = new TextDecoder('utf-8', { fatal: true }).decode(uint8Array);
+                } catch (error) {
+                    throw new Error(
+                        `${file.name} is not valid UTF-8 and cannot replace a TEXT cell`,
+                        { cause: error }
+                    );
+                }
+            }
             const sizeMB = uint8Array.length / (1024 * 1024);
 
             // Warn about moderately large files
@@ -271,20 +494,14 @@ export class BlobInspector {
                 updateStatus(`Uploading ${file.name}...`);
             }
 
-            if (
-                state.selectedTable !== targetTable
-                || this.currentRowId !== targetRowId
-                || this.currentColName !== targetColumn
-            ) {
-                throw new Error('BLOB replacement cancelled because the selected cell changed');
-            }
+            if (!this.isReplacementOperationCurrent(operation)) return;
             const { rowIdx, colIdx } = targetCell;
 
             const updatedRowId = await backendApi.updateCell(
                 targetTable,
                 targetRowId,
                 targetColumn,
-                uint8Array,
+                replacementValue,
                 originalValue
             );
             // The replaced value may enter/leave an active filter's match
@@ -297,43 +514,52 @@ export class BlobInspector {
                     : null);
             remapDisplayedRowIdentity(targetTable, targetRowId, updatedRowId, currentCell);
             if (currentCell) {
-                state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = uint8Array;
+                state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = replacementValue;
                 clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
                 clearOversizedCellMetadata(currentCell.rowIdx, currentCell.colIdx);
             }
 
-            // Update Inspector UI
-            this.inspect(
-                uint8Array,
-                updatedRowId ?? targetRowId,
-                targetColumn,
-                currentCell?.rowIdx ?? rowIdx,
-                currentCell?.colIdx ?? colIdx
-            );
-
-            updateStatus(`Replaced with ${file.name}`);
+            if (this.isReplacementOperationCurrent(operation)) {
+                // Update Inspector UI only while this modal session still owns the operation.
+                this.inspect(
+                    replacementValue,
+                    updatedRowId ?? targetRowId,
+                    targetColumn,
+                    currentCell?.rowIdx ?? rowIdx,
+                    currentCell?.colIdx ?? colIdx
+                );
+                updateStatus(`Replaced with ${file.name}`);
+            }
 
         } catch (err) {
             console.error('Replace failed:', err);
             // Provide helpful error message for timeouts
-            let errorMessage = err.message || String(err);
+            let errorMessage = getErrorMessage(err);
             if (errorMessage.includes('timeout')) {
                 errorMessage = 'Upload timed out. Try a smaller file or increase the timeout.';
             }
-            updateStatus(`Replace failed: ${errorMessage}`);
+            if (this.isReplacementOperationCurrent(operation)) {
+                updateStatus(`Replace failed: ${errorMessage}`);
+            }
         } finally {
-            // Always reset upload state to restore UI functionality
-            this.setUploadState(false);
+            this.finishReplacementOperation(operation);
         }
     }
 
     close() {
-        this.modal.classList.add('hidden');
-        this.cleanup();
+        closeModal('blob-inspector-modal', this.modal);
     }
 
     cleanup() {
         this.previewGeneration++;
+        const pendingMediaRequest = this.pendingMediaRequest;
+        this.pendingMediaRequest = null;
+        if (pendingMediaRequest) {
+            void backendApi.cancelCellMediaPreview(
+                pendingMediaRequest.webviewId,
+                pendingMediaRequest.requestId
+            ).catch(error => console.warn('Failed to cancel media preview:', error));
+        }
         const mediaPreview = this.currentMediaPreview;
         this.currentMediaPreview = null;
         if (mediaPreview) {
@@ -347,7 +573,18 @@ export class BlobInspector {
         }
 
         // Reset upload state to ensure buttons are re-enabled
+        this.activeReplacement = null;
+        this.activeFullContent = null;
+        this.activeDownload = null;
+        this.isUploading = false;
         this.currentOversizedMetadata = null;
+        this.currentStorageClass = null;
+        this.currentInlineRawTextBytes = false;
+        this.currentRawTextCanStream = false;
+        this.currentTable = null;
+        this.oversizedLoadedBytes = 0;
+        this.oversizedLoadOperation = null;
+        this.isLoadingOversized = false;
         this.setUploadState(false);
 
         if (this.currentObjectUrl) {
@@ -393,63 +630,143 @@ export class BlobInspector {
 
     async download() {
         if (!this.currentData) return;
-        if (this.currentOversizedMetadata) {
+        if (
+            this.currentOversizedMetadata
+            && (!this.currentInlineRawTextBytes || this.currentRawTextCanStream)
+        ) {
             await this.openFullContent();
             return;
         }
 
-        let ext = this.currentType?.ext || 'bin';
-        let filename = `blob_${this.currentRowId}.${ext}`;
+        if (this.activeDownload?.promise) return this.activeDownload.promise;
 
+        const ext = this.currentType?.ext || 'bin';
+        const operation = {
+            generation: this.previewGeneration ?? 0,
+            rowId: this.currentRowId,
+            filename: `blob_${this.currentRowId}.${ext}`,
+            data: this.currentData instanceof Uint8Array
+                ? this.currentData.slice()
+                : this.currentData,
+            promise: null
+        };
+        this.activeDownload = operation;
+        operation.promise = this.runDownload(operation);
+        return operation.promise;
+    }
+
+    isDownloadOperationCurrent(operation) {
+        return this.activeDownload === operation
+            && (this.previewGeneration ?? 0) === operation.generation
+            && this.currentRowId === operation.rowId;
+    }
+
+    async runDownload(operation) {
         try {
             // Check fileOperations setting to determine behavior
             const settings = await backendApi.getExtensionSettings();
+            if (!this.isDownloadOperationCurrent(operation)) return false;
             const fileOperations = settings?.fileOperations || 'native';
 
             if (fileOperations === 'web') {
                 // Web mode: Use browser download
-                this.downloadBlob(this.currentData, filename);
-                updateStatus(`Downloaded ${filename}`);
+                this.downloadBlob(operation.data, operation.filename);
+                if (this.isDownloadOperationCurrent(operation)) {
+                    updateStatus(`Downloaded ${operation.filename}`);
+                }
             } else {
                 // Native mode: Use VS Code API to save file via backendApi
-                await backendApi.saveFile(filename, this.currentData);
-                updateStatus(`Saved ${filename}`);
+                const result = await backendApi.saveFile(operation.filename, operation.data);
+                if (!this.isDownloadOperationCurrent(operation)) return false;
+                if (result?.success === false) {
+                    updateStatus(result.cancelled ? 'Save cancelled' : (result.message || 'Save failed'));
+                    return false;
+                }
+                updateStatus(`Saved ${operation.filename}`);
             }
+            return true;
         } catch (err) {
             console.error('Download failed:', err);
-            updateStatus(`Download failed: ${err.message}`);
+            if (this.isDownloadOperationCurrent(operation)) {
+                updateStatus(`Download failed: ${getErrorMessage(err)}`);
+            }
+            return false;
+        } finally {
+            if (this.activeDownload === operation) this.activeDownload = null;
         }
     }
 
     async openFullContent() {
+        if (this.activeFullContent?.promise) return this.activeFullContent.promise;
+        const targetTable = this.currentTable ?? state.selectedTable;
         if (
             !this.currentOversizedMetadata
-            || !state.selectedTable
+            || !targetTable
             || this.currentRowId === null
-            || !this.currentColName
+            || this.currentRowId === undefined
+            || this.currentColName === null
+            || this.currentColName === undefined
         ) return;
 
+        const webviewId = document.getElementById('vscode-env')?.dataset.webviewId || 'default';
+        const operation = {
+            generation: this.previewGeneration,
+            targetTable,
+            rowId: this.currentRowId,
+            column: this.currentColName,
+            type: this.currentType,
+            sourceByteLength: this.currentOversizedMetadata.byteLength,
+            webviewId,
+            promise: null
+        };
+        this.activeFullContent = operation;
+        this.setUploadState(this.isUploading);
+        operation.promise = this.runFullContentOperation(operation);
+        return operation.promise;
+    }
+
+    isFullContentOperationCurrent(operation) {
+        return this.activeFullContent === operation
+            && this.previewGeneration === operation.generation
+            && this.currentRowId === operation.rowId
+            && this.currentColName === operation.column;
+    }
+
+    async runFullContentOperation(operation) {
         try {
-            const webviewId = document.getElementById('vscode-env')?.dataset.webviewId || 'default';
             const result = await backendApi.openCellEditor(
-                { table: state.selectedTable, name: '' },
-                this.currentRowId,
-                this.currentColName,
+                { table: operation.targetTable, name: '' },
+                operation.rowId,
+                operation.column,
                 {},
                 {
-                    type: this.currentType,
-                    webviewId,
-                    sourceByteLength: this.currentOversizedMetadata.byteLength
+                    type: operation.type,
+                    webviewId: operation.webviewId,
+                    sourceByteLength: operation.sourceByteLength
                 }
             );
+            if (!this.isFullContentOperationCurrent(operation)) return false;
             if (result?.success === false) {
                 updateStatus(result.message || 'Full content is unavailable in the web demo');
-                return;
+                return false;
             }
-            updateStatus('Opened full content in a verified read-only temporary file');
+            updateStatus(result?.mode === 'temporary-read-only'
+                ? 'Opened full content in a verified read-only temporary file'
+                : 'Opened full content in VS Code');
+            return true;
         } catch (error) {
-            const details = error instanceof Error ? error.message : String(error);
-            updateStatus(`Full content unavailable: ${details}`);
+            if (this.isFullContentOperationCurrent(operation)) {
+                const details = getErrorMessage(error);
+                updateStatus(`Full content unavailable: ${details}`);
+            }
+            return false;
+        } finally {
+            if (this.activeFullContent === operation) {
+                this.activeFullContent = null;
+                if (this.previewGeneration === operation.generation) {
+                    this.setUploadState(this.isUploading);
+                }
+            }
         }
     }
 
@@ -462,38 +779,65 @@ export class BlobInspector {
         const a = document.createElement('a');
         a.href = url;
         a.download = filename;
-        a.click();
-        URL.revokeObjectURL(url);
+        let appended = false;
+        let clicked = false;
+        try {
+            document.body.appendChild(a);
+            appended = true;
+            a.click();
+            clicked = true;
+        } finally {
+            try {
+                if (appended) document.body.removeChild(a);
+            } finally {
+                if (clicked) setTimeout(() => URL.revokeObjectURL(url), 100);
+                else URL.revokeObjectURL(url);
+            }
+        }
     }
 
     inspect(blobData, rowId, colName, rowIdx, colIdx) {
         this.cleanup();
+        const isText = typeof blobData === 'string';
+        this.setInspectorTitle(isText ? 'TEXT Inspector' : 'BLOB Inspector');
 
         // Store metadata
+        this.currentTable = state.selectedTable;
         this.currentRowId = rowId;
         this.currentColName = colName;
         this.currentCellInfo = { rowIdx, colIdx };
+        this.currentStorageClass = isText ? 'text' : 'blob';
         this.setUploadState(false);
 
         // Show modal
-        this.modal.classList.remove('hidden');
+        openModal('blob-inspector-modal', this.modal);
 
         // Reset tabs to preview
         this.switchTab('preview');
 
         // Ensure we have a Uint8Array
-        const data = blobData instanceof Uint8Array ? blobData : new Uint8Array(blobData);
+        const data = isText
+            ? new TextEncoder().encode(blobData)
+            : blobData instanceof Uint8Array
+                ? blobData
+                : new Uint8Array(blobData);
+        // Downloads and hex rendering share this value. Keep it byte-based even
+        // for TEXT so native saves cannot reinterpret a JavaScript string as an
+        // ArrayBuffer-like object.
         this.currentData = data;
 
         // Detect type
-        const type = this.detectType(data);
+        const type = isText
+            ? { mime: 'text/plain', type: 'text', ext: 'txt' }
+            : this.detectType(data);
         this.currentType = type;
         const size = this.formatSize(data.length);
 
-        this.infoContainer.textContent = `${colName} (Row ${rowId}) | ${type.mime || 'Unknown Type'} | ${size}`;
+        this.infoContainer.textContent =
+            `${colName} (Row ${rowId}) | ${isText ? 'TEXT' : (type.mime || 'Unknown Type')} | ${size}`;
 
         // Render Preview
-        this.renderPreview(data, type);
+        this.renderPreview(data, type, { text: isText ? blobData : undefined });
 
         // Render Hex
         this.renderHex(data);
@@ -501,47 +845,240 @@ export class BlobInspector {
 
     inspectOversized(previewValue, metadata, rowId, colName, rowIdx, colIdx) {
         this.cleanup();
+        this.setInspectorTitle(metadata.storageClass === 'text' ? 'TEXT Inspector' : 'BLOB Inspector');
 
+        this.currentTable = state.selectedTable;
         this.currentRowId = rowId;
         this.currentColName = colName;
         this.currentCellInfo = { rowIdx, colIdx };
         this.currentOversizedMetadata = metadata;
+        this.currentStorageClass = metadata.storageClass;
+        this.currentInlineRawTextBytes =
+            metadata.storageClass === 'text' && previewValue instanceof Uint8Array;
+        this.currentRawTextCanStream = this.currentInlineRawTextBytes
+            && state.selectedTableType === 'table';
+        this.oversizedLoadedBytes = 0;
         this.setUploadState(false);
-        this.modal.classList.remove('hidden');
+        openModal('blob-inspector-modal', this.modal);
         this.switchTab('preview');
 
         const data = capOversizedInspectorPreview(previewValue, metadata.storageClass);
         this.currentData = data;
-        const type = this.detectType(data);
+        const type = this.currentInlineRawTextBytes
+            ? { mime: 'application/octet-stream', type: 'binary', ext: 'bin' }
+            : metadata.storageClass === 'text'
+                ? { mime: 'text/plain', type: 'text', ext: 'txt' }
+                : this.detectType(data);
         this.currentType = type;
+        if (this.currentInlineRawTextBytes && !this.currentRawTextCanStream) {
+            this.oversizedLoadedBytes = data.byteLength;
+            const complete = data.byteLength === metadata.byteLength;
+            this.infoContainer.textContent = complete
+                ? `${colName} (Row ${rowId}) | TEXT | Full raw value ${this.formatSize(data.byteLength)} | ` +
+                    'Stored TEXT is not safely representable; Hex is authoritative'
+                : `${colName} (Row ${rowId}) | TEXT | Raw prefix ` +
+                    `${this.formatSize(data.byteLength)} of ${this.formatSize(metadata.byteLength)} | ` +
+                    'Stored TEXT is not safely representable; Hex is authoritative';
+            this.renderHex(data);
+            this.renderPreview(data, type);
+            this.setUploadState(false);
+            return Promise.resolve(true);
+        }
         this.infoContainer.textContent =
             `${colName} (Row ${rowId}) | ${metadata.storageClass.toUpperCase()} | ` +
             `Preview ${this.formatSize(data.byteLength)} of ${this.formatSize(metadata.byteLength)} | ` +
             'Full content opens from a desktop temporary file; web is preview-only';
 
         this.renderHex(data);
+        if (metadata.byteLength <= OVERSIZED_INSPECTOR_LOAD_STEP_BYTES) {
+            // Aggregate page pressure can truncate a modest value to a few
+            // hundred characters. One bounded snapshot read restores it.
+            return this.loadMoreOversizedContent(metadata.byteLength);
+        }
         if (isOversizedMediaType(type)) {
             const generation = this.previewGeneration;
             this.renderOversizedMediaStatus('Preparing a private desktop media URI...');
             void this.loadOversizedMediaPreview(type, metadata, generation);
         } else {
             // Bounded text/binary previews keep the existing byte path.
-            this.renderPreview(data, type);
+            this.renderPreview(data, type, {
+                text: metadata.storageClass === 'text' ? String(previewValue) : undefined
+            });
         }
+        return Promise.resolve(false);
+    }
+
+    /** Reread one complete prefix from offset zero inside a single snapshot. */
+    async loadMoreOversizedContent(requestedPrefixBytes) {
+        const metadata = this.currentOversizedMetadata;
+        const table = this.currentTable;
+        const rowId = this.currentRowId;
+        const colName = this.currentColName;
+        if (
+            !metadata
+            || !table
+            || rowId === null
+            || rowId === undefined
+            || colName === null
+            || colName === undefined
+        ) {
+            updateStatus('Cannot read this cell because its identity changed. Reopen the inspector.');
+            return false;
+        }
+        if (this.oversizedLoadOperation) return false;
+
+        const defaultTarget = Math.max(
+            OVERSIZED_INSPECTOR_LOAD_STEP_BYTES,
+            this.oversizedLoadedBytes + OVERSIZED_INSPECTOR_LOAD_STEP_BYTES
+        );
+        const requestedTarget = requestedPrefixBytes ?? defaultTarget;
+        if (!Number.isSafeInteger(requestedTarget) || requestedTarget < 0) {
+            updateStatus('Cannot read this cell because the requested preview size is invalid.');
+            return false;
+        }
+        if (this.oversizedLoadedBytes >= MAX_OVERSIZED_INSPECTOR_LOAD_BYTES) return false;
+
+        const generation = this.previewGeneration;
+        const operation = {};
+        this.oversizedLoadOperation = operation;
+        this.isLoadingOversized = true;
+        this.setUploadState(this.isUploading);
+        let session;
+        let loaded;
+        let failure;
+        try {
+            session = await backendApi.openCellReadSession({ table, rowId, column: colName });
+            if (!session || typeof session.sessionId !== 'string' || session.sessionId.length === 0) {
+                throw new Error('Cell read session returned an invalid identifier');
+            }
+            validateCellReadMetadata(session.metadata);
+            const targetBytes = Math.min(
+                requestedTarget,
+                session.metadata.byteLength,
+                MAX_OVERSIZED_INSPECTOR_LOAD_BYTES
+            );
+            const bytes = new Uint8Array(targetBytes);
+            let offset = 0;
+            while (offset < targetBytes) {
+                const requestBytes = Math.min(MAX_CELL_READ_CHUNK_BYTES, targetBytes - offset);
+                const chunk = await backendApi.readCellChunk(
+                    session.sessionId,
+                    offset,
+                    requestBytes
+                );
+                validateCellReadChunk(
+                    chunk,
+                    offset,
+                    requestBytes,
+                    session.metadata.byteLength
+                );
+                bytes.set(chunk.bytes, offset);
+                offset += chunk.bytes.byteLength;
+            }
+            loaded = { bytes, metadata: session.metadata, complete: targetBytes >= session.metadata.byteLength };
+        } catch (error) {
+            failure = error;
+        }
+
+        if (session?.sessionId) {
+            try {
+                await backendApi.closeCellReadSession(session.sessionId);
+            } catch (closeError) {
+                failure = failure
+                    ? new AggregateError([failure, closeError], 'Cell read and session cleanup both failed')
+                    : closeError;
+            }
+        }
+
+        if (this.oversizedLoadOperation === operation) {
+            this.oversizedLoadOperation = null;
+            this.isLoadingOversized = false;
+            if (generation === this.previewGeneration) this.setUploadState(this.isUploading);
+        }
+        if (failure) {
+            const details = getErrorMessage(failure);
+            console.error('Reading the full cell failed:', failure);
+            if (generation === this.previewGeneration) {
+                updateStatus(`Reading the full cell failed: ${details}`);
+            }
+            return false;
+        }
+        if (!loaded || generation !== this.previewGeneration) return false;
+
+        this.currentData = loaded.bytes;
+        this.currentOversizedMetadata = loaded.metadata;
+        this.oversizedLoadedBytes = loaded.bytes.byteLength;
+        let renderedText;
+        if (loaded.metadata.storageClass === 'text') {
+            try {
+                renderedText = decodeCellTextPrefix(
+                    loaded.bytes,
+                    loaded.metadata.textEncoding,
+                    loaded.complete
+                );
+                try {
+                    const parsed = JSON.parse(renderedText);
+                    this.currentType = typeof parsed === 'object' && parsed !== null
+                        ? { mime: 'application/json', type: 'json', ext: 'json' }
+                        : { mime: 'text/plain', type: 'text', ext: 'txt' };
+                } catch {
+                    this.currentType = { mime: 'text/plain', type: 'text', ext: 'txt' };
+                }
+            } catch (error) {
+                const details = getErrorMessage(error);
+                updateStatus(`Text preview unavailable: ${details}. Raw bytes remain in Hex.`);
+                this.currentType = { mime: 'application/octet-stream', type: 'binary', ext: 'bin' };
+            }
+        } else {
+            this.currentType = this.detectType(loaded.bytes);
+        }
+
+        if (this.currentObjectUrl) {
+            URL.revokeObjectURL(this.currentObjectUrl);
+            this.currentObjectUrl = null;
+        }
+        this.previewContainer.replaceChildren?.();
+        if (!this.previewContainer.replaceChildren) this.previewContainer.innerHTML = '';
+        this.renderHex(loaded.bytes);
+        this.renderPreview(loaded.bytes, this.currentType, { text: renderedText });
+        this.infoContainer.textContent = loaded.complete
+            ? `${colName} (Row ${rowId}) | ${loaded.metadata.storageClass.toUpperCase()} | ` +
+                `Full value ${this.formatSize(loaded.metadata.byteLength)}`
+            : `${colName} (Row ${rowId}) | ${loaded.metadata.storageClass.toUpperCase()} | ` +
+                `Loaded ${this.formatSize(loaded.bytes.byteLength)} of ` +
+                `${this.formatSize(loaded.metadata.byteLength)} source bytes`;
+        this.setUploadState(this.isUploading);
+        return true;
     }
 
     async loadOversizedMediaPreview(type, metadata, generation) {
-        const table = state.selectedTable;
+        const table = this.currentTable ?? state.selectedTable;
         const rowId = this.currentRowId;
         const colName = this.currentColName;
         const webviewId = document.getElementById('vscode-env')?.dataset.webviewId || 'default';
-        if (!table || rowId === null || !colName) {
+        if (
+            !table
+            || rowId === null
+            || rowId === undefined
+            || colName === null
+            || colName === undefined
+        ) {
             this.renderOversizedMediaStatus(
                 'Oversized media is unavailable because the cell identity changed. ' +
                 'The bounded Hex preview remains available.'
             );
             return;
         }
+
+        const request = {
+            requestId: createMediaPreviewRequestId(),
+            webviewId,
+            generation,
+            table,
+            rowId,
+            colName
+        };
+        this.pendingMediaRequest = request;
 
         try {
             const result = await backendApi.prepareCellMediaPreview(
@@ -551,11 +1088,14 @@ export class BlobInspector {
                 {
                     type,
                     webviewId,
+                    requestId: request.requestId,
                     sourceByteLength: metadata.byteLength
                 }
             );
             if (
-                generation !== this.previewGeneration
+                this.pendingMediaRequest !== request
+                || generation !== this.previewGeneration
+                || (this.currentTable ?? state.selectedTable) !== table
                 || this.currentRowId !== rowId
                 || this.currentColName !== colName
             ) {
@@ -564,6 +1104,7 @@ export class BlobInspector {
                 }
                 return;
             }
+            this.pendingMediaRequest = null;
             if (!result?.success) {
                 this.renderOversizedMediaStatus(
                     `${result?.message || 'Oversized media preview is unavailable'} ` +
@@ -572,7 +1113,11 @@ export class BlobInspector {
                 return;
             }
 
-            this.currentMediaPreview = { webviewId, previewId: result.previewId };
+            this.currentMediaPreview = {
+                webviewId,
+                requestId: request.requestId,
+                previewId: result.previewId
+            };
             try {
                 this.renderMediaUri(result.uri, type, generation);
             } catch (error) {
@@ -581,8 +1126,14 @@ export class BlobInspector {
                 throw error;
             }
         } catch (error) {
-            if (generation !== this.previewGeneration) return;
-            const details = error instanceof Error ? error.message : String(error);
+            const requestIsCurrent = this.pendingMediaRequest === request
+                && generation === this.previewGeneration
+                && (this.currentTable ?? state.selectedTable) === table
+                && this.currentRowId === rowId
+                && this.currentColName === colName;
+            if (this.pendingMediaRequest === request) this.pendingMediaRequest = null;
+            if (!requestIsCurrent) return;
+            const details = getErrorMessage(error);
             this.renderOversizedMediaStatus(
                 `Oversized media preview unavailable: ${details}. ` +
                 'The bounded Hex preview remains available.'
@@ -652,10 +1203,27 @@ export class BlobInspector {
             throw new Error(`Unsupported oversized media category: ${type.type}`);
         }
 
-        mediaElement.addEventListener('error', () => {
-            if (generation !== this.previewGeneration) return;
+        const lease = this.currentMediaPreview;
+        mediaElement.addEventListener('error', async () => {
+            if (
+                generation !== this.previewGeneration
+                || !lease
+                || this.currentMediaPreview !== lease
+            ) return;
+            try {
+                await backendApi.releaseCellMediaPreview(lease.webviewId, lease.previewId);
+            } catch (error) {
+                const details = getErrorMessage(error);
+                this.renderOversizedMediaStatus(
+                    `The media preview failed to load and its temporary file could not be ` +
+                    `released: ${details}. Close the inspector to retry cleanup. ` +
+                    'The bounded Hex preview remains available.'
+                );
+                return;
+            }
+            if (this.currentMediaPreview === lease) this.currentMediaPreview = null;
             this.renderOversizedMediaStatus(
-                'The temporary preview file was cleaned up while this preview was open. ' +
+                'The media preview failed to load, so its temporary file was released. ' +
                 'The bounded Hex preview remains available.'
             );
         }, { once: true });
@@ -741,7 +1309,7 @@ export class BlobInspector {
         return (controlChars / sample.length) < 0.1;
     }
 
-    renderPreview(data, type) {
+    renderPreview(data, type, { text: decodedText } = {}) {
         if (type.type === 'image') {
             // Image preview using object URL
             const blob = new Blob([data], { type: type.mime });
@@ -796,7 +1364,7 @@ export class BlobInspector {
 
             this.previewContainer.appendChild(video);
         } else if (type.type === 'text' || type.type === 'json') {
-            const text = new TextDecoder().decode(data);
+            const text = decodedText ?? new TextDecoder().decode(data);
             const pre = document.createElement('pre');
             if (type.type === 'json') {
                 try {

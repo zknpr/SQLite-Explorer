@@ -17,6 +17,53 @@ const gridEventsModulePath = '../../core/ui/modules/grid-events.js';
 const globalShortcutsModulePath = '../../core/ui/modules/global-shortcuts.js';
 const dndModulePath = '../../core/ui/modules/dnd.js';
 const clipboardModulePath = '../../core/ui/modules/clipboard.js';
+const backendApiModulePath = '../../core/ui/modules/api.js';
+const gridActionsModulePath = '../../core/ui/modules/grid-actions.js';
+const connectionStateModulePath = '../../core/ui/modules/connection-state.js';
+
+interface CellReadSessionResult {
+    sessionId: string;
+    metadata: {
+        storageClass: string;
+        byteLength: number;
+        textEncoding?: string;
+    };
+}
+
+interface CellChunkResult {
+    byteOffset: number;
+    bytes: Uint8Array;
+    done: boolean;
+}
+
+interface EditorBackendApi {
+    updateCell: (...args: unknown[]) => Promise<unknown>;
+    openCellReadSession: (target: unknown) => Promise<CellReadSessionResult>;
+    readCellChunk: (
+        sessionId: string,
+        byteOffset: number,
+        maxBytes: number
+    ) => Promise<CellChunkResult>;
+    closeCellReadSession: (sessionId: string) => Promise<unknown>;
+}
+
+interface BackendApiModule {
+    backendApi: EditorBackendApi;
+}
+
+interface GridActionsModule {
+    onCellDoubleClick(
+        event: unknown,
+        rowIdx: number,
+        colIdx: number,
+        rowId: number | string
+    ): unknown;
+}
+
+async function loadEditorBackendApi(): Promise<EditorBackendApi> {
+    const module = await import(backendApiModulePath) as BackendApiModule;
+    return module.backendApi;
+}
 
 function createClassList(initial: string[] = []) {
     const classes = new Set(initial);
@@ -72,6 +119,7 @@ describe('editor keyboard and grid selection interactions', () => {
         state.selectedTableType = 'table';
         state.selectedTableIdentity = null;
         state.isReadOnly = false;
+        state.cellEditBehavior = 'inline';
         state.cellPreviewInfo = null;
         state.isLoadingData = false;
         state.matchNav = { scope: null, term: null, matches: [], currentIndex: -1 };
@@ -259,6 +307,224 @@ describe('editor keyboard and grid selection interactions', () => {
         }
     });
 
+    it('keeps the preview open and reports the host reason when external editing is unavailable', async () => {
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { openCellInVsCode } = await import(editModulePath);
+        const originalOpenCellEditor = backendApi.openCellEditor;
+        const status = { textContent: '' };
+        const modal = { classList: createClassList() };
+        backendApi.openCellEditor = async () => ({
+            success: false,
+            message: 'External editing is unavailable in this environment'
+        });
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cellPreviewModal') return modal;
+                if (id === 'statusText') return status;
+                return null;
+            }
+        };
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'body', type: 'TEXT' }];
+        state.gridData = [[1, 'value']];
+        state.cellPreviewInfo = {
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 1,
+            columnName: 'body',
+            originalValue: 'value',
+            originalText: 'value'
+        };
+
+        try {
+            await openCellInVsCode();
+            assert.strictEqual(status.textContent, 'External editing is unavailable in this environment');
+            assert.strictEqual(modal.classList.contains('hidden'), false);
+            assert.ok(state.cellPreviewInfo, 'a failed external open must not discard the modal draft');
+        } finally {
+            backendApi.openCellEditor = originalOpenCellEditor;
+        }
+    });
+
+    it('does not let an older external-editor completion close a newer cell preview', async () => {
+        const { backendApi } = await import(backendApiModulePath);
+        const { state } = await import(stateModulePath);
+        const { openCellInVsCode } = await import(editModulePath);
+        const originalOpenCellEditor = backendApi.openCellEditor;
+        const opened = createDeferred<any>();
+        const status = { textContent: '' };
+        const modal = { classList: createClassList() };
+        const firstSession = {
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 1,
+            columnName: 'body',
+            table: 'items',
+            column: { name: 'body', type: 'TEXT' },
+            originalValue: 'first',
+            originalText: 'first'
+        };
+        const secondSession = {
+            ...firstSession,
+            rowId: 2,
+            originalValue: 'second',
+            originalText: 'second'
+        };
+        backendApi.openCellEditor = async () => opened.promise;
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cellPreviewModal') return modal;
+                if (id === 'statusText') return status;
+                if (id === 'vscode-env') return { dataset: { webviewId: 'test' } };
+                return null;
+            }
+        };
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'body', type: 'TEXT' }];
+        state.gridData = [[1, 'first'], [2, 'second']];
+        state.cellPreviewInfo = firstSession;
+
+        try {
+            const pendingOpen = openCellInVsCode();
+            state.cellPreviewInfo = secondSession;
+            status.textContent = 'Editing second cell';
+            opened.resolve({ success: true });
+            await pendingOpen;
+
+            assert.strictEqual(state.cellPreviewInfo, secondSession);
+            assert.strictEqual(modal.classList.contains('hidden'), false);
+            assert.strictEqual(status.textContent, 'Editing second cell');
+        } finally {
+            backendApi.openCellEditor = originalOpenCellEditor;
+        }
+    });
+
+    it('persists programmatic JSON formatting instead of treating the preview as unchanged', async () => {
+        const { backendApi } = await import(backendApiModulePath);
+        const { state } = await import(stateModulePath);
+        const {
+            compactCellPreviewJson,
+            formatCellPreviewJson,
+            saveCellPreview
+        } = await import(editModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const textarea = { value: '' };
+        const modal = { classList: createClassList() };
+        const charCount = { textContent: '' };
+        const calls: unknown[][] = [];
+        backendApi.updateCell = async (...args: unknown[]) => {
+            calls.push(args);
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cellPreviewTextarea') return textarea;
+                if (id === 'cellPreviewModal') return modal;
+                if (id === 'cellPreviewCharCount') return charCount;
+                if (id === 'statusText') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll() { return []; },
+            querySelector() { return null; }
+        };
+        state.isReadOnly = false;
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'body', type: 'TEXT', notnull: 0 }];
+        state.gridData = [[1, '{"a":1}']];
+
+        try {
+            textarea.value = '{"a":1}';
+            state.cellPreviewInfo = {
+                rowIdx: 0,
+                colIdx: 0,
+                rowId: 1,
+                columnName: 'body',
+                table: 'items',
+                tableType: 'table',
+                column: { name: 'body', type: 'TEXT', notnull: 0 },
+                originalValue: '{"a":1}',
+                originalText: '{"a":1}',
+                valueMode: 'value',
+                dirty: false
+            };
+            formatCellPreviewJson();
+            assert.strictEqual(state.cellPreviewInfo.dirty, true);
+            await saveCellPreview();
+
+            textarea.value = '{\n  "b": 2\n}';
+            state.gridData = [[2, '{\n  "b": 2\n}']];
+            state.cellPreviewInfo = {
+                rowIdx: 0,
+                colIdx: 0,
+                rowId: 2,
+                columnName: 'body',
+                table: 'items',
+                tableType: 'table',
+                column: { name: 'body', type: 'TEXT', notnull: 0 },
+                originalValue: '{\n  "b": 2\n}',
+                originalText: '{\n  "b": 2\n}',
+                valueMode: 'value',
+                dirty: false
+            };
+            compactCellPreviewJson();
+            assert.strictEqual(state.cellPreviewInfo.dirty, true);
+            await saveCellPreview();
+
+            assert.deepStrictEqual(calls, [
+                ['items', 1, 'body', '{\n  "a": 1\n}', '{"a":1}'],
+                ['items', 2, 'body', '{"b":2}', '{\n  "b": 2\n}']
+            ]);
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+        }
+    });
+
+    it('does not resurrect the VS Code editor action in the standalone web viewer', async () => {
+        const { state } = await import(stateModulePath);
+        const { openCellPreview } = await import(editModulePath);
+        const element = () => ({
+            value: '',
+            textContent: '',
+            title: '',
+            readOnly: false,
+            style: {} as Record<string, string>,
+            classList: createClassList(),
+            focus() {},
+            addEventListener() {},
+            removeEventListener() {}
+        });
+        const elements: Record<string, any> = {
+            cellPreviewModal: element(),
+            cellPreviewColumnName: element(),
+            cellPreviewTypeBadge: element(),
+            cellPreviewTextarea: element(),
+            cellPreviewReadonlyBadge: element(),
+            cellPreviewSaveBtn: element(),
+            openInVsCodeBtn: element(),
+            wrapTextBtn: element(),
+            cellPreviewCharCount: element()
+        };
+        elements.openInVsCodeBtn.style.display = 'none';
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                return elements[id] ?? null;
+            }
+        };
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'body', type: 'TEXT' }];
+        state.gridData = [[1, 'value']];
+
+        openCellPreview(0, 0, 1);
+
+        assert.strictEqual(elements.openInVsCodeBtn.style.display, 'none');
+        assert.strictEqual(elements.cellPreviewModal.classList.contains('hidden'), false);
+    });
+
     it('applies a delayed cell-preview save by row and column identity after a refresh reorders the grid', async () => {
         const apiModulePath = '../../core/ui/modules/api.js';
         const { backendApi } = await import(apiModulePath);
@@ -358,6 +624,180 @@ describe('editor keyboard and grid selection interactions', () => {
         }
     });
 
+    it('saves a modal draft to its snapshotted table and column semantics after a table switch', async () => {
+        const backendApi = await loadEditorBackendApi();
+        const { state } = await import(stateModulePath);
+        const { saveCellPreview } = await import(editModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const calls: unknown[][] = [];
+        const modal = { classList: createClassList() };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cellPreviewTextarea') return { value: '00123' };
+                if (id === 'cellPreviewModal') return modal;
+                if (id === 'statusText') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll() { return []; },
+            querySelector() { return null; }
+        };
+        backendApi.updateCell = async (...args: unknown[]) => {
+            calls.push(args);
+        };
+        state.isReadOnly = false;
+        state.selectedTable = 'table_b';
+        state.selectedTableType = 'table';
+        state.selectedTableIdentity = { kind: 'rowid' } as any;
+        state.tableColumns = [{ name: 'body', type: 'INTEGER', notnull: 0 }];
+        state.gridData = [[1, 999]];
+        state.cellPreviewInfo = {
+            rowIdx: 0,
+            colIdx: 0,
+            rowId: 1,
+            columnName: 'body',
+            table: 'table_a',
+            tableType: 'table',
+            column: { name: 'body', type: 'TEXT', notnull: 0 },
+            identityKind: 'rowid',
+            documentReadOnly: false,
+            valueMode: 'value',
+            originalValue: 'value from A',
+            originalText: 'value from A'
+        };
+
+        try {
+            await saveCellPreview();
+            assert.deepStrictEqual(calls, [[
+                'table_a', 1, 'body', '00123', 'value from A'
+            ]]);
+            assert.deepStrictEqual(state.gridData, [[1, 999]]);
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+        }
+    });
+
+    it('treats clearing nullable inline and modal TEXT as an empty string, not SQL NULL', async () => {
+        const backendApi = await loadEditorBackendApi();
+        const { state } = await import(stateModulePath);
+        const { saveCellEdit, saveCellPreview } = await import(editModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const calls: unknown[][] = [];
+        const modal = { classList: createClassList() };
+        const cell = {
+            classList: createClassList(['editing']),
+            textContent: '',
+            children: [] as any[],
+            appendChild(child: any) { this.children.push(child); }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cellPreviewTextarea') return { value: '' };
+                if (id === 'cellPreviewModal') return modal;
+                if (id === 'cell-0-0') return cell;
+                if (id === 'statusText') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll() { return []; },
+            querySelector() { return null; },
+            createElement() {
+                return { className: '', textContent: '', title: '', scrollWidth: 0, clientWidth: 0 };
+            }
+        };
+        backendApi.updateCell = async (...args: unknown[]) => {
+            calls.push(args);
+        };
+        const column = { name: 'body', type: 'TEXT', notnull: 0 };
+        state.isReadOnly = false;
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [column];
+        state.gridData = [[1, 'before']];
+        state.editingCellInfo = {
+            rowIdx: 0, colIdx: 0, rowId: 1, columnName: 'body', table: 'items',
+            tableType: 'table', column, identityKind: 'rowid',
+            originalValue: 'before', originalText: 'before'
+        };
+        state.activeCellInput = { value: '', removeEventListener() {} };
+
+        try {
+            assert.strictEqual(await saveCellEdit(), true);
+            state.gridData = [[1, 'before']];
+            state.cellPreviewInfo = {
+                rowIdx: 0, colIdx: 0, rowId: 1, columnName: 'body', table: 'items',
+                tableType: 'table', column, identityKind: 'rowid', documentReadOnly: false,
+                valueMode: 'value', originalValue: 'before', originalText: 'before'
+            };
+            await saveCellPreview();
+
+            assert.deepStrictEqual(calls, [
+                ['items', 1, 'body', '', 'before'],
+                ['items', 1, 'body', '', 'before']
+            ]);
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+        }
+    });
+
+    it('keeps SQL NULL and empty string as explicit, distinct modal actions', async () => {
+        const backendApi = await loadEditorBackendApi();
+        const { state } = await import(stateModulePath);
+        const { saveCellPreview, setCellPreviewEmpty, setCellPreviewNull } =
+            await import(editModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const calls: unknown[][] = [];
+        const textarea = { value: '', focus() {} };
+        const modal = { classList: createClassList() };
+        const emptyButton = { classList: createClassList() };
+        const nullButton = { classList: createClassList() };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'cellPreviewTextarea') return textarea;
+                if (id === 'cellPreviewModal') return modal;
+                if (id === 'cellPreviewEmptyBtn') return emptyButton;
+                if (id === 'cellPreviewNullBtn') return nullButton;
+                if (id === 'cellPreviewCharCount') return { textContent: '' };
+                if (id === 'statusText') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll() { return []; },
+            querySelector() { return null; }
+        };
+        backendApi.updateCell = async (...args: unknown[]) => {
+            calls.push(args);
+        };
+        const column = { name: 'body', type: 'TEXT', notnull: 0 };
+        state.isReadOnly = false;
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [column];
+        state.gridData = [[1, null]];
+        const session = (originalValue: unknown) => ({
+            rowIdx: 0, colIdx: 0, rowId: 1, columnName: 'body', table: 'items',
+            tableType: 'table', column, identityKind: 'rowid', documentReadOnly: false,
+            valueMode: 'value', dirty: false, originalValue,
+            originalText: originalValue === null ? '' : String(originalValue)
+        });
+
+        try {
+            state.cellPreviewInfo = session(null);
+            setCellPreviewEmpty();
+            await saveCellPreview();
+
+            state.gridData = [[1, 'before']];
+            state.cellPreviewInfo = session('before');
+            textarea.value = 'before';
+            setCellPreviewNull();
+            await saveCellPreview();
+
+            assert.deepStrictEqual(calls, [
+                ['items', 1, 'body', '', null],
+                ['items', 1, 'body', null, 'before']
+            ]);
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+        }
+    });
+
     it('aborts a BLOB drop when the selected table changes during the file read', async () => {
         const listeners = new Map<string, (event: any) => Promise<void>>();
         const source = createDeferred<Uint8Array>();
@@ -431,6 +871,83 @@ describe('editor keyboard and grid selection interactions', () => {
             assert.deepStrictEqual(state.gridData, [[22, new Uint8Array([2])]]);
         } finally {
             backendApi.readWorkspaceFileUri = originalReadWorkspaceFileUri;
+            backendApi.updateCell = originalUpdateCell;
+        }
+    });
+
+    it('aborts a BLOB drop when Reload replaces the same table and rowid', async () => {
+        const listeners = new Map<string, (event: any) => Promise<void>>();
+        const source = createDeferred<Uint8Array>();
+        const cell = {
+            dataset: { rowidx: '0', colidx: '0' },
+            classList: createClassList(),
+            closest(selector: string) {
+                return selector === '.data-cell' ? this : null;
+            }
+        };
+        const container = {
+            addEventListener(type: string, listener: (event: any) => Promise<void>) {
+                listeners.set(type, listener);
+            }
+        };
+        const status = { textContent: '' };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'gridContainer') return container;
+                if (id === 'statusText') return status;
+                return null;
+            },
+            addEventListener() {}
+        };
+
+        const { backendApi } = await import(backendApiModulePath);
+        const { state } = await import(stateModulePath);
+        const { applyConnectionResult } = await import(connectionStateModulePath);
+        const { initDragAndDrop } = await import(dndModulePath);
+        const originalReadWorkspaceFileUri = (backendApi as any).readWorkspaceFileUri;
+        const originalUpdateCell = backendApi.updateCell;
+        const updateCalls: unknown[][] = [];
+        (backendApi as any).readWorkspaceFileUri = async () => source.promise;
+        backendApi.updateCell = async (...args: unknown[]) => {
+            updateCalls.push(args);
+        };
+        state.connectionGeneration = 11;
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'payload', type: 'BLOB' }];
+        state.gridData = [[1, new Uint8Array([1])]];
+        initDragAndDrop();
+
+        try {
+            const pendingDrop = listeners.get('drop')!({
+                preventDefault() {},
+                target: cell,
+                dataTransfer: {
+                    files: [],
+                    getData: (type: string) => (
+                        type === 'text/uri-list' ? 'file:///tmp/payload.bin' : ''
+                    )
+                }
+            });
+
+            // The reopened database deliberately has the same visible target.
+            applyConnectionResult({
+                connected: true,
+                readOnly: false,
+                connectionGeneration: 12
+            });
+            state.selectedTable = 'items';
+            state.selectedTableType = 'table';
+            state.tableColumns = [{ name: 'payload', type: 'BLOB' }];
+            state.gridData = [[1, new Uint8Array([2])]];
+            source.resolve(new Uint8Array([9]));
+            await pendingDrop;
+
+            assert.deepStrictEqual(updateCalls, []);
+            assert.deepStrictEqual(state.gridData, [[1, new Uint8Array([2])]]);
+            assert.strictEqual(status.textContent, 'Upload cancelled because the database was reloaded');
+        } finally {
+            (backendApi as any).readWorkspaceFileUri = originalReadWorkspaceFileUri;
             backendApi.updateCell = originalUpdateCell;
         }
     });
@@ -836,6 +1353,56 @@ describe('editor keyboard and grid selection interactions', () => {
         } finally {
             backendApi.updateCell = originalUpdateCell;
         }
+    });
+
+    it('labels the inline editor with the column being edited', async () => {
+        const container = {
+            scrollLeft: 0,
+            scrollTop: 0,
+            getBoundingClientRect: () => ({
+                left: 0, top: 0, right: 500, bottom: 300, width: 500, height: 300
+            }),
+            querySelector() { return null; },
+            querySelectorAll() { return []; }
+        };
+        const cell = {
+            innerHTML: '',
+            classList: createClassList(),
+            children: [] as any[],
+            closest: () => null,
+            getBoundingClientRect: () => ({
+                left: 80, top: 160, right: 180, bottom: 190, width: 100, height: 30
+            }),
+            appendChild(child: any) { this.children.push(child); }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'gridContainer') return container;
+                if (id === 'cell-0-0') return cell;
+                return null;
+            },
+            createElement() {
+                return {
+                    className: '',
+                    value: '',
+                    spellcheck: false,
+                    ariaLabel: '',
+                    addEventListener() {},
+                    removeEventListener() {},
+                    focus() {}
+                };
+            }
+        };
+        const { state } = await import(stateModulePath);
+        const { startCellEdit } = await import(editModulePath);
+        state.selectedTable = 'orders';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'customer note', type: 'TEXT', notnull: 0, isPrimaryKey: false }];
+        state.gridData = [[3, 'plain text']];
+
+        startCellEdit(0, 0, 3);
+
+        assert.strictEqual(cell.children[0]?.ariaLabel, 'Edit customer note');
     });
 
     it('snapshots the full save target into the edit session at edit start', async () => {
@@ -1269,7 +1836,7 @@ describe('editor keyboard and grid selection interactions', () => {
         assert.strictEqual(scrollLeftWhenFocused, 30);
     });
 
-    it('refuses inline editing of a bounded oversized preview with the exact byte count', async () => {
+    it('refuses inline editing when the grid lacks the full byte-exact value', async () => {
         const status = { textContent: '' };
         const cell = {
             innerHTML: '',
@@ -1300,8 +1867,90 @@ describe('editor keyboard and grid selection interactions', () => {
         assert.strictEqual(cell.children.length, 0);
         assert.strictEqual(
             status.textContent,
-            'Too large to edit inline — 268,435,456 bytes (TEXT)'
+            'Inline editing unavailable because the grid does not contain the full byte-exact value. ' +
+            'Use View Full Content and the Hex view (TEXT, 268,435,456 bytes).'
         );
+    });
+
+    it('opens a bounded preview on default double-click instead of treating it as an edit', async () => {
+        const modal = {
+            classList: createClassList(['hidden']),
+            querySelectorAll() { return []; }
+        };
+        const preview = {
+            innerHTML: '',
+            style: {},
+            children: [] as any[],
+            appendChild(child: any) { this.children.push(child); }
+        };
+        const hex = { value: '' };
+        const info = { textContent: '' };
+        const genericElement = () => ({
+            addEventListener() {},
+            classList: createClassList(),
+            style: {},
+            textContent: '',
+            querySelectorAll() { return []; }
+        });
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'blob-inspector-modal') return modal;
+                if (id === 'tab-preview') return preview;
+                if (id === 'blob-info') return info;
+                return genericElement();
+            },
+            querySelector(selector: string) {
+                return selector === '.hex-dump' ? hex : null;
+            },
+            createElement() {
+                return {
+                    style: {},
+                    className: '',
+                    textContent: '',
+                    appendChild() {},
+                    addEventListener() {}
+                };
+            }
+        };
+        const { state } = await import(stateModulePath);
+        const backendApi = await loadEditorBackendApi();
+        const { initEdit } = await import(editModulePath);
+        const { onCellDoubleClick } = await import(gridActionsModulePath) as GridActionsModule;
+        const originalReadApi = {
+            openCellReadSession: backendApi.openCellReadSession,
+            readCellChunk: backendApi.readCellChunk,
+            closeCellReadSession: backendApi.closeCellReadSession
+        };
+        const fullValue = new TextEncoder().encode('x'.repeat(2_000));
+        backendApi.openCellReadSession = async () => ({
+            sessionId: 'bounded-preview',
+            metadata: { storageClass: 'text', byteLength: fullValue.byteLength, textEncoding: 'utf-8' }
+        });
+        backendApi.readCellChunk = async (_sessionId: string, offset: number, maxBytes: number) => ({
+            byteOffset: offset,
+            bytes: fullValue.slice(offset, offset + maxBytes),
+            done: offset + maxBytes >= fullValue.byteLength
+        });
+        backendApi.closeCellReadSession = async () => {};
+        initEdit();
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.cellEditBehavior = 'inline';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.gridData = [[1, 'bounded preview']];
+        state.gridOversizedCells = {
+            0: { 1: { storageClass: 'text', byteLength: 2_000 } }
+        };
+
+        try {
+            await onCellDoubleClick({}, 0, 0, 1);
+
+            assert.strictEqual(state.editingCellInfo, null);
+            assert.strictEqual(modal.classList.contains('hidden'), false);
+            assert.match(info.textContent, /Full value 1.95 KB/);
+        } finally {
+            Object.assign(backendApi, originalReadApi);
+        }
     });
 
     it('keeps batch clear blocked but permits confirmed single-cell replacement affordances', async () => {
@@ -1366,7 +2015,11 @@ describe('editor keyboard and grid selection interactions', () => {
         try {
             await clearSelectedCellValues();
             assert.strictEqual(batchUpdateCalls, 0);
-            assert.strictEqual(status.textContent, 'Too large to edit inline — 4,096 bytes (BLOB)');
+            assert.strictEqual(
+                status.textContent,
+                'Inline editing unavailable because the grid does not contain the full byte-exact value. ' +
+                'Use View Full Content and the Hex view (BLOB, 4,096 bytes).'
+            );
 
             status.textContent = '';
             initDragAndDrop();
@@ -1385,6 +2038,62 @@ describe('editor keyboard and grid selection interactions', () => {
             backendApi.updateCellBatch = originalUpdateCellBatch;
             backendApi.updateCell = originalUpdateCell;
             backendApi.readWorkspaceFileUri = originalReadWorkspaceFileUri;
+        }
+    });
+
+    it('coalesces duplicate Smart Delete clears and does not mutate a newly selected table', async () => {
+        const { backendApi } = await import(backendApiModulePath);
+        const { state } = await import(stateModulePath);
+        const { clearSelectedCellValues } = await import(clipboardModulePath);
+        const originalUpdateCellBatch = backendApi.updateCellBatch;
+        const update = createDeferred<any[]>();
+        const status = { textContent: '' };
+        let calls = 0;
+        backendApi.updateCellBatch = async () => {
+            calls += 1;
+            return update.promise;
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'statusText') return status;
+                return null;
+            },
+            querySelectorAll() { return []; },
+            querySelector() { return null; }
+        };
+        state.isReadOnly = false;
+        state.selectedTable = 'table_a';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'value', type: 'TEXT', notnull: 0 }];
+        state.gridData = [[1, 'one'], [2, 'two'], [3, 'three']];
+        state.selectedCells = [{ rowIdx: 2, colIdx: 0, rowId: 3, value: 'three' }];
+
+        try {
+            const first = clearSelectedCellValues();
+            const duplicate = clearSelectedCellValues();
+            assert.strictEqual(calls, 1);
+
+            state.selectedTable = 'table_b';
+            state.tableColumns = [{ name: 'other', type: 'TEXT', notnull: 0 }];
+            state.gridData = [[99, 'table-b-value']];
+            state.selectedCells = [{ rowIdx: 0, colIdx: 0, rowId: 99, value: 'table-b-value' }];
+            state.selectedColumns = new Set(['other']);
+            state.lastSelectedCell = { rowIdx: 0, colIdx: 0 };
+            status.textContent = 'Table B ready';
+
+            update.resolve([{ rowId: 3, columnName: 'value' }]);
+            await Promise.all([first, duplicate]);
+
+            assert.strictEqual(calls, 1);
+            assert.deepStrictEqual(state.gridData, [[99, 'table-b-value']]);
+            assert.deepStrictEqual(state.selectedCells, [
+                { rowIdx: 0, colIdx: 0, rowId: 99, value: 'table-b-value' }
+            ]);
+            assert.deepStrictEqual([...state.selectedColumns], ['other']);
+            assert.deepStrictEqual(state.lastSelectedCell, { rowIdx: 0, colIdx: 0 });
+            assert.strictEqual(status.textContent, 'Table B ready');
+        } finally {
+            backendApi.updateCellBatch = originalUpdateCellBatch;
         }
     });
 
@@ -1928,4 +2637,158 @@ describe('editor keyboard and grid selection interactions', () => {
 
         assert.strictEqual(prevented, 1);
     });
+
+    it('selects a focused grid cell with Space and moves its roving focus with ArrowRight', async () => {
+        const containerListeners = new Map<string, (event: any) => any>();
+        const row = { dataset: { rowid: '7' } };
+        const cells = [0, 1].map(colIdx => {
+            const cell: any = {
+                id: `cell-0-${colIdx}`,
+                tagName: 'TD',
+                tabIndex: colIdx === 0 ? 0 : -1,
+                dataset: { rowidx: '0', colidx: String(colIdx), gridTabstop: colIdx === 0 ? 'true' : 'false' },
+                classList: createClassList(['data-cell']),
+                focused: false,
+                closest(selector: string) {
+                    if (selector === '.data-cell') return cell;
+                    if (selector === '.data-row') return row;
+                    if (selector.includes('input')) return null;
+                    return null;
+                },
+                focus() { cell.focused = true; }
+            };
+            return cell;
+        });
+        const container = {
+            addEventListener(type: string, listener: (event: any) => any) {
+                containerListeners.set(type, listener);
+            },
+            querySelector(selector: string) {
+                return selector === '.data-cell[data-grid-tabstop="true"]' ? cells[0] : null;
+            }
+        };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'gridContainer') return container;
+                return cells.find(cell => cell.id === id) ?? null;
+            },
+            addEventListener() {},
+            querySelectorAll() { return []; },
+            querySelector() { return null; }
+        };
+        const { state } = await import(stateModulePath);
+        const { initGridInteraction } = await import(gridEventsModulePath);
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [
+            { name: 'first', type: 'TEXT' },
+            { name: 'second', type: 'TEXT' }
+        ];
+        state.gridData = [[7, 'a', 'b']];
+        initGridInteraction();
+        const keydown = containerListeners.get('keydown');
+        assert.ok(keydown);
+        let prevented = 0;
+
+        keydown({
+            key: ' ',
+            target: cells[0],
+            shiftKey: false,
+            ctrlKey: false,
+            metaKey: false,
+            altKey: false,
+            preventDefault() { prevented++; },
+            stopPropagation() {}
+        });
+        keydown({
+            key: 'ArrowRight',
+            target: cells[0],
+            shiftKey: false,
+            ctrlKey: false,
+            metaKey: false,
+            altKey: false,
+            preventDefault() { prevented++; },
+            stopPropagation() {}
+        });
+
+        assert.deepStrictEqual(state.selectedCells, [
+            { rowIdx: 0, colIdx: 0, rowId: 7, value: 'a' }
+        ]);
+        assert.strictEqual(cells[0].tabIndex, -1);
+        assert.strictEqual(cells[1].tabIndex, 0);
+        assert.strictEqual(cells[1].focused, true);
+        assert.strictEqual(prevented, 2);
+
+        state.isGridReloading = true;
+        state.selectedCells = [];
+        keydown({
+            key: ' ',
+            target: cells[1],
+            shiftKey: false,
+            ctrlKey: false,
+            metaKey: false,
+            altKey: false,
+            preventDefault() {},
+            stopPropagation() {}
+        });
+        assert.deepStrictEqual(state.selectedCells, [], 'stale cells must stay inert during reload');
+    });
+
+    it('resizes a column from its keyboard-focusable separator', async () => {
+        const containerListeners = new Map<string, (event: any) => any>();
+        const header = { dataset: { column: 'body' } };
+        const handle: any = {
+            classList: createClassList(['resize-handle']),
+            attributes: {} as Record<string, string>,
+            closest(selector: string) {
+                return selector === '.header-cell' ? header : null;
+            },
+            setAttribute(name: string, value: string) {
+                this.attributes[name] = value;
+            }
+        };
+        const headerCell = { style: {} as Record<string, string> };
+        const dataCell = { style: {} as Record<string, string> };
+        const container = {
+            addEventListener(type: string, listener: (event: any) => any) {
+                containerListeners.set(type, listener);
+            }
+        };
+        (globalThis as any).document = {
+            body: { style: {} },
+            getElementById(id: string) { return id === 'gridContainer' ? container : null; },
+            addEventListener() {},
+            querySelector(selector: string) {
+                if (selector === 'th[data-column="body"]') return headerCell;
+                return null;
+            },
+            querySelectorAll(selector: string) {
+                if (selector === 'th[data-column]') return [{ ...headerCell, dataset: { column: 'body' } }];
+                return selector === '.data-row td.data-cell[data-colidx="0"]' ? [dataCell] : [];
+            }
+        };
+        const { state } = await import(stateModulePath);
+        const { initGridInteraction } = await import(gridEventsModulePath);
+        state.tableColumns = [{ name: 'body', type: 'TEXT' }];
+        state.columnWidths = { body: 120 };
+        initGridInteraction();
+        const keydown = containerListeners.get('keydown');
+        assert.ok(keydown);
+        let prevented = 0;
+
+        keydown({
+            key: 'ArrowRight',
+            shiftKey: false,
+            target: handle,
+            preventDefault() { prevented++; },
+            stopPropagation() {}
+        });
+
+        assert.strictEqual(state.columnWidths.body, 130);
+        assert.strictEqual(headerCell.style.width, '130px');
+        assert.strictEqual(dataCell.style.width, '130px');
+        assert.strictEqual(handle.attributes['aria-valuenow'], '130');
+        assert.strictEqual(prevented, 1);
+    });
+
 });

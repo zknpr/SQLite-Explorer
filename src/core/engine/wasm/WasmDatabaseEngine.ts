@@ -38,11 +38,27 @@ import type {
   CellTextEncoding,
   OversizedCellMetadata,
   DatabaseWriteResult,
-  ColumnDropTableState
+  ColumnDropTableState,
+  StoredCellState
 } from '../../types';
-import { escapeIdentifier, validateSqlType, validateRowId } from '../../sql-utils';
+import {
+  assertUsableSqlIdentifier,
+  escapeIdentifier,
+  escapeMainIdentifier,
+  validateSqlType,
+  validateRowId
+} from '../../sql-utils';
+import {
+  assertColumnNameAvailable,
+  buildCreateTableSql,
+  buildColumnDefaultClause,
+  buildIndexDependencyProbeIndexSql,
+  buildIndexDependencyProbeTableSql,
+  resolveIndexDependencyColumns
+} from '../../schema-ddl';
 import { crypto } from '../../../platform/cryptoShim';
 import { buildSelectQuery, buildCountQuery } from '../../query-builder';
+import { normalizeTablePageOptions } from '../../table-pagination';
 import {
   computeKeysetKey,
   computeKeysetQueryTag,
@@ -53,31 +69,55 @@ import {
 } from '../../keyset-pagination';
 import {
   applyMergePatch,
-  computeJsonPatchUndo,
   parseJsonValueForPatching,
+  planJsonPatchHistoryReplay,
   prepareCellUpdateForStorage
 } from '../../json-utils';
+import {
+  assertStoredCellState,
+  buildStoredCellPredicate,
+  buildStoredCellStateProjection,
+  buildStoredCellWrite,
+  CellHistoryConflictError,
+  LegacyCellHistoryError,
+  parseStoredCellState,
+  storedCellStatesEqual
+} from '../../cell-history';
+import {
+  buildRowHistoryPredicate,
+  buildRowHistoryWrites,
+  LegacyRowHistoryError,
+  RowHistoryConflictError,
+  rowHistoryStates
+} from '../../row-history';
 import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
   collectRowIdExactRealTexts,
   hasUnsafeBigIntAtColumn,
   normalizeIntegerRowsForTransport,
+  parseRowIdAliasColumn,
+  ROWID_ALIAS_COLUMN_SQL,
+  sqliteIdentifiersEqual,
+  TABLE_XINFO_WITH_ROWID_ALIAS_SQL,
   ROWID_TABLE_AUTHORITY_SQL
 } from '../../integer-utils';
 import {
   buildByteFaithfulPrimaryKeyProjection,
   buildCellContainmentQuery,
+  containUnrepresentableTextCells,
   decodeRawTextColumns,
   decodeCellContainment,
   encodeByteFaithfulPrimaryKeyRecordId,
   findUnrepresentableTextRows,
   mergeCellContainmentMetadataRows,
   prependCellContainmentColumn,
+  remapShadowedRowIdContainment,
   SQLITE_MAX_RESULT_COLUMNS,
   remapPrimaryKeyContainment
 } from '../../cell-containment';
 import { getNodeFs } from '../../platform/fs';
+import { writeDatabaseSnapshotAtomically } from '../../../atomicDatabaseWrite';
 import {
   buildCappedCountProbeSql,
   buildCountUpperBoundSql,
@@ -90,17 +130,26 @@ import {
 } from '../../paged-count';
 import {
   assertMutableRecordId,
+  assertNoApplicableUpdateTriggerTargetWrites,
+  assertNoUntrackedMutationPrograms,
+  assertUniqueCellUpdateTargets,
+  buildDeleteTriggerProbeSql,
+  buildInsertTriggerProbeSql,
   buildRecordIdentitiesPredicate,
   buildRecordIdentityPredicateChunks,
   buildRecordIdentityPredicate,
+  buildUpdateTriggerProbeSql,
   buildTableIdentityMap,
   classifyTableIdentity,
   encodePrimaryKeyRecordId,
   isPrimaryKeyRecordId,
+  MAIN_TABLE_ROOT_PAGE_SQL,
+  parseMainTableRootPage,
   primaryKeyColumnsFromTableInfo,
   replacePrimaryKeyRecordIdValues,
   TABLE_IDENTITY_METADATA_SQL,
-  unresolvableTriggeredPrimaryKeyUpdateError
+  unresolvableTriggeredPrimaryKeyUpdateError,
+  unresolvableTriggeredRowIdUpdateError
 } from '../../row-identity';
 import {
   assertDeleteSnapshotFitsUndoBudget,
@@ -114,16 +163,24 @@ import {
   assertViewDefinitionIntent,
   assertViewTriggerSnapshotIsMutationSafe,
   assertViewTriggersCompatibleWithColumns,
+  buildStoredTriggerValidationSql,
   buildCreateViewTriggerSql,
   buildCreateViewSql,
   extractViewColumnListSql,
   extractViewSelectSql,
   escapeMainViewIdentifier,
+  explainIncludesTriggerProgram,
   mapViewTriggerRows,
   VIEW_TRIGGER_SCHEMA_QUERIES,
   normalizeViewDefinitionError,
-  normalizeViewSelectSql
+  normalizeViewSelectSql,
+  qualifyMainTriggerTargetSql
 } from '../../view-utils';
+import {
+  assertNoNewBrokenSchemaDependencies,
+  captureSchemaDependencySnapshot,
+  type SchemaDependencySnapshot
+} from '../../schema-dependency';
 import {
   buildCellChunkQuery,
   buildCellMetadataQuery,
@@ -152,6 +209,7 @@ import {
 import {
   assertNoNewColumnDropForeignKeyViolations,
   assertColumnDropTableStateCurrent,
+  assertTableSchemaStateCurrent,
   buildColumnDropRestorePlan,
   captureColumnDropForeignKeyBaseline,
   columnDropForeignKeyViolationBytes,
@@ -236,11 +294,37 @@ export type WasmEngineLogHandler = (
   ...args: unknown[]
 ) => void;
 
-export type WasmQueryCancellation = AbortSignal | Int32Array;
+export type WasmOperationCancellation = AbortSignal | Int32Array;
+export type WasmQueryCancellation = WasmOperationCancellation;
+
+function cancellationCheck(
+  cancellation?: WasmOperationCancellation
+): Pick<AbortSignal, 'throwIfAborted'> | undefined {
+  if (!cancellation || 'aborted' in cancellation) return cancellation;
+  return {
+    throwIfAborted() {
+      if (cancellation.length > 0 && Atomics.load(cancellation, 0) !== 0) {
+        const error = new Error('Database operation cancelled');
+        error.name = 'AbortError';
+        throw error;
+      }
+    }
+  };
+}
 
 interface ExistingViewForIntent {
   storedSql: CellValue | undefined;
   columnListSql: string | undefined;
+}
+
+interface GuardedCellHistoryEntry {
+  rowId: RecordId;
+  newRowId?: RecordId;
+  columnName: string;
+  newValue?: CellValue;
+  operation?: ModificationEntry['operation'];
+  priorState: StoredCellState;
+  postState: StoredCellState;
 }
 
 /**
@@ -445,11 +529,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     statement.free();
   }
 
-  /** Compile the body in a SELECT-only context and reject trailing statements. */
-  private compileViewSelect(selectSql: string): void {
-    this.compileSingleStatement(`EXPLAIN SELECT * FROM (${selectSql}\n) LIMIT 0`);
-  }
-
   /**
    * Run synchronous SQLite work with a real VM deadline and optional cooperative
    * cancellation. The handler is connection-global, so every registration is
@@ -533,20 +612,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         statement.free();
       }
     }, cancellation);
-  }
-
-  /**
-   * Normalize serialized cell replay operations for old and malformed history.
-   */
-  private normalizeReplayCellOperation(
-    operation: unknown,
-    strict: boolean,
-    context: string
-  ): 'set' | 'json_patch' {
-    if (operation === undefined || operation === null) return 'set';
-    if (operation === 'set' || operation === 'json_patch') return operation;
-    if (strict) throw new Error(`Cannot apply ${context}: unsupported cell operation ${String(operation)}`);
-    return 'set';
   }
 
   /**
@@ -900,8 +965,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * @param _name - Identifier (unused, for interface compatibility)
    * @returns Database binary content
    */
-  async serializeDatabase(): Promise<Uint8Array> {
-    return this.exportDatabaseImage();
+  async serializeDatabase(signal?: AbortSignal): Promise<Uint8Array> {
+    signal?.throwIfAborted();
+    const content = this.exportDatabaseImage();
+    signal?.throwIfAborted();
+    return content;
   }
 
   /** Export a buffer/paged-writable database and normalize the fork's save gate. */
@@ -1074,7 +1142,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     if (modificationType === 'pragma_update') {
       throw new Error('Persistent PRAGMA changes are forward-only history barriers');
     }
-    if (!targetTable) return;
+    if (!targetTable) {
+      throw new Error(`Cannot undo ${modificationType}: missing target table`);
+    }
 
     switch (modificationType) {
       case 'cell_update':
@@ -1098,17 +1168,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         break;
 
       case 'table_create':
-        await this.undoTableCreate(targetTable);
+        await this.undoTableCreate(targetTable, mod);
         break;
 
       case 'view_create':
         if (mod.viewDefAfter) {
           await this.applyViewHistoryState(targetTable, mod.viewDefAfter, null);
         } else {
-          this.logger(
-            'warn',
-            '[WasmDatabaseEngine] Skipping view undo: definition missing from history entry'
-          );
+          throw new Error('Cannot undo view_create: missing view definition');
         }
         break;
 
@@ -1116,10 +1183,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         if (mod.viewDefBefore && mod.viewDefAfter) {
           await this.applyViewHistoryState(targetTable, mod.viewDefAfter, mod.viewDefBefore);
         } else {
-          this.logger(
-            'warn',
-            '[WasmDatabaseEngine] Skipping view undo: definition missing from history entry'
-          );
+          throw new Error('Cannot undo view_edit: missing view definition');
         }
         break;
 
@@ -1127,131 +1191,308 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         if (mod.viewDefBefore) {
           await this.applyViewHistoryState(targetTable, null, mod.viewDefBefore);
         } else {
-          this.logger(
-            'warn',
-            '[WasmDatabaseEngine] Skipping view undo: definition missing from history entry'
-          );
+          throw new Error('Cannot undo view_drop: missing view definition');
         }
         break;
+
+      default:
+        throw new Error(`Cannot undo unsupported modification type: ${String(modificationType)}`);
     }
   }
 
   private async undoCellUpdate(targetTable: string, mod: ModificationEntry): Promise<void> {
-    const {
-      affectedCells,
-      targetRowId,
-      newTargetRowId,
-      targetColumn,
-      priorValue,
-      newValue,
-      operation
-    } = mod;
-    if (affectedCells) {
-      // Forward replay can vacate a key that a later row occupies. Undo batches
-      // containing identity transitions in reverse so the dependent key is
-      // vacated first, while preserving established order for ordinary edits.
-      const hasIdentityTransition = affectedCells.some(cell => (
-        cell.newRowId !== undefined && cell.newRowId !== cell.rowId
-      ));
-      const undoCells = hasIdentityTransition
-        ? [...affectedCells].reverse()
-        : affectedCells;
-      const updates: CellUpdate[] = await Promise.all(
-        undoCells.map(async (cell) => ({
-          rowId: cell.newRowId ?? cell.rowId,
-          column: cell.columnName,
-          value: await this.computeUndoValue(
-            targetTable,
-            cell.newRowId ?? cell.rowId,
-            cell.columnName,
-            cell.priorValue,
-            cell.newValue,
-            cell.operation
-          )
-        }))
-      );
-      await this.updateCellBatch(
-        targetTable,
-        updates,
-        undefined,
-        undefined,
-        HISTORY_REPLAY_EDIT_TOKEN
-      );
-    } else if (targetRowId !== undefined && targetColumn) {
-      await this.updateCell(
-        targetTable,
-        newTargetRowId ?? targetRowId,
-        targetColumn,
-        await this.computeUndoValue(
-          targetTable,
-          newTargetRowId ?? targetRowId,
-          targetColumn,
-          priorValue,
-          newValue,
-          operation
-        ),
-        undefined,
-        undefined,
-        HISTORY_REPLAY_EDIT_TOKEN
-      );
-    }
+    await this.replayCellHistory(targetTable, mod, 'undo');
+  }
+
+  private guardedCellHistoryEntries(mod: ModificationEntry): GuardedCellHistoryEntry[] {
+    const entries = mod.affectedCells ?? (
+      mod.targetRowId !== undefined && mod.targetColumn
+        ? [{
+            rowId: mod.targetRowId,
+            newRowId: mod.newTargetRowId,
+            columnName: mod.targetColumn,
+            newValue: mod.newValue,
+            operation: mod.operation,
+            priorState: mod.priorState,
+            postState: mod.postState
+          }]
+        : []
+    );
+    if (entries.length === 0) throw new LegacyCellHistoryError();
+    return entries.map(entry => {
+      assertStoredCellState(entry.priorState);
+      assertStoredCellState(entry.postState);
+      return { ...entry, priorState: entry.priorState, postState: entry.postState };
+    });
   }
 
   /**
-   * Compute the value to write for one undo cell. JSON-patch entries read the
-   * current cell and surgically restore touched keys when that can be done
-   * exactly; all other cases write the recorded prior value.
+   * Replay one cell-history entry under a single compare-and-swap savepoint.
+   * Reads start after SAVEPOINT and every write matches the exact state read,
+   * so a second connection cannot land between JSON planning and mutation.
    */
-  private async computeUndoValue(
+  private async replayCellHistory(
     table: string,
-    rowId: RecordId,
-    column: string,
-    priorValue: CellValue | undefined,
-    newValue: CellValue | undefined,
-    operation: ModificationEntry['operation']
-  ): Promise<CellValue> {
-    if (operation === 'json_patch') {
-      const currentValue = await this.readCellValue(table, rowId, column);
-      const plan = computeJsonPatchUndo(currentValue, newValue, priorValue);
-      if (plan.kind === 'restore') {
-        return plan.value;
-      }
+    mod: ModificationEntry,
+    direction: 'undo' | 'redo'
+  ): Promise<void> {
+    if (mod.undoPolicy === 'barrier') {
+      throw new Error('Forward-only cell history barriers cannot be replayed');
+    }
+    const cells = this.guardedCellHistoryEntries(mod);
+    const usesPrimaryKey = cells.some(cell => isPrimaryKeyRecordId(cell.rowId));
+    if (usesPrimaryKey && !cells.every(cell => isPrimaryKeyRecordId(cell.rowId))) {
+      throw new Error('Cannot mix rowid and primary-key row identities');
+    }
+    const identity = await this.resolveTableIdentity(table);
+    if (usesPrimaryKey && identity.kind !== 'primaryKey') {
+      throw new Error(`Primary-key identity cannot target rowid table ${table}`);
+    }
+    if (!usesPrimaryKey && identity.kind !== 'rowid') {
+      throw new Error(`Rowid identity cannot target WITHOUT ROWID table ${table}`);
     }
 
-    return priorValue ?? null;
-  }
+    const grouped = new Map<RecordId, GuardedCellHistoryEntry[]>();
+    for (const cell of cells) {
+      const row = grouped.get(cell.rowId) ?? [];
+      if (row.some(existing => sqliteIdentifiersEqual(existing.columnName, cell.columnName))) {
+        throw new Error(`Cell history for ${table} contains the same column more than once`);
+      }
+      row.push(cell);
+      grouped.set(cell.rowId, row);
+    }
+    const groups = [...grouped.entries()];
+    if (
+      direction === 'undo'
+      && cells.some(cell => cell.newRowId !== undefined && cell.newRowId !== cell.rowId)
+    ) {
+      groups.reverse();
+    }
 
-  /** Read the current value of one cell through the table's declared identity. */
-  private async readCellValue(table: string, rowId: RecordId, column: string): Promise<CellValue> {
-    const identity = isPrimaryKeyRecordId(rowId)
-      ? await this.resolveTableIdentity(table)
-      : { kind: 'rowid' } as const;
-    const predicate = buildRecordIdentityPredicate(rowId, identity);
-    const result = await this.executeQuery(
-      `SELECT ${escapeIdentifier(column)} FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
-      predicate.params
-    );
-    return (result[0]?.rows[0]?.[0] ?? null) as CellValue;
+    const savepointName = this.createSavepointName('sp_replay_cell_history');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      await this.assertUpdateHasNoTargetTableTriggerWrites(
+        table,
+        cells.map(cell => cell.columnName),
+        identity.kind === 'rowid'
+      );
+      for (const [originalRowId, rowCells] of groups) {
+        const recordedNewRowIds = new Set(
+          rowCells.map(cell => cell.newRowId ?? cell.rowId)
+        );
+        if (recordedNewRowIds.size !== 1) {
+          throw new Error(`Cell history for ${table} has inconsistent post-update identities`);
+        }
+        const recordedNewRowId = rowCells[0].newRowId ?? originalRowId;
+        const currentRowId = direction === 'undo' ? recordedNewRowId : originalRowId;
+        const targetRowId = direction === 'undo' ? originalRowId : recordedNewRowId;
+        const currentPredicate = buildRecordIdentityPredicate(currentRowId, identity);
+        const projections = rowCells.map(cell => buildStoredCellStateProjection(cell.columnName));
+        const currentResult = this.queryRaw(
+          `SELECT ${projections.join(', ')} FROM ${escapeMainIdentifier(table)} ` +
+          `WHERE ${currentPredicate.sql} LIMIT 2`,
+          currentPredicate.params
+        );
+        if (currentResult.rows.length !== 1) {
+          throw new CellHistoryConflictError(table, rowCells.map(cell => cell.columnName));
+        }
+
+        const currentStates = rowCells.map((cell, index) => parseStoredCellState(
+          currentResult.rows[0][index * 2],
+          currentResult.rows[0][index * 2 + 1],
+          `${table}.${cell.columnName}`,
+          { textEncoding: this.getCellTextEncoding() }
+        ));
+        const targetStates = rowCells.map((cell, index) => {
+          const expected = direction === 'undo' ? cell.postState : cell.priorState;
+          const recordedTarget = direction === 'undo' ? cell.priorState : cell.postState;
+          const current = currentStates[index];
+          if (cell.operation !== 'json_patch') {
+            if (!storedCellStatesEqual(current, expected)) {
+              throw new CellHistoryConflictError(table, [cell.columnName]);
+            }
+            return recordedTarget;
+          }
+          if (current.storageClass !== expected.storageClass || cell.newValue === undefined) {
+            throw new CellHistoryConflictError(table, [cell.columnName]);
+          }
+          const plan = planJsonPatchHistoryReplay(
+            current.value,
+            cell.newValue,
+            cell.priorState.value,
+            cell.postState.value,
+            direction
+          );
+          if (plan.kind === 'conflict') {
+            throw new CellHistoryConflictError(table, [cell.columnName]);
+          }
+          return Object.is(plan.value, recordedTarget.value)
+            ? recordedTarget
+            : parseStoredCellState('text', plan.value, `${table}.${cell.columnName} JSON replay`);
+        });
+
+        const writes = targetStates.map(state => buildStoredCellWrite(state, wasmBindPlaceholder));
+        const guards = currentStates.map((state, index) => buildStoredCellPredicate(
+          rowCells[index].columnName,
+          state,
+          wasmBindPlaceholder
+        ));
+        await this.executeQuery(
+          `UPDATE ${escapeMainIdentifier(table)} SET ` +
+          `${rowCells.map((cell, index) => (
+            `${escapeIdentifier(cell.columnName)} = ${writes[index].sql}`
+          )).join(', ')} WHERE ${currentPredicate.sql} AND ` +
+          guards.map(guard => `(${guard.sql})`).join(' AND '),
+          [
+            ...writes.flatMap(write => write.params),
+            ...currentPredicate.params,
+            ...guards.flatMap(guard => guard.params)
+          ]
+        );
+        if (this.readChangesCount() !== 1) {
+          throw new CellHistoryConflictError(table, rowCells.map(cell => cell.columnName));
+        }
+
+        const targetPredicate = buildRecordIdentityPredicate(targetRowId, identity);
+        const actualResult = this.queryRaw(
+          `SELECT ${projections.join(', ')} FROM ${escapeMainIdentifier(table)} ` +
+          `WHERE ${targetPredicate.sql} LIMIT 2`,
+          targetPredicate.params
+        );
+        if (actualResult.rows.length !== 1) {
+          throw new CellHistoryConflictError(table, rowCells.map(cell => cell.columnName));
+        }
+        const exactTarget = targetStates.every((state, index) => storedCellStatesEqual(
+          state,
+          parseStoredCellState(
+            actualResult.rows[0][index * 2],
+            actualResult.rows[0][index * 2 + 1],
+            `${table}.${rowCells[index].columnName}`,
+            { textEncoding: this.getCellTextEncoding() }
+          )
+        ));
+        if (!exactTarget) {
+          throw new CellHistoryConflictError(table, rowCells.map(cell => cell.columnName));
+        }
+      }
+      await this.executeQuery(`RELEASE ${savepointName}`);
+    } catch (error) {
+      await this.safeRollbackSavepoint(savepointName, 'replayCellHistory');
+      throw error;
+    }
   }
 
   private async undoRowInsert(targetTable: string, mod: ModificationEntry): Promise<void> {
-    const { targetRowId } = mod;
-    // Undo insert = delete row
-    if (targetRowId !== undefined) {
-      await this.deleteRows(targetTable, [targetRowId]);
+    if (!mod.insertedRow || mod.targetRowId === undefined) {
+      throw new LegacyRowHistoryError();
     }
+    if (
+      typeof mod.insertedRow.rowId !== typeof mod.targetRowId ||
+      String(mod.insertedRow.rowId) !== String(mod.targetRowId)
+    ) {
+      throw new LegacyRowHistoryError();
+    }
+    await this.deleteRowHistorySnapshots(targetTable, [mod.insertedRow]);
   }
 
   private async undoRowDelete(targetTable: string, mod: ModificationEntry): Promise<void> {
     const { deletedRows } = mod;
-    // Undo delete = re-insert rows
     if (deletedRows && deletedRows.length > 0) {
-      await this.insertRowBatch(
-        targetTable,
-        deletedRows.map(dr => dr.row),
-        undefined,
-        HISTORY_REPLAY_EDIT_TOKEN
-      );
+      await this.restoreRowHistorySnapshots(targetTable, deletedRows);
+    } else {
+      throw new Error('Cannot undo row_delete: missing deleted row data');
+    }
+  }
+
+  private async deleteRowHistorySnapshots(
+    table: string,
+    snapshots: readonly DeletedRow[]
+  ): Promise<void> {
+    if (snapshots.length === 0) throw new LegacyRowHistoryError();
+    snapshots.forEach(rowHistoryStates);
+    const identity = await this.resolveTableIdentity(table);
+    const savepointName = this.createSavepointName('sp_history_delete_rows');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      await this.assertDeleteHasNoUntrackedPrograms(table);
+      for (const snapshot of snapshots) {
+        const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
+        const rowState = buildRowHistoryPredicate(snapshot, wasmBindPlaceholder);
+        await this.executeQuery(
+          `DELETE FROM ${escapeMainIdentifier(table)} WHERE ` +
+          `(${rowIdentity.sql}) AND (${rowState.sql})`,
+          [...rowIdentity.params, ...rowState.params]
+        );
+        if (this.readChangesCount() !== 1) throw new RowHistoryConflictError(table);
+      }
+      await this.executeQuery(`RELEASE ${savepointName}`);
+    } catch (error) {
+      await this.safeRollbackSavepoint(savepointName, 'deleteRowHistorySnapshots');
+      throw error;
+    }
+  }
+
+  private async restoreRowHistorySnapshots(
+    table: string,
+    snapshots: readonly DeletedRow[]
+  ): Promise<void> {
+    if (snapshots.length === 0) throw new LegacyRowHistoryError();
+    const identity = await this.resolveTableIdentity(table);
+    const prepared = snapshots.map(snapshot => ({
+      snapshot,
+      states: rowHistoryStates(snapshot),
+      writes: buildRowHistoryWrites(snapshot, wasmBindPlaceholder)
+    }));
+    const savepointName = this.createSavepointName('sp_history_restore_rows');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      for (const entry of prepared) {
+        await this.assertInsertHasNoUntrackedPrograms(
+          table,
+          entry.states.map(state => state.column)
+        );
+        const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
+        const existing = this.queryRaw(
+          `SELECT 1 FROM ${escapeMainIdentifier(table)} ` +
+          `WHERE ${rowIdentity.sql} LIMIT 1`,
+          rowIdentity.params
+        );
+        if (existing.rows.length !== 0) throw new RowHistoryConflictError(table);
+      }
+
+      for (const entry of prepared) {
+        const columns = entry.writes.map(item => item.column);
+        const values = entry.writes.map(item => item.write.sql);
+        const params = entry.writes.flatMap(item => item.write.params);
+        if (
+          identity.kind === 'rowid'
+          && !columns.some(column => column.toLowerCase() === 'rowid')
+        ) {
+          columns.unshift('rowid');
+          values.unshift(wasmBindPlaceholder(entry.snapshot.rowId));
+          params.unshift(entry.snapshot.rowId);
+        }
+        await this.executeQuery(
+          `INSERT INTO ${escapeMainIdentifier(table)} ` +
+          `(${columns.map(escapeIdentifier).join(', ')}) VALUES (${values.join(', ')})`,
+          params
+        );
+        if (this.readChangesCount() !== 1) throw new RowHistoryConflictError(table);
+
+        const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
+        const rowState = buildRowHistoryPredicate(entry.snapshot, wasmBindPlaceholder);
+        const verified = this.queryRaw(
+          `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ` +
+          `(${rowIdentity.sql}) AND (${rowState.sql}) LIMIT 2`,
+          [...rowIdentity.params, ...rowState.params]
+        );
+        if (verified.rows.length !== 1) throw new RowHistoryConflictError(table);
+      }
+      await this.executeQuery(`RELEASE ${savepointName}`);
+    } catch (error) {
+      await this.safeRollbackSavepoint(savepointName, 'restoreRowHistorySnapshots');
+      throw error;
     }
   }
 
@@ -1259,7 +1500,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const { targetColumn } = mod;
     // Undo add column = drop column
     if (targetColumn) {
-      await this.deleteColumns(targetTable, [targetColumn]);
+      await this.deleteColumns(
+        targetTable,
+        [targetColumn],
+        undefined,
+        mod.columnAddSnapshot
+      );
+    } else {
+      throw new Error('Cannot undo column_add: missing column name');
     }
   }
 
@@ -1293,7 +1541,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private async undoColumnDrop(targetTable: string, mod: ModificationEntry): Promise<void> {
     const { deletedColumns, columnDropSnapshot } = mod;
     // Undo drop column = add column + restore values
-    if (!deletedColumns || deletedColumns.length === 0) return;
+    if (!deletedColumns || deletedColumns.length === 0) {
+      throw new Error('Cannot undo column_drop: missing deleted column data');
+    }
     if (!columnDropSnapshot) {
       await this.undoLegacyColumnDrop(targetTable, deletedColumns);
       return;
@@ -1326,14 +1576,15 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
     const foreignKeysBefore = await readPragma('foreign_keys');
     const legacyAlterBefore = await readPragma('legacy_alter_table');
-    let transactionStarted = false;
+    const restoreSavepoint = this.createSavepointName('sp_undo_column_drop');
+    let savepointStarted = false;
     let operationError: unknown;
     try {
       if (foreignKeysBefore !== 0) await setPragma('foreign_keys', 0);
       if (legacyAlterBefore !== 1) await setPragma('legacy_alter_table', 1);
 
-      await this.executeQuery('BEGIN TRANSACTION');
-      transactionStarted = true;
+      await this.executeQuery(`SAVEPOINT ${restoreSavepoint}`);
+      savepointStarted = true;
       const foreignKeyBaseline = captureColumnDropForeignKeyBaseline(
         targetTable,
         this.readBoundedColumnDropForeignKeyViolations(targetTable)
@@ -1341,7 +1592,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const current = await this.readColumnDropTableState(targetTable);
       assertColumnDropTableStateCurrent(targetTable, columnDropSnapshot.after, current);
       const collision = await this.executeQuery(
-        'SELECT 1 FROM sqlite_schema WHERE name = ? COLLATE NOCASE LIMIT 1',
+        'SELECT 1 FROM main.sqlite_schema WHERE name = ? COLLATE NOCASE LIMIT 1',
         [stagingTable]
       );
       if ((collision[0]?.rows.length ?? 0) !== 0) {
@@ -1350,11 +1601,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
       let sequenceState: { value: CellValue } | undefined;
       const sequenceCatalog = await this.executeQuery(
-        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_sequence'"
+        "SELECT 1 FROM main.sqlite_schema WHERE type = 'table' AND name = 'sqlite_sequence'"
       );
       if ((sequenceCatalog[0]?.rows.length ?? 0) !== 0) {
         const sequence = await this.executeQuery(
-          'SELECT seq FROM sqlite_sequence WHERE name = ? LIMIT 2',
+          'SELECT seq FROM main.sqlite_sequence WHERE name = ? LIMIT 2',
           [targetTable]
         );
         if ((sequence[0]?.rows.length ?? 0) > 1) {
@@ -1380,9 +1631,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         // RENAME transfers the retired-ID high-water mark to staging, while
         // INSERT...SELECT seeds the recreated table only at max(rowid). Restore
         // the exact pre-rebuild entry after dropping staging removes the old one.
-        await this.executeQuery('DELETE FROM sqlite_sequence WHERE name = ?', [targetTable]);
+        await this.executeQuery('DELETE FROM main.sqlite_sequence WHERE name = ?', [targetTable]);
         await this.executeQuery(
-          'INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)',
+          'INSERT INTO main.sqlite_sequence(name, seq) VALUES (?, ?)',
           [targetTable, sequenceState.value]
         );
       }
@@ -1395,11 +1646,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         foreignKeyBaseline,
         this.readBoundedColumnDropForeignKeyViolations(targetTable)
       );
-      await this.executeQuery('COMMIT');
-      transactionStarted = false;
+      await this.executeQuery(`RELEASE ${restoreSavepoint}`);
+      savepointStarted = false;
     } catch (error) {
       operationError = error;
-      if (transactionStarted) await this.safeRollback('undoColumnDrop');
+      if (savepointStarted) {
+        await this.safeRollbackSavepoint(restoreSavepoint, 'undoColumnDrop');
+      }
     }
 
     let pragmaRestoreError: unknown;
@@ -1423,16 +1676,20 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
   /** Map the current catalog state while the undo transaction holds its schema snapshot. */
   private async readColumnDropTableState(table: string): Promise<ColumnDropTableState> {
-    const [schema, columns, identity] = await Promise.all([
+    const [schema, columns, identity, dataVersionResult] = await Promise.all([
       this.executeQuery(COLUMN_DROP_TABLE_STATE_SQL, [table, table]),
       this.getTableInfo(table),
-      this.resolveTableIdentity(table)
+      this.resolveTableIdentity(table),
+      this.executeQuery('PRAGMA data_version')
     ]);
+    const dataVersion = Number(dataVersionResult[0]?.rows[0]?.[0]);
     return mapColumnDropTableState(
       table,
       columns.map(column => column.identifier),
       identity,
-      schema[0]?.rows ?? []
+      schema[0]?.rows ?? [],
+      columns.filter(column => column.isGenerated).map(column => column.identifier),
+      dataVersion
     );
   }
 
@@ -1463,7 +1720,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         )).join(', ');
         const predicate = buildRecordIdentityPredicate(rowId, identity);
         const sql =
-          `UPDATE ${escapeIdentifier(table)} SET ${setClause} WHERE ${predicate.sql}`;
+          `UPDATE ${escapeMainIdentifier(table)} SET ${setClause} WHERE ${predicate.sql}`;
         let statement = statements.get(sql);
         if (!statement) {
           statement = this.instance.prepare(sql);
@@ -1481,24 +1738,62 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     targetTable: string,
     deletedColumns: NonNullable<ModificationEntry['deletedColumns']>
   ): Promise<void> {
-    await this.executeQuery('BEGIN TRANSACTION');
+    const savepointName = this.createSavepointName('sp_undo_legacy_column_drop');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const addColumnStatements = deletedColumns.map(column => {
         validateSqlType(column.type);
-        return `ALTER TABLE ${escapeIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(column.name)} ${column.type};`;
+        return `ALTER TABLE ${escapeMainIdentifier(targetTable)} ADD COLUMN ${escapeIdentifier(column.name)} ${column.type};`;
       }).join('\n');
       if (addColumnStatements) await this.executeQuery(addColumnStatements);
       await this.restoreDroppedColumnValues(targetTable, deletedColumns, { kind: 'rowid' });
-      await this.executeQuery('COMMIT');
+      await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (error) {
-      await this.safeRollback('undoColumnDrop legacy');
+      await this.safeRollbackSavepoint(savepointName, 'undoColumnDrop legacy');
       throw error;
     }
   }
 
-  private async undoTableCreate(targetTable: string): Promise<void> {
-    // Undo create table = drop table
-    await this.executeQuery(`DROP TABLE IF EXISTS ${escapeIdentifier(targetTable)}`);
+  private async undoTableCreate(
+    targetTable: string,
+    mod: ModificationEntry
+  ): Promise<void> {
+    if (!mod.tableCreateSnapshot) {
+      throw new Error(
+        `Cannot undo table creation on ${targetTable}: history lacks the required schema snapshot`
+      );
+    }
+
+    const savepointName = this.createSavepointName('sp_undo_table_create');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      const dependenciesBefore = await this.captureViewDependencySnapshot();
+      const current = await this.readColumnDropTableState(targetTable);
+      assertTableSchemaStateCurrent(
+        targetTable,
+        mod.tableCreateSnapshot,
+        current,
+        'undo table creation',
+        'after the table was created'
+      );
+      const rows = await this.executeQuery(
+        `SELECT 1 FROM ${escapeMainIdentifier(targetTable)} LIMIT 1`
+      );
+      if ((rows[0]?.rows.length ?? 0) !== 0) {
+        throw new Error(
+          `Cannot undo table creation on ${targetTable}: the table contains data`
+        );
+      }
+      await this.executeQuery(`DROP TABLE ${escapeMainIdentifier(targetTable)}`);
+      assertNoNewBrokenSchemaDependencies(
+        dependenciesBefore,
+        await this.captureViewDependencySnapshot()
+      );
+      await this.executeQuery(`RELEASE ${savepointName}`);
+    } catch (error) {
+      await this.safeRollbackSavepoint(savepointName, 'undoTableCreate');
+      throw error;
+    }
   }
 
   /**
@@ -1513,7 +1808,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * ModificationEntry fields keep one interpretation across web and desktop.
    */
   private async forwardApply(mod: ModificationEntry, strict: boolean): Promise<void> {
-    const { modificationType, targetTable, targetRowId, targetColumn, newValue, operation, affectedCells, affectedRowIds, rowData, tableDef, columnDef, deletedColumns, droppedIndexes } = mod;
+    const { modificationType, targetTable, targetRowId, targetColumn, newValue, operation, affectedCells, tableDef, columnDef, deletedColumns, droppedIndexes } = mod;
     if (modificationType === 'pragma_update') {
       if (!mod.targetPragma || newValue === undefined) {
         throw new Error('Cannot apply pragma_update: missing PRAGMA name or new value');
@@ -1528,79 +1823,48 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
     switch (modificationType) {
         case 'cell_update':
-            if (affectedCells) {
-                // Batch cell updates preserve the original per-cell order and values.
-                const updates = affectedCells.map(cell => ({
-                    rowId: cell.rowId,
-                    column: cell.columnName,
-                    value: cell.newValue ?? null,
-                    operation: this.normalizeReplayCellOperation(cell.operation, strict, 'cell_update')
-                }));
-                await this.updateCellBatch(
-                  targetTable,
-                  updates,
-                  undefined,
-                  undefined,
-                  HISTORY_REPLAY_EDIT_TOKEN
-                );
-            } else if (targetRowId !== undefined && targetColumn) {
-                const replayOperation = this.normalizeReplayCellOperation(operation, strict, 'cell_update');
-                if (replayOperation === 'json_patch') {
-                    const patch = typeof newValue === 'string' ? newValue : JSON.stringify(newValue ?? null);
-                    await this.updateCell(
-                      targetTable,
-                      targetRowId,
-                      targetColumn,
-                      null,
-                      patch,
-                      undefined,
-                      HISTORY_REPLAY_EDIT_TOKEN
-                    );
-                } else {
-                    await this.updateCell(
-                      targetTable,
-                      targetRowId,
-                      targetColumn,
-                      newValue ?? null,
-                      undefined,
-                      undefined,
-                      HISTORY_REPLAY_EDIT_TOKEN
-                    );
-                }
-            } else if (strict) {
-                throw new Error('Cannot apply cell_update: missing target cell or affected cells');
+            if (mod.undoPolicy === 'barrier') {
+              if (!strict || targetRowId === undefined || !targetColumn) {
+                throw new Error('Forward-only cell history barriers cannot be replayed by redo');
+              }
+              await this.updateCell(
+                targetTable,
+                targetRowId,
+                targetColumn,
+                newValue ?? null,
+                undefined,
+                undefined,
+                HISTORY_REPLAY_EDIT_TOKEN
+              );
+              break;
             }
+            await this.replayCellHistory(targetTable, mod, 'redo');
             break;
 
         case 'row_insert':
-            if (rowData) {
-                // If the history captured a rowid, include it so restored rows
-                // keep the same identity they had before shutdown.
-                const dataToInsert = targetRowId !== undefined && !isPrimaryKeyRecordId(targetRowId)
-                    ? { ...rowData, rowid: targetRowId }
-                    : rowData;
-                await this.insertRow(
-                  targetTable,
-                  dataToInsert,
-                  undefined,
-                  HISTORY_REPLAY_EDIT_TOKEN
-                );
-            } else if (strict) {
-                throw new Error('Cannot apply row_insert: missing row data');
-            }
+            if (!mod.insertedRow) throw new LegacyRowHistoryError();
+            await this.restoreRowHistorySnapshots(targetTable, [mod.insertedRow]);
             break;
 
         case 'row_delete':
-            if (affectedRowIds) {
-                await this.deleteRows(targetTable, affectedRowIds);
-            } else if (strict) {
-                throw new Error('Cannot apply row_delete: missing affected row ids');
+            if (!mod.deletedRows || mod.deletedRows.length === 0) {
+              throw new LegacyRowHistoryError();
             }
+            await this.deleteRowHistorySnapshots(targetTable, mod.deletedRows);
             break;
 
         case 'column_add':
             if (targetColumn && columnDef) {
-                await this.addColumn(targetTable, targetColumn, columnDef.type, columnDef.defaultValue);
+                if (!mod.columnAddBeforeSnapshot) {
+                  throw new Error('Cannot redo column addition: pre-add schema snapshot is unavailable');
+                }
+                await this.addColumn(
+                  targetTable,
+                  targetColumn,
+                  columnDef.type,
+                  columnDef.defaultValue,
+                  mod.columnAddBeforeSnapshot
+                );
             } else if (strict) {
                 throw new Error('Cannot apply column_add: missing column definition');
             }
@@ -1609,7 +1873,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         case 'column_drop':
             if (deletedColumns) {
                 const colNames = deletedColumns.map(c => c.name);
-                await this.deleteColumns(targetTable, colNames, droppedIndexes ?? undefined);
+                await this.deleteColumns(
+                  targetTable,
+                  colNames,
+                  droppedIndexes ?? undefined,
+                  mod.columnDropSnapshot?.before
+                );
             } else if (strict) {
                 throw new Error('Cannot apply column_drop: missing deleted column data');
             }
@@ -1678,7 +1947,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * Redo a modification.
    */
   async redoModification(mod: ModificationEntry): Promise<void> {
-    await this.forwardApply(mod, false);
+    await this.forwardApply(mod, true);
   }
 
   /**
@@ -1695,11 +1964,103 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    */
   async discardModifications(
     mods: ModificationEntry[],
-    _signal?: AbortSignal
+    signal?: AbortSignal
   ): Promise<void> {
-    // Apply undos in reverse order (LIFO)
-    for (let i = mods.length - 1; i >= 0; i--) {
-        await this.undoModification(mods[i]);
+    await this.revertModifications(mods, [], signal);
+  }
+
+  async revertModifications(
+    discard: ModificationEntry[],
+    restore: ModificationEntry[],
+    signal?: AbortSignal
+  ): Promise<void> {
+    signal?.throwIfAborted();
+    const needsColumnRestorePragmas = discard.some(
+      modification => modification.modificationType === 'column_drop'
+    );
+    const readBooleanPragma = async (
+      pragma: 'foreign_keys' | 'legacy_alter_table'
+    ): Promise<number> => {
+      const value = Number((await this.executeQuery(`PRAGMA ${pragma}`))[0]?.rows[0]?.[0]);
+      if (value !== 0 && value !== 1) {
+        throw new Error(`SQLite returned an invalid ${pragma} value`);
+      }
+      return value;
+    };
+    const setBooleanPragma = async (
+      pragma: 'foreign_keys' | 'legacy_alter_table',
+      value: number
+    ): Promise<void> => {
+      await this.executeQuery(`PRAGMA ${pragma} = ${value ? 'ON' : 'OFF'}`);
+      if (await readBooleanPragma(pragma) !== value) {
+        throw new Error(`Unable to set PRAGMA ${pragma} for atomic history replay`);
+      }
+    };
+
+    const foreignKeysBefore = needsColumnRestorePragmas
+      ? await readBooleanPragma('foreign_keys')
+      : 0;
+    const legacyAlterBefore = needsColumnRestorePragmas
+      ? await readBooleanPragma('legacy_alter_table')
+      : 1;
+    let pragmasPrepared = false;
+    let operationError: unknown;
+    const savepointName = this.createSavepointName('sp_revert_checkpoint');
+    let savepointStarted = false;
+    try {
+      pragmasPrepared = true;
+      if (needsColumnRestorePragmas) {
+        if (foreignKeysBefore !== 0) await setBooleanPragma('foreign_keys', 0);
+        if (legacyAlterBefore !== 1) await setBooleanPragma('legacy_alter_table', 1);
+      }
+      await this.executeQuery(`SAVEPOINT ${savepointName}`);
+      savepointStarted = true;
+      for (let index = discard.length - 1; index >= 0; index--) {
+        signal?.throwIfAborted();
+        await this.undoModification(discard[index]);
+      }
+      for (const modification of restore) {
+        signal?.throwIfAborted();
+        await this.forwardApply(modification, true);
+      }
+      signal?.throwIfAborted();
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      savepointStarted = false;
+    } catch (error) {
+      operationError = error;
+      if (savepointStarted) {
+        await this.safeRollbackSavepoint(savepointName, 'revertModifications');
+      }
+    }
+
+    let pragmaRestoreError: unknown;
+    if (pragmasPrepared && needsColumnRestorePragmas) {
+      try {
+        if (legacyAlterBefore !== 1) {
+          await setBooleanPragma('legacy_alter_table', legacyAlterBefore);
+        }
+        if (foreignKeysBefore !== 0) {
+          await setBooleanPragma('foreign_keys', foreignKeysBefore);
+        }
+      } catch (error) {
+        pragmaRestoreError = error;
+      }
+    }
+    if (operationError !== undefined) {
+      if (pragmaRestoreError !== undefined) {
+        throw new AggregateError(
+          [operationError, pragmaRestoreError],
+          'Atomic history replay failed and connection PRAGMAs could not be restored'
+        );
+      }
+      throw operationError;
+    }
+    if (pragmaRestoreError !== undefined) {
+      this.logger(
+        'warn',
+        'History replay committed, but connection PRAGMAs could not be restored:',
+        pragmaRestoreError
+      );
     }
   }
 
@@ -1738,61 +2099,70 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
     // Validate rowId is a number
     const rowIdNum = validateRowId(rowId);
+    const identity = await this.resolveTableIdentity(table);
+    if (identity.kind !== 'rowid') {
+      throw new Error(`Rowid identity cannot target WITHOUT ROWID table ${table}`);
+    }
+    const savepointName = this.createSavepointName('sp_update_rowid_cell');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
 
-    let sql: string;
-    let params: CellValue[];
+    try {
+      const rowIdAliasColumn = await this.readRowIdAliasColumn(table);
+      await this.assertUpdateHasNoTargetTableTriggerWrites(table, [column]);
+      let sql: string;
+      let params: CellValue[];
 
-    if (patch) {
+      if (patch) {
         const escapedCol = escapeIdentifier(column);
-        const escapedTbl = escapeIdentifier(table);
+        const escapedTbl = escapeMainIdentifier(table);
 
         if (this.hasJsonPatch) {
-            // Use SQLite's native json_patch() — single UPDATE, no SELECT round-trip.
-            // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL per SQL semantics,
-            // but the expected behavior is to treat NULL as empty object (matching JS fallback).
-            sql =
-              `UPDATE ${escapedTbl} SET ${escapedCol} = ` +
-              `json_patch(COALESCE(${escapedCol}, '{}'), ?) WHERE rowid = ?` +
-              (enforcePriorPolicy
-                ? ` AND NOT (typeof(${escapedCol}) IN ('text', 'blob') ` +
-                  `AND length(CAST(${escapedCol} AS BLOB)) > ?)`
-                : '');
-            params = enforcePriorPolicy
-              ? [
-                  typeof patch === 'string' ? patch : JSON.stringify(patch),
-                  rowIdNum,
-                  editLimitBytes
-                ]
-              : [typeof patch === 'string' ? patch : JSON.stringify(patch), rowIdNum];
-        } else {
-            // Fallback: read current value, apply patch in JS, write back
-            if (enforcePriorPolicy) {
-              await this.assertCellPriorWithinEditLimit(
-                table,
+          // Use SQLite's native json_patch() — single UPDATE, no SELECT round-trip.
+          // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL per SQL semantics,
+          // but the expected behavior is to treat NULL as empty object (matching JS fallback).
+          sql =
+            `UPDATE ${escapedTbl} SET ${escapedCol} = ` +
+            `json_patch(COALESCE(${escapedCol}, '{}'), ?) WHERE rowid = ?` +
+            (enforcePriorPolicy
+              ? ` AND NOT (typeof(${escapedCol}) IN ('text', 'blob') ` +
+                `AND length(CAST(${escapedCol} AS BLOB)) > ?)`
+              : '');
+          params = enforcePriorPolicy
+            ? [
+                typeof patch === 'string' ? patch : JSON.stringify(patch),
                 rowIdNum,
-                column,
                 editLimitBytes
-              );
-            }
-            const currentResult = await this.executeQuery(
-              `SELECT ${escapedCol} FROM ${escapedTbl} WHERE rowid = ?`,
-              [rowIdNum]
+              ]
+            : [typeof patch === 'string' ? patch : JSON.stringify(patch), rowIdNum];
+        } else {
+          // Fallback: read current value, apply patch in JS, write back
+          if (enforcePriorPolicy) {
+            await this.assertCellPriorWithinEditLimit(
+              table,
+              rowIdNum,
+              column,
+              editLimitBytes
             );
-            let currentValue = currentResult[0]?.rows[0]?.[0];
+          }
+          const currentResult = await this.executeQuery(
+            `SELECT ${escapedCol} FROM ${escapedTbl} WHERE rowid = ?`,
+            [rowIdNum]
+          );
+          const currentValue = currentResult[0]?.rows[0]?.[0];
 
-            const currentObj = parseJsonValueForPatching(currentValue, 'updateCell');
+          const currentObj = parseJsonValueForPatching(currentValue, 'updateCell');
 
-            const patchObj = typeof patch === 'string' ? JSON.parse(patch) : patch;
-            const newValueObj = applyMergePatch(currentObj, patchObj);
-            const newValueStr = JSON.stringify(newValueObj);
+          const patchObj = typeof patch === 'string' ? JSON.parse(patch) : patch;
+          const newValueObj = applyMergePatch(currentObj, patchObj);
+          const newValueStr = JSON.stringify(newValueObj);
 
-            sql = `UPDATE ${escapedTbl} SET ${escapedCol} = ? WHERE rowid = ?`;
-            params = [newValueStr, rowIdNum];
+          sql = `UPDATE ${escapedTbl} SET ${escapedCol} = ? WHERE rowid = ?`;
+          params = [newValueStr, rowIdNum];
         }
-    } else {
+      } else {
         const escapedColumn = escapeIdentifier(column);
         sql =
-          `UPDATE ${escapeIdentifier(table)} SET ${escapedColumn} = ` +
+          `UPDATE ${escapeMainIdentifier(table)} SET ${escapedColumn} = ` +
           `${wasmBindPlaceholder(value)} WHERE rowid = ?` +
           (enforcePriorPolicy
             ? ` AND NOT (typeof(${escapedColumn}) IN ('text', 'blob') ` +
@@ -1801,14 +2171,32 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         params = enforcePriorPolicy
           ? [value, rowIdNum, editLimitBytes]
           : [value, rowIdNum];
-    }
+      }
 
-    await this.executeQuery(sql, params);
-    if (enforcePriorPolicy && this.readChangesCount() !== 1) {
-      await this.assertCellPriorWithinEditLimit(table, rowIdNum, column, editLimitBytes);
-      throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+      await this.executeQuery(sql, params);
+      const changes = this.readChangesCount();
+      if (changes !== 1) {
+        if (enforcePriorPolicy) {
+          await this.assertCellPriorWithinEditLimit(table, rowIdNum, column, editLimitBytes);
+        }
+        if (changes > 1) {
+          throw new Error(`Cell ${table}.${column} matched more than one row`);
+        }
+        throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+      }
+      const newRowId = this.readUpdatedRowId(
+        table,
+        rowIdAliasColumn,
+        rowIdNum,
+        column,
+        patch ?? value
+      );
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return newRowId;
+    } catch (error) {
+      await this.safeRollbackSavepoint(savepointName, 'updateCell');
+      throw error;
     }
-    return rowIdNum;
   }
 
   async replaceOversizedCell(
@@ -1825,7 +2213,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     assertMutableRecordId(rowId);
     const identity = await this.resolveTableIdentity(table);
     const predicate = buildRecordIdentityPredicate(rowId, identity);
-    const escapedTable = escapeIdentifier(table);
+    const escapedTable = escapeMainIdentifier(table);
     const escapedColumn = escapeIdentifier(column);
     const guardedSql =
       `UPDATE ${escapedTable} SET ${escapedColumn} = ${wasmBindPlaceholder(value)} ` +
@@ -1843,7 +2231,15 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       if (this.readChangesCount() !== 1) {
         throw new Error(OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE);
       }
-      if (identity.kind === 'rowid') return validateRowId(rowId);
+      if (identity.kind === 'rowid') {
+        return this.readUpdatedRowId(
+          table,
+          await this.readRowIdAliasColumn(table),
+          validateRowId(rowId),
+          column,
+          value
+        );
+      }
 
       const keyIndex = identity.columns.findIndex(key => key.identifier === column);
       const candidateId = replacePrimaryKeyRecordIdValues(
@@ -1859,11 +2255,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       );
     };
 
-    if (identity.kind === 'rowid') return updateAndResolveIdentity();
-
     const savepointName = this.createSavepointName('sp_replace_oversized_cell');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
+      await this.assertUpdateHasNoTargetTableTriggerWrites(
+        table,
+        [column],
+        identity.kind === 'rowid'
+      );
       const newRowId = await updateAndResolveIdentity();
       await this.executeQuery(`RELEASE ${savepointName}`);
       return newRowId;
@@ -1882,6 +2281,44 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     maxEditValueBytes?: number,
     historyReplayToken?: typeof HISTORY_REPLAY_EDIT_TOKEN
   ): Promise<RecordId | undefined> {
+    const result = await this.insertRowInternal(
+      table,
+      data,
+      maxEditValueBytes,
+      historyReplayToken,
+      false
+    );
+    return typeof result === 'object' ? result.rowId : result;
+  }
+
+  async insertRowWithHistory(
+    table: string,
+    data: Record<string, CellValue>,
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow> {
+    const result = await this.insertRowInternal(
+      table,
+      data,
+      maxEditValueBytes,
+      undefined,
+      true,
+      maxUndoSnapshotBytes
+    );
+    if (!result || typeof result !== 'object') {
+      throw new Error(`Insert into ${table} did not capture guarded row history`);
+    }
+    return result;
+  }
+
+  private async insertRowInternal(
+    table: string,
+    data: Record<string, CellValue>,
+    maxEditValueBytes: number | undefined,
+    historyReplayToken: typeof HISTORY_REPLAY_EDIT_TOKEN | undefined,
+    captureHistory: boolean,
+    maxUndoSnapshotBytes?: number
+  ): Promise<RecordId | DeletedRow | undefined> {
     if (historyReplayToken !== HISTORY_REPLAY_EDIT_TOKEN) {
       assertCellValuesWithinEditLimit(Object.values(data), maxEditValueBytes);
     }
@@ -1891,18 +2328,19 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     let params: CellValue[] = [];
 
     if (columns.length === 0) {
-      sql = `INSERT INTO ${escapeIdentifier(table)} DEFAULT VALUES`;
+      sql = `INSERT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`;
     } else {
       const colNames = columns.map(escapeIdentifier).join(', ');
       params = columns.map(col => data[col]);
       const placeholders = params.map(wasmBindPlaceholder).join(', ');
-      sql = `INSERT INTO ${escapeIdentifier(table)} (${colNames}) VALUES (${placeholders})`;
+      sql = `INSERT INTO ${escapeMainIdentifier(table)} (${colNames}) VALUES (${placeholders})`;
     }
 
     if (identity.kind === 'primaryKey') {
       const savepointName = this.createSavepointName('sp_insert_pk_row');
       await this.executeQuery(`SAVEPOINT ${savepointName}`);
       try {
+        await this.assertInsertHasNoUntrackedPrograms(table, columns);
         const returningSql =
           `${sql} RETURNING ${buildByteFaithfulPrimaryKeyProjection(identity)}`;
         const result = this.queryRaw(returningSql, params);
@@ -1920,22 +2358,48 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           identity,
           buildRecordIdentityPredicate(candidateId, identity)
         );
+        const history = captureHistory
+          ? await this.captureInsertedRowHistory(table, identity, rowId, maxUndoSnapshotBytes)
+          : undefined;
         await this.executeQuery(`RELEASE ${savepointName}`);
-        return rowId;
+        return history ?? rowId;
       } catch (error) {
         await this.safeRollbackSavepoint(savepointName, 'insertPrimaryKeyRow');
         throw error;
       }
     }
 
-    await this.executeQuery(sql, params);
-
-    // Get last insert rowid
-    const result = await this.executeQuery('SELECT last_insert_rowid() as id');
-    if (result && result.length > 0 && result[0].rows.length > 0) {
-      return result[0].rows[0][0] as RecordId;
+    const savepointName = this.createSavepointName('sp_insert_rowid_row');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      await this.assertInsertHasNoUntrackedPrograms(table, columns);
+      await this.executeQuery(sql, params);
+      if (this.readChangesCount() !== 1) {
+        throw new Error(`Insert into ${table} did not create exactly one row`);
+      }
+      const rawRowId = this.queryRaw(
+        'SELECT CAST(last_insert_rowid() AS TEXT)'
+      ).rows[0]?.[0];
+      const rowId = validateRowId(rawRowId as RecordId | bigint);
+      const predicate = buildRecordIdentityPredicate(rowId, identity);
+      const current = this.queryRaw(
+        `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
+        predicate.params
+      );
+      if (current.rows.length !== 1) {
+        throw new Error(
+          `Insert into ${table} did not leave one addressable row; the insert was rolled back`
+        );
+      }
+      const history = captureHistory
+        ? await this.captureInsertedRowHistory(table, identity, rowId, maxUndoSnapshotBytes)
+        : undefined;
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return history ?? rowId;
+    } catch (error) {
+      await this.safeRollbackSavepoint(savepointName, 'insertRowIdRow');
+      throw error;
     }
-    return undefined;
   }
 
   /**
@@ -1955,13 +2419,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       );
     }
 
-    const escapedTable = escapeIdentifier(table);
+    const escapedTable = escapeMainIdentifier(table);
     const statements = new Map<string, WasmPreparedStatement>();
     let operationFailed = false;
     let operationError: unknown;
     let failedStatement: WasmPreparedStatement | undefined;
 
-    await this.executeQuery('BEGIN TRANSACTION');
+    const savepointName = this.createSavepointName('sp_insert_row_batch');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       for (const row of rows) {
         const columns = Object.keys(row);
@@ -1970,6 +2435,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const key = `${columns.join('\0')}\0\0${placeholders.join('\0')}`;
         let statement = statements.get(key);
         if (!statement) {
+          await this.assertInsertHasNoUntrackedPrograms(table, columns);
           const sql = columns.length === 0
             ? `INSERT INTO ${escapedTable} DEFAULT VALUES`
             : `INSERT INTO ${escapedTable} (${columns.map(escapeIdentifier).join(', ')}) ` +
@@ -2023,16 +2489,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           'Multiple batch insert statements failed to finalize'
         );
       }
-      await this.safeRollback('insertRowBatch');
+      await this.safeRollbackSavepoint(savepointName, 'insertRowBatch');
       throw errorToThrow;
     }
 
     try {
       // Finalize every statement before committing so cleanup failures still
       // roll back the batch instead of surfacing after durable side effects.
-      await this.executeQuery('COMMIT');
+      await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (error) {
-      await this.safeRollback('insertRowBatch');
+      await this.safeRollbackSavepoint(savepointName, 'insertRowBatch');
       throw error;
     }
   }
@@ -2047,12 +2513,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   ): Promise<DeletedRow[]> {
     rowIds.forEach(assertMutableRecordId);
     if (rowIds.length === 0) return [];
+    const identity = await this.resolveTableIdentity(table);
 
     if (rowIds.some(isPrimaryKeyRecordId)) {
       if (!rowIds.every(isPrimaryKeyRecordId)) {
         throw new Error('Cannot mix rowid and primary-key row identities');
       }
-      const identity = await this.resolveTableIdentity(table);
       if (identity.kind !== 'primaryKey') {
         throw new Error(`Primary-key identity cannot target rowid table ${table}`);
       }
@@ -2060,6 +2526,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const savepointName = this.createSavepointName('sp_delete_pk_rows');
       await this.executeQuery(`SAVEPOINT ${savepointName}`);
       try {
+        await this.assertDeleteHasNoUntrackedPrograms(table);
         const insertableColumns = await this.getInsertableColumnNames(table);
         if (maxUndoSnapshotBytes !== undefined) {
           this.assertDeleteSnapshotWithinBudget(
@@ -2074,24 +2541,40 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const deletedRows: DeletedRow[] = [];
         for (const predicate of predicates) {
           const current = this.queryRaw(
-            `SELECT ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
-            `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+            `SELECT ${insertableColumns.map(buildStoredCellStateProjection).join(', ')} ` +
+            `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
             predicate.params
           );
           const primaryKeyIndices = identity.columns.map(column => {
-            const index = current.headers.indexOf(column.identifier);
+            const index = insertableColumns.indexOf(column.identifier);
             if (index < 0) throw new Error(`Primary-key column missing from ${table}: ${column.identifier}`);
             return index;
           });
           deletedRows.push(...current.rows.map(row => {
+            const states = insertableColumns.map((column, index) => parseStoredCellState(
+              row[index * 2],
+              row[index * 2 + 1],
+              `${table}.${column}`,
+              { textEncoding: this.getCellTextEncoding() }
+            ));
             const deletedRowId = encodePrimaryKeyRecordId(
               identity.columns,
-              primaryKeyIndices.map(index => row[index])
+              primaryKeyIndices.map(index => states[index].value)
             );
-            const rowData = Object.fromEntries(
-              current.headers.map((header, index) => [header, row[index] as CellValue])
-            );
-            return { rowId: deletedRowId, row: rowData };
+            const rowData = Object.fromEntries(insertableColumns.map(
+              (column, index) => [
+                column,
+                states[index].rawTextBytes ?? states[index].value
+              ]
+            ));
+            return {
+              rowId: deletedRowId,
+              row: rowData,
+              storageClasses: insertableColumns.map((column, index) => ({
+                column,
+                storageClass: states[index].storageClass
+              }))
+            };
           }));
         }
         if (deletedRows.length !== rowIds.length) {
@@ -2099,7 +2582,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
         for (const predicate of predicates) {
           await this.executeQuery(
-            `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+            `DELETE FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
             predicate.params
           );
         }
@@ -2111,11 +2594,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
     }
 
+    if (identity.kind !== 'rowid') {
+      throw new Error(`Rowid identity cannot target WITHOUT ROWID table ${table}`);
+    }
+
     // Snapshot and delete rowid rows under one savepoint, matching the PK path.
-    const predicates = buildRecordIdentityPredicateChunks(rowIds, { kind: 'rowid' });
+    const predicates = buildRecordIdentityPredicateChunks(rowIds, identity);
     const savepointName = this.createSavepointName('sp_delete_rowid_rows');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
+      await this.assertDeleteHasNoUntrackedPrograms(table);
       const insertableColumns = await this.getInsertableColumnNames(table);
       if (maxUndoSnapshotBytes !== undefined) {
         this.assertDeleteSnapshotWithinBudget(
@@ -2130,17 +2618,33 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const deletedRows: DeletedRow[] = [];
       for (const predicate of predicates) {
         const current = this.queryRaw(
-          `SELECT CAST(rowid AS TEXT), ${insertableColumns.map(escapeIdentifier).join(', ')} ` +
-          `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+          `SELECT CAST(rowid AS TEXT), ` +
+          `${insertableColumns.map(buildStoredCellStateProjection).join(', ')} ` +
+          `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
           predicate.params
         );
         deletedRows.push(...current.rows.map(row => {
           const rowId = validateRowId(row[0] as RecordId | bigint);
-          const rowData: Record<string, CellValue> = Object.fromEntries(
-            insertableColumns.map((column, index) => [column, row[index + 1] as CellValue])
-          );
-          rowData.rowid = rowId;
-          return { rowId, row: rowData };
+          const states = insertableColumns.map((column, index) => parseStoredCellState(
+            row[index * 2 + 1],
+            row[index * 2 + 2],
+            `${table}.${column}`,
+            { textEncoding: this.getCellTextEncoding() }
+          ));
+          const rowData: Record<string, CellValue> = Object.fromEntries(insertableColumns.map(
+            (column, index) => [
+              column,
+              states[index].rawTextBytes ?? states[index].value
+            ]
+          ));
+          return {
+            rowId,
+            row: rowData,
+            storageClasses: insertableColumns.map((column, index) => ({
+              column,
+              storageClass: states[index].storageClass
+            }))
+          };
         }));
       }
       if (deletedRows.length !== rowIds.length) {
@@ -2148,7 +2652,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
       for (const predicate of predicates) {
         await this.executeQuery(
-          `DELETE FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+          `DELETE FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
           predicate.params
         );
       }
@@ -2168,44 +2672,92 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * @returns Array of index names that reference any of the columns
    */
   async findDependentIndexes(table: string, columns: string[]): Promise<string[]> {
-    const dependentIndexes: string[] = [];
-
-    // Query sqlite_master for indexes on this table
     const indexQuery = `
-      SELECT name, sql FROM sqlite_master
+      SELECT name, sql FROM main.sqlite_master
       WHERE type = 'index'
         AND tbl_name = ?
         AND sql IS NOT NULL
     `;
     const indexResult = await this.executeQuery(indexQuery, [table]);
+    const indexes = (indexResult[0]?.rows ?? []).map(row => ({
+      name: row[0] as string,
+      sql: row[1] as string
+    }));
+    if (indexes.length === 0 || columns.length === 0) return [];
 
-    if (indexResult.length > 0 && indexResult[0].rows) {
-      for (const row of indexResult[0].rows) {
-        const indexName = row[0] as string;
-        const indexSql = row[1] as string;
+    const tableInfo = await this.executeQuery(
+      `PRAGMA main.table_xinfo(${escapeIdentifier(table)})`
+    );
+    const tableColumns = (tableInfo[0]?.rows ?? []).map(row => row[1] as string);
+    const targetColumns = resolveIndexDependencyColumns(tableColumns, columns);
+    if (targetColumns.length === 0) return [];
+    const suffix = crypto.randomUUID().replace(/-/g, '');
+    const probeTable = `__sqlite_explorer_index_probe_${suffix}`;
+    const probeIndex = `__sqlite_explorer_index_candidate_${suffix}`;
+    const savepointName = this.createSavepointName('sp_index_dependencies');
 
-        // Check if this index references any of the columns
-        const referencesColumn = columns.some(col => {
-          // Escape regex metacharacters in column name to prevent broken patterns
-          // for names like "data[0]", "a+b", "user.name"
-          const escaped = col.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          // Match column name in index definition (quoted or unquoted)
-          const patterns = [
-            new RegExp(`[\\(,]\\s*${escaped}\\s*[\\),]`, 'i'),
-            new RegExp(`[\\(,]\\s*"${escaped}"\\s*[\\),]`, 'i'),
-            new RegExp(`[\\(,]\\s*\\[${escaped}\\]\\s*[\\),]`, 'i'),
-            new RegExp(`[\\(,]\\s*\`${escaped}\`\\s*[\\),]`, 'i')
-          ];
-          return patterns.some(p => p.test(indexSql));
-        });
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      await this.executeQuery(
+        buildIndexDependencyProbeTableSql(probeTable, tableColumns)
+      );
+      const baselineSavepoint = this.createSavepointName('sp_index_baseline');
+      await this.executeQuery(`SAVEPOINT ${baselineSavepoint}`);
+      try {
+        for (const column of targetColumns) {
+          await this.executeQuery(
+            `ALTER TABLE temp.${escapeIdentifier(probeTable)} `
+            + `DROP COLUMN ${escapeIdentifier(column)}`
+          );
+        }
+        await this.executeQuery(`ROLLBACK TO ${baselineSavepoint}`);
+        await this.executeQuery(`RELEASE ${baselineSavepoint}`);
+      } catch (error) {
+        await this.safeRollbackSavepoint(baselineSavepoint, 'findDependentIndexBaseline');
+        throw new Error('Cannot establish the index dependency probe baseline', { cause: error });
+      }
 
-        if (referencesColumn) {
-          dependentIndexes.push(indexName);
+      const dependentIndexes: string[] = [];
+      for (const index of indexes) {
+        const candidateSavepoint = this.createSavepointName('sp_index_candidate');
+        await this.executeQuery(`SAVEPOINT ${candidateSavepoint}`);
+        try {
+          await this.executeQuery(buildIndexDependencyProbeIndexSql(
+            probeTable,
+            probeIndex,
+            index.sql
+          ));
+          let isDependent = false;
+          for (const column of targetColumns) {
+            try {
+              await this.executeQuery(
+                `ALTER TABLE temp.${escapeIdentifier(probeTable)} `
+                + `DROP COLUMN ${escapeIdentifier(column)}`
+              );
+            } catch {
+              isDependent = true;
+              break;
+            }
+          }
+          await this.executeQuery(`ROLLBACK TO ${candidateSavepoint}`);
+          await this.executeQuery(`RELEASE ${candidateSavepoint}`);
+          if (isDependent) dependentIndexes.push(index.name);
+        } catch (error) {
+          await this.safeRollbackSavepoint(candidateSavepoint, 'findDependentIndex');
+          throw new Error(
+            `Cannot inspect dependency for index ${escapeIdentifier(index.name)}`,
+            { cause: error }
+          );
         }
       }
-    }
 
-    return dependentIndexes;
+      await this.executeQuery(`ROLLBACK TO ${savepointName}`);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return dependentIndexes;
+    } catch (error) {
+      await this.safeRollbackSavepoint(savepointName, 'findDependentIndexes');
+      throw error;
+    }
   }
 
   /**
@@ -2221,7 +2773,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   async deleteColumns(
     table: string,
     columns: string[],
-    dropDependentIndexes?: string[]
+    dropDependentIndexes?: string[],
+    expectedCurrentState?: ColumnDropTableState
   ): Promise<ColumnDropTableState> {
     if (columns.length === 0) return this.readColumnDropTableState(table);
 
@@ -2230,6 +2783,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const savepointName = this.createSavepointName('sp_delete_columns');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
+      if (expectedCurrentState) {
+        const current = await this.readColumnDropTableState(table);
+        assertTableSchemaStateCurrent(
+          table,
+          expectedCurrentState,
+          current,
+          'apply column deletion history',
+          'since this history entry was recorded'
+        );
+      }
       await executeSchemaPreservingColumnDrop(
         table,
         columns,
@@ -2282,6 +2845,15 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private async resolveTableIdentity(table: string): Promise<TableIdentity> {
     const identity = await this.findTableIdentity(table);
     if (!identity) throw new Error(`Table not found: ${table}`);
+    if (identity.kind === 'rowid') {
+      const authority = await this.executeQuery(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
+      if ((authority[0]?.rows.length ?? 0) !== 1) {
+        throw new Error(
+          `Table ${table} is read-only because a declared "rowid" column ` +
+          `shadows SQLite's intrinsic row identity`
+        );
+      }
+    }
     return identity;
   }
 
@@ -2393,7 +2965,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /** Columns SQLite permits in an INSERT; generated columns have hidden 2/3. */
   private async getInsertableColumnNames(table: string): Promise<string[]> {
     const result = await this.executeQuery(
-      'SELECT name FROM pragma.pragma_table_xinfo(?) ' +
+      "SELECT name FROM pragma.pragma_table_xinfo(?, 'main') " +
       'WHERE hidden NOT IN (2, 3) ORDER BY cid',
       [table]
     );
@@ -2411,7 +2983,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     predicates: ReturnType<typeof buildRecordIdentityPredicateChunks>,
     rowIds: readonly RecordId[],
     includeSyntheticRowId: boolean,
-    maxSnapshotBytes: number
+    maxSnapshotBytes: number,
+    operation: 'Delete' | 'Insert' = 'Delete'
   ): void {
     const valueColumns = deleteSnapshotValueColumns(
       insertableColumns,
@@ -2433,8 +3006,66 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       rowIds,
       rowCount,
       valueBytes,
-      maxSnapshotBytes
+      maxSnapshotBytes,
+      operation
     });
+  }
+
+  private readRowHistorySnapshot(
+    table: string,
+    identity: TableIdentity,
+    rowId: RecordId,
+    insertableColumns: readonly string[]
+  ): DeletedRow {
+    const predicate = buildRecordIdentityPredicate(rowId, identity);
+    const projections = insertableColumns.map(buildStoredCellStateProjection);
+    const result = this.queryRaw(
+      `SELECT ${projections.join(', ')} FROM ${escapeMainIdentifier(table)} ` +
+      `WHERE ${predicate.sql} LIMIT 2`,
+      predicate.params
+    );
+    if (result.rows.length !== 1) throw new RowHistoryConflictError(table);
+    const states = insertableColumns.map((column, index) => parseStoredCellState(
+      result.rows[0][index * 2],
+      result.rows[0][index * 2 + 1],
+      `${table}.${column}`,
+      { textEncoding: this.getCellTextEncoding() }
+    ));
+    const row = Object.fromEntries(insertableColumns.map(
+      (column, index) => [
+        column,
+        states[index].rawTextBytes ?? states[index].value
+      ]
+    ));
+    return {
+      rowId,
+      row,
+      storageClasses: insertableColumns.map((column, index) => ({
+        column,
+        storageClass: states[index].storageClass
+      }))
+    };
+  }
+
+  private async captureInsertedRowHistory(
+    table: string,
+    identity: TableIdentity,
+    rowId: RecordId,
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow> {
+    const insertableColumns = await this.getInsertableColumnNames(table);
+    if (maxUndoSnapshotBytes !== undefined) {
+      this.assertDeleteSnapshotWithinBudget(
+        table,
+        insertableColumns,
+        [buildRecordIdentityPredicate(rowId, identity)],
+        [rowId],
+        identity.kind === 'rowid',
+        maxUndoSnapshotBytes,
+        'Insert'
+      );
+    }
+    return this.readRowHistorySnapshot(table, identity, rowId, insertableColumns);
   }
 
   private readPrimaryKeyRecordId(
@@ -2445,7 +3076,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   ): RecordId {
     const result = this.queryRaw(
       `SELECT ${buildByteFaithfulPrimaryKeyProjection(identity)} ` +
-      `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
+      `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
       predicate.params
     );
     if (result.rows.length === 0) {
@@ -2462,7 +3093,192 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     );
   }
 
+  private async readRowIdAliasColumn(table: string): Promise<string | undefined> {
+    const result = await this.executeQuery(ROWID_ALIAS_COLUMN_SQL, [table]);
+    return parseRowIdAliasColumn(result[0]?.rows ?? [], table);
+  }
+
+  private async assertUpdateHasNoTargetTableTriggerWrites(
+    table: string,
+    columns: readonly string[],
+    hasIntrinsicRowId: boolean = true
+  ): Promise<void> {
+    const rootPageResult = await this.executeQuery(MAIN_TABLE_ROOT_PAGE_SQL, [table]);
+    const rootPage = parseMainTableRootPage(rootPageResult[0]?.rows ?? [], table);
+    const result = await this.executeQuery(
+      buildUpdateTriggerProbeSql(table, columns, hasIntrinsicRowId),
+      hasIntrinsicRowId ? [0] : []
+    );
+    assertNoApplicableUpdateTriggerTargetWrites(
+      table,
+      rootPage,
+      result[0]?.rows ?? [],
+      hasIntrinsicRowId ? 'rowid' : 'primary-key'
+    );
+  }
+
+  private async assertInsertHasNoUntrackedPrograms(
+    table: string,
+    columns: readonly string[]
+  ): Promise<void> {
+    const result = await this.executeQuery(buildInsertTriggerProbeSql(table, columns));
+    assertNoUntrackedMutationPrograms('INSERT', table, result[0]?.rows ?? []);
+  }
+
+  private async assertDeleteHasNoUntrackedPrograms(table: string): Promise<void> {
+    const result = await this.executeQuery(buildDeleteTriggerProbeSql(table));
+    assertNoUntrackedMutationPrograms('DELETE', table, result[0]?.rows ?? []);
+  }
+
+  /** Resolve the post-update rowid while the caller's savepoint is still open. */
+  private readUpdatedRowId(
+    table: string,
+    aliasColumn: string | undefined,
+    previousRowId: RecordId,
+    updatedColumn: string | undefined,
+    updatedValue: CellValue | undefined
+  ): RecordId {
+    const aliasWasUpdated = aliasColumn !== undefined
+      && updatedColumn !== undefined
+      && sqliteIdentifiersEqual(aliasColumn, updatedColumn);
+    const predicateColumn = aliasWasUpdated ? escapeIdentifier(aliasColumn) : 'rowid';
+    const candidate = aliasWasUpdated ? updatedValue : previousRowId;
+    const result = this.queryRaw(
+      `SELECT CAST(rowid AS TEXT) FROM ${escapeMainIdentifier(table)} ` +
+      `WHERE ${predicateColumn} = ? LIMIT 2`,
+      [candidate ?? null]
+    );
+    if (result.rows.length === 0) {
+      throw unresolvableTriggeredRowIdUpdateError(table);
+    }
+    if (result.rows.length !== 1) {
+      throw new Error(`Rowid identity for ${table} matched more than one row`);
+    }
+    return validateRowId(result.rows[0][0] as RecordId);
+  }
+
+  /** Preserve per-cell UPDATE semantics while carrying a changed rowid forward. */
+  private async updateRowIdAliasCellBatchWithinSavepoint(
+    table: string,
+    aliasColumn: string,
+    updates: CellUpdate[],
+    editLimitBytes: number,
+    isHistoryReplay: boolean
+  ): Promise<CellUpdateResult[]> {
+    const updatesByRow = new Map<RecordId, CellUpdate[]>();
+    for (const update of updates) {
+      const rowId = validateRowId(update.rowId);
+      const rowUpdates = updatesByRow.get(rowId) ?? [];
+      rowUpdates.push({ ...update, rowId });
+      updatesByRow.set(rowId, rowUpdates);
+    }
+
+    const results: CellUpdateResult[] = [];
+    for (const [rowId, rowUpdates] of updatesByRow) {
+      const columns = [...new Set(rowUpdates.map(update => update.column))];
+      if (columns.length !== rowUpdates.length) {
+        throw new Error(`Batch update for ${table} contains the same column more than once`);
+      }
+      const current = this.queryRaw(
+        `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+        `FROM ${escapeMainIdentifier(table)} WHERE rowid = ? LIMIT 2`,
+        [rowId]
+      );
+      if (current.rows.length !== 1) {
+        throw new Error(`Cannot update ${table}: row identity no longer exists`);
+      }
+
+      const preparedUpdates = rowUpdates.map((update, index) => {
+        const priorState = parseStoredCellState(
+          current.rows[0][index * 2],
+          current.rows[0][index * 2 + 1],
+          `${table}.${update.column}`,
+          { textEncoding: this.getCellTextEncoding() }
+        );
+        const priorValue = priorState.value;
+        const prepared = prepareCellUpdateForStorage(
+          update.value,
+          priorValue,
+          update.operation ?? 'set'
+        );
+        const storedValue = prepared.operation === 'json_patch'
+          ? this.applyJsonPatchValue(priorValue, prepared.value)
+          : prepared.value;
+        if (!isHistoryReplay && prepared.operation === 'json_patch') {
+          assertCellValueWithinEditLimit(storedValue, editLimitBytes);
+        }
+        return { update, priorValue, priorState, prepared, storedValue };
+      });
+      let newRowId = rowId;
+      for (const preparedUpdate of preparedUpdates) {
+        const escapedColumn = escapeIdentifier(preparedUpdate.update.column);
+        const useNativePatch = preparedUpdate.prepared.operation === 'json_patch'
+          && this.hasJsonPatch;
+        const storedBindValue = useNativePatch
+          ? (typeof preparedUpdate.prepared.value === 'string'
+              ? preparedUpdate.prepared.value
+              : JSON.stringify(preparedUpdate.prepared.value))
+          : preparedUpdate.storedValue;
+        const expression = useNativePatch
+          ? `json_patch(COALESCE(${escapedColumn}, '{}'), ?)`
+          : wasmBindPlaceholder(preparedUpdate.storedValue);
+        await this.executeQuery(
+          `UPDATE ${escapeMainIdentifier(table)} SET ${escapedColumn} = ${expression} ` +
+          'WHERE rowid = ?',
+          [storedBindValue, newRowId]
+        );
+        if (this.readChangesCount() !== 1) {
+          throw new Error(`Cannot update ${table}: row identity no longer exists`);
+        }
+        newRowId = this.readUpdatedRowId(
+          table,
+          aliasColumn,
+          newRowId,
+          preparedUpdate.update.column,
+          preparedUpdate.storedValue
+        );
+      }
+      const post = this.queryRaw(
+        `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+        `FROM ${escapeMainIdentifier(table)} WHERE rowid = ? LIMIT 2`,
+        [newRowId]
+      );
+      if (post.rows.length !== 1) {
+        throw unresolvableTriggeredRowIdUpdateError(table);
+      }
+      for (const [index, preparedUpdate] of preparedUpdates.entries()) {
+        results.push({
+          rowId,
+          newRowId,
+          columnName: preparedUpdate.update.column,
+          priorValue: preparedUpdate.priorValue,
+          newValue: preparedUpdate.prepared.value,
+          priorState: preparedUpdate.priorState,
+          postState: parseStoredCellState(
+            post.rows[0][index * 2],
+            post.rows[0][index * 2 + 1],
+            `${table}.${preparedUpdate.update.column}`,
+            { textEncoding: this.getCellTextEncoding() }
+          ),
+          operation: preparedUpdate.prepared.operation
+        });
+      }
+    }
+    return results;
+  }
+
   private applyJsonPatchValue(currentValue: CellValue, patch: CellValue): string {
+    if (this.hasJsonPatch) {
+      const patchText = typeof patch === 'string' ? patch : JSON.stringify(patch);
+      const value = this.queryRaw(
+        `SELECT json_patch(COALESCE(?, '{}'), ?)`,
+        [currentValue, patchText]
+      ).rows[0]?.[0];
+      if (typeof value !== 'string') {
+        throw new Error('SQLite returned an invalid json_patch result');
+      }
+      return value;
+    }
     const currentObject = parseJsonValueForPatching(currentValue, 'updateCellBatch');
     const patchObject = typeof patch === 'string' ? JSON.parse(patch) : patch;
     return JSON.stringify(applyMergePatch(currentObject, patchObject));
@@ -2486,6 +3302,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const savepointName = this.createSavepointName('sp_update_pk_batch');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
+      await this.assertUpdateHasNoTargetTableTriggerWrites(
+        table,
+        updates.map(update => update.column),
+        false
+      );
       // Metadata-only preflight must run before the established full prior-value
       // SELECT below. Normal bounded edits retain the same SAVEPOINT and update path.
       if (!isHistoryReplay && maxEditValueBytes !== undefined) {
@@ -2506,8 +3327,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           throw new Error(`Batch update for ${table} contains the same column more than once`);
         }
         const current = this.queryRaw(
-          `SELECT ${columns.map(escapeIdentifier).join(', ')} ` +
-          `FROM ${escapeIdentifier(table)} WHERE ${oldPredicate.sql} LIMIT 2`,
+          `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+          `FROM ${escapeMainIdentifier(table)} WHERE ${oldPredicate.sql} LIMIT 2`,
           oldPredicate.params
         );
         if (current.rows.length !== 1) {
@@ -2515,7 +3336,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
 
         const preparedUpdates = rowUpdates.map((update, index) => {
-          const priorValue = current.rows[0][index] as CellValue;
+          const priorState = parseStoredCellState(
+            current.rows[0][index * 2],
+            current.rows[0][index * 2 + 1],
+            `${table}.${update.column}`,
+            { textEncoding: this.getCellTextEncoding() }
+          );
+          const priorValue = priorState.value;
           const prepared = prepareCellUpdateForStorage(
             update.value,
             priorValue,
@@ -2529,19 +3356,22 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             // Validate the result while the row is still protected by the savepoint.
             assertCellValueWithinEditLimit(storedValue, editLimitBytes);
           }
-          return { update, priorValue, prepared, storedValue };
+          return { update, priorValue, priorState, prepared, storedValue };
         });
 
         const setClause = preparedUpdates.map(({ update, storedValue }) => (
           `${escapeIdentifier(update.column)} = ${wasmBindPlaceholder(storedValue)}`
         )).join(', ');
         await this.executeQuery(
-          `UPDATE ${escapeIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
+          `UPDATE ${escapeMainIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
           [
             ...preparedUpdates.map(update => update.storedValue),
             ...oldPredicate.params
           ]
         );
+        if (this.readChangesCount() !== 1) {
+          throw new Error(`Cannot update ${table}: row identity no longer exists`);
+        }
 
         const primaryKeyReplacements: Array<{ column: string; value: CellValue }> = [];
         for (const preparedUpdate of preparedUpdates) {
@@ -2566,13 +3396,29 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           buildRecordIdentityPredicate(candidateId, identity),
           unresolvableTriggeredPrimaryKeyUpdateError(table)
         );
-        for (const preparedUpdate of preparedUpdates) {
+        const newPredicate = buildRecordIdentityPredicate(newRowId, identity);
+        const post = this.queryRaw(
+          `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+          `FROM ${escapeMainIdentifier(table)} WHERE ${newPredicate.sql} LIMIT 2`,
+          newPredicate.params
+        );
+        if (post.rows.length !== 1) {
+          throw unresolvableTriggeredPrimaryKeyUpdateError(table);
+        }
+        for (const [index, preparedUpdate] of preparedUpdates.entries()) {
           results.push({
             rowId,
             newRowId,
             columnName: preparedUpdate.update.column,
             priorValue: preparedUpdate.priorValue,
             newValue: preparedUpdate.prepared.value,
+            priorState: preparedUpdate.priorState,
+            postState: parseStoredCellState(
+              post.rows[0][index * 2],
+              post.rows[0][index * 2 + 1],
+              `${table}.${preparedUpdate.update.column}`,
+              { textEncoding: this.getCellTextEncoding() }
+            ),
             operation: preparedUpdate.prepared.operation
           });
         }
@@ -2589,23 +3435,27 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Create a new table.
    */
-  async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {
-    if (columns.length === 0) throw new Error('At least one column is required');
-
-    const colDefs = columns.map(col => {
-      if (typeof col === 'string') {
-         throw new Error('Legacy string column definitions not supported for security');
-      }
-      // Validate SQL type to prevent injection via malicious type definitions
-      validateSqlType(col.type);
-      let def = `${escapeIdentifier(col.name)} ${col.type}`;
-      if (col.primaryKey) def += ' PRIMARY KEY';
-      if (col.notNull && !col.primaryKey) def += ' NOT NULL';
-      return def;
-    });
-
-    const sql = `CREATE TABLE ${escapeIdentifier(table)} (${colDefs.join(', ')})`;
-    await this.executeQuery(sql);
+  async createTable(
+    table: string,
+    columns: ColumnDefinition[]
+  ): Promise<ColumnDropTableState> {
+    const sql = buildCreateTableSql(table, columns);
+    const savepointName = this.createSavepointName('sp_create_table');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      const dependenciesBefore = await this.captureViewDependencySnapshot();
+      await this.executeQuery(sql);
+      assertNoNewBrokenSchemaDependencies(
+        dependenciesBefore,
+        await this.captureViewDependencySnapshot()
+      );
+      const stateAfter = await this.readColumnDropTableState(table);
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return stateAfter;
+    } catch (error) {
+      await this.safeRollbackSavepoint(savepointName, 'createTable');
+      throw error;
+    }
   }
 
   /** Read a view and every INSTEAD OF trigger SQLite associates with it. */
@@ -2614,7 +3464,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     allowUnparsed: boolean
   ): Promise<ViewDefinition | null> {
     const viewResult = await this.executeQuery(
-      "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+      "SELECT sql FROM main.sqlite_schema WHERE type = 'view' AND name = ?",
       [view]
     );
     const createSql = viewResult[0]?.rows[0]?.[0];
@@ -2627,10 +3477,60 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const result = await this.executeQuery(source.sql, source.params(view));
       triggerRows.push(result[0]?.rows ?? []);
     }
-    const { triggers, ambiguousTemporaryTriggerNames } = mapViewTriggerRows(
+    const {
+      triggers,
+      ambiguousTemporaryTriggerNames,
+      unqualifiedTemporaryTriggers
+    } = mapViewTriggerRows(
       view,
       triggerRows
     );
+    if (unqualifiedTemporaryTriggers.length > 0) {
+      const columnsResult = await this.executeQuery(
+        "SELECT name FROM pragma.pragma_table_xinfo(?, 'main') ORDER BY cid",
+        [view]
+      );
+      const writableColumns = (columnsResult[0]?.rows ?? []).map(row => {
+        if (typeof row[0] !== 'string') {
+          throw new Error(`SQLite returned invalid view column metadata for ${view}`);
+        }
+        return row[0];
+      });
+      for (const trigger of unqualifiedTemporaryTriggers) {
+        // A same-named persistent trigger makes EXPLAIN's program marker
+        // schema-ambiguous even if the DML itself compiles.
+        if (triggers.some(candidate => (
+          !candidate.temporary
+          && sqliteIdentifiersEqual(candidate.identifier, trigger.identifier)
+        ))) {
+          ambiguousTemporaryTriggerNames.push(trigger.identifier);
+          continue;
+        }
+        try {
+          const validationSql = buildStoredTriggerValidationSql(
+            trigger.sql,
+            'main',
+            view,
+            writableColumns
+          );
+          if (validationSql === undefined) {
+            ambiguousTemporaryTriggerNames.push(trigger.identifier);
+            continue;
+          }
+          const probe = await this.executeQuery(validationSql);
+          if (explainIncludesTriggerProgram(probe[0]?.rows ?? [], trigger.identifier)) {
+            triggers.push({
+              ...trigger,
+              sql: qualifyMainTriggerTargetSql(trigger.sql, trigger.identifier)
+            });
+          }
+        } catch {
+          // Failure to compile may be caused by the candidate main trigger or
+          // by another broken program. Either way ownership is not provable.
+          ambiguousTemporaryTriggerNames.push(trigger.identifier);
+        }
+      }
+    }
 
     let selectSql: string;
     let columnListSql: string | undefined;
@@ -2665,13 +3565,30 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     return this.readViewDefinition(view, false);
   }
 
+  /** Snapshot schema validity on this connection and therefore in the caller's savepoint. */
+  private captureViewDependencySnapshot(): Promise<SchemaDependencySnapshot> {
+    return captureSchemaDependencySnapshot({
+      queryRows: async (sql, params) => (
+        (await this.executeQuery(sql, params))[0]?.rows ?? []
+      ),
+      compileStatements: async statements => statements.map(sql => {
+        try {
+          this.compileSingleStatement(sql);
+          return undefined;
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
+      })
+    });
+  }
+
   /** Resolve the installed view state once so validate and preview enforce identical intent rules. */
   private async resolveExistingViewForIntent(
     view: string,
     intent: ViewDefinitionIntent
   ): Promise<ExistingViewForIntent> {
     const result = await this.executeQuery(
-      "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+      "SELECT sql FROM main.sqlite_schema WHERE type = 'view' AND name = ?",
       [view]
     );
     const row = result[0]?.rows[0];
@@ -2690,6 +3607,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     selectSql: string,
     intent: ViewDefinitionIntent = 'edit'
   ): Promise<void> {
+    assertUsableSqlIdentifier(view, 'View name');
     if (this.readOnlyMode) {
       throw new Error('View validation is unavailable because the database is read-only');
     }
@@ -2699,11 +3617,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const savepointName = this.createSavepointName('sp_validate_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
+      const dependenciesBefore = await this.captureViewDependencySnapshot();
       if (typeof existingSql === 'string') {
         this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
       }
       this.runSingleStatement(buildCreateViewSql(view, body, columnListSql));
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
+      assertNoNewBrokenSchemaDependencies(
+        dependenciesBefore,
+        await this.captureViewDependencySnapshot()
+      );
       // Successful validation is deliberately non-mutating.
       await this.executeQuery(`ROLLBACK TO ${savepointName}`);
       await this.executeQuery(`RELEASE ${savepointName}`);
@@ -2720,6 +3643,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     intent: ViewDefinitionIntent = 'edit',
     cancellation?: WasmQueryCancellation
   ): Promise<QueryResultSet> {
+    assertUsableSqlIdentifier(view, 'View name');
     const body = normalizeViewSelectSql(selectSql);
     const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
     const { storedSql: existingSql, columnListSql } =
@@ -2748,11 +3672,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const savepointName = this.createSavepointName('sp_preview_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
+      const dependenciesBefore = await this.captureViewDependencySnapshot();
       if (typeof existingSql === 'string') {
         this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
       }
       this.runSingleStatement(buildCreateViewSql(view, body, columnListSql));
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
+      assertNoNewBrokenSchemaDependencies(
+        dependenciesBefore,
+        await this.captureViewDependencySnapshot()
+      );
       const result = this.executeSingleQuery(
         `SELECT * FROM ${escapeMainViewIdentifier(view)} LIMIT ${boundedLimit}`,
         cancellation
@@ -2767,14 +3696,19 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   async createView(view: string, selectSql: string): Promise<ViewDefinition> {
+    assertUsableSqlIdentifier(view, 'View name');
     this.assertWritableMutation('View creation');
     const body = normalizeViewSelectSql(selectSql);
-    this.compileViewSelect(body);
     const savepointName = this.createSavepointName('sp_create_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
+      const dependenciesBefore = await this.captureViewDependencySnapshot();
       this.runSingleStatement(buildCreateViewSql(view, body));
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
+      assertNoNewBrokenSchemaDependencies(
+        dependenciesBefore,
+        await this.captureViewDependencySnapshot()
+      );
       const definition = await this.getViewDefinition(view);
       await this.executeQuery(`RELEASE ${savepointName}`);
       return definition;
@@ -2793,7 +3727,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   ): Promise<ViewEditResult> {
     this.assertWritableMutation('View editing');
     const body = normalizeViewSelectSql(selectSql);
-    this.compileViewSelect(body);
     const savepointName = this.createSavepointName('sp_edit_view');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
@@ -2808,6 +3741,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         expectedTriggers,
         before.triggers
       );
+      const dependenciesBefore = await this.captureViewDependencySnapshot();
       this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
       this.runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
       this.compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
@@ -2827,6 +3761,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
       }
       const after = await this.getViewDefinition(view);
+      assertNoNewBrokenSchemaDependencies(
+        dependenciesBefore,
+        await this.captureViewDependencySnapshot()
+      );
       await this.executeQuery(`RELEASE ${savepointName}`);
       return { before, after };
     } catch (err) {
@@ -2852,7 +3790,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         expectedTriggers,
         before.triggers
       );
+      const dependenciesBefore = await this.captureViewDependencySnapshot();
       this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+      assertNoNewBrokenSchemaDependencies(
+        dependenciesBefore,
+        await this.captureViewDependencySnapshot()
+      );
       await this.executeQuery(`RELEASE ${savepointName}`);
       return before;
     } catch (err) {
@@ -2879,6 +3822,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const current = await this.findViewDefinition(view, true);
       if (current) assertViewTriggerSnapshotIsMutationSafe(current);
       assertViewDefinitionStateCurrent(expectedCurrent, current);
+      const dependenciesBefore = await this.captureViewDependencySnapshot();
       if (current) {
         this.runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
       }
@@ -2891,6 +3835,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           this.runSingleStatement(buildCreateViewTriggerSql(trigger));
         }
       }
+      assertNoNewBrokenSchemaDependencies(
+        dependenciesBefore,
+        await this.captureViewDependencySnapshot()
+      );
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (err) {
       await this.safeRollbackSavepoint(savepointName, 'restoreViewDefinition');
@@ -2926,6 +3874,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       if (identity.kind !== 'primaryKey') {
         throw new Error(`Primary-key identity cannot target rowid table ${table}`);
       }
+      assertUniqueCellUpdateTargets(updates, identity);
       if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
         await this.assertBatchHistoryWithinBudget(
           table,
@@ -2943,11 +3892,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       );
     }
 
+    const rowIdIdentity = await this.resolveTableIdentity(table);
+    if (rowIdIdentity.kind !== 'rowid') {
+      throw new Error(`Rowid identity cannot target WITHOUT ROWID table ${table}`);
+    }
+    assertUniqueCellUpdateTargets(updates, rowIdIdentity);
     if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
       await this.assertBatchHistoryWithinBudget(
         table,
         updates,
-        { kind: 'rowid' },
+        rowIdIdentity,
         maxUndoSnapshotBytes
       );
     }
@@ -2964,29 +3918,59 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       if (!isHistoryReplay && maxEditValueBytes !== undefined) {
         await this.assertRowIdBatchPriorsWithinEditLimit(table, updates, editLimitBytes);
       }
-      const escapedTable = escapeIdentifier(table);
+      const rowIdAliasColumn = await this.readRowIdAliasColumn(table);
+      await this.assertUpdateHasNoTargetTableTriggerWrites(
+        table,
+        updates.map(update => update.column)
+      );
+      if (
+        rowIdAliasColumn !== undefined
+        && updates.some(update => sqliteIdentifiersEqual(update.column, rowIdAliasColumn))
+      ) {
+        const results = await this.updateRowIdAliasCellBatchWithinSavepoint(
+          table,
+          rowIdAliasColumn,
+          updates,
+          editLimitBytes,
+          isHistoryReplay
+        );
+        await this.executeQuery(`RELEASE ${savepointName}`);
+        return results;
+      }
+      const escapedTable = escapeMainIdentifier(table);
       const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
       const columns = [...new Set(updates.map(update => update.column))];
-      const placeholders = rowIds.map(() => '?').join(', ');
-      const current = await this.executeQuery(
-        `SELECT CAST(rowid AS TEXT), ${columns.map(escapeIdentifier).join(', ')} ` +
-        `FROM ${escapedTable} WHERE rowid IN (${placeholders})`,
-        rowIds
-      );
-      const currentValues = new Map<string, Map<string, CellValue>>();
-      for (const row of current[0]?.rows ?? []) {
-        const values = new Map<string, CellValue>();
-        columns.forEach((column, index) => values.set(column, row[index + 1]));
-        currentValues.set(String(validateRowId(row[0] as RecordId)), values);
+      const rowIdPredicates = buildRecordIdentityPredicateChunks(rowIds, rowIdIdentity);
+      const currentValues = new Map<string, Map<string, StoredCellState>>();
+      for (const predicate of rowIdPredicates) {
+        const current = await this.executeQuery(
+          `SELECT CAST(rowid AS TEXT), ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+          `FROM ${escapedTable} WHERE ${predicate.sql}`,
+          predicate.params
+        );
+        for (const row of current[0]?.rows ?? []) {
+          const values = new Map<string, StoredCellState>();
+          columns.forEach((column, index) => values.set(column, parseStoredCellState(
+            row[index * 2 + 1],
+            row[index * 2 + 2],
+            `${table}.${column}`,
+            { textEncoding: this.getCellTextEncoding() }
+          )));
+          currentValues.set(String(validateRowId(row[0] as RecordId)), values);
+        }
       }
-      const results: CellUpdateResult[] = [];
+      const results: Array<Omit<CellUpdateResult, 'postState'>> = [];
       const processedUpdates = updates.map(update => {
         const rowId = validateRowId(update.rowId);
         const row = currentValues.get(String(rowId));
         if (!row) {
           throw new Error(`Cannot update ${table}.${update.column}: row ${update.rowId} no longer exists`);
         }
-        const priorValue = row.get(update.column) as CellValue;
+        const priorState = row.get(update.column);
+        if (!priorState) {
+          throw new Error(`Cannot update ${table}.${update.column}: cell state is unavailable`);
+        }
+        const priorValue = priorState.value;
         const prepared = prepareCellUpdateForStorage(
           update.value,
           priorValue,
@@ -3001,6 +3985,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           columnName: update.column,
           priorValue,
           newValue: prepared.value,
+          priorState,
           operation: prepared.operation
         });
         return { ...update, rowId, value: prepared.value, operation: prepared.operation };
@@ -3106,8 +4091,52 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           }
       }
 
+      // A trigger may move or delete an intrinsic rowid after an otherwise
+      // successful per-cell UPDATE. Never commit history that still names a
+      // vanished identity.
+      const remainingRowIds = new Set<string>();
+      for (const predicate of rowIdPredicates) {
+        const remaining = this.queryRaw(
+          `SELECT CAST(rowid AS TEXT) FROM ${escapedTable} ` +
+          `WHERE ${predicate.sql}`,
+          predicate.params
+        );
+        for (const row of remaining.rows) {
+          remainingRowIds.add(String(validateRowId(row[0] as RecordId)));
+        }
+      }
+      if (rowIds.some(rowId => !remainingRowIds.has(String(rowId)))) {
+        throw unresolvableTriggeredRowIdUpdateError(table);
+      }
+
+      const postValues = new Map<string, Map<string, StoredCellState>>();
+      for (const predicate of rowIdPredicates) {
+        const post = this.queryRaw(
+          `SELECT CAST(rowid AS TEXT), ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+          `FROM ${escapedTable} WHERE ${predicate.sql}`,
+          predicate.params
+        );
+        for (const row of post.rows) {
+          const values = new Map<string, StoredCellState>();
+          columns.forEach((column, index) => values.set(column, parseStoredCellState(
+            row[index * 2 + 1],
+            row[index * 2 + 2],
+            `${table}.${column}`,
+            { textEncoding: this.getCellTextEncoding() }
+          )));
+          postValues.set(String(validateRowId(row[0] as RecordId)), values);
+        }
+      }
+      const completedResults: CellUpdateResult[] = results.map(result => {
+        const postState = postValues.get(String(result.rowId))?.get(result.columnName);
+        if (!postState) {
+          throw unresolvableTriggeredRowIdUpdateError(table);
+        }
+        return { ...result, postState };
+      });
+
       await this.executeQuery(`RELEASE ${savepointName}`);
-      return results;
+      return completedResults;
     } catch (err) {
       await this.safeRollbackSavepoint(savepointName, 'updateCellBatch');
       throw err;
@@ -3117,25 +4146,46 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Add a new column to a table.
    */
-  async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {
+  async addColumn(
+    table: string,
+    column: string,
+    type: string,
+    defaultValue?: string,
+    expectedCurrentState?: ColumnDropTableState
+  ): Promise<ColumnDropTableState> {
+    assertUsableSqlIdentifier(column, 'Column name');
     // Validate SQL type to prevent injection via malicious type definitions
     validateSqlType(type);
-    let sql = `ALTER TABLE ${escapeIdentifier(table)} ADD COLUMN ${escapeIdentifier(column)} ${type}`;
+    const sql = `ALTER TABLE ${escapeMainIdentifier(table)} ADD COLUMN `
+      + `${escapeIdentifier(column)} ${type}${buildColumnDefaultClause(defaultValue)}`;
 
-    if (defaultValue !== undefined && defaultValue !== null && defaultValue !== '') {
-      // SQL safe default value handling with strict validation
-      if (defaultValue.toLowerCase() === 'null') {
-        sql += ' DEFAULT NULL';
-      } else if (/^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(defaultValue)) {
-        // Strict numeric pattern: optional sign, digits with optional decimal, optional exponent
-        // This prevents hex (0x), special values, and other edge cases
-        sql += ` DEFAULT ${defaultValue}`;
-      } else {
-        sql += ` DEFAULT '${defaultValue.replace(/'/g, "''")}'`;
+    const savepointName = this.createSavepointName('sp_add_column');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      const current = await this.readColumnDropTableState(table);
+      if (expectedCurrentState) {
+        assertTableSchemaStateCurrent(
+          table,
+          expectedCurrentState,
+          current,
+          'redo column addition',
+          'after the column addition was undone'
+        );
       }
+      assertColumnNameAvailable(table, column, current.columns);
+      const dependenciesBefore = await this.captureViewDependencySnapshot();
+      await this.executeQuery(sql);
+      const stateAfter = await this.readColumnDropTableState(table);
+      assertNoNewBrokenSchemaDependencies(
+        dependenciesBefore,
+        await this.captureViewDependencySnapshot()
+      );
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return stateAfter;
+    } catch (error) {
+      await this.safeRollbackSavepoint(savepointName, 'addColumn');
+      throw error;
     }
-
-    await this.executeQuery(sql);
   }
 
   /**
@@ -3146,6 +4196,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * expensive view, CTE or unindexed ORDER BY still hits queryTimeout.
    */
   async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
+    options = normalizeTablePageOptions(options);
     const queryOptions = { ...options };
     queryOptions.columns = await this.resolveQueryColumns(table, queryOptions.columns, queryOptions.globalFilter);
 
@@ -3175,7 +4226,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const executionState: {
       headerStmt?: WasmPreparedStatement;
       stmt?: WasmPreparedStatement;
-      metadataStmt?: WasmPreparedStatement;
       rowIdStmt?: WasmPreparedStatement;
     } = {};
     try {
@@ -3213,7 +4263,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         queryOptions.orderDir = fallbackOrder.orderDir;
       }
 
-      const splitSyntheticRowId = isRowIdTable
+      const splitSyntheticRowId = identity?.kind === 'rowid'
         && firstColumn === 'rowid'
         && (queryOptions.columns?.length ?? 0) > SQLITE_MAX_RESULT_COLUMNS;
       const valueQueryOptions = splitSyntheticRowId
@@ -3251,14 +4301,18 @@ export class WasmDatabaseEngine implements DatabaseOperations {
               .map(column => headers.indexOf(column))
               .filter(index => index >= 0)
           : [];
-        const rawTextColumnIndices = [
+        const identityRawTextColumnIndices = [
           ...new Set([...primaryKeyColumnIndices, ...keysetColumnIndices])
         ];
-        const containmentRawTextColumnIndices = splitSyntheticRowId
-          ? rawTextColumnIndices
+        const identityContainmentRawTextColumnIndices = splitSyntheticRowId
+          ? identityRawTextColumnIndices
               .filter(index => index > 0)
               .map(index => index - 1)
-          : rawTextColumnIndices;
+          : identityRawTextColumnIndices;
+        const containmentRawTextColumnIndices =
+          valueHeaders.length * 2 + 1 <= SQLITE_MAX_RESULT_COLUMNS
+            ? valueHeaders.map((_, index) => index)
+            : identityContainmentRawTextColumnIndices;
         const containmentQuery = buildCellContainmentQuery(
           sql,
           valueHeaders.length,
@@ -3280,21 +4334,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                 primaryRows.push(row);
             }
         }
-        let metadataRows: Array<Array<CellValue | bigint>> | undefined;
-        if (containmentQuery.metadataSql) {
-          const metadataStmt = this.instance.prepare(containmentQuery.metadataSql, bindParams);
-          executionState.metadataStmt = metadataStmt;
-          metadataRows = [];
-          while (metadataStmt.step()) {
-            const row = metadataStmt.get(null, { useBigInt: true });
-            if (row) metadataRows.push(row);
-          }
-          metadataStmt.free();
-          executionState.metadataStmt = undefined;
-        }
         const valueSourceRows = mergeCellContainmentMetadataRows(
           primaryRows,
-          metadataRows,
+          undefined,
           containmentQuery
         ) as Array<Array<CellValue | bigint>>;
         let rowIdRows: Array<Array<CellValue | bigint>> | undefined;
@@ -3370,7 +4412,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           normalized.exactIntegerTexts,
           queryOptions.maxPageResponseBytes
         );
-        const contained = rowIdRows
+        const decodedContained = rowIdRows
           ? prependCellContainmentColumn(
               normalizeIntegerRowsForTransport(
                 rowIdRows,
@@ -3382,7 +4424,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
               companionExactTexts
             )
           : valueContained;
-        const { rows, oversizedCells, exactIntegerTexts } = contained;
         const rawTextRows = decodeRawTextColumns(normalized.rows, containmentQuery);
         const textEncoding = containmentRawTextColumnIndices.length > 0
           ? this.getCellTextEncoding()
@@ -3390,6 +4431,26 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const sourceRawTextColumnIndices = splitSyntheticRowId
           ? containmentQuery.rawTextColumnIndices.map(index => index + 1)
           : containmentQuery.rawTextColumnIndices;
+        const contained = textEncoding
+          ? containUnrepresentableTextCells({
+              sourceRows,
+              rawTextRows,
+              rawTextColumnIndices: sourceRawTextColumnIndices,
+              textEncoding,
+              contained: decodedContained
+            })
+          : decodedContained;
+        const { rows, oversizedCells, exactIntegerTexts } = contained;
+        const shadowedRowId = identity?.kind === 'rowid'
+          && hasRowIdShape
+          && !isRowIdTable
+          ? remapShadowedRowIdContainment({
+              rows,
+              oversizedCells,
+              exactIntegerTexts,
+              rowOffset: queryOptions.offset
+            })
+          : undefined;
         const remapped = primaryKeyContext
           ? remapPrimaryKeyContainment({
               identity: primaryKeyContext.identity,
@@ -3446,11 +4507,18 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
         return {
             headers,
-            rows,
+            rows: shadowedRowId?.rows ?? rows,
             columns: headers,
-            values: rows,
-            exactIntegerTexts,
-            ...(oversizedCells ? { oversizedCells } : {}),
+            values: shadowedRowId?.rows ?? rows,
+            exactIntegerTexts: shadowedRowId
+              ? shadowedRowId.exactIntegerTexts
+              : exactIntegerTexts,
+            ...((shadowedRowId ? shadowedRowId.oversizedCells : oversizedCells)
+              ? { oversizedCells: shadowedRowId ? shadowedRowId.oversizedCells : oversizedCells }
+              : {}),
+            ...(shadowedRowId?.readOnlyRowReasons
+              ? { readOnlyRowReasons: shadowedRowId.readOnlyRowReasons }
+              : {}),
             ...(keysetAnchors ? { keysetAnchors } : {})
         };
       });
@@ -3460,7 +4528,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     } finally {
       executionState.headerStmt?.free();
       executionState.stmt?.free();
-      executionState.metadataStmt?.free();
       executionState.rowIdStmt?.free();
     }
   }
@@ -3549,7 +4616,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   async fetchSchema(): Promise<SchemaSnapshot> {
     const [schemaResult, identityResult] = await Promise.all([
       this.executeQuery(
-        "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
+        "SELECT type, name, tbl_name, sql FROM main.sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
       ),
       this.executeQuery(TABLE_IDENTITY_METADATA_SQL)
     ]);
@@ -3581,15 +4648,22 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * Get table metadata.
    */
   async getTableInfo(table: string): Promise<ColumnMetadata[]> {
-    const result = await this.executeQuery(`PRAGMA table_info(${escapeIdentifier(table)})`);
-    return (result[0]?.rows || []).map(row => ({
-      ordinal: row[0] as number,
-      identifier: row[1] as string,
-      declaredType: row[2] as string,
-      isRequired: row[3] as number,
-      defaultExpression: row[4],
-      primaryKeyPosition: row[5] as number
-    }));
+    const result = await this.executeQuery(TABLE_XINFO_WITH_ROWID_ALIAS_SQL, [table]);
+    return (result[0]?.rows || [])
+      // table_xinfo also exposes hidden virtual-table implementation columns
+      // (hidden=1). Preserve table_info's user-facing surface while adding the
+      // generated VIRTUAL/STORED columns represented by hidden=2/3.
+      .filter(row => Number(row[6] ?? 0) !== 1)
+      .map(row => ({
+        ordinal: row[0] as number,
+        identifier: row[1] as string,
+        declaredType: row[2] as string,
+        isRequired: row[3] as number,
+        defaultExpression: row[4],
+        primaryKeyPosition: row[5] as number,
+        isGenerated: Number(row[6] ?? 0) === 2 || Number(row[6] ?? 0) === 3,
+        isRowidAlias: Number(row[7] ?? 0) === 1
+      }));
   }
 
   /**
@@ -3726,19 +4800,32 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Write database directly to file system.
    */
-  async writeToFile(path: string): Promise<DatabaseWriteResult | void> {
+  async writeToFile(
+    path: string,
+    cancellation?: WasmOperationCancellation
+  ): Promise<DatabaseWriteResult | void> {
     if (this.pagedState?.writable) {
       throw new Error(
         'Internal error: writable page-on-demand databases must be saved by the desktop host stream writer.'
       );
     }
-    const data = this.exportDatabaseImage();
-
     const fs = getNodeFs();
-    if (fs) {
-        await fs.promises.writeFile(path, data);
-    } else {
-        throw new Error('File system access not available');
-    }
+    if (!fs) throw new Error('File system access not available');
+
+    const signal = cancellationCheck(cancellation);
+    signal?.throwIfAborted();
+    const data = this.exportDatabaseImage();
+    return writeDatabaseSnapshotAtomically(
+      fs,
+      undefined,
+      path,
+      async temporaryPath => {
+        // The helper supplies a collision-resistant sibling path. `wx` keeps
+        // an unexpected local race from converting it into an overwrite.
+        await fs.promises.writeFile(temporaryPath, data, { flag: 'wx' });
+      },
+      signal,
+      (level, message, error) => this.logger(level, message, error)
+    );
   }
 }

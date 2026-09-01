@@ -16,6 +16,7 @@ class classEventEmitter {
 }
 
 const closeTextDocumentEmitter = new classEventEmitter();
+const changeTabsEmitter = new classEventEmitter();
 
 export const mockVscode = {
     Uri: {
@@ -107,6 +108,10 @@ export const mockVscode = {
         executeCommand: (command: string, ...args: any[]) => Promise.resolve()
     },
     window: {
+        tabGroups: {
+            onDidChangeTabs: changeTabsEmitter.event,
+            __fireDidChangeTabs: (event: any) => changeTabsEmitter.fire(event)
+        },
         showInformationMessage: (_message: string, ..._items: any[]) => Promise.resolve(),
         showWarningMessage: (_message: string, ..._items: any[]) => Promise.resolve(),
         showErrorMessage: (_message: string, ..._items: any[]) => Promise.resolve(),
@@ -149,6 +154,9 @@ export const mockVscode = {
     },
     ProgressLocation: {
         Notification: 15
+    },
+    ConfigurationTarget: {
+        Global: 1
     },
     ViewColumn: {
         Two: 2

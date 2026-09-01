@@ -15,6 +15,17 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { Upload, Database, FileUp, ArrowLeft, Download, RefreshCw, AlertCircle } from 'lucide-react';
 import { isTrustedViewerMessage } from './messageGuard';
+import {
+  createDemoExtensionSettings,
+  updateDemoExtensionSetting
+} from './extensionSettings';
+import {
+  DemoWorkerRetiredError,
+  reloadDemoDatabase,
+  retireDemoWorker,
+  triggerBrowserDownload,
+  type PendingWorkerCall
+} from './lifecycle';
 import { DEMO_INLINE_CONTENT_MAX_BYTES } from '../../../src/core/paged-open';
 import {
   demoRpcErrorFields,
@@ -25,6 +36,7 @@ import {
   guardDemoIframeResponse,
   guardDemoWorkerRequest,
   guardDemoWorkerResponse,
+  isSafeDemoRpcIdentifier,
   serializeDemoIframeResponse
 } from './transport';
 
@@ -195,16 +207,18 @@ export default function DemoClient() {
    */
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
+  /** Session-scoped settings supported by the standalone viewer. */
+  const extensionSettings = useRef(createDemoExtensionSettings());
+
   /**
    * Pending RPC calls waiting for responses.
    */
-  const pendingCalls = useRef<Map<string, {
-    method: string;
-    resolve: (value: unknown) => void;
-    reject: (error: Error) => void;
-  }>>(new Map());
+  const pendingCalls = useRef<Map<string, PendingWorkerCall>>(new Map());
 
   const activePreviewController = useRef<AbortController | null>(null);
+
+  /** Latest source-bound reload callback used by iframe RPCs. */
+  const reloadDatabaseRef = useRef<(() => Promise<unknown>) | null>(null);
 
   /**
    * Message ID counter for RPC calls.
@@ -260,7 +274,8 @@ export default function DemoClient() {
     }
 
     const invocation = new Promise<unknown>((resolve, reject) => {
-      if (!workerRef.current) {
+      const worker = workerRef.current;
+      if (!worker) {
         reject(new Error('Worker not initialized'));
         return;
       }
@@ -285,7 +300,12 @@ export default function DemoClient() {
       }
 
       pendingCalls.current.set(messageId, { method, resolve, reject });
-      workerRef.current.postMessage(message);
+      try {
+        worker.postMessage(message);
+      } catch (error) {
+        pendingCalls.current.delete(messageId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
     return invocation.then(
       result => {
@@ -324,6 +344,10 @@ export default function DemoClient() {
     if (envelope?.channel === 'rpc' && envelope.content?.kind === 'invoke') {
       const { messageId, targetMethod, payload } = envelope.content;
 
+      // Invalid IDs cannot be reflected safely in an error response. Drop the
+      // request before decoding or invoking any capability.
+      if (!isSafeDemoRpcIdentifier(messageId)) return;
+
       let deserializedPayload: unknown[];
       try {
         guardDemoIframeRequest(envelope);
@@ -355,17 +379,80 @@ export default function DemoClient() {
       }
 
       if (targetMethod === 'getExtensionSettings') {
-        // Return default settings for web mode
         postIframeRpcResponse(event.source, viewerOrigin, {
           kind: 'response',
           messageId,
           success: true,
-          data: {
-            defaultPageSize: 5000,
-            instantCommit: 'never',
-            doubleClickBehavior: 'inline'
-          }
+          data: extensionSettings.current
         });
+        return;
+      }
+
+      if (targetMethod === 'updateExtensionSetting') {
+        try {
+          const [key, value] = deserializedPayload;
+          const updated = updateDemoExtensionSetting(
+            extensionSettings.current,
+            key,
+            value
+          );
+          extensionSettings.current = updated;
+          if (key === 'doubleClickBehavior') {
+            event.source?.postMessage(
+              {
+                kind: 'invoke',
+                correlationId: `demo-setting-${messageId}`,
+                methodName: 'updateCellEditBehavior',
+                parameters: [updated.cellEditBehavior]
+              },
+              { targetOrigin: viewerOrigin }
+            );
+          }
+          postIframeRpcResponse(event.source, viewerOrigin, {
+            kind: 'response',
+            messageId,
+            success: true,
+            data: { success: true }
+          });
+        } catch (error) {
+          postIframeRpcResponse(event.source, viewerOrigin, {
+            kind: 'response',
+            messageId,
+            success: false,
+            ...demoRpcErrorFields(error)
+          });
+        }
+        return;
+      }
+
+      if (targetMethod === 'refreshFile') {
+        const reload = reloadDatabaseRef.current;
+        if (!reload) {
+          postIframeRpcResponse(event.source, viewerOrigin, {
+            kind: 'response',
+            messageId,
+            success: false,
+            errorMessage: 'Reload is unavailable because no database source is open'
+          });
+          return;
+        }
+        reload()
+          .then(() => {
+            postIframeRpcResponse(event.source, viewerOrigin, {
+              kind: 'response',
+              messageId,
+              success: true,
+              data: { connected: true, isReadOnly: databaseIsReadOnly.current }
+            });
+          })
+          .catch(error => {
+            postIframeRpcResponse(event.source, viewerOrigin, {
+              kind: 'response',
+              messageId,
+              success: false,
+              ...demoRpcErrorFields(error)
+            });
+          });
         return;
       }
 
@@ -380,14 +467,7 @@ export default function DemoClient() {
             };
             // This is bounded chunk assembly, not progressive worker streaming.
             const blob = new Blob(exportResult.contentChunks, { type: exportResult.mimeType });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = exportResult.filename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
+            triggerBrowserDownload(blob, exportResult.filename);
 
             postIframeRpcResponse(event.source, viewerOrigin, {
               kind: 'response',
@@ -460,8 +540,13 @@ export default function DemoClient() {
       // Cleanup worker on unmount
       activePreviewController.current?.abort();
       activePreviewController.current = null;
-      if (workerRef.current) {
-        workerRef.current.terminate();
+      const worker = workerRef.current;
+      if (worker) {
+        retireDemoWorker(
+          worker,
+          pendingCalls.current,
+          new DemoWorkerRetiredError('Database worker was terminated while the demo closed')
+        );
         workerRef.current = null;
       }
     };
@@ -482,8 +567,14 @@ export default function DemoClient() {
     // Terminate existing worker
     activePreviewController.current?.abort();
     activePreviewController.current = null;
-    if (workerRef.current) {
-      workerRef.current.terminate();
+    const previousWorker = workerRef.current;
+    if (previousWorker) {
+      retireDemoWorker(
+        previousWorker,
+        pendingCalls.current,
+        new DemoWorkerRetiredError('Database worker was replaced before its RPC completed')
+      );
+      if (workerRef.current === previousWorker) workerRef.current = null;
     }
 
     // Create new worker (classic worker, not module, to support importScripts)
@@ -518,9 +609,22 @@ export default function DemoClient() {
     };
 
     worker.onerror = (error) => {
+      if (workerRef.current !== worker) return;
       console.error('[Demo] Worker error:', error);
+      const failure = new Error(error.message || 'Database worker failed');
+      retireDemoWorker(worker, pendingCalls.current, failure);
+      workerRef.current = null;
       setStatus('error');
-      setErrorMessage('Worker failed to initialize');
+      setErrorMessage(failure.message);
+    };
+
+    worker.onmessageerror = () => {
+      if (workerRef.current !== worker) return;
+      const failure = new Error('Database worker returned an unreadable message');
+      retireDemoWorker(worker, pendingCalls.current, failure);
+      workerRef.current = null;
+      setStatus('error');
+      setErrorMessage(failure.message);
     };
 
     // Wait for worker to be ready, then initialize database
@@ -550,13 +654,26 @@ export default function DemoClient() {
       setReadOnlyNotice(result?.readOnlyReason ?? null);
       setDatabaseName(filename);
       setStatus('ready');
+      return result;
     } catch (error) {
-      console.error('[Demo] Failed to initialize database:', error);
-      setStatus('error');
-      setErrorMessage(error instanceof Error ? error.message : 'Failed to load database');
-      setReadOnlyNotice(null);
+      const failure = error instanceof Error ? error : new Error('Failed to load database');
+      if (workerRef.current === worker) {
+        console.error('[Demo] Failed to initialize database:', failure);
+        retireDemoWorker(worker, pendingCalls.current, failure);
+        workerRef.current = null;
+        setStatus('error');
+        setErrorMessage(failure.message);
+        setReadOnlyNotice(null);
+      }
+      throw failure;
     }
   }, [callWorker]);
+
+  reloadDatabaseRef.current = () => reloadDemoDatabase(
+    databaseBinary.current ?? databaseFile.current,
+    databaseName,
+    initializeWorker
+  );
 
   // -------------------------------------------------------------------------
   // File Handling
@@ -591,6 +708,7 @@ export default function DemoClient() {
         await initializeWorker(file, file.name);
       }
     } catch (error) {
+      if (error instanceof DemoWorkerRetiredError) return;
       console.error('[Demo] Failed to load file:', error);
       setStatus('error');
       setErrorMessage(error instanceof Error ? error.message : 'Failed to load file');
@@ -620,6 +738,7 @@ export default function DemoClient() {
         : new File([binary], name, { type: 'application/x-sqlite3' });
       await initializeWorker(source, name);
     } catch (error) {
+      if (error instanceof DemoWorkerRetiredError) return;
       console.error('[Demo] Failed to load sample:', error);
       setStatus('error');
       setErrorMessage(error instanceof Error ? error.message : 'Failed to load sample database');
@@ -685,12 +804,7 @@ export default function DemoClient() {
         ? exportedData.buffer
         : exportedData.slice().buffer;
       const blob = new Blob([exportedBuffer], { type: 'application/x-sqlite3' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = databaseName;
-      a.click();
-      URL.revokeObjectURL(url);
+      triggerBrowserDownload(blob, databaseName);
     } catch (error) {
       console.error('[Demo] Failed to export database:', error);
       setDownloadError(error instanceof Error ? error.message : 'Failed to download database');
@@ -703,11 +817,14 @@ export default function DemoClient() {
    * the snapshot), the re-open fails into the normal error surface.
    */
   const handleReload = useCallback(() => {
-    const source = databaseBinary.current ?? databaseFile.current;
-    if (source && databaseName) {
-      initializeWorker(source, databaseName);
-    }
-  }, [initializeWorker, databaseName]);
+    void reloadDatabaseRef.current?.().catch(error => {
+      if (!(error instanceof DemoWorkerRetiredError)) {
+        console.error('[Demo] Failed to reload database:', error);
+        setStatus('error');
+        setErrorMessage(error instanceof Error ? error.message : 'Failed to reload database');
+      }
+    });
+  }, []);
 
   /**
    * Close the current database and return to upload UI.
@@ -715,8 +832,13 @@ export default function DemoClient() {
   const handleClose = useCallback(() => {
     activePreviewController.current?.abort();
     activePreviewController.current = null;
-    if (workerRef.current) {
-      workerRef.current.terminate();
+    const worker = workerRef.current;
+    if (worker) {
+      retireDemoWorker(
+        worker,
+        pendingCalls.current,
+        new DemoWorkerRetiredError('Database worker was terminated when the database closed')
+      );
       workerRef.current = null;
     }
     databaseBinary.current = null;

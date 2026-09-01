@@ -1,15 +1,24 @@
 /**
  * Sidebar and Schema Logic
  */
-import { state, persistState } from './state.js';
+import { createSafeColumnState, state, persistState } from './state.js';
 import { backendApi } from './api.js';
-import { updateStatus, updateToolbarButtons } from './ui.js';
-import { loadTableData, loadTableColumns } from './grid.js';
+import {
+    showErrorState,
+    showEmptyState,
+    showLoading,
+    updateStatus,
+    updateToolbarButtons
+} from './ui.js';
+import { clearSelection, loadTableData, loadTableColumns } from './grid.js';
 import {
     getCellMutationBlockReason,
     getCellValueForDisplay,
     getBatchSelectionEligibility,
-    getRowDataOffset
+    getRowDataOffset,
+    clearExactIntegerText,
+    clearOversizedCellMetadata,
+    resolveDisplayedCell
 } from './data-utils.js';
 import { updateSelectionStates } from './grid-selection.js';
 import { openCreateTableModal } from './crud.js';
@@ -18,6 +27,18 @@ import { openCreateViewModal, openEditViewModal, dropViewFromSidebar } from './v
 import { groupSelectedCellsByColumn, summarizeColumnValue, prepareBatchUpdates } from './batch-update-logic.js';
 import { applyConnectionResult } from './connection-state.js';
 import { invalidateAllCounts, noteCellValuesChanged } from './count-cache.js';
+import { closeDatabaseTargetModals } from './modals.js';
+import { getErrorMessage } from './utils.js';
+
+let isApplyingBatchUpdate = false;
+let activeSchemaLoadToken = 0;
+let isReloadingFromDisk = false;
+
+function cellSelectionSignature() {
+    return state.selectedCells.map(cell => (
+        `${typeof cell.rowId}:${String(cell.rowId)}\u0000${cell.colIdx}`
+    )).join('\u0001');
+}
 
 export function initSidebar() {
     const sidebarPanel = document.getElementById('sidebarPanel');
@@ -29,8 +50,23 @@ export function initSidebar() {
         sidebarFilterInput.addEventListener('input', () => {
             state.sidebarFilter = sidebarFilterInput.value;
             renderSidebar();
+            persistState();
         });
     }
+
+    // Batch fields are rebuilt whenever the selection changes. Delegation keeps
+    // the explicit NULL mode from surviving once the user types a real value.
+    sidebarPanel.addEventListener('input', (event) => {
+        const input = event.target?.closest?.('.batch-input');
+        if (!input) return;
+        if (input.dataset.mode !== 'patch') {
+            input.dataset.mode = 'value';
+            input.dataset.isnull = 'false';
+            input.dataset.ispatch = 'false';
+            input.placeholder = input.dataset.valuePlaceholder || '(mixed values)';
+        }
+        input.style.fontStyle = 'normal';
+    });
 
     sidebarPanel.addEventListener('click', (event) => {
         const target = event.target;
@@ -84,7 +120,7 @@ export function initSidebar() {
         }
 
         // 6. Table/View Selection
-        const listItem = target.closest('.list-item');
+        const listItem = target.closest('.list-item-select')?.closest('.list-item');
         if (listItem) {
             // Check if it's a table/view item (has data attributes)
             const name = listItem.dataset.name;
@@ -98,12 +134,9 @@ export function initSidebar() {
 
         // 7. Section Toggling
         // Check if we clicked the section header
-        const sectionTitle = target.closest('.section-title');
-        if (sectionTitle) {
-            // Ignore clicks on buttons inside the header (e.g. Create Table) or settings
-            if (target.closest('.icon-button') || sectionTitle.id === 'btnOpenSettings') return;
-
-            const section = sectionTitle.dataset.section;
+        const sectionToggle = target.closest('.section-toggle, #batchUpdateSectionTitle');
+        if (sectionToggle) {
+            const section = sectionToggle.dataset.section;
             if (section) {
                 toggleSection(section);
             }
@@ -116,6 +149,16 @@ export function initSidebar() {
             if (field) {
                 const colIdx = parseInt(field.dataset.colidx, 10);
                 setBatchNull(colIdx);
+            }
+            return;
+        }
+
+        const emptyBtn = target.closest('.btn-batch-empty');
+        if (emptyBtn) {
+            const field = emptyBtn.closest('.batch-field');
+            if (field) {
+                const colIdx = parseInt(field.dataset.colidx, 10);
+                setBatchEmpty(colIdx);
             }
             return;
         }
@@ -139,10 +182,13 @@ export function syncSelectedTableIdentity() {
 }
 
 export async function refreshSchema() {
-    if (!state.isDbConnected) return;
+    if (!state.isDbConnected) return false;
+
+    const loadToken = ++activeSchemaLoadToken;
 
     try {
         const schema = await backendApi.fetchSchema();
+        if (loadToken !== activeSchemaLoadToken) return false;
 
         state.schemaCache.tables = (schema.tables || []).map(t => ({
             name: t.identifier,
@@ -153,10 +199,12 @@ export async function refreshSchema() {
         syncSelectedTableIdentity();
 
         renderSidebar();
-
+        return true;
     } catch (err) {
+        if (loadToken !== activeSchemaLoadToken) return false;
         console.error('Error loading schema:', err);
         updateStatus('Error loading schema');
+        throw err;
     }
 }
 
@@ -180,7 +228,7 @@ function renderSidebarList(listId, items, type, iconClass, emptyText) {
 
     if (items.length === 0) {
         const li = document.createElement('li');
-        li.className = 'list-item';
+        li.className = 'list-item empty';
         li.style.opacity = '0.5';
         li.textContent = emptyText;
         list.appendChild(li);
@@ -199,14 +247,23 @@ function renderSidebarList(listId, items, type, iconClass, emptyText) {
         if (type) li.dataset.type = type;
         li.title = item.name;
 
+        const selectButton = document.createElement('button');
+        selectButton.type = 'button';
+        selectButton.className = 'list-item-select';
+        selectButton.setAttribute('aria-label', `Open ${type} ${item.name}`);
+        if (state.selectedTable === item.name && state.selectedTableType === type) {
+            selectButton.setAttribute('aria-current', 'true');
+        }
+
         const icon = document.createElement('span');
         icon.className = `item-icon codicon ${iconClass}`;
-        li.appendChild(icon);
+        selectButton.appendChild(icon);
 
         const nameSpan = document.createElement('span');
         nameSpan.className = 'item-name';
         nameSpan.textContent = item.name;
-        li.appendChild(nameSpan);
+        selectButton.appendChild(nameSpan);
+        li.appendChild(selectButton);
 
         if (type === 'view') {
             const actions = document.createElement('span');
@@ -250,7 +307,7 @@ function renderIndexesList(listId, indexes, emptyText) {
 
     if (indexes.length === 0) {
         const li = document.createElement('li');
-        li.className = 'list-item';
+        li.className = 'list-item empty';
         li.style.opacity = '0.5';
         li.textContent = emptyText;
         indexesList.appendChild(li);
@@ -310,6 +367,7 @@ export function updateBatchSidebar() {
     const fieldsContainer = document.getElementById('batchUpdateFields');
 
     if (!title || !list || !countBadge || !fieldsContainer) return;
+    const applyButton = document.getElementById('btnApplyBatchUpdate');
 
     const eligibility = getBatchSelectionEligibility();
     const cellCount = eligibility.cells.length;
@@ -317,16 +375,22 @@ export function updateBatchSidebar() {
     if (state.selectedCells.length === 0) {
         title.classList.add('hidden');
         list.classList.add('hidden');
+        countBadge.textContent = '0';
+        fieldsContainer.replaceChildren();
+        title.title = '';
+        if (applyButton) applyButton.disabled = true;
         return;
     }
 
     title.classList.remove('hidden');
     list.classList.remove('hidden');
     title.classList.remove('collapsed');
+    title.setAttribute?.('aria-expanded', 'true');
 
     countBadge.textContent = cellCount;
-    const applyButton = document.getElementById('btnApplyBatchUpdate');
-    if (applyButton) applyButton.disabled = state.isReadOnly || cellCount === 0;
+    if (applyButton) {
+        applyButton.disabled = state.isReadOnly || isApplyingBatchUpdate || cellCount === 0;
+    }
 
     // Analyze selected cells - group by column (see batch-update-logic.js)
     const visibleCells = eligibility.cells.map(cell => {
@@ -367,6 +431,8 @@ export function updateBatchSidebar() {
         const label = document.createElement('label');
         label.style.fontSize = '11px';
         label.style.color = 'var(--text-secondary)';
+        const inputId = `batchInput_${colIdx}`;
+        label.htmlFor = inputId;
 
         const nameText = document.createTextNode(colInfo.name + ' ');
         label.appendChild(nameText);
@@ -384,24 +450,43 @@ export function updateBatchSidebar() {
 
         const input = document.createElement('input');
         input.type = 'text';
+        input.id = inputId;
         input.className = 'batch-input';
         input.placeholder = valueDisplay;
         input.dataset.colidx = colIdx;
+        input.dataset.valuePlaceholder = valueDisplay;
+        input.dataset.mode = 'unchanged';
+        input.dataset.isnull = 'false';
+        input.dataset.ispatch = 'false';
         input.style.flex = '1';
         input.style.minWidth = '0';
         controlsDiv.appendChild(input);
 
         const nullBtn = document.createElement('button');
+        nullBtn.type = 'button';
         nullBtn.className = 'btn-secondary btn-batch-null';
         nullBtn.style.padding = '2px 6px';
         nullBtn.title = 'Set to NULL';
+        nullBtn.ariaLabel = `Set ${colInfo.name} to NULL`;
         nullBtn.textContent = 'NULL';
+        nullBtn.disabled = colInfo.notnull === 1;
         controlsDiv.appendChild(nullBtn);
 
+        const emptyBtn = document.createElement('button');
+        emptyBtn.type = 'button';
+        emptyBtn.className = 'btn-secondary btn-batch-empty';
+        emptyBtn.style.padding = '2px 6px';
+        emptyBtn.title = 'Set to an empty string';
+        emptyBtn.ariaLabel = `Set ${colInfo.name} to empty string`;
+        emptyBtn.textContent = 'Empty';
+        controlsDiv.appendChild(emptyBtn);
+
         const patchBtn = document.createElement('button');
+        patchBtn.type = 'button';
         patchBtn.className = 'btn-secondary btn-batch-patch';
         patchBtn.style.padding = '2px 6px';
         patchBtn.title = 'JSON Patch';
+        patchBtn.ariaLabel = `Apply JSON patch to ${colInfo.name}`;
         patchBtn.textContent = '{}';
         controlsDiv.appendChild(patchBtn);
 
@@ -412,7 +497,7 @@ export function updateBatchSidebar() {
 }
 
 export async function applyBatchUpdate() {
-    if (state.selectedCells.length === 0) return;
+    if (isApplyingBatchUpdate || state.selectedCells.length === 0) return;
     const eligibility = getBatchSelectionEligibility();
     if (eligibility.cells.length === 0) {
         updateStatus(`Batch update unavailable: ${eligibility.readOnlyReason}`);
@@ -461,10 +546,15 @@ export async function applyBatchUpdate() {
     // Snapshot the target so the count-cache note below can never be applied
     // to a table the user switched to while the batch RPC was in flight.
     const targetTable = state.selectedTable;
+    const targetSelectionSignature = cellSelectionSignature();
+    isApplyingBatchUpdate = true;
+    const applyButton = document.getElementById('btnApplyBatchUpdate');
+    if (applyButton) applyButton.disabled = true;
 
     try {
-        updateStatus(`Updating ${updates.length} cells...`);
-        const label = `Batch update ${updates.length} cells`;
+        const cellCountLabel = `${updates.length} cell${updates.length === 1 ? '' : 's'}`;
+        updateStatus(`Updating ${cellCountLabel}...`);
+        const label = `Batch update ${cellCountLabel}`;
 
         // Strip extra metadata for backend
         const backendUpdates = updates.map(u => ({
@@ -498,36 +588,57 @@ export async function applyBatchUpdate() {
                 }
             }
         }
-        // Update local grid data
+        const stillOnTargetTable = state.selectedTable === targetTable;
+        // Update local grid data by stable row/column identity. Page reloads
+        // and sort changes can move both indices while the RPC is pending.
         const hasPatch = updates.some(u => u.operation === 'json_patch');
 
-        if (!hasPatch) {
+        if (stillOnTargetTable && !hasPatch) {
             for (const u of updates) {
-                state.gridData[u.rowIdx][u.colIdx + getRowDataOffset()] = u.value;
+                const outcome = (outcomes ?? []).find(candidate => (
+                    candidate.rowId === u.rowId && candidate.columnName === u.column
+                ));
+                const currentCell = resolveDisplayedCell(
+                    targetTable,
+                    outcome?.newRowId ?? u.rowId,
+                    u.column
+                ) ?? resolveDisplayedCell(targetTable, u.rowId, u.column);
+                if (!currentCell) continue;
+                state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = u.value;
+                clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
+                clearOversizedCellMetadata(currentCell.rowIdx, currentCell.colIdx);
             }
         }
 
         // Applying the batch ends the selection gesture. Clear both halves of
         // the cell/column selection before replacing the grid so the DOM diff
         // cache removes the old body and header highlights together.
-        state.selectedCells = [];
-        state.selectedColumns.clear();
-        state.lastSelectedCell = null;
-        state.lastSelectedColumnIndex = null;
-        updateSelectionStates();
-        updateToolbarButtons();
-        updateBatchSidebar();
+        if (stillOnTargetTable && cellSelectionSignature() === targetSelectionSignature) {
+            state.selectedCells = [];
+            state.selectedColumns.clear();
+            state.lastSelectedCell = null;
+            state.lastSelectedColumnIndex = null;
+            updateSelectionStates();
+            updateToolbarButtons();
+        }
 
         // A PK edit can move the row in the table's default ordering.
-        await loadTableData(false);
+        if (stillOnTargetTable) await loadTableData(false);
 
-        updateStatus(eligibility.readOnlyCount > 0
-            ? `Batch update completed; excluded ${eligibility.readOnlyCount} read-only selected cell${eligibility.readOnlyCount === 1 ? '' : 's'}`
-            : 'Batch update completed');
+        if (state.selectedTable === targetTable) {
+            updateStatus(eligibility.readOnlyCount > 0
+                ? `Batch update completed; excluded ${eligibility.readOnlyCount} read-only selected cell${eligibility.readOnlyCount === 1 ? '' : 's'}`
+                : 'Batch update completed');
+        }
 
     } catch (err) {
         console.error('Batch update failed:', err);
-        updateStatus(`Batch update failed: ${err.message}`);
+        if (state.selectedTable === targetTable) {
+            updateStatus(`Batch update failed: ${getErrorMessage(err)}`);
+        }
+    } finally {
+        isApplyingBatchUpdate = false;
+        updateBatchSidebar();
     }
 }
 
@@ -540,11 +651,30 @@ export function setBatchNull(colIdx) {
         input.placeholder = 'SET TO NULL';
         input.dataset.isnull = 'true';
         input.dataset.ispatch = 'false';
+        input.dataset.mode = 'null';
         input.style.fontStyle = 'italic';
         if (btn) {
             btn.style.background = '';
             btn.style.color = '';
         }
+    }
+}
+
+export function setBatchEmpty(colIdx) {
+    const input = document.querySelector(`.batch-input[data-colidx="${colIdx}"]`);
+    const patchBtn = document.querySelector(
+        `.batch-field[data-colidx="${colIdx}"] .btn-batch-patch`
+    );
+    if (!input) return;
+    input.value = '';
+    input.placeholder = 'SET TO EMPTY STRING';
+    input.dataset.mode = 'value';
+    input.dataset.isnull = 'false';
+    input.dataset.ispatch = 'false';
+    input.style.fontStyle = 'italic';
+    if (patchBtn) {
+        patchBtn.style.background = '';
+        patchBtn.style.color = '';
     }
 }
 
@@ -556,13 +686,15 @@ export function toggleBatchPatch(colIdx, btn) {
         if (!isPatch) {
             input.dataset.ispatch = 'true';
             input.dataset.isnull = 'false';
+            input.dataset.mode = 'patch';
             input.placeholder = 'JSON Patch (e.g. {"a": 1})';
             input.style.fontStyle = 'normal';
             btn.style.background = 'var(--accent-color)';
             btn.style.color = 'white';
         } else {
             input.dataset.ispatch = 'false';
-            input.placeholder = '(mixed values)';
+            input.dataset.mode = input.value === '' ? 'unchanged' : 'value';
+            input.placeholder = input.dataset.valuePlaceholder || '(mixed values)';
             btn.style.background = '';
             btn.style.color = '';
         }
@@ -571,11 +703,15 @@ export function toggleBatchPatch(colIdx, btn) {
 
 export function toggleSection(section) {
     const list = document.getElementById(`${section}List`);
-    const title = document.querySelector(`.section-title[data-section="${section}"]`);
+    const toggle = document.querySelector(`[data-section="${section}"]`);
+    const title = toggle?.classList?.contains('section-title')
+        ? toggle
+        : toggle?.closest?.('.section-title');
 
     if (list && title) {
         list.classList.toggle('hidden');
         title.classList.toggle('collapsed');
+        toggle.setAttribute?.('aria-expanded', String(!list.classList.contains('hidden')));
     }
 }
 
@@ -594,7 +730,7 @@ export async function selectTableItem(name, type) {
     state.sortedColumn = null;
     state.sortAscending = true;
     state.filterQuery = '';
-    state.columnFilters = {};
+    state.columnFilters = createSafeColumnState();
     if (state.filterTimer !== null) clearTimeout(state.filterTimer);
     state.filterTimer = null;
     state.filterApplyPending = false;
@@ -603,11 +739,27 @@ export async function selectTableItem(name, type) {
     state.selectedRowIds.clear();
     state.selectedCells = [];
     state.lastSelectedCell = null;
+    state.lastSelectedColumnIndex = null;
+    state.lastSelectedRowIndex = null;
     state.selectedColumns.clear();
     state.pinnedColumns.clear();
     state.pinnedRowIds.clear();
-    state.columnWidths = {}; // Reset widths for new table
+    state.columnWidths = createSafeColumnState(); // Reset widths for new table
     state.scrollPosition = { top: 0, left: 0 };
+    // The mounted grid belongs to the previous table until both metadata and
+    // rows for this selection commit. Remove every index/identity sidecar now,
+    // before the first await, so old DOM cannot issue an edit against `name`.
+    state.tableColumns = [];
+    state.gridData = [];
+    state.gridExactIntegerTexts = {};
+    state.gridOversizedCells = {};
+    state.gridReadOnlyRowReasons = {};
+    state.keysetAnchors = null;
+    state.renderedTable = null;
+    state.editingCellInfo = null;
+    state.activeCellInput = null;
+    showLoading();
+    updateToolbarButtons();
 
     // Update UI
     renderSidebar();
@@ -624,13 +776,23 @@ export async function selectTableItem(name, type) {
     const clearFilterButton = document.getElementById('btnClearFilter');
     if (clearFilterButton) clearFilterButton.hidden = true;
 
-    await loadTableColumns();
+    if (!await loadTableColumns()) {
+        if (state.selectedTable === name && state.selectedTableType === type) {
+            showErrorState('Unable to load table columns');
+            updateToolbarButtons();
+        }
+        return;
+    }
+    if (state.selectedTable !== name || state.selectedTableType !== type) return;
     await loadTableData(true, false);
+    if (state.selectedTable !== name || state.selectedTableType !== type) return;
     persistState();
 }
 
 export async function reloadFromDisk() {
-    if (!state.isDbConnected) return;
+    if (!state.isDbConnected || isReloadingFromDisk) return;
+
+    isReloadingFromDisk = true;
 
     try {
         updateStatus('Reloading...');
@@ -638,17 +800,63 @@ export async function reloadFromDisk() {
         // no cached count survives it.
         invalidateAllCounts();
         const connectionResult = await backendApi.refreshFile();
+        if (connectionResult?.cancelled) {
+            updateStatus('Reload cancelled');
+            return;
+        }
         if (connectionResult?.connected === true) {
             applyConnectionResult(connectionResult);
+            closeDatabaseTargetModals({ connectionReplaced: true });
         }
-        await refreshSchema();
+        // The successful reopen has replaced the logical database even when
+        // table names and rowids collide. Clear generation-bound identity state
+        // in this promise continuation, before the browser can dispatch another
+        // input event against the newly active connection.
+        clearSelection();
+        state.pinnedRowIds.clear();
+        state.pinnedColumns.clear();
+        state.tableColumns = [];
+        state.gridData = [];
+        state.gridExactIntegerTexts = {};
+        state.gridOversizedCells = {};
+        state.gridReadOnlyRowReasons = {};
+        state.keysetAnchors = null;
+        state.renderedTable = null;
+        state.editingCellInfo = null;
+        state.activeCellInput = null;
+        showLoading();
+        updateToolbarButtons();
+        persistState();
+        if (!await refreshSchema()) return;
+        const selectedObjectExists = state.schemaCache.tables.some(
+            table => table.name === state.selectedTable
+        ) || state.schemaCache.views.some(view => view.name === state.selectedTable);
+        if (state.selectedTable && !selectedObjectExists) {
+            state.selectedTable = null;
+            state.selectedTableType = null;
+            state.selectedTableIdentity = null;
+            const tableNameLabel = document.getElementById('tableNameLabel');
+            if (tableNameLabel) tableNameLabel.textContent = 'No table selected';
+            showEmptyState();
+            updateToolbarButtons();
+            persistState();
+            updateStatus(connectionResult?.cancelled ? 'Reload cancelled' : 'Reloaded');
+            return;
+        }
         if (state.selectedTable) {
-            await loadTableColumns();
-            await loadTableData();
+            if (!await loadTableColumns()) return;
+            if (!await loadTableData()) return;
         }
-        updateStatus('Reloaded');
+        updateStatus(connectionResult?.cancelled ? 'Reload cancelled' : 'Reloaded');
     } catch (err) {
         console.error('Reload failed:', err);
-        updateStatus(`Reload failed: ${err.message}`);
+        const message = getErrorMessage(err);
+        if (err?.name === 'Canceled' || err?.name === 'CancellationError' || /^cancel(?:led|ed)$/i.test(message)) {
+            updateStatus('Reload cancelled');
+        } else {
+            updateStatus(`Reload failed: ${message}`);
+        }
+    } finally {
+        isReloadingFromDisk = false;
     }
 }

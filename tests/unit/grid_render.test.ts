@@ -15,6 +15,7 @@ class FakeNode {
     textContent = '';
     title = '';
     ariaLabel = '';
+    tabIndex = -1;
     hidden = false;
     value = '';
     scrollLeft = 0;
@@ -28,6 +29,10 @@ class FakeNode {
     appendChild(child: FakeNode) {
         this.children.push(child);
         return child;
+    }
+
+    setAttribute(name: string, value: string) {
+        (this as any)[name] = value;
     }
 
     set innerHTML(value: string) {
@@ -130,12 +135,15 @@ describe('grid header rendering', () => {
         const headerText = findByClass(container, 'header-text');
         const filterInput = findByClass(container, 'column-filter');
         const clearButton = findByClass(container, 'filter-clear-btn');
+        const applyButton = findByClass(container, 'filter-apply-btn');
         assert.ok(headerText);
         assert.ok(filterInput);
         assert.ok(clearButton);
+        assert.ok(applyButton);
         assert.strictEqual(headerText.textContent, hostileColumn);
         assert.strictEqual(filterInput.value, hostileFilter);
         assert.strictEqual(clearButton.ariaLabel, `Clear filter for ${hostileColumn}`);
+        assert.strictEqual(applyButton.ariaLabel, `Search column ${hostileColumn}`);
         assert.strictEqual(clearButton.hidden, false);
     });
 
@@ -186,7 +194,7 @@ describe('grid header rendering', () => {
         assert.strictEqual(text.children.map(child => child.textContent).join(''), '9007199254740993');
     });
 
-    it('renders bounded oversized previews with exact storage and byte metadata', async () => {
+    it('renders bounded previews with exact metadata and a full-content affordance', async () => {
         const { state } = await import(stateModulePath);
         const { renderDataGrid } = await import(gridRenderModulePath);
         const elements = new Map<string, FakeNode>([
@@ -229,12 +237,114 @@ describe('grid header rendering', () => {
 
         const oversized = findAllByClass(elements.get('gridContainer')!, 'oversized-cell');
         assert.strictEqual(oversized.length, 2);
-        assert.match(collectText(oversized[0]), /^ab… · TEXT · 12 bytes · too large to edit inline$/);
-        assert.match(collectText(oversized[1]), /^de ad… · BLOB · 20 bytes · too large to edit inline$/);
-        assert.strictEqual(findAllByClass(elements.get('gridContainer')!, 'expand-icon').length, 0);
+        assert.match(
+            collectText(oversized[0]),
+            /^ab… · TEXT · 12 bytes · full byte-exact value not shown in grid$/
+        );
+        assert.match(
+            collectText(oversized[1]),
+            /^de ad… · BLOB · 20 bytes · full byte-exact value not shown in grid$/
+        );
+        const expandIcons = findAllByClass(elements.get('gridContainer')!, 'expand-icon');
+        assert.strictEqual(expandIcons.length, 2);
+        assert.ok(expandIcons.every(icon => icon.title === 'View full content'));
         const readOnlyRow = findByClass(elements.get('gridContainer')!, 'read-only-row');
         assert.ok(readOnlyRow);
         assert.strictEqual(readOnlyRow.title, 'Primary-key identity was not transported.');
+    });
+
+    it('does not claim a one-byte contained TEXT value is too large', async () => {
+        const { state } = await import(stateModulePath);
+        const { renderDataGrid } = await import(gridRenderModulePath);
+        const elements = new Map<string, FakeNode>([
+            ['gridContainer', new FakeNode('div')],
+            ['pageIndicator', new FakeNode('span')],
+            ['btnFirst', new FakeNode('button')],
+            ['btnPrev', new FakeNode('button')],
+            ['btnNext', new FakeNode('button')],
+            ['btnLast', new FakeNode('button')]
+        ]);
+        (globalThis as any).document = {
+            createElement(tagName: string) { return new FakeNode(tagName); },
+            createDocumentFragment() { return new FakeNode('#fragment'); },
+            createTextNode(text: string) {
+                const node = new FakeNode('#text');
+                node.textContent = text;
+                return node;
+            },
+            getElementById(id: string) { return elements.get(id) ?? null; },
+            querySelectorAll() { return []; },
+            querySelector() { return null; }
+        };
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'unsafe_text', type: 'TEXT', isPrimaryKey: false }];
+        state.gridData = [[1, Uint8Array.of(0x80)]];
+        state.gridOversizedCells = {
+            0: { 1: { storageClass: 'text', byteLength: 1 } }
+        };
+        state.totalPageCount = 1;
+        state.currentPageIndex = 0;
+
+        renderDataGrid();
+
+        const cell = findByClass(elements.get('gridContainer')!, 'oversized-cell');
+        assert.ok(cell);
+        assert.strictEqual(
+            cell.title,
+            'Inline text editing unavailable because the stored TEXT cannot be represented safely. ' +
+            'The full byte-exact raw value is available in the Hex inspector. ' +
+            'Use Replace to overwrite it (TEXT, 1 byte).'
+        );
+        assert.doesNotMatch(cell.title, /too large/i);
+        assert.strictEqual(
+            collectText(cell),
+            '80 · TEXT · 1 byte · full byte-exact raw value'
+        );
+        const expand = findByClass(cell, 'expand-icon');
+        assert.ok(expand);
+        assert.strictEqual(expand.title, 'Inspect raw TEXT bytes');
+        assert.strictEqual(expand.ariaLabel, 'Inspect raw TEXT bytes for unsafe_text, row 1');
+    });
+
+    it('renders semantic controls and one keyboard entry point for grid actions', async () => {
+        const { state } = await import(stateModulePath);
+        const { renderDataGrid } = await import(gridRenderModulePath);
+        const container = new FakeNode('div');
+        (globalThis as any).document = {
+            createElement(tagName: string) { return new FakeNode(tagName); },
+            createDocumentFragment() { return new FakeNode('#fragment'); },
+            createTextNode(text: string) {
+                const node = new FakeNode('#text');
+                node.textContent = text;
+                return node;
+            },
+            getElementById(id: string) { return id === 'gridContainer' ? container : null; },
+            querySelectorAll() { return []; },
+            querySelector() { return null; }
+        };
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'body', type: 'TEXT', isPrimaryKey: false }];
+        state.gridData = [[7, 'readable value']];
+        state.totalPageCount = 1;
+        state.currentPageIndex = 0;
+
+        renderDataGrid();
+
+        assert.strictEqual(findByClass(container, 'row-select-all-button')?.tagName, 'BUTTON');
+        assert.strictEqual(findByClass(container, 'header-sort-button')?.tagName, 'BUTTON');
+        assert.strictEqual(findByClass(container, 'select-column-icon')?.tagName, 'BUTTON');
+        assert.strictEqual(findAllByClass(container, 'pin-icon').every(node => node.tagName === 'BUTTON'), true);
+        assert.strictEqual(findByClass(container, 'row-select-button')?.tagName, 'BUTTON');
+        assert.strictEqual(findByClass(container, 'expand-icon')?.tagName, 'BUTTON');
+
+        const resize = findByClass(container, 'resize-handle');
+        assert.ok(resize);
+        assert.strictEqual((resize as any).role, 'separator');
+        assert.strictEqual(resize.tabIndex, 0);
+
+        const cells = findAllByClass(container, 'data-cell')
+            .filter(cell => !cell.className.split(/\s+/).includes('row-number'));
+        assert.deepStrictEqual(cells.map(cell => cell.tabIndex), [0]);
     });
 
     it('highlights only cells whose SQLite-comparable value matches the global filter', async () => {

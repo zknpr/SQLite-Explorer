@@ -17,12 +17,20 @@ import {
     escapeJsonSafeNumberString,
     rpcErrorFields
 } from './transport.js';
+import { getErrorMessage } from './utils.js';
 import {
     CellEditPolicyError,
     DEFAULT_MAX_CELL_EDIT_BYTES,
     formatOversizedCellReplacementWarning,
-    isOversizedCellReplacementConflictError
+    isOversizedCellReplacementConflictError,
+    MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS,
+    OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE
 } from '../../../src/core/cell-edit-policy.ts';
+import {
+    isViewDefinitionConflictError,
+    MAX_VIEW_DEFINITION_CONFIRMATION_ATTEMPTS,
+    VIEW_DEFINITION_RETRY_EXHAUSTED_MESSAGE
+} from '../../../src/core/view-utils.ts';
 
 export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
 
@@ -37,6 +45,31 @@ const parentOriginReady = lockedParentOrigin
     : new Promise(resolve => {
         resolveParentOrigin = resolve;
     });
+const PARENT_ORIGIN_HANDSHAKE_TIMEOUT_MS = 10_000;
+
+export async function waitForParentOrigin({
+    originPromise = parentOriginReady,
+    lockedOrigin = lockedParentOrigin,
+    timeoutMs = PARENT_ORIGIN_HANDSHAKE_TIMEOUT_MS
+} = {}) {
+    if (lockedOrigin !== null) return lockedOrigin;
+    let timeoutId;
+    try {
+        return await Promise.race([
+            originPromise,
+            new Promise((_, reject) => {
+                timeoutId = setTimeout(() => {
+                    reject(new Error(
+                        `Parent origin handshake timed out after ` +
+                        `${timeoutMs}ms`
+                    ));
+                }, timeoutMs);
+            })
+        ]);
+    } finally {
+        if (timeoutId !== undefined) clearTimeout(timeoutId);
+    }
+}
 
 /**
  * Accept messages only from the embedding window and lock Firefox-style
@@ -204,7 +237,12 @@ async function serializeValueAsync(value) {
     if (value && typeof value === 'object' && Object.prototype.toString.call(value) === '[object Object]') {
         const result = {};
         for (const key of Object.keys(value)) {
-            result[key] = await serializeValueAsync(value[key]);
+            Object.defineProperty(result, key, {
+                value: await serializeValueAsync(value[key]),
+                enumerable: true,
+                configurable: true,
+                writable: true
+            });
         }
         return result;
     }
@@ -262,7 +300,12 @@ function deserializeValue(value) {
         // Recursively deserialize object properties
         const result = {};
         for (const key of Object.keys(value)) {
-            result[key] = deserializeValue(value[key]);
+            Object.defineProperty(result, key, {
+                value: deserializeValue(value[key]),
+                enumerable: true,
+                configurable: true,
+                writable: true
+            });
         }
         return result;
     }
@@ -292,7 +335,7 @@ export async function sendRpcRequest(method, args) {
     // Serialize args asynchronously to handle Uint8Array without blocking UI
     // This is done before setting up the timeout to ensure encoding time is included
     const serializedArgs = await serializeArgsAsync(args);
-    const targetOrigin = await parentOriginReady;
+    const targetOrigin = await waitForParentOrigin();
     const outboundMessage = {
         channel: 'rpc',
         content: {
@@ -318,7 +361,14 @@ export async function sendRpcRequest(method, args) {
         pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
 
         // Post message to parent window instead of VS Code API
-        parentWindow.postMessage(outboundMessage, targetOrigin);
+        try {
+            parentWindow.postMessage(outboundMessage, targetOrigin);
+        } catch (error) {
+            if (pendingRpcCalls.delete(messageId)) {
+                if (timeoutId !== undefined) clearTimeout(timeoutId);
+                reject(error);
+            }
+        }
     });
 }
 
@@ -377,7 +427,7 @@ export function sendRpcError(correlationId, error) {
     const message = {
         kind: 'result',
         correlationId,
-        errorText: error instanceof Error ? error.message : String(error),
+        errorText: getErrorMessage(error),
         ...rpcErrorFields(error)
     };
     assertWebviewTransportPayload(message, {
@@ -389,18 +439,16 @@ export function sendRpcError(correlationId, error) {
 // Backend API proxy
 export const backendApi = {
     initialize: () => sendRpcRequest('initialize', []),
-    exportDb: (filename) => sendRpcRequest('exportDb', [filename]),
     refreshFile: () => sendRpcRequest('refreshFile', []),
     // The standalone demo has no VS Code globalState; keep the shared resize
     // lifecycle callable without pretending the width persists outside it.
     saveSidebarState: async () => undefined,
-    fireEditEvent: (edit) => sendRpcRequest('fireEditEvent', [edit]),
     exportTable: (dbParams, columns, dbOptions, tableStore, exportOptions, extras) =>
         sendRpcRequest('exportTable', [dbParams, columns, dbOptions, tableStore, exportOptions, extras]),
 
     // Database operations
-    updateCell: async (table, rowId, column, value, originalValue) => {
-        while (true) {
+    updateCell: async (table, rowId, column, value, _originalValue) => {
+        for (let attempt = 1; attempt <= MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS; attempt++) {
             const metadata = await sendRpcRequest('getCellMetadata', [{
                 table,
                 rowId,
@@ -430,7 +478,12 @@ export const backendApi = {
                         DEFAULT_MAX_CELL_EDIT_BYTES
                     ]);
                 } catch (error) {
-                    if (isOversizedCellReplacementConflictError(error)) continue;
+                    if (isOversizedCellReplacementConflictError(error)) {
+                        if (attempt < MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS) continue;
+                        throw new Error(OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE, {
+                            cause: error
+                        });
+                    }
                     throw error;
                 }
             }
@@ -439,10 +492,11 @@ export const backendApi = {
                 rowId,
                 column,
                 value,
-                originalValue,
+                undefined,
                 DEFAULT_MAX_CELL_EDIT_BYTES
             ]);
         }
+        throw new Error(OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE);
     },
     getCellMetadata: (target) => sendRpcRequest('getCellMetadata', [target]),
     openCellReadSession: (target) => sendRpcRequest('openCellReadSession', [target]),
@@ -455,7 +509,36 @@ export const backendApi = {
         [table, data, DEFAULT_MAX_CELL_EDIT_BYTES]
     ),
     deleteRows: (table, rowIds) => sendRpcRequest('deleteRows', [table, rowIds]),
-    deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),
+    deleteColumns: async (table, columns) => {
+        const dependentIndexes = await sendRpcRequest(
+            'findDependentIndexes',
+            [table, columns]
+        );
+        if (!Array.isArray(dependentIndexes)) {
+            throw new Error('Invalid dependent-index response from demo worker');
+        }
+        const indexNames = dependentIndexes.map(index => {
+            if (
+                !index
+                || typeof index !== 'object'
+                || typeof index.identifier !== 'string'
+                || typeof index.sql !== 'string'
+            ) {
+                throw new Error('Invalid dependent-index definition from demo worker');
+            }
+            return index.identifier;
+        });
+        if (
+            indexNames.length > 0
+            && !window.confirm(
+                `The following indexes depend on the selected column(s) and will be ` +
+                `permanently dropped: ${indexNames.join(', ')}. Continue?`
+            )
+        ) {
+            return { cancelled: true };
+        }
+        return sendRpcRequest('deleteColumns', [table, columns, dependentIndexes]);
+    },
     createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
     getViewDefinition: (view) => sendRpcRequest('getViewDefinition', [view]),
     validateViewDefinition: (view, selectSql, intent) =>
@@ -469,7 +552,7 @@ export const backendApi = {
             const current = await sendRpcRequest('getViewDefinition', [view]);
             // Bind the mutation to the exact trigger set shown in this dialog;
             // the worker rechecks it atomically inside the edit savepoint.
-            triggerSnapshot ??= current.triggers ?? [];
+            triggerSnapshot = current.triggers ?? [];
             if (current.triggers?.length > 0) {
                 const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
                 if (!window.confirm(
@@ -489,17 +572,32 @@ export const backendApi = {
         ]);
     },
     dropView: async (view) => {
-        const current = await sendRpcRequest('getViewDefinition', [view]);
-        const triggerSnapshot = current.triggers ?? [];
-        const triggerNames = triggerSnapshot.map(trigger => trigger.identifier).join(', ');
-        const message = triggerNames
-            ? `Drop view "${view}"? This will permanently drop its INSTEAD OF triggers: ${triggerNames}.`
-            : `Drop view "${view}"?`;
-        if (!window.confirm(message)) {
-            return { cancelled: true };
+        for (let attempt = 1; attempt <= MAX_VIEW_DEFINITION_CONFIRMATION_ATTEMPTS; attempt++) {
+            const current = await sendRpcRequest('getViewDefinition', [view]);
+            const triggerSnapshot = current.triggers ?? [];
+            const triggerNames = triggerSnapshot.map(trigger => trigger.identifier).join(', ');
+            const message = triggerNames
+                ? `Drop view "${view}"? This will permanently drop its INSTEAD OF triggers: ${triggerNames}.`
+                : `Drop view "${view}"?`;
+            if (!window.confirm(message)) {
+                return { cancelled: true };
+            }
+            try {
+                return await sendRpcRequest('dropView', [view, current.sql, triggerSnapshot]);
+            } catch (error) {
+                if (isViewDefinitionConflictError(error)) {
+                    if (attempt < MAX_VIEW_DEFINITION_CONFIRMATION_ATTEMPTS) continue;
+                    throw new Error(VIEW_DEFINITION_RETRY_EXHAUSTED_MESSAGE, { cause: error });
+                }
+                throw error;
+            }
         }
-        return sendRpcRequest('dropView', [view, current.sql, triggerSnapshot]);
+        throw new Error(VIEW_DEFINITION_RETRY_EXHAUSTED_MESSAGE);
     },
+    confirmLargeSelection: async (itemCount, unit) => window.confirm(
+        `Selecting ${Number(itemCount).toLocaleString()} ${unit} may slow or freeze this page. ` +
+        'Use Export for large data operations. Continue?'
+    ),
     updateCellBatch: (table, updates, label) => sendRpcRequest(
         'updateCellBatch',
         [table, updates, label, DEFAULT_MAX_CELL_EDIT_BYTES]
@@ -528,6 +626,7 @@ export const backendApi = {
                 'Only the bounded Text/Hex preview is available; transferable streaming is not implemented.'
         });
     },
+    cancelCellMediaPreview: () => Promise.resolve(),
     releaseCellMediaPreview: () => Promise.resolve(),
     openCellEditor: (_params, _rowId, _colName, _colTypes, options = {}) => Promise.resolve({
         success: false,
@@ -537,21 +636,33 @@ export const backendApi = {
     }),
     openViewEditor: () => Promise.resolve({ success: false, message: 'Not available in web mode' }),
     readWorkspaceFileUri: () => Promise.resolve(null),
-    triggerUndo: () => Promise.resolve(),
-    triggerRedo: () => Promise.resolve(),
 
     // Web-compatible implementations for Blob Inspector
-    saveFile: (filename, data) => {
+    saveFile: async (filename, data) => {
         const blob = new Blob([data]);
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
         a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setTimeout(() => URL.revokeObjectURL(url), 100);
-        return Promise.resolve();
+        let appended = false;
+        let clicked = false;
+        try {
+            document.body.appendChild(a);
+            appended = true;
+            a.click();
+            clicked = true;
+            return { success: true };
+        } finally {
+            try {
+                if (appended) document.body.removeChild(a);
+            } finally {
+                if (clicked) {
+                    setTimeout(() => URL.revokeObjectURL(url), 100);
+                } else {
+                    URL.revokeObjectURL(url);
+                }
+            }
+        }
     },
     selectFile: () => {
         return new Promise((resolve, reject) => {
@@ -598,9 +709,22 @@ export const backendApi = {
                     cleanup();
                 }
             };
+            // Chromium fires `cancel` when the picker closes without a file.
+            // Resolve explicitly so BlobInspector can release its replacement
+            // operation instead of remaining permanently busy. Do not remove
+            // the input on a timer: users may legitimately keep the native
+            // picker open for longer than one second before choosing a file.
+            input.oncancel = () => {
+                resolve(undefined);
+                cleanup();
+            };
             parent.appendChild(input);
-            input.click();
-            setTimeout(cleanup, 1000);
+            try {
+                input.click();
+            } catch (error) {
+                cleanup();
+                reject(error);
+            }
         });
     }
 };

@@ -7,6 +7,7 @@ import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-
 import type { DatabaseOperations } from '../../src/core/types';
 import {
     assertViewTriggersCompatibleWithColumns,
+    buildCreateViewTriggerSql,
     mapViewTriggerRows
 } from '../../src/core/view-utils';
 
@@ -95,6 +96,36 @@ describe('view trigger single-quoted identifiers', () => {
         assert.strictEqual(mainRows.triggers.length, 1);
         assert.strictEqual(mainRows.triggers[0].temporary, true);
         assert.deepStrictEqual(mainRows.ambiguousTemporaryTriggerNames, []);
+    });
+
+    it('keeps unqualified TEMP targets unresolved even without a current TEMP shadow', () => {
+        const mapped = mapViewTriggerRows('v', [
+            [],
+            [[
+                'historical trigger',
+                'CREATE TRIGGER "historical trigger" INSTEAD OF INSERT ON v BEGIN SELECT 1; END',
+                0
+            ]]
+        ]);
+
+        assert.deepStrictEqual(mapped.triggers, []);
+        assert.deepStrictEqual(mapped.ambiguousTemporaryTriggerNames, []);
+        assert.deepStrictEqual(
+            mapped.unqualifiedTemporaryTriggers.map(trigger => trigger.identifier),
+            ['historical trigger']
+        );
+    });
+
+    it('recreates a proven unqualified TEMP trigger with an explicit main target', () => {
+        const sql = buildCreateViewTriggerSql({
+            identifier: 'quoted temp trigger',
+            temporary: true,
+            sql: "CREATE TRIGGER 'quoted temp trigger' INSTEAD OF INSERT ON 'quoted view' " +
+                'BEGIN SELECT 1; END'
+        });
+
+        assert.match(sql, /^CREATE TEMP TRIGGER 'quoted temp trigger'/i);
+        assert.match(sql, /ON main\.'quoted view'/i);
     });
 
     it('edits a view whose stored trigger uses single-quoted identifiers', async () => {

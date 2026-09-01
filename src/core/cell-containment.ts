@@ -19,6 +19,7 @@ export const DEFAULT_MAX_PAGE_RESPONSE_BYTES = 16 * 1024 * 1024;
 export const MIN_SQL_INLINE_CELL_BYTES = 256;
 export const DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES =
   2 * DEFAULT_MAX_PAGE_RESPONSE_BYTES;
+export const MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES = 64 * 1024;
 export const WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES = 40;
 
 // Reserve space outside the per-cell model for response/header keys, row-map
@@ -41,9 +42,9 @@ export const SQLITE_MAX_RESULT_COLUMNS = 2000;
 
 export interface CellContainmentQuery {
   sql: string;
-  /** Separate one-column metadata read when the value projection fills SQLite's width. */
-  metadataSql?: string;
-  /** Columns returned by sql before separately fetched metadata is inserted. */
+  /** The final transport row packs metadata when values fill SQLite's width. */
+  metadataTrailer: boolean;
+  /** Columns returned by sql before packed metadata is inserted. */
   primaryTransportColumnCount: number;
   /** Original value columns, excluding the packed metadata transport column. */
   valueColumnCount: number;
@@ -210,32 +211,36 @@ export function buildCellContainmentQuery(
   const privateProjection = rawTextExpressions.length > 0
     ? `, ${rawTextExpressions.join(', ')}`
     : '';
+  const metadataUsesTrailer = columnCount + 1 > SQLITE_MAX_RESULT_COLUMNS;
   const sourceCte =
-    `WITH ${quotedSource} (${quotedValues.join(', ')}) AS (\n` +
+    `WITH ${quotedSource} (${quotedValues.join(', ')}) AS` +
+    `${metadataUsesTrailer ? ' MATERIALIZED' : ''} (\n` +
     `SELECT * FROM (\n${sourceSql}\n) LIMIT -1 OFFSET 0\n)\n`;
-  const metadataMustBeFetchedSeparately = columnCount + 1 > SQLITE_MAX_RESULT_COLUMNS;
-  const primaryMetadataProjection = metadataMustBeFetchedSeparately
+  const primaryMetadataProjection = metadataUsesTrailer
     ? ''
     : `, ${metadataExpression} AS ${escapeIdentifier(CELL_METADATA_ALIAS)}`;
+  const metadataTrailerProjection = metadataUsesTrailer
+    ? (
+        `\nUNION ALL\nSELECT ` +
+        `(SELECT COALESCE(group_concat(${metadataExpression}, char(10)), '') ` +
+        `FROM ${quotedSource})` +
+        `${columnCount > 1 ? `, ${Array(columnCount - 1).fill('NULL').join(', ')}` : ''}`
+      )
+    : '';
 
   return {
-    // OFFSET prevents query flattening so volatile view expressions are
-    // evaluated once before their value, typeof, and octet_length are reused.
+    // OFFSET prevents query flattening. At the width ceiling, MATERIALIZED
+    // lets the value rows and their one-row metadata trailer scan the same
+    // ephemeral result instead of evaluating a volatile source twice.
     sql:
       sourceCte +
       `SELECT ${projectedValues.join(', ')}` +
       `${primaryMetadataProjection}${privateProjection} ` +
-      `FROM ${quotedSource}`,
-    ...(metadataMustBeFetchedSeparately ? {
-      // Grid callers execute this before releasing the same serialized read
-      // (and, for native files, the same WAL snapshot) as the value query.
-      metadataSql:
-        sourceCte +
-        `SELECT ${metadataExpression} AS ${escapeIdentifier(CELL_METADATA_ALIAS)} ` +
-        `FROM ${quotedSource}`
-    } : {}),
+      `FROM ${quotedSource}` +
+      metadataTrailerProjection,
+    metadataTrailer: metadataUsesTrailer,
     primaryTransportColumnCount:
-      columnCount + (metadataMustBeFetchedSeparately ? 0 : 1) + projectedRawTextColumnIndices.length,
+      columnCount + (metadataUsesTrailer ? 0 : 1) + projectedRawTextColumnIndices.length,
     valueColumnCount: columnCount,
     metadataColumnIndex: columnCount,
     transportColumnCount: columnCount + 1 + projectedRawTextColumnIndices.length,
@@ -247,40 +252,44 @@ export function buildCellContainmentQuery(
   };
 }
 
-/** Insert a separately fetched metadata column at its logical transport slot. */
+/** Insert packed metadata at its logical transport slot. */
 export function mergeCellContainmentMetadataRows(
   primaryRows: readonly (readonly unknown[])[],
   metadataRows: readonly (readonly unknown[])[] | undefined,
   query: Pick<
     CellContainmentQuery,
-    'metadataSql' | 'metadataColumnIndex' | 'primaryTransportColumnCount'
+    'metadataTrailer' | 'metadataColumnIndex' | 'primaryTransportColumnCount'
   >
 ): Array<Array<unknown>> {
-  if (!query.metadataSql) {
+  if (!query.metadataTrailer) {
     if (metadataRows !== undefined) {
       throw new Error('Cell containment received unexpected separate metadata rows');
     }
     return primaryRows as Array<Array<unknown>>;
   }
-  if (metadataRows === undefined) {
-    if (primaryRows.length === 0) return [];
-    throw new Error('Cell containment metadata row count does not match the value page');
+  if (metadataRows !== undefined) {
+    throw new Error('Cell containment metadata must come from the value statement');
   }
-  if (metadataRows.length !== primaryRows.length) {
+  const trailer = primaryRows.at(-1);
+  if (!trailer || trailer.length !== query.primaryTransportColumnCount) {
+    throw new Error('Cell containment metadata trailer is missing or malformed');
+  }
+  if (typeof trailer[0] !== 'string' || trailer.slice(1).some(value => value !== null)) {
+    throw new Error('Cell containment metadata trailer is not one packed text value');
+  }
+  const valueRows = primaryRows.slice(0, -1);
+  const packedMetadataRows = trailer[0] === '' ? [] : trailer[0].split('\n');
+  if (packedMetadataRows.length !== valueRows.length) {
     throw new Error('Cell containment metadata row count does not match the value page');
   }
 
-  return primaryRows.map((row, rowIndex) => {
+  return valueRows.map((row, rowIndex) => {
     if (row.length < query.primaryTransportColumnCount) {
       throw new Error(`Cell containment value row ${rowIndex} is missing transport columns`);
     }
-    const metadataRow = metadataRows[rowIndex];
-    if (!metadataRow || metadataRow.length !== 1 || typeof metadataRow[0] !== 'string') {
-      throw new Error(`Cell containment metadata row ${rowIndex} is not one packed text value`);
-    }
     return [
       ...row.slice(0, query.metadataColumnIndex),
-      metadataRow[0],
+      packedMetadataRows[rowIndex],
       ...row.slice(query.metadataColumnIndex)
     ];
   });
@@ -407,6 +416,132 @@ export function findUnrepresentableTextRows(input: {
   return unrepresentableRows;
 }
 
+/**
+ * Replace decoded TEXT cells whose JavaScript string cannot reproduce the
+ * stored SQLite bytes with a bounded authoritative byte prefix. The sparse
+ * sidecar still blocks lossy inline edits, while identityless view rows retain
+ * useful Hex data instead of depending on a table-only streaming locator.
+ */
+export function containUnrepresentableTextCells(input: {
+  sourceRows: readonly (readonly unknown[])[];
+  rawTextRows: readonly (readonly (Uint8Array | null)[])[];
+  rawTextColumnIndices: readonly number[];
+  textEncoding: CellTextEncoding;
+  contained: DecodedCellContainment;
+}): DecodedCellContainment {
+  if (
+    input.sourceRows.length !== input.contained.rows.length
+    || input.rawTextRows.length !== input.sourceRows.length
+  ) {
+    throw new Error('Raw TEXT containment row count does not match the source page');
+  }
+  const rows = input.contained.rows.map(row => Array.from(row));
+  let oversizedCells: OversizedCellMap | undefined;
+  if (input.contained.oversizedCells) {
+    oversizedCells = {};
+    for (const [rowIndexText, row] of Object.entries(input.contained.oversizedCells)) {
+      oversizedCells[Number(rowIndexText)] = { ...row };
+    }
+  }
+  let exactIntegerTexts: ExactIntegerTextMap | undefined;
+  if (input.contained.exactIntegerTexts) {
+    exactIntegerTexts = {};
+    for (const [rowIndexText, row] of Object.entries(input.contained.exactIntegerTexts)) {
+      exactIntegerTexts[Number(rowIndexText)] = { ...row };
+    }
+  }
+  const aggregateBudget =
+    DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES - WEBVIEW_GRID_RESPONSE_HEADROOM_BYTES;
+  let aggregateBytes = estimateRowsWireBytes(rows)
+    + estimateOversizedCellsWireBytes(oversizedCells)
+    + estimateExactIntegerTextsWireBytes(exactIntegerTexts);
+  const decoder = new TextDecoder(input.textEncoding, { fatal: true, ignoreBOM: true });
+  input.sourceRows.forEach((sourceRow, rowIndex) => {
+    const rawRow = input.rawTextRows[rowIndex];
+    if (!rawRow || rawRow.length !== input.rawTextColumnIndices.length) {
+      throw new Error(`Raw TEXT containment row ${rowIndex} has the wrong width`);
+    }
+    input.rawTextColumnIndices.forEach((columnIndex, rawIndex) => {
+      const sourceValue = sourceRow[columnIndex];
+      if (typeof sourceValue !== 'string') return;
+      // A size/page-contained cell is already routed through the raw reader.
+      if (oversizedCells?.[rowIndex]?.[columnIndex]) return;
+      const rawBytes = rawRow[rawIndex];
+      if (!(rawBytes instanceof Uint8Array)) {
+        throw new Error(
+          `Raw TEXT containment bytes are missing at row ${rowIndex}, column ${columnIndex}`
+        );
+      }
+      let representable = false;
+      try {
+        representable = decoder.decode(rawBytes) === sourceValue;
+      } catch {
+        representable = false;
+      }
+      if (representable) return;
+      const previousValue = rows[rowIndex][columnIndex];
+      const metadataInsertionBytes = oversizedMetadataInsertionWireBytes(
+        oversizedCells,
+        rowIndex,
+        columnIndex
+      );
+      oversizedCells ??= {};
+      oversizedCells[rowIndex] ??= {};
+      oversizedCells[rowIndex][columnIndex] = {
+        storageClass: 'text',
+        byteLength: rawBytes.byteLength
+      };
+      const replacementBudget = Math.max(
+        0,
+        aggregateBudget
+          - aggregateBytes
+          - metadataInsertionBytes
+          + transportedCellWireBytes(previousValue)
+      );
+      const maxRawBytesByWire = replacementBudget > WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES
+        ? Math.floor(
+            (replacementBudget - WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES) / 4
+          ) * 3
+        : 0;
+      const retainedByteLength = Math.min(
+        rawBytes.byteLength,
+        MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES,
+        maxRawBytesByWire
+      );
+      if (retainedByteLength === 0) {
+        throw new Error(
+          `Raw TEXT containment cannot retain an authoritative byte prefix ` +
+          `for row ${rowIndex}, column ${columnIndex} within the webview transport limit`
+        );
+      }
+      const replacementValue = rawBytes.slice(0, retainedByteLength);
+      rows[rowIndex][columnIndex] = replacementValue;
+      aggregateBytes += transportedCellWireBytes(replacementValue)
+        - transportedCellWireBytes(previousValue)
+        + metadataInsertionBytes;
+      if (exactIntegerTexts?.[rowIndex]) {
+        delete exactIntegerTexts[rowIndex][columnIndex];
+        if (Object.keys(exactIntegerTexts[rowIndex]).length === 0) {
+          delete exactIntegerTexts[rowIndex];
+        }
+      }
+    });
+  });
+  if (aggregateBytes > aggregateBudget) {
+    throw new Error(
+      `Raw TEXT containment cannot fit this page within the ` +
+      `${DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES}-byte transport limit`
+    );
+  }
+  return {
+    rows,
+    ...(oversizedCells ? { oversizedCells } : {}),
+    ...(exactIntegerTexts && Object.keys(exactIntegerTexts).length > 0
+      ? { exactIntegerTexts }
+      : {})
+  };
+}
+
 function parseMetadataToken(token: string, rowIndex: number, columnIndex: number) {
   if (token === '') return undefined;
   const match = /^([tb])([1-9]\d*)$/.exec(token);
@@ -497,6 +632,21 @@ function estimateOversizedCellsWireBytes(oversizedCells: OversizedCellMap | unde
     }
   }
   return bytes;
+}
+
+function oversizedMetadataInsertionWireBytes(
+  oversizedCells: OversizedCellMap | undefined,
+  rowIndex: number,
+  columnIndex: number
+): number {
+  if (oversizedCells?.[rowIndex]?.[columnIndex]) return 0;
+  const columnBytes = objectKeyWireBytes(String(columnIndex))
+    + OVERSIZED_CELL_METADATA_VALUE_BYTES;
+  const existingRow = oversizedCells?.[rowIndex];
+  if (existingRow) return 1 + columnBytes;
+  const rowBytes = objectKeyWireBytes(String(rowIndex)) + 2 + columnBytes;
+  if (oversizedCells) return 1 + rowBytes;
+  return 2 + rowBytes;
 }
 
 function estimateExactIntegerTextsWireBytes(exactIntegerTexts: ExactIntegerTextMap | undefined): number {
@@ -627,17 +777,6 @@ export function decodeCellContainment(
     + estimateOversizedCellsWireBytes(oversizedCells)
     + estimateExactIntegerTextsWireBytes(retainedExactIntegerTexts);
 
-  const metadataInsertionBytes = (rowIndex: number, columnIndex: number): number => {
-    if (oversizedCells?.[rowIndex]?.[columnIndex]) return 0;
-    const columnBytes = objectKeyWireBytes(String(columnIndex))
-      + OVERSIZED_CELL_METADATA_VALUE_BYTES;
-    const existingRow = oversizedCells?.[rowIndex];
-    if (existingRow) return 1 + columnBytes;
-    const rowBytes = objectKeyWireBytes(String(rowIndex)) + 2 + columnBytes;
-    if (oversizedCells) return 1 + rowBytes;
-    return 2 + rowBytes;
-  };
-
   for (
     let index = retainedInlineCells.length - 1;
     index >= 0 && aggregateBytes > aggregateBudget;
@@ -648,7 +787,11 @@ export function decodeCellContainment(
     const emptyValue = emptyInlinePreview(candidate.metadata.storageClass);
     const delta = transportedCellWireBytes(emptyValue)
       - transportedCellWireBytes(currentValue)
-      + metadataInsertionBytes(candidate.rowIndex, candidate.columnIndex);
+      + oversizedMetadataInsertionWireBytes(
+        oversizedCells,
+        candidate.rowIndex,
+        candidate.columnIndex
+      );
     if (delta >= 0) continue;
     recordOversizedCell(candidate.rowIndex, candidate.columnIndex, candidate.metadata);
     rows[candidate.rowIndex][candidate.columnIndex] = emptyValue;
@@ -711,6 +854,90 @@ function remapSparseColumns<T>(
     }
   }
   return remapped;
+}
+
+function omitSparseColumn<T>(
+  source: Record<number, Record<number, T>> | undefined,
+  omittedColumn: number
+): Record<number, Record<number, T>> | undefined {
+  if (!source) return undefined;
+  let retained: Record<number, Record<number, T>> | undefined;
+  for (const [rowIndexText, sourceRow] of Object.entries(source)) {
+    for (const [columnIndexText, value] of Object.entries(sourceRow)) {
+      const columnIndex = Number(columnIndexText);
+      if (columnIndex === omittedColumn) continue;
+      retained ??= {};
+      retained[Number(rowIndexText)] ??= {};
+      retained[Number(rowIndexText)][columnIndex] = value;
+    }
+  }
+  return retained;
+}
+
+export interface ShadowedRowIdContainmentInput {
+  rows: CellValue[][];
+  oversizedCells?: OversizedCellMap;
+  exactIntegerTexts?: ExactIntegerTextMap;
+  rowOffset?: number;
+}
+
+/**
+ * A declared `rowid` column makes every literal-rowid locator in the current
+ * identity contract resolve to user data instead of SQLite's intrinsic row.
+ * Keep the values viewable, but replace the synthetic leading identity with a
+ * non-mutable token. The duplicate visible `rowid` column remains untouched.
+ */
+export function remapShadowedRowIdContainment(
+  input: ShadowedRowIdContainmentInput
+): PrimaryKeyContainmentResult {
+  const reason =
+    'Row is read-only because a declared "rowid" column shadows SQLite\'s intrinsic row identity.';
+  const rowOffset = Number.isSafeInteger(input.rowOffset) && (input.rowOffset ?? 0) >= 0
+    ? input.rowOffset!
+    : 0;
+  let readOnlyRowReasons: ReadOnlyRowReasonMap | undefined;
+  const rows = input.rows.map((row, rowIndex) => {
+    if (row.length === 0) {
+      throw new Error(`Shadowed rowid result row ${rowIndex} has no identity slot`);
+    }
+    const rowOrdinal = rowOffset + rowIndex;
+    if (!Number.isSafeInteger(rowOrdinal)) {
+      throw new Error('Shadowed rowid result ordinal exceeds the safe integer range');
+    }
+    readOnlyRowReasons ??= {};
+    readOnlyRowReasons[rowIndex] = reason;
+    return [
+      encodeReadOnlyPrimaryKeyRecordId(reason, rowOrdinal),
+      ...row.slice(1)
+    ];
+  });
+  // The replaced identity value no longer has numeric/oversized sidecar data.
+  // A second, visible declared `rowid` column retains its own metadata slot.
+  const oversizedCells = omitSparseColumn(input.oversizedCells, 0) as OversizedCellMap | undefined;
+  const exactIntegerTexts = omitSparseColumn(
+    input.exactIntegerTexts,
+    0
+  ) as ExactIntegerTextMap | undefined;
+
+  const aggregateBudget =
+    DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES - WEBVIEW_GRID_RESPONSE_HEADROOM_BYTES;
+  const aggregateBytes = estimateRowsWireBytes(rows)
+    + estimateOversizedCellsWireBytes(oversizedCells)
+    + estimateExactIntegerTextsWireBytes(exactIntegerTexts)
+    + estimateReadOnlyRowReasonsWireBytes(readOnlyRowReasons);
+  if (aggregateBytes > aggregateBudget) {
+    throw new Error(
+      `Cell containment cannot fit this page within the ` +
+      `${DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES}-byte transport limit`
+    );
+  }
+
+  return {
+    rows,
+    ...(oversizedCells ? { oversizedCells } : {}),
+    ...(exactIntegerTexts ? { exactIntegerTexts } : {}),
+    ...(readOnlyRowReasons ? { readOnlyRowReasons } : {})
+  };
 }
 
 function boundedReasonIdentifier(identifier: string): string {
@@ -879,13 +1106,22 @@ export function remapPrimaryKeyContainment(
     ) {
       throw new Error(`Primary-key raw TEXT row missing at index ${rowIndex}`);
     }
-    const unrepresentableTextMembers = oversizedMembers.length > 0
-      ? []
-      : input.rawTextValidationUnavailable
-        ? input.identity.columns.map(column => column.identifier)
-        : input.identity.columns.flatMap((column, keyIndex) => {
+    // A byte-invalid TEXT key also has a sparse containment entry so the grid
+    // routes it to the raw inspector. Validate its authoritative bytes before
+    // classifying that entry as merely size-contained; otherwise a one-byte
+    // malformed key is mislabeled as exceeding an 800+ KiB inline limit.
+    const unrepresentableTextMembers = input.rawTextValidationUnavailable
+      ? input.identity.columns.map(column => column.identifier)
+      : input.identity.columns.flatMap((column, keyIndex) => {
           const value = identityRow[primaryKeyIndices[keyIndex]];
           if (typeof value !== 'string') return [];
+          const containment = input.oversizedCells?.[rowIndex]?.[primaryKeyIndices[keyIndex]];
+          if (containment && containment.byteLength > input.effectiveInlineCellBytes) {
+            // SQL deliberately returned only a bounded prefix, so comparing it
+            // with the complete raw companion would manufacture an encoding
+            // mismatch. The size-containment reason is authoritative here.
+            return [];
+          }
           const rawBytes = rawTextRow[rawTextSlots[keyIndex]];
           if (!(rawBytes instanceof Uint8Array)) return [column.identifier];
           try {
@@ -893,21 +1129,13 @@ export function remapPrimaryKeyContainment(
           } catch {
             return [column.identifier];
           }
-          });
+        });
     let recordId;
     if (input.rawTextValidationUnavailable) {
       unrepresentableTextKeyRows ??= new Set();
       unrepresentableTextKeyRows.add(rowIndex);
     }
-    if (oversizedMembers.length > 0) {
-      const reason = readOnlyPrimaryKeyReason(
-        oversizedMembers,
-        input.effectiveInlineCellBytes
-      );
-      readOnlyRowReasons ??= {};
-      readOnlyRowReasons[rowIndex] = reason;
-      recordId = encodeReadOnlyPrimaryKeyRecordId(reason, rowOffset + rowIndex);
-    } else if (unrepresentableTextMembers.length > 0) {
+    if (unrepresentableTextMembers.length > 0) {
       const reason = input.rawTextValidationUnavailable
         ? readOnlyPrimaryKeyValidationReason(unrepresentableTextMembers)
         : readOnlyPrimaryKeyTextReason(unrepresentableTextMembers, input.textEncoding);
@@ -915,6 +1143,14 @@ export function remapPrimaryKeyContainment(
       readOnlyRowReasons[rowIndex] = reason;
       unrepresentableTextKeyRows ??= new Set();
       unrepresentableTextKeyRows.add(rowIndex);
+      recordId = encodeReadOnlyPrimaryKeyRecordId(reason, rowOffset + rowIndex);
+    } else if (oversizedMembers.length > 0) {
+      const reason = readOnlyPrimaryKeyReason(
+        oversizedMembers,
+        input.effectiveInlineCellBytes
+      );
+      readOnlyRowReasons ??= {};
+      readOnlyRowReasons[rowIndex] = reason;
       recordId = encodeReadOnlyPrimaryKeyRecordId(reason, rowOffset + rowIndex);
     } else {
       recordId = encodePrimaryKeyRecordId(

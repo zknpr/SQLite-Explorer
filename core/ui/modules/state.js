@@ -11,6 +11,27 @@ import { saveVsCodeState } from './api.js';
  */
 export const DEFAULT_ROWS_PER_PAGE = 5000;
 
+/**
+ * Create a dictionary whose keys may be arbitrary SQLite identifiers. A plain
+ * object makes __proto__ an inherited setter and exposes constructor/toString
+ * as fake pre-existing values, corrupting column filters and widths.
+ */
+export function createSafeColumnState(source) {
+    const target = Object.create(null);
+    if (!source || typeof source !== 'object' || Array.isArray(source)) return target;
+    for (const key of Object.keys(source)) {
+        const descriptor = Object.getOwnPropertyDescriptor(source, key);
+        if (!descriptor || !('value' in descriptor)) continue;
+        Object.defineProperty(target, key, {
+            value: descriptor.value,
+            enumerable: true,
+            configurable: true,
+            writable: true
+        });
+    }
+    return target;
+}
+
 // Accepted page-size range. The upper bound mirrors the declared maximum of
 // sqliteExplorer.defaultPageSize in package.json so a hand-edited setting
 // cannot request a LIMIT that starves the per-page inline-cell byte budget
@@ -41,6 +62,13 @@ export function resolveStartupPageSize(configuredValue, persistedValue) {
 export const state = {
     isDbConnected: false,
     isReadOnly: false,
+    // Host connection identity. Async UI intents capture this so a reload
+    // cannot retarget them to an unrelated row with the same table/rowid.
+    connectionGeneration: 0,
+    // Advances for every external content broadcast, including same-engine
+    // edits. Row identities can be deleted and reused without changing the
+    // connection generation, so delayed destructive intents bind to both.
+    contentGeneration: 0,
     selectedTable: null,
     selectedTableType: 'table',
     selectedTableIdentity: null,
@@ -81,6 +109,8 @@ export const state = {
     activeCellInput: null,
     isSavingCell: false,
     isLoadingData: false,
+    isLoadingColumns: false,
+    isRefreshingContent: false,
     // Dedicated guard for "a grid data reload is in flight", owned solely by
     // loadTableData. Kept separate from isLoadingData (which BLOB uploads also set)
     // so the grid-interaction guards can't be cleared by an unrelated upload. The
@@ -98,13 +128,13 @@ export const state = {
     lastSelectedRowIndex: null,    // For row range selection
 
     // Column resize state
-    columnWidths: {},
+    columnWidths: createSafeColumnState(),
     resizingColumn: null,
     resizeStartX: 0,
     resizeStartWidth: 0,
 
     // Column filters
-    columnFilters: {},
+    columnFilters: createSafeColumnState(),
     // Filter drafts are copied from every visible input before asynchronous work.
     // A single debounce queue prevents overlapping reloads while preserving text
     // typed into the still-visible header during an in-flight replacement.
@@ -161,6 +191,7 @@ export function persistState() {
     if (_persistTimer) clearTimeout(_persistTimer);
     _persistTimer = setTimeout(() => {
         saveVsCodeState({
+            connectionGeneration: state.connectionGeneration,
             selectedTable: state.selectedTable,
             selectedTableType: state.selectedTableType,
             currentPageIndex: state.currentPageIndex,

@@ -9,15 +9,24 @@ import { noteCellValuesChanged } from './count-cache.js';
 import {
     getCellValueForDisplay,
     getCellMutationBlockReason,
+    getOrderedColumnIndices,
+    getOrderedRowIndices,
     getOversizedCellMetadata,
     getRowDataOffset,
     remapDisplayedRowIdentity,
     resolveDisplayedCell
 } from './data-utils.js';
-import { validateRowId, escapeIdentifier } from './utils.js';
+import { validateRowId, escapeIdentifier, getErrorMessage } from './utils.js';
 
 const TRUNCATED_COPY_NOTICE =
     'Copy blocked: selection contains truncated data. Use Open Full Content for one cell or Export for complete rows.';
+let isClearingSelectedCellValues = false;
+
+function cellSelectionSignature() {
+    return state.selectedCells.map(cell => (
+        `${typeof cell.rowId}:${String(cell.rowId)}\u0000${cell.colIdx}`
+    )).join('\u0001');
+}
 
 function refuseTruncatedCellSelection() {
     if (state.selectedCells.some(cell => getOversizedCellMetadata(cell.rowIdx, cell.colIdx))) {
@@ -66,8 +75,10 @@ export async function copyCellsToClipboard() {
             }
         } else {
             // Organize into grid
-            const rows = [...new Set(state.selectedCells.map(c => c.rowIdx))].sort((a, b) => a - b);
-            const cols = [...new Set(state.selectedCells.map(c => c.colIdx))].sort((a, b) => a - b);
+            const selectedRows = new Set(state.selectedCells.map(c => c.rowIdx));
+            const selectedColumns = new Set(state.selectedCells.map(c => c.colIdx));
+            const rows = getOrderedRowIndices().filter(index => selectedRows.has(index));
+            const cols = getOrderedColumnIndices().filter(index => selectedColumns.has(index));
 
             const cellMap = new Map();
             for (const cell of state.selectedCells) {
@@ -103,7 +114,7 @@ export async function copyCellsToClipboard() {
 
     } catch (err) {
         console.error('Copy failed:', err);
-        updateStatus('Copy failed: ' + err.message);
+        updateStatus('Copy failed: ' + getErrorMessage(err));
     }
 }
 
@@ -114,7 +125,7 @@ export async function copySelectedRowsToClipboard() {
     try {
         // Collect rows
         const dataRows = [];
-        for (let i = 0; i < state.gridData.length; i++) {
+        for (const i of getOrderedRowIndices()) {
             // Derive row ID to check against the selection set.
             // For tables, the row ID is always at index 0.
             // For views (which lack rowid), use the calculated pagination index.
@@ -127,7 +138,7 @@ export async function copySelectedRowsToClipboard() {
             }
 
             if (state.selectedRowIds.has(rowId)) {
-                const rowData = state.tableColumns.map((_column, colIdx) => {
+                const rowData = getOrderedColumnIndices().map(colIdx => {
                     const val = getCellValueForDisplay(row, i, colIdx);
                     if (val === null || val === undefined) return '';
                     if (val instanceof Uint8Array) return '[BLOB]';
@@ -137,7 +148,9 @@ export async function copySelectedRowsToClipboard() {
             }
         }
 
-        const headers = state.tableColumns.map(c => c.name).join('\t');
+        const headers = getOrderedColumnIndices()
+            .map(colIdx => state.tableColumns[colIdx].name)
+            .join('\t');
         const clipboardText = [headers, ...dataRows].join('\n');
 
         await navigator.clipboard.writeText(clipboardText);
@@ -145,12 +158,12 @@ export async function copySelectedRowsToClipboard() {
 
     } catch (err) {
         console.error('Copy failed:', err);
-        updateStatus('Copy failed: ' + err.message);
+        updateStatus('Copy failed: ' + getErrorMessage(err));
     }
 }
 
 export async function clearSelectedCellValues() {
-    if (state.selectedCells.length === 0) return;
+    if (isClearingSelectedCellValues || state.selectedCells.length === 0) return;
     if (state.isReadOnly || state.selectedTableType !== 'table') {
         updateStatus('Views are read-only');
         return;
@@ -163,71 +176,79 @@ export async function clearSelectedCellValues() {
         }
     }
 
+    const updates = [];
+    for (const cell of state.selectedCells) {
+        const column = state.tableColumns[cell.colIdx];
+        if (!column) continue;
+
+        const isNotNull = column.notnull === 1;
+        const newValue = isNotNull ? '' : null;
+
+        updates.push({
+            rowId: cell.rowId,
+            column: column.name,
+            value: newValue,
+            originalValue: cell.value,
+            rowIdx: cell.rowIdx,
+            colIdx: cell.colIdx
+        });
+    }
+
+    const label = `Clear ${updates.length} cell${updates.length > 1 ? 's' : ''}`;
+    const targetTable = state.selectedTable;
+    const targetSelectionSignature = cellSelectionSignature();
+    isClearingSelectedCellValues = true;
     try {
         updateStatus('Clearing cells...');
-
-        const updates = [];
-        for (const cell of state.selectedCells) {
-            const column = state.tableColumns[cell.colIdx];
-            if (!column) continue;
-
-            const isNotNull = column.notnull === 1;
-            const newValue = isNotNull ? '' : null;
-
-            updates.push({
-                rowId: cell.rowId,
-                column: column.name,
-                value: newValue,
-                originalValue: cell.value,
-                // Extra for local update
-                rowIdx: cell.rowIdx,
-                colIdx: cell.colIdx
-            });
-        }
-
-        const label = `Clear ${updates.length} cell${updates.length > 1 ? 's' : ''}`;
-        // Snapshot the target so the cache note below can never be applied to
-        // a table the user switched to while the batch RPC was in flight.
-        const targetTable = state.selectedTable;
         const outcomes = await backendApi.updateCellBatch(targetTable, updates, label);
         // Cleared values may leave an active filter's match set, so the
         // table's cached filtered counts are no longer trustworthy.
         noteCellValuesChanged(targetTable);
-        for (const outcome of outcomes ?? []) {
+        const stillOnTargetTable = state.selectedTable === targetTable;
+        for (const outcome of stillOnTargetTable ? outcomes ?? [] : []) {
             const currentCell = resolveDisplayedCell(
-                state.selectedTable,
+                targetTable,
                 outcome.rowId,
                 outcome.columnName
             ) ?? (outcome.newRowId !== undefined
                 ? resolveDisplayedCell(
-                    state.selectedTable,
+                    targetTable,
                     outcome.newRowId,
                     outcome.columnName
                 )
                 : null);
             remapDisplayedRowIdentity(
-                state.selectedTable,
+                targetTable,
                 outcome.rowId,
                 outcome.newRowId,
                 currentCell
             );
         }
 
-        // Update local grid
-        for (const update of updates) {
-            state.gridData[update.rowIdx][update.colIdx + getRowDataOffset()] = update.value;
+        // Resolve the live cell by identity: a sort or reload may have moved
+        // both indices while the mutation was pending.
+        for (const update of stillOnTargetTable ? updates : []) {
+            const currentCell = resolveDisplayedCell(targetTable, update.rowId, update.column);
+            if (!currentCell) continue;
+            state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = update.value;
         }
 
-        state.selectedCells = [];
-        state.lastSelectedCell = null;
-        state.selectedColumns.clear();
+        if (stillOnTargetTable && cellSelectionSignature() === targetSelectionSignature) {
+            state.selectedCells = [];
+            state.lastSelectedCell = null;
+            state.selectedColumns.clear();
+        }
 
-        await loadTableData();
-        updateToolbarButtons();
-        updateStatus(`${label} - Ctrl+S to save`);
+        if (stillOnTargetTable) {
+            await loadTableData();
+            updateToolbarButtons();
+            updateStatus(`${label} - Ctrl+S to save`);
+        }
 
     } catch (err) {
         console.error('Clear cells failed:', err);
-        updateStatus(`Clear failed: ${err.message}`);
+        if (state.selectedTable === targetTable) updateStatus(`Clear failed: ${getErrorMessage(err)}`);
+    } finally {
+        isClearingSelectedCellValues = false;
     }
 }

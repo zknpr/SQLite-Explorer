@@ -162,18 +162,45 @@ body {
 }
 
 .section-title {
-    padding: 6px 12px;
+    padding: 0;
     font-size: 11px;
     font-weight: 600;
     color: var(--text-secondary);
     display: flex;
     align-items: center;
-    cursor: pointer;
     user-select: none;
 }
 
-.section-title:hover {
+.section-toggle,
+button.section-title {
+    width: 100%;
+    min-width: 0;
+    padding: 6px 12px;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+}
+
+.section-toggle {
+    flex: 1;
+}
+
+.section-toggle:hover,
+button.section-title:hover {
     background: var(--hover-bg);
+}
+
+.section-toggle:focus-visible,
+button.section-title:focus-visible,
+.list-item-select:focus-visible,
+.resize-handle:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: -2px;
 }
 
 .section-title .arrow {
@@ -203,14 +230,32 @@ body {
 }
 
 .list-item {
+    padding: 0;
+    display: flex;
+    align-items: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.list-item-select {
+    flex: 1;
+    min-width: 0;
     padding: 4px 12px 4px 24px;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
     cursor: pointer;
     display: flex;
     align-items: center;
     gap: 6px;
-    white-space: nowrap;
     overflow: hidden;
-    text-overflow: ellipsis;
+}
+
+.list-item.empty {
+    padding: 4px 12px 4px 24px;
 }
 
 .list-item:hover {
@@ -469,8 +514,36 @@ body {
     align-items: center;
     gap: 4px;
     height: 22px;
+    overflow: hidden;
+}
+
+.header-sort-button,
+.grid-icon-button,
+.row-select-button,
+.pin-icon,
+.select-column-icon {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+}
+
+.header-sort-button {
+    min-width: 0;
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    text-align: left;
     cursor: pointer;
     overflow: hidden;
+}
+
+.row-select-all-button {
+    width: 100%;
+    height: 100%;
+    cursor: pointer;
 }
 
 .header-bottom {
@@ -497,7 +570,8 @@ body {
 }
 
 .header-cell .resize-handle:hover,
-.header-cell .resize-handle.resizing {
+.header-cell .resize-handle.resizing,
+.header-cell .resize-handle:focus-visible {
     background: var(--accent-color);
     /* Show visible indicator only in the border area (4px wide) */
     background-clip: padding-box;
@@ -699,6 +773,12 @@ body {
     opacity: 0.5;
 }
 
+.header-cell:focus-within .pin-icon,
+.header-cell:focus-within .select-column-icon,
+.data-cell.row-number:focus-within .pin-icon {
+    opacity: 0.5;
+}
+
 .pin-icon:hover,
 .select-column-icon:hover {
     opacity: 1 !important;
@@ -764,6 +844,20 @@ body {
     font-size: 0.85em;
     user-select: none;
     box-shadow: 1px 0 0 0 var(--border-color);
+}
+
+.row-select-button {
+    cursor: pointer;
+}
+
+.data-cell:focus-visible,
+.header-sort-button:focus-visible,
+.grid-icon-button:focus-visible,
+.row-select-button:focus-visible,
+.pin-icon:focus-visible,
+.select-column-icon:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: -2px;
 }
 
 .data-cell.null-value {
@@ -1023,7 +1117,8 @@ body {
     margin-bottom: 12px;
 }
 
-.form-field label {
+.form-field label,
+.form-field .form-group-label {
     display: block;
     margin-bottom: 4px;
     font-size: 12px;
@@ -1380,6 +1475,7 @@ body {
     font-size: 10px;
     color: var(--text-secondary);
     background: var(--bg-secondary);
+    border: 0;
     padding: 2px 4px;
     border-radius: 2px;
     cursor: pointer;
@@ -1393,6 +1489,11 @@ body {
 
 /* Show expand icon only when cell has overflow class AND is hovered */
 .data-cell.has-overflow:hover .expand-icon {
+    display: inline-block;
+}
+
+.data-cell:focus .expand-icon,
+.data-cell:focus-within .expand-icon {
     display: inline-block;
 }
 

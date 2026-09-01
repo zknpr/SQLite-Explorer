@@ -14,8 +14,8 @@ import {
     resolveDisplayedCell
 } from './data-utils.js';
 import { noteCellValuesChanged } from './count-cache.js';
-import { formatCellValueAsText } from './utils.js';
-import { renderDataGrid } from './grid.js';
+import { formatCellValueAsText, getErrorMessage, normalizeBinaryData } from './utils.js';
+import { loadTableData, renderDataGrid } from './grid.js';
 import { DEFAULT_MAX_CELL_EDIT_BYTES } from '../../../src/core/cell-edit-policy.ts';
 
 // Track upload state to prevent concurrent uploads and allow proper cleanup
@@ -31,6 +31,7 @@ export function initDragAndDrop() {
     // Prevent default behavior for dragover/drop on the whole document
     document.addEventListener('dragover', e => e.preventDefault());
     document.addEventListener('drop', e => e.preventDefault());
+    document.addEventListener('dragend', clearDragHighlight);
 
     // Highlight cell on dragover
     container.addEventListener('dragover', onDragOver);
@@ -40,17 +41,20 @@ export function initDragAndDrop() {
 
 let lastHighlightedCell = null;
 
+function clearDragHighlight() {
+    if (!lastHighlightedCell) return;
+    lastHighlightedCell.classList.remove('drag-over');
+    lastHighlightedCell = null;
+}
+
 function onDragOver(e) {
     e.preventDefault();
 
     // Don't offer a drop target while a grid reload is in flight: the cells under
     // the cursor are stale and about to be replaced. Leave dropEffect unset so the
     // cursor shows "no-drop", and clear any lingering highlight.
-    if (state.isReadOnly || state.isGridReloading) {
-        if (lastHighlightedCell) {
-            lastHighlightedCell.classList.remove('drag-over');
-            lastHighlightedCell = null;
-        }
+    if (isUploading || state.isReadOnly || state.isGridReloading || state.isRefreshingContent) {
+        clearDragHighlight();
         return;
     }
 
@@ -68,30 +72,24 @@ function onDragOver(e) {
         }
         cell.classList.add('drag-over');
         lastHighlightedCell = cell;
-    } else if (lastHighlightedCell) {
-        lastHighlightedCell.classList.remove('drag-over');
-        lastHighlightedCell = null;
-    }
+    } else clearDragHighlight();
 }
 
 function onDragLeave(e) {
-    if (e.target === lastHighlightedCell) {
-        // Rely on dragover
-    }
+    if (!lastHighlightedCell) return;
+    const next = e.relatedTarget;
+    if (!next || !lastHighlightedCell.contains?.(next)) clearDragHighlight();
 }
 
 async function onDrop(e) {
     e.preventDefault();
 
-    if (lastHighlightedCell) {
-        lastHighlightedCell.classList.remove('drag-over');
-        lastHighlightedCell = null;
-    }
+    clearDragHighlight();
 
     // Ignore drops while a grid reload is in flight: the targeted cell belongs to
     // the stale result set about to be replaced, so the upload would land on the
     // wrong row/column once the new data renders.
-    if (state.isReadOnly || state.isGridReloading) return;
+    if (state.isReadOnly || state.isGridReloading || state.isRefreshingContent) return;
 
     const cell = e.target.closest('.data-cell');
     if (!cell || cell.classList.contains('row-number')) {
@@ -100,19 +98,20 @@ async function onDrop(e) {
     const uploadTarget = captureUploadTarget(cell);
     if (!uploadTarget) return;
 
-    // Check for files
+    let upload;
     if (e.dataTransfer.files.length > 0) {
         const file = e.dataTransfer.files[0];
-        await handleFileUpload(uploadTarget, file.name, file);
-        return;
-    }
-
-    // Check for VS Code internal URI list (dragging from Explorer)
-    const uriList = e.dataTransfer.getData('text/uri-list');
-    if (uriList) {
-        const uris = uriList.split(/\r?\n/);
-        if (uris.length > 0 && uris[0]) {
-            let uri = uris[0];
+        upload = () => handleFileUpload(uploadTarget, file.name, file);
+    } else {
+        // Check for VS Code internal URI list (dragging from Explorer)
+        const uriList = e.dataTransfer.getData('text/uri-list');
+        // text/uri-list permits blank lines and #-prefixed comments. VS Code
+        // can include either before the first dragged URI.
+        const uri = uriList && uriList
+            .split(/\r?\n/)
+            .map(line => line.trim())
+            .find(line => line.length > 0 && !line.startsWith('#'));
+        if (uri) {
             // Extract name from URI
             let name = 'unknown_file';
             try {
@@ -122,15 +121,32 @@ async function onDrop(e) {
             } catch (err) {
                 console.warn('Failed to parse name from URI', err);
             }
-            await handleUriUpload(uploadTarget, name, uri);
-            return;
+            upload = () => handleUriUpload(uploadTarget, name, uri);
         }
+    }
+    if (!upload) return;
+
+    // Reserve before FileReader/workspace I/O. Otherwise several rapid drops
+    // can each allocate the full edit limit and race, with the fastest read
+    // writing first regardless of which file the user dropped first.
+    if (isUploading) {
+        updateStatus('Upload already in progress...');
+        return;
+    }
+    isUploading = true;
+    try {
+        await upload();
+    } finally {
+        isUploading = false;
     }
 }
 
 /** Capture the database identity represented by a DOM cell before any file I/O. */
 function captureUploadTarget(cell) {
-    if (state.isReadOnly || state.selectedTableType !== 'table' || !state.selectedTable) {
+    if (state.isReadOnly
+        || state.isRefreshingContent
+        || state.selectedTableType !== 'table'
+        || !state.selectedTable) {
         updateStatus('Cannot upload to a read-only document or view');
         return null;
     }
@@ -152,6 +168,8 @@ function captureUploadTarget(cell) {
 
     return {
         table: state.selectedTable,
+        connectionGeneration: state.connectionGeneration,
+        contentGeneration: state.contentGeneration,
         rowId: getRowId(row, rowIdx),
         columnName: column.name,
         originalValue: row[colIdx + getRowDataOffset()]
@@ -160,6 +178,10 @@ function captureUploadTarget(cell) {
 
 async function handleFileUpload(uploadTarget, fileName, fileBlob) {
     // Early size check before reading file
+    if (!Number.isSafeInteger(fileBlob?.size) || fileBlob.size < 0) {
+        updateStatus('Unable to determine the dropped file size safely.');
+        return;
+    }
     if (fileBlob.size > DEFAULT_MAX_CELL_EDIT_BYTES) {
         const sizeMB = (fileBlob.size / (1024 * 1024)).toFixed(1);
         const limitMB = (DEFAULT_MAX_CELL_EDIT_BYTES / (1024 * 1024)).toFixed(0);
@@ -174,7 +196,7 @@ async function handleFileUpload(uploadTarget, fileName, fileBlob) {
         await uploadDataToCell(uploadTarget, fileName, uint8Array);
     } catch (err) {
         console.error('File read failed:', err);
-        updateStatus(`File read failed: ${err.message}`);
+        updateStatus(`File read failed: ${getErrorMessage(err)}`);
     }
 }
 
@@ -183,32 +205,27 @@ async function handleUriUpload(uploadTarget, fileName, uri) {
         updateStatus(`Fetching ${fileName}...`);
         const result = await backendApi.readWorkspaceFileUri(uri);
 
-        let uint8Array;
-        if (result instanceof Uint8Array) {
-            uint8Array = result;
-        } else if (result && result.type === 'Buffer' && Array.isArray(result.data)) {
-            uint8Array = new Uint8Array(result.data);
-        } else if (result && typeof result === 'object' && Object.keys(result).some(k => !isNaN(k))) {
-             uint8Array = new Uint8Array(Object.values(result));
-        } else {
-             console.error('Unknown data format from backend:', result);
-             throw new Error('Received invalid data format from backend');
-        }
+        const uint8Array = normalizeUploadBytes(result);
 
         await uploadDataToCell(uploadTarget, fileName, uint8Array);
     } catch (err) {
         console.error('URI upload failed:', err);
-        updateStatus(`Upload failed: ${err.message}`);
+        updateStatus(`Upload failed: ${getErrorMessage(err)}`);
+    }
+}
+
+function normalizeUploadBytes(result) {
+    try {
+        return normalizeBinaryData(result);
+    } catch (error) {
+        // The malformed payload may be a very large database value or contain
+        // secrets. Diagnostics need the classification, never the bytes.
+        console.error('Unknown data format from backend');
+        throw new Error('Received invalid data format from backend', { cause: error });
     }
 }
 
 async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
-    // Prevent concurrent uploads
-    if (isUploading) {
-        updateStatus('Upload already in progress...');
-        return;
-    }
-
     // URI reads cannot preflight a browser File, so enforce the same edit
     // ceiling again before serialization or database mutation.
     if (uint8Array.byteLength > DEFAULT_MAX_CELL_EDIT_BYTES) {
@@ -226,9 +243,16 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
         updateStatus('Upload cancelled because the selected table changed');
         return;
     }
+    if (state.connectionGeneration !== uploadTarget.connectionGeneration) {
+        updateStatus('Upload cancelled because the database was reloaded');
+        return;
+    }
+    if (state.contentGeneration !== uploadTarget.contentGeneration) {
+        updateStatus('Upload cancelled because the database content changed');
+        return;
+    }
 
-    // Set upload state to block other operations
-    isUploading = true;
+    // Block conflicting cell-selection/edit gestures during the database write.
     state.isLoadingData = true;
 
     try {
@@ -248,9 +272,12 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
         // A background refresh may reorder rows or columns while the write is
         // in flight. Resolve the current UI position only after the stable
         // database identity has been written, and never paint another table.
-        if (state.selectedTable === uploadTarget.table
-            && state.selectedTableType === 'table') {
-            const currentCell = resolveDisplayedCell(
+        const targetStillCurrent = state.connectionGeneration === uploadTarget.connectionGeneration
+            && state.contentGeneration === uploadTarget.contentGeneration
+            && state.selectedTable === uploadTarget.table
+            && state.selectedTableType === 'table';
+        const currentCell = targetStillCurrent
+            ? resolveDisplayedCell(
                 uploadTarget.table,
                 uploadTarget.rowId,
                 uploadTarget.columnName
@@ -260,7 +287,21 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
                     updatedRowId,
                     uploadTarget.columnName
                 )
-                : null);
+                : null)
+            : null;
+        if (currentCell) {
+            // The write has committed. Invalidate metadata describing the
+            // replaced value before any authoritative refresh, because that
+            // refresh can fail and leave the existing grid mounted.
+            clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
+            clearOversizedCellMetadata(currentCell.rowIdx, currentCell.colIdx);
+        }
+        if (targetStillCurrent && !document.getElementById('vscode-env')) {
+            // The standalone demo has no host refresh echo. A BLOB can change
+            // sort/filter/page membership, so an in-place cell paint is not an
+            // authoritative representation of the query result.
+            await loadTableData(false);
+        } else if (targetStillCurrent) {
             remapDisplayedRowIdentity(
                 uploadTarget.table,
                 uploadTarget.rowId,
@@ -269,35 +310,42 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
             );
             if (currentCell) {
                 state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = uint8Array;
-                clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
-                clearOversizedCellMetadata(currentCell.rowIdx, currentCell.colIdx);
                 const cellElement = document.getElementById(
                     `cell-${currentCell.rowIdx}-${currentCell.colIdx}`
                 );
                 if (cellElement) updateCellDom(cellElement, uint8Array);
             }
         }
-        updateStatus(`Uploaded ${fileName}`);
+        if (state.connectionGeneration === uploadTarget.connectionGeneration
+            && state.contentGeneration === uploadTarget.contentGeneration) {
+            updateStatus(`Uploaded ${fileName}`);
+        }
     } catch (err) {
         console.error('Upload failed:', err);
-        let errorMessage = err.message || String(err);
+        let errorMessage = getErrorMessage(err);
         if (errorMessage.includes('timeout')) {
             errorMessage = 'Upload timed out. Try a smaller file.';
         }
         updateStatus(`Upload failed: ${errorMessage}`);
     } finally {
-        // Always reset upload state to restore functionality
-        isUploading = false;
         state.isLoadingData = false;
     }
 }
 
-function readFileAsArrayBuffer(file) {
+export function readFileAsArrayBuffer(file) {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = () => reject(reader.error);
-        reader.readAsArrayBuffer(file);
+        reader.onload = () => {
+            if (reader.result instanceof ArrayBuffer) resolve(reader.result);
+            else reject(new Error('FileReader returned a non-binary result'));
+        };
+        reader.onerror = () => reject(reader.error ?? new Error('File read failed'));
+        reader.onabort = () => reject(new Error('File read was aborted'));
+        try {
+            reader.readAsArrayBuffer(file);
+        } catch (error) {
+            reject(error);
+        }
     });
 }
 
@@ -325,4 +373,7 @@ function updateCellDom(cell, value) {
     cell.appendChild(expandIcon);
 
     cell.classList.remove('null-value');
+    // The old measurement belongs to the replaced text node. Let the delegated
+    // mouseover handler measure the new content against the live column width.
+    cell.classList.remove('checked-overflow', 'has-overflow');
 }

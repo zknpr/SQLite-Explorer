@@ -15,6 +15,7 @@ const stateModulePath = '../../core/ui/modules/state.js';
 const apiModulePath = '../../core/ui/modules/api.js';
 const uiModulePath = '../../core/ui/modules/ui.js';
 const crudModulePath = '../../core/ui/modules/crud.js';
+const modalsModulePath = '../../core/ui/modules/modals.js';
 const exportModulePath = '../../core/ui/modules/export.js';
 const sidebarModulePath = '../../core/ui/modules/sidebar.js';
 
@@ -102,11 +103,13 @@ async function prepareState() {
     state.isReadOnly = false;
     state.isGridReloading = false;
     state.selectedTable = 'items';
+    state.renderedTable = 'items';
     state.selectedTableType = 'table';
     state.selectedTableIdentity = null;
     state.tableColumns = [{ name: 'value', type: 'TEXT' }];
     state.gridData = [[readOnlyId, 'preview'], [7, 'before']];
     state.gridReadOnlyRowReasons = { 0: readOnlyReason };
+    state.gridOversizedCells = {};
     state.selectedColumns = new Set();
     state.selectedCells = [];
     state.selectedRowIds = new Set([readOnlyId]);
@@ -115,14 +118,18 @@ async function prepareState() {
 
 describe('read-only primary-key action eligibility', () => {
     afterEach(async () => {
+        const { closeModal } = await import(modalsModulePath);
+        closeModal('deleteModal');
         delete (globalThis as any).document;
         const { state } = await import(stateModulePath);
         state.selectedTable = null;
+        state.renderedTable = null;
         state.selectedTableType = 'table';
         state.selectedTableIdentity = null;
         state.tableColumns = [];
         state.gridData = [];
         state.gridReadOnlyRowReasons = {};
+        state.gridOversizedCells = {};
         state.selectedColumns = new Set();
         state.selectedCells = [];
         state.selectedRowIds = new Set();
@@ -209,6 +216,63 @@ describe('read-only primary-key action eligibility', () => {
         }
     });
 
+    it('does not report an export as initiated when the save dialog is cancelled', async () => {
+        const { elements } = installDocument();
+        const state = await prepareState();
+        const { backendApi } = await import(apiModulePath);
+        const { submitExport } = await import(exportModulePath);
+        const originalExportTable = backendApi.exportTable;
+        backendApi.exportTable = async () => ({ success: false, cancelled: true });
+        state.selectedRowIds.clear();
+
+        try {
+            await submitExport();
+            assert.strictEqual(elements.statusText.textContent, 'Export cancelled');
+        } finally {
+            backendApi.exportTable = originalExportTable;
+        }
+    });
+
+    it('uses singular row grammar for a one-row export', async () => {
+        const { elements } = installDocument();
+        const state = await prepareState();
+        const { backendApi } = await import(apiModulePath);
+        const { submitExport } = await import(exportModulePath);
+        const originalExportTable = backendApi.exportTable;
+        backendApi.exportTable = async () => ({ success: true, rowCount: 1 });
+        state.selectedRowIds.clear();
+
+        try {
+            await submitExport();
+            assert.strictEqual(elements.statusText.textContent, 'Exported 1 row');
+        } finally {
+            backendApi.exportTable = originalExportTable;
+        }
+    });
+
+    it('reports an export command failure without claiming it started', async () => {
+        const { elements } = installDocument();
+        const state = await prepareState();
+        const { backendApi } = await import(apiModulePath);
+        const { submitExport } = await import(exportModulePath);
+        const originalExportTable = backendApi.exportTable;
+        state.selectedRowIds.clear();
+        backendApi.exportTable = async () => ({
+            success: false,
+            message: 'Destination became read-only'
+        });
+
+        try {
+            await submitExport();
+            assert.strictEqual(
+                elements.statusText.textContent,
+                'Export failed: Destination became read-only'
+            );
+        } finally {
+            backendApi.exportTable = originalExportTable;
+        }
+    });
+
     it('excludes readonly cells from the batch count, notice, and RPC payload', async () => {
         const { elements } = installDocument();
         const state = await prepareState();
@@ -240,5 +304,29 @@ describe('read-only primary-key action eligibility', () => {
             backendApi.updateCellBatch = originalUpdateCellBatch;
             console.error = originalConsoleError;
         }
+    });
+
+    it('describes a contained one-byte TEXT batch exclusion without claiming size', async () => {
+        const { elements } = installDocument();
+        const state = await prepareState();
+        const { updateBatchSidebar } = await import(sidebarModulePath);
+        state.gridData = [[7, '']];
+        state.gridReadOnlyRowReasons = {};
+        state.gridOversizedCells = {
+            0: { 1: { storageClass: 'text', byteLength: 1 } }
+        };
+        state.selectedCells = [{ rowIdx: 0, colIdx: 0, rowId: 7, value: '' }];
+
+        updateBatchSidebar();
+
+        const expected =
+            '1 read-only selected cell excluded: ' +
+            'Inline editing unavailable because the grid does not contain the full byte-exact value. ' +
+            'Use View Full Content and the Hex view (TEXT, 1 byte).';
+        assert.strictEqual(elements.batchUpdateCount.textContent, 0);
+        assert.strictEqual(textOf(elements.batchUpdateFields), expected);
+        assert.strictEqual(elements.batchUpdateSectionTitle.title, expected);
+        assert.doesNotMatch(expected, /too large/i);
+        assert.strictEqual(elements.btnApplyBatchUpdate.disabled, true);
     });
 });

@@ -32,9 +32,12 @@ import {
     updateStatus,
     showEmptyState,
     showErrorState,
+    showLoading,
+    updateToolbarButtons,
     initSidebarResize
 } from './modules/ui.js';
 import {
+    closeDatabaseTargetModals,
     initModals
 } from './modules/modals.js';
 import {
@@ -54,7 +57,10 @@ import {
     initDragAndDrop
 } from './modules/dnd.js';
 import { initViews } from './modules/views.js';
-import { applyConnectionResult } from './modules/connection-state.js';
+import {
+    applyConnectionResult,
+    updateMutationControlCapabilities
+} from './modules/connection-state.js';
 import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
 
 // Uploaded databases may contain UPDATE triggers that change row cardinality,
@@ -75,19 +81,46 @@ const webviewMethods = {
         // so no cached count survives it. (Currently unused by the demo
         // host, but the parity keeps it safe to wire.)
         invalidateAllCounts();
+        const contentGeneration = ++state.contentGeneration;
+        state.isRefreshingContent = true;
+        updateMutationControlCapabilities();
+        const priorConnectionGeneration = state.connectionGeneration;
         if (connectionResult) {
             applyConnectionResult(connectionResult);
         }
-        if (state.isDbConnected) {
+        const connectionReplaced = connectionResult
+            && state.connectionGeneration !== priorConnectionGeneration;
+        closeDatabaseTargetModals({ connectionReplaced });
+        clearSelection();
+        state.pinnedRowIds.clear();
+        state.editingCellInfo = null;
+        state.activeCellInput = null;
+        updateToolbarButtons();
+        try {
+          if (state.isDbConnected) {
+            if (connectionReplaced) {
+                clearSelection();
+                state.pinnedRowIds.clear();
+                state.pinnedColumns.clear();
+                state.tableColumns = [];
+                state.gridData = [];
+                state.gridExactIntegerTexts = {};
+                state.gridOversizedCells = {};
+                state.gridReadOnlyRowReasons = {};
+                state.keysetAnchors = null;
+                state.renderedTable = null;
+                state.editingCellInfo = null;
+                state.activeCellInput = null;
+                showLoading();
+                updateToolbarButtons();
+                persistState();
+            }
             // A broadcast view refresh may change projection and row order.
             // Clear positional state before the first await so controls cannot
             // target cells from the previous result while schema reloads.
-            if (state.selectedTable && state.selectedTableType === 'view') {
-                clearSelection();
-                persistState();
-            }
+            if (state.selectedTable && state.selectedTableType === 'view') persistState();
 
-            await refreshSchema();
+            if (!await refreshSchema()) return { success: false, superseded: true };
             const tableExists = state.schemaCache.tables.some(t => t.name === state.selectedTable) ||
                                 state.schemaCache.views.some(v => v.name === state.selectedTable);
             if (!tableExists && state.selectedTable) {
@@ -97,12 +130,27 @@ const webviewMethods = {
                 document.getElementById('tableNameLabel').textContent = 'No table selected';
                 showEmptyState();
                 persistState();
+                updateToolbarButtons();
             } else if (state.selectedTable) {
-                await loadTableColumns();
-                await loadTableData(false);
+                if (await loadTableColumns()) await loadTableData(false);
+                else if (connectionReplaced) {
+                    showErrorState('Could not load table columns after reloading the database.');
+                }
             }
+          }
+          return { success: true };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          showErrorState(`Refresh failed: ${message}`);
+          updateStatus(`Refresh failed: ${message}`);
+          throw error;
+        } finally {
+          if (state.contentGeneration === contentGeneration) {
+            state.isRefreshingContent = false;
+            updateMutationControlCapabilities();
+            updateToolbarButtons();
+          }
         }
-        return { success: true };
     },
 
     async updateColorScheme(scheme) {

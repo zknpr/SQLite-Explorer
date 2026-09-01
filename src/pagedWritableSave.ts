@@ -522,16 +522,18 @@ function assertNoSiblingWalFramesSync(
 }
 
 /**
- * Hold SQLite's own writer lock through the final identity/WAL gate and, where
+ * Hold SQLite's own exclusive lock through the final identity/WAL gate and, where
  * the platform permits renaming an open database, through the rename itself.
  *
  * Synchronous host code only excludes another extension-host task. A different
  * process can still switch a rollback database to WAL and commit after the last
- * stat unless SQLite itself excludes writers. BEGIN IMMEDIATE takes that lock
- * in both rollback and WAL modes; if another writer already owns it, saving
- * fails closed before the active pathname is replaced.
+ * stat unless SQLite itself excludes every connection. In particular, a clean
+ * WAL has no frames to detect, but each attached WAL peer retains a shared lock
+ * on the main file. EXCLUSIVE locking mode plus BEGIN EXCLUSIVE must displace
+ * that lock, so replacement fails closed while any WAL peer can retain the old
+ * inode and later write through the shared WAL pathname.
  */
-function acquireSqliteWriteLock(databasePath: string): PagedSaveWriteLock {
+export function acquireSqliteWriteLock(databasePath: string): PagedSaveWriteLock {
   let DatabaseSync: typeof import('node:sqlite').DatabaseSync;
   try {
     ({ DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite'));
@@ -547,10 +549,12 @@ function acquireSqliteWriteLock(databasePath: string): PagedSaveWriteLock {
   let database: import('node:sqlite').DatabaseSync | undefined;
   try {
     database = new DatabaseSync(databasePath);
-    // Do not busy-wait on the extension-host thread. An active external writer
-    // makes this save fail immediately and leaves both its transaction and our
-    // paged overlay intact for an explicit retry.
-    database.exec('PRAGMA busy_timeout = 0; BEGIN IMMEDIATE');
+    // Do not busy-wait on the extension-host thread. Any connection that keeps
+    // SQLite's main-file lock makes this save fail immediately and leaves both
+    // its transaction and our paged overlay intact for an explicit retry.
+    database.exec(
+      'PRAGMA busy_timeout = 0; PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE'
+    );
   } catch (error) {
     try {
       database?.close();
@@ -559,8 +563,8 @@ function acquireSqliteWriteLock(databasePath: string): PagedSaveWriteLock {
       // successful save that a secondary close error could usefully describe.
     }
     throw new Error(
-      'Cannot acquire the SQLite write lock required for an atomic page-on-demand save; '
-      + 'close other writers and retry.',
+      'Cannot acquire the exclusive SQLite lock required for an atomic database save; '
+      + 'close other connections and retry.',
       { cause: error }
     );
   }
@@ -568,7 +572,7 @@ function acquireSqliteWriteLock(databasePath: string): PagedSaveWriteLock {
   let released = false;
   return {
     // SQLite's Windows VFS does not share delete/rename access for the main
-    // database handle. POSIX can retain the stronger lock-through-rename window.
+    // database handle. POSIX can retain the exclusive lock-through-rename window.
     releaseBeforeRename: process.platform === 'win32',
     release(): void {
       if (released) return;
@@ -827,8 +831,12 @@ export async function writePagedWritableOverlayToFile(
       // Existing SQLite targets need the same writer exclusion as an in-place
       // replacement. A new Save As target remains on the lock-free fast path.
       if (target.requiresReopen) {
+        // Keep the specific hot-WAL error while retaining the locked recheck in
+        // assertReplacementReadySync as the authoritative commit gate.
+        assertNoSiblingWalFramesSync(fs, activeBasePath);
         writeLock = acquireWriteLock(activeBasePath);
       } else if (target.requiresTargetWriteLock) {
+        assertNoSiblingWalFramesSync(fs, target.replacementPath, 'saveAsTarget');
         writeLock = acquireWriteLock(target.replacementPath);
       }
       assertReplacementReadySync(

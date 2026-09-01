@@ -1,4 +1,4 @@
-import { state } from './state.js';
+import { createSafeColumnState, persistState, state } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus, showLoading, showErrorState, updateToolbarButtons } from './ui.js';
 import { updatePagination, renderDataGrid } from './grid-render.js';
@@ -8,6 +8,7 @@ import { updatePagination, renderDataGrid } from './grid-render.js';
 import { clearCellSelection } from './grid-selection.js';
 import { resetMatchNav } from './match-nav.js';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
+import { getErrorMessage } from './utils.js';
 import {
     buildCountIdentity,
     getCachedCount,
@@ -15,18 +16,35 @@ import {
     prepareCountStore
 } from './count-cache.js';
 
+// Column metadata is a separate RPC from row data. Keep its own generation so
+// an older table click cannot commit after a newer click has already selected
+// and loaded a different table.
+let activeColumnLoadToken = 0;
+
 export async function loadTableColumns() {
-    if (!state.selectedTable) return;
+    if (!state.selectedTable) return false;
+
+    const loadToken = ++activeColumnLoadToken;
+    const requestedTable = state.selectedTable;
+    const requestedTableType = state.selectedTableType;
+    const isSuperseded = () => loadToken !== activeColumnLoadToken
+        || requestedTable !== state.selectedTable
+        || requestedTableType !== state.selectedTableType;
+    state.isLoadingColumns = true;
+    updateToolbarButtons();
 
     try {
-        const columns = await backendApi.getTableInfo(state.selectedTable);
+        const columns = await backendApi.getTableInfo(requestedTable);
+        if (isSuperseded()) return false;
         state.tableColumns = columns.map(r => ({
             cid: r.ordinal,
             name: r.identifier,
             type: r.declaredType,
             notnull: r.isRequired,
             dflt_value: r.defaultExpression,
-            isPrimaryKey: r.primaryKeyPosition > 0
+            isPrimaryKey: r.primaryKeyPosition > 0,
+            isGenerated: r.isGenerated === true,
+            isRowidAlias: r.isRowidAlias === true
         })).sort((a, b) => a.cid - b.cid);
 
         // Sanitize state based on new columns
@@ -58,9 +76,16 @@ export async function loadTableColumns() {
         // clear it upstream, but same-table schema reloads (undo/redo
         // broadcasts, reload-from-disk) reach here with it still staged.
         clearCellSelection();
+        return true;
     } catch (err) {
         console.error('Error loading columns:', err);
-        updateStatus('Error loading columns');
+        if (!isSuperseded()) updateStatus('Error loading columns');
+        return false;
+    } finally {
+        if (!isSuperseded()) {
+            state.isLoadingColumns = false;
+            updateToolbarButtons();
+        }
     }
 }
 
@@ -155,6 +180,23 @@ function keysetModeCanProveInexactCount(keyset) {
     );
 }
 
+/**
+ * Bound the engine query to the rows that can actually exist on an exact page.
+ * The containment layer divides its fixed transport budget across `limit`
+ * slots, so passing the user's 5,000-row preference for a 46-row table would
+ * needlessly turn ordinary cells into previews. Keep at least one slot for an
+ * exact empty page and for rows inserted concurrently after the count.
+ */
+function getPageQueryLimit(recordCount, countIsExact, pageIndex, pageSize) {
+    if (!countIsExact || recordCount === undefined) return pageSize;
+    const remainingRows = recordCount - pageIndex * pageSize;
+    return Math.max(1, Math.min(pageSize, remainingRows));
+}
+
+function hasClippedCells(result) {
+    return Object.keys(result?.oversizedCells || {}).length > 0;
+}
+
 export async function loadTableData(showSpinner = true, saveScrollPosition = true, navIntent) {
     if (!state.selectedTable) return;
 
@@ -166,7 +208,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     const requestedTable = state.selectedTable;
     const requestedTableType = state.selectedTableType;
     const requestedFilterQuery = state.filterQuery;
-    const requestedColumnFilters = { ...state.columnFilters };
+    const requestedColumnFilters = createSafeColumnState(state.columnFilters);
     let keepExistingGridOnError = false;
     state.lastGridLoadError = null;
     // This load is superseded if a newer load has started (token bumped) OR the
@@ -264,7 +306,12 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // clamped, retry), so they can never disagree on anything but the page
         // index and count knowledge. OFFSET always stays in the request: it is
         // the engine's validated fallback whenever the keyset does not hold up.
-        const buildDataQueryOptions = (pageIndex, countResult, pageCount) => {
+        const buildDataQueryOptions = (
+            pageIndex,
+            countResult,
+            pageCount,
+            mayBoundQueryToCount = true
+        ) => {
             const recordCount = countResult?.count;
             const options = {
                 columns: queryColumns,
@@ -273,7 +320,14 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
                 globalFilterColumns: columnNames,
                 orderBy: state.sortedColumn,
                 orderDir: state.sortAscending ? 'ASC' : 'DESC',
-                limit: requestedPageSize,
+                limit: mayBoundQueryToCount
+                    ? getPageQueryLimit(
+                        recordCount,
+                        countResult?.isExact,
+                        pageIndex,
+                        requestedPageSize
+                      )
+                    : requestedPageSize,
                 offset: pageIndex * requestedPageSize,
                 filters,
                 globalFilter
@@ -294,11 +348,11 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         };
 
         // Resolve the count: cached when the identity is known, otherwise
-        // fetched — in parallel with the data query wherever possible. From
-        // here on this single totalRecordCount value feeds the clamp, the
-        // page count, the keyset 'last' remainder, the retry check, and the
-        // commit; cached and fetched counts are never mixed within one load.
+        // fetched in parallel with the data query wherever possible. A cached
+        // count can drive pagination metadata, but cannot shorten a new data
+        // query because another native connection may have changed the file.
         let countResult = getCachedCount(countIdentity);
+        let countWasFetchedForLoad = false;
 
         if (countResult === undefined && navIntent === 'last') {
             // 'last' must resolve the count before the data query: both its
@@ -310,6 +364,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             countResult = normalizeCountResult(
                 await backendApi.fetchTableCount(requestedTable, countOptions)
             );
+            countWasFetchedForLoad = true;
             if (isSuperseded()) return; // a newer load started, or the user switched tables
             storeCount(countResult);
         }
@@ -323,15 +378,21 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         let exactBoundStore;
 
         if (countResult !== undefined) {
-            // Count known synchronously (cache hit) or resolved above: page
-            // turns run a single data query and no count RPC at all.
+            // Count known synchronously (cache hit) or resolved above. Cache
+            // hits retain the configured page limit so the data request can
+            // reveal rows written by another connection.
             totalRecordCount = countResult.count;
             totalRecordCountIsExact = countResult.isExact;
             totalPageCount = Math.max(1, Math.ceil(totalRecordCount / requestedPageSize));
             if (currentPageIndex >= totalPageCount) {
                 currentPageIndex = Math.max(0, totalPageCount - 1);
             }
-            queryOptions = buildDataQueryOptions(currentPageIndex, countResult, totalPageCount);
+            queryOptions = buildDataQueryOptions(
+                currentPageIndex,
+                countResult,
+                totalPageCount,
+                countWasFetchedForLoad
+            );
             if (!totalRecordCountIsExact && keysetModeCanProveInexactCount(queryOptions.keyset)) {
                 exactBoundStore = prepareCountStore(countIdentity);
             }
@@ -359,6 +420,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             if (isSuperseded()) return; // superseded during the parallel fetch
             if (countOutcome.status === 'rejected') throw countOutcome.reason;
             countResult = normalizeCountResult(countOutcome.value);
+            countWasFetchedForLoad = true;
             totalRecordCount = countResult.count;
             totalRecordCountIsExact = countResult.isExact;
             // Store before inspecting the data outcome: the count is engine
@@ -387,6 +449,78 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
                 // parallel leg must also prevent this row-proved exact store.
                 exactBoundStore = storeCount;
             }
+        }
+
+        // A cold-cache load keeps count and data parallel, so its speculative
+        // query cannot know that this is a short exact page. Retry only when
+        // that pessimistic row bound actually clipped a cell; ordinary pages
+        // retain the one-query fast path. The second request is bounded by the
+        // just-resolved count and preserves the containment cap for genuinely
+        // large values.
+        let countAwareOptions = buildDataQueryOptions(
+            currentPageIndex,
+            countResult,
+            totalPageCount,
+            countWasFetchedForLoad
+        );
+        if (!countWasFetchedForLoad) {
+            const returnedRowCount = (dataResult.rows || []).length;
+            const cachedRemainingRows = Math.max(
+                0,
+                totalRecordCount - currentPageIndex * requestedPageSize
+            );
+            const staleCountBoundOptions = buildDataQueryOptions(
+                currentPageIndex,
+                countResult,
+                totalPageCount,
+                true
+            );
+            const cachedFinalPageMayHaveGrown = totalRecordCountIsExact
+                && currentPageIndex === totalPageCount - 1
+                && (
+                    returnedRowCount > cachedRemainingRows
+                    || returnedRowCount >= requestedPageSize
+                );
+            const tighterBoundMayRecoverClippedCell = hasClippedCells(dataResult)
+                && queryOptions.limit > staleCountBoundOptions.limit;
+            if (cachedFinalPageMayHaveGrown || tighterBoundMayRecoverClippedCell) {
+                // A full or unexpectedly long cached final page cannot prove
+                // the table still ends here. Refresh before disabling Next.
+                // The same fresh count also keeps the containment retry from
+                // hiding rows inserted by another connection.
+                const storeCount = prepareCountStore(countIdentity);
+                countResult = normalizeCountResult(
+                    await backendApi.fetchTableCount(requestedTable, countOptions)
+                );
+                if (isSuperseded()) return;
+                storeCount(countResult);
+                countWasFetchedForLoad = true;
+                totalRecordCount = countResult.count;
+                totalRecordCountIsExact = countResult.isExact;
+                totalPageCount = Math.max(1, Math.ceil(totalRecordCount / requestedPageSize));
+                if (currentPageIndex >= totalPageCount) {
+                    currentPageIndex = Math.max(0, totalPageCount - 1);
+                    queryOptions = buildDataQueryOptions(
+                        currentPageIndex,
+                        countResult,
+                        totalPageCount,
+                        true
+                    );
+                    dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
+                    if (isSuperseded()) return;
+                }
+                countAwareOptions = buildDataQueryOptions(
+                    currentPageIndex,
+                    countResult,
+                    totalPageCount,
+                    true
+                );
+            }
+        }
+        if (queryOptions.limit > countAwareOptions.limit && hasClippedCells(dataResult)) {
+            queryOptions = countAwareOptions;
+            dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
+            if (isSuperseded()) return;
         }
 
         if (queryOptions.keyset && keysetResultNeedsOffsetRetry(
@@ -484,6 +618,15 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         state.gridExactIntegerTexts = dataResult.exactIntegerTexts || {};
         state.gridOversizedCells = dataResult.oversizedCells || {};
         state.gridReadOnlyRowReasons = dataResult.readOnlyRowReasons || {};
+        const clearedOrdinalRowState = requestedTableType !== 'table'
+            && (state.selectedRowIds.size > 0 || state.pinnedRowIds.size > 0);
+        if (requestedTableType !== 'table') {
+            // Views have no stable row identity: getRowId() uses only a page
+            // ordinal. Any sort/filter/reload can bind that ordinal to another
+            // row, so selections and pins must not cross a committed load.
+            state.selectedRowIds.clear();
+            state.pinnedRowIds.clear();
+        }
         // Anchors commit atomically with the rows they describe; a superseded
         // load bailed above, so its anchors can never survive into state. On
         // error paths the previous grid stays mounted together with the
@@ -510,6 +653,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // must not survive the commit either. Flows that need a selection
         // across a reload rebuild it by identity afterwards (applyBatchUpdate).
         clearCellSelection();
+        if (clearedOrdinalRowState) persistState();
         resetMatchNav();
 
         // When preserving scroll, re-capture the latest position right before
@@ -550,7 +694,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         console.error('Error loading data:', err);
         // Don't let a superseded load's error replace the current table's view.
         if (!isSuperseded()) {
-            const message = err instanceof Error ? err.message : String(err);
+            const message = getErrorMessage(err);
             state.lastGridLoadError = message;
             updateStatus(`Error: ${message}`);
             // Background filters retain the last successful grid so the UI can

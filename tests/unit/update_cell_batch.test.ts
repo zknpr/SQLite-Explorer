@@ -5,6 +5,7 @@ import assert from 'node:assert';
 
 import { OversizedCellReplacementRequiredError } from '../../src/core/cell-edit-policy';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+import type { CellUpdate, CellValue, QueryResultSet } from '../../src/core/types';
 
 describe('atomic cell batches', () => {
     it('returns authoritative prior values and derives JSON patches inside the savepoint', async () => {
@@ -46,6 +47,14 @@ describe('atomic cell batches', () => {
                     columnName: 'payload',
                     priorValue: '{"count":1,"concurrent":true}',
                     newValue: '{"count":2}',
+                    priorState: {
+                        storageClass: 'text',
+                        value: '{"count":1,"concurrent":true}'
+                    },
+                    postState: {
+                        storageClass: 'text',
+                        value: '{"count":2,"concurrent":true}'
+                    },
                     operation: 'json_patch'
                 },
                 {
@@ -53,6 +62,8 @@ describe('atomic cell batches', () => {
                     columnName: 'label',
                     priorValue: 'database-current',
                     newValue: 'after',
+                    priorState: { storageClass: 'text', value: 'database-current' },
+                    postState: { storageClass: 'text', value: 'after' },
                     operation: 'set'
                 }
             ]);
@@ -102,6 +113,112 @@ describe('atomic cell batches', () => {
             assert.strictEqual(outcomes.length, 6);
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('chunks rowid value and identity reads above the SQLite variable ceiling', async () => {
+        const initialized = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const engine = initialized.operations as WasmDatabaseEngine;
+        const internals = engine as any;
+        const updateCount = 32_767;
+        const updates: CellUpdate[] = Array.from({ length: updateCount }, (_, index) => ({
+            rowId: index + 1,
+            column: 'payload',
+            value: 'after'
+        }));
+        const currentReadSizes: number[] = [];
+        const postReadSizes: number[] = [];
+        const identityReadSizes: number[] = [];
+        let writes = 0;
+
+        const originalExecuteQuery = engine.executeQuery.bind(engine);
+        const originalPrepare = internals.instance.prepare.bind(internals.instance);
+        const originalQueryRaw = internals.queryRaw.bind(engine);
+        const originalReadRowIdAliasColumn = internals.readRowIdAliasColumn.bind(engine);
+        const originalTriggerGuard = internals.assertUpdateHasNoTargetTableTriggerWrites.bind(engine);
+        try {
+            await originalExecuteQuery('CREATE TABLE batch_bind_limit (payload TEXT)');
+            // Keep the real batch orchestration and savepoint. Stub only the
+            // 32k per-row SQLite work so this boundary regression stays cheap.
+            internals.readRowIdAliasColumn = async () => undefined;
+            internals.assertUpdateHasNoTargetTableTriggerWrites = async () => {};
+            engine.executeQuery = async (sql, params, signal): Promise<QueryResultSet[]> => {
+                if (/^SELECT CAST\(rowid AS TEXT\),/.test(sql)) {
+                    const rowIds = params ?? [];
+                    assert.ok(rowIds.length <= 32_766);
+                    currentReadSizes.push(rowIds.length);
+                    return [{
+                        headers: ['rowid', 'storage_class', 'payload'],
+                        rows: rowIds.map(rowId => [String(rowId), 'text', 'before'])
+                    }];
+                }
+                return originalExecuteQuery(sql, params, signal);
+            };
+            internals.instance.prepare = (sql: string, params?: CellValue[]) => {
+                if (/^UPDATE main\."batch_bind_limit" SET "payload" = \? WHERE rowid = \?$/.test(sql)) {
+                    return {
+                        run(bound: CellValue[]) {
+                            assert.strictEqual(bound[0], 'after');
+                            writes++;
+                        },
+                        free() {
+                            return true;
+                        }
+                    };
+                }
+                return originalPrepare(sql, params);
+            };
+            internals.queryRaw = (sql: string, params: CellValue[] = []) => {
+                if (/^SELECT CAST\(rowid AS TEXT\),/.test(sql)) {
+                    assert.ok(params.length <= 32_766);
+                    postReadSizes.push(params.length);
+                    return {
+                        columns: ['rowid', 'storage_class', 'payload'],
+                        rows: params.map(rowId => [String(rowId), 'text', 'after'])
+                    };
+                }
+                if (/^SELECT CAST\(rowid AS TEXT\) FROM main\."batch_bind_limit"/.test(sql)) {
+                    assert.ok(params.length <= 32_766);
+                    identityReadSizes.push(params.length);
+                    return {
+                        columns: ['rowid'],
+                        rows: params.map(rowId => [String(rowId)])
+                    };
+                }
+                return originalQueryRaw(sql, params);
+            };
+
+            const outcomes = await engine.updateCellBatch('batch_bind_limit', updates);
+
+            assert.ok(currentReadSizes.length > 1);
+            assert.ok(postReadSizes.length > 1);
+            assert.ok(identityReadSizes.length > 1);
+            assert.strictEqual(currentReadSizes.reduce((sum, size) => sum + size, 0), updateCount);
+            assert.strictEqual(postReadSizes.reduce((sum, size) => sum + size, 0), updateCount);
+            assert.strictEqual(identityReadSizes.reduce((sum, size) => sum + size, 0), updateCount);
+            assert.strictEqual(writes, updateCount);
+            assert.strictEqual(outcomes.length, updateCount);
+            assert.deepStrictEqual(outcomes[0], {
+                rowId: 1,
+                columnName: 'payload',
+                priorValue: 'before',
+                newValue: 'after',
+                priorState: { storageClass: 'text', value: 'before' },
+                postState: { storageClass: 'text', value: 'after' },
+                operation: 'set'
+            });
+            assert.strictEqual(outcomes.at(-1)?.rowId, updateCount);
+        } finally {
+            engine.executeQuery = originalExecuteQuery;
+            internals.instance.prepare = originalPrepare;
+            internals.queryRaw = originalQueryRaw;
+            internals.readRowIdAliasColumn = originalReadRowIdAliasColumn;
+            internals.assertUpdateHasNoTargetTableTriggerWrites = originalTriggerGuard;
+            engine.shutdown();
         }
     });
 

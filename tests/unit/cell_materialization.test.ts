@@ -297,6 +297,27 @@ describe('CellMaterializationService', () => {
         assert.strictEqual(fs.existsSync(replacement.uri.fsPath), true);
     });
 
+    it('releases a binary materialization when its editor tab closes without a text document', async () => {
+        const source = Uint8Array.from({ length: 12 }, () => 0x24);
+        const operations = makeChunkedOperations(
+            source,
+            { storageClass: 'blob', byteLength: source.byteLength }
+        );
+        service = new CellMaterializationService(vscode.Uri.file(testDir), {
+            maxBytes: 16,
+            chunkBytes: 4
+        });
+
+        const materialized = await service.materialize(operations, target);
+        (vscode.window.tabGroups as any).__fireDidChangeTabs({
+            opened: [],
+            changed: [],
+            closed: [{ input: { uri: materialized.uri } }]
+        });
+
+        assert.strictEqual(fs.existsSync(materialized.uri.fsPath), false);
+    });
+
     it('reserves aggregate quota across concurrent materializations', async () => {
         const source = Uint8Array.from({ length: 12 }, () => 0x7a);
         const firstOperations = makeChunkedOperations(

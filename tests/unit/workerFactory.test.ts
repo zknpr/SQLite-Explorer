@@ -9,6 +9,8 @@ const moduleCache = require('module')._cache;
 
 let connectionFailed = false;
 let workerTerminated = false;
+let wasmWorkerCreationCount = 0;
+let wasmWorkerTerminationCount = 0;
 let exposedWorkerMethods: string[] = [];
 let workerProxy: Record<string, (...args: any[]) => any> = {};
 let workerTimeoutPolicy: ((methodName: string, parameters: readonly unknown[]) => number) | undefined;
@@ -16,8 +18,10 @@ let pagedHostSaveCalls: unknown[][] = [];
 let nativeAvailable = false;
 let nativeAvailabilityChecks = 0;
 let nativeConnectionCalls = 0;
+let nativeBundleFactory: (() => Promise<any>) | undefined;
 let outputLines: string[] = [];
 let serializeOperationsCalls = 0;
+let maximumFileSizeBytes = 0;
 
 const Module = require('module');
 
@@ -68,7 +72,11 @@ Module.prototype.require = function(id: string) {
     if (id.endsWith('platform/threadPool')) {
         return {
           Worker: class Worker {
-            terminate() { workerTerminated = true; }
+            constructor() { wasmWorkerCreationCount++; }
+            terminate() {
+              workerTerminated = true;
+              wasmWorkerTerminationCount++;
+            }
             postMessage() {}
             on() {}
             addEventListener() {}
@@ -77,7 +85,7 @@ Module.prototype.require = function(id: string) {
     }
     if (id.endsWith('config')) {
         return {
-          getMaximumFileSizeBytes: () => 0,
+          getMaximumFileSizeBytes: () => maximumFileSizeBytes,
           getQueryTimeout: () => 5000
         };
     }
@@ -111,6 +119,7 @@ Module.prototype.require = function(id: string) {
           },
           createNativeDatabaseConnection: async () => {
             nativeConnectionCalls++;
+            if (nativeBundleFactory) return nativeBundleFactory();
             throw new Error('native connection must not be created without its binary');
           }
         };
@@ -128,14 +137,18 @@ describe('workerFactory error path tests', () => {
   beforeEach(() => {
     connectionFailed = false;
     workerTerminated = false;
+    wasmWorkerCreationCount = 0;
+    wasmWorkerTerminationCount = 0;
     exposedWorkerMethods = [];
     workerTimeoutPolicy = undefined;
     pagedHostSaveCalls = [];
     nativeAvailable = false;
     nativeAvailabilityChecks = 0;
     nativeConnectionCalls = 0;
+    nativeBundleFactory = undefined;
     outputLines = [];
     serializeOperationsCalls = 0;
+    maximumFileSizeBytes = 0;
     workerProxy = {
       initializeDatabase: async () => {
         if (connectionFailed) throw new Error('Connection failed');
@@ -190,6 +203,65 @@ describe('workerFactory error path tests', () => {
     assert.deepStrictEqual(outputLines, ['[SQLite Explorer] Using WebAssembly SQLite backend']);
   });
 
+  it('does not create an unused WASM worker when the native connection succeeds', async () => {
+    nativeAvailable = true;
+    let nativeDisposals = 0;
+    nativeBundleFactory = async () => ({
+      workerMethods: {
+        initializeDatabase: async () => ({ isReadOnly: false }),
+        runQuery: async () => [],
+        exportDatabase: async () => new Uint8Array(),
+        [Symbol.dispose]: () => { nativeDisposals++; }
+      },
+      establishConnection: async () => ({
+        databaseOps: { engineKind: Promise.resolve('native') },
+        isReadOnly: false,
+        storage: 'native'
+      })
+    });
+
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+    await bundle.establishConnection(testDbUri(), 'test.sqlite');
+
+    assert.strictEqual(wasmWorkerCreationCount, 0);
+    bundle.workerMethods[Symbol.dispose]();
+    assert.strictEqual(nativeDisposals, 1);
+    assert.strictEqual(wasmWorkerTerminationCount, 0);
+  });
+
+  it('disposes both sides of a native-to-WASM open fallback exactly once', async () => {
+    nativeAvailable = true;
+    let nativeDisposals = 0;
+    nativeBundleFactory = async () => ({
+      workerMethods: {
+        initializeDatabase: async () => ({ isReadOnly: false }),
+        runQuery: async () => [],
+        exportDatabase: async () => new Uint8Array(),
+        [Symbol.dispose]: () => { nativeDisposals++; }
+      },
+      establishConnection: async () => {
+        throw new Error('native open refused this database');
+      }
+    });
+
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+    const connection = await bundle.establishConnection(testDbUri(), 'test.sqlite');
+    assert.strictEqual(await connection.databaseOps.engineKind, 'wasm');
+    assert.strictEqual(nativeDisposals, 1, 'failed native worker must be retired immediately');
+    assert.strictEqual(wasmWorkerCreationCount, 1);
+
+    bundle.workerMethods[Symbol.dispose]();
+    bundle.workerMethods[Symbol.dispose]();
+    assert.strictEqual(nativeDisposals, 1);
+    assert.strictEqual(wasmWorkerTerminationCount, 1);
+  });
+
   it('serializes the desktop worker-backed WASM facade as one operation queue', async () => {
     const bundle = await workerFactory.createDatabaseConnection(
       { scheme: 'file', fsPath: '/test/extensionPath' } as any,
@@ -225,6 +297,98 @@ describe('workerFactory error path tests', () => {
       assert.strictEqual(err.message, 'Connection failed');
       assert.strictEqual(workerTerminated, true, 'terminateWorker should be called to prevent memory leaks');
     }
+  });
+
+  it('does not bypass the whole-file size guard when a remote provider cannot stat the database', async () => {
+    let readCalls = 0;
+    const remoteUri = {
+      scheme: 'vscode-vfs',
+      authority: 'provider',
+      path: '/repo/test.sqlite',
+      fsPath: '',
+      toString: () => 'vscode-vfs://provider/repo/test.sqlite',
+      with({ path }: { path: string }) {
+        return {
+          ...this,
+          path,
+          toString: () => `vscode-vfs://provider${path}`
+        };
+      }
+    } as any;
+    Object.defineProperty(mockVscode.workspace, 'fs', {
+      value: {
+        stat: async (uri: any) => {
+          if (uri.path.endsWith('-wal')) {
+            const error = new Error('not found');
+            (error as any).code = 'FileNotFound';
+            throw error;
+          }
+          throw new Error('provider stat unavailable');
+        },
+        readFile: async () => {
+          readCalls++;
+          return new Uint8Array([1, 2, 3]);
+        }
+      },
+      writable: true,
+      configurable: true
+    });
+
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+    await assert.rejects(
+      () => bundle.establishConnection(remoteUri, 'test.sqlite'),
+      /Cannot verify database file size.*provider stat unavailable/i
+    );
+    assert.strictEqual(readCalls, 0, 'an unbounded provider read must not start without a size result');
+    assert.strictEqual(workerTerminated, true);
+  });
+
+  it('rejects a remote provider read that grows beyond maxFileSize after the stat check', async () => {
+    maximumFileSizeBytes = 2;
+    let initializeCalls = 0;
+    workerProxy.initializeDatabase = async () => {
+      initializeCalls++;
+      return { isReadOnly: false };
+    };
+    const remoteUri = {
+      scheme: 'vscode-vfs',
+      authority: 'provider',
+      path: '/repo/growing.sqlite',
+      fsPath: '',
+      toString: () => 'vscode-vfs://provider/repo/growing.sqlite',
+      with({ path }: { path: string }) {
+        return { ...this, path, toString: () => `vscode-vfs://provider${path}` };
+      }
+    } as any;
+    Object.defineProperty(mockVscode.workspace, 'fs', {
+      value: {
+        stat: async (uri: any) => {
+          if (uri.path.endsWith('-wal')) {
+            const error = new Error('not found');
+            (error as any).code = 'FileNotFound';
+            throw error;
+          }
+          return { size: 1 };
+        },
+        readFile: async () => new Uint8Array(3)
+      },
+      writable: true,
+      configurable: true
+    });
+
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+    await assert.rejects(
+      () => bundle.establishConnection(remoteUri, 'growing.sqlite'),
+      /File size \(0\.00 MB\) exceeds the maximum allowed size \(0\.00 MB\)/
+    );
+    assert.strictEqual(initializeCalls, 0, 'oversized bytes must not cross into sql.js');
+    assert.strictEqual(workerTerminated, true);
   });
 
   it('routes writable paged saves through the host streamer without a worker full-image path', async () => {
@@ -337,6 +501,53 @@ describe('workerFactory error path tests', () => {
     );
     assert.strictEqual(directWorkerWriteCalls, 1);
     assert.deepStrictEqual(pagedHostSaveCalls, []);
+  });
+
+  it('propagates mid-flight cancellation to memory-backed worker saves', async () => {
+    let saveStarted!: () => void;
+    let releaseSave!: () => void;
+    const started = new Promise<void>(resolve => { saveStarted = resolve; });
+    const release = new Promise<void>(resolve => { releaseSave = resolve; });
+    let cancellationFlag: Int32Array | undefined;
+    let committed = false;
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false, storage: 'memory' }),
+      writeToFile: async (_targetPath: string, flag?: Int32Array) => {
+        cancellationFlag = flag;
+        saveStarted();
+        await release;
+        if (flag && Atomics.load(flag, 0) !== 0) {
+          const error = new Error('worker save cancelled');
+          error.name = 'AbortError';
+          throw error;
+        }
+        committed = true;
+        return { requiresReopen: false };
+      }
+    };
+
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+    const { databaseOps } = await bundle.establishConnection(testDbUri(), 'test.sqlite');
+    const controller = new AbortController();
+    const cancellation = new Error('cancelled during memory save');
+    const pending = databaseOps.writeToFile(
+      '/test/cancelled-memory-save.sqlite',
+      controller.signal
+    );
+    await started;
+
+    controller.abort(cancellation);
+    releaseSave();
+    let caught: unknown;
+    await pending.catch((error: unknown) => { caught = error; });
+
+    assert.ok(cancellationFlag instanceof Int32Array);
+    assert.strictEqual(Atomics.load(cancellationFlag, 0), 1);
+    assert.strictEqual(caught, cancellation);
+    assert.strictEqual(committed, false);
   });
 
   it('routes view history through the desktop worker-backed WASM facade', async () => {
@@ -710,6 +921,46 @@ describe('workerFactory error path tests', () => {
       new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
       'hot-exit serialization must retain the transferred BLOB bytes'
     );
+  });
+
+  it('preserves own prototype-spelled columns while copying a desktop WASM insert', async () => {
+    let insertedData: Record<string, any> | undefined;
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false }),
+      insertRow: async (_table: string, data: Record<string, any>) => {
+        insertedData = data;
+        return 1;
+      }
+    };
+
+    const extensionUri = { scheme: 'file', fsPath: '/test/extensionPath' } as any;
+    const bundle = await workerFactory.createDatabaseConnection(extensionUri, null as any);
+    const { databaseOps } = await bundle.establishConnection(testDbUri(), 'test.sqlite');
+    const insertedBlob = new Uint8Array([0xaa, 0xbb]);
+    const row = Object.create(null) as Record<string, any> & {
+      constructor: string;
+      prototype: string;
+    };
+    Object.defineProperty(row, '__proto__', {
+      value: insertedBlob,
+      enumerable: true,
+      configurable: true,
+      writable: true
+    });
+    row.constructor = 'constructor-value';
+    row.prototype = 'prototype-value';
+
+    await databaseOps.insertRow('items', row);
+
+    assert.ok(insertedData);
+    assert.strictEqual(
+      Object.prototype.propertyIsEnumerable.call(insertedData, '__proto__'),
+      true
+    );
+    assert.deepStrictEqual(insertedData.__proto__.value, new Uint8Array([0xaa, 0xbb]));
+    assert.strictEqual(insertedData.constructor, 'constructor-value');
+    assert.strictEqual(insertedData.prototype, 'prototype-value');
+    assert.deepStrictEqual(insertedBlob, new Uint8Array([0xaa, 0xbb]));
   });
 
   it('waits for a delayed batch revert under a modification-scaled worker deadline', async () => {

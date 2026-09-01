@@ -24,6 +24,25 @@ function nextPostedMessage() {
     };
 }
 
+const OWN_PROTO_JSON =
+    '{"safe":1,"__proto__":{"inherited":"top"},"nested":[{"safe":2,"__proto__":{"inherited":"nested"}}]}';
+
+function ownProtoFixture(): any {
+    return JSON.parse(OWN_PROTO_JSON);
+}
+
+function assertOwnProtoPreserved(value: unknown): void {
+    const root = value as Record<string, any>;
+    const nested = root.nested[0] as Record<string, any>;
+    for (const [record, expected] of [[root, 'top'], [nested, 'nested']] as const) {
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(record, '__proto__'), true);
+        assert.deepStrictEqual(record['__proto__'], { inherited: expected });
+        assert.strictEqual(record.inherited, undefined);
+    }
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(value)), ownProtoFixture());
+    assert.strictEqual(({} as Record<string, unknown>).inherited, undefined);
+}
+
 function assertLimitError(
     message: any,
     expected: {
@@ -45,9 +64,51 @@ function assertLimitError(
 }
 
 describe('WebviewMessageHandler', () => {
+    it('preserves own __proto__ keys on webview-to-host arguments', async () => {
+        let captured: unknown;
+        const posted = nextPostedMessage();
+        const handler = new WebviewMessageHandler(posted.postMessage, {
+            updateExtensionSetting(_key: string, value: unknown) {
+                captured = value;
+                return null;
+            }
+        } as unknown as import('../../src/hostBridge').HostBridge);
+
+        handler.handleMessage({
+            channel: 'rpc',
+            content: {
+                kind: 'invoke',
+                messageId: 'own-proto-ingress',
+                targetMethod: 'updateExtensionSetting',
+                payload: ['test', structuredClone(ownProtoFixture())]
+            }
+        });
+        await posted.promise;
+        assertOwnProtoPreserved(captured);
+    });
+
+    it('preserves own __proto__ keys on host-to-webview results', async () => {
+        const posted = nextPostedMessage();
+        const handler = new WebviewMessageHandler(posted.postMessage, {
+            fetchSchema: () => ownProtoFixture()
+        } as unknown as import('../../src/hostBridge').HostBridge);
+
+        handler.handleMessage({
+            channel: 'rpc',
+            content: {
+                kind: 'invoke',
+                messageId: 'own-proto-egress',
+                targetMethod: 'fetchSchema',
+                payload: []
+            }
+        });
+        const message = await posted.promise;
+        assertOwnProtoPreserved(message.content.data);
+    });
+
     it('should handle RPC invocation', (context) => {
         const hostBridge = {
-            echo: (val: unknown) => val
+            ping: (val: unknown) => val
         };
         let sentMessage: any = null;
         const postMessage = async (msg: unknown) => {
@@ -62,7 +123,7 @@ describe('WebviewMessageHandler', () => {
             content: {
                 kind: 'invoke',
                 messageId: '123',
-                targetMethod: 'echo',
+                targetMethod: 'ping',
                 payload: ['hello']
             }
         });
@@ -109,6 +170,57 @@ describe('WebviewMessageHandler', () => {
         assert.match(sentMessage.content.errorMessage, /Method 'unknown' not found/);
     });
 
+    it('rejects a non-array modern RPC payload before invoking the host', async () => {
+        const ping = mock.fn();
+        const posted = nextPostedMessage();
+        const handler = new WebviewMessageHandler(
+            posted.postMessage,
+            { ping } as unknown as import('../../src/hostBridge').HostBridge
+        );
+
+        handler.handleMessage({
+            channel: 'rpc',
+            content: {
+                kind: 'invoke',
+                messageId: 'malformed-payload',
+                targetMethod: 'ping',
+                payload: 'spread-me-as-characters'
+            }
+        });
+
+        const message = await posted.promise;
+        assert.strictEqual(message.content.success, false);
+        assert.match(message.content.errorMessage, /payload must be an array/i);
+        assert.strictEqual(ping.mock.callCount(), 0);
+    });
+
+    it('drops an unsafe modern RPC message ID before invoking or reflecting it', async () => {
+        const ping = mock.fn();
+        const postedMessages: unknown[] = [];
+        const handler = new WebviewMessageHandler(
+            async message => {
+                postedMessages.push(message);
+                return true;
+            },
+            { ping } as unknown as import('../../src/hostBridge').HostBridge
+        );
+        const hostileId = { secret: 'must-not-be-reflected' };
+
+        handler.handleMessage({
+            channel: 'rpc',
+            content: {
+                kind: 'invoke',
+                messageId: hostileId,
+                targetMethod: 'ping',
+                payload: ['hello']
+            }
+        });
+        await new Promise(resolve => setImmediate(resolve));
+
+        assert.strictEqual(ping.mock.callCount(), 0);
+        assert.deepStrictEqual(postedMessages, []);
+    });
+
     it('surfaces oversized new-value refusal as a typed RPC error', async () => {
         const hostBridge = {
             insertRow: () => {
@@ -139,9 +251,43 @@ describe('WebviewMessageHandler', () => {
         assert.strictEqual(message.content.error.limitBytes, 2048);
     });
 
-    it('should handle legacy RPC request', () => {
+    it('returns a terminal failure when a host method rejects an unstringifiable value', async () => {
+        const hostile = {
+            [Symbol.toPrimitive]() {
+                throw new Error('coercion trap');
+            }
+        };
+        const posted = nextPostedMessage();
+        const handler = new WebviewMessageHandler(
+            posted.postMessage,
+            { ping: () => { throw hostile; } } as unknown as import('../../src/hostBridge').HostBridge
+        );
+
+        handler.handleMessage({
+            channel: 'rpc',
+            content: {
+                kind: 'invoke',
+                messageId: 'hostile-host-rejection',
+                targetMethod: 'ping',
+                payload: []
+            }
+        });
+
+        const message = await posted.promise;
+        assert.deepStrictEqual(message, {
+            channel: 'rpc',
+            content: {
+                kind: 'response',
+                messageId: 'hostile-host-rejection',
+                success: false,
+                errorMessage: 'Unknown error'
+            }
+        });
+    });
+
+    it('invokes a legacy RPC method exactly once', () => {
         const hostBridge = {
-            echo: (val: unknown) => val
+            ping: mock.fn((val: unknown) => val)
         };
         let sentMessage: any = null;
         const postMessage = async (msg: unknown) => {
@@ -153,7 +299,7 @@ describe('WebviewMessageHandler', () => {
 
         handler.handleMessage({
             type: 'rpc-request',
-            method: 'echo',
+            method: 'ping',
             id: '123',
             args: ['legacy']
         });
@@ -165,13 +311,160 @@ describe('WebviewMessageHandler', () => {
                     id: '123',
                     result: 'legacy'
                 });
+                assert.strictEqual(hostBridge.ping.mock.callCount(), 1);
                 resolve();
              }, 10);
         });
     });
 
+    it('does not dispatch history-forging fireEditEvent requests', async () => {
+        const fireEditEvent = mock.fn();
+        const posted = nextPostedMessage();
+        const handler = new WebviewMessageHandler(
+            posted.postMessage,
+            { fireEditEvent } as unknown as import('../../src/hostBridge').HostBridge
+        );
+
+        handler.handleMessage({
+            channel: 'rpc',
+            content: {
+                kind: 'invoke',
+                messageId: 'forged-history',
+                targetMethod: 'fireEditEvent',
+                payload: [{
+                    modificationType: 'row_insert',
+                    targetTable: 'items',
+                    targetRowId: 1
+                }]
+            }
+        });
+
+        const message = await posted.promise;
+        assert.strictEqual(message.content.success, false);
+        assert.match(message.content.errorMessage, /not found|not available/i);
+        assert.strictEqual(fireEditEvent.mock.callCount(), 0);
+    });
+
+    it('default-denies HostBridge helpers that are not webview capabilities', async () => {
+        const acquireOutputChannel = mock.fn();
+        const posted = nextPostedMessage();
+        const handler = new WebviewMessageHandler(
+            posted.postMessage,
+            { acquireOutputChannel } as unknown as import('../../src/hostBridge').HostBridge
+        );
+
+        handler.handleMessage({
+            channel: 'rpc',
+            content: {
+                kind: 'invoke',
+                messageId: 'private-helper',
+                targetMethod: 'acquireOutputChannel',
+                payload: []
+            }
+        });
+
+        const message = await posted.promise;
+        assert.strictEqual(message.content.success, false);
+        assert.strictEqual(acquireOutputChannel.mock.callCount(), 0);
+    });
+
+    it('does not dispatch a hybrid modern-and-legacy envelope twice', async () => {
+        const ping = mock.fn((value: unknown) => value);
+        const messages: unknown[] = [];
+        const handler = new WebviewMessageHandler(
+            async message => {
+                messages.push(message);
+                return true;
+            },
+            { ping } as unknown as import('../../src/hostBridge').HostBridge
+        );
+
+        handler.handleMessage({
+            channel: 'rpc',
+            content: {
+                kind: 'invoke',
+                messageId: 'hybrid',
+                targetMethod: 'ping',
+                payload: ['modern']
+            },
+            type: 'rpc-request',
+            method: 'ping',
+            id: 'hybrid-legacy',
+            args: ['legacy']
+        });
+        await new Promise(resolve => setTimeout(resolve, 10));
+
+        assert.strictEqual(ping.mock.callCount(), 1);
+        assert.strictEqual(messages.length, 1);
+        assert.strictEqual(ping.mock.calls[0].arguments[0], 'modern');
+    });
+
+    it('does not dispatch a legacy request attached to a core RPC response', async () => {
+        const ping = mock.fn();
+        const onComplete = mock.fn();
+        const onFault = mock.fn();
+        const expirationTimer = setTimeout(() => undefined, 60_000);
+        const pendingInvocations = new Map<string, PendingInvocation>([[
+            'host-call',
+            { onComplete, onFault, expirationTimer }
+        ]]);
+        const postedMessages: unknown[] = [];
+        const handler = new WebviewMessageHandler(
+            async message => {
+                postedMessages.push(message);
+                return true;
+            },
+            { ping } as unknown as import('../../src/hostBridge').HostBridge,
+            pendingInvocations
+        );
+
+        handler.handleMessage({
+            kind: 'result',
+            correlationId: 'host-call',
+            payload: 'response-value',
+            type: 'rpc-request',
+            method: 'ping',
+            id: 'smuggled-request',
+            args: []
+        });
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        assert.strictEqual(onComplete.mock.callCount(), 1);
+        assert.strictEqual(onComplete.mock.calls[0].arguments[0], 'response-value');
+        assert.strictEqual(onFault.mock.callCount(), 0);
+        assert.strictEqual(ping.mock.callCount(), 0);
+        assert.deepStrictEqual(postedMessages, []);
+    });
+
+    it('also denies fireEditEvent through the legacy envelope', async () => {
+        const fireEditEvent = mock.fn();
+        const postedMessages: unknown[] = [];
+        const handler = new WebviewMessageHandler(
+            async message => {
+                postedMessages.push(message);
+                return true;
+            },
+            { fireEditEvent } as unknown as import('../../src/hostBridge').HostBridge
+        );
+
+        handler.handleMessage({
+            type: 'rpc-request',
+            method: 'fireEditEvent',
+            id: 'legacy-forged-history',
+            args: [{}]
+        });
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        assert.strictEqual(fireEditEvent.mock.callCount(), 0);
+        assert.deepStrictEqual(postedMessages, [{
+            type: 'rpc-response',
+            id: 'legacy-forged-history',
+            error: "Method 'fireEditEvent' not found on hostBridge"
+        }]);
+    });
+
     it('rejects an oversized webview request before deserialization or host invocation', async () => {
-        const hostBridge = { echo: mock.fn((value: unknown) => value) };
+        const hostBridge = { ping: mock.fn((value: unknown) => value) };
         const posted = nextPostedMessage();
         const handler = new WebviewMessageHandler(
             posted.postMessage,
@@ -184,7 +477,7 @@ describe('WebviewMessageHandler', () => {
             content: {
                 kind: 'invoke',
                 messageId: 'oversized-request',
-                targetMethod: 'echo',
+                targetMethod: 'ping',
                 payload: [bytes]
             }
         }));
@@ -196,11 +489,11 @@ describe('WebviewMessageHandler', () => {
             actualBytes: bytes.byteLength,
             limitBytes: MAX_WEBVIEW_BINARY_VALUE_BYTES
         });
-        assert.strictEqual(hostBridge.echo.mock.callCount(), 0);
+        assert.strictEqual(hostBridge.ping.mock.callCount(), 0);
     });
 
     it('rejects aggregate webview request amplification before host invocation', async () => {
-        const hostBridge = { echo: mock.fn((value: unknown) => value) };
+        const hostBridge = { ping: mock.fn((value: unknown) => value) };
         const posted = nextPostedMessage();
         const handler = new WebviewMessageHandler(
             posted.postMessage,
@@ -213,7 +506,7 @@ describe('WebviewMessageHandler', () => {
             content: {
                 kind: 'invoke',
                 messageId: 'aggregate-request',
-                targetMethod: 'echo',
+                targetMethod: 'ping',
                 payload: [new Uint8Array(bytesPerValue), new Uint8Array(bytesPerValue)]
             }
         });
@@ -224,12 +517,12 @@ describe('WebviewMessageHandler', () => {
             kind: 'aggregate-payload',
             limitBytes: MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES
         });
-        assert.strictEqual(hostBridge.echo.mock.callCount(), 0);
+        assert.strictEqual(hostBridge.ping.mock.callCount(), 0);
     });
 
     it('turns an oversized host response into a typed RPC rejection without throwing', async () => {
         const bytes = new Uint8Array(MAX_WEBVIEW_BINARY_VALUE_BYTES + 1);
-        const hostBridge = { oversized: () => bytes };
+        const hostBridge = { fetchSchema: () => bytes };
         const posted = nextPostedMessage();
         const handler = new WebviewMessageHandler(
             posted.postMessage,
@@ -241,7 +534,7 @@ describe('WebviewMessageHandler', () => {
             content: {
                 kind: 'invoke',
                 messageId: 'oversized-response',
-                targetMethod: 'oversized',
+                targetMethod: 'fetchSchema',
                 payload: []
             }
         }));
@@ -258,7 +551,7 @@ describe('WebviewMessageHandler', () => {
     it('turns aggregate host response amplification into a typed RPC rejection', async () => {
         const bytesPerValue = 13 * 1024 * 1024;
         const hostBridge = {
-            oversized: () => [
+            fetchSchema: () => [
                 new Uint8Array(bytesPerValue),
                 new Uint8Array(bytesPerValue)
             ]
@@ -274,7 +567,7 @@ describe('WebviewMessageHandler', () => {
             content: {
                 kind: 'invoke',
                 messageId: 'aggregate-response',
-                targetMethod: 'oversized',
+                targetMethod: 'fetchSchema',
                 payload: []
             }
         });

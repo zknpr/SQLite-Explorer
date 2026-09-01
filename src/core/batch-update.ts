@@ -2,7 +2,7 @@ import {
   OversizedCellReplacementRequiredError
 } from './cell-edit-policy';
 import { SQLITE_MAX_VARIABLE_NUMBER } from './integer-utils';
-import { escapeIdentifier, validateRowId } from './sql-utils';
+import { escapeIdentifier, escapeMainIdentifier, validateRowId } from './sql-utils';
 import {
   buildRecordIdentityPredicateChunks
 } from './row-identity';
@@ -22,6 +22,7 @@ export interface BatchHistorySizePreflight {
 // Each query reserves one bind for the edit limit. Staying below SQLite's
 // bundled variable ceiling also bounds SQL text and worker-message size.
 export const BATCH_PRIOR_ROWID_CHUNK_SIZE = SQLITE_MAX_VARIABLE_NUMBER - 1;
+const RAW_TEXT_HISTORY_SIDECAR_KEY_BYTES = 'rawTextBytes'.length * 2;
 
 /**
  * Build metadata-only guards for rowid batches without one query per cell.
@@ -55,7 +56,7 @@ export function buildBatchPriorLimitQueries(
         sql:
           `SELECT typeof(${escapedColumn}) AS "storage_class", ` +
           `length(CAST(${escapedColumn} AS BLOB)) AS "byte_length" ` +
-          `FROM ${escapeIdentifier(table)} ` +
+          `FROM ${escapeMainIdentifier(table)} ` +
           `WHERE rowid IN (${chunk.map(() => '?').join(', ')}) ` +
           `AND typeof(${escapedColumn}) IN ('text', 'blob') ` +
           `AND length(CAST(${escapedColumn} AS BLOB)) > ? LIMIT 1`,
@@ -142,7 +143,7 @@ export function buildBatchHistorySizePreflight(
       queries.push({
         sql:
           `SELECT COUNT(*), COALESCE(SUM(${batchHistoryValueBytes(column)}), 0) `
-          + `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+          + `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
         params: predicate.params
       });
     }
@@ -187,7 +188,12 @@ export function assertBatchHistoryFitsUndoBudget(input: {
   if (cellCount !== input.preflight.expectedCellCount) {
     throw new Error(`Cannot update ${input.table}: one or more row identities no longer exist`);
   }
-  if (valueBytes > input.maxPriorValueBytes) {
+  // The provisional history shape already reserves priorState itself, but a
+  // malformed TEXT prior adds this optional key when its exact bytes replace a
+  // lossy JS string. SQL cannot classify malformed encodings portably, so
+  // reserve the key for every cell; valueBytes already covers the byte array.
+  const projectedBytes = valueBytes + cellCount * RAW_TEXT_HISTORY_SIDECAR_KEY_BYTES;
+  if (!Number.isSafeInteger(projectedBytes) || projectedBytes > input.maxPriorValueBytes) {
     throw new Error(
       `Batch update undo snapshot exceeds the ${input.maxPriorValueBytes}-byte memory budget; `
       + 'update fewer cells or increase sqliteExplorer.maxUndoMemory.'

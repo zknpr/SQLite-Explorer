@@ -1,6 +1,6 @@
 import * as vsc from 'vscode';
 import { DocumentRegistry } from './documentRegistry';
-import { escapeIdentifier, validateRowId } from './core/sql-utils';
+import { escapeIdentifier, escapeMainIdentifier, validateRowId } from './core/sql-utils';
 import {
     buildRecordIdentityPredicate,
     classifyTableIdentity,
@@ -14,12 +14,15 @@ import {
 } from './core/view-utils';
 import { GlobalOutputChannel } from './main';
 import { getMaxInlineCellBytes } from './config';
+import { sqliteIdentifiersEqual } from './core/integer-utils';
 import {
     assertCellValueWithinEditLimit,
     DEFAULT_MAX_CELL_EDIT_BYTES,
     formatOversizedCellReplacementWarning,
     isOversizedCellReplacementConflictError,
-    isOversizedCellReplacementRequiredError
+    isOversizedCellReplacementRequiredError,
+    MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS,
+    OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE
 } from './core/cell-edit-policy';
 
 import type {
@@ -29,6 +32,8 @@ import type {
 } from './databaseModel';
 import type {
     RecordId,
+    CellMetadata,
+    CellUpdateResult,
     TableIdentity,
     ViewDefinition,
     ViewEditResult,
@@ -58,6 +63,7 @@ interface CellDocumentTarget {
     uri: vsc.Uri;
     table: string;
     rowId: RecordId;
+    column: string;
 }
 
 function getViewDefinitionErrorDetail(error: unknown): string {
@@ -229,7 +235,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             }
 
             const colName = column;
-            const targetRowId = this.getCellDocumentTarget(document, uri, table, rowId);
+            const targetRowId = this.getCellDocumentTarget(document, uri, table, rowId, colName);
             let rowPredicate: ReturnType<typeof buildRecordIdentityPredicate>;
             try {
                 if (isPrimaryKeyRecordId(targetRowId)) {
@@ -243,16 +249,17 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 return new TextEncoder().encode(`Invalid Row ID: ${rowId}`);
             }
 
+            let cellMetadata: CellMetadata | undefined;
             if (typeof document.databaseOperations.getCellMetadata === 'function') {
-                const metadata = await document.databaseOperations.getCellMetadata({
+                cellMetadata = await document.databaseOperations.getCellMetadata({
                     table,
                     rowId: targetRowId,
                     column: colName
                 });
-                if (metadata.byteLength > getMaxInlineCellBytes()) {
+                if (cellMetadata.byteLength > getMaxInlineCellBytes()) {
                     throw vsc.FileSystemError.NoPermissions(
-                        `This oversized ${metadata.storageClass.toUpperCase()} cell is ` +
-                        `${metadata.byteLength.toLocaleString()} bytes and cannot be returned by ` +
+                        `This oversized ${cellMetadata.storageClass.toUpperCase()} cell is ` +
+                        `${cellMetadata.byteLength.toLocaleString()} bytes and cannot be returned by ` +
                         'FileSystemProvider.readFile. Open it from the grid to use a read-only ' +
                         'temporary-file document. Export the cell instead if temporary ' +
                         'materialization is unavailable.'
@@ -267,12 +274,15 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             const query =
                 `SELECT ${escapedColumn}, ` +
                 `CASE WHEN typeof(${escapedColumn}) IN ('integer', 'real') ` +
-                `THEN CAST(${escapedColumn} AS TEXT) END ` +
-                `FROM ${escapeIdentifier(table)} WHERE ${rowPredicate.sql}`;
+                `THEN CAST(${escapedColumn} AS TEXT) END, ` +
+                `CASE WHEN typeof(${escapedColumn}) = 'text' ` +
+                `THEN CAST(${escapedColumn} AS BLOB) END ` +
+                `FROM ${escapeMainIdentifier(table)} WHERE ${rowPredicate.sql}`;
             const result = await document.databaseOperations.executeQuery(query, rowPredicate.params);
 
             const value = result?.[0]?.rows?.[0]?.[0];
             const exactNumericText = result?.[0]?.rows?.[0]?.[1];
+            const rawText = result?.[0]?.rows?.[0]?.[2];
 
             if (value === null) {
                 // Return empty content for NULL values as VS Code expects a string/buffer.
@@ -285,6 +295,33 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
             if (typeof exactNumericText === 'string') {
                 return new TextEncoder().encode(exactNumericText);
+            }
+
+            if (typeof value === 'string' && cellMetadata?.storageClass === 'text') {
+                if (!(rawText instanceof Uint8Array) || !cellMetadata.textEncoding) {
+                    throw vsc.FileSystemError.Unavailable(
+                        'SQLite did not return byte-faithful TEXT metadata for the external editor'
+                    );
+                }
+                let decoded: string;
+                try {
+                    decoded = new TextDecoder(cellMetadata.textEncoding, {
+                        fatal: true,
+                        ignoreBOM: true
+                    }).decode(rawText);
+                } catch {
+                    throw vsc.FileSystemError.NoPermissions(
+                        'This TEXT cell is not validly encoded without changing its stored bytes. ' +
+                        'Open its raw Hex inspector or export it instead.'
+                    );
+                }
+                if (decoded !== value) {
+                    throw vsc.FileSystemError.NoPermissions(
+                        'This TEXT cell cannot be represented by the external text editor without ' +
+                        'changing its stored bytes. Open its raw Hex inspector or export it instead.'
+                    );
+                }
+                return new TextEncoder().encode(decoded);
             }
 
             return new TextEncoder().encode(String(value));
@@ -411,7 +448,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         }
 
         try {
-            const targetRowId = this.getCellDocumentTarget(document, uri, table, rowId);
+            const targetRowId = this.getCellDocumentTarget(document, uri, table, rowId, column);
             let validatedRowId: RecordId;
             let rowPredicate: ReturnType<typeof buildRecordIdentityPredicate>;
             try {
@@ -429,27 +466,41 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
 
            
 
-            let value: string | Uint8Array = content;
-
-            // Try to decode as UTF-8
-            try {
-                // We strictly try to decode as UTF-8. If the content contains invalid UTF-8 sequences,
-                // the TextDecoder with 'fatal: true' will throw, and we will fall back to treating it as a BLOB.
-                // This allows saving text containing null bytes, which are valid in UTF-8/SQL TEXT,
-                // while correctly handling actual binary data.
-                value = new TextDecoder('utf-8', { fatal: true }).decode(content);
-            } catch {
-                // Keep as Uint8Array, treating as BLOB
-            }
+            // Reject over-limit buffers before any database read. Storage
+            // class is resolved from authoritative metadata below; byte count
+            // is identical for the UTF-8 editor buffer and a BLOB value.
             const editLimitBytes = DEFAULT_MAX_CELL_EDIT_BYTES;
-            assertCellValueWithinEditLimit(value, editLimitBytes);
+            assertCellValueWithinEditLimit(content, editLimitBytes);
+            let decodedText: string | undefined;
+            try {
+                decodedText = new TextDecoder('utf-8', { fatal: true }).decode(content);
+            } catch {
+                // BLOB editors may contain arbitrary bytes. TEXT editors are
+                // rejected below rather than silently changing storage class.
+            }
 
-            while (true) {
+            for (let attempt = 1; attempt <= MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS; attempt++) {
                 const metadata = await document.databaseOperations.getCellMetadata({
                     table,
                     rowId: validatedRowId,
                     column
                 });
+                let value: string | Uint8Array;
+                if (metadata.storageClass === 'blob') {
+                    value = content;
+                } else if (metadata.storageClass === 'text') {
+                    if (decodedText === undefined) {
+                        throw vsc.FileSystemError.NoPermissions(
+                            'TEXT cell editor content must be valid UTF-8; use the BLOB/Hex workflow for raw bytes'
+                        );
+                    }
+                    value = decodedText;
+                } else {
+                    // Preserve legacy flexibility for numeric/NULL cells:
+                    // valid editor text is bound as text (letting SQLite apply
+                    // affinity), while arbitrary bytes remain a BLOB.
+                    value = decodedText ?? content;
+                }
                 const oversized = (
                     metadata.storageClass === 'text' || metadata.storageClass === 'blob'
                 ) && metadata.byteLength > editLimitBytes;
@@ -477,8 +528,8 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                             editLimitBytes
                         );
                         const newTargetRowId = updatedRowId ?? validatedRowId;
-                        if (isPrimaryKeyRecordId(validatedRowId)) {
-                            this.setCellDocumentTarget(document, uri, table, newTargetRowId);
+                        if (newTargetRowId !== validatedRowId) {
+                            this.setCellDocumentTarget(document, uri, table, newTargetRowId, column);
                         }
                         // Future file-backed undo would attach its checksummed
                         // snapshot here and replace this forward-only policy.
@@ -488,16 +539,22 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                             modificationType: 'cell_update',
                             targetTable: table,
                             targetRowId: validatedRowId,
-                            ...(isPrimaryKeyRecordId(validatedRowId) ? { newTargetRowId } : {}),
+                            ...(isPrimaryKeyRecordId(validatedRowId) || newTargetRowId !== validatedRowId
+                                ? { newTargetRowId }
+                                : {}),
                             targetColumn: column,
                             newValue: value,
                             operation: 'set',
                             undoPolicy: 'barrier'
                         });
-                        this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
                         return;
                     } catch (error) {
-                        if (isOversizedCellReplacementConflictError(error)) continue;
+                        if (isOversizedCellReplacementConflictError(error)) {
+                            if (attempt < MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS) continue;
+                            throw new Error(OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE, {
+                                cause: error
+                            });
+                        }
                         throw error;
                     }
                 }
@@ -509,9 +566,11 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 const previous = await document.databaseOperations.executeQuery(
                     `SELECT typeof(${escapedColumn}), ${byteLengthExpression}, ` +
                     `CASE WHEN typeof(${escapedColumn}) IN ('text', 'blob') ` +
-                    `AND ${byteLengthExpression} > ? THEN NULL ELSE ${escapedColumn} END ` +
-                    `FROM ${escapeIdentifier(table)} WHERE ${rowPredicate.sql} LIMIT 2`,
-                    [editLimitBytes, ...rowPredicate.params]
+                    `AND ${byteLengthExpression} > ? THEN NULL ELSE ${escapedColumn} END, ` +
+                    `CASE WHEN typeof(${escapedColumn}) = 'text' ` +
+                    `AND ${byteLengthExpression} <= ? THEN CAST(${escapedColumn} AS BLOB) END ` +
+                    `FROM ${escapeMainIdentifier(table)} WHERE ${rowPredicate.sql} LIMIT 2`,
+                    [editLimitBytes, editLimitBytes, ...rowPredicate.params]
                 );
                 if (previous[0]?.rows.length !== 1) {
                     throw new Error(`Cannot update ${table}.${column}: row identity no longer exists`);
@@ -528,28 +587,68 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                     // the raced oversized payload. Re-read and confirm it.
                     continue;
                 }
+                if (
+                    metadata.storageClass !== storageClass
+                    || metadata.byteLength !== Number(byteLength)
+                ) {
+                    // Metadata and prior-value reads are independently
+                    // serialized. Re-read rather than binding editor bytes
+                    // using a storage class from another version of the cell.
+                    continue;
+                }
+                if (storageClass === 'text') {
+                    const rawText = previous[0].rows[0][3];
+                    if (!(rawText instanceof Uint8Array) || !metadata.textEncoding) {
+                        throw new Error(`SQLite returned invalid raw TEXT metadata for ${table}.${column}`);
+                    }
+                    let decoded: string;
+                    try {
+                        decoded = new TextDecoder(metadata.textEncoding, {
+                            fatal: true,
+                            ignoreBOM: true
+                        }).decode(rawText);
+                    } catch {
+                        decoded = '';
+                    }
+                    if (decoded !== boundedValue) {
+                        throw vsc.FileSystemError.NoPermissions(
+                            'This TEXT cell cannot be edited as text without changing its stored bytes. ' +
+                            'Open its raw Hex inspector or export it instead.'
+                        );
+                    }
+                }
                 const keyColumnIndex = rowPredicate.primaryKey?.columns.indexOf(column) ?? -1;
                 const priorValue = keyColumnIndex >= 0
                     ? rowPredicate.primaryKey!.values[keyColumnIndex]
                     : boundedValue;
 
-                let updatedRowId: RecordId | void;
+                let historyCell: CellUpdateResult | undefined;
                 try {
-                    updatedRowId = await document.databaseOperations.updateCell(
+                    [historyCell] = await document.databaseOperations.updateCellBatch(
                         table,
-                        validatedRowId,
-                        column,
-                        value,
-                        undefined,
+                        [{
+                            rowId: validatedRowId,
+                            column,
+                            value,
+                            operation: 'set'
+                        }],
                         editLimitBytes
                     );
                 } catch (error) {
-                    if (isOversizedCellReplacementRequiredError(error)) continue;
+                    if (isOversizedCellReplacementRequiredError(error)) {
+                        if (attempt < MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS) continue;
+                        throw new Error(OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE, {
+                            cause: error
+                        });
+                    }
                     throw error;
                 }
-                const newTargetRowId = updatedRowId ?? validatedRowId;
-                if (isPrimaryKeyRecordId(validatedRowId)) {
-                    this.setCellDocumentTarget(document, uri, table, newTargetRowId);
+                if (!historyCell) {
+                    throw new Error(`Backend did not return cell history for ${table}.${column}`);
+                }
+                const newTargetRowId = historyCell.newRowId ?? validatedRowId;
+                if (newTargetRowId !== validatedRowId) {
+                    this.setCellDocumentTarget(document, uri, table, newTargetRowId, column);
                 }
 
                 document.recordExternalModification({
@@ -558,15 +657,20 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                     modificationType: 'cell_update',
                     targetTable: table,
                     targetRowId: validatedRowId,
-                    ...(isPrimaryKeyRecordId(validatedRowId) ? { newTargetRowId } : {}),
+                    ...(isPrimaryKeyRecordId(validatedRowId) || newTargetRowId !== validatedRowId
+                        ? { newTargetRowId }
+                        : {}),
                     targetColumn: column,
-                    priorValue,
-                    newValue: value
+                    priorValue: historyCell.priorValue ?? priorValue,
+                    newValue: historyCell.newValue,
+                    operation: historyCell.operation,
+                    priorState: historyCell.priorState,
+                    postState: historyCell.postState
                 });
 
-                this._emitter.fire([{ type: vsc.FileChangeType.Changed, uri }]);
                 return;
             }
+            throw new Error(OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE);
 
         } catch (err) {
             GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error writing cell: ${err instanceof Error ? err.message : String(err)}`);
@@ -587,23 +691,33 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         document: DatabaseDocument,
         uri: vsc.Uri,
         table: string,
-        uriRowId: string
+        uriRowId: string,
+        column: string
     ): RecordId {
-        if (!isPrimaryKeyRecordId(uriRowId)) return uriRowId;
         const existing = this.cellDocumentTargets.get(document)?.get(uri.toString());
         if (existing) return existing.rowId;
+        let initialRowId: RecordId = uriRowId;
+        if (!isPrimaryKeyRecordId(uriRowId)) {
+            try {
+                initialRowId = validateRowId(uriRowId);
+            } catch {
+                // Preserve the established caller-owned invalid-URI handling.
+                return uriRowId;
+            }
+        }
         // readFile is the point at which VS Code has opened this immutable URI.
-        // Track its initial identity too, so grid-originated PK edits and their
-        // history replay can retarget it even before this editor writes.
-        this.setCellDocumentTarget(document, uri, table, uriRowId);
-        return uriRowId;
+        // Track numeric and opaque identities alike so grid-originated alias/PK
+        // edits and their history replay can retarget it before this editor saves.
+        this.setCellDocumentTarget(document, uri, table, initialRowId, column);
+        return initialRowId;
     }
 
     private setCellDocumentTarget(
         document: DatabaseDocument,
         uri: vsc.Uri,
         table: string,
-        rowId: RecordId
+        rowId: RecordId,
+        column: string
     ): void {
         this.ensureDocumentTracking(document);
         let targets = this.cellDocumentTargets.get(document);
@@ -611,7 +725,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             targets = new Map<string, CellDocumentTarget>();
             this.cellDocumentTargets.set(document, targets);
         }
-        targets.set(uri.toString(), { uri, table, rowId });
+        targets.set(uri.toString(), { uri, table, rowId, column });
     }
 
     private isLogicalDirectory(uri: vsc.Uri): boolean {
@@ -647,8 +761,9 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
         // pathParts[2] is grouping name, ignore
         const rowId = decodeURIComponent(pathParts[3]);
 
-        let column = '';
-        if (pathParts.length > 4) {
+        const query = new URLSearchParams(uri.query);
+        let column = query.has('column') ? (query.get('column') ?? '') : '';
+        if (!query.has('column') && pathParts.length > 4) {
             const filename = decodeURIComponent(pathParts[4]);
             const lastDotIndex = filename.lastIndexOf('.');
             column = lastDotIndex > 0 ? filename.substring(0, lastDotIndex) : filename;
@@ -762,39 +877,56 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             return;
         }
 
-        const direction = change.modificationDirection ?? 'forward';
-        const identityPairs: Array<{ before: RecordId; after: RecordId }> = [];
+        const cellChanges: Array<{
+            before: RecordId;
+            after: RecordId;
+            column: string;
+        }> = [];
         if (
             modification.targetRowId !== undefined
-            && modification.newTargetRowId !== undefined
+            && typeof modification.targetColumn === 'string'
         ) {
-            identityPairs.push({
+            cellChanges.push({
                 before: modification.targetRowId,
-                after: modification.newTargetRowId
+                after: modification.newTargetRowId ?? modification.targetRowId,
+                column: modification.targetColumn
             });
         }
         for (const cell of modification.affectedCells ?? []) {
-            if (cell.newRowId !== undefined) {
-                identityPairs.push({ before: cell.rowId, after: cell.newRowId });
-            }
+            cellChanges.push({
+                before: cell.rowId,
+                after: cell.newRowId ?? cell.rowId,
+                column: cell.columnName
+            });
         }
-        if (identityPairs.length === 0) return;
+        if (cellChanges.length === 0) return;
 
+        const direction = change.modificationDirection ?? 'forward';
         const changes: vsc.FileChangeEvent[] = [];
         for (const target of targets.values()) {
             if (target.table !== modification.targetTable) continue;
-            const pair = identityPairs.find(candidate => {
+            const contentChanged = cellChanges.some(candidate => {
                 const source = direction === 'undo' ? candidate.after : candidate.before;
-                return isPrimaryKeyRecordId(source)
-                    && isPrimaryKeyRecordId(target.rowId)
-                    && source === target.rowId;
+                const destination = direction === 'undo' ? candidate.before : candidate.after;
+                return sqliteIdentifiersEqual(candidate.column, target.column)
+                    && (source === target.rowId
+                        // External-editor saves retarget their own URI before
+                        // recordExternalModification synchronously emits this event.
+                        || (source !== destination && destination === target.rowId));
             });
-            if (!pair) continue;
-            const replacement = direction === 'undo' ? pair.before : pair.after;
-            if (!isPrimaryKeyRecordId(replacement)) continue;
-            if (replacement === target.rowId) continue;
-            target.rowId = replacement;
-            changes.push({ type: vsc.FileChangeType.Changed, uri: target.uri });
+            const identityChange = cellChanges.find(candidate => {
+                const source = direction === 'undo' ? candidate.after : candidate.before;
+                const destination = direction === 'undo' ? candidate.before : candidate.after;
+                return source !== destination && source === target.rowId;
+            });
+            if (identityChange) {
+                target.rowId = direction === 'undo'
+                    ? identityChange.before
+                    : identityChange.after;
+            }
+            if (contentChanged || identityChange) {
+                changes.push({ type: vsc.FileChangeType.Changed, uri: target.uri });
+            }
         }
         if (changes.length > 0) this._emitter.fire(changes);
     }

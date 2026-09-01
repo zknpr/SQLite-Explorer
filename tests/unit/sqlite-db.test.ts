@@ -225,6 +225,25 @@ describe('WasmDatabaseEngine', () => {
     await engine.insertRow('users', { id: 1, name: 'Alice' });
   });
 
+  it('surfaces generated columns in table metadata and marks them read-only', async () => {
+    await engine.executeQuery(
+      'CREATE TABLE generated_metadata (' +
+      'base INTEGER, ' +
+      'virtual_value INTEGER GENERATED ALWAYS AS (base * 2) VIRTUAL, ' +
+      'stored_value INTEGER GENERATED ALWAYS AS (base * 3) STORED)'
+    );
+
+    const info = await engine.getTableInfo('generated_metadata');
+    assert.deepStrictEqual(
+      info.map((column: any) => [column.identifier, column.isGenerated]),
+      [
+        ['base', false],
+        ['virtual_value', true],
+        ['stored_value', true]
+      ]
+    );
+  });
+
   describe('safeRollback', () => {
     it('should attempt a rollback and warn on error', async () => {
       // override executeQuery to simulate error on ROLLBACK
@@ -318,7 +337,7 @@ describe('WasmDatabaseEngine', () => {
         await engine.addColumn('users', 'name', 'TEXT');
         assert.fail('Should have thrown error for duplicate column');
       } catch (err: any) {
-        assert.match(err.message, /duplicate column name/i);
+        assert.match(err.message, /Column "name" already exists in table "users"/);
       }
     });
   });

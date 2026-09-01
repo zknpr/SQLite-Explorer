@@ -10,6 +10,7 @@ import {
 } from '../../src/core/webview-transport';
 import { isTrustedViewerMessage } from '../../website/app/demo/messageGuard';
 import {
+    demoRpcErrorFields,
     guardDemoIframeRequest,
     guardDemoIframeResponse,
     guardDemoDatabaseExportResponse,
@@ -17,6 +18,11 @@ import {
     guardDemoWorkerResponse,
     serializeDemoIframeResponse
 } from '../../website/app/demo/transport';
+import {
+    createDemoExtensionSettings,
+    DEMO_EXTENSION_SETTINGS,
+    updateDemoExtensionSetting
+} from '../../website/app/demo/extensionSettings';
 import { deserializeValue } from '../../core/ui/modules/transport.js';
 
 function rejectsAt(surface: string, operation: () => void) {
@@ -40,6 +46,95 @@ function rejectsAggregateAt(surface: string, operation: () => void) {
 }
 
 describe('DemoClient transport guards', () => {
+    it('rejects malformed RPC identities and payload shapes at clone boundaries', () => {
+        assert.throws(() => guardDemoIframeRequest({
+            channel: 'rpc',
+            content: {
+                kind: 'invoke',
+                messageId: { reflected: true },
+                targetMethod: 'fetchSchema',
+                payload: []
+            }
+        }), /messageId.*bounded string/i);
+        assert.throws(() => guardDemoWorkerRequest({
+            channel: 'rpc',
+            content: {
+                kind: 'invoke',
+                messageId: 'request-1',
+                targetMethod: { constructor: true },
+                payload: []
+            }
+        }), /method.*bounded string/i);
+        assert.throws(() => guardDemoIframeRequest({
+            channel: 'rpc',
+            content: {
+                kind: 'invoke',
+                messageId: 'request-2',
+                targetMethod: 'fetchSchema',
+                payload: 'not-an-array'
+            }
+        }), /payload.*array/i);
+        assert.throws(() => guardDemoWorkerResponse({
+            channel: 'rpc',
+            content: {
+                kind: 'response',
+                messageId: 'response-1',
+                success: 'yes',
+                data: { accepted: false }
+            }
+        }), /success.*boolean/i);
+    });
+
+    it('serializes hostile rejection values without throwing from the response path', () => {
+        const hostile = {
+            [Symbol.toPrimitive]() {
+                throw new Error('coercion trap');
+            }
+        };
+
+        assert.deepStrictEqual(demoRpcErrorFields(hostile), {
+            errorMessage: 'Unknown error'
+        });
+
+        const bounded = demoRpcErrorFields(new Error('x'.repeat(20_000)));
+        assert.ok(bounded.errorMessage.length < 8400);
+        assert.match(bounded.errorMessage, /truncated from 20000 characters/i);
+    });
+
+    it('reports settings in the shape consumed by the shared viewer', () => {
+        assert.deepStrictEqual(DEMO_EXTENSION_SETTINGS, {
+            autoCommit: false,
+            autoCommitSupported: false,
+            cellEditBehavior: 'inline',
+            cellEditBehaviorOptions: ['inline', 'modal'],
+            fileOperations: 'web'
+        });
+    });
+
+    it('updates supported demo settings without forwarding them to the worker', () => {
+        const settings = createDemoExtensionSettings();
+        const updated = updateDemoExtensionSetting(
+            settings,
+            'doubleClickBehavior',
+            'modal'
+        );
+
+        assert.strictEqual(updated.cellEditBehavior, 'modal');
+        assert.strictEqual(settings.cellEditBehavior, 'inline');
+        assert.throws(
+            () => updateDemoExtensionSetting(updated, 'doubleClickBehavior', 'vscode'),
+            /not available in the web demo/
+        );
+        assert.throws(
+            () => updateDemoExtensionSetting(updated, 'autoCommit', true),
+            /Auto-commit is not available in the web demo/
+        );
+        assert.throws(
+            () => updateDemoExtensionSetting(updated, '__proto__', true),
+            /Unsupported demo extension setting/
+        );
+    });
+
     it('preserves reserved-prefix TEXT and infinities across the iframe response', () => {
         const original = {
             text: '~sqlite-explorer-non-finite:Infinity',
