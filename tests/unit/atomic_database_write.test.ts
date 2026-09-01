@@ -331,4 +331,28 @@ describe('writeDatabaseSnapshotAtomically', () => {
       await assertNoAtomicTemporaryFiles(directory);
     });
   });
+
+  it('saves to a distinct target after the active source pathname disappears', async () => {
+    await withScratchDirectory(async (directory) => {
+      const sourcePath = path.join(directory, 'unlinked-source.db');
+      const targetPath = path.join(directory, 'recovered-copy.db');
+      const snapshotBytes = Buffer.from('recoverable open database snapshot');
+      await fs.promises.writeFile(sourcePath, 'former source pathname');
+      await fs.promises.unlink(sourcePath);
+
+      const result = await writeDatabaseSnapshotAtomically(
+        fs,
+        sourcePath,
+        targetPath,
+        async (temporaryPath) => {
+          await fs.promises.writeFile(temporaryPath, snapshotBytes);
+        }
+      );
+
+      assert.deepStrictEqual(result, { requiresReopen: false });
+      assert.deepStrictEqual(await fs.promises.readFile(targetPath), snapshotBytes);
+      assert.strictEqual(await pathExists(sourcePath), false);
+      await assertNoAtomicTemporaryFiles(directory);
+    });
+  });
 });

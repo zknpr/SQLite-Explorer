@@ -3814,15 +3814,9 @@ export async function createNativeDatabaseConnection(
               transportQuery.transportColumns,
               transportQuery.valueColumnCount
             ]);
-            const metadataResult = containmentQuery.metadataSql
-              ? await worker.call<NativeQueryResult>('query', [
-                  containmentQuery.metadataSql,
-                  params
-                ])
-              : undefined;
             const valueSourceRows = mergeCellContainmentMetadataRows(
               primaryResult.values,
-              metadataResult?.values,
+              undefined,
               containmentQuery
             ) as CellValue[][];
             const rowIdResult = rowIdQuery

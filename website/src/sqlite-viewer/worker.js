@@ -1971,12 +1971,9 @@ async function fetchTableData(table, options = {}) {
     containmentQuery.primaryTransportColumnCount
   );
   const results = db.exec(transportQuery.sql, params, { useBigInt: true });
-  const metadataResults = containmentQuery.metadataSql
-    ? db.exec(containmentQuery.metadataSql, params, { useBigInt: true })
-    : undefined;
   const valueSourceRows = mergeCellContainmentMetadataRows(
     results[0]?.values ?? [],
-    metadataResults?.[0]?.values,
+    undefined,
     containmentQuery
   );
   const rowIdResults = rowIdQuery

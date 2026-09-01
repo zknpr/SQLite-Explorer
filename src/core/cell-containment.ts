@@ -41,9 +41,9 @@ export const SQLITE_MAX_RESULT_COLUMNS = 2000;
 
 export interface CellContainmentQuery {
   sql: string;
-  /** Separate one-column metadata read when the value projection fills SQLite's width. */
-  metadataSql?: string;
-  /** Columns returned by sql before separately fetched metadata is inserted. */
+  /** The final transport row packs metadata when values fill SQLite's width. */
+  metadataTrailer: boolean;
+  /** Columns returned by sql before packed metadata is inserted. */
   primaryTransportColumnCount: number;
   /** Original value columns, excluding the packed metadata transport column. */
   valueColumnCount: number;
@@ -210,32 +210,36 @@ export function buildCellContainmentQuery(
   const privateProjection = rawTextExpressions.length > 0
     ? `, ${rawTextExpressions.join(', ')}`
     : '';
+  const metadataUsesTrailer = columnCount + 1 > SQLITE_MAX_RESULT_COLUMNS;
   const sourceCte =
-    `WITH ${quotedSource} (${quotedValues.join(', ')}) AS (\n` +
+    `WITH ${quotedSource} (${quotedValues.join(', ')}) AS` +
+    `${metadataUsesTrailer ? ' MATERIALIZED' : ''} (\n` +
     `SELECT * FROM (\n${sourceSql}\n) LIMIT -1 OFFSET 0\n)\n`;
-  const metadataMustBeFetchedSeparately = columnCount + 1 > SQLITE_MAX_RESULT_COLUMNS;
-  const primaryMetadataProjection = metadataMustBeFetchedSeparately
+  const primaryMetadataProjection = metadataUsesTrailer
     ? ''
     : `, ${metadataExpression} AS ${escapeIdentifier(CELL_METADATA_ALIAS)}`;
+  const metadataTrailerProjection = metadataUsesTrailer
+    ? (
+        `\nUNION ALL\nSELECT ` +
+        `(SELECT COALESCE(group_concat(${metadataExpression}, char(10)), '') ` +
+        `FROM ${quotedSource})` +
+        `${columnCount > 1 ? `, ${Array(columnCount - 1).fill('NULL').join(', ')}` : ''}`
+      )
+    : '';
 
   return {
-    // OFFSET prevents query flattening so volatile view expressions are
-    // evaluated once before their value, typeof, and octet_length are reused.
+    // OFFSET prevents query flattening. At the width ceiling, MATERIALIZED
+    // lets the value rows and their one-row metadata trailer scan the same
+    // ephemeral result instead of evaluating a volatile source twice.
     sql:
       sourceCte +
       `SELECT ${projectedValues.join(', ')}` +
       `${primaryMetadataProjection}${privateProjection} ` +
-      `FROM ${quotedSource}`,
-    ...(metadataMustBeFetchedSeparately ? {
-      // Grid callers execute this before releasing the same serialized read
-      // (and, for native files, the same WAL snapshot) as the value query.
-      metadataSql:
-        sourceCte +
-        `SELECT ${metadataExpression} AS ${escapeIdentifier(CELL_METADATA_ALIAS)} ` +
-        `FROM ${quotedSource}`
-    } : {}),
+      `FROM ${quotedSource}` +
+      metadataTrailerProjection,
+    metadataTrailer: metadataUsesTrailer,
     primaryTransportColumnCount:
-      columnCount + (metadataMustBeFetchedSeparately ? 0 : 1) + projectedRawTextColumnIndices.length,
+      columnCount + (metadataUsesTrailer ? 0 : 1) + projectedRawTextColumnIndices.length,
     valueColumnCount: columnCount,
     metadataColumnIndex: columnCount,
     transportColumnCount: columnCount + 1 + projectedRawTextColumnIndices.length,
@@ -247,40 +251,44 @@ export function buildCellContainmentQuery(
   };
 }
 
-/** Insert a separately fetched metadata column at its logical transport slot. */
+/** Insert packed metadata at its logical transport slot. */
 export function mergeCellContainmentMetadataRows(
   primaryRows: readonly (readonly unknown[])[],
   metadataRows: readonly (readonly unknown[])[] | undefined,
   query: Pick<
     CellContainmentQuery,
-    'metadataSql' | 'metadataColumnIndex' | 'primaryTransportColumnCount'
+    'metadataTrailer' | 'metadataColumnIndex' | 'primaryTransportColumnCount'
   >
 ): Array<Array<unknown>> {
-  if (!query.metadataSql) {
+  if (!query.metadataTrailer) {
     if (metadataRows !== undefined) {
       throw new Error('Cell containment received unexpected separate metadata rows');
     }
     return primaryRows as Array<Array<unknown>>;
   }
-  if (metadataRows === undefined) {
-    if (primaryRows.length === 0) return [];
-    throw new Error('Cell containment metadata row count does not match the value page');
+  if (metadataRows !== undefined) {
+    throw new Error('Cell containment metadata must come from the value statement');
   }
-  if (metadataRows.length !== primaryRows.length) {
+  const trailer = primaryRows.at(-1);
+  if (!trailer || trailer.length !== query.primaryTransportColumnCount) {
+    throw new Error('Cell containment metadata trailer is missing or malformed');
+  }
+  if (typeof trailer[0] !== 'string' || trailer.slice(1).some(value => value !== null)) {
+    throw new Error('Cell containment metadata trailer is not one packed text value');
+  }
+  const valueRows = primaryRows.slice(0, -1);
+  const packedMetadataRows = trailer[0] === '' ? [] : trailer[0].split('\n');
+  if (packedMetadataRows.length !== valueRows.length) {
     throw new Error('Cell containment metadata row count does not match the value page');
   }
 
-  return primaryRows.map((row, rowIndex) => {
+  return valueRows.map((row, rowIndex) => {
     if (row.length < query.primaryTransportColumnCount) {
       throw new Error(`Cell containment value row ${rowIndex} is missing transport columns`);
     }
-    const metadataRow = metadataRows[rowIndex];
-    if (!metadataRow || metadataRow.length !== 1 || typeof metadataRow[0] !== 'string') {
-      throw new Error(`Cell containment metadata row ${rowIndex} is not one packed text value`);
-    }
     return [
       ...row.slice(0, query.metadataColumnIndex),
-      metadataRow[0],
+      packedMetadataRows[rowIndex],
       ...row.slice(query.metadataColumnIndex)
     ];
   });

@@ -1,6 +1,7 @@
 import './vscode_mock_setup';
 
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import {
@@ -133,6 +134,73 @@ describe('grid cell containment limits', () => {
             );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('derives maximum-width containment metadata from the same volatile row evaluation', async () => {
+        const {
+            buildCellContainmentQuery,
+            decodeCellContainment,
+            mergeCellContainmentMetadataRows
+        } = await loadContainmentModule();
+        const sourceColumns = Array.from({ length: 2000 }, (_, index) => (
+            index === 0 ? 'volatile_blob() AS c0' : `NULL AS c${index}`
+        ));
+        const query = buildCellContainmentQuery(
+            `SELECT ${sourceColumns.join(', ')}`,
+            2000,
+            {
+                limit: 1,
+                maxInlineCellBytes: 1024 * 1024,
+                maxPageResponseBytes: 16 * 1024 * 1024
+            }
+        );
+        let evaluations = 0;
+        const database = new DatabaseSync(':memory:');
+        try {
+            database.function('volatile_blob', () => {
+                evaluations += 1;
+                const byteLength = evaluations === 1
+                    ? query.effectiveInlineCellBytes + 1
+                    : 1;
+                return Buffer.alloc(byteLength, 0x41);
+            });
+            const executeRows = (sql: string): unknown[][] => {
+                const statement = database.prepare(sql);
+                statement.setReturnArrays(true);
+                return statement.all() as unknown as unknown[][];
+            };
+            const primaryRows = executeRows(query.sql);
+            const metadataRows = query.metadataSql
+                ? executeRows(query.metadataSql)
+                : undefined;
+            const transportedRows = mergeCellContainmentMetadataRows(
+                primaryRows,
+                metadataRows,
+                query
+            );
+            const decoded = decodeCellContainment(
+                transportedRows,
+                2000,
+                undefined,
+                16 * 1024 * 1024
+            );
+
+            assert.strictEqual(evaluations, 1);
+            assert.strictEqual(
+                (decoded.rows[0][0] as Uint8Array).byteLength,
+                query.effectiveInlineCellBytes
+            );
+            assert.deepStrictEqual(decoded.oversizedCells, {
+                0: {
+                    0: {
+                        storageClass: 'blob',
+                        byteLength: query.effectiveInlineCellBytes + 1
+                    }
+                }
+            });
+        } finally {
+            database.close();
         }
     });
 

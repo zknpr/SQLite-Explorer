@@ -107,16 +107,36 @@ async function resolveTarget(
   sourcePath: string | undefined,
   targetPath: string
 ): Promise<ResolvedTarget> {
-  const canonicalSource = sourcePath
-    ? await fs.promises.realpath(sourcePath)
-    : undefined;
   const absoluteTarget = path.resolve(targetPath);
+
+  const requiresReopen = async (replacementPath: string): Promise<boolean> => {
+    if (!sourcePath) return false;
+    const absoluteSource = path.resolve(sourcePath);
+    if (absoluteSource === absoluteTarget) return true;
+    try {
+      return await fs.promises.realpath(absoluteSource) === replacementPath;
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') throw error;
+    }
+
+    // An unlinked native source can remain usable through SQLite's open file
+    // descriptor. Resolve its surviving parent only for same-path detection;
+    // a missing source must not block recovery to an unrelated Save As target.
+    try {
+      const canonicalParent = await fs.promises.realpath(path.dirname(absoluteSource));
+      return path.join(canonicalParent, path.basename(absoluteSource)) === replacementPath;
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return false;
+      throw error;
+    }
+  };
+
   try {
     const replacementPath = await fs.promises.realpath(absoluteTarget);
     const stats = await fs.promises.stat(replacementPath, { bigint: true });
     return {
       replacementPath,
-      requiresReopen: replacementPath === canonicalSource,
+      requiresReopen: await requiresReopen(replacementPath),
       requiresWriteLock: await hasSqliteHeader(fs, replacementPath),
       metadata: replacementFileMetadataFromStats(stats),
       generation: { exists: true, fingerprint: fingerprint(stats) }
@@ -137,7 +157,9 @@ async function resolveTarget(
   const canonicalParent = await fs.promises.realpath(path.dirname(absoluteTarget));
   return {
     replacementPath: path.join(canonicalParent, path.basename(absoluteTarget)),
-    requiresReopen: false,
+    requiresReopen: await requiresReopen(
+      path.join(canonicalParent, path.basename(absoluteTarget))
+    ),
     requiresWriteLock: false,
     generation: { exists: false }
   };

@@ -4210,7 +4210,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const executionState: {
       headerStmt?: WasmPreparedStatement;
       stmt?: WasmPreparedStatement;
-      metadataStmt?: WasmPreparedStatement;
       rowIdStmt?: WasmPreparedStatement;
     } = {};
     try {
@@ -4319,21 +4318,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                 primaryRows.push(row);
             }
         }
-        let metadataRows: Array<Array<CellValue | bigint>> | undefined;
-        if (containmentQuery.metadataSql) {
-          const metadataStmt = this.instance.prepare(containmentQuery.metadataSql, bindParams);
-          executionState.metadataStmt = metadataStmt;
-          metadataRows = [];
-          while (metadataStmt.step()) {
-            const row = metadataStmt.get(null, { useBigInt: true });
-            if (row) metadataRows.push(row);
-          }
-          metadataStmt.free();
-          executionState.metadataStmt = undefined;
-        }
         const valueSourceRows = mergeCellContainmentMetadataRows(
           primaryRows,
-          metadataRows,
+          undefined,
           containmentQuery
         ) as Array<Array<CellValue | bigint>>;
         let rowIdRows: Array<Array<CellValue | bigint>> | undefined;
@@ -4525,7 +4512,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     } finally {
       executionState.headerStmt?.free();
       executionState.stmt?.free();
-      executionState.metadataStmt?.free();
       executionState.rowIdStmt?.free();
     }
   }
