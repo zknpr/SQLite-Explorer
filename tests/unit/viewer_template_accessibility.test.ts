@@ -5,9 +5,13 @@ import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+function escapeRegExpLiteral(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function findLabelForExactText(template: string, id: string, text: string): string | undefined {
     return template.match(
-        new RegExp(`<label\\b(?=[^>]*\\bfor=["']${id}["'])[^>]*>\\s*${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*</label>`, 'i')
+        new RegExp(`<label\\b(?=[^>]*\\bfor=["']${escapeRegExpLiteral(id)}["'])[^>]*>\\s*${escapeRegExpLiteral(text)}\\s*</label>`, 'i')
     )?.[0];
 }
 
@@ -29,6 +33,29 @@ describe('viewer template accessibility', () => {
                     `<label for="fixture">${regexInterpretation}</label>`,
                     'fixture',
                     literal
+                ),
+                undefined
+            );
+        }
+    });
+
+    it('matches interpolated label ids as RegExp literals', () => {
+        for (const [literal, regexInterpretation] of [
+            ['field.name', 'fieldXname'],
+            ['field+name', 'fieldddddname'],
+            ['field|name', 'field'],
+            [String.raw`field\name`, 'fieldname']
+        ]) {
+            const literalLabel = `<label for="${literal}">Name</label>`;
+            assert.strictEqual(
+                findLabelForExactText(literalLabel, literal, 'Name'),
+                literalLabel
+            );
+            assert.strictEqual(
+                findLabelForExactText(
+                    `<label for="${regexInterpretation}">Name</label>`,
+                    literal,
+                    'Name'
                 ),
                 undefined
             );
